@@ -33,6 +33,7 @@ use crate::{
         load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
     },
     worker::{ConnectionMode, Worker, WorkerRegistry},
+    workflow::steps::local::ReleaseTokenizerStep,
 };
 
 /// Configuration for adding a tokenizer
@@ -55,8 +56,11 @@ pub struct TokenizerConfigRequest {
     #[serde(default)]
     pub fail_on_duplicate: bool,
     /// Whether a worker's registration asked for the load: an entry it loads
-    /// afresh is the worker's, released with its model's last worker; the
-    /// startup entry's and an operator's requests leave this false.
+    /// afresh is the worker's (recorded by the loader under the registry's
+    /// per-name lock, before the entry is published), released with its
+    /// model's last worker, by the load itself when that worker left while
+    /// it ran; the startup entry's and an operator's requests leave this
+    /// false.
     #[serde(skip)]
     pub for_worker: bool,
 }
@@ -293,6 +297,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let source = config.source.clone();
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
+        let for_worker = config.for_worker;
 
         // Load the tokenizer using the registry's load method
         // This handles: validation, deduplication, and loading
@@ -306,7 +311,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let name = name.clone();
                 let id = id.clone();
                 async move {
-                    load_tokenizer(
+                    let tokenizer = load_tokenizer(
                         &app_context,
                         &id,
                         &name,
@@ -314,7 +319,14 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         chat_template.as_deref(),
                         cache_cfg,
                     )
-                    .await
+                    .await?;
+                    // Recorded under the registry's per-name lock, before the
+                    // entry is published: a reader that sees the entry sees
+                    // the record.
+                    if for_worker {
+                        app_context.worker_loaded_tokenizers.insert(id);
+                    }
+                    Ok(tokenizer)
                 }
             })
             .await;
@@ -322,6 +334,12 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         match result {
             Ok(outcome) => {
                 let vocab_size = note_load_outcome(&app_context, config, &outcome)?;
+                // A worker's load looks at the worker registry again once it
+                // has published: the removal of the model's last worker while
+                // the load ran found no entry to take.
+                if for_worker && matches!(outcome, LoadOutcome::Loaded { .. }) {
+                    ReleaseTokenizerStep::release_if_unserved(&app_context, &name);
+                }
 
                 // Store vocab size in typed data
                 if let Some(size) = vocab_size {
@@ -406,9 +424,6 @@ fn note_load_outcome(
                 "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
                 name, id, vocab_size
             );
-            if config.for_worker {
-                app_context.worker_loaded_tokenizers.insert(id.clone());
-            }
             hint_response_template(app_context, name, id);
         }
         LoadOutcome::AlreadyExists { id } => {
@@ -714,11 +729,34 @@ pub fn create_tokenizer_workflow_data(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    /// A directory holding a small real tokenizer (a two-token WordLevel
+    /// `tokenizer.json`): a source the registration step loads from disk.
+    pub(crate) fn tokenizer_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": {"hello": 0, "<unk>": 1},
+                "unk_token": "<unk>"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerType};
+    use wfaas::WorkflowInstanceId;
 
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder};
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        worker::{test_support::no_health_check, BasicWorkerBuilder},
+    };
 
     #[test]
     fn worker_tokenizer_bundle_preserves_configured_template() {
@@ -1036,5 +1074,87 @@ mod tests {
         assert!(!failures.record("m", TokenizerLoadFailure::Removed));
         note_tokenizer_removed(&failures, &workers, "other");
         assert_eq!(failures.get("other"), None);
+    }
+
+    /// The application context the step runs on, its worker registry given.
+    fn app_context(workers: WorkerRegistry) -> Arc<AppContext> {
+        app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::new(workers),
+            None,
+        )
+    }
+
+    /// The registration step run for the tokenizer of `source` under `id`
+    /// and `name`.
+    async fn load(
+        app_context: &Arc<AppContext>,
+        id: &str,
+        name: &str,
+        source: &str,
+        for_worker: bool,
+    ) {
+        let request = TokenizerConfigRequest {
+            id: id.to_string(),
+            name: name.to_string(),
+            source: source.to_string(),
+            chat_template_path: None,
+            cache_config: None,
+            fail_on_duplicate: false,
+            for_worker,
+        };
+        let mut context = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_tokenizer_workflow_data(request, Arc::clone(app_context)),
+        );
+        let result = LoadTokenizerStep
+            .execute(&mut context)
+            .await
+            .expect("the step runs");
+        assert_eq!(result, StepResult::Success);
+    }
+
+    /// The record follows a worker's fresh load alone: the entry loaded
+    /// afresh for a worker is recorded, one the registry already held is
+    /// not, and a startup or operator load records nothing and stays
+    /// whether or not a worker serves its model.
+    #[tokio::test]
+    async fn the_record_follows_a_workers_fresh_load_alone() {
+        let dir = test_support::tokenizer_dir();
+        let source = dir.path().to_str().unwrap();
+        let app_context = app_context(serving("m"));
+        load(&app_context, "t1", "m", source, true).await;
+        assert!(app_context.worker_loaded_tokenizers.contains("t1"));
+
+        load(&app_context, "t2", "m", source, true).await;
+        assert_eq!(
+            app_context.tokenizer_registry.get_by_name("m").unwrap().id,
+            "t1",
+            "the entry the registry held stays"
+        );
+        assert!(!app_context.worker_loaded_tokenizers.contains("t2"));
+        assert!(app_context.worker_loaded_tokenizers.contains("t1"));
+
+        load(&app_context, "s1", "n", source, false).await;
+        assert!(
+            app_context.tokenizer_registry.get_by_name("n").is_some(),
+            "a startup or operator entry stays for a model no worker serves"
+        );
+        assert!(!app_context.worker_loaded_tokenizers.contains("s1"));
+    }
+
+    /// A worker's load that publishes after the model's last worker left
+    /// (that removal's release found no entry to take) releases its entry
+    /// at once, record and all.
+    #[tokio::test]
+    async fn a_workers_load_that_publishes_after_its_last_worker_left_releases_the_entry() {
+        let dir = test_support::tokenizer_dir();
+        let app_context = app_context(WorkerRegistry::new());
+        load(&app_context, "t1", "m", dir.path().to_str().unwrap(), true).await;
+        assert!(app_context.tokenizer_registry.get_by_name("m").is_none());
+        assert_eq!(app_context.tokenizer_registry.len(), 0);
+        assert!(!app_context.worker_loaded_tokenizers.contains("t1"));
     }
 }

@@ -22,12 +22,14 @@ use crate::{app_context::AppContext, worker::Worker, workflow::data::WorkerRemov
 /// leaves (with autoload off the gateway manages none and the step skips).
 /// A model no worker serves any more loses the tokenizer registered under
 /// its id, with the multimodal config that came with it, when a worker's
-/// registration loaded that entry (the registration workflow records the
-/// entries it loads afresh for a worker, `AppContext::worker_loaded_tokenizers`):
-/// the startup entry and an operator's registration under a model's name
-/// stay. The model's next registration loads the tokenizer again. A model a
-/// removed worker only lists keeps its entry until a worker whose primary it
-/// is leaves.
+/// registration loaded that entry (the registration workflow's loader records
+/// the entries it loads afresh for a worker, `AppContext::worker_loaded_tokenizers`,
+/// under the registry's per-name lock before the entry is published; a load
+/// that published after the model's last worker left releases its own entry,
+/// see `release_if_unserved`): the startup entry and an operator's
+/// registration under a model's name stay. The model's next registration
+/// loads the tokenizer again. A model a removed worker only lists keeps its
+/// entry until a worker whose primary it is leaves.
 pub struct ReleaseTokenizerStep;
 
 #[async_trait]
@@ -175,14 +177,15 @@ impl ReleaseTokenizerStep {
         }
     }
 
-    /// The put-back's second look: the worker that kept the model served may
-    /// have left while the put-back waited on the registry's per-name lock
-    /// (that removal's release found no entry to take), so a model no worker
-    /// serves any more loses the entry under its name again, config and
-    /// record with it, when a worker's registration loaded it. The per-name
-    /// lock orders the put-back's insert before any later removal's remove,
-    /// so this look closes the window.
-    fn release_if_unserved(app_context: &Arc<AppContext>, model_id: &str) {
+    /// The second look of a put-back, and of a worker's load, once it has
+    /// published: the worker that kept the model served may have left while
+    /// the put-back waited on the registry's per-name lock, or the model's
+    /// last worker while its registration's load ran (that removal's release
+    /// found no entry to take), so a model no worker serves any more loses
+    /// the entry under its name again, config and record with it, when a
+    /// worker's registration loaded it. The per-name lock orders the insert
+    /// before any later removal's remove, so this look closes the window.
+    pub(crate) fn release_if_unserved(app_context: &Arc<AppContext>, model_id: &str) {
         if app_context.worker_registry.contains_model(model_id) {
             return;
         }
@@ -193,7 +196,7 @@ impl ReleaseTokenizerStep {
         if loaded_by_a_worker && Self::release(app_context, model_id) {
             debug!(
                 model = %model_id,
-                "Released the tokenizer of a model whose last worker left under its put-back"
+                "Released the tokenizer of a model whose last worker left while it was put back or loaded"
             );
         }
     }
@@ -346,7 +349,9 @@ mod tests {
 
     /// A load of `name` that holds the registry's per-name lock until `gate`
     /// is notified, then succeeds or fails as told: a registration's
-    /// tokenizer job that takes long, on its own task.
+    /// tokenizer job that takes long, on its own task, recording the entry
+    /// as a worker's where the registration's loader does, under the lock
+    /// before the publish.
     fn competing_load(
         app_context: &Arc<AppContext>,
         name: &str,
@@ -780,5 +785,32 @@ mod tests {
         assert!(app_context.multimodal_config_registry.get(&old).is_none());
         assert!(!app_context.worker_loaded_tokenizers.contains(&old));
         assert!(!app_context.worker_loaded_tokenizers.contains(&fresh));
+    }
+
+    /// The model's last worker leaving while its own registration's load is
+    /// in flight: that removal's release finds no entry to take, the load
+    /// then publishes one, recorded, and the look after the publish (the
+    /// registration step's) releases it.
+    #[tokio::test]
+    async fn the_last_worker_leaving_under_its_own_load_empties_the_registry() {
+        let app_context = app_context();
+        let only = worker(&app_context, "http://w1:8000", "m", "/tok/m");
+        let gate = Arc::new(Notify::new());
+        let load = competing_load(&app_context, "m", Arc::clone(&gate), true);
+        settle().await;
+        remove(&app_context, only).await;
+        assert!(
+            app_context.tokenizer_registry.get_by_name("m").is_none(),
+            "the removal found no entry to take"
+        );
+
+        gate.notify_one();
+        let LoadOutcome::Loaded { id } = load.await.unwrap().unwrap() else {
+            panic!("the load published afresh");
+        };
+        assert!(app_context.worker_loaded_tokenizers.contains(&id));
+        ReleaseTokenizerStep::release_if_unserved(&app_context, "m");
+        assert_eq!(app_context.tokenizer_registry.len(), 0, "the entry left");
+        assert!(!app_context.worker_loaded_tokenizers.contains(&id));
     }
 }

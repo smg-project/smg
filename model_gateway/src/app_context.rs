@@ -80,8 +80,10 @@ pub struct AppContext {
     /// model.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
     /// The ids of the tokenizer entries a worker's registration loaded:
-    /// written by the registration workflow's load, read by the removal
-    /// workflow's release step, which takes no other entry (the startup
+    /// written by the registration workflow's loader under the registry's
+    /// per-name lock, before the entry is published (a reader that sees the
+    /// entry sees the record), read by the removal workflow's release step,
+    /// which takes no other entry (the startup
     /// entry and an operator's stay however their models' workers come
     /// and go), and dropped with the entry on every removal path, the
     /// operator's `DELETE /v1/tokenizers/{id}` included: that ends the
