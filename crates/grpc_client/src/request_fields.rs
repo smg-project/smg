@@ -289,6 +289,26 @@ pub fn non_negative_folded_i32(seed: u64) -> i32 {
     seed_folded_i32(seed) & i32::MAX
 }
 
+/// A seed on a wire whose engine reads `-1` as "no seed": the legacy form ([`legacy_seed_i32`])
+/// with that one value moved to the word's minimum, which the fold also reaches (the one shared
+/// value a 32-bit field costs), so a seeded request never runs unseeded.
+pub fn seeded_i32(seed: i64) -> i32 {
+    never_minus_one(legacy_seed_i32(seed))
+}
+
+/// A 64-bit seed on such a wire: the fold ([`seed_folded_i32`]) with `-1` moved the same way.
+pub fn seeded_folded_i32(seed: u64) -> i32 {
+    never_minus_one(seed_folded_i32(seed))
+}
+
+fn never_minus_one(seed: i32) -> i32 {
+    if seed == -1 {
+        i32::MIN
+    } else {
+        seed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +543,21 @@ mod seed_tests {
         assert_eq!(non_negative_folded_i32(u64::MAX), 0);
         for seed in [-1, i64::MIN, i64::MAX, 1 << 31, 1 << 32] {
             assert!(non_negative_seed_i32(seed) >= 0, "{seed}");
+        }
+    }
+
+    #[test]
+    fn a_seed_for_an_engine_that_reads_minus_one_as_unseeded_is_never_minus_one() {
+        assert_eq!(seeded_i32(7), 7);
+        assert_eq!(seeded_i32(-2), -2);
+        assert_eq!(seeded_i32(-1), i32::MIN);
+        assert_eq!(seeded_i32(i64::from(u32::MAX)), i32::MIN);
+        assert_eq!(seeded_i32(i64::MAX), i32::MIN);
+        assert_eq!(seeded_folded_i32(7), 7);
+        assert_eq!(seeded_folded_i32(u64::from(u32::MAX)), i32::MIN);
+        assert_eq!(seeded_folded_i32(u64::MAX), 0);
+        for seed in [-1, i64::from(u32::MAX), i64::MIN, i64::MAX] {
+            assert_ne!(seeded_i32(seed), -1, "{seed}");
         }
     }
 }

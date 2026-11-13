@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 use crate::{
     channel::Channel,
     request_fields::{
-        body_format, completion_constraint, legacy_seed_i32, logit_bias_by_token_id,
-        plain_constraint, seed_folded_i32, stop_strings, ConstraintKind, OutputConstraint,
+        body_format, completion_constraint, logit_bias_by_token_id, plain_constraint,
+        seeded_folded_i32, seeded_i32, stop_strings, ConstraintKind, OutputConstraint,
         PlainSampling,
     },
     BoxedTraceInjector,
@@ -212,8 +212,9 @@ impl VllmEngineClient {
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             // The proto seed is a signed 32-bit word, the OpenAI-compatible seed an int64: itself
-            // when it fits, else its bits folded; None stays None and the engine picks its own.
-            seed: request.seed.map(legacy_seed_i32),
+            // when it fits, else its bits folded, and never -1, which the engine reads as "no seed";
+            // None stays None and the engine picks its own.
+            seed: request.seed.map(seeded_i32),
             constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
@@ -448,7 +449,7 @@ impl VllmEngineClient {
             n: request.n.unwrap_or(1),
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            seed: request.seed.map(legacy_seed_i32),
+            seed: request.seed.map(seeded_i32),
             constraint,
             ..Default::default()
         })
@@ -489,8 +490,8 @@ impl VllmEngineClient {
             ignore_eos: plain.ignore_eos,
             include_stop_str_in_output: plain.no_stop_trim,
             n: plain.n,
-            // The proto seed is a signed 32-bit word, the plain seed a u64: its bits folded.
-            seed: plain.sampling_seed.map(seed_folded_i32),
+            // The proto seed is a signed 32-bit word, the plain seed a u64: its bits folded, never -1.
+            seed: plain.sampling_seed.map(seeded_folded_i32),
             constraint: match params {
                 Some(p) => Self::constraint_of(plain_constraint(p)?),
                 None => None,
@@ -621,6 +622,9 @@ mod tests {
         assert_eq!(seed(seeded(Some(7))), Some(7));
         assert_eq!(seed(seeded(Some(1 << 32))), Some(1));
         assert_eq!(seed(seeded(Some(u64::MAX))), Some(0));
+        // The fold lands this seed on -1, which the engine reads as "no seed": it is carried as the
+        // word's minimum instead.
+        assert_eq!(seed(seeded(Some(u64::from(u32::MAX)))), Some(i32::MIN));
         assert_eq!(seed(seeded(None)), None);
     }
 
@@ -711,6 +715,20 @@ mod tests {
         )
         .expect("build sampling params");
         assert_eq!(next_params.seed, Some(i32::MIN + 1));
+        // The engine reads -1 as "no seed": a public -1, and a seed that folds to it, are carried
+        // as the word's minimum instead, so the request stays seeded.
+        for seed in [-1, i64::from(u32::MAX)] {
+            let sentinel = ChatCompletionRequest {
+                seed: Some(seed),
+                ..Default::default()
+            };
+            let sentinel_params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+                &sentinel,
+                OutputConstraint::default(),
+            )
+            .expect("build sampling params");
+            assert_eq!(sentinel_params.seed, Some(i32::MIN), "{seed}");
+        }
     }
 
     #[test]
@@ -810,6 +828,16 @@ mod tests {
         let next_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&next)
             .expect("build sampling params");
         assert_eq!(next_params.seed, Some(i32::MIN + 1));
+        for seed in [-1, i64::from(u32::MAX)] {
+            let sentinel = CompletionRequest {
+                seed: Some(seed),
+                ..minimal_completion_request()
+            };
+            let sentinel_params =
+                VllmEngineClient::build_grpc_sampling_params_from_completion(&sentinel)
+                    .expect("build sampling params");
+            assert_eq!(sentinel_params.seed, Some(i32::MIN), "{seed}");
+        }
     }
 
     /// A chat or completion request's `logit_bias` reaches the proto keyed by
