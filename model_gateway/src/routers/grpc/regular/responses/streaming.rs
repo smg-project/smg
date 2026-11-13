@@ -92,7 +92,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     ctx: &ResponsesContext,
     chat_request: Arc<ChatCompletionRequest>,
     params: ResponsesCallContext,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     background: Option<BackgroundStream>,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
@@ -134,8 +134,9 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     // Create channel for transformed SSE events
     let (tx, rx) = sse_channel();
 
-    // Spawn background task to transform stream
-    let original_request_clone = original_request.clone();
+    // Spawn background task to transform stream; it takes a share of the
+    // request (a count), not a copy of it.
+    let original_request_clone = Arc::clone(original_request);
     let response_storage = ctx.response_storage.clone();
     let conversation_storage = ctx.conversation_storage.clone();
     let conversation_item_storage = ctx.conversation_item_storage.clone();
@@ -383,7 +384,7 @@ async fn record_departure(
 )]
 async fn process_and_transform_sse_stream(
     body: Body,
-    original_request: ResponsesRequest,
+    original_request: Arc<ResponsesRequest>,
     response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
@@ -401,7 +402,7 @@ async fn process_and_transform_sse_stream(
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
-    event_emitter.set_original_request(original_request.clone());
+    event_emitter.set_original_request(ResponsesRequest::clone(&original_request));
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
@@ -563,7 +564,7 @@ async fn process_and_transform_sse_stream(
 pub(super) async fn execute_tool_loop_streaming(
     ctx: &ResponsesContext,
     current_request: ResponsesRequest,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
     background: Option<BackgroundStream>,
@@ -572,9 +573,9 @@ pub(super) async fn execute_tool_loop_streaming(
     let (tx, rx) = sse_channel();
     let (startup_tx, startup_rx) = stream_startup_channel();
 
-    // Clone data for background task
+    // Clone data for background task; the request is shared by count, not copied.
     let ctx_clone = ctx.clone();
-    let original_request_clone = original_request.clone();
+    let original_request_clone = Arc::clone(original_request);
     // A background stream's events go through a relay, so the work and its
     // terminal record outlive a client that leaves.
     let tx = match &background {
@@ -1333,10 +1334,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(false),
                 ..Default::default()
-            },
+            }),
             None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1457,10 +1458,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..request
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1941,10 +1942,10 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let transform = process_and_transform_sse_stream(
                 body,
-                ResponsesRequest {
+                Arc::new(ResponsesRequest {
                     store: Some(store),
                     ..Default::default()
-                },
+                }),
                 None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2056,10 +2057,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let transform = process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2108,10 +2109,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let transform = process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2177,10 +2178,10 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let transform = process_and_transform_sse_stream(
                 body,
-                ResponsesRequest {
+                Arc::new(ResponsesRequest {
                     store: Some(true),
                     ..Default::default()
-                },
+                }),
                 None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2419,10 +2420,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             response_storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
