@@ -2,7 +2,12 @@
 
 Three files, two contracts, one vocabulary. Nothing here is compiled into the
 gateway or the engine crate; a crate test compiles and parses the files and
-holds them to the crate's own types.
+holds them to the crate's own types. The WIT's `types` interface is generated
+from those types: `smg-policy.wit.in` is the hand-written template, the
+crate's `wit` module renders the interface into it from descriptors tied to
+the engine's structs, and `smg-policy.wit` is the committed rendering
+(`SMG_POLICY_WIT_WRITE=1 cargo test -p smg-policy-controller --test wit`
+rewrites it; the test fails on any other difference).
 
 | file | what it is | design |
 |---|---|---|
@@ -108,5 +113,7 @@ resolves and its records and enums are the crate's (by field and case names,
 not their types: a width change such as `u8` to `u16` passes this check,
 which a type table in a later head closes); the versioned names are the
 pinned lists; the packed request block's padding keeps its u64 sections
-8-byte aligned and the world's comment states the rule. No code is generated
-and nothing at run time reads the files.
+8-byte aligned and the world's comment states the rule. `--test wit` holds the
+committed WIT to its rendering byte for byte and every record to the engine's
+struct in name and type (the type table the earlier head left open); the WIT order is the descriptor's, held by the byte-for-byte test.
+Nothing at run time reads the files.
