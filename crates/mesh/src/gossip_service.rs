@@ -64,6 +64,7 @@ use super::{
         sync_stream::build_heartbeat,
     },
 };
+use crate::kv::{MeshKV, RoundBatch};
 
 /// Where a prepared gossip server accepts: a listener its caller bound, or
 /// the configured address, bound when it serves.
@@ -120,11 +121,11 @@ pub struct GossipService {
     /// broadcast drain_entries and also emit targeted_entries addressed
     /// to the remote peer learned from the first inbound message, so
     /// publish_to(peer) works in both directions of a peer pair.
-    current_stream_batch: Option<Arc<parking_lot::RwLock<Arc<crate::kv::RoundBatch>>>>,
+    current_stream_batch: Option<Arc<parking_lot::RwLock<Arc<RoundBatch>>>>,
     /// Node-wide MeshKV handle. Owns the stream buffers, subscriber
     /// registry, and chunk assembler shared with the client-side
     /// SyncStream handlers.
-    mesh_kv: Option<Arc<crate::kv::MeshKV>>,
+    mesh_kv: Option<Arc<MeshKV>>,
 }
 
 /// The HTTP/2 flow-control credit one stream on an accepted connection may
@@ -160,7 +161,7 @@ impl GossipService {
     /// of a peer pair.
     pub fn with_current_stream_batch(
         mut self,
-        current_stream_batch: Arc<parking_lot::RwLock<Arc<crate::kv::RoundBatch>>>,
+        current_stream_batch: Arc<parking_lot::RwLock<Arc<RoundBatch>>>,
     ) -> Self {
         self.current_stream_batch = Some(current_stream_batch);
         self
@@ -170,7 +171,7 @@ impl GossipService {
     /// builder so stream buffers, subscribers, and the chunk assembler
     /// are shared between the client-side (outbound) and server-side
     /// (inbound) SyncStream handlers.
-    pub fn with_mesh_kv(mut self, mesh_kv: Arc<crate::kv::MeshKV>) -> Self {
+    pub fn with_mesh_kv(mut self, mesh_kv: Arc<MeshKV>) -> Self {
         self.mesh_kv = Some(mesh_kv);
         self
     }
