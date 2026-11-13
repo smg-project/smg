@@ -491,6 +491,12 @@ impl Config {
                     let raw = value(&mut args, &flag)?;
                     parse_per_worker(raw, &flag, &mut cfg.worker_pass_time_scale)?;
                 }
+                "--global-l3-blocks" => {
+                    cfg.engine.global_l3_blocks = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--global-l3-ms-per-token" => {
+                    cfg.engine.global_l3_ms_per_token = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--request-overhead-ms" => {
                     cfg.engine.request_overhead_ms = parse(value(&mut args, &flag)?, &flag)?;
                     overhead_given = true;
@@ -601,6 +607,7 @@ impl Config {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
         }
         cfg.check_worker_overrides()?;
+        cfg.check_global_l3()?;
         if cfg.kv_events_wire == Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1 {
             return Err(
                 "--kv-cache-groups names several groups, but the SGLang wire (--kv-events-wire \
@@ -819,6 +826,55 @@ impl Config {
         (is_rank && whole.starts_with("grpc:") && self.serves(whole)).then_some(whole)
     }
 
+    /// Refuse the shared KV tier's flags where the tier would not take: on a
+    /// canned engine, with prefix caching off (a restore continues a prefix
+    /// hit), on an engine whose cache groups are not one main-attention group
+    /// (the tier holds whole blocks of one group), and a restore price with no
+    /// tier or one that is not a finite number of at least 0.
+    fn check_global_l3(&self) -> Result<(), String> {
+        let (blocks, ms) = (
+            self.engine.global_l3_blocks,
+            self.engine.global_l3_ms_per_token,
+        );
+        if blocks > 0 && !self.realistic {
+            return Err(
+                "--global-l3-blocks is a realistic engine's tier: it needs --engine realistic"
+                    .to_string(),
+            );
+        }
+        if blocks > 0 && !self.engine.prefix_cache {
+            return Err(
+                "--global-l3-blocks restores what continues a prefix hit: it needs \
+                 --prefix-cache true"
+                    .to_string(),
+            );
+        }
+        let one_main_group = matches!(
+            self.engine.kv_cache_groups.as_slice(),
+            [group] if KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str())
+        );
+        if blocks > 0 && !one_main_group {
+            return Err(
+                "--global-l3-blocks holds whole blocks of one cache group: it needs one KV cache \
+                 group of a main-attention kind (--kv-cache-groups)"
+                    .to_string(),
+            );
+        }
+        if !(ms.is_finite() && ms >= 0.0) {
+            return Err(format!(
+                "--global-l3-ms-per-token must be a finite number of at least 0, got {ms}"
+            ));
+        }
+        if ms > 0.0 && blocks == 0 {
+            return Err(
+                "--global-l3-ms-per-token prices restores from the shared tier: it needs \
+                 --global-l3-blocks"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// The bootstrap port of worker number `index` (its offset from its
     /// wire's base port, `--grpc-base-port` or `--http-base-port`):
     /// `--bootstrap-base-port` plus the offset for a
@@ -1029,6 +1085,11 @@ pub fn usage() -> String {
                                 keeps the fleet's step time: a pool's size is room, not speed\n\
        --worker-pass-time-scale <worker=f,..>  the named workers' passes take f times the\n\
                                 timing model's duration (0.001 to 1000; above 1 a slower engine)\n\
+       --global-l3-blocks <n>   process-wide shared KV tier every engine writes to and restores\n\
+                                prefixes from, in blocks (default 0: off; realistic engine,\n\
+                                --prefix-cache true and one main-attention cache group only)\n\
+       --global-l3-ms-per-token <f>  pass time per token restored from the shared tier (default 0;\n\
+                                needs --global-l3-blocks)\n\
        --request-overhead-ms <f>  fixed per-request latency added to every event of a stream (default 0)\n\
        --block-size <n>         cache block/page size in tokens (default 16)\n\
        --prefix-cache <bool>    enable prefix caching + KV events (default true)\n\
@@ -1393,6 +1454,79 @@ mod tests {
             let err = zmq(worker).expect_err("not a rank of the process");
             assert!(err.contains("no worker of this process"), "{worker}: {err}");
         }
+    }
+
+    /// The shared tier's flags set the engines' tier and are refused where
+    /// it would not take: a canned engine, prefix caching off, a hybrid
+    /// engine's several cache groups, a restore price with no tier, a price
+    /// that is not a finite number of at least 0.
+    #[test]
+    fn the_shared_tier_flags_set_the_tier_and_are_refused_where_it_would_not_take() {
+        let realistic = [
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+        ];
+        let with = |flags: &[&str]| parse(&[&realistic[..], flags].concat());
+        let cfg = with(&[
+            "--global-l3-blocks",
+            "4096",
+            "--global-l3-ms-per-token",
+            "0.002",
+        ])
+        .expect("a tier");
+        assert_eq!(cfg.engine.global_l3_blocks, 4096);
+        assert_eq!(cfg.engine.global_l3_ms_per_token, 0.002);
+        assert_eq!(with(&[]).expect("no tier").engine.global_l3_blocks, 0);
+        let refused = |flags: &[&str], reason: &str| {
+            let err = with(flags).expect_err("refused");
+            assert!(err.contains(reason), "{flags:?}: {err}");
+        };
+        refused(
+            &["--global-l3-blocks", "4096", "--prefix-cache", "false"],
+            "needs --prefix-cache true",
+        );
+        for groups in ["full_attention,sliding_window:128", "sliding_window:128"] {
+            refused(
+                &["--global-l3-blocks", "4096", "--kv-cache-groups", groups],
+                "one KV cache group of a main-attention kind",
+            );
+        }
+        with(&[
+            "--global-l3-blocks",
+            "4096",
+            "--kv-cache-groups",
+            "mla_attention",
+        ])
+        .expect("one main-attention group of another kind");
+        refused(
+            &["--global-l3-ms-per-token", "0.002"],
+            "needs --global-l3-blocks",
+        );
+        for price in ["-1", "inf", "NaN"] {
+            refused(
+                &[
+                    "--global-l3-blocks",
+                    "4096",
+                    "--global-l3-ms-per-token",
+                    price,
+                ],
+                "a finite number of at least 0",
+            );
+        }
+        let canned = parse(&[
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--global-l3-blocks",
+            "4096",
+        ])
+        .expect_err("a canned engine has no tier");
+        assert!(canned.contains("needs --engine realistic"), "{canned}");
     }
 
     /// `--kv-cache-groups` names each group's kind and window in order, the
