@@ -420,6 +420,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
+    ("granite-switch-4.1-8b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
     // Step-5-Preview writes ChatML after a DeepSeek-style beginning-of-sentence marker, the tools
@@ -1086,6 +1087,10 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
     ("k-exaone-236b-a23b", "<|assistant|>"),
     (
         "granite-4.1-3b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+    (
+        "granite-switch-4.1-8b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
     ("laguna-xs.2", "<assistant>"),
