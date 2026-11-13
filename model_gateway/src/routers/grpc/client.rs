@@ -416,7 +416,7 @@ impl GrpcClient {
             }
             (Self::TokenSpeed(client), ProtoGenerateRequest::TokenSpeed(boxed_req)) => {
                 let shm_handles = collect_tokenspeed_generate_request_shm_handles(&boxed_req);
-                match client.generate(*boxed_req).await {
+                match client.generate_framed(*boxed_req).await {
                     Ok(stream) => Ok(ProtoStream::TokenSpeed(stream)),
                     Err(error) => {
                         cleanup_mm_shm_handles(&shm_handles);

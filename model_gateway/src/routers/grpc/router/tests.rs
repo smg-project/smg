@@ -1063,10 +1063,14 @@ async fn retry_override_survives_a_model_alias() {
 }
 
 /// A gRPC engine on loopback that answers every generate call with
-/// `output_ids`: one chunk carrying them, then the complete frame.
+/// `output_ids`: one chunk carrying them, then the complete frame. With
+/// `seen` it keeps the request it decoded; with `fail` it answers every call
+/// with that status instead (a trailers-only response).
 #[derive(Clone)]
 struct ScriptedEngine {
     output_ids: Vec<u32>,
+    seen: Option<Arc<std::sync::Mutex<Option<ts::GenerateRequest>>>>,
+    fail: Option<tonic::Code>,
 }
 
 type ScriptedStream<T> = std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send>>;
@@ -1082,7 +1086,14 @@ impl TokenSpeedScheduler for ScriptedEngine {
         request: TonicRequest<ts::GenerateRequest>,
     ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
         use ts::generate_response::Response as GenResp;
-        let request_id = request.into_inner().request_id;
+        if let Some(code) = self.fail {
+            return Err(Status::new(code, "scripted engine"));
+        }
+        let request = request.into_inner();
+        let request_id = request.request_id.clone();
+        if let Some(seen) = &self.seen {
+            *seen.lock().expect("the recorded request") = Some(request);
+        }
         let completion_tokens = self.output_ids.len() as u32;
         let frames = vec![
             Ok(ts::GenerateResponse {
@@ -1192,8 +1203,98 @@ impl TokenSpeedScheduler for ScriptedEngine {
 async fn spawn_engine(output_ids: Vec<u32>) -> u16 {
     let router = Server::builder().add_service(TokenSpeedSchedulerServer::new(ScriptedEngine {
         output_ids,
+        seen: None,
+        fail: None,
     }));
     serve_on_loopback(router).await.0.port()
+}
+
+/// Serves a [`ScriptedEngine`] that records what it decodes (or fails every
+/// call with `fail`) and returns the port.
+async fn spawn_recording_engine(
+    seen: Arc<std::sync::Mutex<Option<ts::GenerateRequest>>>,
+    fail: Option<tonic::Code>,
+) -> u16 {
+    // The 1080p-class request is 25 MB; tonic's 4 MiB default would refuse it
+    // at the length prefix, before the handler runs (the engine servicers and
+    // the mock worker raise the same limit).
+    let router = Server::builder().add_service(
+        TokenSpeedSchedulerServer::new(ScriptedEngine {
+            output_ids: vec![11],
+            seen: Some(seen),
+            fail,
+        })
+        .max_decoding_message_size(64 << 20),
+    );
+    serve_on_loopback(router).await.0.port()
+}
+
+/// A multimodal item with an inline tensor of `len` bytes.
+fn inline_tensor_item(fill: u8, len: usize) -> ts::MultimodalItem {
+    ts::MultimodalItem {
+        content_hash: vec![fill; 4],
+        encoder_input: Some(ts::TensorData {
+            shape: vec![1, (len / 4) as u32],
+            dtype: "float32".into(),
+            payload: Some(ts::tensor_data::Payload::Inline(bytes::Bytes::from(
+                vec![fill; len],
+            ))),
+        }),
+        placeholder_token_id: Some(7),
+        ..Default::default()
+    }
+}
+
+/// A request with a 1080p-class inline tensor and a small part behind it goes
+/// through the client's channel as body frames and reaches the engine as the
+/// request it was; an engine that answers with a trailers-only status hands
+/// the framed call that status.
+#[tokio::test]
+async fn a_framed_request_reaches_the_engine_as_the_request_it_was() {
+    let request = ts::GenerateRequest {
+        request_id: "framed-1".to_string(),
+        mm_inputs: Some(ts::MultimodalInputs {
+            items: vec![
+                inline_tensor_item(1, 1920 * 1080 * 3 * 4),
+                inline_tensor_item(2, 16),
+            ],
+        }),
+        ..Default::default()
+    };
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let port = spawn_recording_engine(seen.clone(), None).await;
+    let client =
+        smg_grpc_client::TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("the client connects");
+    let mut stream = client
+        .generate_framed(request.clone())
+        .await
+        .expect("the framed call is accepted");
+    while let Some(frame) = futures::StreamExt::next(&mut stream).await {
+        frame.expect("a response frame");
+    }
+    assert_eq!(
+        seen.lock().expect("the recorded request").as_ref(),
+        Some(&request),
+        "the engine decoded the request the client framed"
+    );
+
+    let port = spawn_recording_engine(
+        Arc::new(std::sync::Mutex::new(None)),
+        Some(tonic::Code::Unavailable),
+    )
+    .await;
+    let client =
+        smg_grpc_client::TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("the client connects");
+    let error = client
+        .generate_framed(request)
+        .await
+        .err()
+        .expect("the trailers-only status");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
 }
 
 /// A gRPC worker of `worker_type` serving `card`'s model at `url`.

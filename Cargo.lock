@@ -7885,9 +7885,11 @@ dependencies = [
 name = "smg-grpc-client"
 version = "1.17.0"
 dependencies = [
+ "bytes",
  "futures",
  "h2",
  "http-body",
+ "http-body-util",
  "openai-protocol",
  "prost",
  "prost-types",

@@ -35,6 +35,8 @@ pub type AbortOnDropStream =
 pub struct SglangSchedulerClient {
     client: proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
 }
 
 /// Optional request data used when building SGLang generation requests.

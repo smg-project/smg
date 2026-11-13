@@ -34,6 +34,8 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, V
 pub struct VllmEngineClient {
     client: proto::vllm_engine_client::VllmEngineClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
 }
 
 crate::impl_abort_for_drop_with_reason!(VllmEngineClient);
