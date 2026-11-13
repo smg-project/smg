@@ -32,7 +32,7 @@ use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
     observability::metrics::Metrics,
     routers::common::header_utils::{extract_routing_key_hint, extract_target_worker},
-    worker::Worker,
+    worker::{HashRing, Worker},
 };
 
 /// Execution branch for metrics
@@ -121,18 +121,9 @@ impl ConsistentHashingPolicy {
             return None;
         }
 
-        // Use blake3 for consistent hashing in fallback too
-        let hash = blake3::hash(key.as_bytes());
-        #[expect(
-            clippy::expect_used,
-            reason = "blake3 hash is always 32 bytes; slicing first 8 is infallible"
-        )]
-        let hash_val = u64::from_le_bytes(
-            hash.as_bytes()[..8]
-                .try_into()
-                .expect("blake3 hash is always 32 bytes, slicing first 8 is infallible"),
-        );
-        let idx = (hash_val as usize) % healthy_indices.len();
+        // The ring's position hash, so the fallback spells a key's position
+        // as the ring does.
+        let idx = (HashRing::hash_position(key) as usize) % healthy_indices.len();
         Some(healthy_indices[idx])
     }
 
@@ -251,10 +242,7 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::{
-        policies::test_support::{headers_with_routing_key, make_workers, with_headers},
-        worker::HashRing,
-    };
+    use crate::policies::test_support::{headers_with_routing_key, make_workers, with_headers};
 
     fn headers_with_target_worker(idx: usize) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();

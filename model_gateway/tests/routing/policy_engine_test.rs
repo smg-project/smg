@@ -105,3 +105,14 @@ async fn least_load_routes_through_the_engine() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn cache_aware_routes_through_the_engine() {
+    every_request_is_placed(
+        3929,
+        19948,
+        2,
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+    )
+    .await;
+}

@@ -129,6 +129,16 @@ pub(crate) async fn prepare_rendered_prompt(
                 model_id,
                 wire_pools,
             );
+            // The byte bound the pixels must fit before any image is decoded,
+            // where every worker the selection can pick takes them inline in
+            // the gateway's own Generate message; none where any may take
+            // them beside it (an SHM handle, the RDMA lane, a TRT-LLM
+            // worker's file bytes, a ZMQ wire), and the framing itself answers.
+            let image_wire_cap = multimodal::mm_image_wire_cap_over(
+                &ctx.components.worker_registry,
+                model_id,
+                wire_pools,
+            );
             // The frames decode under the destination engine's own
             // transparency rule, resolved over the same pools as the dtype.
             let transparency = multimodal::engine_transparency_policy(
@@ -149,6 +159,7 @@ pub(crate) async fn prepare_rendered_prompt(
                 &tokenizer_id,
                 &tokenizer_source,
                 image_wire_dtype,
+                image_wire_cap,
                 transparency,
                 encoder_budget,
             )
