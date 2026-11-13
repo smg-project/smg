@@ -563,7 +563,7 @@ mod seed_tests {
         for seed in [-1, i64::from(u32::MAX), i64::MIN, i64::MAX] {
             assert_ne!(seeded_i32(seed), -1, "{seed}");
         }
-        // A word derived by an offset (a per-choice seed) goes through the same rule.
+        // The rule on a bare word: `-1` alone moves to the minimum, every other word stays.
         assert_eq!(seeded_word((-2i32).wrapping_add(1)), i32::MIN);
         assert_eq!(seeded_word(-2), -2);
         assert_eq!(seeded_word(i32::MAX.wrapping_add(1)), i32::MIN);

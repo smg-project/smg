@@ -1170,6 +1170,7 @@ fn fan_out_seeds_reach_the_engine_unsigned() {
         translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
             .expect("translated")
             .sampling_params
+            .expect("sampling params")
             .seed
     };
     let subs = fan_out_requests(tokenized_req(vllm::SamplingParams {
