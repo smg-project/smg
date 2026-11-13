@@ -11,10 +11,11 @@
     clippy::allow_attributes
 )]
 
-use std::{fs, path::Path};
+use std::{fs, net::SocketAddr, path::Path};
 
 use gateway_launch::{
-    base_args, free_ports, launch, launch_with, serial, Launch, Until, EXIT_TIMEOUT,
+    base_args, free_ports, launch, launch_with, log_with_line, serial, Gateway, Launch, Until,
+    EXIT_TIMEOUT, IP,
 };
 use smg_policy_controller::spec::PolicySpec;
 
@@ -48,17 +49,27 @@ fn assert_refused(name: &str, launch: &Launch, named: &[&str]) {
     }
 }
 
-/// A launch of the common flags without `--enable-igw` (its routers pair, so
-/// a document is refused beside it on this base) plus `args`, until a bind.
-/// It picks its own ports, so it holds the harness's serial guard from the
-/// pick to the verdict, as [`launch`] does.
-fn launch_regular(args: &[&str], log_path: &Path) -> Launch {
-    let _serial = serial();
-    let [port, metrics_port] = free_ports::<2>();
+/// The common flags without `--enable-igw` (its routers pair, so a document
+/// is refused beside it on this base) plus `args`.
+fn regular_args(args: &[&str], port: u16, metrics_port: u16) -> Vec<String> {
     let mut all = base_args(port, metrics_port);
     all.retain(|flag| flag != "--enable-igw");
     all.extend(args.iter().map(|flag| (*flag).to_string()));
-    launch_with(&all, &[port, metrics_port], Until::Bound, log_path)
+    all
+}
+
+/// A launch of [`regular_args`] until a bind. It picks its own ports, so it
+/// holds the harness's serial guard from the pick to the verdict, as
+/// [`launch`] does.
+fn launch_regular(args: &[&str], log_path: &Path) -> Launch {
+    let _serial = serial();
+    let [port, metrics_port] = free_ports::<2>();
+    launch_with(
+        &regular_args(args, port, metrics_port),
+        &[port, metrics_port],
+        Until::Bound,
+        log_path,
+    )
 }
 
 /// The round-robin preset as a document, written to `path`.
@@ -78,25 +89,28 @@ fn a_policy_spec_the_engine_accepts_starts_the_gateway() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let spec = dir.path().join("spec.yaml");
     write_preset(&spec);
-    let launch = launch_regular(
+    let log_path = dir.path().join("accepted.log");
+    // The gateway's lines reach its log a moment after the event they
+    // report (its writer thread batches them), and a launch killed at the
+    // bind loses what the thread has not written yet: this case keeps the
+    // gateway alive until it serves, and the verdict on the start-up line
+    // waits for the line.
+    let _serial = serial();
+    let [port, metrics_port] = free_ports::<2>();
+    let args = regular_args(
         &[
             "--policy-engine",
             "engine",
             "--policy-spec",
             spec.to_str().unwrap(),
         ],
-        &dir.path().join("accepted.log"),
+        port,
+        metrics_port,
     );
-    assert!(
-        launch.bound.is_some(),
-        "the gateway did not bind under an accepted document\n{}",
-        launch.log
-    );
-    assert!(
-        launch.log.contains("policy document applied"),
-        "the start does not say the document was applied\n{}",
-        launch.log
-    );
+    let gateway = Gateway::start(&args, SocketAddr::from((IP, port)), &log_path);
+    if let Err(log) = log_with_line(&gateway.log, "policy document applied", EXIT_TIMEOUT) {
+        panic!("the start does not say the document was applied\n{log}");
+    }
 }
 
 /// A document the engine refuses stops the start, the error naming the flag
