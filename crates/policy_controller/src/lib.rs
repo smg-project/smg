@@ -53,6 +53,7 @@
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
+pub mod affinity;
 pub mod builtins;
 #[cfg(feature = "controller")]
 pub mod controller;

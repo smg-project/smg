@@ -818,9 +818,13 @@ fn validate_chat_cross_parameters(
             .map_err(|error| on_field(error, "response_format"))?;
     }
 
+    // The provider profile, derived once here for the tool-choice rule (7)
+    // and the contract rules (10).
+    let provider = ProviderProfile::for_model(&req.model);
+
     // 7. A tool_choice against the tools the model will see
     if let Some(tool_choice) = &req.tool_choice {
-        validate_tool_choice(req, tool_choice)?;
+        validate_tool_choice(req, provider, tool_choice)?;
     }
 
     // 8. A function's `parameters`, when given, is a JSON Schema object (an
@@ -858,22 +862,23 @@ fn validate_chat_cross_parameters(
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
     //     OpenAI's own contract refuses the pair.
-    ProviderProfile::for_model(&req.model).validate_chat(req)?;
+    provider.validate_chat(req)?;
 
     Ok(())
 }
 
 /// A `tool_choice` against the tools the model will see: the request's tools
-/// plus the dynamic tools its system and developer messages declare. Only
-/// `none` and `auto` are allowed without tools; a named function must be
-/// declared; an allowed-tools choice names a mode and function tools only,
-/// each declared.
+/// plus the dynamic tools its system and developer messages declare under
+/// `provider`, the request's profile the caller derived. Only `none` and
+/// `auto` are allowed without tools; a named function must be declared; an
+/// allowed-tools choice names a mode and function tools only, each declared.
 fn validate_tool_choice(
     req: &ChatCompletionRequest,
+    provider: ProviderProfile,
     tool_choice: &ToolChoice,
 ) -> Result<(), validator::ValidationError> {
     // Lazy on purpose: most tool traffic only needs the emptiness check.
-    let effective_tools = || req.effective_tools();
+    let effective_tools = || req.effective_tools_for(provider);
     let has_tools = effective_tools().next().is_some();
     let requires_tools = !matches!(
         tool_choice,
@@ -972,11 +977,17 @@ impl ChatCompletionRequest {
     /// tool-call parsing first of all, must work from this set rather than
     /// from `tools` alone, or a call to a dynamic tool comes back as text.
     pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.effective_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn effective_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
         self.tools
             .as_deref()
             .into_iter()
             .flatten()
-            .chain(self.dynamic_tools())
+            .chain(self.dynamic_tools_for(provider))
     }
 
     /// [`Self::effective_tools`] as one list: the request's own `tools`,
@@ -2361,7 +2372,7 @@ mod request_contract_tests {
 mod tool_choice_tests {
     use serde_json::{json, Value};
 
-    use super::{validate_tool_choice, ChatCompletionRequest};
+    use super::{validate_tool_choice, ChatCompletionRequest, ProviderProfile};
 
     fn request(tools: Value, tool_choice: Value) -> ChatCompletionRequest {
         serde_json::from_value(json!({
@@ -2377,7 +2388,7 @@ mod tool_choice_tests {
     fn verdict(tools: Value, tool_choice: Value) -> Option<String> {
         let req = request(tools, tool_choice);
         let choice = req.tool_choice.as_ref().expect("a tool choice");
-        validate_tool_choice(&req, choice)
+        validate_tool_choice(&req, ProviderProfile::for_model(&req.model), choice)
             .err()
             .map(|e| e.code.into_owned())
     }

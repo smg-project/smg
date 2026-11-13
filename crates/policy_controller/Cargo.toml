@@ -23,6 +23,13 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The Kubernetes Lease elector (design 10), behind the `kubernetes` feature:
+# the gateway's own kube client stack, pinned to the same release. The
+# runtime handle its election thread blocks on is the optional tokio declared
+# with the controller's dependencies below; this feature turns it on too.
+# Nothing of it is built without the feature.
+k8s-openapi = { version = "0.27.0", features = ["v1_33"], optional = true }
+kube = { version = "3.0.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
 
 # The standalone controller (the `controller` feature): the listeners, the
 # health service, the admin endpoints and the binary. Every dependency below
@@ -58,8 +65,17 @@ controller = [
     "dep:tracing-subscriber",
 ]
 
+# The Kubernetes Lease backend of the elector.
+kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
+
 [dev-dependencies]
 criterion = "0.8"
+# The Kubernetes elector's tests run its client against a service in the
+# test's process that plays one Lease, and its three-process cell against
+# the same stand-in served over HTTP.
+axum = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 # The corpus test reads YAML documents; the gateway reads its spec file with
 # the same crate.
 serde_yaml = { workspace = true }
@@ -75,6 +91,7 @@ tempfile = "3"
 # certificates when it runs; no certificate file lives in the repository.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # The admin router's tests drive it with `oneshot`, no socket.
+# The Kubernetes elector's stand-in is a `service_fn` of the same crate.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [[bin]]
@@ -85,6 +102,10 @@ required-features = ["controller"]
 [[test]]
 name = "controller"
 required-features = ["controller"]
+
+[[test]]
+name = "elector_k8s_cell"
+required-features = ["kubernetes"]
 
 [[bench]]
 name = "decision"

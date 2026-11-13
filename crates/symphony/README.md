@@ -236,11 +236,12 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-238 groups, 422 checkpoints, newest first.
-12 ready, 172 replaying a recorded set, 5 on main awaiting fixtures, 49 pending.
+240 groups, 424 checkpoints, newest first.
+12 ready, 174 replaying a recorded set, 5 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
+| 2026-10-30 | [mage-vl-cowork](https://github.com/smg-project/bellwether/tree/main/fixtures/mage-vl-cowork) | microsoft/Mage-VL-Cowork |  | `qwen3` | 28 | replaying the set | none |
 | 2026-10-24 | [d1-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-2b) | LiquidAI/d1-2B |  | `qwen3`, tagged calls | 9 | replaying the set | none |
 | 2026-10-24 | [d1-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-omni-2b) | LiquidAI/d1-Omni-2B |  | `qwen3`, tagged calls | — | awaiting fixtures | none |
 | 2026-10-23 | [lfm3-1.7b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-1.7b) | LiquidAI/LFM3-1.7B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
@@ -253,6 +254,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-10-12 | [lfm2.5-24b-a2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm2.5-24b-a2b) | LiquidAI/LFM2.5-24B-A2B |  | `lfm2.5` | 9 | replaying the set | none |
 | 2026-10-12 | [nvidia-nemotron-3.5-super-vl-120b-a12b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-super-vl-120b-a12b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 |  | `qwen3`, tagged calls | 27 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-10-09 | [nvidia-nemotron-3.5-bolt-74b-a9b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-bolt-74b-a9b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16 |  | `qwen3`, tagged calls | 27 | replaying the set | `qwen_xml`, `nano_v3` |
+| 2026-10-09 | [youtu-parsing-omni](https://github.com/smg-project/bellwether/tree/main/fixtures/youtu-parsing-omni) | tencent/Youtu-Parsing-Omni |  | `qwen3` | 1 | replaying the set | none |
 | 2026-10-05 | [d1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-3b) | LiquidAI/d1-3B |  | `lfm2.5` | 589,657 | replaying the set | none |
 | 2026-10-05 | [nld-uni](https://github.com/smg-project/bellwether/tree/main/fixtures/nld-uni) | nvidia/NLD-Uni |  | `qwen3`, tagged calls | 27 | replaying the set | none |
 | 2026-10-05 | [nvidia-nemotron-3.5-bolt-e4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-bolt-e4b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 |  | `gemma4` | 28 | replaying the set | `qwen_xml`, `nano_v3` |

@@ -282,6 +282,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // an older template without a thought; the recorded outputs follow the former.
     ("qwen-agentworld-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
+    // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
+    // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
+    // off.
+    ("mage-vl-cowork", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
@@ -360,6 +364,14 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("webworld-32b", GenerationPrompt::ModelWritesTheThought),
     ("webworld-14b", GenerationPrompt::ModelWritesTheThought),
     ("k-exaone-236b-a23b", GenerationPrompt::OpensTheThought),
+    // Youtu-Parsing-Omni writes Qwen3's thinking switch under turn headers of its own
+    // (`<|begin_of_text|>assistant\n`, the group's opener) and declares no tools; bellwether
+    // recorded one content case of it (the rest refused), and a thought the model writes is
+    // reasoning, as the switch says.
+    (
+        "youtu-parsing-omni",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
@@ -1041,6 +1053,7 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "llama-3.3-nemotron-70b-reward-principle",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
+    ("youtu-parsing-omni", "<|begin_of_text|>assistant\n"),
 ];
 
 /// What a recorded model's own chat template writes after the thought's close before a call,
@@ -1569,6 +1582,14 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     // sixteen, and no fence probe.
     ("d1-2b", "parse/content-with-marker-in-code-fence"),
     ("lfm2.5-24b-a2b", "parse/content-with-marker-in-code-fence"),
+    // Youtu-Parsing-Omni: the set is the one content case bellwether could record (the template
+    // renders no thought in history), so the qwen3 table's two listed probes are not among its
+    // fixtures.
+    ("youtu-parsing-omni", "parse/reasoning-with-marker-text"),
+    (
+        "youtu-parsing-omni",
+        "parse/content-with-marker-in-code-fence",
+    ),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
