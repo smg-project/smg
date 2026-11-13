@@ -150,7 +150,7 @@ pub async fn serve_with_listener_until(
     let ops = AdminOps::register(&name);
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
+        .then(|| Engine::spawn_named(cfg.engine_for(&name), name.clone(), true));
     let state = Arc::new(AppState {
         cfg,
         name,
