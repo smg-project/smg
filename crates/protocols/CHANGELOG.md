@@ -78,6 +78,8 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   upstream without its token, so each hop started the answer over. A modeled field also reads its
   camelCase spelling (`previousInteractionId`, `systemInstruction`, `generationConfig`, ...) into
   the typed field, where the gateway's checks see it, and a body with both spellings is refused.
+  So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
+  `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
   Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or

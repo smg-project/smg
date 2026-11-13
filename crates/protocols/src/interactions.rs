@@ -521,31 +521,42 @@ pub enum ToolChoiceType {
 // Generation Config (Gemini-specific)
 // ============================================================================
 
+/// A field with an underscore also reads its camelCase spelling, which the
+/// public API accepts too, as the request's top-level fields do. So that key
+/// fills the typed field, is checked there and goes upstream in snake_case.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct GenerationConfig {
     #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
+    #[serde(alias = "topP")]
     #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
     pub seed: Option<i64>,
 
+    #[serde(alias = "stopSequences")]
     #[validate(custom(function = "validate_stop_sequences"))]
     pub stop_sequences: Option<Vec<String>>,
 
+    #[serde(alias = "toolChoice")]
     pub tool_choice: Option<ToolChoice>,
 
+    #[serde(alias = "thinkingLevel")]
     pub thinking_level: Option<ThinkingLevel>,
 
+    #[serde(alias = "thinkingSummaries")]
     pub thinking_summaries: Option<ThinkingSummaries>,
 
+    #[serde(alias = "maxOutputTokens")]
     #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
 
+    #[serde(alias = "speechConfig")]
     pub speech_config: Option<Vec<SpeechConfig>>,
 
+    #[serde(alias = "imageConfig")]
     pub image_config: Option<ImageConfig>,
 }
 
@@ -576,6 +587,7 @@ pub enum ToolChoice {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ToolChoiceConfig {
+    #[serde(alias = "allowedTools")]
     pub allowed_tools: Option<AllowedTools>,
 }
 
@@ -590,7 +602,9 @@ pub struct SpeechConfig {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageConfig {
+    #[serde(alias = "aspectRatio")]
     pub aspect_ratio: Option<AspectRatio>,
+    #[serde(alias = "imageSize")]
     pub image_size: Option<ImageSize>,
 }
 
@@ -639,7 +653,7 @@ pub enum AgentConfig {
     #[serde(rename = "deep-research")]
     DeepResearch {
         /// Whether to include thought summaries ("auto" or "none")
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(alias = "thinkingSummaries", skip_serializing_if = "Option::is_none")]
         thinking_summaries: Option<ThinkingSummaries>,
     },
 }
@@ -1296,6 +1310,63 @@ mod tests {
         }));
         let error = both.expect_err("both spellings of one field").to_string();
         assert!(error.contains("duplicate field"), "{error}");
+    }
+
+    /// A generation or agent config key's camelCase spelling fills its typed
+    /// field, as a top-level key's does, so it is checked there and written
+    /// back for the upstream in snake_case rather than dropped.
+    #[test]
+    fn a_config_keys_camel_case_spelling_fills_the_typed_field() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi",
+            "generationConfig": {
+                "topP": 0.5,
+                "stopSequences": ["END"],
+                "toolChoice": {"allowedTools": {"mode": "validated", "tools": ["f"]}},
+                "thinkingLevel": "low",
+                "thinkingSummaries": "auto",
+                "maxOutputTokens": 1,
+                "speechConfig": [{"voice": "Kore"}],
+                "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"}
+            }
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(
+            written["generation_config"],
+            serde_json::json!({
+                "top_p": 0.5,
+                "stop_sequences": ["END"],
+                "tool_choice": {"allowed_tools": {"mode": "validated", "tools": ["f"]}},
+                "thinking_level": "low",
+                "thinking_summaries": "auto",
+                "max_output_tokens": 1,
+                "speech_config": [{"voice": "Kore"}],
+                "image_config": {"aspect_ratio": "16:9", "image_size": "2K"}
+            })
+        );
+
+        let agent: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "agent": "deep-research", "input": "hi",
+            "agentConfig": {"type": "deep-research", "thinkingSummaries": "auto"}
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&agent).unwrap();
+        assert_eq!(
+            written["agent_config"],
+            serde_json::json!({"type": "deep-research", "thinking_summaries": "auto"})
+        );
+
+        let zero: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi",
+            "generationConfig": {"maxOutputTokens": 0}
+        }))
+        .unwrap();
+        let error = zero
+            .validate()
+            .expect_err("a zero token budget")
+            .to_string();
+        assert!(error.contains("max_output_tokens"), "{error}");
     }
 
     /// The request's fields the gateway does not model are written back for
