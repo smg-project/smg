@@ -39,7 +39,7 @@ use crate::{
     },
     traits::{
         AppendedStep, ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding,
-        IncrementalDecoder, SpecialTokens, TokenIdType, Tokenizer,
+        IncrementalDecoder, RendererCapabilities, SpecialTokens, TokenIdType, Tokenizer,
     },
 };
 
@@ -576,7 +576,7 @@ impl Tokenizer for CachedTokenizer {
         self.inner.prefill_opens_think_block()
     }
 
-    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+    fn renderer_capabilities(&self) -> RendererCapabilities {
         self.inner.renderer_capabilities()
     }
 

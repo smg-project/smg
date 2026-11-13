@@ -27,24 +27,30 @@ use tokenizers::{
 };
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "tokenizers-v1")]
+use crate::v1::V1Encoder;
 use crate::{
-    byte_fallback::PieceTable,
-    byte_level::{cut_start, ByteLevelIncremental, ByteLevelTable, UnknownId},
+    byte_fallback::{byte_token, PieceTable},
+    byte_level::{cut_start, decoder_kind, ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
-        load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
-        ChatTemplateState, ConfigChatTemplates, ThinkingKeyName, ThinkingToggle,
+        load_chat_template_from_file, wrap_string_content_in_place, ChatTemplateContentFormat,
+        ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, ThinkingKeyName,
+        ThinkingToggle,
     },
+    decode_activity::note_prefix_mismatch,
     encode_path::{self, EncodePath},
     encoders::{
         deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, marks,
         PromptSegment, RendererProfile, TemplateAnswers,
     },
+    eos::{load_eos_token_ids, with_tokenizer_eos},
+    factory::{discover_chat_template_in_dir, processor_chat_template},
     native::{Added, AddedTokens, NativeEncoder},
     token_text::TokenTextTable,
     traits::{
         append_step_text, AppendedStep, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob,
-        Encoder, Encoding, IncrementalDecoder, PromptEncoding, SpecialTokens, TokenIdType,
-        Tokenizer as TokenizerTrait,
+        Encoder, Encoding, IncrementalDecoder, MediaHandling, PromptEncoding, RendererCapabilities,
+        SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
     word_cache::{LateBoundModel, Listing, LoadingTokenizer, ModelView, TokenizerOf},
 };
@@ -90,7 +96,7 @@ pub struct HuggingFaceTokenizer {
     renderer: Renderer,
     /// Checkpoint identity and media policy resolved when binding the template.
     glm: Option<glm::Checkpoint>,
-    media_handling: crate::traits::MediaHandling,
+    media_handling: MediaHandling,
     /// Checkpoint identity of the V3 architecture family, resolved when the
     /// template is bound (see `deepseek_v31`).
     deepseek_v31: Option<deepseek_v31::Checkpoint>,
@@ -117,7 +123,7 @@ pub struct HuggingFaceTokenizer {
     /// The opt-in v1 pipeline, when the choice took it (then the core's
     /// `native` is `None`).
     #[cfg(feature = "tokenizers-v1")]
-    v1: Option<crate::v1::V1Encoder>,
+    v1: Option<V1Encoder>,
     has_byte_fallback: bool,
     /// The byte each `<0xHH>` token stands for, indexed by id (see
     /// [`byte_fallback_values`]); empty unless the decoder has ByteFallback.
@@ -156,7 +162,7 @@ fn log_decode_path(tokenizer: &HfTokenizer, byte_level: bool, pieces: bool, toke
     } else {
         tracing::info!(
             path,
-            declined = %crate::byte_level::decoder_kind(tokenizer.get_decoder()),
+            declined = %decoder_kind(tokenizer.get_decoder()),
             "tokenizer decode path (the tables take a ByteLevel decoder, the chain \
              [Replace U+2581 -> space] ByteFallback Fuse [Strip one leading space], \
              or a WordPiece or Metaspace decoder)"
@@ -191,7 +197,7 @@ fn byte_fallback_values(tokenizer: &HfTokenizer, has_byte_fallback: bool) -> Vec
     for &high in PLACES {
         for &low in PLACES {
             let text = format!("<0x{}{}>", char::from(high), char::from(low));
-            let Some(byte) = crate::byte_fallback::byte_token(&text) else {
+            let Some(byte) = byte_token(&text) else {
                 continue;
             };
             let Some(index) = tokenizer
@@ -229,7 +235,7 @@ struct AddedTokenConfig {
 /// itself, chosen once per load by [`DirectEncoders::choose`].
 struct DirectEncoders {
     #[cfg(feature = "tokenizers-v1")]
-    v1: Option<crate::v1::V1Encoder>,
+    v1: Option<V1Encoder>,
     native: Option<NativeEncoder>,
 }
 
@@ -241,7 +247,7 @@ impl DirectEncoders {
     /// path ([`encode_path::encode_path_loads`]).
     fn choose<M: Model + ModelView + Serialize>(tokenizer: &TokenizerOf<M>) -> Self {
         #[cfg(feature = "tokenizers-v1")]
-        let v1_declined = match crate::v1::V1Encoder::from_tokenizer(
+        let v1_declined = match V1Encoder::from_tokenizer(
             tokenizer,
             HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD,
         ) {
@@ -554,9 +560,7 @@ impl HuggingFaceTokenizer {
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
         let path = Path::new(file_path);
-        let chat_template_path = path
-            .parent()
-            .and_then(crate::factory::discover_chat_template_in_dir);
+        let chat_template_path = path.parent().and_then(discover_chat_template_in_dir);
         Self::from_file_with_chat_template(file_path, chat_template_path.as_deref())
     }
 
@@ -829,7 +833,7 @@ impl HuggingFaceTokenizer {
         // The processor's legacy template file beside the tokenizer, for the
         // requests without tools (the rule is on `processor_chat_template`).
         let processor_template =
-            crate::factory::processor_chat_template(tokenizer_path.parent(), chat_template_path);
+            processor_chat_template(tokenizer_path.parent(), chat_template_path);
 
         // The configuration's special tokens on request (the rule is on
         // `from_file`): an explicit `add_bos_token` / `add_eos_token` of
@@ -855,10 +859,10 @@ impl HuggingFaceTokenizer {
 
         // Load merged EOS token IDs from config.json + generation_config.json,
         // plus the tokenizer's own eos_token (structured-output grammars end on it).
-        let eos_token_ids = crate::eos::with_tokenizer_eos(
+        let eos_token_ids = with_tokenizer_eos(
             tokenizer_path
                 .parent()
-                .map(crate::eos::load_eos_token_ids)
+                .map(load_eos_token_ids)
                 .unwrap_or_default(),
             special_tokens
                 .eos_token
@@ -1754,7 +1758,7 @@ impl HuggingFaceTokenizer {
                     "decode no longer starts with the emitted text; streaming the remainder"
                 );
                 if count {
-                    crate::decode_activity::note_prefix_mismatch(byte_run);
+                    note_prefix_mismatch(byte_run);
                 }
                 (rest, true)
             }
@@ -2044,7 +2048,7 @@ impl HuggingFaceTokenizer {
                     *prefix = "\u{FFFD}".repeat(ids.len());
                     *prefix_index = ids.len();
                     if rewritten && count {
-                        crate::decode_activity::note_prefix_mismatch(true);
+                        note_prefix_mismatch(true);
                     }
                     return Ok(Stepped::Step(DecodeStep {
                         text: Some(replacements),
@@ -2266,7 +2270,7 @@ impl Decoder for HuggingFaceTokenizer {
                     byte_run,
                     "end-of-input decode no longer starts with the emitted text; streaming the remainder"
                 );
-                crate::decode_activity::note_prefix_mismatch(byte_run);
+                note_prefix_mismatch(byte_run);
                 (pending, true)
             }
         };
@@ -2499,7 +2503,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 .content_format_for_tools(params.tools.is_some())
                 == ChatTemplateContentFormat::OpenAI
         {
-            crate::chat_template::wrap_string_content_in_place(&mut messages);
+            wrap_string_content_in_place(&mut messages);
         }
         self.apply_chat_template_with_encoding(&messages, params, assistant_prefix)
     }
@@ -2541,7 +2545,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
     /// The profile's, or the Jinja template's with the media handling resolved
     /// for this checkpoint.
-    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+    fn renderer_capabilities(&self) -> RendererCapabilities {
         self.template_answers()
             .renderer_capabilities(self.media_handling)
     }

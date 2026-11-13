@@ -602,6 +602,7 @@ pub(crate) mod tests {
     };
 
     use super::*;
+    use crate::traits::Decoder;
 
     pub(crate) const SPECIAL: &str = "<|im_end|>";
     const ADDED: &str = "<tool>";
@@ -954,7 +955,7 @@ pub(crate) mod tests {
                     let expected = tokenizer.decode(&ids, skip).expect("HF decode");
                     assert_eq!(table.decode(&ids, skip), expected, "{ids:?} {skip}");
                     assert_eq!(
-                        crate::traits::Decoder::decode(&smg, &ids, skip).expect("SMG decode"),
+                        Decoder::decode(&smg, &ids, skip).expect("SMG decode"),
                         expected
                     );
                 }
@@ -1007,7 +1008,7 @@ pub(crate) mod tests {
         for skip in [false, true] {
             let ids = [0, 1, 2, u32::MAX];
             assert_eq!(
-                crate::traits::Decoder::decode(&smg, &ids, skip).unwrap(),
+                Decoder::decode(&smg, &ids, skip).unwrap(),
                 tokenizer.decode(&ids, skip).unwrap()
             );
         }
@@ -1020,7 +1021,7 @@ pub(crate) mod tests {
         let smg = crate::HuggingFaceTokenizer::from_tokenizer(tokenizer.clone());
         let ids = [b'h' as u32, b'e' as u32, u32::MAX];
         assert_eq!(
-            crate::traits::Decoder::decode(&smg, &ids, false).unwrap(),
+            Decoder::decode(&smg, &ids, false).unwrap(),
             tokenizer.decode(&ids, false).unwrap()
         );
     }
