@@ -2050,7 +2050,9 @@ class TestMultiTurnToolCall:
         assert "".join(content_parts), "Streaming follow-up should produce text content"
 
 
-@pytest.mark.engine("tokenspeed")
+# vLLM exercises the same worker-policy trigger and original requests/oracles
+# as a functional alternate; this does not qualify the TokenSpeed engine.
+@pytest.mark.engine("tokenspeed", "vllm")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
 @pytest.mark.gateway(
