@@ -6,6 +6,7 @@ mod completion;
 mod decisions;
 mod deepseek_profile;
 mod provider_ext;
+mod realtime;
 mod responses;
 mod sampling_params;
 mod systemone;

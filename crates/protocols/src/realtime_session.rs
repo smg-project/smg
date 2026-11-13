@@ -29,6 +29,10 @@ pub struct RealtimeSessionCreateRequest {
     pub model: Option<String>,
     #[serde(default = "audio")]
     pub output_modalities: Option<Vec<OutputModality>>,
+    /// Whether the model may call tools in parallel
+    pub parallel_tool_calls: Option<bool>,
+    /// The reasoning effort of a reasoning model
+    pub reasoning: Option<RealtimeReasoning>,
     pub prompt: Option<ResponsePrompt>,
     pub tool_choice: Option<RealtimeToolChoiceConfig>,
     pub tools: Option<RealtimeToolsConfig>,
@@ -148,6 +152,44 @@ pub struct AudioTranscription {
     pub language: Option<String>,
     pub model: Option<String>,
     pub prompt: Option<String>,
+    /// The languages the audio may be in, as hints
+    pub languages: Option<Vec<String>>,
+    /// Words and phrases the transcription should recognize
+    pub keywords: Option<Vec<String>>,
+    /// How long the transcription may wait for more audio before it
+    /// commits text
+    pub delay: Option<RealtimeTranscriptionDelay>,
+}
+
+/// How long a realtime transcription may wait for more audio, as the
+/// public API names the settings
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeTranscriptionDelay {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+/// A realtime reasoning model's configuration, as the public API takes it
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealtimeReasoning {
+    pub effort: Option<RealtimeReasoningEffort>,
+}
+
+/// The reasoning efforts a realtime model takes. The Responses API's set
+/// differs (it has `none` and `max`), so that type is not reused.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
 }
 
 // ============================================================================
@@ -325,6 +367,13 @@ pub enum RealtimeToolsConfig {
         require_approval: Option<McpToolApproval>,
         server_description: Option<String>,
         server_url: Option<String>,
+        /// The tunnel that reaches a private server
+        tunnel_id: Option<String>,
+        /// Who may call the server's tools (`direct`, `programmatic`)
+        allowed_callers: Option<Vec<String>>,
+        /// Whether the server's tools are loaded only when a tool search
+        /// asks for them
+        defer_loading: Option<bool>,
     },
 }
 
