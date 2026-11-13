@@ -1454,9 +1454,9 @@ pub fn build_apps(
         );
     let protected_routes = typed_routes.merge(plain_protected_routes);
 
-    // WebSocket and WebRTC routes: auth + admission but NO WASM middleware.
-    // WASM OnResponse reconstructs the response from status/headers/body,
-    // dropping the response extensions that carry the WebSocket upgrade future.
+    // WebSocket and WebRTC routes: auth + admission but no WASM middleware.
+    // The hooks filter HTTP requests and responses; a realtime session is
+    // upgraded away from HTTP and its frames are not run through modules.
     let realtime_routes = Router::new()
         .route("/v1/realtime", get(v1_realtime_ws))
         .route("/v1/realtime/calls", post(v1_realtime_webrtc))

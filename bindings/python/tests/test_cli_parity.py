@@ -34,6 +34,7 @@ def cli_source() -> str:
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
+    "--grouped-dp-sticky": "the launcher and the binding's Router take it in a follow-up change",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.

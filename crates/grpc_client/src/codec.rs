@@ -32,6 +32,11 @@ use tonic_prost::{ProstCodec, ProstDecoder};
 
 use crate::{mlx_proto, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
+/// tonic's eager encode buffer (`BufferSettings::default()`, whose size is
+/// private): the capacity the codec's unreserved write starts from, and the
+/// framed single-frame path with it, so a plain request grows neither.
+pub(crate) const EAGER_BUFFER_BYTES: usize = 8 * 1024;
+
 /// A [`Codec`] for `T` requests and `U` responses that reserves the encoded
 /// length of a message carrying inline tensors before writing it.
 #[derive(Debug, Clone)]
@@ -97,8 +102,9 @@ impl<T: Message + 'static> Encoder for SizedProstEncoder<T> {
 /// of many megabytes), the shapes whose inline payloads the reservation is
 /// for; every other message reserves as before. The encoder is instantiated
 /// per message type, so each type check here folds at compile time and a
-/// text request pays one field read.
-fn reserves_for<T: 'static>(item: &T) -> bool {
+/// text request pays one field read. The framed builders read it too, for a
+/// request none of whose payloads rides as a frame of its own.
+pub(crate) fn reserves_for<T: 'static>(item: &T) -> bool {
     let item: &dyn Any = item;
     if let Some(request) = item.downcast_ref::<tokenspeed_proto::GenerateRequest>() {
         return request.mm_inputs.is_some();

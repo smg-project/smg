@@ -1018,11 +1018,42 @@ fn oracle_config_validation_accepts_dsn_only() {
             pool_min: 1,
             pool_max: 4,
             pool_timeout_secs: 30,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();
 
     config.validate().expect("dsn-based config should validate");
+}
+
+/// The store-call bound is refused at zero by the validator, as the pool wait
+/// is: a configuration built outside the CLI (the Python bindings, a config
+/// by hand) is refused before the storage factory sees it.
+#[test]
+fn oracle_config_validation_refuses_a_zero_store_call_bound() {
+    let config = RouterConfig::builder()
+        .openai_mode(vec!["https://api.openai.com".to_string()])
+        .oracle_history(OracleConfig {
+            wallet_path: None,
+            connect_descriptor: "tcps://db.example.com:1522/service".to_string(),
+            external_auth: false,
+            username: "scott".to_string(),
+            password: "tiger".to_string(),
+            pool_min: 1,
+            pool_max: 4,
+            pool_timeout_secs: 30,
+            op_timeout_secs: 0,
+            schema: None,
+        })
+        .build_unchecked();
+
+    let err = config
+        .validate()
+        .expect_err("a zero store-call bound is refused, as a zero pool wait is");
+    match err {
+        ConfigError::InvalidValue { field, .. } => assert_eq!(field, "oracle.op_timeout_secs"),
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
@@ -1038,6 +1069,7 @@ fn oracle_config_validation_accepts_wallet_alias() {
             pool_min: 1,
             pool_max: 8,
             pool_timeout_secs: 45,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();
@@ -1060,6 +1092,7 @@ fn oracle_config_validation_for_external_auth() {
             pool_min: 1,
             pool_max: 4,
             pool_timeout_secs: 30,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();
@@ -1079,6 +1112,7 @@ fn oracle_config_validation_for_external_auth() {
             pool_min: 1,
             pool_max: 4,
             pool_timeout_secs: 30,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();

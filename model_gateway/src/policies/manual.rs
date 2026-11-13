@@ -379,29 +379,33 @@ where
     V: Ord,
     F: Fn(K) -> V,
 {
-    let mut min_val: Option<V> = None;
-    let mut candidates = Vec::new();
-
+    // One pass and no list of the ties: the n-th candidate tied for the
+    // minimum replaces the pick with probability 1/n, which leaves every
+    // tied candidate as likely as a draw from a list of them did.
+    let mut rng = rand::rng();
+    let mut pick: Option<(K, V)> = None;
+    let mut ties: u32 = 0;
     for &idx in indices {
         let val = get_value(idx);
-        match min_val.as_ref().map(|m| val.cmp(m)) {
+        match pick.as_ref().map(|(_, min)| val.cmp(min)) {
             None | Some(std::cmp::Ordering::Less) => {
-                min_val = Some(val);
-                candidates.clear();
-                candidates.push(idx);
+                pick = Some((idx, val));
+                ties = 1;
             }
             Some(std::cmp::Ordering::Equal) => {
-                candidates.push(idx);
+                ties += 1;
+                if rng.random_range(0..ties) == 0 {
+                    pick = Some((idx, val));
+                }
             }
             Some(std::cmp::Ordering::Greater) => {}
         }
     }
-
-    if candidates.len() == 1 {
-        candidates[0]
-    } else {
-        let mut rng = rand::rng();
-        candidates[rng.random_range(0..candidates.len())]
+    match pick {
+        Some((idx, _)) => idx,
+        // Every caller returns early on an empty pool, so a pick always exists;
+        // this index is the invariant's check, not a recovery path.
+        None => indices[0],
     }
 }
 
