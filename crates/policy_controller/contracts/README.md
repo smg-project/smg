@@ -87,9 +87,11 @@ repository (bellwether) under a pinned tree, never in this repository.
 
 Measured with prost 0.14 over these files (typical frames; proto3 omits a
 field at its default): a decision costs about 110 bytes plus 8 per block hash
-and the headers in and about 170 bytes out (a pair with two decode alternates
-260); a candidate row with its load row is about 90 bytes, so a gRPC plugin's
-record view is about 42 KB at 512 candidates, hence `plugins[].max_candidates`
+and the headers in (up to 6 more when the request carries its block size) and
+about 170 bytes out (a pair with two decode alternates 260); a candidate row
+with its load row is about 90 bytes (up to 6 more with the index's block count
+set), so a gRPC plugin's record view is about 42 KB at 512 candidates, hence
+`plugins[].max_candidates`
 (default 128); a credit grant (a delta: each decide request spends one, no
 answer returns one, a new stream starts at the welcome's window) is 6 bytes
 in its envelope (20 on the wire); a
