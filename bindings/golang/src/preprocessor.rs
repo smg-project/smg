@@ -67,7 +67,7 @@ fn preprocess_impl(
 
     // Generate tool constraints if tools are present
     let tool_constraint = match tool_constraint_for(chat_request) {
-        Ok(constraint) => constraint.map(|c| c.to_tuple()),
+        Ok(constraint) => constraint,
         Err(e) => {
             return Err((
                 SglErrorCode::ParsingError,
