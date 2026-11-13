@@ -1460,7 +1460,7 @@ fn image_generation_call_output_item_round_trips_spec_shape() {
                 ..
             } => {
                 assert_eq!(id, "ig_1");
-                assert_eq!(result, "aGVsbG8=");
+                assert_eq!(result.as_deref(), Some("aGVsbG8="));
                 assert!(revised_prompt.is_none());
                 assert_eq!(*status, expected);
             }
@@ -1495,7 +1495,7 @@ fn image_generation_call_output_item_round_trips_with_revised_prompt() {
             ..
         } => {
             assert_eq!(id, "ig_1");
-            assert_eq!(result, "aGVsbG8=");
+            assert_eq!(result.as_deref(), Some("aGVsbG8="));
             assert_eq!(
                 revised_prompt.as_deref(),
                 Some("A red fox sitting on a rock at sunset.")
@@ -1505,6 +1505,43 @@ fn image_generation_call_output_item_round_trips_with_revised_prompt() {
         other => panic!("expected ImageGenerationCall, got {other:?}"),
     }
     assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
+}
+
+/// A tool call item without output reads `null` and writes it back, as the
+/// public API writes it: a failed `mcp_call`'s `output`, the `result` of an
+/// `image_generation_call` without an image, and the `code` and `outputs` of a
+/// `code_interpreter_call` that reported neither.
+#[test]
+fn tool_call_items_without_output_round_trip_null() {
+    for item in [
+        json!({
+            "type": "mcp_call",
+            "id": "mcp_1",
+            "server_label": "wiki",
+            "name": "search",
+            "arguments": "{}",
+            "status": "failed",
+            "output": null
+        }),
+        json!({
+            "type": "image_generation_call",
+            "id": "ig_1",
+            "status": "completed",
+            "result": null
+        }),
+        json!({
+            "type": "code_interpreter_call",
+            "id": "ci_1",
+            "status": "completed",
+            "container_id": "cntr_1",
+            "code": null,
+            "outputs": null
+        }),
+    ] {
+        let parsed: ResponseOutputItem =
+            serde_json::from_value(item.clone()).unwrap_or_else(|e| panic!("{item}: {e}"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), item);
+    }
 }
 
 /// `ResponseInputOutputItem::ImageGenerationCall` mirrors the output-item
@@ -1648,7 +1685,7 @@ fn image_generation_call_output_item_round_trips_with_full_metadata() {
             assert_eq!(background.as_deref(), Some("opaque"));
             assert_eq!(output_format.as_deref(), Some("png"));
             assert_eq!(quality.as_deref(), Some("high"));
-            assert_eq!(result, "aGVsbG8=");
+            assert_eq!(result.as_deref(), Some("aGVsbG8="));
             assert_eq!(
                 revised_prompt.as_deref(),
                 Some("A red fox sitting on a mossy rock at golden hour.")
@@ -1693,7 +1730,7 @@ fn image_generation_call_output_item_round_trips_minimal_without_metadata() {
             assert!(background.is_none());
             assert!(output_format.is_none());
             assert!(quality.is_none());
-            assert_eq!(result, "aGVsbG8=");
+            assert_eq!(result.as_deref(), Some("aGVsbG8="));
             assert!(revised_prompt.is_none());
             assert!(size.is_none());
             assert_eq!(*status, ImageGenerationCallStatus::Completed);

@@ -1097,7 +1097,7 @@ fn not_executed_tool_call_item(
         let mut item = build_mcp_call_item(
             tool_name,
             arguments,
-            "",
+            None,
             server_label,
             false,
             Some(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
@@ -1488,11 +1488,12 @@ fn is_internal_mcp_response_item(item: &Value, session: &McpToolSession<'_>) -> 
     }
 }
 
-/// Build a mcp_call output item
+/// Build a mcp_call output item; `output` is `null` for a call that produced
+/// none, as the public API writes it.
 fn build_mcp_call_item(
     tool_name: &str,
     arguments: &str,
-    output: &str,
+    output: Option<&str>,
     server_label: &str,
     success: bool,
     error: Option<&str>,
@@ -1648,6 +1649,11 @@ mod tests {
         assert_eq!(plain["status"], "failed");
         assert_eq!(plain["id"], "mcp_1");
         assert_eq!(plain["server_label"], "mock");
+        assert_eq!(
+            plain.get("output"),
+            Some(&serde_json::Value::Null),
+            "{plain}"
+        );
         assert!(
             plain["error"]
                 .to_string()

@@ -2408,7 +2408,10 @@ pub enum ResponseOutputItem {
         #[serde(default, deserialize_with = "mcp_call_error_compat")]
         error: Option<McpToolCallError>,
         name: String,
-        output: String,
+        /// The tool's output, `null` for a call that produced none (a failed
+        /// call), as the public API writes it.
+        #[serialize_always]
+        output: Option<String>,
         server_label: String,
     },
     #[serde(rename = "mcp_approval_request")]
@@ -2435,7 +2438,12 @@ pub enum ResponseOutputItem {
         id: String,
         status: CodeInterpreterCallStatus,
         container_id: String,
+        /// The code the call ran. The public API requires the key and writes
+        /// `null` when there is none, so `None` is written as `null`.
+        #[serialize_always]
         code: Option<String>,
+        /// The call's outputs, written as `null` when there are none, as `code`.
+        #[serialize_always]
         outputs: Option<Vec<CodeInterpreterOutput>>,
     },
     #[serde(rename = "file_search_call")]
@@ -2447,7 +2455,7 @@ pub enum ResponseOutputItem {
     },
     /// `type: "image_generation_call"` — output item carrying a base64 image
     /// produced by the `image_generation` built-in tool. Spec:
-    /// `{ id, action?, background?, output_format?, quality?, result: base64,
+    /// `{ id, action?, background?, output_format?, quality?, result: base64 | null,
     /// revised_prompt?, size?, status, type }`.
     ///
     /// Real OpenAI production responses include the five metadata fields
@@ -2480,8 +2488,10 @@ pub enum ResponseOutputItem {
         /// the `image_generation` tool input knob of the same name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<String>,
-        /// Base64-encoded image bytes.
-        result: String,
+        /// Base64-encoded image bytes, `null` when the call produced no image.
+        /// The public API requires the key, so `None` is written as `null`.
+        #[serialize_always]
+        result: Option<String>,
         /// Prompt text the mainline model rewrote before dispatching the
         /// image-generation call. Preserved so downstream turns/storage do
         /// not drop it on replay.
