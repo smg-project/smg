@@ -47,7 +47,8 @@ pub(super) fn chat_usage(
     counts: response_formatting::TokenCounts,
     parsed_reasoning_tokens: u32,
 ) -> Usage {
-    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0)
+    // The Harmony models take no images: no image count to report.
+    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0, None)
 }
 
 /// The usage of one Responses API iteration: the engine's counters with the
