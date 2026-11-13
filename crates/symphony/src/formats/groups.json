@@ -92,6 +92,7 @@
   {"model": "moonshotai/Kimi-K2.7-Code", "also": [], "table": "kimi_k2", "opener": null, "after": null},
   {"model": "moonshotai/Kimi-K3", "also": ["Kimi-K3.1-Pro", "nvidia/Kimi-K3.1-Pro-NVFP4"], "table": "kimi_k3", "opener": null, "after": null},
   {"model": "poolside/Laguna-XS.2", "also": [], "table": "glm4", "opener": "<assistant>", "after": null},
+  {"model": "inclusionAI/LBS-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "LiquidAI/LFM2.5-1.2B-Instruct", "also": ["LFM2.5-1.2B-Thinking"], "table": "lfm2.5", "opener": null, "after": null},
   {"model": "LiquidAI/LFM2.5-24B-A2B", "also": ["LFM2.5-24B-A2B-FP8"], "table": "lfm2.5", "opener": null, "after": null},
   {"model": "LiquidAI/LFM3-1.7B", "also": [], "table": "qwen3_tagged", "opener": null, "after": ""},
@@ -207,11 +208,15 @@
   {"model": "Qwen/Qwen3.8-Flash-Next", "also": ["nvidia/Qwen3.8-Flash-Next-FP4-Local"], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "ByteDance-Seed/Seed-OSS-36B-Instruct", "also": ["Seed-OSS-36B-Base-woSyn"], "table": "seed_oss", "opener": null, "after": null},
   {"model": "microsoft/Sentiment-Analysis-7B", "also": [], "table": "plain", "opener": null, "after": null},
+  {"model": "inclusionAI/SingVL_S1_4B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "stepfun-ai/Step-3.5-Flash", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "stepfun-ai/Step-5-Preview", "also": [], "table": "qwen3_tagged", "opener": null, "after": ""},
   {"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "microsoft/UserLM-2.0", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "Qwen/WebWorld-32B", "also": ["WebWorld-8B", "WebWorld-14B"], "table": "qwen3", "opener": null, "after": null},
   {"model": "tencent/WeVisOne-VL-4B", "also": ["WeVisOne-VL-2B"], "table": "qwen3", "opener": null, "after": null},
-  {"model": "tencent/Youtu-Parsing-Omni", "also": [], "table": "qwen3", "opener": "<|begin_of_text|>assistant\n", "after": null}
+  {"model": "tencent/Youtu-Parsing-Omni", "also": [], "table": "qwen3", "opener": "<|begin_of_text|>assistant\n", "after": null},
+  {"model": "inclusionAI/ZoomGain-9B", "also": ["ZoomGain-4B"], "table": "qwen3_tagged", "opener": null, "after": null},
+  {"model": "inclusionAI/ZwZ2-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
+  {"model": "inclusionAI/ZwZ2-9B", "also": ["ZwZ2-4B"], "table": "qwen3_tagged", "opener": null, "after": null}
 ]

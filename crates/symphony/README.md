@@ -240,10 +240,13 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
+| 2026-11-11 | [singvl-s1-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/singvl-s1-4b) | inclusionAI/SingVL_S1_4B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
+| 2026-11-10 | [zoomgain-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/zoomgain-9b) | inclusionAI/ZoomGain-9B | ZoomGain-4B | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-11-08 | [minimax-h3-image-pe](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-h3-image-pe) | MiniMaxAI/MiniMax-H3-Image-PE |  | `qwen3`, tagged calls | 28 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-11-06 | [arete-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/arete-27b) | NousResearch/Arete-27B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-11-04 | [longcat-2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/longcat-2.5) | meituan-longcat/LongCat-2.5 |  | `longcat` | 19 | replaying the set | none |
 | 2026-10-30 | [mage-vl-cowork](https://github.com/smg-project/bellwether/tree/main/fixtures/mage-vl-cowork) | microsoft/Mage-VL-Cowork |  | `qwen3` | 28 | replaying the set | none |
+| 2026-10-26 | [lbs-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/lbs-27b) | inclusionAI/LBS-27B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-26 | [otel-2.0-llm-31b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/otel-2.0-llm-31b-it) | RedHatAI/OTel-2.0-LLM-31B-IT |  | `gemma4` | 28 | replaying the set | none |
 | 2026-10-24 | [d1-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-2b) | LiquidAI/d1-2B |  | `qwen3`, tagged calls | 9 | replaying the set | none |
 | 2026-10-24 | [d1-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-omni-2b) | LiquidAI/d1-Omni-2B |  | `qwen3`, tagged calls | — | awaiting fixtures | none |
@@ -257,6 +260,8 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-19 | [lfm3-vl-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-vl-2b) | LiquidAI/LFM3-VL-2B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-17 | [sentiment-analysis-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/sentiment-analysis-7b) | microsoft/Sentiment-Analysis-7B |  | `plain` | — | awaiting fixtures | none |
 | 2026-10-16 | [nvidia-nemotron-labs-dory1.0-4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-labs-dory1.0-4b-bf16) | nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 | NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8, NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4 | `qwen3`, tagged calls | 27 | replaying the set | none |
+| 2026-10-16 | [zwz2-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/zwz2-27b) | inclusionAI/ZwZ2-27B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
+| 2026-10-16 | [zwz2-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/zwz2-9b) | inclusionAI/ZwZ2-9B | ZwZ2-4B | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-15 | [hy-memory-30b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/hy-memory-30b-a3b) | tencent/Hy-Memory-30B-A3B | Hy-Memory-30B-A3B-FP8 | `hy_v3` | 19 | replaying the set | none |
 | 2026-10-15 | [muse-spark-open-816b-a42b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-spark-open-816b-a42b) | meta-models/Muse-Spark-Open-816B-A42B | Muse-Spark-Open-816B-A42B-NVFP4 | `muse_spark` | — | awaiting fixtures | none |
 | 2026-10-14 | [granite-switch-4.1-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-switch-4.1-8b) | ibm-granite/granite-switch-4.1-8b | granite-switch-4.1-30b | `qwen2.5` | 19 | replaying the set | none |
