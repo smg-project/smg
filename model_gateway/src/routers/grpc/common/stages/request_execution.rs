@@ -16,10 +16,12 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
+    grouped_dp::hash_rank,
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
     pd_protocol::{PdDispatch, PdProtocol},
 };
 use crate::{
+    config::GroupedDpSticky,
     observability::{
         cache_trace,
         metrics::{metrics_labels, Metrics},
@@ -35,6 +37,7 @@ use crate::{
         },
         error,
         grpc::{
+            backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
@@ -224,12 +227,15 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// deadline, counted from its dispatch (after the admission gate below,
 /// which has a bound of its own) over the calls that open the streams and
 /// over every message on them (see [`RequestDeadline`]); `None` leaves the
-/// attempt unbounded.
+/// attempt unbounded. `grouped_dp_sticky` is `--grouped-dp-sticky`: whether,
+/// and how, a sticky request to a grouped data-parallel worker is pinned to
+/// one of its engines (see [`pin_grouped_dp_rank`]).
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
     request_timeout: Option<Duration>,
+    grouped_dp_sticky: GroupedDpSticky,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -276,6 +282,15 @@ pub(crate) async fn execute_plan(
         admission,
         LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
     ));
+    // A sticky request to a grouped data-parallel worker goes to its key's
+    // engine.
+    pin_grouped_dp_rank(
+        &mut execution_plan,
+        workers,
+        || clients.single().and_then(BackendClient::pinnable_ranks),
+        ctx.sticky_key.as_deref(),
+        grouped_dp_sticky,
+    );
     // The Prefill admission slot worker selection took for this attempt. It
     // is released when the Prefill phase ends, not with the load guards.
     let prefill_guard = ctx.pd_prefill_guard.take();
@@ -803,6 +818,65 @@ async fn execute_batch_dispatch(
 
     let results = try_join_all(dispatches).await?;
     Ok(ExecutionResult::Batch { results })
+}
+
+/// A grouped data-parallel worker (one ZMQ socket set that several engines
+/// dial, no `dp_rank`) leaves each request to the connector's least-loaded
+/// pick, which scatters one conversation's turns over the ranks' separate
+/// prefix caches. With a sticky key, pin the plan's single generate request
+/// to the key's rank instead, stable per key as dp-aware expansion pins gRPC
+/// and HTTP rank workers: under `sticky`, the key's hash rank. A batch's
+/// prompts, an embedding and a disaggregated request are left as they are.
+/// The ranks are the worker's `dp_size`, or, for a worker given no count
+/// (its engines declare the group at the handshake), the ranks its
+/// connection places a pin on, fixed for the connection's life:
+/// `pinnable_ranks` reads them, when the connection says (see
+/// [`BackendClient::pinnable_ranks`]), and only for a request that may be
+/// pinned. A key whose rank is not below `pinnable_ranks` (on vLLM, one at
+/// or past the first index the group's engines lack) is left to the
+/// connector's pick, which takes any engine, rather than pinned where the
+/// connector may refuse it; each such request is logged at debug.
+fn pin_grouped_dp_rank(
+    plan: &mut ExecutionPlan,
+    workers: &WorkerSelection,
+    pinnable_ranks: impl FnOnce() -> Option<usize>,
+    sticky_key: Option<&str>,
+    sticky: GroupedDpSticky,
+) {
+    if sticky == GroupedDpSticky::Off {
+        return;
+    }
+    let (ExecutionPlan::Single(ProtoRequest::Generate(request)), Some(key)) = (plan, sticky_key)
+    else {
+        return;
+    };
+    let Some(worker) = workers.single() else {
+        return;
+    };
+    if worker.dp_rank().is_some() {
+        return;
+    }
+    let pinnable_ranks = pinnable_ranks();
+    let Some(size) = worker.dp_size().or(pinnable_ranks).filter(|&size| size > 1) else {
+        return;
+    };
+    let rank = match sticky {
+        GroupedDpSticky::Off => return,
+        GroupedDpSticky::Hash => hash_rank(key, size),
+    };
+    if pinnable_ranks.is_none_or(|ranks| rank < ranks) {
+        request.set_data_parallel_rank(rank as i32);
+    } else {
+        debug!(
+            request_id = request.request_id(),
+            worker = worker.redacted_url(),
+            rank,
+            size,
+            pinnable_ranks,
+            "Sticky key's grouped data-parallel rank is past the ranks its worker's connection \
+             places a pin on; the request keeps the connector's pick"
+        );
+    }
 }
 
 async fn execute_single(
@@ -4284,6 +4358,208 @@ pub(crate) mod tests {
             books(&worker),
             none,
             "a call that fails gives the booking back"
+        );
+    }
+
+    /// A grouped ZMQ worker: `size` engines behind one socket set, no rank.
+    fn grouped_worker(url: &str, size: usize) -> WorkerSelection {
+        WorkerSelection::Single {
+            worker: Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Zmq)
+                    .zmq_engine_group(size)
+                    .build(),
+            ),
+        }
+    }
+
+    fn pinned_rank(request: &ProtoGenerateRequest) -> Option<i32> {
+        let ProtoGenerateRequest::TokenSpeed(request) = request else {
+            panic!("expected a TokenSpeed request");
+        };
+        request.data_parallel_rank
+    }
+
+    /// One attempt of a single generate request (sticky `key`) to `workers`,
+    /// pinned as `execute_plan` pins it under `sticky`: the rank the request
+    /// carries. The worker's connection does not say which ranks it places a
+    /// pin on.
+    fn attempt(
+        sticky: GroupedDpSticky,
+        workers: &WorkerSelection,
+        key: Option<&str>,
+    ) -> Option<i32> {
+        attempt_on(sticky, workers, None, key)
+    }
+
+    /// [`attempt`] through a connection that places a pin on its first
+    /// `pinnable_ranks` ranks.
+    fn attempt_on(
+        sticky: GroupedDpSticky,
+        workers: &WorkerSelection,
+        pinnable_ranks: Option<usize>,
+        key: Option<&str>,
+    ) -> Option<i32> {
+        let mut plan = ExecutionPlan::Single(ProtoRequest::Generate(tokenspeed_request(1, None)));
+        pin_grouped_dp_rank(&mut plan, workers, || pinnable_ranks, key, sticky);
+        let ExecutionPlan::Single(ProtoRequest::Generate(request)) = &plan else {
+            panic!("the plan stays a single generate request");
+        };
+        pinned_rank(request)
+    }
+
+    /// Under `--grouped-dp-sticky off` (the default) a sticky request to a
+    /// grouped worker is left to the connector's pick.
+    #[test]
+    fn with_pinning_off_no_request_is_pinned() {
+        let workers = grouped_worker("ipc:///tmp/unpinned.ipc", 2);
+        assert_eq!(attempt(GroupedDpSticky::Off, &workers, Some("conv")), None);
+    }
+
+    /// Under hash placement a sticky key is pinned to `xxh3(key) % dp_size`,
+    /// the same rank for every request of the key.
+    #[test]
+    fn hash_placement_pins_every_key_to_its_hash_rank() {
+        fn hashed(key: &str, size: usize) -> i32 {
+            (xxhash_rust::xxh3::xxh3_64(key.as_bytes()) % size as u64) as i32
+        }
+
+        for size in [2, 3, 8] {
+            let workers = grouped_worker(&format!("ipc:///tmp/hash-{size}.ipc"), size);
+            for i in 0..100 {
+                let key = format!("conv-{i}");
+                for _ in 0..2 {
+                    let rank = attempt(GroupedDpSticky::Hash, &workers, Some(&key));
+                    assert_eq!(rank, Some(hashed(&key, size)), "{key} of {size}");
+                }
+            }
+        }
+    }
+
+    /// A key whose rank the worker's connection places no pin on (on vLLM, one
+    /// at or past the first index the group's engines lack) is left to the
+    /// connector's pick, which takes any engine, rather than pinned where the
+    /// connector may refuse it, and each such request is logged at debug; a
+    /// key whose rank the connection places keeps it.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_key_whose_rank_the_connection_cannot_place_is_left_to_the_connector() {
+        let workers = grouped_worker("ipc:///tmp/partial.ipc", 4);
+        let hash = |ranks: usize, key: &str| {
+            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
+        };
+        let mut left = 0;
+        for i in 0..32 {
+            let key = format!("conv-{i}");
+            let hashed = hash_rank(&key, 4) as i32;
+            let rank = hash(2, &key);
+            assert_eq!(rank, (hashed < 2).then_some(hashed), "{key}, 2 of 4 placed");
+            left += usize::from(rank.is_none());
+            assert_eq!(hash(4, &key), Some(hashed), "{key}, all 4 placed");
+            assert_eq!(hash(0, &key), None, "{key}, none placed");
+        }
+        assert!((1..32).contains(&left), "keys on either side: {left} left");
+        // One debug line per request left to the connector, naming the
+        // worker, its size and the ranks its connection places.
+        logs_assert(|lines: &[&str]| {
+            let logged: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("keeps the connector's pick"))
+                .collect();
+            let placing = |ranks: usize| {
+                let ranks = format!("pinnable_ranks={ranks}");
+                logged
+                    .iter()
+                    .filter(|line| {
+                        line.contains("ipc:///tmp/partial.ipc")
+                            && line.contains("size=4")
+                            && line.contains(&ranks)
+                    })
+                    .count()
+            };
+            if (logged.len(), placing(2), placing(0)) == (left + 32, left, 32) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{left} lines placing 2 and 32 placing none expected: {logged:?}"
+                ))
+            }
+        });
+    }
+
+    /// A worker given no count has no `dp_size`: its ranks are the ones its
+    /// connection places a pin on (on TokenSpeed, every engine of the group
+    /// its engines declared at the handshake), and a sticky key is pinned to
+    /// its hash rank among them. A connection with one engine has none to
+    /// choose.
+    #[test]
+    fn a_group_its_engines_declared_is_pinned_by_the_engines_connected() {
+        let workers = WorkerSelection::Single {
+            worker: Arc::new(
+                BasicWorkerBuilder::new("ipc:///tmp/declared.ipc")
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Zmq)
+                    .build(),
+            ),
+        };
+        let hash = |ranks: usize, key: &str| {
+            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
+        };
+        for i in 0..32 {
+            let key = format!("conv-{i}");
+            assert_eq!(hash(4, &key), Some(hash_rank(&key, 4) as i32), "{key}");
+        }
+        assert_eq!(hash(1, "conv"), None, "one engine");
+    }
+
+    /// Only a grouped worker is pinned: a rank-expanded worker carries its
+    /// own rank (set at dispatch), a worker without a group or with one
+    /// engine has none to choose, and a disaggregated pair's ranks are its
+    /// protocol's.
+    #[test]
+    fn only_a_grouped_worker_is_pinned() {
+        let single = |builder: BasicWorkerBuilder| WorkerSelection::Single {
+            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()),
+        };
+        for workers in [
+            single(BasicWorkerBuilder::new("ipc:///tmp/ranked.ipc").dp_config(1, 2)),
+            single(BasicWorkerBuilder::new("ipc:///tmp/ungrouped.ipc")),
+            single(BasicWorkerBuilder::new("ipc:///tmp/one.ipc").zmq_engine_group(1)),
+            tokenspeed_pair(),
+        ] {
+            assert_eq!(attempt(GroupedDpSticky::Hash, &workers, Some("conv")), None);
+        }
+    }
+
+    /// Only a single generate request with a sticky key is pinned: one
+    /// without a key and a batch's prompts are left to the connector's pick.
+    #[test]
+    fn only_a_single_generate_request_with_a_sticky_key_is_pinned() {
+        let workers = grouped_worker("ipc:///tmp/unkeyed.ipc", 2);
+        assert_eq!(
+            attempt(GroupedDpSticky::Hash, &workers, None),
+            None,
+            "no sticky key"
+        );
+
+        let mut batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            shared_request_id: "batch".to_string(),
+            requests: vec![tokenspeed_request(1, None), tokenspeed_request(1, None)],
+        };
+        pin_grouped_dp_rank(
+            &mut batch,
+            &workers,
+            || None,
+            Some("conv"),
+            GroupedDpSticky::Hash,
+        );
+        assert!(
+            batch
+                .generate_requests_mut()
+                .all(|request| pinned_rank(request).is_none()),
+            "a batch's prompts"
         );
     }
 }

@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -95,6 +96,10 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (header keys, rid-lineage fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// Whether, and how, a request's sticky key pins it to one engine of a
+    /// grouped data-parallel worker; see [`GroupedDpSticky`].
+    #[serde(default)]
+    pub grouped_dp_sticky: GroupedDpSticky,
     /// How strictly PD placement pairs a prefill with a decode on their KV
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
@@ -1345,6 +1350,46 @@ impl Default for RoutingKeyOverrideConfig {
     }
 }
 
+/// How a request with a sticky key is placed on the engines (data-parallel
+/// ranks) of a grouped worker: one worker URL whose socket set several
+/// engines dial (as many as `--zmq-engine-count` above one or `dp_size` on
+/// its spec says, or, given no count, as its engines declare at the
+/// handshake). Routing policies see the group as one worker, and its
+/// connection otherwise sends each request to its least-loaded engine,
+/// which scatters one conversation's turns over the engines' separate
+/// prefix caches. The key is the one sticky routing reads: the first valid
+/// routing-key header, or the body `rid` under the routing-key override.
+/// Only a single generate request is pinned: one without a key, a batch's
+/// prompts and an embedding keep the connection's pick under every mode, and
+/// so does a request whose rank is not among the ranks, counted from 0, that
+/// its connection places a pin on (on vLLM, the engine indices from 0 up to
+/// the first the group lacks).
+///
+/// The flag and the configuration file take one spelling: the flag's values
+/// are this enum's clap [`ValueEnum`] names, and serde writes the same ones.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupedDpSticky {
+    /// No pinning: every request goes to the connection's least-loaded
+    /// engine.
+    #[default]
+    Off,
+    /// Every request of a key to its hash engine, `xxh3(key) % dp_size`: the
+    /// same engine across requests, gateway restarts and replicas, however
+    /// unevenly the keys fall.
+    Hash,
+}
+
+impl GroupedDpSticky {
+    /// The spelling of the flag and the configuration file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Hash => "hash",
+        }
+    }
+}
+
 /// Under-layer index the cache_aware policy keeps per model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2210,6 +2255,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            grouped_dp_sticky: GroupedDpSticky::default(),
             pd_pairing_mode: PdPairingMode::default(),
             policy_engine: PolicyEngineMode::default(),
             host: "0.0.0.0".to_string(),
@@ -3051,6 +3097,33 @@ mod tests {
             RoutingKeyOverrideConfig::default().assignment_mode,
             ManualAssignmentMode::Delegate
         );
+    }
+
+    #[test]
+    fn grouped_dp_sticky_is_off_unless_configured_and_spelled_as_the_flag() {
+        // A configuration file that leaves the key out pins nothing.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        assert_eq!(json["grouped_dp_sticky"], "off");
+        json.as_object_mut().unwrap().remove("grouped_dp_sticky");
+        let read: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        // One spelling everywhere: the flag's values are the file's.
+        let flag_values: Vec<String> = GroupedDpSticky::value_variants()
+            .iter()
+            .filter_map(GroupedDpSticky::to_possible_value)
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        assert_eq!(flag_values, ["off", "hash"]);
+        for &sticky in GroupedDpSticky::value_variants() {
+            let json = serde_json::to_value(sticky).unwrap();
+            assert_eq!(json, sticky.as_str());
+            assert_eq!(
+                serde_json::from_value::<GroupedDpSticky>(json).unwrap(),
+                sticky
+            );
+        }
+        assert!(serde_json::from_value::<GroupedDpSticky>(serde_json::json!("sticky")).is_err());
     }
 
     #[test]

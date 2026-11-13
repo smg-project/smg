@@ -88,6 +88,33 @@ impl BackendClient {
         matches!(self, Self::Zmq(_))
     }
 
+    /// How many data-parallel ranks, counted from 0, a request pinned on a
+    /// direct-ZMQ connection reaches: a pin below the count is placed, one at
+    /// or past it may be refused. TokenSpeed places rank `r` on its `r`-th
+    /// rank's engine, so every engine it connected counts (TRT-LLM takes no
+    /// pin). vLLM and SGLang place a pin on the engine whose ZMQ index it
+    /// names, so the ranks run from 0 to the first index no engine has: none
+    /// for a vLLM group launched at a non-zero data-parallel start rank. A
+    /// worker given no count (no `dp_size`) has the group its engines
+    /// declared. `None` on a gRPC backend, whose servicer checks a pin
+    /// against its own engines.
+    pub fn pinnable_ranks(&self) -> Option<usize> {
+        let Self::Zmq(client) = self else {
+            return None;
+        };
+        Some(match client.dialect() {
+            ZmqDialect::Vllm | ZmqDialect::Sglang => (0..)
+                .take_while(|&rank| {
+                    client
+                        .engines()
+                        .iter()
+                        .any(|engine| engine.engine_id.engine_index() == Some(rank))
+                })
+                .count(),
+            ZmqDialect::TokenSpeed | ZmqDialect::Trtllm => client.engine_count(),
+        })
+    }
+
     /// The bootstrap rendezvous the engine behind a direct-ZMQ connection
     /// declared at its handshake (`host`, `port`): where a prefill or encode
     /// engine's bootstrap server listens. `None` on a gRPC backend, whose

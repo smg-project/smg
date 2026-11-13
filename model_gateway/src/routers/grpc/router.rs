@@ -17,7 +17,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -45,7 +45,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    config::types::RetryConfig,
+    config::{types::RetryConfig, GroupedDpSticky},
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
     routers::{
@@ -143,6 +143,17 @@ impl GrpcRouter {
         // The gRPC request timeout bounds each attempt's calls to its workers
         // and the streams they open; zero, the default, arms no deadline.
         let request_timeout = Duration::from_secs(ctx.router_config.grpc_request_timeout_secs);
+        // `--grouped-dp-sticky`: a sticky request to a grouped data-parallel
+        // worker is pinned to one of its engines at dispatch. Only the
+        // regular mode dispatches to a single worker, so only its router
+        // announces the setting.
+        let grouped_dp_sticky = ctx.router_config.grouped_dp_sticky;
+        if mode == Mode::Regular && grouped_dp_sticky != GroupedDpSticky::Off {
+            info!(
+                grouped_dp_sticky = grouped_dp_sticky.as_str(),
+                "Sticky keys are pinned to the engines of grouped data-parallel workers"
+            );
+        }
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -155,7 +166,8 @@ impl GrpcRouter {
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         )
-        .with_request_timeout(request_timeout);
+        .with_request_timeout(request_timeout)
+        .with_grouped_dp_sticky(grouped_dp_sticky);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -165,7 +177,8 @@ impl GrpcRouter {
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         )
-        .with_request_timeout(request_timeout);
+        .with_request_timeout(request_timeout)
+        .with_grouped_dp_sticky(grouped_dp_sticky);
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)

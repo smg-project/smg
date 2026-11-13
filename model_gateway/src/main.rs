@@ -26,7 +26,8 @@ pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
     config::{
-        AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        AccessLogField, GroupedDpSticky, PowerOfTwoLoadMetric, TurboJpegPolicy,
+        DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
     secrets::SecretFiles,
@@ -624,6 +625,21 @@ struct RoutingArgs {
     /// override is enabled
     #[arg(long, num_args = 0.., default_value = "x-smg-routing-key", value_parser = parse_routing_key_header, help_heading = "Routing Policy")]
     routing_key_headers: Vec<String>,
+
+    /// Whether, and how, a request that carries a routing key is pinned to
+    /// one engine of a grouped data-parallel worker (a ZMQ worker whose
+    /// socket set several engines dial, as many as --zmq-engine-count says
+    /// or its engines declare), so a conversation keeps one engine's prefix
+    /// cache. The key is the sticky-session key: the first valid
+    /// --routing-key-headers header, or the body rid under
+    /// --routing-key-override
+    #[arg(
+        long,
+        value_enum,
+        default_value = "off",
+        help_heading = "Routing Policy"
+    )]
+    grouped_dp_sticky: GroupedDpSticky,
 
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -3258,6 +3274,34 @@ mod tests {
             assert!(
                 Cli::try_parse_from(argv).is_err(),
                 "--routing-key-headers {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_dp_sticky_flag_flows_into_router_config() {
+        // Off by default: no request is pinned to an engine of a grouped worker.
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        for (flag, sticky) in [
+            ("off", GroupedDpSticky::Off),
+            ("hash", GroupedDpSticky::Hash),
+        ] {
+            let config = cli_args_from(&["--grouped-dp-sticky", flag])
+                .to_router_config(vec![], vec![])
+                .unwrap();
+            assert_eq!(
+                config.grouped_dp_sticky, sticky,
+                "--grouped-dp-sticky {flag}"
+            );
+        }
+
+        for bad in ["", "on", "1", "least_load", "HASH"] {
+            let argv = ["smg", "--grouped-dp-sticky", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--grouped-dp-sticky {bad:?} should be rejected"
             );
         }
     }
