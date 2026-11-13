@@ -39,7 +39,7 @@ interface types {
   /// The transport outcome of a dispatch, beside its status.
   enum transport-class { ok, client-error, server-error, connect-failed, timeout, cancelled }
   /// Why a lease was released before its completion.
-  enum release-reason { abandoned, late-decision, client-gone, commit-failed }
+  enum release-reason { abandoned, late-decision, client-gone, commit-failed, expired, worker-removed }
 
   /// A tenant or a session key under the plugin's exposure: `hash` unless the
   /// spec says `plain`, `none` when withheld.
