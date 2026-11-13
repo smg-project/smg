@@ -2131,6 +2131,9 @@ fn reads_space_beyond_start(node: &Node, classes: &[Class], at_start: bool) -> b
                         Node::NotAhead(_)
                             | Node::NotAheadSeq { .. }
                             | Node::End
+                            | Node::Start
+                            | Node::TextEnd
+                            | Node::SearchStart
                             | Node::GroupsAhead { .. }
                     );
                 reads
@@ -2139,9 +2142,13 @@ fn reads_space_beyond_start(node: &Node, classes: &[Class], at_start: bool) -> b
         Node::Alt { alternatives, .. } => alternatives
             .iter()
             .any(|node| reads_space_beyond_start(node, classes, at_start)),
-        Node::NotAhead(_) | Node::NotAheadSeq { .. } | Node::End | Node::GroupsAhead { .. } => {
-            false
-        }
+        Node::NotAhead(_)
+        | Node::NotAheadSeq { .. }
+        | Node::End
+        | Node::Start
+        | Node::TextEnd
+        | Node::SearchStart
+        | Node::GroupsAhead { .. } => false,
         Node::UnitRun { first, second, .. } => space(first) || space(second),
         Node::JoinedTail { .. } | Node::JoinedRun { .. } => false,
         Node::RunOfOne { class, .. } => space(class),
@@ -2162,7 +2169,13 @@ fn classes_of(node: &Node, out: &mut Vec<usize>) {
         } => {
             nodes.iter().for_each(|node| classes_of(node, out));
         }
-        Node::NotAhead(_) | Node::NotAheadSeq { .. } | Node::End | Node::GroupsAhead { .. } => {}
+        Node::NotAhead(_)
+        | Node::NotAheadSeq { .. }
+        | Node::End
+        | Node::Start
+        | Node::TextEnd
+        | Node::SearchStart
+        | Node::GroupsAhead { .. } => {}
         Node::UnitRun { first, second, .. } => out.extend([*first, *second]),
         Node::JoinedTail { join, letter, mark } | Node::JoinedRun { join, letter, mark } => {
             out.extend([*join, *letter, *mark]);
@@ -2184,6 +2197,9 @@ fn joined_tail_loose(node: &Node) -> bool {
         | Node::UnitRun { .. }
         | Node::JoinedRun { .. }
         | Node::End
+        | Node::Start
+        | Node::TextEnd
+        | Node::SearchStart
         | Node::GroupsAhead { .. }
         | Node::RunOfOne { .. } => false,
         Node::Repeat { node, .. } => joined_tail_loose(node),

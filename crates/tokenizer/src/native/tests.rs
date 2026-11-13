@@ -1801,60 +1801,101 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
 
 #[test]
 fn a_later_stage_runs_over_the_earlier_stage_pieces_of_the_cut_window() {
-    // Two isolated stages, `aa` first, then a space with 999 of the
-    // space-or-a class. The walk runs the second stage inside the first
-    // stage's pieces, so its match after `aa` begins where `aa` ends and
-    // spans the candidate; a cut check that ran the second stage over the
-    // whole window saw a match end on the candidate and the next begin
-    // there, and approved a cut inside the piece.
+    // Stacked stages around a cut candidate, each case a chain of splits
+    // (the byte level after them) and a text: two isolated stages whose
+    // later one begins its match where the earlier one's piece ends (the
+    // cut check ran it from the window's start instead); two whose later
+    // one splits the earlier one's match on the candidate, where the next
+    // unit's first stage begins inside that match (the check read the text
+    // before the candidate on its own and nothing from it on); and a
+    // dropped match the next unit begins inside the same way.
     let mut state = 0x5354_4147_4544_0001u64;
-    let shape = Shape {
-        name: "stacked-stages",
-        normalizer: Normalizer::None,
-        pre_tokenizers: vec![
-            split("aa", SplitDelimiterBehavior::Isolated, false),
-            split(r" [ a]{999}", SplitDelimiterBehavior::Isolated, false),
-            byte_level(false),
-        ],
-        ignore_merges: false,
-        special: &[],
-        added: &[],
-    };
-    let tokenizer = tokenizer_of(&shape, &mut state);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
-    let text = format!(
-        "{}{}  aa{}z {}",
-        "z".repeat(31_768),
-        " a".repeat(115),
-        " a".repeat(883),
-        "z".repeat(40_000)
-    );
-    let whole: Vec<String> = {
-        let mut out = Vec::new();
-        native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
-        out
-    };
-    let mut chunked = Vec::new();
-    for unit in native.units(&text, true, true).as_slice() {
-        let Segment::Text(chunk) = unit else {
-            panic!("no added tokens in this text");
+    let cases: [(Vec<PreTokenizerWrapper>, String); 4] = [
+        (
+            vec![
+                split("aa", SplitDelimiterBehavior::Isolated, false),
+                split(r" [ a]{999}", SplitDelimiterBehavior::Isolated, false),
+            ],
+            format!(
+                "{}{}  aa{}z {}",
+                "z".repeat(31_768),
+                " a".repeat(115),
+                " a".repeat(883),
+                "z".repeat(40_000)
+            ),
+        ),
+        (
+            vec![
+                split(r"[ a]{999}", SplitDelimiterBehavior::Isolated, false),
+                split(" a", SplitDelimiterBehavior::Isolated, false),
+            ],
+            format!(
+                "{}{}z {}",
+                "z".repeat(31_968),
+                " a".repeat(1_000),
+                "z".repeat(40_000)
+            ),
+        ),
+        (
+            vec![
+                split(
+                    r"[a-z]+ [a-z]+|[0-9]+",
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                ),
+                split(r" ?[a-z]+", SplitDelimiterBehavior::Isolated, false),
+            ],
+            "12ab cd ef. ".repeat(8_000),
+        ),
+        (
+            vec![split(
+                r"[a-z]+ ?[a-z]*",
+                SplitDelimiterBehavior::Removed,
+                false,
+            )],
+            "12ab cd. ".repeat(10_000),
+        ),
+    ];
+    for (index, (splits, text)) in cases.into_iter().enumerate() {
+        let mut pre_tokenizers = splits;
+        pre_tokenizers.push(byte_level(false));
+        let shape = Shape {
+            name: "stacked-stages",
+            normalizer: Normalizer::None,
+            pre_tokenizers,
+            ignore_merges: false,
+            special: &[],
+            added: &[],
         };
-        native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let whole: Vec<String> = {
+            let mut out = Vec::new();
+            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            out
+        };
+        let mut chunked = Vec::new();
+        for unit in native.units(&text, true, true).as_slice() {
+            let Segment::Text(chunk) = unit else {
+                panic!("no added tokens in this text");
+            };
+            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+        }
+        assert_eq!(chunked, whole, "case {index}: a cut split a piece");
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), &text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), &text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "case {index}: the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "case {index}: against the reference");
     }
-    assert_eq!(chunked, whole, "a cut split a piece of the second stage");
-    let pooled = native
-        .encode_with(Some(tokenizer.get_model()), &text, true, false)
-        .expect("pooled");
-    let serial = native
-        .encode_with(Some(tokenizer.get_model()), &text, false, false)
-        .expect("serial");
-    assert_eq!(pooled, serial, "the pool changed the ids");
-    let reference = tokenizer
-        .encode(text.as_str(), false)
-        .expect("encode")
-        .get_ids()
-        .to_vec();
-    assert_eq!(pooled, reference, "against the reference");
 }
 
 /// When no stage reads a space after a non-whitespace character inside one

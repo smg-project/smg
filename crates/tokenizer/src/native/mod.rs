@@ -2502,11 +2502,16 @@ impl NativeEncoder {
     /// class, over a run of ` a` with `aa` inside it: the second stage's match
     /// begins where `aa` ends, while a run from the window's start would end
     /// one match on the candidate and begin the next there). A piece that
-    /// holds `p` inside it would be split, so that is no cut; and the text
-    /// before `p` on its own, as the pool's unit reads it, must cut into the
+    /// holds `p` inside it would be split, so that is no cut. The text before
+    /// `p` on its own, as the unit before the cut reads it, must cut into the
     /// same pieces as it does inside the window (a lookahead at `p` reads the
     /// unit's end where the text reads on: ` a{1000}(?!\s)` holds at the one
-    /// and fails at the other), else that is no cut either.
+    /// and fails at the other); and the text from `p` on its own, as the unit
+    /// after the cut reads it, must cut into the same pieces too (an earlier
+    /// stage's match that a later stage splits at `p`, or that a dropped
+    /// stage drops, leaves no final piece over `p`, while the next unit's
+    /// first stage begins inside that match and may match otherwise:
+    /// `[ a]{999}` then ` a` over a run of ` a`); else that is no cut.
     fn piece_starts_at(&self, text: &str, p: usize) -> bool {
         let Some(start) = self.window_start(text, p) else {
             return false;
@@ -2523,8 +2528,18 @@ impl NativeEncoder {
         }
         let mut left = Vec::new();
         self.piece_spans(&window[..at], &mut left);
-        left.iter()
+        if !left
+            .iter()
             .eq(whole.iter().take_while(|&&(_, to)| to <= at))
+        {
+            return false;
+        }
+        let mut right = Vec::new();
+        self.piece_spans(&window[at..], &mut right);
+        right
+            .iter()
+            .map(|&(from, to)| (from + at, to + at))
+            .eq(whole.iter().skip_while(|&&(_, to)| to <= at).copied())
     }
 
     /// The final pieces of `text` under the stages, as the walk cuts them
