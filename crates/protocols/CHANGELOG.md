@@ -70,6 +70,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `ResponsesResponse` whose `metadata` is `null`, or whose `incomplete_details.reason` is
+  `max_messages` or `steered`, as the public API writes them, parses; it refused all three.
+  `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
+  `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
+  `MaxMessages` and `Steered`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

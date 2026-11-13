@@ -19,7 +19,9 @@ use super::{
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
-    builders::ResponsesResponseBuilder, common::invalid, profile::is_openai_vendor_model,
+    builders::ResponsesResponseBuilder,
+    common::{deserialize_null_as_empty_map, invalid},
+    profile::is_openai_vendor_model,
     validated::Normalizable,
 };
 
@@ -2841,25 +2843,34 @@ pub enum ResponseStatus {
     Cancelled,
 }
 
-/// Why a response stopped before producing complete output.
+/// Why a response stopped before producing complete output: the public API's
+/// `incomplete_details.reason`.
 ///
-/// Mirrors OpenAI's `incomplete_details.reason`: reserved strictly for the two
-/// truncation semantics. Any other stop condition (wall-clock timeout,
-/// `max_tool_calls` exhaustion, provider errors) is surfaced as a `failed`
-/// status with an `error` payload instead.
+/// The gateway's own Responses report `max_output_tokens` alone: any other stop
+/// condition of its own (wall-clock timeout, `max_tool_calls` exhaustion,
+/// provider errors) is surfaced as a `failed` status with an `error` payload
+/// instead. The other reasons are an upstream's, which a typed reader of its
+/// Response parses.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum IncompleteReason {
     /// Output was truncated because it hit `max_output_tokens`.
     MaxOutputTokens,
+    /// An upstream's `max_messages`, which the public API lists without
+    /// describing it.
+    MaxMessages,
     /// Output was truncated by the content filter.
     ContentFilter,
+    /// The response stopped at a safe output boundary after a WebSocket
+    /// `response.steer` event; the server may then create a successor response
+    /// with the queued input.
+    Steered,
 }
 
 /// Structured detail attached to a response whose status is `incomplete`.
 ///
-/// Wire shape: `{ "reason": "max_output_tokens" | "content_filter" }`.
+/// Wire shape: `{ "reason": "max_output_tokens" | "max_messages" | "content_filter" | "steered" }`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IncompleteDetails {
     /// The reason the response is incomplete.
@@ -4361,8 +4372,9 @@ pub struct ResponsesResponse {
     #[serialize_always]
     pub presence_penalty: Option<f32>,
 
-    /// Additional metadata
-    #[serde(default)]
+    /// Additional metadata. An upstream may write `null`, as the public API's
+    /// `Metadata` allows, which reads as the empty map.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_map")]
     pub metadata: HashMap<String, Value>,
 }
 

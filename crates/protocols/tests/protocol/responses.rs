@@ -4658,6 +4658,52 @@ fn metadata_limits_are_enforced() {
     );
 }
 
+/// A Response reads as the public API writes one: its `metadata` may be
+/// `null`, which reads as the empty map, and `incomplete_details.reason` may be
+/// any of the four reasons the public API lists.
+#[test]
+fn a_response_with_null_metadata_or_any_listed_incomplete_reason_parses() {
+    let mut response = json!({
+        "id": "resp_incomplete",
+        "object": "response",
+        "created_at": 1,
+        "status": "incomplete",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.6",
+        "output": [],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": true,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null,
+        "user": null,
+        "metadata": null
+    });
+    for reason in [
+        "max_output_tokens",
+        "max_messages",
+        "content_filter",
+        "steered",
+    ] {
+        response["incomplete_details"] = json!({"reason": reason});
+        let parsed: ResponsesResponse = serde_json::from_value(response.clone())
+            .unwrap_or_else(|e| panic!("a Response incomplete for {reason}: {e}"));
+        assert!(parsed.metadata.is_empty());
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["incomplete_details"], json!({"reason": reason}));
+        assert_eq!(written["metadata"], json!({}));
+    }
+}
+
 #[test]
 fn function_tool_parameters_must_be_an_object() {
     let request = plain_request(json!({
