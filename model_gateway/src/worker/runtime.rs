@@ -364,13 +364,21 @@ struct PrefillBook {
     /// Gateway clock at which the timed tokens left zero; `None` while
     /// none is pending.
     busy_since_ms: Option<u64>,
-    /// Busy time banked into the open window from closed intervals.
+    /// Busy time banked into the open window from closed intervals. An
+    /// interval closed by a release without an answer banks only the part
+    /// up to the latest timed answer in it (the tokens the window holds; an
+    /// untimed answer puts none in it), none of the wait after it.
     window_busy_ms: u64,
     /// First tokens' prompt tokens in the open window.
     window_tokens: u64,
     /// Gateway clock of the latest first response (or one answer) to a
     /// prompt dispatched here; zero until one.
     last_answer_ms: u64,
+    /// Gateway clock of the latest answer to a timed prompt dispatched here
+    /// (one whose tokens the rate window takes); zero until one. The credit
+    /// an unanswered release banks stops here, not at an untimed answer:
+    /// the window holds no tokens for that answer's time.
+    last_timed_answer_ms: u64,
     /// Gateway clock of the latest handoff of a prompt dispatched here that
     /// a decode side showed (see [`Worker::prefill_handed_off_ago`]); zero
     /// until one. No answer: it releases no prompt, times nothing, answers
@@ -439,11 +447,29 @@ impl PrefillBook {
             return;
         }
         self.timed = self.timed.saturating_sub(tokens);
-        if tokens > 0 {
-            if let Some(cached) = cached {
-                // What the engine computed: the prompt less its cache hit.
-                self.observe(tokens.saturating_sub(cached), now_ms);
+        let Some(cached) = cached else {
+            // A release without an answer: the engine showed nothing for it.
+            // Prompts still in flight keep the interval open (their prefill
+            // runs on in it); with none left it closes, banking only the part
+            // up to the latest timed answer in it, whose tokens the window
+            // holds, and none of the wait after that answer. An untimed
+            // answer in the interval is not that mark: its one answer put no
+            // tokens in the window, so the time up to it would read as
+            // prefill time with nothing computed in it.
+            if self.timed == 0 {
+                if let Some(since) = self.busy_since_ms.take() {
+                    let answered = self.last_timed_answer_ms.min(now_ms);
+                    self.window_busy_ms = self
+                        .window_busy_ms
+                        .saturating_add(answered.saturating_sub(since));
+                }
             }
+            return;
+        };
+        self.last_timed_answer_ms = self.last_timed_answer_ms.max(now_ms);
+        if tokens > 0 {
+            // What the engine computed: the prompt less its cache hit.
+            self.observe(tokens.saturating_sub(cached), now_ms);
         }
         if self.timed == 0 {
             if let Some(since) = self.busy_since_ms.take() {
@@ -1586,6 +1612,102 @@ mod tests {
             runtime.prefill_unanswered_total_at(21_000),
             Duration::from_secs(1),
             "the run after the answer, from its start"
+        );
+    }
+
+    #[test]
+    fn a_prompt_released_without_an_answer_leaves_no_busy_time_in_the_rate_window() {
+        // A timed prompt given up on after the whole cold-shape grace showed
+        // the engine computing nothing the gateway could read; the first
+        // answer after it is read over its own time, not over that wait.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(95, true, 1_000);
+        runtime.note_prefill_ended_at(95, true, None, 121_000);
+        assert_eq!(runtime.prefill_rate_tps(), 0, "nothing answered yet");
+        runtime.note_prefill_started_at(95, true, 121_000);
+        runtime.note_prefill_ended_at(95, true, Some(0), 122_000);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            95,
+            "95 tokens over the second they took"
+        );
+        assert_eq!(runtime.prefill_eta(95), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_untimed_answer_does_not_bank_a_cancelled_timed_prompts_wait() {
+        // A streaming prompt and a non-streaming one start together; the
+        // non-streaming one answers at 120 s (its one answer puts no tokens
+        // in the rate window), the streaming one is given up on at 121 s.
+        // The interval closes banking nothing: the next answer is read over
+        // its own second, not over the 119 s a credit up to the untimed
+        // answer would have banked (1 token/s, every bound after it long).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(95, true, 1_000);
+        runtime.note_prefill_started_at(95, false, 1_000);
+        runtime.note_prefill_ended_at(95, false, Some(0), 120_000);
+        runtime.note_prefill_ended_at(95, true, None, 121_000);
+        assert_eq!(runtime.prefill_rate_tps(), 0, "no timed answer yet");
+        runtime.note_prefill_started_at(95, true, 121_000);
+        runtime.note_prefill_ended_at(95, true, Some(0), 122_000);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            95,
+            "95 tokens over the second they took, not over the untimed answer's wait"
+        );
+    }
+
+    #[test]
+    fn a_release_without_an_answer_keeps_the_interval_open_for_the_prompts_still_in_flight() {
+        // A client drops a short prompt while a long one is still prefilling:
+        // the long prompt's answer is still read over the whole time it
+        // took, so a healthy engine at 10k tokens/s reads 10k tokens/s and
+        // its next long prompt keeps a bound it can meet (a release that
+        // cut the interval short would read it ten times too fast and veto
+        // the worker at the threshold).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(100_000, true, 0);
+        runtime.note_prefill_started_at(100, true, 9_900);
+        runtime.note_prefill_ended_at(100, true, None, 9_950);
+        runtime.note_prefill_ended_at(100_000, true, Some(0), 10_000);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "100k tokens over the ten seconds they took"
+        );
+        let mut at = 10_000;
+        for _ in 0..10 {
+            runtime.note_prefill_started_at(1_000, true, at);
+            at += 100;
+            runtime.note_prefill_ended_at(1_000, true, Some(0), at);
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "ten short answers at the same speed"
+        );
+        assert_eq!(runtime.prefill_eta(100_000), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn an_answer_then_a_cancel_keeps_the_answers_time_in_the_window() {
+        // A long prompt answers inside the window's first second (its tokens
+        // stay in the window, no sample yet) and a short prompt dispatched
+        // beside it is cancelled before its first token: the time up to the
+        // answer stays banked, only the tail after it is dropped, and the
+        // next answer's sample reads the engine's real rate (dropping the
+        // whole interval would keep the tokens and lose their time).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(9_000, true, 0);
+        runtime.note_prefill_started_at(100, true, 500);
+        runtime.note_prefill_ended_at(9_000, true, Some(0), 900);
+        runtime.note_prefill_ended_at(100, true, None, 950);
+        runtime.note_prefill_started_at(1_000, true, 950);
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 1_050);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "10k tokens over the 900 ms up to the first answer plus the 100 ms of the next"
         );
     }
 

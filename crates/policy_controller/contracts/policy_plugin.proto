@@ -235,6 +235,9 @@ message Candidate {
   // registration key's fingerprint, equal across one worker's handles and
   // across gateway replicas (where `id` is per handle); 0 when none.
   uint32 key = 26;  // u32
+  // Blocks the index holds for the worker: what a warm-up stage reads
+  // thinness from, against the fleet's level.
+  uint32 indexed_blocks = 27;
 }
 
 // One request as a decision sees it; the tenant and the session key travel
@@ -271,6 +274,10 @@ message RequestFacts {
   // controller hashes it into `block_hashes` before any stage sees the view;
   // bounded by `view.max_prompt_text_bytes`, refused over it.
   bytes prompt_text = 18;
+  // The size in tokens of one of the request's blocks as the host counted
+  // them: an index's learned block size on an event-fed request, the
+  // configured one on a tree-fed request; 0 reads the view's.
+  uint32 block_size = 19;
 }
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:
