@@ -286,4 +286,22 @@ mod tests {
             "{body}"
         );
     }
+
+    /// The structured-member array is refused by the stage's own arm, not by
+    /// the deserializer behind it: the code alone cannot tell the two apart,
+    /// the message names what this route does not serve.
+    #[tokio::test]
+    async fn an_array_of_structured_members_is_refused_as_not_served_here() {
+        let refused = embedding_inputs(&json!([{"text": "a"}])).expect_err("refused");
+        let body = axum::body::to_bytes(refused.into_body(), 4096)
+            .await
+            .expect("the body");
+        let body: Value = serde_json::from_slice(&body).expect("the error envelope");
+        assert_eq!(body["error"]["code"], INVALID_INPUT_CODE, "{body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("input as an array of objects (structured members) is not served"),
+            "{body}"
+        );
+    }
 }
