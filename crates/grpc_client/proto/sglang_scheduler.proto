@@ -153,7 +153,7 @@ message GenerateRequest {
   // Input embeddings (alternative to text/tokens)
   repeated float input_embeds = 14;
 
-  // LoRA adapter ID (if pre-loaded)
+  // Preloaded LoRA adapter ID or name (resolved to an ID by the worker).
   string lora_id = 15;
 
   // Data parallel routing: the rank the request is pinned to, when it is

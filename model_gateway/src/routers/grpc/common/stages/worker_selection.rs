@@ -12,6 +12,7 @@ use axum::{
     response::Response,
 };
 use futures::{future::Either, FutureExt};
+use openai_protocol::common::CachePartition;
 use smg_policy_controller::{fingerprint, Side, Target};
 use tracing::{debug, error, warn};
 
@@ -406,14 +407,16 @@ impl<'a> SelectionInputs<'a> {
             || stage
                 .policy_registry
                 .any_policy_needs_request_text_with_tokens(headers);
-        // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
-        // request's cache-partition fields yet, so the engine's prefix cache
-        // is unpartitioned on this path and the router must not split
-        // affinity for it: a namespace here would cost cache hits for every
-        // request that sets a salt today. The snapshot carries the field so
-        // the forwarding change can derive it (as the HTTP proxy path does via
-        // `GenerationRequest::cache_partition`) without touching selection.
-        let cache_namespace: Option<CacheNamespace> = None;
+        // Only LoRA selection is forwarded; salts and extra_key still are
+        // not, so they must not split affinity on the tokenized wire. Names
+        // match the engine's KV-event namespace. Internal IDs stay isolated
+        // too, but cannot match name-keyed events without a name mapping.
+        let lora_adapter = input.request_type.lora_adapter();
+        let cache_namespace = CacheNamespace::derive(&CachePartition {
+            cache_salt: None,
+            extra_key: None,
+            lora_path: lora_adapter,
+        });
         let media = MediaDemands {
             media_refs,
             vision: needs_vision,
@@ -425,15 +428,17 @@ impl<'a> SelectionInputs<'a> {
         };
 
         let model_id = input.model_id.as_str();
-        // Decisions needs selected-token scoring, currently supported only by
-        // SGLang gRPC. Retries retain the selected wire via DispatchContext.
-        let wire =
-            matches!(input.request_type, RequestType::Decisions(_)).then_some(WireConstraint {
-                runtime: RuntimeType::Sglang,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            });
+        // Selected-token scoring and LoRA selection are currently supported
+        // only by SGLang gRPC. Pin initial selection as well as retries so a
+        // mixed-runtime pool cannot silently run a LoRA request on the base model.
+        let wire = (matches!(input.request_type, RequestType::Decisions(_))
+            || lora_adapter.is_some())
+        .then_some(WireConstraint {
+            runtime: RuntimeType::Sglang,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+            pipeline: PipelinePin::Any,
+        });
         Self {
             intermediate,
             media_refs,
@@ -625,7 +630,7 @@ impl WorkerSelectionStage {
                             model_id,
                             placement,
                             sticky_key,
-                            None,
+                            wire,
                             media,
                             inputs.demand,
                         ),
@@ -674,6 +679,7 @@ impl WorkerSelectionStage {
                             sticky_key,
                             &encode_item_hashes,
                             EpdDemands {
+                                wire,
                                 encode: media,
                                 decode_vision: inputs.demand.decode,
                                 image_fanout: ctx.state.image_anchor.is_some(),
@@ -2087,7 +2093,8 @@ impl WorkerSelectionStage {
         // may take references (it processes the media itself); a rendezvous
         // encoder takes router-processed items only.
         let capable_for = |worker: &Arc<dyn Worker>, media: MediaDemands| {
-            media.accepts(worker.as_ref())
+            WireConstraint::admits(demand.wire, worker.as_ref())
+                && media.accepts(worker.as_ref())
                 && match PdProtocol::encode_handoff(worker.metadata().spec.runtime_type) {
                     Some(EncodeHandoff::Push) => ec_role(worker.as_ref(), "ec_producer"),
                     Some(EncodeHandoff::Rendezvous) => !media.media_refs,
@@ -2146,11 +2153,11 @@ impl WorkerSelectionStage {
                 || vision_capable(worker)
         };
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-        let ec_pair_exists = pair_admitted_by(&pairs, None, &registered_ec);
-        if !ec_pair_exists && pair_admitted_by(&pairs, None, &|_| true) {
+        let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
+        if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
             return Err(EpdSelectionFailure::EcIncompatible);
         }
-        let vision_pair_exists = pair_admitted_by(&pairs, None, &|worker| {
+        let vision_pair_exists = pair_admitted_by(&pairs, demand.wire, &|worker| {
             registered_ec(worker) && decode_vision(worker)
         });
         if demand.decode_vision && ec_pair_exists && !vision_pair_exists {
@@ -2170,7 +2177,7 @@ impl WorkerSelectionStage {
             &self.policy_registry,
             model_id,
             &pairs,
-            None,
+            demand.wire,
             true,
             prefill_capacity,
             PlacementInputs {
@@ -2238,6 +2245,7 @@ impl WorkerSelectionStage {
 /// E consumes the media; D may still need grids for positional embeddings.
 #[derive(Clone, Copy)]
 struct EpdDemands {
+    wire: Option<WireConstraint>,
     encode: MediaDemands,
     decode_vision: bool,
     image_fanout: bool,
@@ -2423,6 +2431,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod lora;
+
     use std::{
         collections::HashMap,
         sync::atomic::{AtomicUsize, Ordering},
@@ -4317,6 +4327,7 @@ mod tests {
                     PlacementInputs::default(),
                     &[vec![1], vec![2]],
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: false,
                             vision: true,
@@ -4444,6 +4455,7 @@ mod tests {
                         },
                         &[vec![1], vec![2]],
                         EpdDemands {
+                            wire: None,
                             encode: MediaDemands {
                                 media_refs,
                                 vision: true,
@@ -4492,6 +4504,7 @@ mod tests {
                     },
                     &[vec![1]],
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs,
                             vision: true,
@@ -4697,6 +4710,7 @@ mod tests {
                     PlacementInputs::default(),
                     &[vec![1]],
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: false,
                             vision: needs_vision,
@@ -4736,6 +4750,7 @@ mod tests {
                             PlacementInputs::default(),
                             &[vec![1]],
                             EpdDemands {
+                                wire: None,
                                 encode: MediaDemands {
                                     media_refs: false,
                                     vision: true,
@@ -4751,6 +4766,7 @@ mod tests {
                 }
                 if runtime == RuntimeType::Vllm && allowed && !d_vision {
                     let refs = EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: true,
                             vision: needs_vision,
@@ -4844,6 +4860,7 @@ mod tests {
                     PlacementInputs::default(),
                     hashes,
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: false,
                             vision: true,

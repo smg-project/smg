@@ -1192,6 +1192,47 @@ first release with them), under `xgrammar` or an unresolved backend; a router
 spells such a worker's structural tags without `optional`, `plus` and `star` (a
 `token` node stays as derived).
 
+#### Preloaded LoRA adapters
+
+Both SGLang gRPC servicers support inference with adapters loaded at startup:
+
+```bash
+sglang serve --model-path BASE_MODEL --grpc-mode \
+    --enable-lora --lora-paths adapter=/weights/adapter
+```
+
+For `/v1/chat/completions` and `/v1/completions`, select the adapter with
+`"model":"BASE_MODEL:adapter"`, as on SGLang's OpenAI-compatible API.
+SMG routes and tokenizes using the registered base model (aliases are
+accepted), then forwards the adapter to the SGLang gRPC worker. Responses
+report the canonical base model with the adapter suffix. Exact registered
+model names or aliases containing `:` take precedence over this syntax.
+The extension `"lora_path":"adapter"` with a separate base `model` is also
+accepted; if both selectors are supplied, they must agree.
+
+For native `/generate`, send `"lora_path":"adapter"` or `lora_id`. If both
+are supplied, they must match. For example, with `SMG_URL` set to the gateway's URL:
+
+```bash
+curl "$SMG_URL/generate" -H 'Content-Type: application/json' \
+    -d '{"text":"Hello","lora_path":"adapter","sampling_params":{"max_new_tokens":16}}'
+```
+
+The worker resolves adapter names to SGLang's preloaded internal IDs; direct
+gRPC callers can supply either in `GenerateRequest.lora_id` and inspect them
+with `ListLoadedLoRAAdapters`. Unknown adapters and requests to a worker
+without LoRA enabled fail with `INVALID_ARGUMENT`. Omitting the selector
+uses the base model. Streaming and multiple choices use the same adapter.
+Preload the selected adapter on every eligible worker, including both sides
+of a prefill/decode pair. Runtime `LoadLoRAAdapter` and `UnloadLoRAAdapter`
+remain unimplemented; changing adapters requires restarting the worker.
+LoRA requests stay on SGLang gRPC workers in a mixed-runtime pool. Adapter
+names also partition cache affinity to match SGLang's KV events. Internal
+IDs use their own isolated routing partition but do not match name-keyed
+KV events; use adapter names for cache-aware placement.
+Media-bearing gateway EPD requests remain unsupported for SGLang and are
+refused rather than falling back to another runtime's base model.
+
 #### KV-event recovery
 
 To retain cache knowledge across a recoverable event gap, configure SGLang's

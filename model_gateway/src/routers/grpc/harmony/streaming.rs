@@ -441,18 +441,17 @@ impl HarmonyStreamingProcessor {
         };
 
         // Build and emit chunk
-        let chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .add_choice(ChatStreamChoice {
-                    index,
-                    delta: chat_delta,
-                    logprobs,
-                    finish_reason: None,
-                    matched_stop: None,
-                })
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
+        let chunk = ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .add_choice(ChatStreamChoice {
+                index,
+                delta: chat_delta,
+                logprobs,
+                finish_reason: None,
+                matched_stop: None,
+            })
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
 
         let sse_data = encoder
             .encode_data(&ChatChunkWithUsage::new(
@@ -478,7 +477,7 @@ impl HarmonyStreamingProcessor {
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let role_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
                 .created(dispatch.created)
                 .add_choice_role(index, "assistant")
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
@@ -508,12 +507,11 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
+        let chunk = ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
 
         let sse_data = encoder
             .encode_data(&ChatChunkWithUsage::new(
@@ -536,12 +534,11 @@ impl HarmonyStreamingProcessor {
         counts: TokenCounts,
         parsed_reasoning_tokens: u32,
         dispatch: &context::DispatchMetadata,
-        original_request: &ChatCompletionRequest,
         tx: &SseSender,
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let usage_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
                 .created(dispatch.created)
                 .usage(chat_usage(counts, parsed_reasoning_tokens))
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
@@ -1875,7 +1872,6 @@ impl ChatDecode {
                 counts,
                 self.parsed_reasoning_tokens,
                 dispatch,
-                original_request,
                 tx,
                 &mut self.encoder,
             )
