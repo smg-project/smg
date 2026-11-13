@@ -18,6 +18,7 @@ pub mod channel;
 pub mod codec;
 pub mod constraint_failure;
 pub mod engine_load;
+mod framed;
 pub mod media_fault;
 pub mod media_identity;
 pub mod mlx_engine;
@@ -354,11 +355,18 @@ macro_rules! impl_engine_client_basics {
                 $display_name,
                 channel.peer()
             );
-            let client = <$proto_client>::new(channel);
+            let client = <$proto_client>::new(channel.clone());
             Ok(Self {
                 client,
                 trace_injector,
+                channel,
             })
+        }
+
+        /// The client's own channel, the one its generated stub rides; a
+        /// request sent as body frames drives it directly.
+        pub fn channel(&self) -> &$crate::channel::Channel {
+            &self.channel
         }
 
         /// Set or replace the trace injector.
@@ -380,6 +388,10 @@ macro_rules! impl_engine_client_basics {
         ///
         /// The trace context is injected when the future is first polled, from
         /// the span active then, so an instrumented future's span is the parent.
+        /// The clients whose wire has a `generate_framed` (the request's large
+        /// tensors as body frames; the gateway's call on those wires) keep the
+        /// same shape there: the request becomes its frames before the future
+        /// exists.
         pub fn generate(
             &self,
             req: $proto::GenerateRequest,
