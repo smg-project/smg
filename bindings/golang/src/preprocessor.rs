@@ -67,7 +67,7 @@ fn preprocess_impl(
 
     // Generate tool constraints if tools are present
     let tool_constraint = match tool_constraint_for(chat_request) {
-        Ok(constraint) => constraint.map(|c| c.to_tuple()),
+        Ok(constraint) => constraint,
         Err(e) => {
             return Err((
                 SglErrorCode::ParsingError,
@@ -84,14 +84,18 @@ fn preprocess_impl(
     let skip_special_tokens = chat_request.skip_special_tokens
         && !tools_keep_special_tokens(chat_request, tool_constraint.as_ref());
 
+    // One object keyed by the constraint's kind (`{"json_schema": "…"}`):
+    // the shape the Go client reads the constraint in, and the name the
+    // engine request's constraint takes.
     let tool_constraints = match tool_constraint {
-        Some(constraint) => {
-            let json_str = serde_json::to_string(&constraint).map_err(|e| {
-                (
-                    SglErrorCode::ParsingError,
-                    format!("Failed to serialize tool constraints: {e}"),
-                )
-            })?;
+        Some((kind, value)) => {
+            let json_str =
+                serde_json::to_string(&serde_json::json!({ kind: value })).map_err(|e| {
+                    (
+                        SglErrorCode::ParsingError,
+                        format!("Failed to serialize tool constraints: {e}"),
+                    )
+                })?;
             Some(CString::new(json_str).map_err(|e| {
                 (
                     SglErrorCode::MemoryError,
@@ -512,6 +516,44 @@ mod tests {
             assert!(result.skip_special_tokens, "tools {tools}");
             assert!(result.tools_json.is_none());
         }
+    }
+
+    /// The constraint of a forced call is written as one object keyed by its
+    /// kind, the shape the Go client reads it in: a named function's is that
+    /// function's parameters schema; a choice that forces no call writes none.
+    #[test]
+    fn a_forced_call_constraint_is_one_object_keyed_by_its_kind() {
+        let named = preprocess(request_json(
+            weather_tool(),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            Value::Null,
+        ));
+        let written = named
+            .tool_constraints
+            .expect("a named function is constrained");
+        let constraint: Value = serde_json::from_str(written.to_str().unwrap()).unwrap();
+        let object = constraint
+            .as_object()
+            .unwrap_or_else(|| panic!("one object keyed by the kind, not {constraint}"));
+        assert_eq!(object.len(), 1, "{constraint}");
+        let schema: Value = serde_json::from_str(
+            object
+                .get("json_schema")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("a json_schema string, not {constraint}")),
+        )
+        .unwrap();
+        assert_eq!(schema, weather_tool()[0]["function"]["parameters"]);
+
+        let required = preprocess(request_json(weather_tool(), json!("required"), Value::Null));
+        let written = required
+            .tool_constraints
+            .expect("a required call is constrained");
+        let constraint: Value = serde_json::from_str(written.to_str().unwrap()).unwrap();
+        assert!(constraint["json_schema"].is_string(), "{constraint}");
+
+        let auto = preprocess(request_json(weather_tool(), json!("auto"), Value::Null));
+        assert!(auto.tool_constraints.is_none());
     }
 
     /// A request that asks for its special tokens keeps them whatever its

@@ -290,7 +290,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
             },
         ));
     }
-    let usage = serde_json::to_value(tracker.snapshot(0)).unwrap();
+    let usage = serde_json::to_value(tracker.snapshot(0, None)).unwrap();
     assert_eq!(usage["prompt_tokens"], 10);
     assert_eq!(usage["completion_tokens"], 9);
     assert_eq!(usage["total_tokens"], 19);
@@ -307,7 +307,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 3,
         ..Default::default()
     }));
-    let usage = tracker.snapshot(0);
+    let usage = tracker.snapshot(0, None);
     assert_eq!(usage.completion_tokens, 10);
     let details = usage.completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(2));
@@ -321,7 +321,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 1,
         ..Default::default()
     }));
-    let details = tracker.snapshot(0).completion_tokens_details.unwrap();
+    let details = tracker.snapshot(0, None).completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(3));
     assert_eq!(details.rejected_prediction_tokens, Some(1));
 }
@@ -340,7 +340,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             },
         ));
     }
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
     tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
         proto::GenerateComplete {
             prompt_tokens: 10,
@@ -348,7 +348,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             ..Default::default()
         },
     )));
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
 }
 
 /// Wire contract: cache counters serialize as integer zeros, never null,

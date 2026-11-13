@@ -6,7 +6,8 @@
 //!
 //! This module provides C-compatible function signatures for:
 //! - Tokenizer operations (encode, decode, chat template)
-//! - Tool parser operations (parse tool calls)
+//! - Response conversion (the engine's chunks as the client's deltas, with
+//!   tool calls and reasoning read through the Symphony crate's tables)
 //! - gRPC client SDK (complete request-response flow)
 //!
 //! # Safety
@@ -68,30 +69,24 @@ pub use tokenizer::{
     sgl_tokenizer_create_from_file, sgl_tokenizer_decode, sgl_tokenizer_encode, sgl_tokenizer_free,
     TokenizerHandle,
 };
-// Re-export tool parser functions
-pub use tool_parser::{
-    sgl_tool_parser_create, sgl_tool_parser_free, sgl_tool_parser_parse_complete,
-    sgl_tool_parser_parse_incremental, sgl_tool_parser_reset, ToolParserHandle,
-};
 
 // Sub-modules
 mod args;
 mod chat_stream;
 mod client;
 mod error;
-mod forced_tool_choice;
 mod grpc_converter;
 mod memory;
 mod policy;
 mod postprocessor;
 mod preprocessor;
 mod proto_parse;
+mod reader;
 mod runtime;
 mod stream;
 mod stream_state;
 mod tokenizer;
 mod tool_constraint;
-mod tool_parser;
 mod utils;
 
 #[cfg(all(test, not(target_env = "msvc"), not(target_env = "musl")))]

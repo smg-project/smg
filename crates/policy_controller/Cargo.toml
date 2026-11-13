@@ -23,9 +23,59 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The Kubernetes Lease elector (design 10), behind the `kubernetes` feature:
+# the gateway's own kube client stack, pinned to the same release. The
+# runtime handle its election thread blocks on is the optional tokio declared
+# with the controller's dependencies below; this feature turns it on too.
+# Nothing of it is built without the feature.
+k8s-openapi = { version = "0.27.0", features = ["v1_33"], optional = true }
+kube = { version = "3.0.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
+
+# The standalone controller (the `controller` feature): the listeners, the
+# health service, the admin endpoints and the binary. Every dependency below
+# is optional so a host that embeds the engine (the gateway, a binding)
+# builds the crate as it is today, with no server stack.
+axum = { workspace = true, optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+metrics = { version = "0.24.6", optional = true }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
+# The process TLS crypto provider, installed once before the first listener;
+# the gateway, the servicer and the mock worker install the same one.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
+tonic = { workspace = true, features = ["tls-ring"], optional = true }
+tonic-health = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+# The standalone controller: the store's drivers, the listeners with their
+# scopes, the gRPC health service, the admin endpoints and the binary of the
+# package's name. Off by default: the engine alone has no server dependency.
+controller = [
+    "dep:axum",
+    "dep:clap",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+    "dep:rustls",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tonic-health",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
+# The Kubernetes Lease backend of the elector.
+kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 
 [dev-dependencies]
 criterion = "0.8"
+# The Kubernetes elector's tests run its client against a service in the
+# test's process that plays one Lease, and its three-process cell against
+# the same stand-in served over HTTP.
+axum = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 # The corpus test reads YAML documents; the gateway reads its spec file with
 # the same crate.
 serde_yaml = { workspace = true }
@@ -35,9 +85,34 @@ serde_yaml = { workspace = true }
 prost-build = { version = "0.14.4", default-features = false }
 prost-types = { workspace = true }
 wit-parser = { version = "0.258.3", default-features = false, features = ["std"] }
+# The lease-file tests and bench write under a directory of their own.
+tempfile = "3"
+# The controller's mutual-TLS test mints its authority, server and client
+# certificates when it runs; no certificate file lives in the repository.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# The admin router's tests drive it with `oneshot`, no socket.
+# The Kubernetes elector's stand-in is a `service_fn` of the same crate.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+
+[[bin]]
+name = "smg-policy-controller"
+path = "src/main.rs"
+required-features = ["controller"]
+
+[[test]]
+name = "controller"
+required-features = ["controller"]
+
+[[test]]
+name = "elector_k8s_cell"
+required-features = ["kubernetes"]
 
 [[bench]]
 name = "decision"
+harness = false
+
+[[bench]]
+name = "elector"
 harness = false
 
 [[bench]]
