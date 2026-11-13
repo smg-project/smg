@@ -69,6 +69,9 @@ pub struct RealtimeSessionCreateResponse {
     pub model: Option<String>,
     #[serde(default = "audio")]
     pub output_modalities: Option<Vec<OutputModality>>,
+    /// The reasoning effort the session runs at, as the public API's answer
+    /// echoes it.
+    pub reasoning: Option<RealtimeReasoning>,
     pub prompt: Option<ResponsePrompt>,
     pub tool_choice: Option<RealtimeToolChoiceConfig>,
     pub tools: Option<Vec<RealtimeToolsConfig>>,

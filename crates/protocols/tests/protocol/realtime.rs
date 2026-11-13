@@ -4,7 +4,10 @@
 
 use openai_protocol::{
     realtime_response::RealtimeResponseCreateParams,
-    realtime_session::{RealtimeSessionCreateRequest, RealtimeTranscriptionSessionCreateRequest},
+    realtime_session::{
+        RealtimeSessionCreateRequest, RealtimeSessionCreateResponse,
+        RealtimeTranscriptionSessionCreateRequest,
+    },
 };
 use serde_json::json;
 
@@ -75,4 +78,22 @@ fn a_response_create_keeps_its_reasoning_and_an_mcp_tools_keys() {
     });
     let request: RealtimeResponseCreateParams = serde_json::from_value(params.clone()).unwrap();
     assert_eq!(serde_json::to_value(&request).unwrap(), params);
+}
+
+/// The session object the public API answers echoes the reasoning effort
+/// (SDK `RealtimeSessionCreateResponse.reasoning`): it is read and written
+/// back.
+#[test]
+fn a_session_answer_keeps_its_reasoning() {
+    let answer: RealtimeSessionCreateResponse = serde_json::from_value(json!({
+        "client_secret": {"value": "ek_test", "expires_at": 1_700_000_000},
+        "type": "realtime",
+        "model": "gpt-realtime-2",
+        "reasoning": {"effort": "low"}
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&answer).unwrap()["reasoning"],
+        json!({"effort": "low"})
+    );
 }
