@@ -16,6 +16,8 @@
 //!
 //! [`shape`]: crate::shape
 
+use std::sync::Arc;
+
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
@@ -76,7 +78,7 @@ pub(super) fn compact_calls(
             Tag::new(
                 format!("{}{}", markers.call_open, tool.function.name),
                 Grammar::JsonSchema {
-                    schema: tool.function.parameters_schema().clone(),
+                    schema: Arc::new(tool.function.parameters_schema().clone()),
                     style: Some("glm_xml".to_string()),
                     excludes: Vec::new(),
                     whitespace: Whitespace::Free,
