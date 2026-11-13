@@ -998,6 +998,14 @@ impl ConfigValidator {
             ));
         }
 
+        if oracle.op_timeout_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "oracle.op_timeout_secs",
+                oracle.op_timeout_secs,
+                "Must be > 0",
+            ));
+        }
+
         Ok(())
     }
 
