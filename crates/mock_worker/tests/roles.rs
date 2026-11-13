@@ -9,7 +9,6 @@ use std::{
 
 use futures::StreamExt as _;
 use mock_worker::{
-    admin,
     config::{Config, Role, SchedulerWire},
     drain,
     grpc::serve_with_listener,
@@ -285,25 +284,11 @@ async fn start_realistic_prefill() -> (TokenSpeedSchedulerClient, reqwest::Clien
 }
 
 /// The admin API beside the worker on gRPC `port`: an HTTP client and the
-/// worker's fault route, up.
+/// worker's fault route, on a port the server held before it was read.
 async fn fault_route(port: u16) -> (reqwest::Client, String) {
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(Config::default()),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    let admin_port = common::start_admin(Config::default()).await;
     let http = common::http_client();
     let fault = format!("http://127.0.0.1:{admin_port}/admin/fault/grpc:{port}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while http.get(&fault).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     (http, fault)
 }
 
@@ -663,22 +648,8 @@ async fn start_realistic_http_prefill() -> (reqwest::Client, String, String) {
         ..Config::default()
     })
     .await;
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(Config::default()),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    let admin_port = common::start_admin(Config::default()).await;
     let fault = format!("http://127.0.0.1:{admin_port}/admin/fault/{name}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while client.get(&fault).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     (client, base, fault)
 }
 
