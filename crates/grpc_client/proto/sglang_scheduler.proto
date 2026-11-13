@@ -177,6 +177,8 @@ message GenerateRequest {
   repeated MultimodalInputs extra_mm_inputs = 21;
 }
 
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   string original_text = 1;  // For reference
   repeated uint32 input_ids = 2;
