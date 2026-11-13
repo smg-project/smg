@@ -412,11 +412,14 @@ impl Roles {
 
     /// [`Self::run_end`] with `stop` bits: a character holding one of them
     /// ends the run as the end of the text would (the chain scanner's
-    /// stretches end at the next character of a stage class).
+    /// stretches end at the next character of a stage class). The stop test
+    /// comes first: with the role's bit tested first the compiler emits one
+    /// instruction more per character (measured on the chain shape's short
+    /// inputs), and this loop is the chain's byte loop for every run.
     #[inline(always)]
     pub(super) fn run_end_in(&self, text: &str, mut pos: usize, bit: Bits, stop: Bits) -> usize {
-        while let Some((bits, len)) = self.at(text, pos) {
-            if bits & bit == 0 || bits & stop != 0 {
+        while let Some((bits, len)) = self.at(text, pos).filter(|(bits, _)| bits & stop == 0) {
+            if bits & bit == 0 {
                 break;
             }
             pos += len;

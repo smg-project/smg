@@ -201,7 +201,7 @@ pub(super) struct Scanner {
     /// The most characters of the digit class one group holds.
     digits: u32,
     /// Whether the letter and white-space runs may take the word scans
-    /// (`Roles::run_end_as`): no stop class holds an ASCII character of
+    /// (`Roles::run_end_as_in`): no stop class holds an ASCII character of
     /// the scanned sets, so a word of members never hides a stop.
     word_scans: bool,
 }
@@ -386,16 +386,11 @@ impl Scanner {
     }
 
     /// The end of the run of characters holding `bit` that starts at `pos`,
-    /// a character holding one of `stop` ending it as the text's end would.
+    /// a character holding one of `stop` ending it as the text's end would
+    /// ([`Roles::run_end_in`], the one byte loop with stop bits).
     #[inline(always)]
-    fn run_end_in(&self, text: &str, mut pos: usize, bit: Bits, stop: Bits) -> usize {
-        while let Some((bits, len)) = self.at_in(text, pos, stop) {
-            if bits & bit == 0 {
-                break;
-            }
-            pos += len;
-        }
-        pos
+    fn run_end_in(&self, text: &str, pos: usize, bit: Bits, stop: Bits) -> usize {
+        self.roles.run_end_in(text, pos, bit, stop)
     }
 
     /// [`Self::run_end_in`] through the word scan `SCAN` of the role's ASCII
@@ -756,6 +751,27 @@ mod tests {
         let overlapping = Scanner::recognize(&chain(&[HEX, LETTERS, TEMPLATE]))
             .expect("overlapping classes take the scanner");
         assert_eq!(overlapping.digits, 3);
+        // The gain of the word scans rests on these: a class change that
+        // kept the ids and lost the scans fails here, not in a benchmark.
+        assert!(scanner.word_scans, "the shipped shape takes the word scans");
+        assert!(
+            !overlapping.word_scans,
+            "a digit class holding a-f keeps the byte loop"
+        );
+        for role in [Role::PunctLetter, Role::Word] {
+            assert_eq!(
+                scanner.roles.scan_of(role.bit()),
+                WordScan::LETTERS,
+                "{role:?}"
+            );
+        }
+        for role in [Role::TrailSpace, Role::Space] {
+            assert_eq!(
+                scanner.roles.scan_of(role.bit()),
+                WordScan::SPACES,
+                "{role:?}"
+            );
+        }
         // Fewer or more stages, the stages in another order, the GPT-4
         // family's template as the third stage, a bounded second stage, a
         // stage that drops its gaps, a stage that drops its matches.
