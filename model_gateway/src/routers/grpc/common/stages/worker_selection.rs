@@ -3519,7 +3519,6 @@ mod tests {
             root_request_id: None,
             request_id: None,
             cache_trace: None,
-            parser: None,
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),
@@ -6604,13 +6603,10 @@ mod tests {
             templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
             tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             worker_registry: registry,
-            tool_parser_factory: Default::default(),
-            reasoning_parser_factory: Default::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
         });
         let mut ctx = RequestContext::for_generate(
             Arc::new(request),

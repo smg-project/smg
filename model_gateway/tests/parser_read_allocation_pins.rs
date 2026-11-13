@@ -1,11 +1,11 @@
-//! What a single parser-name read allocates on a card that sets both parser
-//! kinds, pinned at today's count: the registry walk's own allocations plus
-//! the one String of the kind asked for, so a reader that clones both names
-//! and drops one fails a test rather than adding a String per request on the
-//! paths that read one kind (the preparation stage's reasoning read, the
-//! fallbacks that read the pair). The mock bed's cards set no parser names, so
-//! its allocation cell cannot see this path. A separate executable, so it can
-//! declare the counting allocator the pin needs.
+//! What a request's one read of the parser names allocates on a card that
+//! sets both kinds, pinned at today's count: the registry walk's own
+//! allocations plus the two Strings of the names, once per request (the
+//! preparation stage's read), and the two Strings alone where the names were
+//! resolved already (request building's read of them: no second walk). The
+//! mock bed's cards set no parser names, so its allocation cell cannot see
+//! this path. A separate executable, so it can declare the counting allocator
+//! the pin needs.
 
 #![expect(
     clippy::print_stderr,
@@ -23,12 +23,10 @@ use std::{
 };
 
 use openai_protocol::model_card::ModelCard;
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg::{
     routers::grpc::utils::ParserResolver,
     worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
 };
-use tool_parser::ParserFactory as ToolParserFactory;
 
 thread_local! {
     /// Allocation and reallocation calls this thread made.
@@ -82,39 +80,34 @@ fn registry_with_both_kinds() -> Arc<WorkerRegistry> {
     registry
 }
 
-/// A single read costs the walk over the model's workers and one String, the
-/// name of the kind it asked for; the other kind's name is read, not cloned.
+/// A request's read of the names costs the walk over the model's workers and
+/// the two Strings of the names; a read of names resolved already costs the
+/// two Strings and no walk.
 #[test]
-fn a_single_parser_read_clones_only_its_kind() {
+fn a_requests_read_of_the_names_costs_the_walk_and_two_strings_once() {
     let registry = registry_with_both_kinds();
-    let resolver = ParserResolver::new(
-        Arc::clone(&registry),
-        None,
-        None,
-        &ToolParserFactory::new(),
-        &ReasoningParserFactory::new(),
-    );
-    // The first reads: whatever the registry or the resolver builds lazily.
-    assert_eq!(resolver.tool_parser("m").as_deref(), Some("json"));
-    assert_eq!(resolver.reasoning_parser("m").as_deref(), Some("qwen3"));
+    let resolver = ParserResolver::new(Arc::clone(&registry), None, None);
+    // The first read: whatever the registry or the resolver builds lazily.
+    let resolved = resolver.names_for(None, "m").labels;
+    assert_eq!(resolved.tool.as_deref(), Some("json"));
+    assert_eq!(resolved.reasoning.as_deref(), Some("qwen3"));
 
     let (workers, walk) = allocations_during(|| registry.get_by_model("m"));
     assert_eq!(workers.len(), 1);
     drop(workers);
 
-    let (tool, calls) = allocations_during(|| resolver.tool_parser("m"));
-    assert_eq!(tool.as_deref(), Some("json"));
+    let (names, calls) = allocations_during(|| resolver.names_for(None, "m"));
+    assert_eq!(names.labels, resolved);
     assert_eq!(
         calls,
-        walk + 1,
-        "a tool read costs the walk and its one String: {calls} calls, the walk alone {walk}"
+        walk + 2,
+        "a read costs the walk and the two Strings: {calls} calls, the walk alone {walk}"
     );
-    let (reasoning, calls) = allocations_during(|| resolver.reasoning_parser("m"));
-    assert_eq!(reasoning.as_deref(), Some("qwen3"));
+    let (names, calls) = allocations_during(|| resolver.names_for(Some(&resolved), "m"));
+    assert_eq!(names.labels, resolved);
     assert_eq!(
-        calls,
-        walk + 1,
-        "a reasoning read costs the walk and its one String: {calls} calls, the walk alone {walk}"
+        calls, 2,
+        "a read of resolved names costs their two Strings and no walk: {calls} calls"
     );
-    eprintln!("allocation calls per single parser read on a card with both kinds: {calls} (the walk alone: {walk})");
+    eprintln!("allocation calls per read of the names on a card with both kinds: {} (the walk alone: {walk})", walk + 2);
 }

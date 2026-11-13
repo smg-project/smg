@@ -8,9 +8,9 @@
 //! skip special tokens, as a checkpoint's vocabulary does for its control tokens, so a request
 //! decoded with them skipped loses the markers. The worker records what the gateway sends.
 //!
-//! The requests do not ask for the reasoning split: the model's reasoning parser keeps the
-//! special tokens on its own account when they do, whatever the tools say, which would hide the
-//! gate under test.
+//! The requests take the reasoning split, the default: the table then drops the turn's channel
+//! tags, and the content is the response channel's text. (With the split off a table shows every
+//! marker that is not a call's, as the output read without a reasoning parser was.)
 
 use std::sync::{Arc, Mutex};
 
@@ -108,9 +108,15 @@ async fn serve() -> Gateway {
         .max_payload_size(1024 * 1024)
         .build_unchecked();
     config.health_check.disable_health_check = true;
-    // The parsers are the model's own, resolved from its name.
-    let tokenizer: Arc<dyn Tokenizer> =
-        Arc::new(ScriptedTokenizer::from_chunks(chunks).with_special_tokens(EOS));
+    // The worker's labels name the table: the scripted model id is one the
+    // registry does not know. The rendered prompt ends where the template
+    // opens the assistant's turn, which the table replays to read the turn
+    // from its first region.
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        ScriptedTokenizer::from_chunks(chunks)
+            .with_special_tokens(EOS)
+            .with_prompt_tail("<|open|>message role=\"assistant\"<|sep|>"),
+    );
     let tokenizers = Arc::new(TokenizerRegistry::new());
     tokenizers
         .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
@@ -121,7 +127,11 @@ async fn serve() -> Gateway {
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Grpc)
         .runtime_type(RuntimeType::TokenSpeed)
-        .model(ModelCard::new(MODEL))
+        .model(
+            ModelCard::new(MODEL)
+                .with_tool_parser("kimi_k3")
+                .with_reasoning_parser("kimi_k3"),
+        )
         .health_config(HealthCheckConfig {
             disable_health_check: true,
             ..Default::default()
@@ -184,7 +194,7 @@ struct Chat {
 /// the model's profile, without the reasoning split (see the module's note).
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "test helper")]
 fn chat_request(extra: Value) -> ChatCompletionRequest {
-    let mut request = json!({"model": MODEL, "max_tokens": 64, "separate_reasoning": false});
+    let mut request = json!({"model": MODEL, "max_tokens": 64});
     request
         .as_object_mut()
         .unwrap()

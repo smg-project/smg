@@ -31,8 +31,8 @@ use super::{
     super::*,
     eof::{
         chunk, collect_events, data_frame, decoded_stream, gated_stream, messages_spec,
-        mock_worker_endpoint, processor, response_processor, runtime, scripted_stream,
-        trailers_frame, CharacterTokenizer,
+        mock_worker_endpoint, processor, read_by, response_processor, runtime, scripted_stream,
+        trailers_frame, CharacterTokenizer, ASSISTANT_PROMPT,
     },
     symphony_chat::assigned_message,
 };
@@ -196,13 +196,17 @@ async fn streamed_chat_usage(
     reservation: Option<Arc<SharedReservationHandle>>,
 ) -> Value {
     let (tx, rx) = sse_channel();
-    let result = processor(false)
+    let result = processor()
         .process_streaming_chunks(
             stream,
             dispatch(),
             tokenizer(),
             (None, None, false, false, false),
-            ChatResponseSpec::from(request),
+            read_by(
+                ChatResponseSpec::from(request),
+                qwen3(CallSyntax::Json),
+                ASSISTANT_PROMPT,
+            ),
             &tx,
             reservation,
         )
@@ -227,7 +231,11 @@ async fn non_streamed_chat(
                 stream,
                 dispatch_start: Instant::now(),
             },
-            ChatResponseSpec::from(request),
+            read_by(
+                ChatResponseSpec::from(request),
+                qwen3(CallSyntax::Json),
+                ASSISTANT_PROMPT,
+            ),
             dispatch(),
             tokenizer,
             &mut decoder,
@@ -251,7 +259,7 @@ async fn streamed_completion_usage(
 ) -> Value {
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
-    let response = Arc::new(processor(false))
+    let response = Arc::new(processor())
         .process_completion_streaming_response(
             context::ExecutionResult::Single {
                 stream,
@@ -378,7 +386,7 @@ async fn streamed_messages(
     reservation: Option<Arc<SharedReservationHandle>>,
 ) -> Vec<Value> {
     let (tx, rx) = sse_channel();
-    let result = processor(false)
+    let result = processor()
         .process_messages_streaming_chunks(
             stream,
             dispatch(),
@@ -411,7 +419,6 @@ async fn non_streamed_messages(
             },
             spec,
             dispatch(),
-            tokenizer,
             &mut decoder,
         )
         .await
@@ -526,11 +533,15 @@ async fn chat_usage_reports_the_image_tokens_streamed_and_not() {
     };
     for image_tokens in [Some(324), None] {
         let streaming_request = request(true);
-        let mut spec = ChatResponseSpec::from(&streaming_request);
+        let mut spec = read_by(
+            ChatResponseSpec::from(&streaming_request),
+            qwen3(CallSyntax::Json),
+            ASSISTANT_PROMPT,
+        );
         spec.image_tokens = image_tokens;
         let (stream, server) = engine_stream(frames(&["hi"], 1, counters)).await;
         let (tx, rx) = sse_channel();
-        let result = processor(false)
+        let result = processor()
             .process_streaming_chunks(
                 stream,
                 dispatch(),
@@ -548,7 +559,11 @@ async fn chat_usage_reports_the_image_tokens_streamed_and_not() {
         let streamed = usage_chunk(&events);
 
         let whole_request = request(false);
-        let mut spec = ChatResponseSpec::from(&whole_request);
+        let mut spec = read_by(
+            ChatResponseSpec::from(&whole_request),
+            qwen3(CallSyntax::Json),
+            ASSISTANT_PROMPT,
+        );
         spec.image_tokens = image_tokens;
         let (stream, server) = engine_stream(frames(&["hi"], 1, counters)).await;
         let tokenizer = tokenizer();
@@ -1116,9 +1131,8 @@ fn a_collected_answer_records_its_token_and_generation_families() {
     }
 }
 
-/// A collected Messages answer a Symphony table reads records the token and
-/// generation families as one the legacy parsers read does: the engine's
-/// counts under the messages endpoint and one generation observation, no
+/// A collected Messages answer records the token and generation families:
+/// the engine's counts under the messages endpoint and one generation observation, no
 /// TTFT or TPOT (the whole-answer Symphony reading once returned before the
 /// record was made).
 #[test]
@@ -1188,13 +1202,17 @@ async fn a_chat_stream_whose_client_left_before_the_terminal_sends_settles_the_e
     let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
     let (tx, mut rx) = sse_channel();
     let (handle, backend) = RecordingBackend::reservation();
-    let processor = processor(false);
+    let processor = processor();
     let streamed = processor.process_streaming_chunks(
         stream,
         dispatch(),
         tokenizer(),
         (None, None, false, false, false),
-        ChatResponseSpec::from(&request),
+        read_by(
+            ChatResponseSpec::from(&request),
+            qwen3(CallSyntax::Json),
+            ASSISTANT_PROMPT,
+        ),
         &tx,
         Some(handle),
     );
@@ -1233,7 +1251,7 @@ async fn a_messages_stream_whose_client_left_before_the_terminal_sends_settles_t
     let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
     let (tx, mut rx) = sse_channel();
     let (handle, backend) = RecordingBackend::reservation();
-    let processor = processor(false);
+    let processor = processor();
     let streamed = processor.process_messages_streaming_chunks(
         stream,
         dispatch(),
@@ -1271,6 +1289,104 @@ async fn a_messages_stream_whose_client_left_before_the_terminal_sends_settles_t
     assert_eq!(backend.closes(), 0);
 }
 
+/// A chat read that fails once every choice has closed (the engine's stream
+/// ends with an error status after its `Complete`) settles the reservation
+/// with the engine's counts before the failure returns: the counts were the
+/// engine's own, read before the failure, so nothing is closed as
+/// reserved-only. A failure before the close leaves the reservation to its
+/// drop, as before (`a_watched_stream_whose_client_leaves_...`).
+#[tokio::test]
+async fn a_chat_read_that_fails_after_every_choice_closed_settles_the_engines_counts() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "messages": [], "stream": true,
+        "stream_options": {"include_usage": true},
+    }))
+    .expect("chat request");
+    let (stream, server) = scripted_stream(choice_frames(0, &["hi"], SETTLED), "13").await;
+    let (tx, mut rx) = sse_channel();
+    let (handle, backend) = RecordingBackend::reservation();
+    let processor = processor();
+    let streamed = async move {
+        let result = processor
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                tokenizer(),
+                (None, None, false, false, false),
+                read_by(
+                    ChatResponseSpec::from(&request),
+                    qwen3(CallSyntax::Json),
+                    ASSISTANT_PROMPT,
+                ),
+                &tx,
+                Some(handle),
+            )
+            .await;
+        // The sender goes with the read, so the client below sees the end.
+        drop(tx);
+        result
+    };
+    let client = async { while rx.recv().await.is_some() {} };
+    let (result, ()) = tokio::join!(streamed, client);
+    server.abort();
+    assert!(
+        result.is_err(),
+        "the read fails on the stream's error status: {result:?}"
+    );
+    assert_eq!(
+        backend.settlements(),
+        vec![UsageSettlement {
+            actual_input_tokens: SETTLED.prompt,
+            completion_tokens: 2,
+            cached_input_tokens: SETTLED.cached,
+            reasoning_tokens: 0,
+        }]
+    );
+    assert_eq!(backend.closes(), 0);
+}
+
+/// The same for the Messages path: a read that fails once the message has
+/// closed settles the engine's counts before the failure returns.
+#[tokio::test]
+async fn a_messages_read_that_fails_after_the_message_closed_settles_the_engines_counts() {
+    let (stream, server) = scripted_stream(choice_frames(0, &["hi"], SETTLED), "13").await;
+    let (tx, mut rx) = sse_channel();
+    let (handle, backend) = RecordingBackend::reservation();
+    let processor = processor();
+    let streamed = async move {
+        let result = processor
+            .process_messages_streaming_chunks(
+                stream,
+                dispatch(),
+                tokenizer(),
+                (None, None, false, false, false),
+                messages_spec(false),
+                &tx,
+                Some(handle),
+            )
+            .await;
+        drop(tx);
+        result
+    };
+    let client = async { while rx.recv().await.is_some() {} };
+    let (result, ()) = tokio::join!(streamed, client);
+    server.abort();
+    assert!(
+        result.is_err(),
+        "the read fails on the stream's error status: {result:?}"
+    );
+    assert_eq!(
+        backend.settlements(),
+        vec![UsageSettlement {
+            actual_input_tokens: SETTLED.prompt,
+            completion_tokens: 2,
+            cached_input_tokens: SETTLED.cached,
+            reasoning_tokens: 0,
+        }]
+    );
+    assert_eq!(backend.closes(), 0);
+}
+
 /// The same two paths over the stream as production reads it, watched for
 /// the client's leaving (`until_client_gone`): the client's drop ends the
 /// read before the engine's `Complete`, so the path sends nothing more and
@@ -1291,7 +1407,7 @@ async fn a_watched_stream_whose_client_leaves_sends_nothing_more_and_closes_its_
         let (tx, mut rx) = sse_channel();
         let stream = stream.until_client_gone(&tx, "chatcmpl-eof");
         let (handle, backend) = RecordingBackend::reservation();
-        let processor = processor(false);
+        let processor = processor();
         let streamed = async {
             if messages {
                 processor
@@ -1312,7 +1428,11 @@ async fn a_watched_stream_whose_client_leaves_sends_nothing_more_and_closes_its_
                         dispatch(),
                         tokenizer(),
                         (None, None, false, false, false),
-                        ChatResponseSpec::from(&request),
+                        read_by(
+                            ChatResponseSpec::from(&request),
+                            qwen3(CallSyntax::Json),
+                            ASSISTANT_PROMPT,
+                        ),
                         &tx,
                         Some(handle),
                     )
@@ -1361,7 +1481,7 @@ async fn a_watched_stream_whose_client_leaves_with_held_text_ends_its_read_at_th
         let (tx, mut rx) = sse_channel();
         let stream = stream.until_client_gone(&tx, "chatcmpl-eof");
         let (handle, backend) = RecordingBackend::reservation();
-        let processor = processor(false);
+        let processor = processor();
         let stop = Some(StringOrArray::Array(vec!["hiya".to_string()]));
         let streamed = async {
             if messages {
@@ -1383,7 +1503,11 @@ async fn a_watched_stream_whose_client_leaves_with_held_text_ends_its_read_at_th
                         dispatch(),
                         tokenizer(),
                         (stop, None, false, false, false),
-                        ChatResponseSpec::from(&request),
+                        read_by(
+                            ChatResponseSpec::from(&request),
+                            qwen3(CallSyntax::Json),
+                            ASSISTANT_PROMPT,
+                        ),
                         &tx,
                         Some(handle),
                     )
@@ -1438,7 +1562,7 @@ async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_
     let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
     let (tx, mut rx) = sse_channel();
     let stream = stream.until_client_gone(&tx, "cmpl-eof");
-    let processor = processor(false);
+    let processor = processor();
     let stop = Some(StringOrArray::Array(vec!["hiya".to_string()]));
     let spec = CompletionResponseSpec::new(&request, Vec::new());
     let streamed = processor.process_completion_streaming_chunks(
@@ -1585,7 +1709,7 @@ async fn continuous_spec_usage_waits_for_unseen_choice() {
     .unwrap();
     let (stream, server) = engine_stream(data).await;
     let (tx, rx) = sse_channel();
-    let result = processor(false)
+    let result = processor()
         .process_streaming_chunks(
             stream,
             dispatch(),
@@ -1597,7 +1721,11 @@ async fn continuous_spec_usage_waits_for_unseen_choice() {
                 false,
                 false,
             ),
-            ChatResponseSpec::from(&request),
+            read_by(
+                ChatResponseSpec::from(&request),
+                qwen3(CallSyntax::Json),
+                ASSISTANT_PROMPT,
+            ),
             &tx,
             None,
         )

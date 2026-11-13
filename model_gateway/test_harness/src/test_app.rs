@@ -80,8 +80,6 @@ pub fn create_test_app(
             .client(client)
             .rate_limiter(rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-            .reasoning_parser_factory(None) // reasoning_parser_factory
-            .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)
@@ -313,8 +311,6 @@ pub async fn create_test_app_context_with_config(router_config: &RouterConfig) -
             .client(client)
             .rate_limiter(None)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-            .reasoning_parser_factory(None)
-            .tool_parser_factory(None)
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)

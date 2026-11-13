@@ -7,6 +7,7 @@ use crate::routers::{
     grpc::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext, RequestType},
+        regular::symphony,
         utils,
     },
 };
@@ -25,19 +26,16 @@ impl PipelineStage for DecisionsPreparationStage {
         let request = request.clone();
         let tokenizer = utils::resolve_tokenizer(ctx, "DecisionsPreparationStage::execute")
             .map_err(|error| *error)?;
-        let configured = ctx
-            .components
-            .parser_resolver
-            .reasoning_parser(&ctx.input.model_id);
-        let answers_open_reasoning = utils::create_reasoning_parser(
-            &ctx.components.reasoning_parser_factory,
-            configured.as_deref(),
-            &ctx.input.model_id,
-        )
-        .is_some_and(|parser| parser.is_in_reasoning());
-        let (items, scoring) = prepare_decisions(&request, tokenizer, answers_open_reasoning)
-            .await
-            .map_err(|message| error::bad_request("unsupported_decisions_request", message))?;
+        // The table that reads the model replays each rendered prompt: one that
+        // leaves the model inside its thought at the answer position is refused.
+        let model = &ctx.input.model_id;
+        let names = ctx.components.parser_resolver.names_for(None, model);
+        let format = symphony::reads(&names, model, &ctx.components.templates)
+            .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        let (items, scoring) =
+            prepare_decisions(&request, tokenizer, |prompt| format.reasoning_open(prompt))
+                .await
+                .map_err(|message| error::bad_request("unsupported_decisions_request", message))?;
         ctx.state.preparation = Some(PreparationOutput::Decisions { items, scoring });
         Ok(())
     }

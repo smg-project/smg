@@ -34,7 +34,7 @@ allocate and copy" for eight traffic shapes.
 | `long` | 32k and 128k-token prompts at 50 req/s | the clone and copy cost of big bodies, tokenizer throughput |
 | `image-router`, `image-worker` | 4 MB inline PNGs at 100 req/s, media preprocessed by the gateway or passed to the worker (needs `LLAVA_TOKENIZER`, a `llava-hf` model directory) | media decode, pixel buffers, body copies |
 | `tenants` | 1k req/s over 200 header-resolved tenants with per-tenant limits | tenant resolution and rate-limit accounting |
-| `tools` | 500 req/s of 10-turn tool conversations with 8 schemas, unary and streaming, `--parser symphony` | template rendering of tools, tool-call parsing |
+| `tools` | 500 req/s of 10-turn tool conversations with 8 schemas, unary and streaming | template rendering of tools, tool-call parsing |
 | `responses` | 500 req/s of `previous_response_id` chains of 10 (`store: true`, memory backend) | the response store |
 
 Each cell is 120 s after a 10 s warm-up, repeated 3 times, interleaved with

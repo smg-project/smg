@@ -88,11 +88,7 @@ async fn reader_panicked_body(response: Response) -> Value {
 }
 
 fn whole_reader() -> ResponseProcessor {
-    ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    )
+    ResponseProcessor::new()
 }
 
 /// The one `panicked` output of the qwen3 table in `scrape`.
@@ -115,7 +111,7 @@ async fn a_reader_panic_ends_the_chat_stream_with_an_error_event_and_done() {
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let (payloads, scrape) = scraped(async {
-        let response = Arc::new(processor(true))
+        let response = Arc::new(processor())
             .process_streaming_response(
                 context::ExecutionResult::Single {
                     stream,
@@ -203,7 +199,7 @@ async fn a_reader_panic_ends_the_messages_stream_with_its_error_event() {
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_MESSAGES);
     let (payloads, scrape) = scraped(async {
-        let response = Arc::new(processor(true))
+        let response = Arc::new(processor())
             .process_messages_streaming_response(
                 context::ExecutionResult::Single {
                     stream,
@@ -251,7 +247,6 @@ async fn a_reader_panic_answers_the_whole_message_with_a_500_under_its_code() {
         },
         assigned_message(qwen3(CallSyntax::Json), PROMPT, false),
         dispatch(),
-        tokenizer,
         &mut decoder,
     ))
     .await;
@@ -274,7 +269,7 @@ async fn a_reading_that_does_not_panic_is_untouched_by_the_isolation() {
         scripted_stream(vec![chunk(0, "Hello world"), complete(0, "stop")], "0").await;
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
-    let response = Arc::new(processor(true))
+    let response = Arc::new(processor())
         .process_streaming_response(
             context::ExecutionResult::Single {
                 stream,

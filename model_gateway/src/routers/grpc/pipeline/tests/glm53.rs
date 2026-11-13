@@ -101,7 +101,7 @@ async fn glm53_media_returns_normal_completion_and_stream_without_media_processi
         .await;
         let registry = Arc::new(WorkerRegistry::new());
         register_worker_with_labels(&registry, port, WorkerType::Regular, LANGUAGE_MODEL_ONLY);
-        let deps = PipelineDeps::pair(
+        let deps = PipelineDeps::new(
             registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,
@@ -167,7 +167,7 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 .build();
             registry.register(Arc::new(worker)).unwrap();
         }
-        let deps = PipelineDeps::pair(
+        let deps = PipelineDeps::new(
             registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,
@@ -386,7 +386,7 @@ async fn glm53_medium_effort_is_rendered_as_high() {
     let port = spawn_stub(GatedScheduler::default()).await;
     let registry = Arc::new(WorkerRegistry::new());
     register_worker_with_labels(&registry, port, WorkerType::Regular, LANGUAGE_MODEL_ONLY);
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,
@@ -428,7 +428,7 @@ async fn glm53_flash_tool_reference_reaches_the_prompt() {
     const TEXT_ALIAS: &str = "weather-reference-text-test-alias";
     ProviderProfile::register_model_aliases([(ALIAS, MODEL_ID), (TEXT_ALIAS, "glm-5.3")]);
     let registry = Arc::new(WorkerRegistry::new());
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,

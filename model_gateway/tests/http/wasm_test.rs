@@ -83,8 +83,6 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
             .client(client)
             .rate_limiter(None)
             .tokenizer_registry(tokenizer_registry)
-            .reasoning_parser_factory(None)
-            .tool_parser_factory(None)
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)

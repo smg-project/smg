@@ -45,10 +45,14 @@ impl QuestionKind {
 
 /// Share the HTTP adapter's supported-input validation and native question
 /// mapping. After encoding, only the response mapping survives in `scoring`.
+/// `reasoning_open` says whether a rendered prompt leaves the model inside its
+/// thought at the answer position, as the table that reads the model replays
+/// it (`regular::symphony`): such a prompt is refused, since the labels would
+/// be scored inside the thought.
 pub(crate) async fn prepare_decisions(
     request: &DecisionsRequest,
     tokenizer: Arc<dyn Tokenizer>,
-    answers_open_reasoning: bool,
+    reasoning_open: impl Fn(&str) -> bool,
 ) -> Result<(Vec<DecisionPrompt>, DecisionScoring), String> {
     let mut adapter = SglangDecisionAdapter::new(request)?;
     let native = adapter.request();
@@ -102,7 +106,7 @@ pub(crate) async fn prepare_decisions(
         };
         let content = render_question(&state, question, kind, &labels)?;
         let text = render_prompt(&tokenizer, &content)?;
-        reject_reasoning(&tokenizer, &content, &text, answers_open_reasoning)?;
+        reject_reasoning(&tokenizer, &content, &text, reasoning_open(&text))?;
         let token_ids = encode_ids(&tokenizer, &text, &mut budget).await?;
         let label_context = label_suffix(&tokenizer, &text, &token_ids, &mut budget).await?;
         let (label_text, label_prefix) = label_context
@@ -223,7 +227,7 @@ fn reject_reasoning(
     tokenizer: &Arc<dyn Tokenizer>,
     content: &str,
     prompt: &str,
-    answers_open_reasoning: bool,
+    prompt_opens_reasoning: bool,
 ) -> Result<(), String> {
     let closing = content
         .rsplit('\n')
@@ -294,7 +298,7 @@ fn reject_reasoning(
             }
         }
     }
-    if answers_open_reasoning && !closed_reasoning {
+    if prompt_opens_reasoning && !closed_reasoning {
         return Err("Decisions requires the chat template to close the reasoning block before the answer position".into());
     }
     Ok(())
@@ -540,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn matches_pinned_native_prompts_and_contextual_label_ids() {
-        let (prompts, _) = prepare_decisions(&request(), tokenizer(TEMPLATE), false)
+        let (prompts, _) = prepare_decisions(&request(), tokenizer(TEMPLATE), |_| false)
             .await
             .unwrap();
         assert_eq!(prompts.len(), 3);
@@ -558,7 +562,7 @@ mod tests {
         let mut raw = serde_json::to_value(request()).unwrap();
         raw["input"] = json!([{"role":"user","content":[{"type":"input_text","text":"A"},{"type":"input_text","text":"B"}]}]);
         let request = serde_json::from_value(raw).unwrap();
-        let (prompts, _) = prepare_decisions(&request, tokenizer(TEMPLATE), false)
+        let (prompts, _) = prepare_decisions(&request, tokenizer(TEMPLATE), |_| false)
             .await
             .unwrap();
         assert!(prompts[0].text.starts_with("<user>[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"A\"},{\"type\":\"input_text\",\"text\":\"B\"}]}]\n\n"));
@@ -569,7 +573,7 @@ mod tests {
         let mut raw = serde_json::to_value(request()).unwrap();
         raw["questions"] = json!([{"type":"choice","instructions":"Choose.","choices":(0..27).map(|i| json!({"value":format!("value{i}")})).collect::<Vec<_>>()}]);
         let request = serde_json::from_value(raw).unwrap();
-        let (prompts, _) = prepare_decisions(&request, tokenizer(TEMPLATE), false)
+        let (prompts, _) = prepare_decisions(&request, tokenizer(TEMPLATE), |_| false)
             .await
             .unwrap();
         assert!(prompts[0].text.contains("\nAA: o0 -"));
@@ -580,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_labels_that_change_the_prompt_boundary() {
         let template = "{% for message in messages %}{{ message.content }}{% endfor %}prefix";
-        let result = prepare_decisions(&request(), tokenizer(template), false).await;
+        let result = prepare_decisions(&request(), tokenizer(template), |_| false).await;
         assert!(result.err().unwrap().contains("distinct token"));
     }
 
@@ -592,7 +596,7 @@ mod tests {
             "{% for message in messages %}{{ message.content }}{% endfor %}<assistant>◁think▷",
             "{% for message in messages %}{{ message.content }}{% endfor %}<assistant><|START_THINKING|>",
         ] {
-            let result = prepare_decisions(&request(), tokenizer(template), false).await;
+            let result = prepare_decisions(&request(), tokenizer(template), |_| false).await;
             assert!(result.err().unwrap().contains("reasoning"));
         }
     }
@@ -660,16 +664,16 @@ mod tests {
     #[tokio::test]
     async fn rejects_deferred_encoders_before_label_scoring() {
         let tokenizer = Arc::new(MockTokenizer::new().with_deferred_chat_ids(vec![1]));
-        let result = prepare_decisions(&request(), tokenizer, false).await;
+        let result = prepare_decisions(&request(), tokenizer, |_| false).await;
         assert!(result.err().unwrap().contains("deferred encode"));
     }
 
     #[tokio::test]
     async fn always_reasoning_parser_requires_an_explicitly_closed_block() {
-        let result = prepare_decisions(&request(), tokenizer(TEMPLATE), true).await;
+        let result = prepare_decisions(&request(), tokenizer(TEMPLATE), |_| true).await;
         assert!(result.err().unwrap().contains("reasoning"));
         let template = "{% for message in messages %}<{{ message.role }}>{{ message.content }}</{{ message.role }}>{% endfor %}{% if add_generation_prompt %}<assistant><think></think>{% endif %}";
-        assert!(prepare_decisions(&request(), tokenizer(template), true)
+        assert!(prepare_decisions(&request(), tokenizer(template), |_| true)
             .await
             .is_ok());
     }
@@ -680,18 +684,18 @@ mod tests {
             "{% for message in messages %}{{ message.content }}{% endfor %}<assistant><think:6124c78e>",
             "{% for message in messages %}{% if message.role == 'assistant' %}<think:6124c78e>{% endif %}{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}",
         ] {
-            let result = prepare_decisions(&request(), tokenizer(template), false).await;
+            let result = prepare_decisions(&request(), tokenizer(template), |_| false).await;
             assert!(result.err().unwrap().contains("reasoning"));
         }
         let closed = "{% for message in messages %}{{ message.content }}{% endfor %}<assistant><think:6124c78e></think:6124c78e>";
-        assert!(prepare_decisions(&request(), tokenizer(closed), true)
+        assert!(prepare_decisions(&request(), tokenizer(closed), |_| true)
             .await
             .is_ok());
     }
 
     #[tokio::test]
     async fn normalizes_selected_logprobs_stably_and_maps_native_confidence() {
-        let (_, scoring) = prepare_decisions(&request(), tokenizer(TEMPLATE), false)
+        let (_, scoring) = prepare_decisions(&request(), tokenizer(TEMPLATE), |_| false)
             .await
             .unwrap();
         let response = finish_decisions(
@@ -722,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_extra_and_nonfinite_scoring_results() {
-        let (_, scoring) = prepare_decisions(&request(), tokenizer(TEMPLATE), false)
+        let (_, scoring) = prepare_decisions(&request(), tokenizer(TEMPLATE), |_| false)
             .await
             .unwrap();
         for rows in [

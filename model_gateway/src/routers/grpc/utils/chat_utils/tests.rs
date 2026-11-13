@@ -7,7 +7,8 @@ use llm_tokenizer::{
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
-        AudioUrl, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, ResponseFormat, VideoUrl,
+        AudioUrl, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, ResponseFormat,
+        ToolChoiceValue, VideoUrl,
     },
     profile::ProviderProfile,
 };
@@ -1519,62 +1520,6 @@ fn test_render_image_before_question_real_template() {
             vstart < qpos,
             "image must precede the question (vstart={vstart}, qpos={qpos}).\n--- rendered ---\n{rendered}"
         );
-}
-
-#[test]
-fn test_generate_tool_call_id_kimi_k3_opaque_format() {
-    // K3: `{name}_{history + index}` — no `functions.` prefix, `_` (not K2's
-    // `:`) as the separator, and a history offset that keeps ids unique
-    // across turns.
-    assert_eq!(
-        generate_tool_call_id("moonshotai/Kimi-K3", "get_weather", 0, 0),
-        "get_weather_0"
-    );
-    assert_eq!(
-        generate_tool_call_id("kimi_k3", "get_weather", 1, 5),
-        "get_weather_6"
-    );
-}
-
-#[test]
-fn test_generate_tool_call_id_kimi_k3_continues_across_turns() {
-    // A first turn emitting three parallel calls yields 0,1,2; the next
-    // turn's three calls continue at 3,4,5 instead of colliding with them.
-    // K3 matches tool results back to calls by opaque id equality, so a
-    // repeated id would be ambiguous to any caller correlating by id.
-    let first: Vec<String> = (0..3)
-        .map(|i| generate_tool_call_id("Kimi-K3", "get_weather", i, 0))
-        .collect();
-    let second: Vec<String> = (0..3)
-        .map(|i| generate_tool_call_id("Kimi-K3", "get_weather", i, 3))
-        .collect();
-
-    assert_eq!(first, ["get_weather_0", "get_weather_1", "get_weather_2"]);
-    assert_eq!(second, ["get_weather_3", "get_weather_4", "get_weather_5"]);
-    assert!(
-        first.iter().all(|id| !second.contains(id)),
-        "ids must not repeat across turns: {first:?} vs {second:?}"
-    );
-}
-
-#[test]
-fn test_generate_tool_call_id_kimi_k2_unchanged() {
-    // K2 keeps the globally unique `functions.{name}:{history + index}` form.
-    assert_eq!(
-        generate_tool_call_id("moonshotai/Kimi-K2-Instruct", "get_weather", 0, 0),
-        "functions.get_weather:0"
-    );
-    assert_eq!(
-        generate_tool_call_id("Kimi-K2", "get_weather", 1, 2),
-        "functions.get_weather:3"
-    );
-}
-
-#[test]
-fn test_generate_tool_call_id_non_kimi_uses_uuid() {
-    let id = generate_tool_call_id("gpt-4o", "get_weather", 0, 0);
-    assert!(id.starts_with("call_"), "got: {id}");
-    assert!(!id.contains("get_weather"), "got: {id}");
 }
 
 // --- render -> encode contract -------------------------------------------

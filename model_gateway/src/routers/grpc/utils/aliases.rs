@@ -1,18 +1,19 @@
-//! The gateway's older parser names and the Symphony tables that answer to them.
-//!
-//! The `--tool-call-parser` and `--reasoning-parser` flags, and a worker's labels, name the older
-//! parsers. Under `--parser symphony` a name whose format a table reads selects that table
-//! ([`answering_to`]: `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`), so a deployment's
-//! existing flags keep a working parser when the gateway reads with Symphony; the rule is that
-//! every legacy name is a table's own, one of its [`ALIASES`], or in [`UNANSWERED`] with the
-//! reason, never both and never neither, which the test over both legacy registries holds
-//! (`regular::symphony`). The crate knows a table by its own name only (`Table::named`): these
-//! names are the gateway's, and live with its parser resolution.
+//! The names an operator gives the `--tool-call-parser` and `--reasoning-parser` flags, and a
+//! worker's `tool_parser` and `reasoning_parser` labels: a Symphony table's own name, or one of
+//! the other names a table answers to ([`answering_to`]: the gateway's older parser names whose
+//! format a table reads, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, and a launcher's
+//! name for a family whose table has no older parser), so a deployment's existing flags keep
+//! naming a working table. Of the older names no table answers to ([`UNANSWERED`]), a tool-call
+//! name is refused at startup and at a worker's registration with its reason, and a reasoning
+//! name passes and selects nothing, both places saying so with its reason. The crate knows a
+//! table by its own name only (`Table::named`): these names are the gateway's, and live with
+//! its parser resolution.
 
 use symphony::formats::Table;
 
 /// The table that answers to `name`: the table named so ([`Table::named`]), else the one whose
-/// format the legacy parser of that name reads ([`ALIASES`]); `None` for any other text.
+/// format the older parser of that name reads, or that a launcher names so ([`ALIASES`]); `None`
+/// for any other text.
 pub fn answering_to(name: &str) -> Option<Table> {
     Table::named(name).or_else(|| {
         let name = name.trim().to_ascii_lowercase();
@@ -21,19 +22,17 @@ pub fn answering_to(name: &str) -> Option<Table> {
     })
 }
 
-/// The other names a table answers to ([`answering_to`]): the gateway's older tool and
-/// reasoning parsers that read the table's format, so that a deployment that names one
-/// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway reads
-/// with Symphony. The rule, so that a deployment's existing flags keep a working parser under
-/// Symphony, the gateway's default parser: every legacy tool-call or reasoning parser's name
-/// whose format a table reads is an alias of that table; a legacy name no table answers to is
-/// in [`UNANSWERED`] with the reason (what it selects then is said there), `passthrough`
-/// among them, which leaves its channel as written, which no table reads for. A row may also be
-/// the name a downstream launcher passes for a model family whose table has no older parser
-/// (`muse` for `muse_spark`), so that the launcher's flags read with the table, or an engine's
-/// exact name for a table (`llama4_pythonic` for `llama4`, whose generic legacy name `pythonic`
-/// is in [`UNANSWERED`] while another family carries it).
-pub const ALIASES: [(&str, Table); 19] = [
+/// The other names a table answers to ([`answering_to`]): the gateway's older tool and reasoning
+/// parsers that read the table's format, so that a deployment that names one (`--tool-call-parser
+/// qwen_xml`) reads with the table (`qwen3_tagged`); every older parser's name whose format a
+/// table reads is an alias of that table, and an older name no table answers to is in
+/// [`UNANSWERED`] with the reason. A row may also be the name a downstream launcher passes for a
+/// model family whose table has no older parser (`muse` for `muse_spark`), so that the launcher's
+/// flags read with the table, or an engine's exact name for a table (`llama4_pythonic` for
+/// `llama4`, whose generic older name `pythonic` is in [`UNANSWERED`] while another family carries
+/// it). `passthrough`, the older parser that left its channel as written, names the `plain`
+/// table, which reads the whole output as content.
+pub const ALIASES: [(&str, Table); 21] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -44,6 +43,9 @@ pub const ALIASES: [(&str, Table); 19] = [
     ("deepseek31", Table::DeepSeekV3_1),
     ("deepseek_v31", Table::DeepSeekV3_1),
     ("deepseek", Table::DeepSeekV3),
+    // The R1 line's older reasoning name: V3's table reads its thought and the V3 calls the line
+    // writes after it, until the line has a table of its own; startup says so ([`NOTED`]).
+    ("deepseek_r1", Table::DeepSeekV3),
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("llama4_pythonic", Table::Llama4),
@@ -53,33 +55,39 @@ pub const ALIASES: [(&str, Table); 19] = [
     ("kimi_thinking", Table::KimiK2),
     ("kimi_k25", Table::KimiK2),
     // Llama 3.2's calls behind the python tag, `;` between them: the format Llama 3.1's models
-    // write, which the json table reads. One shape differs: the legacy parser took the tag
+    // write, which the json table reads. One shape differs: the older parser took the tag
     // anywhere in the text, prose before it as content; the table reads it at the output's
     // start only, as the engine's own reader of the family does, and an output with prose
     // before the tag is content whole (`docs/tables.md`, the JSON table).
     ("llama", Table::Json),
+    // The output as written, content and nothing else: what the older `passthrough` parser left,
+    // and what a model nothing else reads gets.
+    ("passthrough", Table::Plain),
 ];
 
-/// The legacy parsers' names no table answers to ([`answering_to`] gives `None`), each
-/// with the reason, so that every name of the gateway's two parser registries is accounted
-/// for: a legacy name is here or is one a table answers to, never both and never neither,
-/// which the gateway's test over its registries holds; so a new legacy name cannot go
-/// unmapped, and a table that takes a name here removes its row. Under Symphony a tool-call
-/// name here keeps the legacy parsers, and a reasoning name here alone selects nothing, so
-/// the next source decides: after a worker's labels the registry's table for a model it
-/// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
-/// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 12] = [
-    (
-        "passthrough",
-        "leaves its channel as written, which no table reads for: the way back to the \
-         legacy parsers for one model",
-    ),
+/// The older names a table answers to with a word at startup, each with what the operator learns:
+/// the family's own table is pending, so the name reads with another family's table for now
+/// (`regular::symphony::noted_name`). A row leaves when the family's table arrives and
+/// [`ALIASES`] points the name at it.
+pub const NOTED: [(&str, &str); 1] = [(
+    "deepseek_r1",
+    "DeepSeek R1's thought, which the R1 distills share, read with DeepSeek V3's table, which \
+     reads the V3 calls the line writes after it, until the R1 line has a table of its own",
+)];
+
+/// The gateway's older parser names no table answers to ([`answering_to`] gives `None`), each
+/// with the reason. A tool-call name here is refused at startup and at a worker's registration,
+/// with the reason beside the tables an operator may name (`regular::symphony::check_names`), so
+/// an operator who kept a flag from before the tables learns which table reads the family now. A
+/// reasoning name here passes and selects nothing, since the thought it named is a family's the
+/// tool-call name or the registry decides; startup and the registration say so with the reason
+/// (`regular::symphony::unanswered_reasoning`). A table that takes a name here removes its row.
+pub const UNANSWERED: [(&str, &str); 10] = [
     (
         "base",
         "a thought between `<think>` and `</think>` and nothing of a family's: the \
          registry's table reads a known model's thought, and an unknown model's the table \
-         the flags name, else the legacy parser",
+         the flags name, else `plain`",
     ),
     (
         "glm45",
@@ -96,11 +104,6 @@ pub const UNANSWERED: [(&str, &str); 12] = [
         "a thought two tables' families share, qwen3 (the Qwen3-2507 thinking line) and \
          qwen3_tagged (Qwen 3.5 and later): the tool-call name, qwen or qwen_xml, or the \
          registry decides",
-    ),
-    (
-        "deepseek_r1",
-        "DeepSeek R1's thought, which the R1 distills share; the tool-call name decides: \
-         deepseek reads the R1 line with DeepSeek V3's table",
     ),
     (
         "pythonic",
@@ -146,7 +149,8 @@ mod tests {
         }
         assert_eq!(answering_to("llama"), Some(Table::Json));
         assert_eq!(answering_to("pythonic"), None);
-        assert_eq!(answering_to("passthrough"), None);
+        // The older name of reading nothing: the plain table, by another name.
+        assert_eq!(answering_to("passthrough"), Some(Table::Plain));
         // A launcher's name for a family whose table has no older parser answers for the table.
         assert_eq!(answering_to("muse"), Some(Table::MuseSpark));
         assert_eq!(Table::named("muse"), None);

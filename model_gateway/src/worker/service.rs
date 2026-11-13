@@ -1182,7 +1182,7 @@ mod tests {
         let registry = Arc::new(WorkerRegistry::new());
         let url = "grpc://10.0.0.5:8000";
         let reserved = registry.reserve_id_for_url(url);
-        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry));
         // A queue that accepts a job and never runs it: no slot to run one in.
         let queue = JobQueue::new(
             JobQueueConfig {
@@ -1213,7 +1213,7 @@ mod tests {
     async fn a_patch_of_a_registration_in_flight_is_told_to_poll_it_and_leaves_its_claim() {
         let registry = Arc::new(WorkerRegistry::new());
         let url = "grpc://10.0.0.5:8000";
-        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry));
         // A queue that accepts jobs and never runs one: no slot to run one in.
         let queue = JobQueue::new(
             JobQueueConfig {
@@ -1262,7 +1262,7 @@ mod tests {
         let registry = Arc::new(WorkerRegistry::new());
         let url = "http://10.0.0.6:8000";
         let router_config = RouterConfig::default();
-        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry));
         assert!(
             context
                 .workflow_engines

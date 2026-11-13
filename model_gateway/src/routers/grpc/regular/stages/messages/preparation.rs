@@ -68,14 +68,6 @@ impl MessagePreparationStage {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer = utils::resolve_tokenizer(ctx, "MessagePreparationStage::prepare_messages")
             .map_err(|e| *e)?;
-        // Which parser reads this message: the request's X-SMG-Parser header
-        // when it carries one, else the gateway's --parser flag (see
-        // `regular::symphony`). Decided once here; the constraint below and
-        // request building read the same choice.
-        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
-            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
-        ctx.state.parser = Some(parser);
-
         // Step 1: The response spec, built here because its chat tools (the
         // custom tools, converted once) are what the template renders,
         // narrowed by tool_choice and shared with count_tokens so both render
@@ -298,11 +290,7 @@ mod tests {
             .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
             .await
             .unwrap();
-        let components = components_over(
-            tokenizer_registry,
-            Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
-        );
+        let components = components_over(tokenizer_registry, Arc::new(WorkerRegistry::new()));
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
             (json!({"effort": 2}), Ok("effort=2")),
@@ -368,11 +356,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let components = components_over(
-            tokenizer_registry,
-            Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
-        );
+        let components = components_over(tokenizer_registry, Arc::new(WorkerRegistry::new()));
         for (model, profile, rendered) in [
             (
                 "MiniMax-M3",
@@ -412,9 +396,11 @@ mod tests {
     }
 
     /// A structured output format, under `output_config.format` or the
-    /// field's earlier top-level name, is the answer's schema: where no table
-    /// reads the response the stage hands it to the engine as its own
-    /// JSON-schema constraint (a table gives it its tag instead, see
+    /// field's earlier top-level name, is the answer's schema, prepared as the
+    /// table's tag for a JSON answer: the `plain` table, which reads a model
+    /// no registry table names, has no tag for it, so the request's own schema
+    /// is the engine's constraint, taken where the worker is known
+    /// (`TagForStart::schema`; a table with a thought gives it its tag, see
     /// `regular::symphony::constraint`). A request without one is constrained
     /// by nothing.
     #[tokio::test]
@@ -446,11 +432,7 @@ mod tests {
             .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
             .await
             .unwrap();
-        let components = components_over(
-            tokenizer_registry,
-            Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
-        );
+        let components = components_over(tokenizer_registry, Arc::new(WorkerRegistry::new()));
         let schema = json!({
             "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]
         });
@@ -486,12 +468,20 @@ mod tests {
                 _ => panic!("{extra}: no messages preparation"),
             };
             let pair = match constraint {
-                Ok(symphony::Prepared::Constraint {
-                    constraint,
-                    first_token,
-                }) => {
-                    assert!(!first_token, "{extra}");
-                    Some(constraint.to_tuple())
+                Ok(symphony::Prepared::Answer(answer)) => {
+                    use crate::routers::grpc::{
+                        common::stages::helpers::TagForStart, utils::TagVocabulary,
+                    };
+                    let tag = answer
+                        .for_start(::symphony::GrammarStart::Unknown, TagVocabulary::Current)
+                        .unwrap_or_else(|error| panic!("{extra}: {error}"));
+                    assert!(
+                        tag.is_none(),
+                        "{extra}: the plain table has no tag: {tag:?}"
+                    );
+                    answer
+                        .schema()
+                        .map(|schema| ("json_schema".to_string(), schema.to_string()))
                 }
                 Ok(symphony::Prepared::None) => None,
                 other => panic!("{extra}: {other:?}"),

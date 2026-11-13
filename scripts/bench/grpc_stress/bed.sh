@@ -23,7 +23,7 @@
 #   MOCK_CORES   cpu list the fleet is pinned to [none]
 #   ENGINE_ARGS  mock engine flags [a realistic engine with fast prefill and 10 ms decode steps]
 #   GW_POLICY    the gateway's routing policy [cache_aware]
-#   GW_ARGS      extra gateway flags (e.g. "--parser symphony --trust-tenant-header")
+#   GW_ARGS      extra gateway flags (e.g. "--trust-tenant-header")
 #   GW_ENV       extra KEY=VALUE pairs for the gateway's environment (e.g. _RJEM_MALLOC_CONF=...)
 #   GW_LOG_LEVEL [warn]
 #   SCOPE        auto|1|0: run the gateway and the fleet each in a transient systemd user scope of their own

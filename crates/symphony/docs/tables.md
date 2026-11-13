@@ -284,12 +284,11 @@ is the terminal that leaves the call. Beyond that:
   thought and the prompt's replay puts it there; R1-0528's, R1-0528-Qwen3-8B's and the bf16
   mirror's end at the header, and the model writes `<think>` itself. The recorded sets (R1-0528, R1-0528-Qwen3-8B, the bf16
   mirror, Distill-Qwen-1.5B, Distill-Llama-8B) hold content alone, as the templates render a
-  message, and replay bitwise; the thought's two openings are held by the module's tests. Under
-  `--parser symphony` the ids select this table, so a deployment that named only the
-  `deepseek_r1` reasoning parser reads with the table by its model id; the reasoning parser's
-  name alone selects no table (it reads only a thought, and a table that reads V3's calls under
-  that name would be a wider reading than the name says), which an operator serving an R1 under an
-  opaque name settles by naming the table on both flags.
+  message, and replay bitwise; the thought's two openings are held by the module's tests. The
+  ids select this table, so a deployment that named only the `deepseek_r1` reasoning parser reads
+  with the table by its model id. The gateway also answers that older name with this table and
+  says so at startup: a wider reading than the name says, since the table reads V3's calls too,
+  kept until the R1 line has a table of its own.
 - **The recorded set holds no call**, for the reason given under V3.1; the calls stand on the turns
   the template renders, held in the module's tests at every cut.
 - **A forced call's tag writes the block**, from the same rows as V3.1's: each call is

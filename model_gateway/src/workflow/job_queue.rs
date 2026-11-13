@@ -1773,7 +1773,6 @@ mod tests {
         let context = app_context_for_tests(
             RouterConfig::default(),
             Arc::new(crate::worker::WorkerRegistry::new()),
-            None,
         );
         let queue = JobQueue::new(
             JobQueueConfig {
@@ -1889,7 +1888,6 @@ mod tests {
         let context = app_context_for_tests(
             RouterConfig::builder().build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         );
         let queue = JobQueue::new(
             JobQueueConfig {

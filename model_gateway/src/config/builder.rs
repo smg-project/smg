@@ -7,9 +7,9 @@ use smg_mcp::McpConfig;
 use super::{
     AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
     GroupedDpSticky, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-    PolicyEngineMode, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
-    RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    MetricsConfig, OracleConfig, PdPairingMode, PdReadinessConfig, PolicyConfig, PolicyEngineMode,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -677,12 +677,6 @@ impl RouterConfigBuilder {
 
     pub fn disable_tokenizer_autoload(mut self, disable: bool) -> Self {
         self.config.disable_tokenizer_autoload = disable;
-        self
-    }
-
-    /// Which parser reads a chat completion's output unless a request's header says otherwise.
-    pub fn parser(mut self, parser: ParserChoice) -> Self {
-        self.config.parser = parser;
         self
     }
 

@@ -90,17 +90,6 @@ impl GrpcRouter {
         // Get tokenizer registry (no longer requires pre-loaded tokenizer)
         let tokenizer_registry = ctx.tokenizer_registry.clone();
 
-        let reasoning_parser_factory = ctx
-            .reasoning_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
-            .clone();
-        let tool_parser_factory = ctx
-            .tool_parser_factory
-            .as_ref()
-            .ok_or_else(|| "gRPC router requires tool parser factory".to_string())?
-            .clone();
-
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
@@ -121,19 +110,14 @@ impl GrpcRouter {
         let shared_components = Arc::new(SharedComponents {
             tokenizer_registry: tokenizer_registry.clone(),
             worker_registry: worker_registry.clone(),
-            tool_parser_factory: tool_parser_factory.clone(),
-            reasoning_parser_factory: reasoning_parser_factory.clone(),
             parser_resolver: ParserResolver::new(
                 worker_registry.clone(),
                 ctx.configured_tool_parser.clone(),
                 ctx.configured_reasoning_parser.clone(),
-                &tool_parser_factory,
-                &reasoning_parser_factory,
             ),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
-            parser: ctx.router_config.parser,
             templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         });
 
@@ -163,23 +147,8 @@ impl GrpcRouter {
                 Mode::EncodePrefillDecode => {}
             }
         }
-        // Deps for the parser-consuming endpoints (chat/messages/harmony).
-        let configured_deps = PipelineDeps::new(
-            worker_registry.clone(),
-            policy_registry.clone(),
-            ctx.prefill_admission.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-            ctx.rate_limit_manager.clone(),
-            queue_timeout,
-        )
-        .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
-        // Deps for the parser-free endpoints (completion/embeddings/classify/
-        // decisions/transcription).
-        let pair_deps = PipelineDeps::pair(
+        // The deps every endpoint's pipeline is built from.
+        let deps = PipelineDeps::new(
             worker_registry.clone(),
             policy_registry.clone(),
             ctx.prefill_admission.clone(),
@@ -190,20 +159,19 @@ impl GrpcRouter {
         .with_grouped_dp_sticky(grouped_dp_sticky);
 
         // Present in every mode: chat/generate, messages, completion.
-        let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
+        let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &deps)
             .ok_or_else(|| format!("gRPC router: no chat pipeline for mode {mode:?}"))?;
-        let messages_pipeline = RequestPipeline::build(Endpoint::Messages, mode, &configured_deps)
+        let messages_pipeline = RequestPipeline::build(Endpoint::Messages, mode, &deps)
             .ok_or_else(|| format!("gRPC router: no messages pipeline for mode {mode:?}"))?;
-        let completion_pipeline = RequestPipeline::build(Endpoint::Completion, mode, &pair_deps)
+        let completion_pipeline = RequestPipeline::build(Endpoint::Completion, mode, &deps)
             .ok_or_else(|| format!("gRPC router: no completion pipeline for mode {mode:?}"))?;
 
         // `None` when the (endpoint, mode) combo is unsupported; those endpoints 501.
-        let harmony_pipeline = RequestPipeline::build(Endpoint::Harmony, mode, &configured_deps);
-        let embedding_pipeline = RequestPipeline::build(Endpoint::Embeddings, mode, &pair_deps);
-        let classify_pipeline = RequestPipeline::build(Endpoint::Classify, mode, &pair_deps);
-        let decisions_pipeline = RequestPipeline::build(Endpoint::Decisions, mode, &pair_deps);
-        let transcription_pipeline =
-            RequestPipeline::build(Endpoint::Transcription, mode, &pair_deps);
+        let harmony_pipeline = RequestPipeline::build(Endpoint::Harmony, mode, &deps);
+        let embedding_pipeline = RequestPipeline::build(Endpoint::Embeddings, mode, &deps);
+        let classify_pipeline = RequestPipeline::build(Endpoint::Classify, mode, &deps);
+        let decisions_pipeline = RequestPipeline::build(Endpoint::Decisions, mode, &deps);
+        let transcription_pipeline = RequestPipeline::build(Endpoint::Transcription, mode, &deps);
 
         // Responses contexts are the sole consumer of the MCP orchestrator; EPD
         // builds neither (it doesn't serve /v1/responses).

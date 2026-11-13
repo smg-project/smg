@@ -83,7 +83,7 @@ fn retry_reapplies_defaults_from_the_baseline_not_the_previous_worker() {
     // Worker B omits temperature: it must return to the baseline (1.0),
     // not keep worker A's 0.5.
     let worker_b = worker_with_defaults("grpc://worker-b:30000", Some(r#"{"top_k":9}"#));
-    restamp_plan_for_attempt(&mut plan, &stamp, &worker_b, &ToolParserFactory::new()).unwrap();
+    restamp_plan_for_attempt(&mut plan, &stamp, &worker_b).unwrap();
     {
         let params = sglang_params(&plan);
         assert_eq!(params.temperature, 1.0, "baseline restored, not worker A's");
@@ -93,7 +93,7 @@ fn retry_reapplies_defaults_from_the_baseline_not_the_previous_worker() {
     // Worker C has no defaults label at all: everything returns to the
     // baseline.
     let worker_c = worker_with_defaults("grpc://worker-c:30000", None);
-    restamp_plan_for_attempt(&mut plan, &stamp, &worker_c, &ToolParserFactory::new()).unwrap();
+    restamp_plan_for_attempt(&mut plan, &stamp, &worker_c).unwrap();
     {
         let params = sglang_params(&plan);
         assert_eq!(params.temperature, 1.0);

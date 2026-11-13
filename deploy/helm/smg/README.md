@@ -167,24 +167,18 @@ setting is ignored there.
 
 #### Parser
 
-`router.parser` picks the parser that reads a chat completion's reasoning and
-tool calls: `symphony` (one table per model family, the gateway's default from
-the release after 1.13.0 on) or `legacy` (the older per-model parsers). Empty,
-the default, renders no `--parser`, so the image's own default applies and the
-value is safe on every image. A set value needs a gateway image of 1.13.0 or
-later: the flag arrived in 1.13.0 (with `legacy` as its default there), and an
-earlier image rejects it and exits at startup. The choice applies to gRPC and
-ZMQ workers; an HTTP worker's engine parses its own output, so the value changes
-nothing there. A deployment that set `--parser` through `router.extraArgs` removes
-it there when it sets this value: the gateway refuses the flag twice and exits at
-startup. A request's `X-SMG-Parser` header overrides the flag for that
-request. `router.toolCallParser` and `router.reasoningParser` are read
-differently by each parser: under Symphony, a model the registry knows keeps
-its own table and the flags apply only to models it does not know; under
-`legacy`, each flag takes only a legacy parser's name of its own kind: `hf`
-and a Symphony-only name (`muse`, for one) are refused at startup, while a
-name a legacy parser of that kind also has (`qwen` as `toolCallParser`, for
-one) keeps that parser.
+The gateway reads every chat completion's reasoning and tool calls with Symphony, one table
+per model family. `router.parser` renders the `--parser` flag, which keeps its one value,
+`symphony`, for one release so that a deployment that set it keeps starting; the flag is
+removed in 1.17, so leave the value empty, the default, which renders no flag.
+`router.toolCallParser` and `router.reasoningParser` name a Symphony table, or a name a
+table answers to (an older parser's whose format a table reads, `qwen` for `qwen3`; a
+launcher's, `muse`): a worker's labels decide for its model, else the registry's table for a
+model it knows, else these two flags, else the output is read as plain text. A tool-call name
+no table answers to is refused at startup with the reason. A reasoning name no table answers
+to is refused too, unless it is an older reasoning parser's: that one is accepted, selects
+nothing, and startup says so with the reason. The choice applies to gRPC and ZMQ workers; an
+HTTP worker's engine parses its own output.
 
 #### Worker Discovery
 

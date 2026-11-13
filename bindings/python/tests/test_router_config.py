@@ -576,10 +576,9 @@ class TestRouterConstructorSignature:
 
 
 class TestRouterParserChoice:
-    """The launcher reads with Symphony unless ``--parser legacy`` is given: ``RouterArgs.parser``
-    is what ``Router.from_args`` hands to ``_Router(...)``, by name, so the binding's own
-    signature default never decides for a launcher-started router. The binding stores the
-    name and checks it, like every other name, when the router starts."""
+    """``RouterArgs.parser`` (symphony, the flag's one value) is what ``Router.from_args`` hands
+    to ``_Router(...)``, by name, so the binding's own signature default never decides for a
+    launcher-started router; the binding refuses any other value when the router starts."""
 
     @staticmethod
     def parser_handed_to_the_binding(args: RouterArgs) -> str:
@@ -592,8 +591,8 @@ class TestRouterParserChoice:
         assert RouterArgs().parser == "symphony"
         assert self.parser_handed_to_the_binding(RouterArgs()) == "symphony"
 
-    def test_legacy_is_handed_to_the_binding_as_spelled(self):
-        assert self.parser_handed_to_the_binding(RouterArgs(parser="legacy")) == "legacy"
+    def test_the_value_is_handed_to_the_binding_as_spelled(self):
+        assert self.parser_handed_to_the_binding(RouterArgs(parser="symphony")) == "symphony"
 
 
 class TestControlPlaneAuthHalfJwt:

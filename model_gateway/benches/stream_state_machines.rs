@@ -1,6 +1,6 @@
 //! The per-token paths of the gateway's stream state machines over a
-//! scripted engine stream: a chat under the legacy parsers and under a
-//! Symphony table, a completion, a generate and a Messages stream, each of
+//! scripted engine stream: a chat under a Symphony table, a completion, a
+//! generate and a Messages stream, each of
 //! 300 single-token chunks and a completion, as nanoseconds per chunk
 //! (criterion, `Throughput::Elements`) and allocations per stream (a
 //! counting allocator over the binary's jemalloc, printed once per row).
@@ -129,12 +129,9 @@ fn bench_streams(c: &mut Criterion) {
     let bench = runtime.block_on(StreamBench::start());
     let thinking = EngineScript::single_tokens(&thinking_text(TOKENS));
     let prose = EngineScript::single_tokens(&prose_text(TOKENS));
-    let rows: [Row<'_>; 5] = [
-        ("chat_legacy", &thinking, &|script| {
+    let rows: [Row<'_>; 4] = [
+        ("chat", &thinking, &|script| {
             runtime.block_on(bench.chat(script))
-        }),
-        ("chat_symphony", &thinking, &|script| {
-            runtime.block_on(bench.chat_symphony(script))
         }),
         ("completion", &prose, &|script| {
             runtime.block_on(bench.completion(script))

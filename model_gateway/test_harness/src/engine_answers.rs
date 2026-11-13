@@ -10,7 +10,11 @@
 //! proto it is healthy, aborts, flushes and reports default info, and answers
 //! nothing else.
 
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    sync::{atomic::AtomicUsize, Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use futures::Stream;
 use smg_grpc_client::{
@@ -407,5 +411,36 @@ impl<A: VllmAnswers> VllmEngine for VllmService<A> {
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
         self.0.subscribe_kv_events(request).await
+    }
+}
+
+/// The instants a mock engine was asked to abort a request, and its generate
+/// calls: what a test reads to prove the abort reached the engine, and when,
+/// and that the request was dispatched once.
+#[derive(Clone, Default)]
+pub struct Aborts {
+    at: Arc<Mutex<Vec<Instant>>>,
+    /// The engine's generate calls, counted by the mock at each call.
+    pub calls: Arc<AtomicUsize>,
+}
+
+impl Aborts {
+    /// An abort reaching the engine now.
+    #[expect(clippy::expect_used, reason = "test helper")]
+    pub fn note(&self) {
+        self.at.lock().expect("aborts lock").push(Instant::now());
+    }
+
+    /// The first abort's instant, waited for up to `within`.
+    #[expect(clippy::expect_used, reason = "test helper")]
+    pub async fn first_within(&self, within: Duration) -> Option<Instant> {
+        let started = Instant::now();
+        while started.elapsed() < within {
+            if let Some(at) = self.at.lock().expect("aborts lock").first().copied() {
+                return Some(at);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
     }
 }

@@ -651,7 +651,7 @@ struct Router {
     otlp_traces_endpoint: String,
     overlap_decay: f32,
     overload_token_usage_threshold: f32,
-    /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
+    /// The gateway's `--parser` flag, kept for one release with its one value, `symphony`.
     parser: String,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
@@ -1320,13 +1320,16 @@ impl Router {
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
 
-        let parser = config::ParserChoice::parse(&self.parser).ok_or_else(|| {
-            config::ConfigError::InvalidValue {
+        // The gateway reads with Symphony alone: the flag's one value, until the flag goes.
+        if !self.parser.trim().eq_ignore_ascii_case("symphony") {
+            return Err(config::ConfigError::InvalidValue {
                 field: "parser".to_string(),
                 value: self.parser.clone(),
-                reason: "expected legacy or symphony".to_string(),
-            }
-        })?;
+                reason: "the gateway reads with Symphony alone; `symphony` is the flag's one \
+                         value, and the flag is removed in 1.17"
+                    .to_string(),
+            });
+        }
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -1483,7 +1486,6 @@ impl Router {
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
-            .parser(parser)
             .history_backend(history_backend)
             .memory_config(config::MemoryConfig {
                 max_responses: self.history_memory_max_responses,
@@ -2517,52 +2519,52 @@ fn print_banner(host: &str, port: u16, mode: &str) {
     version::print_banner(host, port, mode);
 }
 
-/// Get the list of available tool call parsers from the Rust factory.
+/// The names `--tool-call-parser` takes ([`parser_choices`]).
 #[pyfunction]
 fn get_available_tool_call_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
-    PARSERS
-        .get_or_init(|| parser_choices(|tools, _| tools.list_parsers()))
-        .clone()
+    PARSERS.get_or_init(parser_choices).clone()
 }
 
-/// The choices of one parser flag: the names `legacy` picks from the two legacy registries (the
-/// flag's own kind), Symphony's tables' (`symphony::formats::Table::name`), which `--parser
-/// symphony` reads with when both flags name one, the names a table answers to that no legacy
-/// parser of either kind has (the gateway's `utils::ALIASES`: an engine's exact parser name for a
-/// family, or a launcher's name for one whose table has no older parser, which the gateway takes
-/// in either flag), and `hf`,
-/// the table a model's response template compiles into, sorted, each once.
-fn parser_choices(
-    legacy: impl FnOnce(&tool_parser::ParserFactory, &reasoning_parser::ParserFactory) -> Vec<String>,
-) -> Vec<String> {
-    let tools = tool_parser::ParserFactory::new();
-    let reasoning = reasoning_parser::ParserFactory::new();
-    let mut names = legacy(&tools, &reasoning);
-    names.extend(
-        symphony::formats::Table::ALL
-            .iter()
-            .map(|table| table.name().to_string()),
-    );
-    names.extend(
-        routers::grpc::utils::ALIASES
-            .iter()
-            .map(|(alias, _)| *alias)
-            .filter(|alias| !tools.has_parser(alias) && !reasoning.registry().has_parser(alias))
-            .map(str::to_string),
-    );
+/// The choices of both parser flags, one list: Symphony's tables' names
+/// (`symphony::formats::Table::name`), the other names a table answers to (the gateway's
+/// `utils::ALIASES`: an older parser's name whose format a table reads, an engine's exact parser
+/// name for a family, a launcher's name for one whose table has no older parser) and `hf`, the
+/// table a model's response template compiles into; sorted, each once.
+fn parser_choices() -> Vec<String> {
+    let mut names: Vec<String> = symphony::formats::Table::ALL
+        .iter()
+        .map(|table| table.name().to_string())
+        .chain(
+            routers::grpc::utils::ALIASES
+                .iter()
+                .map(|(alias, _)| alias.to_string()),
+        )
+        .collect();
     names.push(config::TEMPLATE_PARSER.to_string());
     names.sort();
     names.dedup();
     names
 }
 
-/// Get the list of available reasoning parsers from the Rust factory.
+/// The names `--reasoning-parser` takes: [`parser_choices`] and the older reasoning names no
+/// table answers to (the gateway's `utils::UNANSWERED`), which the gateway accepts and sets
+/// aside with a word at startup, so a launch script's flag pair keeps starting.
 #[pyfunction]
 fn get_available_reasoning_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
-        .get_or_init(|| parser_choices(|_, reasoning| reasoning.list_parsers()))
+        .get_or_init(|| {
+            let mut names = parser_choices();
+            names.extend(
+                routers::grpc::utils::UNANSWERED
+                    .iter()
+                    .map(|(name, _)| name.to_string()),
+            );
+            names.sort();
+            names.dedup();
+            names
+        })
         .clone()
 }
 

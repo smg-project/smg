@@ -16,12 +16,14 @@ use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
 };
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
+use symphony::{formats::qwen3, CallSyntax};
 use tokio::task::JoinHandle;
 
 use super::{
     super::*,
     eof::{
-        chunk, complete, messages_spec, processor, runtime, scripted_stream, CharacterTokenizer,
+        chunk, complete, messages_spec, processor, read_by, runtime, scripted_stream,
+        CharacterTokenizer, ASSISTANT_PROMPT,
     },
 };
 use crate::{
@@ -273,10 +275,14 @@ fn assert_pd_pair(rendered: &str, route: &str, records: f64, prefill_offsets: Du
 fn a_pd_chat_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
-        let response = Arc::new(processor(false))
+        let response = Arc::new(processor())
             .process_streaming_response(
                 result,
-                ChatResponseSpec::from(&chat_request()),
+                read_by(
+                    ChatResponseSpec::from(&chat_request()),
+                    qwen3(CallSyntax::Json),
+                    ASSISTANT_PROMPT,
+                ),
                 dispatch(),
                 Arc::new(CharacterTokenizer::default()),
                 false,
@@ -296,7 +302,7 @@ fn a_pd_chat_stream_anchors_at_the_prefill_dispatch() {
 fn a_pd_messages_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
-        let response = Arc::new(processor(false))
+        let response = Arc::new(processor())
             .process_messages_streaming_response(
                 result,
                 messages_spec(false),
@@ -319,7 +325,7 @@ fn a_pd_messages_stream_anchors_at_the_prefill_dispatch() {
 fn a_pd_completion_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
-        let response = Arc::new(processor(false))
+        let response = Arc::new(processor())
             .process_completion_streaming_response(
                 result,
                 completion_spec(json!("test")),
@@ -351,7 +357,7 @@ fn a_batched_pd_completion_stream_anchors_at_its_earliest_prefill_dispatch() {
         let (first, mut servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
         let (second, more) = pd_result(text_frames(), later).await;
         servers.extend(more);
-        let response = Arc::new(processor(false))
+        let response = Arc::new(processor())
             .process_completion_streaming_response(
                 ExecutionResult::Batch {
                     results: vec![first, second],
@@ -388,7 +394,7 @@ fn a_batched_pd_completion_stream_anchors_at_its_earliest_prefill_dispatch() {
 fn a_pd_generate_stream_anchors_at_the_prefill_dispatch() {
     let rendered = render_after(|| async {
         let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
-        let response = Arc::new(processor(false))
+        let response = Arc::new(processor())
             .process_streaming_generate(
                 result,
                 generate_spec(),
@@ -498,7 +504,7 @@ fn a_batched_single_completion_stream_anchors_at_its_earliest_dispatch() {
         let (first, first_server) = scripted_stream(text_frames(), "0").await;
         let (second, second_server) = scripted_stream(text_frames(), "0").await;
         let timing = pd_timing(PREFILL_OFFSET);
-        let response = Arc::new(processor(false))
+        let response = Arc::new(processor())
             .process_completion_streaming_response(
                 ExecutionResult::Batch {
                     results: vec![

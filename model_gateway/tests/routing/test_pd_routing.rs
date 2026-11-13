@@ -249,8 +249,6 @@ mod pd_routing_unit_tests {
                         .client(client)
                         .rate_limiter(rate_limiter)
                         .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-                        .reasoning_parser_factory(None) // reasoning_parser_factory
-                        .tool_parser_factory(None) // tool_parser_factory
                         .worker_registry(worker_registry)
                         .policy_registry(policy_registry)
                         .response_storage(response_storage)

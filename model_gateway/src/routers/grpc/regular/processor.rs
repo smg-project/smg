@@ -7,19 +7,16 @@ use std::{sync::Arc, time::Instant};
 
 use futures::future::try_join_all;
 use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, SequenceDecoderStep, StopSequenceDecoder},
+    stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::{ChatChoice, ChatCompletionMessage, ChatCompletionResponse},
-    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+    chat::{ChatChoice, ChatCompletionResponse},
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
 };
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use symphony::{adapt, Events};
-use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
 use crate::{
@@ -39,34 +36,28 @@ use crate::{
             spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
             utils::{
                 self,
-                isolation::{isolated, isolated_sync, Panicked, READER_PANICKED_CODE},
+                isolation::{isolated_sync, Panicked, READER_PANICKED_CODE},
             },
         },
     },
 };
 
+/// What a reader answers where request building assigned the response no table: every chat
+/// and Messages request is assigned one (`regular::stages::reading::decide`), so a spec without
+/// one reached the reader by another path.
+pub(super) const NO_TABLE: &str = "no table reads the response: request building assigned none";
+
 /// Unified response processor for both routers
 #[derive(Clone)]
 pub(crate) struct ResponseProcessor {
-    pub tool_parser_factory: ToolParserFactory,
-    pub reasoning_parser_factory: ReasoningParserFactory,
-    /// Per-request parser-name resolution (model-card override → configured).
-    pub parser_resolver: utils::ParserResolver,
     /// The `backend_type` label of the answers' token and generation
     /// records, the one the streaming processor beside it carries.
     backend_type: &'static str,
 }
 
 impl ResponseProcessor {
-    pub fn new(
-        tool_parser_factory: ToolParserFactory,
-        reasoning_parser_factory: ReasoningParserFactory,
-        parser_resolver: utils::ParserResolver,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
-            tool_parser_factory,
-            reasoning_parser_factory,
-            parser_resolver,
             backend_type: metrics_labels::BACKEND_REGULAR,
         }
     }
@@ -77,13 +68,11 @@ impl ResponseProcessor {
         self
     }
 
-    /// Process a single choice from GenerateComplete response
-    ///
-    /// Returns the choice and the number of output tokens the reasoning
-    /// parser routed to `reasoning_content` (0 when it did not run).
-    #[expect(clippy::too_many_arguments)]
-    pub async fn process_single_choice(
-        &self,
+    /// One choice of a GenerateComplete response, as the table request
+    /// building assigned reads it ([`Self::read_with_symphony`]). Returns the
+    /// choice and the number of output tokens the reader routed to
+    /// `reasoning_content`.
+    pub fn process_single_choice(
         request_id: &str,
         complete: &ProtoGenerateComplete,
         index: usize,
@@ -91,136 +80,26 @@ impl ResponseProcessor {
         model: &str,
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
-        history_tool_calls_count: usize,
-        reasoning_parser_available: bool,
-        tool_parser_available: bool,
-        // Resolved once per request by the caller: keeps every choice of one
-        // request on the same parser even if the worker registry changes
-        // between availability check and parsing.
-        reasoning_parser_name: Option<&str>,
-        tool_parser_name: Option<&str>,
     ) -> Result<(ChatChoice, u32), String> {
         stop_decoder.reset();
-        if let Some(assignment) = &original_request.symphony {
-            return Self::read_with_symphony(
-                request_id,
-                assignment,
-                complete,
-                index,
-                original_request,
-                model,
-                tokenizer,
-                stop_decoder,
-            );
-        }
-        let Decoded {
-            text: final_text,
-            token_ends,
-            stopped,
-            held: _,
-        } = decode_complete(
-            stop_decoder,
-            complete.output_ids(),
+        let assignment = original_request.symphony.as_ref().ok_or(NO_TABLE)?;
+        Self::read_with_symphony(
             request_id,
-            index as u32,
-        )
-        .map_err(|e| e.to_string())?
-        .with_eager_token_ends(
-            original_request.separate_reasoning && reasoning_parser_available,
+            assignment,
+            complete,
+            index,
+            original_request,
+            model,
             tokenizer,
-            complete.output_ids(),
-            stop_decoder.skip_special_tokens(),
-        );
-
-        // Steps 1 and 2: the reasoning split out, then the tool calls parsed
-        // from the content (shared with the Messages reader).
-        let ReasoningSplit {
-            content: processed_text,
-            reasoning: reasoning_text,
-            reasoning_tokens,
-        } = self.split_reasoning(
-            final_text,
-            &token_ends,
-            ReasoningSource {
-                wanted: original_request.separate_reasoning && reasoning_parser_available,
-                in_prefill: original_request.reasoning_in_prefill,
-                parser_name: reasoning_parser_name,
-                model,
-            },
-        );
-        let (tool_calls, processed_text) = self
-            .parse_calls(
-                processed_text,
-                ToolCallSource {
-                    tools: original_request.tools.as_deref(),
-                    tool_choice: original_request.tool_choice.as_ref(),
-                    model,
-                    parser_name: tool_parser_name,
-                    parser_available: tool_parser_available,
-                    history_tool_calls_count,
-                    first_call_only: original_request.first_tool_call_only,
-                },
-            )
-            .await;
-
-        // Step 3: Determine finish reason (a local stop beats the engine's).
-        let finish_reason_str = finish_after_local_stop(stopped, complete);
-
-        // Parsed calls do not override an engine truncation or failure.
-        let final_finish_reason_str = if tool_calls.is_some()
-            && !matches!(finish_reason_str, "length" | "failed" | "error")
-        {
-            "tool_calls"
-        } else {
-            finish_reason_str
-        };
-
-        let matched_stop = matched_stop_value(stop_decoder, complete);
-
-        // Step 4: Build ChatCompletionMessage (proper response message type)
-        let chat_message = ChatCompletionMessage {
-            role: "assistant".to_string(),
-            // Whitespace-only residual (e.g. "\n\n" between </think> and <tool_call>)
-            // must be None, not Some("\n\n") — see normalize_assistant_content.
-            content: normalize_assistant_content(processed_text),
-            refusal: None,
-            annotations: Vec::new(),
-            tool_calls,
-            reasoning_content: reasoning_text,
-        };
-
-        // Step 5: the output logprobs as the engine reports them: one entry
-        // per generated token, in generation order, as the engine's own
-        // server returns them and as a stream's chunks carry them. The
-        // reasoning span, the markers, the text of a tool call and the stop
-        // token are in the list like the content: a client reads the
-        // model's margin at every position of the output, and the list's
-        // length is the completion's token count on both sides.
-        let logprobs = complete.output_logprobs().map(|proto_logprobs| {
-            utils::convert_proto_to_openai_logprobs(
-                proto_logprobs,
-                tokenizer,
-                original_request.top_logprobs,
-            )
-        });
-
-        // Step 6: Build ChatChoice
-        let choice = ChatChoice {
-            index: index as u32,
-            message: chat_message,
-            logprobs,
-            finish_reason: Some(final_finish_reason_str.to_string()),
-            matched_stop,
-            hidden_states: None,
-        };
-        Ok((choice, reasoning_tokens))
+            stop_decoder,
+        )
     }
 
     /// The choice as Symphony reads it (see `regular::symphony`): the output as
     /// one delta through the stop decoder, the decoder's last text once decoding
     /// is finished, the engine's finish, and the message the events fold into.
-    /// The matched stop is set as on the older path, and the logprobs are the
-    /// engine's, one entry per generated token, as the older path's are.
+    /// The matched stop is the decoder's or the engine's, and the logprobs are the
+    /// engine's, one entry per generated token.
     #[expect(clippy::too_many_arguments)]
     fn read_with_symphony(
         request_id: &str,
@@ -241,8 +120,8 @@ impl ResponseProcessor {
         let mut reader = Reader::new(assignment, tools, &mut events)?
             .first_call_only(original_request.first_tool_call_only);
         let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
-        // Complete token decoding, including bytes and a partial stop match, as
-        // on the older path; the text it releases is the last token's.
+        // Complete token decoding, including bytes and a partial stop match;
+        // the text it releases is the last token's.
         let tail = stop_decoder
             .finish()
             .map_err(|e| reader.failed(format!("Failed to finish token decoding: {e}")))?;
@@ -263,8 +142,8 @@ impl ResponseProcessor {
             finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);
         let mut choice = adapt::chat::message(index as u32, &events);
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
-        // The output's logprobs as the engine reports them, one entry per generated token, as
-        // on the older path: a message without content keeps them like any other.
+        // The output's logprobs as the engine reports them, one entry per generated token:
+        // a message without content keeps them like any other.
         choice.logprobs = complete.output_logprobs().map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
@@ -278,13 +157,13 @@ impl ResponseProcessor {
     /// The message as Symphony reads it (see `regular::symphony`): the output as one delta
     /// through the stop decoder, the decoder's last text once decoding is finished, the engine's
     /// finish, and the content blocks the events fold into (`adapt::messages::output`). A stop
-    /// sequence the decoder or the engine matched is the stop reason, as on the older path; the
+    /// sequence the decoder or the engine matched is the stop reason; the
     /// thinking tokens are the engine's, or the reasoning text's, when the request asked for
     /// thinking. A call whose arguments no `tool_use` input holds refuses the message
     /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word;
     /// the caller counts the refusal under the table ([`telemetry::record_refused`]). A call whose
     /// arguments are a whole value of another kind than an object (a double-encoded or bare string,
-    /// an array) carries `{}` with a word in the log ([`object_input`]), as on the older path.
+    /// an array) carries `{}` with a word in the log ([`object_input`]).
     fn read_messages_with_symphony(
         dispatch: &DispatchMetadata,
         assignment: &Assignment,
@@ -326,8 +205,8 @@ impl ResponseProcessor {
             )));
         }
         // Arguments that are a whole value of another kind (a double-encoded or
-        // bare string, an array) become `{}` with a word in the log, as on the
-        // older path: the request side takes no other `input`.
+        // bare string, an array) become `{}` with a word in the log: the request
+        // side takes no other `input`.
         object_inputs(&mut output.content, "read_messages_with_symphony");
         if !request.thinking_text_returned {
             utils::message_utils::omit_thinking_text(&mut output.content);
@@ -386,83 +265,33 @@ impl ResponseProcessor {
     {
         let started = generation_start(&execution_result);
         let model = &dispatch.model;
-        let reasoning_parser_name = self
-            .parser_resolver
-            .reasoning_parser_for(chat_request.parser_names.as_ref(), model);
-        let tool_parser_name = self
-            .parser_resolver
-            .tool_parser_for(chat_request.parser_names.as_ref(), model);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
-
-        let history_tool_calls_count = chat_request.history_tool_calls_count;
-
-        // Check parser availability once upfront (not per choice). Where a Symphony table
-        // reads the response its reader takes the thought, and no legacy parser is built to
-        // be asked whether one is available.
-        let reasoning_parser_available = chat_request.separate_reasoning
-            && chat_request.symphony.is_none()
-            && utils::check_reasoning_parser_availability(
-                &self.reasoning_parser_factory,
-                reasoning_parser_name.as_deref(),
-                model,
-            );
-
-        let tool_choice_enabled = !matches!(
-            &chat_request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        );
-
-        let tool_parser_available = tool_choice_enabled
-            && chat_request.tools.is_some()
-            && chat_request.symphony.is_none()
-            && utils::check_tool_parser_availability(
-                &self.tool_parser_factory,
-                tool_parser_name.as_deref(),
-                model,
-            );
-
-        // Log once per request (not per choice)
-        if chat_request.separate_reasoning
-            && chat_request.symphony.is_none()
-            && !reasoning_parser_available
-        {
-            tracing::debug!(
-                "No reasoning parser found for model '{model}', skipping reasoning parsing"
-            );
-        }
-
-        if chat_request.tools.is_some()
-            && tool_choice_enabled
-            && chat_request.symphony.is_none()
-            && !tool_parser_available
-        {
-            tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
-        }
+        // The table that reads every choice, assigned by request building.
+        let table = chat_request
+            .symphony
+            .as_ref()
+            .map(Assignment::table)
+            .ok_or_else(|| error::internal_error("no_table_assigned", NO_TABLE))?;
 
         // Process all choices. Each choice's reading is isolated: a panic in
         // it is this request's 500, not the connection's end (see
         // `utils::isolation`).
-        let table = chat_request.symphony.as_ref().map(Assignment::table);
         let mut choices = Vec::new();
         let mut parsed_reasoning_tokens = 0;
         for (index, complete) in all_responses.iter().enumerate() {
-            let read = isolated(self.process_single_choice(
-                &dispatch.request_id,
-                complete,
-                index,
-                &chat_request,
-                model,
-                &tokenizer,
-                stop_decoder,
-                history_tool_calls_count,
-                reasoning_parser_available,
-                tool_parser_available,
-                reasoning_parser_name.as_deref(),
-                tool_parser_name.as_deref(),
-            ))
-            .await;
+            let read = isolated_sync(|| {
+                Self::process_single_choice(
+                    &dispatch.request_id,
+                    complete,
+                    index,
+                    &chat_request,
+                    model,
+                    &tokenizer,
+                    stop_decoder,
+                )
+            });
             match read {
                 Ok(Ok((choice, reasoning_tokens))) => {
                     choices.push(choice);
@@ -475,7 +304,7 @@ impl ResponseProcessor {
                     ));
                 }
                 Err(panicked) => {
-                    let panicked = panicked.read_by(table);
+                    let panicked = panicked.read_by(Some(table));
                     panicked.record(&dispatch.request_id, model);
                     return Err(reader_panicked(&panicked));
                 }
@@ -483,17 +312,16 @@ impl ResponseProcessor {
         }
 
         // The usage from the gRPC response counters, built as the streamed
-        // answer builds its usage chunk: with the reasoning tokens the
-        // gateway's parser split off when it ran (zero included) and every
-        // detail counter present as the OpenAI API sends it.
+        // answer builds its usage chunk: with the reasoning tokens the table
+        // read (zero included) and every detail counter present as the
+        // OpenAI API sends it.
         let counts = response_formatting::TokenCounts::of_collected(
             &all_responses,
             chat_request.expected_choices,
         );
         let usage = response_formatting::chat_usage(
             counts.usage(),
-            (reasoning_parser_available || chat_request.symphony.is_some())
-                .then_some(parsed_reasoning_tokens),
+            Some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
             chat_request.image_tokens,
         );
@@ -519,162 +347,6 @@ impl ResponseProcessor {
             output_tokens: u64::from(counts.completion),
         });
         Ok((response, counts))
-    }
-
-    /// Split the reasoning out of a decoded choice when the request wants
-    /// it, with a fresh parser (non-streaming extraction keeps no state
-    /// across requests, so the shared pooled mutex is not serialized on); a
-    /// prompt that ends inside the thinking block starts the parser in
-    /// reasoning mode. A parse error leaves the text whole, as before.
-    fn split_reasoning(
-        &self,
-        text: String,
-        token_ends: &[usize],
-        source: ReasoningSource<'_>,
-    ) -> ReasoningSplit {
-        let mut split = ReasoningSplit {
-            content: text,
-            reasoning: None,
-            reasoning_tokens: 0,
-        };
-        if !source.wanted {
-            return split;
-        }
-        let Some(mut parser) = utils::create_reasoning_parser(
-            &self.reasoning_parser_factory,
-            source.parser_name,
-            source.model,
-        ) else {
-            return split;
-        };
-        if source.in_prefill {
-            parser.mark_reasoning_started();
-        }
-        match parser.detect_and_parse_reasoning(&split.content) {
-            Ok(result) => {
-                if !result.reasoning_text.is_empty() {
-                    split.reasoning_tokens = reasoning_span_tokens(
-                        token_ends,
-                        &split.content,
-                        &result.reasoning_text,
-                        &result.normal_text,
-                    );
-                    split.reasoning = Some(result.reasoning_text);
-                }
-                split.content = result.normal_text;
-            }
-            Err(e) => {
-                warn!("Reasoning parsing error, skipping parsing: {e}");
-            }
-        }
-        split
-    }
-
-    /// Parse the tool calls out of the content when the request offers tools
-    /// and its choice allows calls: through the JSON-schema path when the
-    /// choice forced a call and the parser's format is not native (the
-    /// constraint shaped the output), else through the tool parser when one
-    /// is available; the first call alone when the request asked for it.
-    async fn parse_calls(
-        &self,
-        content: String,
-        source: ToolCallSource<'_>,
-    ) -> (Option<Vec<ToolCall>>, String) {
-        let mut tool_calls: Option<Vec<ToolCall>> = None;
-        let mut content = content;
-        let enabled = !matches!(
-            source.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        );
-        if let (true, Some(tools)) = (enabled, source.tools) {
-            let native_tool_format = self
-                .tool_parser_factory
-                .registry()
-                .uses_native_tool_format(source.parser_name);
-            if forced_call_shapes_output(native_tool_format, source.tool_choice) {
-                (tool_calls, content) = utils::parse_json_schema_response(
-                    &content,
-                    source.tool_choice,
-                    source.model,
-                    source.history_tool_calls_count,
-                );
-            } else if source.parser_available {
-                (tool_calls, content) = self
-                    .parse_tool_calls(
-                        &content,
-                        source.model,
-                        source.parser_name,
-                        tools,
-                        source.history_tool_calls_count,
-                    )
-                    .await;
-            }
-        }
-        if source.first_call_only {
-            utils::keep_first_tool_call(&mut tool_calls);
-        }
-        (tool_calls, content)
-    }
-
-    /// Parse tool calls using model-specific parser
-    pub async fn parse_tool_calls(
-        &self,
-        processed_text: &str,
-        model: &str,
-        // Resolved once per request by the caller (see process_single_choice).
-        tool_parser_name: Option<&str>,
-        tools: &[Tool],
-        history_tool_calls_count: usize,
-    ) -> (Option<Vec<ToolCall>>, String) {
-        // Get pooled parser for this model
-        let pooled_parser =
-            utils::get_tool_parser(&self.tool_parser_factory, tool_parser_name, model);
-
-        // Try parsing directly (parser will handle detection internally). Pass the
-        // tool schemas so schema-aware parsers coerce argument types by their
-        // declared type instead of guessing from the raw text.
-        let result = {
-            let parser = pooled_parser.lock().await;
-            parser
-                .parse_complete_with_tools(processed_text, tools)
-                .await
-            // Lock is dropped here
-        };
-
-        match result {
-            Ok((normal_text, parsed_tool_calls)) => {
-                if parsed_tool_calls.is_empty() {
-                    return (None, normal_text);
-                }
-
-                let spec_tool_calls = parsed_tool_calls
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, tc)| {
-                        // Generate ID for this tool call
-                        let id = utils::generate_tool_call_id(
-                            model,
-                            &tc.function.name,
-                            index,
-                            history_tool_calls_count,
-                        );
-                        ToolCall {
-                            id,
-                            tool_type: "function".to_string(),
-                            function: FunctionCallResponse {
-                                name: tc.function.name,
-                                arguments: Some(tc.function.arguments),
-                            },
-                        }
-                    })
-                    .collect();
-                (Some(spec_tool_calls), normal_text)
-            }
-            Err(e) => {
-                error!("Tool call parsing error: {}", e);
-                (None, processed_text.to_string())
-            }
-        }
     }
 
     /// Process non-streaming generate response (collects all responses and builds final response array)
@@ -786,17 +458,9 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         messages_request: MessagesResponseSpec,
         dispatch: DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
         let started = generation_start(&execution_result);
-        let model = &dispatch.model;
-        let reasoning_parser_name = self
-            .parser_resolver
-            .reasoning_parser_for(messages_request.parser_names.as_ref(), model);
-        let tool_parser_name = self
-            .parser_resolver
-            .tool_parser_for(messages_request.parser_names.as_ref(), model);
         // Collect all responses (no logprobs for Messages API)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
 
@@ -827,10 +491,10 @@ impl ResponseProcessor {
         }
         #[expect(clippy::unwrap_used, reason = "safe: checked len == 1 above")]
         let complete = all_responses.into_iter().next().unwrap();
-        // The engine's counters, for the settlement, whichever reader builds the message.
+        // The engine's counters, for the settlement.
         let counts = response_formatting::TokenCounts::of(std::slice::from_ref(&complete));
         // The records a streamed message makes at its end; a collected one
-        // shows no first token. Made once the read succeeded, on either path.
+        // shows no first token. Made once the read succeeded.
         let record = || {
             Metrics::record_streaming_metrics(StreamingMetricsParams {
                 router_type: metrics_labels::ROUTER_GRPC,
@@ -844,270 +508,45 @@ impl ResponseProcessor {
                 output_tokens: u64::from(counts.completion),
             });
         };
-        if let Some(assignment) = &messages_request.symphony {
-            // The reading, isolated: a panic in it is this request's 500,
-            // not the connection's end (see `utils::isolation`).
-            let read = isolated_sync(|| {
-                Self::read_messages_with_symphony(
-                    &dispatch,
-                    assignment,
-                    &complete,
-                    &messages_request,
-                    stop_decoder,
-                )
-            });
-            return match read {
-                Ok(Ok(message)) => {
-                    record();
-                    Ok((message, counts))
-                }
-                // The output's own doing: the model wrote arguments no tool_use input holds.
-                Ok(Err(SymphonyError::InputRefused(why))) => {
-                    telemetry::record_refused(telemetry::table_label(assignment.format.name()));
-                    warn!(function = "process_non_streaming_messages_response", error = %why, "the message's tool_use input cannot carry the model's arguments");
-                    Err(error::internal_error(
-                        "symphony_tool_use_input_refused",
-                        why,
-                    ))
-                }
-                Ok(Err(e)) => {
-                    error!(function = "process_non_streaming_messages_response", error = %e, "Symphony failed to read the message");
-                    Err(error::internal_error("symphony_read_failed", e.to_string()))
-                }
-                Err(panicked) => {
-                    let panicked = panicked.read_by(Some(assignment.table()));
-                    panicked.record(&dispatch.request_id, &dispatch.model);
-                    Err(reader_panicked(&panicked))
-                }
-            };
-        }
-
-        // The older parsers' reading, isolated like the Symphony read: a
-        // panic in it is this request's 500, not the connection's end.
-        let read = isolated(self.read_message_with_the_older_parsers(
-            &dispatch,
-            &messages_request,
-            &complete,
-            &tokenizer,
-            stop_decoder,
-            reasoning_parser_name.as_deref(),
-            tool_parser_name.as_deref(),
-        ))
-        .await;
+        let assignment = messages_request
+            .symphony
+            .as_ref()
+            .ok_or_else(|| error::internal_error("no_table_assigned", NO_TABLE))?;
+        // The reading, isolated: a panic in it is this request's 500, not
+        // the connection's end (see `utils::isolation`).
+        let read = isolated_sync(|| {
+            Self::read_messages_with_symphony(
+                &dispatch,
+                assignment,
+                &complete,
+                &messages_request,
+                stop_decoder,
+            )
+        });
         match read {
             Ok(Ok(message)) => {
                 record();
                 Ok((message, counts))
             }
-            Ok(Err(response)) => Err(response),
+            // The output's own doing: the model wrote arguments no tool_use input holds.
+            Ok(Err(SymphonyError::InputRefused(why))) => {
+                telemetry::record_refused(telemetry::table_label(assignment.format.name()));
+                warn!(function = "process_non_streaming_messages_response", error = %why, "the message's tool_use input cannot carry the model's arguments");
+                Err(error::internal_error(
+                    "symphony_tool_use_input_refused",
+                    why,
+                ))
+            }
+            Ok(Err(e)) => {
+                error!(function = "process_non_streaming_messages_response", error = %e, "Symphony failed to read the message");
+                Err(error::internal_error("symphony_read_failed", e.to_string()))
+            }
             Err(panicked) => {
-                let panicked = panicked.read_by(None);
+                let panicked = panicked.read_by(Some(assignment.table()));
                 panicked.record(&dispatch.request_id, &dispatch.model);
                 Err(reader_panicked(&panicked))
             }
         }
-    }
-
-    /// The message as the older parsers read it (the reasoning split, then the
-    /// tool calls out of the content, the blocks assembled): the whole of a
-    /// `/v1/messages` answer no Symphony table reads, run isolated by its
-    /// caller as the Symphony read is.
-    #[expect(clippy::too_many_arguments)]
-    async fn read_message_with_the_older_parsers(
-        &self,
-        dispatch: &DispatchMetadata,
-        messages_request: &MessagesResponseSpec,
-        complete: &ProtoGenerateComplete,
-        tokenizer: &Arc<dyn Tokenizer>,
-        stop_decoder: &mut StopSequenceDecoder,
-        reasoning_parser_name: Option<&str>,
-        tool_parser_name: Option<&str>,
-    ) -> Result<Message, axum::response::Response> {
-        let model = &dispatch.model;
-        // Check parser availability. Run parser when the user explicitly enabled thinking,
-        // or when the selected parser needs structural special tokens (e.g. Inkling).
-        let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
-            &self.reasoning_parser_factory,
-            reasoning_parser_name,
-            model,
-        );
-        let separate_reasoning =
-            reasoning_requires_special_tokens || messages_request.thinking_requested;
-        let reasoning_parser_available = separate_reasoning
-            && utils::check_reasoning_parser_availability(
-                &self.reasoning_parser_factory,
-                reasoning_parser_name,
-                model,
-            );
-
-        let tool_choice_enabled = !matches!(
-            &messages_request.tool_choice,
-            Some(messages::ToolChoice::None)
-        );
-
-        let tool_parser_available = tool_choice_enabled
-            && messages_request.has_tools
-            && utils::check_tool_parser_availability(
-                &self.tool_parser_factory,
-                tool_parser_name,
-                model,
-            );
-
-        if separate_reasoning && !reasoning_parser_available {
-            tracing::debug!(
-                "No reasoning parser found for model '{model}', reasoning content will not be separated"
-            );
-        }
-
-        if messages_request.has_tools && tool_choice_enabled && !tool_parser_available {
-            tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
-        }
-
-        let Decoded {
-            text: final_text,
-            token_ends,
-            stopped,
-            held: _,
-        } = decode_complete(stop_decoder, complete.output_ids(), &dispatch.request_id, 0)
-            .map_err(|e| {
-                if let DecodeFailure::Process(_) = e {
-                    error!(function = "process_non_streaming_messages_response", error = %e.detail(), "Failed to process tokens");
-                }
-                error::internal_error("process_tokens_failed", e.to_string())
-            })?
-            .with_eager_token_ends(
-                reasoning_parser_available,
-                tokenizer,
-                complete.output_ids(),
-                stop_decoder.skip_special_tokens(),
-            );
-
-        // Steps 1 and 2: the reasoning split out, then the tool calls parsed
-        // from the content (shared with the chat reader); the Messages tool
-        // choice reads as its chat form, whose `forces_call` is the one rule
-        // for the JSON-schema path.
-        let ReasoningSplit {
-            content: processed_text,
-            reasoning: reasoning_text,
-            reasoning_tokens: thinking_tokens,
-        } = self.split_reasoning(
-            final_text,
-            &token_ends,
-            ReasoningSource {
-                wanted: reasoning_parser_available,
-                in_prefill: messages_request.reasoning_in_prefill,
-                parser_name: reasoning_parser_name,
-                model,
-            },
-        );
-        let chat_tool_choice = messages_request.tool_choice.as_ref().map(ToolChoice::from);
-        let (tool_calls, processed_text) = self
-            .parse_calls(
-                processed_text,
-                ToolCallSource {
-                    tools: messages_request
-                        .has_tools
-                        .then_some(&messages_request.chat_tools[..]),
-                    tool_choice: chat_tool_choice.as_ref(),
-                    model,
-                    parser_name: tool_parser_name,
-                    parser_available: tool_parser_available,
-                    history_tool_calls_count: messages_request.history_tool_calls_count,
-                    first_call_only: messages_request.first_tool_call_only,
-                },
-            )
-            .await;
-
-        // Step 3: Build content blocks
-        let mut content_blocks: Vec<messages::ContentBlock> = Vec::new();
-
-        // Thinking block first (if present)
-        if let Some(thinking) = reasoning_text {
-            content_blocks.push(messages::ContentBlock::Thinking {
-                thinking,
-                signature: String::new(),
-            });
-        }
-
-        // Text block (only if non-whitespace; a bare "\n\n" residual must not become one).
-        if !processed_text.trim().is_empty() {
-            content_blocks.push(messages::ContentBlock::Text {
-                text: processed_text,
-                citations: None,
-            });
-        }
-
-        // Tool use blocks (convert from OpenAI ToolCall format)
-        if let Some(calls) = &tool_calls {
-            for tc in calls {
-                let input = tool_use_input(tc.function.arguments.as_deref(), &tc.id);
-
-                content_blocks.push(messages::ContentBlock::ToolUse {
-                    id: utils::message_utils::anthropic_tool_use_id(&tc.id),
-                    name: tc.function.name.clone(),
-                    input,
-                    caller: messages::ToolUseCaller::Direct,
-                });
-            }
-        }
-        if !messages_request.thinking_text_returned {
-            utils::message_utils::omit_thinking_text(&mut content_blocks);
-        }
-
-        // Step 4: Determine stop_reason and stop_sequence (derived from same
-        // conditions): a local stop beats the engine's reason, and the matched
-        // sequence is surfaced for a StopSequence result.
-        let finish_reason_str = finish_after_local_stop(stopped, complete);
-        let stop_sequence = matched_stop_string(stop_decoder, complete);
-
-        // Parsed calls do not override a truncation, as in Chat. The engines
-        // report the request's budget and the model's window alike as
-        // `length`; the spec tells them apart from the counts.
-        let stop_reason = if finish_reason_str == "length" {
-            Some(
-                messages_request
-                    .length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
-            )
-        } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
-            Some(messages::StopReason::ToolUse)
-        } else if stop_sequence.is_some() {
-            Some(messages::StopReason::StopSequence)
-        } else {
-            Some(messages::StopReason::EndTurn)
-        };
-
-        // Clear stop_sequence when stop_reason is not StopSequence
-        let stop_sequence = if matches!(stop_reason, Some(messages::StopReason::StopSequence)) {
-            stop_sequence
-        } else {
-            None
-        };
-
-        // Step 5: Build usage. The engine's prefix-cache hit is the cache-read
-        // count. A turn that ran with thinking reports its thinking tokens:
-        // the engine's own count when it keeps one, else the tokens the parser
-        // placed in the thinking span.
-        let thinking_requested = messages_request.thinking_requested;
-        let usage = messages_usage_from_counts(
-            complete.prompt_tokens(),
-            complete.completion_tokens(),
-            complete.cached_tokens(),
-            thinking_requested.then_some(complete.reasoning_tokens().max(thinking_tokens)),
-        );
-
-        // Step 6: Build Message
-        Ok(Message {
-            id: dispatch.request_id.clone(),
-            message_type: "message".to_string(),
-            role: "assistant".to_string(),
-            content: content_blocks,
-            model: dispatch.model.clone(),
-            stop_reason,
-            stop_sequence,
-            stop_details: None,
-            usage,
-            container: None,
-        })
     }
 
     /// Process non-streaming completion response
@@ -1303,39 +742,6 @@ pub(crate) fn generation_start(execution_result: &ExecutionResult) -> Instant {
     }
 }
 
-/// The reasoning split out of a decoded choice: the content after it, the
-/// reasoning text, and the reasoning's tokens by the token ends.
-struct ReasoningSplit {
-    content: String,
-    reasoning: Option<String>,
-    reasoning_tokens: u32,
-}
-
-/// What the reasoning split reads from the request: whether the request
-/// wants the split at all (its separate-reasoning switch, with a parser
-/// available), whether the rendered prompt ends inside the thinking block,
-/// the parser the request resolved to, and the model.
-struct ReasoningSource<'a> {
-    wanted: bool,
-    in_prefill: bool,
-    parser_name: Option<&'a str>,
-    model: &'a str,
-}
-
-/// What a tool-call parse reads from the request: the tools it offered (none
-/// when it offered none), its tool choice in the chat form, the model, the
-/// parser the request resolved to and whether it is available, how many
-/// calls the history already holds, and whether the first call alone is kept.
-struct ToolCallSource<'a> {
-    tools: Option<&'a [Tool]>,
-    tool_choice: Option<&'a ToolChoice>,
-    model: &'a str,
-    parser_name: Option<&'a str>,
-    parser_available: bool,
-    history_tool_calls_count: usize,
-    first_call_only: bool,
-}
-
 /// The 500 a whole response whose reading panicked is answered with: under
 /// [`READER_PANICKED_CODE`], and never retried. The panic is the gateway's
 /// own, on this output; another attempt would run the engine again for the
@@ -1347,50 +753,13 @@ fn reader_panicked(panicked: &Panicked) -> axum::response::Response {
     response
 }
 
-/// Whether a forced call shaped the output as JSON the constraint dictated
-/// (so the JSON-schema path reads it): the choice forces a call and the
-/// parser's format is not native. One rule for the chat choice and the
-/// Messages choice read as its chat form.
-fn forced_call_shapes_output(native_tool_format: bool, tool_choice: Option<&ToolChoice>) -> bool {
-    !native_tool_format && tool_choice.is_some_and(ToolChoice::forces_call)
-}
-
 /// A choice's output decoded through the stop decoder, as every non-streaming
-/// reader decodes it: the text up to a stop, where each token's text ends in
-/// it (the last token taking the decoder's tail), whether a stop fired at any
-/// token or in the tail, and whether the decoder held text back for bytes
-/// still to come.
+/// reader decodes it: the text up to a stop, and whether a stop fired at any
+/// token or in the tail.
 #[derive(Debug)]
 struct Decoded {
     text: String,
-    token_ends: Vec<usize>,
     stopped: bool,
-    held: bool,
-}
-
-impl Decoded {
-    /// The token ends as the tokenizer's eager boundaries when byte buffering
-    /// released several tokens at once (see `eager_token_ends`); `wanted` is
-    /// the caller's rule for when the spans matter at all.
-    fn with_eager_token_ends(
-        mut self,
-        wanted: bool,
-        tokenizer: &Arc<dyn Tokenizer>,
-        output_ids: &[u32],
-        skip_special_tokens: bool,
-    ) -> Self {
-        if wanted && self.held && tokenizer.uses_byte_fallback() {
-            if let Some(ends) = eager_token_ends(
-                tokenizer,
-                &output_ids[..self.token_ends.len()],
-                skip_special_tokens,
-                &self.text,
-            ) {
-                self.token_ends = ends;
-            }
-        }
-        self
-    }
 }
 
 /// Why a choice could not be decoded, in the words the readers report.
@@ -1398,15 +767,6 @@ impl Decoded {
 enum DecodeFailure {
     Process(String),
     Finish(String),
-}
-
-impl DecodeFailure {
-    /// The decoder's own words, without the reader's prefix.
-    fn detail(&self) -> &str {
-        match self {
-            Self::Process(detail) | Self::Finish(detail) => detail,
-        }
-    }
 }
 
 impl std::fmt::Display for DecodeFailure {
@@ -1420,9 +780,8 @@ impl std::fmt::Display for DecodeFailure {
 
 /// Decode a complete choice's `output_ids` through `stop_decoder`: reset it,
 /// run the tokens with an early break on a stop, finish the decoding (bytes
-/// and a partial stop match; the tail is the last token's), warn about
-/// detokenize recoveries, and note a stop the decoder found at any token or
-/// in the tail.
+/// and a partial stop match), warn about detokenize recoveries, and note a
+/// stop the decoder found at any token or in the tail.
 fn decode_complete(
     stop_decoder: &mut StopSequenceDecoder,
     output_ids: &[u32],
@@ -1432,41 +791,21 @@ fn decode_complete(
     stop_decoder.reset();
     let mut text = String::new();
     let mut stopped = false;
-    let mut held = false;
-    let mut token_ends = Vec::with_capacity(output_ids.len());
     for &token_id in output_ids {
-        match stop_decoder
+        let step = stop_decoder
             .process_token_into(token_id, &mut text)
-            .map_err(|e| DecodeFailure::Process(e.to_string()))?
-        {
-            SequenceDecoderStep::Held => held = true,
-            step => stopped |= step.stopped(),
-        }
-        token_ends.push(text.len());
+            .map_err(|e| DecodeFailure::Process(e.to_string()))?;
+        stopped |= step.stopped();
         if stopped {
             break;
         }
     }
-
-    let tail = stop_decoder
+    stop_decoder
         .finish_into(&mut text)
         .map_err(|e| DecodeFailure::Finish(e.to_string()))?;
     utils::warn_detokenize_recoveries(request_id, index, stop_decoder);
-    if matches!(
-        tail,
-        SequenceDecoderStep::Text | SequenceDecoderStep::StoppedWithText
-    ) {
-        if let Some(last) = token_ends.last_mut() {
-            *last = text.len();
-        }
-    }
     stopped |= stop_decoder.is_stopped();
-    Ok(Decoded {
-        text,
-        token_ends,
-        stopped,
-        held,
-    })
+    Ok(Decoded { text, stopped })
 }
 
 /// The finish reason with a local stop-decoder match taking precedence over
@@ -1505,84 +844,6 @@ fn matched_stop_string(
     })
 }
 
-// Byte buffering can release several tokens at once. Observe their original
-// eager boundaries only for accounting; canonical text and stops stay with the
-// stable decoder. A mismatched observation keeps the existing span estimate.
-fn eager_token_ends(
-    tokenizer: &Arc<dyn Tokenizer>,
-    token_ids: &[u32],
-    skip_special_tokens: bool,
-    text: &str,
-) -> Option<Vec<usize>> {
-    let mut ids = Vec::new();
-    let mut prefix = String::new();
-    let mut prefix_index = 0;
-    let mut observed = String::new();
-    let mut ends = Vec::with_capacity(token_ids.len());
-    for &token_id in token_ids {
-        if let Some(delta) = tokenizer
-            .decode_step_eager(
-                token_id,
-                &mut ids,
-                &mut prefix,
-                &mut prefix_index,
-                skip_special_tokens,
-            )
-            .ok()?
-        {
-            observed.push_str(&delta);
-        }
-        ends.push(observed.len().min(text.len()));
-    }
-    observed.starts_with(text).then_some(ends)
-}
-
-/// Tokens of the output whose text overlaps the reasoning span, given the
-/// cumulative text length after each token. The span is `reasoning` as found
-/// in `text`, else (a delimiter inside it was removed) everything before the
-/// normal text. Tokens that decoded to nothing count with the token that
-/// released their text; the delimiters around the span are not reasoning,
-/// like the engines' own counts.
-fn reasoning_span_tokens(token_ends: &[usize], text: &str, reasoning: &str, normal: &str) -> u32 {
-    let (start, end) = reasoning_span(text, reasoning, normal);
-    let mut token_start = 0;
-    let mut count = 0;
-    for &token_end in token_ends {
-        if token_in_span(token_start, token_end, start, end) {
-            count += 1;
-        }
-        token_start = token_end;
-    }
-    count
-}
-
-/// The byte range of `reasoning` in `text`: where it is found, else
-/// everything before the normal text.
-fn reasoning_span(text: &str, reasoning: &str, normal: &str) -> (usize, usize) {
-    match text.find(reasoning) {
-        Some(start) => (start, start + reasoning.len()),
-        None => (0, text.len().saturating_sub(normal.len())),
-    }
-}
-
-/// Whether a token whose text is `text[token_start..token_end]` belongs to
-/// the span `text[start..end]`. A zero-width token at the span's start held
-/// the text that starts it.
-fn token_in_span(token_start: usize, token_end: usize, start: usize, end: usize) -> bool {
-    token_start < end && (token_end > start || token_start == start)
-}
-
-/// Residual assistant text → OpenAI `content`. Whitespace-only (the `"\n\n"` left
-/// after reasoning + tool-call extraction) becomes `None`, not `Some("\n\n")`, which
-/// would otherwise diverge multi-turn conversations. Real content is kept verbatim.
-fn normalize_assistant_content(text: String) -> Option<String> {
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
 /// Usage for a unary Messages response, from the engine's counts: the whole
 /// prompt (`prompt_tokens`) and its prefix-cache hit (`cached_tokens`), the
 /// counts the settlement and the metrics keep whole. The Anthropic wire splits
@@ -1609,39 +870,12 @@ fn messages_usage_from_counts(
     }
 }
 
-/// The `input` of a `tool_use` block from the arguments a tool call carries:
-/// the parsed object as it is, or an empty object when the arguments are
-/// missing, are not valid JSON, or are valid JSON that is not an object
-/// ([`object_input`]); the fallback is named once in the log, as the parse
-/// failure always was.
-fn tool_use_input(arguments: Option<&str>, tool_call_id: &str) -> serde_json::Value {
-    let Some(args) = arguments else {
-        return serde_json::Value::Object(serde_json::Map::new());
-    };
-    match serde_json::from_str::<serde_json::Value>(args) {
-        Ok(value) => object_input(
-            value,
-            "process_non_streaming_messages_response",
-            tool_call_id,
-        ),
-        Err(e) => {
-            warn!(
-                function = "process_non_streaming_messages_response",
-                tool_call_id = %tool_call_id,
-                error = %e,
-                "Failed to parse tool call arguments, defaulting to empty object"
-            );
-            serde_json::Value::Object(serde_json::Map::new())
-        }
-    }
-}
-
 /// A `tool_use` block's `input` as the Messages contract has it: the object
 /// itself, or an empty object for a whole value of another kind (a
 /// double-encoded or bare string, an array, a number, null), named once in the
-/// log under `function`. The request side refuses anything but an object, so an
-/// answer of either collected reader never carries a value a client could not
-/// send back as history. (The stream carries a call's arguments as written.)
+/// log under `function`. The request side refuses anything but an object, so a
+/// collected answer never carries a value a client could not send back as
+/// history. (The stream carries a call's arguments as written.)
 fn object_input(
     value: serde_json::Value,
     function: &'static str,
@@ -1683,36 +917,7 @@ mod tool_use_input_tests {
     use serde_json::json;
     use symphony::{adapt, Event, Events, FinishReason, Text};
 
-    use super::{messages, object_inputs, tool_use_input};
-
-    /// An answer's `tool_use.input` is always an object, as the request side
-    /// requires it: the parsed object as it is; an empty object for missing
-    /// arguments, arguments that are not JSON, and arguments that are JSON
-    /// but not an object (a double-encoded string, a bare string, an array, a
-    /// number, null).
-    #[test]
-    fn a_tool_use_input_is_always_an_object() {
-        assert_eq!(
-            tool_use_input(Some(r#"{"city":"Paris"}"#), "call_1"),
-            json!({"city": "Paris"})
-        );
-        assert_eq!(tool_use_input(Some("{}"), "call_1"), json!({}));
-        for arguments in [
-            None,
-            Some("not json"),
-            Some(r#""{\"city\":\"Paris\"}""#),
-            Some(r#""Paris""#),
-            Some(r#"["Paris"]"#),
-            Some("1"),
-            Some("null"),
-        ] {
-            assert_eq!(
-                tool_use_input(arguments, "call_1"),
-                json!({}),
-                "{arguments:?}"
-            );
-        }
-    }
+    use super::{messages, object_inputs};
 
     /// The Symphony reader's collected answer keeps the same contract: the
     /// adapter holds a whole value of any kind as the block's `input` (an
@@ -1758,53 +963,6 @@ mod tool_use_input_tests {
             };
             assert_eq!(input, &expected, "{arguments}");
         }
-    }
-}
-
-#[cfg(test)]
-mod content_normalization_tests {
-    use super::normalize_assistant_content;
-
-    #[test]
-    fn whitespace_only_is_none_real_text_kept_verbatim() {
-        assert_eq!(normalize_assistant_content("\n\n".to_string()), None);
-        assert_eq!(normalize_assistant_content("  \t".to_string()), None);
-        assert_eq!(
-            normalize_assistant_content("\n\nDone.".to_string()),
-            Some("\n\nDone.".to_string())
-        );
-    }
-}
-
-#[cfg(test)]
-mod reasoning_span_tests {
-    use super::reasoning_span_tokens;
-
-    #[test]
-    fn reasoning_span_tokens_skips_the_delimiters_and_keeps_held_tokens() {
-        // Tokens: "<think>" | "a" | "" (text held back) | "b" | "</think>" | "c"
-        let text = "<think>ab</think>c";
-        assert_eq!(
-            reasoning_span_tokens(&[7, 8, 8, 9, 17, 18], text, "ab", "c"),
-            3
-        );
-        // Reasoning cut off before its end: every token is reasoning.
-        assert_eq!(reasoning_span_tokens(&[7, 8, 9], "<think>ab", "ab", ""), 2);
-        // The span text is not in the output verbatim: everything before the
-        // normal text, delimiters included.
-        assert_eq!(
-            reasoning_span_tokens(&[7, 8, 9, 17, 18], text, "xy", "c"),
-            4
-        );
-        // Text the stop decoder held back to the end ("ST" of a partial
-        // "STOP") went to the last token at the flush: the held tokens before
-        // it are zero-width inside the span, or at its start.
-        assert_eq!(
-            reasoning_span_tokens(&[7, 9, 9, 11], "<think>abST", "abST", ""),
-            3
-        );
-        assert_eq!(reasoning_span_tokens(&[7, 7, 9], "<think>ST", "ST", ""), 2);
-        assert_eq!(reasoning_span_tokens(&[0, 2], "ST", "ST", ""), 2);
     }
 }
 
@@ -1875,7 +1033,6 @@ mod messages_usage_wire_tests {
 
 #[cfg(test)]
 mod responses_finish_reason_tests {
-    use openai_protocol::chat::ChatCompletionRequest;
     use smg_grpc_client::tokenspeed_proto::GenerateComplete;
 
     use super::*;
@@ -1891,67 +1048,10 @@ mod responses_finish_reason_tests {
         ));
     }
 
-    /// The Messages tool choice read as its chat form decides the JSON-schema
-    /// path exactly as the chat choice does: a named tool and `any` force a
-    /// call, `auto` and `none` do not, and a native format never takes it.
+    /// One decode for every reader: the text and whether a stop fired; the
+    /// finish and the matched stop read from it.
     #[test]
-    fn a_messages_choice_forces_a_call_as_its_chat_form_does() {
-        let named = messages::ToolChoice::Tool {
-            name: "lookup".to_string(),
-            disable_parallel_tool_use: None,
-        };
-        let any = messages::ToolChoice::Any {
-            disable_parallel_tool_use: None,
-        };
-        let auto = messages::ToolChoice::Auto {
-            disable_parallel_tool_use: None,
-        };
-        for (choice, forces) in [
-            (named, true),
-            (any, true),
-            (auto, false),
-            (messages::ToolChoice::None, false),
-        ] {
-            let chat = ToolChoice::from(&choice);
-            assert_eq!(
-                forced_call_shapes_output(false, Some(&chat)),
-                forces,
-                "{choice:?}"
-            );
-            assert!(
-                !forced_call_shapes_output(true, Some(&chat)),
-                "{choice:?} native"
-            );
-        }
-        assert!(!forced_call_shapes_output(false, None));
-    }
-
-    /// Without a parser the split leaves the text whole.
-    #[test]
-    fn splitting_without_a_reasoning_parser_leaves_the_text_whole() {
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        );
-        let split = processor.split_reasoning(
-            "<think>a</think>b".to_string(),
-            &[8, 9, 17],
-            ReasoningSource {
-                wanted: true,
-                in_prefill: false,
-                parser_name: None,
-                model: "no-such-model",
-            },
-        );
-        assert_eq!(split.content, "<think>a</think>b");
-        assert_eq!((split.reasoning, split.reasoning_tokens), (None, 0));
-    }
-
-    /// One decode for every reader: the text, where each token's text ends,
-    /// whether a stop fired; the finish and the matched stop read from it.
-    #[test]
-    fn decoding_a_choice_reports_its_text_token_ends_and_stop() {
+    fn decoding_a_choice_reports_its_text_and_stop() {
         let tokenizer: Arc<dyn Tokenizer> =
             Arc::new(scripted_tokenizer::ScriptedTokenizer::from_chunks(vec![
                 "Hel".into(),
@@ -1964,7 +1064,7 @@ mod responses_finish_reason_tests {
             ..Default::default()
         });
 
-        // Without a stop: every token's text end, the last at the text's end.
+        // Without a stop: the whole text, the engine's finish.
         let mut decoder = StopSequenceDecoder::new(
             tokenizer.clone(),
             llm_tokenizer::StopSequenceConfig::default(),
@@ -1972,7 +1072,6 @@ mod responses_finish_reason_tests {
         );
         let decoded = decode_complete(&mut decoder, &[100, 101, 102, 103], "req", 0).unwrap();
         assert_eq!(decoded.text, "Hello world!");
-        assert_eq!(decoded.token_ends, vec![3, 6, 11, 12]);
         assert!(!decoded.stopped);
         assert_eq!(
             finish_after_local_stop(decoded.stopped, &complete),
@@ -1993,7 +1092,6 @@ mod responses_finish_reason_tests {
         let decoded = decode_complete(&mut decoder, &[100, 101, 102, 103], "req", 0).unwrap();
         assert_eq!(decoded.text, "Hello ");
         assert!(decoded.stopped);
-        assert_eq!(decoded.token_ends.last(), Some(&decoded.text.len()));
         assert_eq!(finish_after_local_stop(decoded.stopped, &complete), "stop");
         assert_eq!(
             matched_stop_value(&decoder, &complete),
@@ -2003,246 +1101,5 @@ mod responses_finish_reason_tests {
             matched_stop_string(&decoder, &complete).as_deref(),
             Some("world")
         );
-    }
-
-    #[tokio::test]
-    async fn parsed_tool_call_preserves_engine_length_finish() {
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
-            "<tool_call>\n{\"name\":\"user_tool\",\"arguments\":{}}\n</tool_call>",
-        ));
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model":"test-model","messages":[{"role":"user","content":"call the tool"}],
-            "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object","properties":{}}}}]
-        })).unwrap();
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        );
-        for (finish, expected) in [("stop", "tool_calls"), ("length", "length")] {
-            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
-                output_ids: vec![100],
-                finish_reason: finish.into(),
-                ..Default::default()
-            });
-            let mut decoder = StopSequenceDecoder::new(
-                tokenizer.clone(),
-                llm_tokenizer::StopSequenceConfig::default(),
-                false,
-            );
-            let (choice, _) = processor
-                .process_single_choice(
-                    "test-request",
-                    &complete,
-                    0,
-                    &ChatResponseSpec::from(&request),
-                    "test-model",
-                    &tokenizer,
-                    &mut decoder,
-                    0,
-                    false,
-                    true,
-                    None,
-                    Some("qwen"),
-                )
-                .await
-                .unwrap();
-            assert_eq!(choice.finish_reason.as_deref(), Some(expected));
-            assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn vllm_json_tool_nonstream_keeps_prefilled_reasoning() {
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        );
-        for (tool_choice, output) in [
-            (
-                serde_json::json!("required"),
-                r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}}]"#,
-            ),
-            (
-                serde_json::json!({"type":"function", "function":{"name":"lookup"}}),
-                r#"plan</think>{"q":"Paris"}"#,
-            ),
-        ] {
-            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-                "model":"test-model", "messages":[], "separate_reasoning":true,
-                "tool_choice":tool_choice,
-                "tools":[{"type":"function","function":{"name":"lookup",
-                    "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
-            }))
-            .unwrap();
-            let mut spec = ChatResponseSpec::from(&request);
-            spec.reasoning_in_prefill = true;
-            let tokenizer: Arc<dyn Tokenizer> =
-                Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
-            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
-                output_ids: vec![100],
-                finish_reason: "stop".into(),
-                ..Default::default()
-            });
-            let mut decoder = StopSequenceDecoder::new(
-                tokenizer.clone(),
-                llm_tokenizer::StopSequenceConfig::default(),
-                false,
-            );
-            let (choice, _) = processor
-                .process_single_choice(
-                    "test-request",
-                    &complete,
-                    0,
-                    &spec,
-                    "test-model",
-                    &tokenizer,
-                    &mut decoder,
-                    0,
-                    true,
-                    true,
-                    Some("qwen3"),
-                    Some("qwen_coder"),
-                )
-                .await
-                .unwrap();
-            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
-            assert!(choice.message.content.is_none());
-            assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
-            let calls = choice.message.tool_calls.unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].function.name, "lookup");
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(
-                    calls[0].function.arguments.as_deref().unwrap()
-                )
-                .unwrap(),
-                serde_json::json!({"q":"Paris"})
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn gemma4_nonstream_native_tool_choices_preserve_reasoning_and_arguments() {
-        let output = r#"<|channel>thought
-plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
-        let tokenizer: Arc<dyn Tokenizer> =
-            Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        );
-        for tool_choice in [
-            serde_json::json!("auto"),
-            serde_json::json!("required"),
-            serde_json::json!({"type":"function", "function":{"name":"get_weather"}}),
-        ] {
-            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-                "model":"test-model", "messages":[], "separate_reasoning":true,
-                "tool_choice":tool_choice,
-                "tools":[{"type":"function","function":{"name":"get_weather",
-                    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
-            }))
-            .unwrap();
-            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
-                output_ids: vec![100],
-                finish_reason: "stop".into(),
-                ..Default::default()
-            });
-            let mut decoder = StopSequenceDecoder::new(
-                tokenizer.clone(),
-                llm_tokenizer::StopSequenceConfig::default(),
-                false,
-            );
-            let (choice, _) = processor
-                .process_single_choice(
-                    "test-request",
-                    &complete,
-                    0,
-                    &ChatResponseSpec::from(&request),
-                    "test-model",
-                    &tokenizer,
-                    &mut decoder,
-                    0,
-                    true,
-                    true,
-                    Some("gemma4"),
-                    Some("gemma4"),
-                )
-                .await
-                .unwrap();
-            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
-            assert!(choice.message.content.is_none());
-            assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
-            let calls = choice.message.tool_calls.unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].function.name, "get_weather");
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(
-                    calls[0].function.arguments.as_deref().unwrap()
-                )
-                .unwrap(),
-                serde_json::json!({"city":"Paris"})
-            );
-        }
-    }
-
-    /// `parallel_tool_calls: false` returns the first of the calls a model
-    /// writes; unset or true, all of them.
-    #[tokio::test]
-    async fn parallel_tool_calls_false_returns_the_first_call() {
-        let call = |q: u32| {
-            format!(
-                "<tool_call>\n{{\"name\":\"user_tool\",\"arguments\":{{\"q\":{q}}}}}\n</tool_call>"
-            )
-        };
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
-            &format!("{}\n{}", call(1), call(2)),
-        ));
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::disabled(),
-        );
-        for (parallel, calls) in [(None, 2), (Some(true), 2), (Some(false), 1)] {
-            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-                "model":"test-model","messages":[{"role":"user","content":"call the tool"}],
-                "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object","properties":{"q":{"type":"integer"}}}}}],
-                "parallel_tool_calls": parallel
-            })).unwrap();
-            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
-                output_ids: vec![100],
-                finish_reason: "stop".into(),
-                ..Default::default()
-            });
-            let mut decoder = StopSequenceDecoder::new(
-                tokenizer.clone(),
-                llm_tokenizer::StopSequenceConfig::default(),
-                false,
-            );
-            let (choice, _) = processor
-                .process_single_choice(
-                    "test-request",
-                    &complete,
-                    0,
-                    &ChatResponseSpec::from(&request),
-                    "test-model",
-                    &tokenizer,
-                    &mut decoder,
-                    0,
-                    false,
-                    true,
-                    None,
-                    Some("qwen"),
-                )
-                .await
-                .unwrap();
-            let got = choice.message.tool_calls.unwrap();
-            assert_eq!(got.len(), calls, "{parallel:?}");
-            assert_eq!(got[0].function.arguments.as_deref(), Some("{\"q\":1}"));
-            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
-        }
     }
 }

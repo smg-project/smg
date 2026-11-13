@@ -8,10 +8,9 @@
 //! silently.
 //!
 //! This crate replaced the separate tool-call and reasoning parser crates on the gateway's request
-//! path: the gateway reads a model's output through it by default, and the older readers stay
-//! behind `--parser legacy` (or a request's `X-SMG-Parser: legacy`) and read the models no table
-//! reads yet. Its formats are proven against recorded fixtures before they are wired in. The
-//! design and the delivery plan live with the maintainers; the short version is in this crate's
+//! path: the gateway reads every model's output through it, a model no table names as plain
+//! text. Its formats are proven against recorded fixtures before they are wired in. The design
+//! and the delivery plan live with the maintainers; the short version is in this crate's
 //! `README.md`.
 //!
 //! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no

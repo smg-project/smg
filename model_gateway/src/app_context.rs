@@ -5,7 +5,6 @@ use std::{
 
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
     create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
@@ -14,11 +13,10 @@ use smg_data_connector::{
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
-use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
 
 use crate::{
-    config::{ParserChoice, RouterConfig},
+    config::RouterConfig,
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::{host_stores::HostStores, PolicyRegistry},
@@ -30,8 +28,8 @@ use crate::{
         gateway::Gateway,
         grpc::{
             multimodal::MultimodalConfigRegistry,
-            regular::symphony::{check_names, named_table},
-            utils::{Names, ALIASES},
+            regular::symphony::{check_names, noted_name, other_table, unanswered_reasoning},
+            utils::Names,
         },
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
@@ -79,8 +77,6 @@ pub struct AppContext {
     /// model.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
-    pub reasoning_parser_factory: Option<ReasoningParserFactory>,
-    pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub prefill_admission: Option<Arc<PrefillAdmission>>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -178,8 +174,6 @@ pub struct AppContextBuilder {
     rate_limiter: Option<Arc<TokenBucket>>,
     rate_limit_manager: Option<Arc<RateLimitManager>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
-    reasoning_parser_factory: Option<ReasoningParserFactory>,
-    tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
     gateway: Option<Arc<Gateway>>,
@@ -266,8 +260,6 @@ impl AppContextBuilder {
             rate_limiter: None,
             rate_limit_manager: None,
             tokenizer_registry: None,
-            reasoning_parser_factory: None,
-            tool_parser_factory: None,
             worker_registry: None,
             policy_registry: None,
             gateway: None,
@@ -322,19 +314,6 @@ impl AppContextBuilder {
 
     pub fn tokenizer_registry(mut self, tokenizer_registry: Arc<TokenizerRegistry>) -> Self {
         self.tokenizer_registry = Some(tokenizer_registry);
-        self
-    }
-
-    pub fn reasoning_parser_factory(
-        mut self,
-        reasoning_parser_factory: Option<ReasoningParserFactory>,
-    ) -> Self {
-        self.reasoning_parser_factory = reasoning_parser_factory;
-        self
-    }
-
-    pub fn tool_parser_factory(mut self, tool_parser_factory: Option<ToolParserFactory>) -> Self {
-        self.tool_parser_factory = tool_parser_factory;
         self
     }
 
@@ -438,61 +417,46 @@ impl AppContextBuilder {
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
-        // The configured parser names are checked against the registries at startup: the
-        // legacy parsers', and Symphony's tables under `--parser symphony`
-        // (`regular::symphony::check_names`). A name whose factory is absent is not checked,
-        // as before.
+        // The configured parser names are checked against the Symphony tables at startup
+        // (`regular::symphony::check_names`): a table's own name, one of the names a table
+        // answers to, or `hf`; anything else refuses to start, with the tables listed.
         let names = Names {
             tool: configured_tool_parser.clone(),
             reasoning: configured_reasoning_parser.clone(),
         };
-        if let Err(why) = check_names(
-            router_config.parser,
-            &names,
-            self.tool_parser_factory.as_ref(),
-            self.reasoning_parser_factory.as_ref(),
-        ) {
-            let listed = |names: Option<Vec<String>>| names.unwrap_or_default().join(", ");
-            let legacy_tool_parsers =
-                listed(self.tool_parser_factory.as_ref().map(|f| f.list_parsers()));
-            let legacy_reasoning_parsers = listed(
-                self.reasoning_parser_factory
-                    .as_ref()
-                    .map(|f| f.list_parsers()),
-            );
-            let symphony_tables: Vec<&str> = symphony::formats::Table::ALL
-                .iter()
-                .map(|table| table.name())
-                .collect();
-            // The other names a table answers to: the legacy names that read a table's format,
-            // and the names no other list has, a launcher's for a family whose table has no
-            // older parser and an engine's exact name for a table.
-            let symphony_aliases: Vec<&str> = ALIASES.iter().map(|(alias, _)| *alias).collect();
+        if let Err(why) = check_names(&names) {
             tracing::error!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
-                legacy_tool_parsers = %legacy_tool_parsers,
-                legacy_reasoning_parsers = %legacy_reasoning_parsers,
-                symphony_tables = %symphony_tables.join(", "),
-                symphony_aliases = %symphony_aliases.join(", "),
                 "Unknown parser name"
             );
             return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
-        if router_config.parser == ParserChoice::Symphony
-            && names.tool.is_some()
-            && named_table(&names).is_none()
-        {
+        if let Some((reads, other)) = other_table(&names) {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
-                "The configured tool-call parser name selects no Symphony table, so under \
-                 --parser symphony every model the registry does not know is read by the legacy \
-                 parsers (the registry's table reads the models it knows, a worker's own labels \
-                 aside); a table's name, a legacy name that reads a table's format (qwen, \
-                 qwen_xml, ...), a launcher's name for a family whose table has no older \
-                 parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
-                 those models with that table"
+                "The tool-call parser name selects the Symphony table '{}', which reads both the \
+                 calls and the thought, so the reasoning parser name's table '{}' reads nothing",
+                reads.name(),
+                other.name()
+            );
+        }
+        if let Some((name, reason)) = unanswered_reasoning(&names) {
+            tracing::warn!(
+                tool_call_parser = ?names.tool,
+                reasoning_parser = ?names.reasoning,
+                "The reasoning parser name '{name}' is an older parser's that no Symphony table \
+                 answers to, so it reads nothing ({reason}); the tool-call parser name's table, \
+                 the registry's table or plain reads the model"
+            );
+        }
+        if let Some((name, table, note)) = noted_name(&names) {
+            tracing::warn!(
+                tool_call_parser = ?names.tool,
+                reasoning_parser = ?names.reasoning,
+                "The parser name '{name}' reads with the Symphony table '{}': {note}",
+                table.name()
             );
         }
 
@@ -564,8 +528,6 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::new(TokenizerLoadFailures::new()),
-            reasoning_parser_factory: self.reasoning_parser_factory,
-            tool_parser_factory: self.tool_parser_factory,
             worker_registry,
             prefill_admission,
             policy_registry,
@@ -628,8 +590,6 @@ impl AppContextBuilder {
             .maybe_rate_limiter(&router_config)
             .maybe_rate_limit_manager(&router_config)?
             .with_tokenizer_registry()
-            .with_reasoning_parser_factory()
-            .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
             .with_storage(&router_config)
@@ -770,20 +730,6 @@ impl AppContextBuilder {
             capacity,
             rate_limit_tokens as usize,
         )));
-        self
-    }
-
-    /// Create reasoning parser factory for gRPC mode or IGW mode
-    fn with_reasoning_parser_factory(mut self) -> Self {
-        // Initialize reasoning parser factory
-        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
-        self
-    }
-
-    /// Create tool parser factory for gRPC mode or IGW mode
-    fn with_tool_parser_factory(mut self) -> Self {
-        // Initialize tool parser factory
-        self.tool_parser_factory = Some(ToolParserFactory::new());
         self
     }
 
@@ -1601,7 +1547,7 @@ mod effective_max_concurrent_requests_tests {
 pub(crate) mod testing {
     use std::sync::Arc;
 
-    use super::{AppContext, ToolParserFactory};
+    use super::AppContext;
     use crate::{
         config::RouterConfig,
         middleware::{AuthConfig, TokenBucket},
@@ -1616,15 +1562,12 @@ pub(crate) mod testing {
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory
     /// storage, a generous rate limiter, no gateway, worker monitor or WASM
     /// manager, the policy registry the configuration's policy and routing-key
-    /// override select, the given tool parsers (a parser override is validated
-    /// against them when they are given), and an uninitialized worker job
-    /// queue: submitted jobs are accepted and queued but never processed, so a
-    /// test observes what a step or a pass submits without spawning workflow
-    /// background tasks.
+    /// override select, and an uninitialized worker job queue: submitted jobs
+    /// are accepted and queued but never processed, so a test observes what a
+    /// step or a pass submits without spawning workflow background tasks.
     pub(crate) fn app_context_for_tests(
         router_config: RouterConfig,
         worker_registry: Arc<WorkerRegistry>,
-        tool_parser_factory: Option<ToolParserFactory>,
     ) -> Arc<AppContext> {
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
@@ -1647,8 +1590,6 @@ pub(crate) mod testing {
                     &router_config.policy,
                 ),
             ),
-            reasoning_parser_factory: None,
-            tool_parser_factory,
             gateway: None,
             response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),

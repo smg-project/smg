@@ -1516,44 +1516,34 @@ struct ModelArgs {
     tokenizer_cache_l1_max_memory: usize,
 
     // ==================== Parsers ====================
-    /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
-    /// --tool-call-parser, or there alone) reads them with that table, and
-    /// so does a legacy parser's name whose format a table reads (the
-    /// table's aliases); `hf` reads each with the table its tokenizer's
-    /// response_template compiles into; any other legacy parser's name keeps
-    /// the legacy parsers for them.
+    /// Parser for reasoning models (e.g., deepseek, qwen3): a Symphony
+    /// table's name, or a name a table answers to (an older parser's whose
+    /// format a table reads, a launcher's). A worker's labels decide for its
+    /// model, else Symphony's registry for a model it knows, else this flag
+    /// (with --tool-call-parser, or alone) for the models the registry does
+    /// not know; `hf` reads each with the table its tokenizer's
+    /// response_template compiles into, and a model nothing names is read as
+    /// plain text.
     #[arg(long, help_heading = "Parsers")]
     reasoning_parser: Option<String>,
 
-    /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
-    /// symphony, a worker's labels decide for its model, else Symphony's
-    /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
-    /// --reasoning-parser, or here alone) reads them with that table, and
-    /// so does a legacy parser's name whose format a table reads (the
-    /// table's aliases); `hf` reads each with the table its tokenizer's
-    /// response_template compiles into; any other legacy parser's name keeps
-    /// the legacy parsers for them.
+    /// Parser for tool-call interactions (e.g., json, qwen): a Symphony
+    /// table's name, or a name a table answers to (an older parser's whose
+    /// format a table reads, a launcher's). A worker's labels decide for its
+    /// model, else Symphony's registry for a model it knows, else this flag
+    /// (with --reasoning-parser, or alone) for the models the registry does
+    /// not know; `hf` reads each with the table its tokenizer's
+    /// response_template compiles into, and a model nothing names is read as
+    /// plain text.
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 
-    /// Which parser reads a chat completion's reasoning and tool calls:
-    /// Symphony (the default) or the per-model parsers (legacy). With
-    /// Symphony, a model's worker labels decide, else Symphony's registry
-    /// for a model it knows, else --tool-call-parser and
-    /// --reasoning-parser: a Symphony table's name reads with that table,
-    /// and so does a legacy parser's name whose format a table reads (qwen
-    /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
-    /// existing flags keep a working parser); any other legacy parser's
-    /// name keeps the legacy parsers (the Symphony crate lists each with
-    /// the reason, passthrough among them), and no name leaves the legacy
-    /// parsers to detect. A request's X-SMG-Parser header overrides the
-    /// flag for that request.
-    #[arg(long, default_value = "symphony", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
-    parser: String,
+    /// Kept hidden for one release so a launch script that passes
+    /// `--parser symphony` still starts: Symphony reads every model, so the
+    /// flag selects nothing and goes away in 1.17. Any other value is
+    /// refused; the per-model parsers `legacy` named were removed.
+    #[arg(long, hide = true, value_parser = ["symphony"], help_heading = "Parsers")]
+    parser: Option<String>,
 
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
@@ -2016,9 +2006,8 @@ mod tests {
     use smg::{
         config::{
             CacheIndexKind, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
-            FileDiscoveryConfig, ManualAssignmentMode, ParserChoice, PolicyConfig,
-            PolicyEngineMode, SlurmDiscoveryConfig, UnhealthyRemovalScope,
-            DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+            FileDiscoveryConfig, ManualAssignmentMode, PolicyConfig, PolicyEngineMode,
+            SlurmDiscoveryConfig, UnhealthyRemovalScope, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
         },
         server::posture::SecretSource,
         service_discovery::RuntimeDiscoveryConfig,
@@ -4524,27 +4513,15 @@ mod tests {
         assert!(!server_config.router_config.engine_metrics);
     }
 
-    /// Symphony is the default parser in both conversions; `--parser legacy`
-    /// selects the per-model parsers, and any other name is refused by clap.
+    /// `--parser symphony` still parses for one release, hidden; `legacy`
+    /// and any other name are refused by clap.
     #[test]
-    fn parser_defaults_to_symphony_and_legacy_selects_the_legacy_parsers() {
-        let cli = cli_args_from(&[]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.parser, ParserChoice::Symphony);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.router_config.parser, ParserChoice::Symphony);
-
-        let cli = cli_args_from(&["--parser", "legacy"]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.parser, ParserChoice::Legacy);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.router_config.parser, ParserChoice::Legacy);
-
+    fn the_parser_flag_takes_symphony_alone() {
         let cli = cli_args_from(&["--parser", "symphony"]);
-        assert_eq!(
-            cli.to_router_config(vec![], vec![]).unwrap().parser,
-            ParserChoice::Symphony
-        );
+        assert_eq!(cli.model.parser.as_deref(), Some("symphony"));
+        assert!(cli.to_router_config(vec![], vec![]).is_ok());
+        assert!(cli_args_from(&[]).model.parser.is_none());
+        assert!(Cli::try_parse_from(["smg", "--parser", "legacy"]).is_err());
         assert!(Cli::try_parse_from(["smg", "--parser", "fast"]).is_err());
     }
 

@@ -144,7 +144,7 @@ mod tests {
         for w in workers {
             registry.register(Arc::clone(w)).unwrap();
         }
-        app_context_for_tests(router_config, registry, None)
+        app_context_for_tests(router_config, registry)
     }
 
     fn make_context(
