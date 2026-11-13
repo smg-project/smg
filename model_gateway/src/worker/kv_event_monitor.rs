@@ -323,14 +323,16 @@ impl KvEventMonitor {
     /// refresh.
     ///
     /// An events subscription feeds the index of the model it started for,
-    /// so a worker of another model does not join it. An engine registered
-    /// again in place under another model id has every rank replaced in
-    /// the registry before the first one is added: that add ends the
-    /// memberships of the ranks the registry no longer holds and, once the
-    /// task has ended, starts the engine's next subscription for its own
-    /// model, which the other ranks join. Beside a worker of the other
-    /// model that the registry still holds, the worker gets no stream
-    /// until its next add.
+    /// and a subscription has one kind. An engine registered again in place
+    /// under another model id, or under a model whose policy reads the
+    /// other kind, has every rank replaced in the registry before the first
+    /// one is added: that add ends the memberships of the ranks the
+    /// registry no longer holds and, once the task has ended, starts the
+    /// engine's next subscription for its own model and kind, which the
+    /// other ranks join. Beside a worker the registry still holds, a worker
+    /// of another model gets no stream from an events subscription until
+    /// its next add, and a worker that differs in kind alone joins the
+    /// subscription as it is, with a warning.
     ///
     /// The add reads the registry it was given (`set_worker_registry`)
     /// under the slot lock on every turn, before it ends a membership for
@@ -413,6 +415,21 @@ impl KvEventMonitor {
                 Metrics::set_kv_events_unavailable(&url, false);
                 continue;
             }
+            // What keeps the worker from joining its engine's live
+            // subscription as it is, read before the engine's entry is
+            // borrowed below: the subscription feeds another model's index,
+            // or it is of another kind. `replaced` is then its members the
+            // registry no longer holds.
+            let engine = subs.engines.get(&address);
+            let other_model = engine.is_some_and(|engine| {
+                engine.kind == SubscriptionKind::Events && engine.model_id != model_id
+            });
+            let replaced = match engine {
+                Some(engine) if other_model || engine.kind != kind => {
+                    self.replaced_members_of(&subs, &address, engine.id)
+                }
+                _ => Vec::new(),
+            };
             let (mut done, engine_ending) = match subs.workers.get(&url) {
                 Some(Slot::Member { .. }) => return,
                 Some(Slot::Removing(reservation)) => (reservation.done.clone(), false),
@@ -423,29 +440,28 @@ impl KvEventMonitor {
                     // a subscription of its own.
                     Some(engine) if engine.members == 0 => (engine.done.clone(), true),
                     // An events subscription feeds the index of the model it
-                    // started for: a worker of another model does not join
-                    // it. An engine registered again in place under another
-                    // model id has every rank replaced in the registry and
-                    // then added in turn, so the memberships it still has
-                    // for workers the registry no longer holds end here
-                    // (their own adds come after this one in the same step
-                    // and could not end them while it waited), and the
-                    // worker starts the engine's next subscription once the
+                    // started for, and a subscription has one kind: a worker
+                    // of another model does not join the first, and a worker
+                    // of another kind joins only beside a worker the
+                    // registry still holds (the arm below). An engine
+                    // registered again in place under another model id, or
+                    // under a model whose policy reads the other kind, has
+                    // every rank replaced in the registry and then added in
+                    // turn, so the memberships it still has for workers the
+                    // registry no longer holds end here (their own adds come
+                    // after this one in the same step and could not end them
+                    // while it waited), and the worker starts the engine's
+                    // next subscription, of its own model and kind, once the
                     // task has ended, on a later turn. Beside a worker of
                     // the other model that the registry still holds it gets
                     // no stream: that worker's stream is not ended for it.
-                    Some(engine)
-                        if engine.kind == SubscriptionKind::Events
-                            && engine.model_id != model_id =>
-                    {
-                        let (engine_id, engine_model) = (engine.id, engine.model_id.clone());
-                        let replaced = self.replaced_members_of(&subs, &address, engine_id);
+                    Some(engine) if other_model || !replaced.is_empty() => {
                         if replaced.is_empty() {
                             warn!(
                                 worker_url = %Endpoint::redacted_str(&url),
                                 engine = %Endpoint::redacted_str(&address),
                                 model_id = %model_id,
-                                engine_model_id = %engine_model,
+                                engine_model_id = %engine.model_id,
                                 "No KV event stream for a worker whose engine streams another model's KV events"
                             );
                             return;
@@ -453,9 +469,11 @@ impl KvEventMonitor {
                         info!(
                             engine = %Endpoint::redacted_str(&address),
                             model_id = %model_id,
-                            engine_model_id = %engine_model,
+                            engine_model_id = %engine.model_id,
+                            ?kind,
+                            engine_kind = ?engine.kind,
                             replaced = replaced.len(),
-                            "Replaced workers leave the KV event subscription of an engine registered under another model"
+                            "Replaced workers leave their engine's KV event subscription of another model or kind"
                         );
                         for member in &replaced {
                             Self::begin_member_removal(

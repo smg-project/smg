@@ -3864,4 +3864,93 @@ mod tests {
         monitor.stop().await;
         server.abort();
     }
+
+    /// A data-parallel engine on a loads-only subscription, registered again
+    /// in place under a model whose policy reads KV events: the registry
+    /// replaces both ranks, then each one's add comes in turn. The first
+    /// does not join the loads-only subscription, which feeds no index: the
+    /// memberships of the ranks the registry replaced end with it, and the
+    /// engine's next subscription is an events one that feeds the new
+    /// model's index, which the other rank joins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_engine_registered_again_under_a_model_of_another_kind_feeds_that_models_index() {
+        let (addr, server) = serve(Subscribe::Counted {
+            calls: Arc::default(),
+            script: vec![Ok(ranked_batch_at(0, 1)), Ok(ranked_batch_at(1, 1))],
+        })
+        .await;
+        let (monitor, registry, old) =
+            engine_of_two_ranks(addr, "before", SubscriptionKind::Loads).await;
+        let (first_subscription, _) = monitor.slot_ids(old[0].url()).await;
+        assert!(
+            monitor.get_indexer("before").is_none(),
+            "a loads-only subscription feeds no index"
+        );
+
+        let new = [
+            rank_serving(addr, 0, "after"),
+            rank_serving(addr, 1, "after"),
+        ];
+        for worker in &new {
+            registry.register_or_replace(Arc::clone(worker));
+        }
+        for worker in &new {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                monitor.on_worker_added(worker, SubscriptionKind::Events),
+            )
+            .await
+            .expect("an add waits for no other rank's add");
+        }
+
+        let after = monitor
+            .get_indexer("after")
+            .expect("the engine's next subscription feeds the new model's index");
+        wait_until("both ranks' batches land in the new model's index", || {
+            new.iter()
+                .all(|worker| blocks_in(&after, worker) == Some(1))
+        })
+        .await;
+        assert_eq!(engine_members(&monitor, new[0].base_url()).await, Some(2));
+        let (subscription, _) = monitor.slot_ids(new[1].url()).await;
+        assert!(
+            subscription.is_some() && subscription != first_subscription,
+            "the other rank is on the engine's next subscription"
+        );
+        monitor.stop().await;
+        server.abort();
+    }
+
+    /// Beside a rank worker the registry still holds, a worker whose model's
+    /// policy reads the other kind joins the engine's subscription as it
+    /// is: the held worker's stream is not ended for it, and the log names
+    /// the two kinds.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_of_another_kind_joins_beside_one_the_registry_holds() {
+        let (addr, server) = serve(Subscribe::Open).await;
+        let (monitor, registry, old) =
+            engine_of_two_ranks(addr, "before", SubscriptionKind::Loads).await;
+        let (subscription, _) = monitor.slot_ids(old[1].url()).await;
+
+        // Rank 0 alone is registered again; rank 1 stays as it is.
+        let newcomer = rank_serving(addr, 0, "after");
+        registry.register_or_replace(Arc::clone(&newcomer));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            monitor.on_worker_added(&newcomer, SubscriptionKind::Events),
+        )
+        .await
+        .expect("the add does not wait for the held worker to leave");
+
+        assert_eq!(
+            monitor.slot_ids(newcomer.url()).await,
+            (subscription, None),
+            "the newcomer joined the subscription its sibling keeps"
+        );
+        assert_eq!(engine_members(&monitor, newcomer.base_url()).await, Some(2));
+        assert!(logs_contain("KV event subscription of another kind"));
+        monitor.stop().await;
+        server.abort();
+    }
 }
