@@ -708,17 +708,20 @@ struct Parser<'a> {
 
 impl Pattern {
     /// Whether the program holds an unbounded run anywhere but as its first
-    /// op. The search passes over a leading run that failed (see
-    /// `Matches::next`); a run elsewhere is rescanned from every start inside
-    /// it, which costs half the square of the run's length. The template
-    /// scanners hold no such run.
+    /// op, or a unit run anywhere. The search passes over a leading run that
+    /// failed (see `Matches::next`); a run elsewhere is rescanned from every
+    /// start inside it, which costs half the square of the run's length. A
+    /// unit run is unbounded by construction and no start skip covers it, so
+    /// one that falls short of its minimum is rescanned the same way from
+    /// every start, as its first op too. The template scanners hold no such
+    /// run.
     pub(super) fn rescans_a_run(&self) -> bool {
         matches!(self.matcher, Matcher::Program)
-            && self
-                .program
-                .iter()
-                .skip(1)
-                .any(|op| matches!(op, Op::Run { max: u32::MAX, .. }))
+            && self.program.iter().enumerate().any(|(i, op)| match op {
+                Op::Run { max: u32::MAX, .. } => i > 0,
+                Op::UnitRun { .. } => true,
+                _ => false,
+            })
     }
 
     /// `None` when the pattern uses anything outside the supported subset.

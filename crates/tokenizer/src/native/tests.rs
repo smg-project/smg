@@ -5529,12 +5529,16 @@ fn image_stages_whose_pattern_rescans_a_run_are_declined() {
         added: &[],
         stripped: &[],
     };
+    // The last two open with a unit run, which no start skip covers: one
+    // that falls short of its minimum is rescanned from every start.
     for pattern in [
         r" ?\p{L}+!",
         r"\p{L}+!|\p{N}+",
         r"\p{L}\p{L}*!",
         r"[a-z]\p{L}+!",
         r"\p{L}*\p{N}+!",
+        r"(?:[!]?\p{L}){3,}",
+        r"(?:[!]?\p{L}){100000,}",
     ] {
         let stage = || split(pattern, SplitDelimiterBehavior::Isolated, false);
         let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
