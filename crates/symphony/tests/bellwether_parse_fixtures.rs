@@ -432,6 +432,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("tinyllama-1.1b-chat-v1.0", GenerationPrompt::Plain),
     ("phi-4-mini-instruct", GenerationPrompt::Plain),
     ("phi-4-multimodal-instruct", GenerationPrompt::Plain),
+    // MiDashengLM-spatial writes a Qwen2.5-Omni-shaped template that renders neither the tools nor
+    // a thought, so the model is never told a call syntax: content alone (bellwether's reference
+    // refused every call and reasoning probe, leaving three common cases and two turn shapes).
+    ("midashenglm-spatial", GenerationPrompt::Plain),
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
