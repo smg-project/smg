@@ -623,6 +623,41 @@ pub enum InputContentBlock {
     McpToolUse(McpToolUseBlock),
     /// MCP tool result block (the same message, beside its use)
     McpToolResult(McpToolResultBlock),
+    /// Web fetch tool result block (a server tool's result, replayed)
+    WebFetchToolResult(ServerToolResultBlock),
+    /// Code execution tool result block (a server tool's result, replayed)
+    CodeExecutionToolResult(ServerToolResultBlock),
+    /// Bash code execution tool result block (a server tool's result, replayed)
+    BashCodeExecutionToolResult(ServerToolResultBlock),
+    /// Text editor code execution tool result block (a server tool's result,
+    /// replayed)
+    TextEditorCodeExecutionToolResult(ServerToolResultBlock),
+    /// Container upload block: a file the request hands the code execution
+    /// container
+    ContainerUpload(ContainerUploadParam),
+}
+
+/// The result of a server tool the public API ran (web fetch, code execution,
+/// bash, the text editor), replayed in an assistant turn. Its `content` is
+/// kept as written, for the upstream that ran the tool to read.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerToolResultBlock {
+    pub tool_use_id: String,
+    pub content: Value,
+    pub cache_control: Option<CacheControl>,
+    /// Who issued the call, when the public API reports it (a web fetch
+    /// result's `caller`).
+    pub caller: Option<ToolUseCaller>,
+}
+
+/// A file the request hands the code execution container
+/// (`container_upload`).
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContainerUploadParam {
+    pub file_id: String,
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Whether `messages` end with an assistant message that has text and no
@@ -2997,6 +3032,40 @@ mod tests {
         assert_eq!(written["content"][1]["type"], "mcp_tool_result");
     }
 
+    /// A conversation replaying the public API's server tool results (web
+    /// fetch, code execution, bash, the text editor) and a container upload
+    /// reads them as input and writes them back as sent, on a create and on a
+    /// token count alike.
+    #[test]
+    fn a_replayed_server_tool_result_or_container_upload_is_accepted() {
+        let assistant = json!({"role": "assistant", "content": [
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1", "caller": {"type": "direct"},
+             "content": {"type": "web_fetch_result", "url": "https://example.com",
+                         "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "page"}}}},
+            {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_2",
+             "content": {"type": "code_execution_result", "stdout": "4\n", "stderr": "", "return_code": 0, "content": []}},
+            {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_3", "cache_control": {"type": "ephemeral"},
+             "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}},
+            {"type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_4",
+             "content": {"type": "text_editor_code_execution_view_result", "file_type": "text", "content": "x = 1",
+                         "num_lines": 1, "start_line": 1, "total_lines": 1}}
+        ]});
+        let user = json!({"role": "user", "content": [
+            {"type": "container_upload", "file_id": "file_1"},
+            {"type": "text", "text": "run it"}
+        ]});
+        for message in [&assistant, &user] {
+            let parsed: InputMessage = serde_json::from_value(message.clone())
+                .unwrap_or_else(|e| panic!("{message}: {e}"));
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), message);
+        }
+        let count: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [user.clone(), assistant.clone()]
+        }))
+        .expect("a token count with the blocks reads");
+        assert_eq!(count.messages.len(), 2);
+    }
+
     /// A content field that is neither a string nor an array of blocks, or
     /// holds a block that cannot be read, is refused with the block's own
     /// reason: the unknown `type` with the accepted ones, the missing field,
@@ -3010,11 +3079,11 @@ mod tests {
         };
         let unknown_block = refusal(json!({
             "role": "user",
-            "content": [{"type": "container_upload", "file_id": "file_1"}]
+            "content": [{"type": "a_block_kind_of_no_api", "file_id": "file_1"}]
         }));
         assert!(
             unknown_block.starts_with(
-                "unknown variant `container_upload`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+                "unknown variant `a_block_kind_of_no_api`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
             ),
             "{unknown_block}"
         );

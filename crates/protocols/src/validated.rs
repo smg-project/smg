@@ -1157,7 +1157,7 @@ mod tests {
                 "model": "m", "max_tokens": 8,
                 "messages": [
                     {"role": "user", "content": "hi"},
-                    {"role": "user", "content": [{"type": "container_upload", "file_id": "file_1"}]}
+                    {"role": "user", "content": [{"type": "a_block_kind_of_no_api", "file_id": "file_1"}]}
                 ]
             })
             .to_string(),
@@ -1171,7 +1171,7 @@ mod tests {
         let message = json["error"]["message"].as_str().unwrap_or_default();
         assert!(
             message.starts_with(
-                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1].content[0].type: unknown variant `container_upload`, expected one of `text`, `image`"
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1].content[0].type: unknown variant `a_block_kind_of_no_api`, expected one of `text`, `image`"
             ),
             "{message}"
         );
