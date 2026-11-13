@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
     registry::{ModelRegistryError, RegistryResult},
-    MediaConnector, MediaConnectorConfig, Modality, ModelProcessorSpec, ModelRegistry,
-    PreProcessorConfig, VisionPreProcessor,
+    EncoderDtype, MediaConnector, MediaConnectorConfig, Modality, ModelProcessorSpec,
+    ModelRegistry, PreProcessorConfig, TransparencyPolicy, VisionPreProcessor,
 };
 use openai_protocol::worker::MmProcessingMode;
+use parking_lot::RwLock;
 use tracing::{debug, warn};
 
 use super::{
@@ -33,6 +34,36 @@ pub(crate) struct MultimodalModelConfig {
     /// The vision processors built from these configs, by the name of the
     /// spec that built them (see [`Self::vision_processors`]).
     vision_processors: DashMap<&'static str, Arc<VisionProcessors>>,
+    /// The pixel cache's fingerprints of these configs, one per tokenizer,
+    /// model, wire dtype and transparency policy a request named (see
+    /// [`Self::image_fingerprint`]).
+    image_fingerprints: RwLock<Vec<ImageFingerprint>>,
+}
+
+/// One pixel-cache fingerprint of a loaded config, with the request
+/// parameters it was hashed for.
+#[derive(Debug)]
+struct ImageFingerprint {
+    tokenizer_id: Box<str>,
+    model_id: Box<str>,
+    image_wire_dtype: Option<EncoderDtype>,
+    transparency: TransparencyPolicy,
+    value: u64,
+}
+
+impl ImageFingerprint {
+    fn is_for(
+        &self,
+        tokenizer_id: &str,
+        model_id: &str,
+        image_wire_dtype: Option<EncoderDtype>,
+        transparency: TransparencyPolicy,
+    ) -> bool {
+        self.image_wire_dtype == image_wire_dtype
+            && self.transparency == transparency
+            && &*self.tokenizer_id == tokenizer_id
+            && &*self.model_id == model_id
+    }
 }
 
 impl MultimodalModelConfig {
@@ -46,7 +77,48 @@ impl MultimodalModelConfig {
             preprocessor_config,
             video_preprocessor_config,
             vision_processors: DashMap::new(),
+            image_fingerprints: RwLock::new(Vec::new()),
         }
+    }
+
+    /// The pixel cache's fingerprint of these configs for `model_id` behind
+    /// `tokenizer_id`, served over `image_wire_dtype` under `transparency`:
+    /// `hash` runs for the first request with that combination and every
+    /// later one reads its value back, as nothing the fingerprint covers
+    /// changes while a config is loaded (a reload is a new config with no
+    /// entries). A deployment names one combination, so the read is a
+    /// comparison or two under the read lock, no allocation.
+    pub(crate) fn image_fingerprint(
+        &self,
+        tokenizer_id: &str,
+        model_id: &str,
+        image_wire_dtype: Option<EncoderDtype>,
+        transparency: TransparencyPolicy,
+        hash: impl FnOnce() -> Result<u64>,
+    ) -> Result<u64> {
+        if let Some(entry) = self
+            .image_fingerprints
+            .read()
+            .iter()
+            .find(|entry| entry.is_for(tokenizer_id, model_id, image_wire_dtype, transparency))
+        {
+            return Ok(entry.value);
+        }
+        let value = hash()?;
+        let mut entries = self.image_fingerprints.write();
+        if !entries
+            .iter()
+            .any(|entry| entry.is_for(tokenizer_id, model_id, image_wire_dtype, transparency))
+        {
+            entries.push(ImageFingerprint {
+                tokenizer_id: tokenizer_id.into(),
+                model_id: model_id.into(),
+                image_wire_dtype,
+                transparency,
+                value,
+            });
+        }
+        Ok(value)
     }
 
     /// The vision processors `spec` builds from these configs: built by the
@@ -541,6 +613,48 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// The fingerprint is hashed once per tokenizer, model, wire dtype and
+    /// transparency policy: the same combination reads the first value back
+    /// without hashing again, a change in any of the four hashes afresh, and
+    /// the earlier entries keep answering.
+    #[test]
+    fn image_fingerprint_is_hashed_once_per_request_shape() {
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": "qwen2_vl"}),
+            PreProcessorConfig::default(),
+            None,
+        );
+        let hashes = std::cell::Cell::new(0u64);
+        let fingerprint = |tokenizer: &str, model: &str, dtype, transparency| {
+            config
+                .image_fingerprint(tokenizer, model, dtype, transparency, || {
+                    hashes.set(hashes.get() + 1);
+                    Ok(hashes.get())
+                })
+                .unwrap()
+        };
+        let keep = TransparencyPolicy::KeepAlpha;
+        assert_eq!(fingerprint("tok", "model", None, keep), 1);
+        assert_eq!(fingerprint("tok", "model", None, keep), 1);
+        assert_eq!(hashes.get(), 1, "the second request read the memo");
+        assert_eq!(
+            fingerprint("tok", "model", Some(EncoderDtype::BFloat16), keep),
+            2
+        );
+        assert_eq!(
+            fingerprint("tok", "model", None, TransparencyPolicy::DropAlpha),
+            3
+        );
+        assert_eq!(fingerprint("other-tokenizer", "model", None, keep), 4);
+        assert_eq!(fingerprint("tok", "other-model", None, keep), 5);
+        assert_eq!(fingerprint("tok", "model", None, keep), 1);
+        assert_eq!(
+            fingerprint("tok", "model", Some(EncoderDtype::BFloat16), keep),
+            2
+        );
+        assert_eq!(hashes.get(), 5);
+    }
 
     #[tokio::test]
     async fn registry_get_or_load_reads_from_local_dir_and_caches() {

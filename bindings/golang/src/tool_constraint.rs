@@ -6,9 +6,7 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{Tool, ToolChoice, ToolChoiceValue},
 };
-use tool_parser::ToolConstraint;
-
-use super::runtime::PARSER_FACTORY;
+use symphony::formats::{forced::arguments_schema, json::required_calls_schema};
 
 /// Every tool the model sees: the request-level `tools` followed by the tools
 /// declared on messages, as the request's provider profile defines them (the
@@ -46,36 +44,64 @@ pub(crate) fn tools_keep_special_tokens(
         )
 }
 
-/// The constraint the engine is held to for the request's tool choice, built
-/// from the request's effective tools narrowed by the choice (the named
-/// function, an allowed-tools list), the gateway's callable set. Built from
-/// `tools` as a whole, a named choice is constrained with the first tool's
-/// schema. `None` when the request declares no tool or its choice forces no
-/// call; an error when the choice narrows the tools to none (a function the
-/// request does not declare, an allowed-tools list naming none of them),
-/// which the gateway's validation rejects.
+/// The constraint the engine is held to for the request's tool choice, as the
+/// `(kind, value)` pair the engine request takes: the JSON schema the
+/// Symphony tables read the forced call under, built from the request's
+/// effective tools narrowed by the choice (the named function, an
+/// allowed-tools list), the gateway's callable set. A named function is
+/// constrained with that function's parameters (the `forced` table reads
+/// the arguments object alone), `required` with the list of calls to any of
+/// the tools (the `json` table reads it). `None` when the request declares no
+/// tool or its choice forces no call; an error when the choice needs a tool
+/// and the request declares none, or narrows the tools to none (a function
+/// the request does not declare, an allowed-tools list naming none of them),
+/// both of which the gateway's validation rejects with the same words, or
+/// when two tools define one `$defs` name differently.
 pub(crate) fn tool_constraint_for(
     request: &ChatCompletionRequest,
-) -> Result<Option<ToolConstraint>, String> {
+) -> Result<Option<(String, String)>, String> {
     let Some(tool_choice) = request.tool_choice.as_ref() else {
         return Ok(None);
     };
     let tools = effective_tools(request);
     if tools.is_empty() {
-        return Ok(None);
+        let needs_none = matches!(
+            tool_choice,
+            ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto)
+        );
+        return if needs_none {
+            Ok(None)
+        } else {
+            Err(TOOL_CHOICE_REQUIRES_TOOLS.to_string())
+        };
     }
     let narrowed = tool_choice.narrow_tools(&tools);
-    let tools: &[Tool] = match &narrowed {
+    let allowed: &[Tool] = match &narrowed {
         Some(narrowed) if narrowed.is_empty() => return Err(narrowed_to_none(tool_choice)),
         Some(narrowed) => narrowed,
         None => &tools,
     };
-    // No parser is configured here, so the registry falls back to a JSON
-    // schema, which carries no reasoning prefix.
-    PARSER_FACTORY
-        .registry()
-        .generate_tool_constraint(None, tools, tool_choice, false)
+    if !tool_choice.forces_call() {
+        return Ok(None);
+    }
+    let schema = match tool_choice {
+        // The helper finds the function among every tool of the request; the
+        // narrowing above refused a name no tool declares.
+        ToolChoice::Function { function, .. } => {
+            arguments_schema(&tools, &function.name).ok_or_else(|| narrowed_to_none(tool_choice))?
+        }
+        ToolChoice::Value(_) | ToolChoice::AllowedTools { .. } => required_calls_schema(allowed)?,
+    };
+    let schema = serde_json::to_string(&schema)
+        .map_err(|e| format!("Failed to serialize tool parameters: {e}"))?;
+    Ok(Some(("json_schema".to_string(), schema)))
 }
+
+/// The gateway's refusal of a choice that needs a tool on a request that
+/// declares none (`tool_choice_requires_tools` in the protocol crate's
+/// validation), word for word.
+const TOOL_CHOICE_REQUIRES_TOOLS: &str =
+    "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.";
 
 /// The error of a choice that leaves no tool to call, worded as the
 /// gateway's validation words it.
@@ -141,7 +167,7 @@ mod tests {
 
     fn schema_of(request: &ChatCompletionRequest) -> Value {
         match tool_constraint_for(request).unwrap() {
-            Some(ToolConstraint::JsonSchema(schema)) => serde_json::from_str(&schema).unwrap(),
+            Some((kind, schema)) if kind == "json_schema" => serde_json::from_str(&schema).unwrap(),
             other => panic!("expected a JSON schema constraint, got {other:?}"),
         }
     }
@@ -165,6 +191,38 @@ mod tests {
             schema,
             json!({"type": "object", "properties": {"city": {"type": "string"}}})
         );
+    }
+
+    /// A choice that needs a tool on a request without tools is refused with
+    /// the gateway's words; `auto` and `none` without tools constrain nothing.
+    #[test]
+    fn a_choice_that_needs_a_tool_is_refused_without_tools() {
+        let without_tools = |tool_choice: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "unmapped-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": tool_choice
+            }))
+            .unwrap()
+        };
+        for tool_choice in [
+            json!("required"),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "get_weather"}]}),
+        ] {
+            let error = tool_constraint_for(&without_tools(tool_choice.clone())).unwrap_err();
+            assert!(
+                error.contains("'tool_choice' is only allowed when 'tools' are specified"),
+                "{tool_choice}: {error}"
+            );
+        }
+        for tool_choice in [json!("auto"), json!("none")] {
+            assert_eq!(
+                tool_constraint_for(&without_tools(tool_choice.clone())).unwrap(),
+                None,
+                "{tool_choice}"
+            );
+        }
     }
 
     /// `required` keeps every tool: the forced array may name either.

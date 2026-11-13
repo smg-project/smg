@@ -7,7 +7,7 @@ use std::{
     os::raw::c_char,
 };
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
 
 use super::error::{clear_error_message, set_error_message, SglErrorCode};
 
@@ -38,25 +38,6 @@ pub(crate) unsafe fn read_json_arg<T: DeserializeOwned>(
         set_error_message(error_out, &format!("Failed to parse {noun} JSON: {e}"));
         SglErrorCode::ParsingError
     })
-}
-
-/// Write `value` as JSON into the caller's `out` string, which the caller
-/// frees with `sgl_free_string`, and clear `error_out`. A value that does not
-/// serialize is `ParsingError`; one with an interior NUL is `MemoryError`.
-///
-/// # Safety
-/// - `out` must point to writable memory
-/// - `error_out` may be null; if non-null, must point to writable memory
-pub(crate) unsafe fn write_json_result<T: Serialize>(
-    value: &T,
-    out: *mut *mut c_char,
-    error_out: *mut *mut c_char,
-) -> Result<(), SglErrorCode> {
-    let text = serde_json::to_string(value).map_err(|e| {
-        set_error_message(error_out, &format!("Failed to serialize JSON: {e}"));
-        SglErrorCode::ParsingError
-    })?;
-    write_string_result(text, out, error_out)
 }
 
 /// Write `text` into the caller's `out` string, which the caller frees with
@@ -178,12 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn a_result_is_written_as_json_and_a_nul_is_refused() {
+    fn a_result_is_written_as_a_c_string_and_a_nul_is_refused() {
         let mut out: *mut c_char = ptr::null_mut();
         let mut error: *mut c_char = CString::new("stale").unwrap().into_raw();
         // SAFETY: the out pointers are live locals; the strings are taken once.
         unsafe {
-            write_json_result(&json!({"normal_text": "hi"}), &mut out, &mut error).unwrap();
+            write_string_result(r#"{"normal_text":"hi"}"#.to_string(), &mut out, &mut error)
+                .unwrap();
             assert_eq!(
                 CStr::from_ptr(out).to_str().unwrap(),
                 r#"{"normal_text":"hi"}"#
