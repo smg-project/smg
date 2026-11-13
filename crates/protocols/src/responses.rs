@@ -1663,20 +1663,21 @@ pub enum StringOrContentParts {
 }
 
 impl StringOrContentParts {
-    /// Project tool output into a text-only backend without silently losing media.
+    /// Project tool output into a text-only backend without silently losing
+    /// media: a part without text is refused, and the refusal names the part.
     pub fn to_text_only(&self) -> Result<String, String> {
         match self {
             Self::String(text) => Ok(text.clone()),
             Self::Array(parts) => {
                 let mut text = String::new();
                 for part in parts {
-                    let Some(part) = part.text() else {
-                        return Err(
-                            "Multimodal function output is not supported by this text-only backend"
-                                .to_string(),
-                        );
+                    let Some(part_text) = part.text() else {
+                        let kind = part.type_name();
+                        return Err(format!(
+                            "Unsupported content part type {kind:?} in a function output for text-only backends: only text parts are carried as a tool result"
+                        ));
                     };
-                    text.push_str(part);
+                    text.push_str(part_text);
                 }
                 Ok(text)
             }
@@ -2246,6 +2247,18 @@ impl ResponseContentPart {
         match self {
             Self::OutputText { text, .. } | Self::InputText { text } => Some(text),
             Self::InputImage { .. } | Self::InputFile { .. } | Self::Refusal { .. } => None,
+        }
+    }
+
+    /// The wire-format type name (e.g. `"input_image"`), for a refusal that
+    /// names the part.
+    const fn type_name(&self) -> &'static str {
+        match self {
+            Self::OutputText { .. } => "output_text",
+            Self::InputText { .. } => "input_text",
+            Self::InputImage { .. } => "input_image",
+            Self::InputFile { .. } => "input_file",
+            Self::Refusal { .. } => "refusal",
         }
     }
 }
@@ -5006,7 +5019,8 @@ mod tests {
         assert_eq!(text.extract_text_for_routing(), "plain");
     }
 
-    /// Text-only content takes the text parts and refuses any other part.
+    /// Text-only content takes the text parts and refuses any other part,
+    /// naming the first part it cannot carry.
     #[test]
     fn text_only_content_refuses_a_part_without_text() {
         let with_image = StringOrContentParts::Array(vec![
@@ -5019,7 +5033,21 @@ mod tests {
                 image_url: Some("https://a/1.png".to_string()),
             },
         ]);
-        assert!(with_image.to_text_only().is_err());
+        assert_eq!(
+            with_image.to_text_only().unwrap_err(),
+            "Unsupported content part type \"input_image\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
+        let with_file = StringOrContentParts::Array(vec![ResponseContentPart::InputFile {
+            detail: None,
+            file_data: None,
+            file_id: Some("file_1".to_string()),
+            file_url: None,
+            filename: None,
+        }]);
+        assert_eq!(
+            with_file.to_text_only().unwrap_err(),
+            "Unsupported content part type \"input_file\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
 
         let text = StringOrContentParts::Array(vec![
             ResponseContentPart::InputText {

@@ -393,27 +393,37 @@ impl SecretReloader {
 /// One reload off the runtime's threads (the files are small, but a mount
 /// can stall), its outcome logged under `trigger` (`route` or `watch`): the
 /// files read and whether each set changed, or the file that stopped it with
-/// every key in force standing. `None` when the reload's task did not
-/// complete, which is logged as an error.
+/// every key in force standing. The task that reloads writes that line,
+/// under the caller's span: a caller that leaves mid-reload (the route's
+/// client gone) drops this future, not the task, and the keys put in force
+/// are still said so. `None` when the reload's task did not complete, which
+/// is logged as an error.
 pub async fn reload_logged(
     reloader: Arc<SecretReloader>,
     trigger: &'static str,
 ) -> Option<Result<ReloadReport, BadFile>> {
-    match task::spawn_blocking(move || reloader.reload()).await {
-        Ok(Ok(report)) => {
-            info!(
-                trigger,
-                files = report.files.len(),
-                serving_changed = report.serving_changed,
-                control_plane_changed = report.control_plane_changed,
-                "the keys were reloaded from their files"
-            );
-            Some(Ok(report))
-        }
-        Ok(Err(BadFile(error))) => {
-            warn!(trigger, %error, "the keys were not reloaded; the keys in force stand");
-            Some(Err(BadFile(error)))
-        }
+    let span = tracing::Span::current();
+    let reloaded = task::spawn_blocking(move || {
+        span.in_scope(|| {
+            let outcome = reloader.reload();
+            match &outcome {
+                Ok(report) => info!(
+                    trigger,
+                    files = report.files.len(),
+                    serving_changed = report.serving_changed,
+                    control_plane_changed = report.control_plane_changed,
+                    "the keys were reloaded from their files"
+                ),
+                Err(BadFile(error)) => {
+                    warn!(trigger, %error, "the keys were not reloaded; the keys in force stand");
+                }
+            }
+            outcome
+        })
+    })
+    .await;
+    match reloaded {
+        Ok(outcome) => Some(outcome),
         Err(error) => {
             error!(trigger, %error, "the keys' reload did not complete");
             None
@@ -549,7 +559,10 @@ async fn watch_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc as std_mpsc;
+
     use smg_auth::{ApiKeyEntry, Role};
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -608,6 +621,71 @@ mod tests {
 
         let again = reloader.reload().expect("reloaded");
         assert!(!again.serving_changed, "the same file changes nothing");
+    }
+
+    /// A caller that leaves while the keys are reloaded: the future is
+    /// dropped at its await of the blocking task, the task puts the files'
+    /// keys in force all the same, and the reload's log line is written under
+    /// the caller's span. The runtime's one blocking thread is held until the
+    /// drop, so the first poll is pending by construction, and the line is
+    /// awaited before the keys are read.
+    #[traced_test]
+    #[test]
+    fn a_reload_whose_caller_leaves_still_logs_its_outcome() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("a directory");
+            let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+            let entries = [TenantApiKeyEntry {
+                tenant_id: "acme".into(),
+                key: "t-one".into(),
+            }];
+            let serving = AuthConfig::with_tenant_keys(Some("flag-key".into()), &entries);
+            let reloader = Arc::new(
+                SecretReloader::new(
+                    SecretFiles {
+                        tenant_api_keys: Some(tenants),
+                        ..SecretFiles::default()
+                    },
+                    &sources(SecretSource::Flag, Some(SecretSource::File)),
+                    Some("flag-key"),
+                    &entries,
+                    KeySets::serving_alone(serving.clone()),
+                )
+                .expect("a file source"),
+            );
+            write(dir.path(), "tenants", "acme:t-two\n");
+
+            let (release, held) = std_mpsc::channel::<()>();
+            let _hold = task::spawn_blocking(move || held.recv());
+            let mut reload = Box::pin(reload_logged(Arc::clone(&reloader), "route"));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(reload.as_mut(), &mut cx).is_pending(),
+                "the reload yields at its await of the queued blocking task"
+            );
+            drop(reload);
+            release.send(()).expect("the hold waits for its release");
+
+            let logged = time::timeout(Duration::from_secs(10), async {
+                while !logs_contain("the keys were reloaded from their files") {
+                    time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                logged.is_ok(),
+                "the reload task logs its outcome without its caller"
+            );
+            assert!(
+                serving.contains_token("t-two"),
+                "the rotated key is in force"
+            );
+        });
     }
 
     #[test]

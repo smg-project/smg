@@ -30,9 +30,9 @@ use std::{
 
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
-    gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling,
-    llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13, muse_spark,
-    olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    gemma4, glm, glm4, hy4, hy_v3, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5,
+    ling, llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13,
+    muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -86,6 +86,8 @@ tables! {
     SeedOss => "seed_oss", seed_oss;
     /// [`hy4()`].
     Hy4 => "hy4", hy4;
+    /// [`hy_v3()`].
+    HyV3 => "hy_v3", hy_v3;
     /// [`ling()`].
     Ling => "ling", ling;
     /// [`iquest()`].
@@ -225,7 +227,7 @@ struct Group {
     /// own: the prompt's replay starts at its last occurrence.
     opener: Option<&'static str>,
     /// What the group's own template writes after the thought's close before the first call,
-    /// when it is not the table's own (the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one
+    /// when it is not the table's own (the NVIDIA Nemotron 3 and 3.5 groups and Step 3.5 Flash write one
     /// newline where the Qwen 3.5 template writes two): the group's tags write it in the table's place
     /// ([`Format::with_thought_after`]).
     after: Option<&'static str>,
@@ -570,6 +572,22 @@ mod tests {
             ("microsoft/AesCode-8B", Table::Qwen3),
             ("microsoft/AesCode-32B", Table::Qwen3),
             ("internlm/Visual-ERM", Table::Qwen3),
+            ("tencent/WeVisOne-VL-2B", Table::Qwen3),
+            ("LiquidAI/LFM2.5-24B-A2B-FP8", Table::Lfm2_5),
+            ("tencent/Hy-Memory-30B-A3B-FP8", Table::HyV3),
+            ("mistralai/Mistral-Large-4-1T-A52B-NVFP4", Table::MistralV13),
+            (
+                "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+                Table::Qwen3Tagged,
+            ),
+            (
+                "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8",
+                Table::Qwen3Tagged,
+            ),
+            (
+                "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+                Table::Qwen3Tagged,
+            ),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
