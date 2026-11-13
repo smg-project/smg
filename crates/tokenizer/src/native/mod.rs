@@ -2584,20 +2584,26 @@ impl NativeEncoder {
         Some(0)
     }
 
-    /// Where the cut check's window for a candidate at `p` ends: the first
-    /// space at or after `p + CUT_CHECK_WINDOW` where the whole text's match
-    /// loop begins a piece, by the rule of the start ([`Self::window_start`]),
-    /// or the text's end, so that the window's pieces around `p` are the
-    /// text's. A window ended at a space inside a piece cuts that piece
-    /// short, and an alternative the end no longer holds gives way to a
-    /// shorter one that fits: ` [ a]{1999}| [ a]{999}| a` over a run of
-    /// ` a` ends its shorter alternative on a candidate the text's longer
-    /// one spans, which would approve a cut inside a piece. When no stage
-    /// reads a space inside a match the first space on is the end, as any
-    /// space begins a piece then. Otherwise `None` when no such space lies
-    /// within [`CUT_CHECK_REACH`] of `p` and the text runs on: no cut there
-    /// (under a pattern that reads a space inside a match such a stretch is
-    /// one piece, so no cut is lost).
+    /// Where the cut check's window for a candidate at `p` ends: just after
+    /// the first space at or after `p + CUT_CHECK_WINDOW` where the whole
+    /// text's match loop begins a piece, by the rule of the start
+    /// ([`Self::window_start`]), or at the text's end, so that the window's
+    /// pieces around `p` are the text's. A window ended at a space inside a
+    /// piece cuts that piece short, and an alternative the end no longer
+    /// holds gives way to a shorter one that fits: ` [ a]{1999}| [ a]{999}| a`
+    /// over a run of ` a` ends its shorter alternative on a candidate the
+    /// text's longer one spans, which would approve a cut inside a piece. The
+    /// space itself lies inside the window, so that a lookahead at it reads
+    /// the space as the text does, not the window's end (` a{1000}(?!\s)`
+    /// holds at the one and fails at the other); nothing from before `p`
+    /// reads past that space (no piece spans it, and `p`'s own left
+    /// neighbour is no whitespace, so no whitespace run spans `p`). When no
+    /// stage reads a space inside a match the first space on is the end: no
+    /// piece spans `p` then, so an end inside a later piece (a whitespace
+    /// run) changes nothing up to `p`. Otherwise `None` when no such space
+    /// lies within [`CUT_CHECK_REACH`] of `p` and the text runs on: no cut
+    /// there (under a pattern that reads a space inside a match such a
+    /// stretch is one piece, so no cut is lost).
     fn window_end(&self, text: &str, p: usize) -> Option<usize> {
         let bytes = text.as_bytes();
         let mut end = (p + CUT_CHECK_WINDOW).min(text.len());
@@ -2605,12 +2611,12 @@ impl NativeEncoder {
             while end < text.len() && !(text.is_char_boundary(end) && bytes[end] == b' ') {
                 end += 1;
             }
-            return Some(end);
+            return Some((end + 1).min(text.len()));
         }
         let ceiling = (p + CUT_CHECK_REACH).min(text.len());
         while end < text.len() {
             if self.piece_begins_at_space(text, end) {
-                return Some(end);
+                return Some(end + 1);
             }
             if end >= ceiling {
                 return None;
