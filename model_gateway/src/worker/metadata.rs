@@ -126,17 +126,23 @@ impl WorkerMetadata {
         self.spec.bootstrap_port
     }
 
+    /// The base URL as the engine registered it: a data-parallel row's engine
+    /// URL (`dp_base_url`), the worker's own otherwise. The key a creation
+    /// reserves a group's id under and every group site compares, however
+    /// the URL was spelled; [`Self::base_url`] is its join form.
+    pub fn registered_base_url(&self) -> &str {
+        self.spec
+            .dp_base_url
+            .as_deref()
+            .unwrap_or(self.spec.url.as_str())
+    }
+
     /// The base URL without any DP rank suffix and, for an `http://` or
     /// `https://` base, without a trailing slash: every route joins to it with
     /// one slash, however the URL was registered. A socket address stays as
     /// given. The worker's `url()` keeps the registered form, the registry's key.
     pub fn base_url(&self) -> &str {
-        join_base(
-            self.spec
-                .dp_base_url
-                .as_deref()
-                .unwrap_or(self.spec.url.as_str()),
-        )
+        join_base(self.registered_base_url())
     }
 
     /// Compose an endpoint URL for a specific route.

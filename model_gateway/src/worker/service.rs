@@ -805,7 +805,7 @@ impl WorkerService {
             .worker_registry
             .get_all()
             .into_iter()
-            .filter(|worker| worker.is_dp_aware() && worker.base_url() == url)
+            .filter(|worker| worker.is_dp_aware() && worker.registered_base_url() == url)
             .collect();
         ranks.sort_by_key(|worker| worker.dp_rank());
         ranks
@@ -1527,6 +1527,59 @@ mod tests {
             Err(WorkerServiceError::NotFound { .. })
         ));
         assert!(service.get_worker(next_id.as_str()).is_ok());
+    }
+
+    /// A data-parallel engine posted with a trailing slash (a form the URL
+    /// check accepts and the join trims) keeps one key through its group's
+    /// life: the creation's reservation, the rows' registration, the GET by
+    /// the group's id, the refusal of a second creation and the id's
+    /// retirement with the last row all meet on the registered base, not on
+    /// the join form.
+    #[tokio::test]
+    async fn a_slashed_engine_url_keeps_one_group_key_through_its_life() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "http://10.0.0.16:8000/";
+        let row = |rank: usize| {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .model(ModelCard::new("m"))
+                    .dp_config(rank, 2)
+                    .build(),
+            )
+        };
+        let group_id = registry
+            .reserve_for_create(url)
+            .expect("nothing answers to the URL yet");
+        let rows: Vec<WorkerId> = (0..2)
+            .map(|rank| registry.register(row(rank)).unwrap())
+            .collect();
+        // The Location's id resolves to the group's first rank.
+        assert!(service.get_worker(group_id.as_str()).is_ok());
+        // A second creation of the URL is refused with the group's id.
+        assert_eq!(registry.reserve_for_create(url), Err(group_id.clone()));
+
+        // The DELETE of the group: the id retires with the last row, so the
+        // next creation of the URL gets a fresh one.
+        for id in &rows {
+            registry.remove(id);
+        }
+        let next_id = registry
+            .reserve_for_create(url)
+            .expect("the URL is free once the group left");
+        assert_ne!(next_id, group_id, "the retired group's id came back");
+        assert!(matches!(
+            service.get_worker(group_id.as_str()),
+            Err(WorkerServiceError::NotFound { .. })
+        ));
     }
 
     /// A worker over the cap through the labels discovered at registration

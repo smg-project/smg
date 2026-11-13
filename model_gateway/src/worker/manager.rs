@@ -1332,7 +1332,9 @@ impl WorkerManager {
         let matching = match url_filter {
             Some(url) => workers
                 .into_iter()
-                .filter(|w| w.url() == url || w.base_url() == url)
+                // The filter in its join form, as the rows' base URL is, so a
+                // trailing slash matches either way.
+                .filter(|w| w.url() == url || w.base_url() == super::metadata::join_base(url))
                 .collect(),
             None => workers,
         };

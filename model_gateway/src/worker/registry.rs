@@ -1917,11 +1917,12 @@ impl WorkerRegistry {
         }
     }
 
-    /// Whether a data-parallel row of the engine at `base_url` is registered.
+    /// Whether a data-parallel row of the engine registered as `base_url` is
+    /// registered: the key as the creation posted it, not its join form.
     fn has_dp_rows_for(&self, base_url: &str) -> bool {
         self.workers
             .iter()
-            .any(|row| row.value().is_dp_aware() && row.value().base_url() == base_url)
+            .any(|row| row.value().is_dp_aware() && row.value().registered_base_url() == base_url)
     }
 
     /// The stripe of [`Self::group_url_locks`] a base URL hashes to.
@@ -2022,7 +2023,7 @@ impl WorkerRegistry {
             self.set_worker_overloaded(&worker, false);
             Self::demote_before_removal(&worker);
             if worker.is_dp_aware() {
-                let base = worker.base_url().to_string();
+                let base = worker.registered_base_url().to_string();
                 #[cfg(test)]
                 self.note_the_group_lock_attempt();
                 let guard = self.group_url_lock(&base).lock();
@@ -2312,7 +2313,7 @@ impl WorkerRegistry {
         // follow a removal mid-registration are a group with an id, a fresh
         // one when the removal retired the id the creation reserved.
         let group = worker.is_dp_aware().then(|| {
-            let base = worker.base_url().to_string();
+            let base = worker.registered_base_url().to_string();
             #[cfg(test)]
             self.note_the_group_lock_attempt();
             let guard = self.group_url_lock(&base).lock();
