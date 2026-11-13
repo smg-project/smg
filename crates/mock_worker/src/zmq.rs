@@ -540,7 +540,7 @@ pub async fn serve_until(
     let (mut input, output) = mock.split();
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
+        .then(|| Engine::spawn_named(cfg.engine_for(&name), name.clone(), true));
     // The rank's KV-event publisher, numbered after the gRPC workers and
     // stamping the batches with the rank this engine advertised.
     let publisher = engine.as_ref().and_then(|engine| {
@@ -1745,6 +1745,51 @@ mod tests {
             first.new_token_ids.is_empty(),
             "no output tokens: {first:?}"
         );
+    }
+
+    /// The rank `--worker-kv-tokens` names, by its engine index, runs its
+    /// engine with its own KV pool.
+    #[tokio::test]
+    async fn the_rank_an_override_names_runs_its_engine_with_its_own_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+        // An index no other test's rank takes: the fleet registry is
+        // process-wide.
+        let index = 4_217;
+        let name = format!("zmq:{index}");
+        let cfg = Config {
+            engine: EngineParams {
+                kv_capacity_tokens: 131_072,
+                ..EngineParams::default()
+            },
+            worker_kv_tokens: [(name.clone(), 65_536)].into(),
+            ..test_config()
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "serve loops until the test drops its handles"
+        )]
+        let _engine = tokio::spawn(serve(Arc::new(cfg), handshake.clone(), index));
+        let _transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let engine = loop {
+            let found = crate::engine::fleet_engines()
+                .into_iter()
+                .find(|engine| engine.name() == name);
+            if let Some(engine) = found {
+                break engine;
+            }
+            assert!(Instant::now() < deadline, "the rank's engine did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(engine.load().max_total_num_tokens, 65_536);
     }
 
     /// A decode rank declares its role, binds no bootstrap port, and

@@ -402,11 +402,13 @@ pub struct EngineParams {
     pub max_running: usize,
     /// KV cache capacity in tokens (`num_blocks × block_size`).
     pub kv_capacity_tokens: u64,
-    /// The KV capacity the decode cost was calibrated against. When set, a
-    /// decode step's utilisation is the decoding context over this reference,
-    /// not over the configured pool, so shrinking the pool (`--kv-blocks`)
-    /// changes how much fits, not how long a step takes: the engine's step
-    /// time depends on the tokens it attends to, not on the pool size.
+    /// The KV capacity the decode cost was calibrated against, or, for a
+    /// worker given a pool of its own (`--worker-kv-tokens`), the fleet's
+    /// pool when no calibration set it. When set, a decode step's utilisation
+    /// is the decoding context over this reference, not over the configured
+    /// pool, so shrinking the pool (`--kv-blocks`) changes how much fits, not
+    /// how long a step takes: the engine's step time depends on the tokens it
+    /// attends to, not on the pool size.
     pub decode_reference_tokens: Option<u64>,
     /// Cache block (page) size in tokens.
     pub block_size: u32,
@@ -447,6 +449,10 @@ pub struct EngineParams {
     /// index, kind and window ([`KvCacheGroup`]); the main group's index is
     /// [`KvCacheGroup::main_index`].
     pub kv_cache_groups: Vec<KvCacheGroup>,
+    /// Every pass takes this many times the timing model's duration: above
+    /// 1 an engine slower than its peers, below 1 a faster one
+    /// (`--worker-pass-time-scale`); 1 by default.
+    pub pass_time_scale: f64,
 }
 
 /// One KV cache group of a hybrid engine, as vLLM's hybrid KV-cache manager
@@ -555,6 +561,7 @@ impl Default for EngineParams {
             output_prefix: Vec::new(),
             dp_rank: 0,
             kv_cache_groups: vec![KvCacheGroup::full_attention()],
+            pass_time_scale: 1.0,
         }
     }
 }
@@ -2380,12 +2387,15 @@ impl SchedulerState {
         self.running = still;
 
         // ---- 5. Timing + bookkeeping ----
-        let prefill_ms = p.timing.prefill_pass_ms(prefill_tokens, largest_chunk);
+        // A slower or faster engine's scale stretches both parts, so the
+        // rates it reports below are its own.
+        let prefill_ms =
+            p.timing.prefill_pass_ms(prefill_tokens, largest_chunk) * p.pass_time_scale;
         let decode_ms = p.timing.decode_ms(
             num_decode,
             decode_ctx,
             p.decode_reference_tokens.unwrap_or(p.kv_capacity_tokens),
-        );
+        ) * p.pass_time_scale;
         let mut secs = (prefill_ms + decode_ms) / 1000.0;
         if secs <= 0.0 && !self.is_idle() {
             secs = 0.001; // never busy-spin while work remains
@@ -3144,6 +3154,44 @@ mod tests {
         assert!(
             (restarted - expected).abs() < 1e-6,
             "{restarted} vs {expected}: not averaged with the stale rate"
+        );
+    }
+
+    /// A pass-time scale stretches every pass, prefill and decode alike, and
+    /// the engine reports its own rate: half its peer's prefill rate at twice
+    /// its pass time.
+    #[test]
+    fn a_pass_time_scale_stretches_every_pass_and_the_rate_reported() {
+        let peer = EngineParams::default();
+        let slow = EngineParams {
+            pass_time_scale: 2.0,
+            ..peer.clone()
+        };
+        let run = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, _rx) = req("scaled", vec![7; 256], 4);
+            st.enqueue(r, p);
+            let prefill = st.step(p).duration.as_secs_f64();
+            let decode = st.step(p).duration.as_secs_f64();
+            let rate = st
+                .snapshot(p)
+                .prefill_throughput
+                .expect("the first pass prefilled");
+            (prefill, decode, rate)
+        };
+        let (peer_prefill, peer_decode, peer_rate) = run(&peer);
+        let (slow_prefill, slow_decode, slow_rate) = run(&slow);
+        assert!(
+            (slow_prefill / peer_prefill - 2.0).abs() < 1e-6,
+            "{slow_prefill} vs {peer_prefill}"
+        );
+        assert!(
+            (slow_decode / peer_decode - 2.0).abs() < 1e-6,
+            "{slow_decode} vs {peer_decode}"
+        );
+        assert!(
+            (slow_rate * 2.0 - peer_rate).abs() < 1e-6,
+            "{slow_rate} vs {peer_rate}"
         );
     }
 
