@@ -998,6 +998,9 @@ impl Format {
                 1 => parts.remove(0),
                 _ => Grammar::Sequence(parts),
             };
+            if answer_open {
+                return Some(self.bounded(answer));
+            }
             // A prefix of free text cannot lead an answer. It leads a forced call because the
             // call's marker is excluded from it, so the marker the model writes can only open
             // the tag; an answer has no marker, nothing in the prefix says where the schema
@@ -1119,15 +1122,14 @@ impl Format {
                 return Some(self.bounded(Grammar::Sequence(parts)));
             }
         }
-        self.led(
-            Grammar::Tag(Tag::new(begin, answer, end)),
-            reasoning_open,
-            false,
-            false,
-            start,
-            "",
-        )
-        .map(|grammar| self.bounded(grammar))
+        let answer = Grammar::Tag(Tag::new(begin, answer, end));
+        // The prompt already entered the answer. Even a table that thinks first
+        // must not prepend another thought after that point.
+        if answer_open {
+            return Some(self.bounded(answer));
+        }
+        self.led(answer, reasoning_open, false, false, start, "")
+            .map(|grammar| self.bounded(grammar))
     }
 
     /// `body` after what the model writes before it. With the prompt's thought open, the prefix
@@ -3316,7 +3318,12 @@ mod tests {
             GrammarStart::FirstToken,
         ] {
             let grammar = format
-                .answer_grammar_at(&value!({"type": "object"}), false, start, position)
+                .answer_grammar_at(
+                    &Arc::new(value!({"type": "object"})),
+                    false,
+                    start,
+                    position,
+                )
                 .expect("an answer");
             grammar.check().expect("a valid structural tag");
             let tag = grammar.payload();
@@ -3337,7 +3344,7 @@ mod tests {
         assert_eq!(position, OutputPosition::InThought);
         let grammar = format
             .answer_grammar_at(
-                &value!({"type": "object"}),
+                &Arc::new(value!({"type": "object"})),
                 true,
                 GrammarStart::AfterReasoning,
                 position,
@@ -3360,7 +3367,7 @@ mod tests {
             grammar,
             format
                 .answer_grammar_for(
-                    &value!({"type": "object"}),
+                    &Arc::new(value!({"type": "object"})),
                     true,
                     GrammarStart::AfterReasoning
                 )
@@ -4129,6 +4136,70 @@ mod tests {
         assert_eq!(
             answer(&format, true),
             answer(&formats::qwen3(CallSyntax::Json), true)
+        );
+    }
+
+    fn assert_prefilled_answer_skips_thinks_first(format: &Format, expected: Value) {
+        for reasoning_open in [false, true] {
+            for start in [
+                GrammarStart::Unknown,
+                GrammarStart::AfterReasoning,
+                GrammarStart::FirstToken,
+                GrammarStart::Either,
+            ] {
+                let grammar = format
+                    .answer_grammar_at(
+                        &shared_schema(),
+                        reasoning_open,
+                        start,
+                        OutputPosition::InAnswer,
+                    )
+                    .expect("the answer has already started");
+                grammar.check().expect("a valid answer grammar");
+                assert_eq!(
+                    grammar.to_json(),
+                    expected,
+                    "{}, reasoning_open={reasoning_open}, start={start:?}",
+                    format.name(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefilled_answer_skips_thinks_first_in_a_framed_region() {
+        let format = formats::kimi_k3().thinks_first();
+        let prompt = "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>";
+        assert_eq!(
+            format.output_position(prompt, false),
+            OutputPosition::InAnswer
+        );
+        assert_prefilled_answer_skips_thinks_first(
+            &format,
+            value!({
+                "type": "tag", "begin": "",
+                "content": {"type": "json_schema", "json_schema": answer_schema()},
+                "end": "<|close|>response<|sep|><|close|>message<|sep|>",
+            }),
+        );
+        let body = r#"{"city":"Paris"}"#;
+        let message = read(
+            &format,
+            &[],
+            prompt,
+            &format!("{body}<|close|>response<|sep|><|close|>message<|sep|>"),
+        );
+        assert_eq!(message["content"], body);
+        assert_eq!(message["reasoning"], Value::Null);
+    }
+
+    #[test]
+    fn prefilled_answer_skips_thinks_first_for_an_unframed_schema() {
+        // An explicit InAnswer also bypasses the thought on the answer path
+        // whose table starts in content, without a framing tag around its schema.
+        assert_prefilled_answer_skips_thinks_first(
+            &thinking_first(),
+            value!({"type": "json_schema", "json_schema": answer_schema()}),
         );
     }
 
