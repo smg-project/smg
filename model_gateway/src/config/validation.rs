@@ -3854,6 +3854,37 @@ mod tests {
         }
     }
 
+    /// The load-time refusal of a denied routing-key header reads the
+    /// override's list, never the default policy: under a `manual` default,
+    /// whose sessions rule lists no override header, an enabled override
+    /// naming a credential header is refused by name under both engines.
+    #[test]
+    fn a_denied_routing_header_is_refused_under_a_manual_default_too() {
+        let mut config = regular_mode_config();
+        config.policy = PolicyConfig::Manual {
+            eviction_interval_secs: 60,
+            max_idle_secs: 3600,
+            assignment_mode: crate::config::types::ManualAssignmentMode::Random,
+        };
+        config.routing_key_override.enabled = true;
+        config.routing_key_override.headers = vec!["x-api-key".to_string()];
+        for engine in [PolicyEngineMode::Engine, PolicyEngineMode::Legacy] {
+            config.policy_engine = engine;
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::ValidationFailed { ref reason })
+                        if reason.contains("routing_key_override.headers")
+                            && reason.contains("x-api-key")
+                            && reason.contains("credential")
+                ),
+                "{engine:?}"
+            );
+        }
+        config.routing_key_override.headers = vec!["x-session-id".to_string()];
+        config.policy_engine = PolicyEngineMode::Engine;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
     /// A routing-key header is never a credential: every name on the shared
     /// header deny-list is refused at load by name, in any letter case and in
     /// any position of the list, where a plain name beside it is taken.
