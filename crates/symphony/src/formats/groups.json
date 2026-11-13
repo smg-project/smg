@@ -155,7 +155,7 @@
   {"model": "nvidia/Nemotron-Research-GooseReason-4B-Instruct", "also": ["OpenMOSS-Team/SciJudge-4B", "OpenMOSS-Team/SciJudge-4B-2605"], "table": "qwen2.5", "opener": null, "after": null},
   {"model": "nvidia/NLD-Uni", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
-  {"model": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
+  {"model": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "also": ["h2oai/h2o-lightning-4b-nemotron-nano"], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", "also": ["Nemotron-3-Labs-Ultra-Math-SFT", "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", "also": ["Nemotron-3-Labs-Ultra-Math-RL", "NVIDIA-Nemotron-Labs-Teacher-Chat", "NVIDIA-Nemotron-Labs-Teacher-Competition-Coding", "NVIDIA-Nemotron-Labs-Teacher-General-Reasoning", "NVIDIA-Nemotron-Labs-Teacher-Instruction-Following", "NVIDIA-Nemotron-Labs-Teacher-STEM"], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
