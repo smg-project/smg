@@ -985,8 +985,9 @@ async fn a_matched_stop_ends_the_second_choice_with_its_own_index() {
     );
     assert!(stream.message().bounded().await.unwrap().is_none());
     // The engine gets the abort for the choice the servicer ended, and only
-    // that one.
+    // that one: nothing follows it.
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r8-1".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
 }
 
 /// A stop string that is one token (`world` is mock token 2) also reaches

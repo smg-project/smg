@@ -1700,7 +1700,8 @@ mod tests {
     /// not end the wait early, and the failure is counted by its code. The
     /// doubling is read from the delays the subscription schedules (its
     /// retry lines), not from the wall-clock gaps between the connects,
-    /// which a loaded host stretches unevenly.
+    /// which a loaded host stretches unevenly; each gap is held to the delay
+    /// slept before it, a floor load can only raise.
     #[traced_test]
     #[test]
     fn a_stream_that_fails_on_its_first_message_backs_off_and_is_counted() {
@@ -1738,7 +1739,12 @@ mod tests {
             "{} subscribe calls in 1.9 s",
             calls.len()
         );
-        // The delay scheduled after each failed stream doubles up to the cap.
+        // The delay scheduled after each failed stream doubles up to the cap,
+        // and each was slept: the gap before a connect is at least the delay
+        // the retry line before it scheduled. A loaded host only stretches a
+        // gap, and a connect it pushes past the window takes its delay with
+        // it, so the floor reads the retry lines rather than a fixed value.
+        let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
         logs_assert(|lines: &[&str]| {
             let delays = lines
                 .iter()
@@ -1764,14 +1770,18 @@ mod tests {
             {
                 return Err(format!("the scheduled delays do not double: {delays:?}"));
             }
+            if let Some((gap, delay)) = gaps
+                .iter()
+                .zip(&delays)
+                .find(|(gap, delay)| **gap < Duration::from_millis(**delay))
+            {
+                return Err(format!(
+                    "a connect came {gap:?} after the one before it, under the {delay} ms \
+                     its retry line scheduled: gaps {gaps:?}, delays {delays:?}"
+                ));
+            }
             Ok(())
         });
-        // The last wait was slept: a loaded host only stretches it.
-        let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        assert!(
-            gaps.last().unwrap() >= &Duration::from_millis(600),
-            "{gaps:?}"
-        );
 
         let rendered = handle.render();
         let line = rendered

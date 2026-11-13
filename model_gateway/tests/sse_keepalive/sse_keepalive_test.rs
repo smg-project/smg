@@ -170,7 +170,16 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
         // The first one interval after the headers, where the timer was
         // armed at most `slack` before the clock paused.
         if read.resumed_at >= INTERVAL {
-            let first = during.first().map_or(Duration::ZERO, |arrival| arrival.at);
+            let first = during
+                .first()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: no keep-alive arrived in the silence, the first was due one interval \
+                         after the headers: {arrivals:#?}",
+                        endpoint.path
+                    )
+                })
+                .at;
             assert!(
                 first <= INTERVAL + WHEEL && first + read.slack >= INTERVAL,
                 "{}: the first keep-alive at {first:?}, not one interval after the headers (slack \
@@ -222,7 +231,14 @@ async fn an_interval_of_zero_sends_nothing_through_the_silence() {
     // frames.
     let first = arrivals
         .first()
-        .map_or(Duration::ZERO, |arrival| arrival.at);
+        .unwrap_or_else(|| {
+            panic!(
+                "no frame arrived within the budget (eof {}): the engine's frames were due at the \
+                 end of its {SILENCE:?} silence",
+                read.eof
+            )
+        })
+        .at;
     assert!(
         first + read.slack + WHEEL >= SILENCE,
         "the engine's first frame at {first:?}, before the end of its {SILENCE:?} silence (slack \

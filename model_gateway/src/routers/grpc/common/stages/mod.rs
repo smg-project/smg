@@ -57,6 +57,7 @@ mod client_acquisition;
 mod context_length;
 mod dispatch_metadata;
 pub(crate) mod encode;
+mod grouped_dp;
 pub(crate) mod helpers;
 pub(crate) mod pd_protocol;
 mod rate_limit;

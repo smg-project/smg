@@ -1486,8 +1486,9 @@ mod tests {
 
     /// A Responses message item's `input_image` or `input_file` part has no
     /// form in a Harmony prompt: the build refuses it by name, as it refuses
-    /// chat audio, instead of rendering the turn without it; a message item
-    /// and a simple input message alike.
+    /// chat audio, instead of rendering the turn without it; a message item,
+    /// a simple input message and a function output (the tool message's text)
+    /// alike.
     #[test]
     fn build_from_responses_refuses_image_and_file_parts() {
         let builder = HarmonyBuilder::new();
@@ -1507,6 +1508,10 @@ mod tests {
                     {"type": "input_text", "text": "hi"}, part.clone()
                 ]}]),
                 json!([{"role": "user", "content": [part.clone()]}]),
+                json!([
+                    {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": [part.clone()]}
+                ]),
             ];
             for input in inputs {
                 let request: ResponsesRequest =
