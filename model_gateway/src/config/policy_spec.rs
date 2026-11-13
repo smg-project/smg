@@ -1807,11 +1807,6 @@ impl Compiler<'_> {
         shown: String,
     ) {
         let rendered = value.value();
-        debug_assert!(
-            !rendered.is_null(),
-            "a held field of {} renders null",
-            flag.id
-        );
         let (default, at_default) = match default {
             Some(default) => {
                 let default = default.value();
@@ -1836,12 +1831,6 @@ impl Compiler<'_> {
         self.push(flag, fields, shown, rendered, default, at_default);
     }
 
-    /// Consume a policy flag into two fields: the binding reference at
-    /// `binding` (the profile's name, what the document holds there) and
-    /// `profiles.<name>`, which holds the structure the flag fixes (see
-    /// [`fixed_shape`]); the line shows the policy's name. A policy at its
-    /// default is consumed only when the front end saw the flag, as a
-    /// value is.
     /// The marks the profile builders left for `name`'s policy row, taken
     /// out of the implied set.
     fn claims(&mut self, name: &str) -> Vec<Field> {
@@ -1854,6 +1843,12 @@ impl Compiler<'_> {
         mine
     }
 
+    /// Consume a policy flag into two fields: the binding reference at
+    /// `binding` (the profile's name, what the document holds there) and
+    /// `profiles.<name>`, which holds the structure the flag fixes (see
+    /// [`fixed_shape`]); the line shows the policy's name. A policy at its
+    /// default is consumed only when the front end saw the flag, as a
+    /// value is.
     fn profile_row(
         &mut self,
         flag: Flag,
@@ -1956,13 +1951,6 @@ impl Compiler<'_> {
     }
 }
 
-/// The structure a policy flag fixes in its profile, as a document value:
-/// the names of its score stages and its picker. The filters are the
-/// document's. Where a knob flag of the policy governs the structure, the
-/// flag fixes the knob's range: the power-of-two profile is one of its
-/// metric's four forms (`forms`), the cache-aware picker one of the two
-/// `--selection-temperature` selects; a knob flag given pins its own
-/// choice on its row. The parameters are the knob rows' to check.
 /// The power-of-two profile's four forms as a range, built once: the
 /// shape of each metric's form, the request tokens not among them.
 static POWER_OF_TWO_FORMS: LazyLock<Value> = LazyLock::new(|| {
@@ -1981,6 +1969,13 @@ static POWER_OF_TWO_FORMS: LazyLock<Value> = LazyLock::new(|| {
     serde_json::json!({ "forms": forms })
 });
 
+/// The structure a policy flag fixes in its profile, as a document value:
+/// the names of its score stages and its picker. The filters are the
+/// document's. Where a knob flag of the policy governs the structure, the
+/// flag fixes the knob's range: the power-of-two profile is one of its
+/// metric's four forms (`forms`), the cache-aware picker one of the two
+/// `--selection-temperature` selects; a knob flag given pins its own
+/// choice on its row. The parameters are the knob rows' to check.
 fn fixed_shape(policy: &PolicyConfig, profile: &ProfileSpec) -> Value {
     if matches!(policy, PolicyConfig::PowerOfTwo { .. }) {
         return POWER_OF_TWO_FORMS.clone();
@@ -4005,5 +4000,23 @@ bindings:
             Some("a zero idle time keeps keys for ever, so the sweep is for ever too")
         );
         assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+    }
+
+    /// A legacy value validation accepts but the schema cannot carry (a
+    /// throughput beyond single precision) compiles without a panic: the
+    /// field renders null and the line shows it.
+    #[test]
+    fn a_non_finite_legacy_value_compiles_without_a_panic() {
+        let config = regular(PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.15,
+            default_throughput: 1e40,
+            mean_prefill_tokens: 1024,
+        });
+        let compiled = compile(&config);
+        assert!(compiled
+            .report
+            .consumed
+            .iter()
+            .any(|row| row.id == "least_load_default_throughput"));
     }
 }
