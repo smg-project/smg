@@ -139,6 +139,12 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
         )
         .await;
         let arrivals = &read.arrivals;
+        assert!(
+            !arrivals.is_empty(),
+            "{}: no frame arrived within the budget (eof={})",
+            endpoint.path,
+            read.eof
+        );
         let (silence, flowing) = split_at_first_engine_frame(arrivals, endpoint.keep_alive);
         let during = keep_alives(silence, endpoint.keep_alive);
         // One keep-alive per whole interval of the silence: every one due
@@ -172,13 +178,7 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
         if read.resumed_at >= INTERVAL {
             let first = during
                 .first()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{}: no keep-alive arrived in the silence, the first was due one interval \
-                         after the headers: {arrivals:#?}",
-                        endpoint.path
-                    )
-                })
+                .expect("the split found a keep-alive in the silence")
                 .at;
             assert!(
                 first <= INTERVAL + WHEEL && first + read.slack >= INTERVAL,

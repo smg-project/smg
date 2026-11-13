@@ -106,16 +106,16 @@ impl Arrival {
 }
 
 /// `send` then `read` with tokio's clock paused from the response headers
-/// on, for
-/// a test that reads the gateway's timers as exact instants. The request,
-/// its dial and its hops to the engine run on the wall clock: a paused
-/// clock's auto-advance polls I/O once and, with nothing ready, moves on to
-/// the next timer, which on a loaded host would be the dial's own timeout.
-/// The silence after the headers has only the gateway's timers, which the
-/// runtime advances to with no wall time spent. Returns the arrivals and
-/// the request's wall duration before the pause: a timer the gateway armed
-/// at the headers is due that much earlier than the arrival clock says, at
-/// most. Needs a current-thread runtime, as `tokio::time::pause` does.
+/// on, for a test that reads the gateway's timers as exact instants. The
+/// request, its dial and its hops to the engine run on the wall clock: a
+/// paused clock's auto-advance polls I/O once and, with nothing ready, moves
+/// on to the next timer, which on a loaded host would be the dial's own
+/// timeout. The silence after the headers has only the gateway's timers,
+/// which the runtime advances to with no wall time spent. Returns the
+/// arrivals and the request's wall duration before the pause: a timer the
+/// gateway armed at the headers is due that much earlier than the arrival
+/// clock says, at most. Needs a current-thread runtime, as
+/// `tokio::time::pause` does.
 pub async fn stream_paused_from_the_headers(
     app: &Router,
     path: &str,
