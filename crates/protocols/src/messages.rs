@@ -2205,7 +2205,7 @@ impl ListModelsResponse {
 
 /// The request's container (beta), in either form the public API takes: the
 /// id of a container to reuse, or its configuration. It is read by hand, as
-/// [`StringOrBlocks`] is, so a malformed container is refused with the error
+/// [`SystemContent`] is, so a malformed container is refused with the error
 /// of the form it took, not an untagged enum's "did not match any variant".
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
