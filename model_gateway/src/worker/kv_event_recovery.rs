@@ -20,6 +20,15 @@
 //!   stores for them), a large one clears it, mirroring the servicers' own
 //!   `OUT_OF_RANGE` / `DATA_LOSS` signal.
 //!
+//! A rank that skips a replay from zero up to its cursor (a rank worker
+//! joined its engine's stream late, [`RankState::replay_from_zero`]) reads
+//! none of the restart signs below the cursor: there a restarted publisher,
+//! counting from its start again, looks like the replay. The skip is
+//! therefore kept only for the stream that follows the subscriber's own drop
+//! of a live one that had moved every cursor ([`RankState::unconfirmed`]); a
+//! stream from zero that opens after a break starts the rank over instead
+//! (the monitor resets it before the first batch).
+//!
 //! The Rust relay serves a state snapshot in band: once its history no longer
 //! starts at the publisher's first batch, a subscription from zero begins with
 //! chunks marked `KvSnapshotChunk` (chunk 0 carries the engine's clear, the
@@ -91,8 +100,10 @@ pub(crate) enum ResyncReason {
     /// A rank worker joined its engine's stream after it had delivered: the
     /// engine resubscribes from zero so the relay's history reaches that
     /// rank too. Counted under the joining worker; the workers already on
-    /// the stream keep their state (all of them are reset, and counted,
-    /// only when a whole-engine worker is on the stream or joins).
+    /// the stream keep their state. All of them are reset, and counted,
+    /// when a whole-engine worker is on the stream or joins, and each time
+    /// a stream from zero opens after a break (its answer may be another
+    /// process's, so no cursor skips it).
     RankJoined,
 }
 
@@ -121,7 +132,8 @@ pub(crate) struct RankState {
     /// The stream was asked for the engine's history from zero for a rank
     /// that joined late: a batch at or below the cursor is that replay
     /// walking up to it, not a restarted publisher. Cleared by the first
-    /// batch past the cursor, or by a round that resumes from the cursor.
+    /// batch past the cursor, by a round that resumes from the cursor, or
+    /// by the reset of a stream from zero that opens after a break.
     replaying: bool,
 }
 
@@ -149,11 +161,20 @@ impl RankState {
         self.fresh = true;
     }
 
+    /// Whether the rank holds a cursor that no batch has moved on the
+    /// current connection: the publisher behind the stream may be another
+    /// one than the cursor's, and the rank's first batch will tell.
+    pub(crate) fn unconfirmed(&self) -> bool {
+        self.fresh && matches!(self.cursor, Cursor::Live(_))
+    }
+
     /// The engine resubscribes from zero for a rank that joined late while
     /// this rank keeps its state: the replay's batches up to the cursor are
     /// skipped as stale, not read as a restart, and the stream goes on from
     /// the cursor (or from wherever a relay without history starts, as
-    /// after a reconnect).
+    /// after a reconnect). Sound only on the stream that follows the
+    /// subscriber's own drop of a live one: after a break the monitor
+    /// resets the rank before the first batch, which ends the skip.
     pub(crate) fn replay_from_zero(&mut self) {
         self.replaying = true;
         self.fresh = false;

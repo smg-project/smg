@@ -580,6 +580,9 @@ impl KvEventMonitor {
             state.rejoin = false;
         }
         let mut backoff = Backoff::new();
+        // Whether the round before ended by the task dropping a live stream
+        // itself for a late join (`subscription_round`).
+        let mut live_drop = false;
 
         let unsupported = loop {
             if ended {
@@ -611,6 +614,7 @@ impl KvEventMonitor {
                 &sub,
                 &mut state,
                 &mut backoff,
+                &mut live_drop,
                 &mut changes,
                 &mut shutdown_rx,
             )
@@ -793,20 +797,40 @@ impl KvEventMonitor {
     /// One round of an engine's subscription: the backend client, the
     /// subscribe call under its deadline, the stream drained to its end;
     /// returns what the loop does next.
+    ///
+    /// `live_drop` carries one fact from a round to the next: the round
+    /// ended by the task dropping a live stream itself, for a late join,
+    /// and every cursor had been moved on that stream. Only then are the
+    /// members' cursors known to be the answering publisher's, and only
+    /// then does the round from zero that follows keep them and skip the
+    /// replay up to them. Every other way into a round from zero is a
+    /// break (a stream that ended or failed, a gap to replay, a call
+    /// refused, unanswered or dropped while pending, a stream dropped
+    /// with a cursor it never moved): the process behind the address may
+    /// be another one, whose sequence numbers start over, and a cursor of
+    /// the old one would take its batches for the replay. Such a round
+    /// starts every member over when its answer opens, as a refused cursor
+    /// does; an attempt that opens no stream leaves the members as they
+    /// are. A stream that had ended, unread, when the task dropped it for
+    /// a join still reads as live: nothing on the wire names the
+    /// publisher's incarnation.
     async fn subscription_round(
         sub: &EngineStream<'_>,
         state: &mut EngineStreamState,
         backoff: &mut Backoff,
+        live_drop: &mut bool,
         changes: &mut mpsc::UnboundedReceiver<MemberChange>,
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Round {
         let address = sub.address;
+        let continues = std::mem::take(live_drop);
         let rejoined = state.rejoin;
         if rejoined {
             // A rank worker joined after the stream delivered: the engine
             // starts over from zero, so the relay's history or snapshot
             // reaches its rank too; the members already streaming keep
-            // their state and skip the replay up to their cursors.
+            // their state and skip the replay up to their cursors, unless
+            // the round follows a break (at the stream's open, below).
             if let Role::Index { indexer, .. } = sub.role {
                 info!(
                     engine = %Endpoint::redacted_str(address),
@@ -847,7 +871,8 @@ impl KvEventMonitor {
 
         // From zero while a late-joined rank owes its history (this round's
         // joiners included), whether or not the last attempt delivered it.
-        let start_seq = if state.starts_from_zero() {
+        let from_zero = state.starts_from_zero();
+        let start_seq = if from_zero {
             0
         } else {
             state.resume_sequence()
@@ -870,6 +895,18 @@ impl KvEventMonitor {
                     // so it is dropped and the next round starts from zero.
                     drop(stream);
                     return Round::Again;
+                }
+                if from_zero && !continues {
+                    // The answer from zero follows a break: it may be another
+                    // process's, so no cursor of the old one skips it.
+                    if let Role::Index { indexer, .. } = sub.role {
+                        info!(
+                            engine = %Endpoint::redacted_str(address),
+                            members = state.members.len(),
+                            "KV event stream from zero follows a break; clearing the engine's index state and taking the answer whole"
+                        );
+                        Self::reset_members(indexer, state, ResyncReason::RankJoined);
+                    }
                 }
                 info!(
                     engine = %Endpoint::redacted_str(address),
@@ -1021,8 +1058,14 @@ impl KvEventMonitor {
                 // again the gap is settled instead of retried.
                 Round::Again
             }
-            // The reset and the subscribe from zero are the next round's.
-            StreamResult::Rejoin => Round::Again,
+            // The subscribe from zero is the next round's. The stream was
+            // live when the task dropped it, so that round keeps the
+            // cursors, unless one was never moved on this stream: a rank
+            // silent since the connect may hold another publisher's.
+            StreamResult::Rejoin => {
+                *live_drop = !state.ranks.values().any(|rank| rank.unconfirmed());
+                Round::Again
+            }
         }
     }
 
@@ -2859,6 +2902,360 @@ mod tests {
         server.abort();
     }
 
+    /// A round from zero that follows a break starts every member over:
+    /// the process behind the address may be another one, whose sequence
+    /// numbers start again, and a cursor of the old one would skip its
+    /// batches as the replay. Here the stream opened from zero for a late
+    /// rank ends without a batch and the next answer from zero is a
+    /// restarted engine's: rank 0's old blocks go, the new ones are indexed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_engine_answering_from_zero_after_a_failed_attempt_is_indexed_whole() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let steps = std::collections::VecDeque::from([
+            Step::Stays(vec![
+                Ok(ranked_batch_at(0, 1)),
+                Ok(ranked_batch_at(0, 2)),
+                Ok(ranked_batch_at(0, 3)),
+            ]),
+            Step::Ends(vec![]),
+            Step::Stays(vec![
+                Ok(restarted_batch_at(0, 1)),
+                Ok(restarted_batch_at(1, 1)),
+            ]),
+        ]);
+        let (addr, server) = serve(Subscribe::Sequence {
+            calls: Arc::clone(&calls),
+            steps: Arc::new(Mutex::new(steps)),
+        })
+        .await;
+        let first = rank_worker(addr, 0, 2);
+        let second = rank_worker(addr, 1, 2);
+        let monitor = KvEventMonitor::new();
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Events)
+            .await;
+        let index = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        let blocks = |worker: &Arc<dyn Worker>| {
+            index
+                .worker_id(worker.url())
+                .map(|id| index.worker_block_count(id))
+        };
+        wait_until("rank 0's cursor stands at 3", || blocks(&first) == Some(3)).await;
+        monitor
+            .on_worker_added(&second, SubscriptionKind::Events)
+            .await;
+        // The stream opened from zero for the late rank ends without a
+        // batch; the next ask from zero is answered by the restarted engine,
+        // rank 0's batch first.
+        wait_until("the restarted engine's batch of rank 1 lands", || {
+            blocks(&second) == Some(1)
+        })
+        .await;
+        let requests = calls.lock().unwrap().clone();
+        assert_eq!(
+            requests[2].start_sequence_number, 0,
+            "the round after the failed attempt asks from zero"
+        );
+        assert_eq!(
+            blocks(&first),
+            Some(1),
+            "rank 0 holds the restarted engine's one block, not the dead process's three"
+        );
+        monitor.stop().await;
+        server.abort();
+    }
+
+    /// The break may come before the join: the stream ends (the engine
+    /// restarts in place) and one of its rank workers is registered again
+    /// while the reconnect's call is pending. The round from zero that the
+    /// join starts follows the break, so its answer, a restarted engine's,
+    /// is indexed whole for the rank that stayed too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_engine_answering_a_late_join_after_a_break_is_indexed_whole() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Notify::new());
+        let steps = std::collections::VecDeque::from([
+            Step::Ends(vec![
+                Ok(ranked_batch_at(0, 1)),
+                Ok(ranked_batch_at(0, 2)),
+                Ok(ranked_batch_at(0, 3)),
+            ]),
+            Step::Gate(Arc::clone(&gate)),
+            Step::Stays(vec![
+                Ok(restarted_batch_at(0, 1)),
+                Ok(restarted_batch_at(1, 1)),
+            ]),
+        ]);
+        let (addr, server) = serve(Subscribe::Sequence {
+            calls: Arc::clone(&calls),
+            steps: Arc::new(Mutex::new(steps)),
+        })
+        .await;
+        let first = rank_worker(addr, 0, 2);
+        let second = rank_worker(addr, 1, 2);
+        let monitor = KvEventMonitor::new();
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Events)
+            .await;
+        let index = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        let blocks = |worker: &Arc<dyn Worker>| {
+            index
+                .worker_id(worker.url())
+                .map(|id| index.worker_block_count(id))
+        };
+        // The first stream delivers rank 0's three batches and ends; the
+        // reconnect's call is held at the gate.
+        wait_until("the reconnect's call is pending", || {
+            calls.lock().unwrap().len() == 2
+        })
+        .await;
+        assert_eq!(blocks(&first), Some(3), "rank 0's cursor stands at 3");
+        monitor
+            .on_worker_added(&second, SubscriptionKind::Events)
+            .await;
+        wait_until("the restarted engine's batch of rank 1 lands", || {
+            blocks(&second) == Some(1)
+        })
+        .await;
+        let requests = calls.lock().unwrap().clone();
+        assert_eq!(
+            requests[1].start_sequence_number, 3,
+            "the reconnect resumed from rank 0's cursor"
+        );
+        assert_eq!(
+            requests[2].start_sequence_number, 0,
+            "the late join starts from zero"
+        );
+        assert_eq!(
+            blocks(&first),
+            Some(1),
+            "rank 0 holds the restarted engine's one block, not the dead process's three"
+        );
+        monitor.stop().await;
+        server.abort();
+    }
+
+    /// The members start over when the answer from zero opens, not before:
+    /// an attempt that has opened no stream leaves a sibling's blocks as
+    /// they are (the engine may only be unreachable, and what it held is
+    /// still the best reading), and the stream that opens after a break
+    /// clears them before its first batch, whatever it then carries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_from_zero_after_a_break_starts_the_members_over_when_it_opens() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Notify::new());
+        let steps = std::collections::VecDeque::from([
+            Step::Ends(vec![
+                Ok(ranked_batch_at(0, 1)),
+                Ok(ranked_batch_at(0, 2)),
+                Ok(ranked_batch_at(0, 3)),
+            ]),
+            Step::Gate(Arc::new(Notify::new())),
+            Step::Gate(Arc::clone(&gate)),
+        ]);
+        let (addr, server) = serve(Subscribe::Sequence {
+            calls: Arc::clone(&calls),
+            steps: Arc::new(Mutex::new(steps)),
+        })
+        .await;
+        let first = rank_worker(addr, 0, 2);
+        let second = rank_worker(addr, 1, 2);
+        let monitor = KvEventMonitor::new();
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Events)
+            .await;
+        let index = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        let blocks = |worker: &Arc<dyn Worker>| {
+            index
+                .worker_id(worker.url())
+                .map(|id| index.worker_block_count(id))
+        };
+        // The first stream delivers rank 0's three batches and ends; the
+        // reconnect's call is pending when the second rank joins, and the
+        // call from zero that follows is held at the gate.
+        wait_until("the reconnect's call is pending", || {
+            calls.lock().unwrap().len() == 2
+        })
+        .await;
+        monitor
+            .on_worker_added(&second, SubscriptionKind::Events)
+            .await;
+        wait_until("the call from zero is pending", || {
+            calls.lock().unwrap().len() == 3
+        })
+        .await;
+        assert_eq!(
+            calls.lock().unwrap()[2].start_sequence_number,
+            0,
+            "the late join starts from zero"
+        );
+        assert_eq!(
+            blocks(&first),
+            Some(3),
+            "an attempt that has opened no stream leaves rank 0's blocks"
+        );
+        gate.notify_one();
+        wait_until("the stream from zero opens and rank 0 starts over", || {
+            blocks(&first) == Some(0)
+        })
+        .await;
+        monitor.stop().await;
+        server.abort();
+    }
+
+    /// A stream that delivered nothing says nothing about its publisher.
+    /// The engine restarts in place, the reconnect opens and stays silent,
+    /// and a rank worker joins late: the task drops that stream itself, but
+    /// rank 0's cursor was never moved on it, so the round from zero starts
+    /// the members over and the restarted engine is indexed whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_join_on_a_reconnect_that_delivered_nothing_starts_the_members_over() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let steps = std::collections::VecDeque::from([
+            Step::Ends(vec![
+                Ok(ranked_batch_at(0, 1)),
+                Ok(ranked_batch_at(0, 2)),
+                Ok(ranked_batch_at(0, 3)),
+            ]),
+            Step::Open,
+            Step::Stays(vec![
+                Ok(restarted_batch_at(0, 1)),
+                Ok(restarted_batch_at(1, 1)),
+            ]),
+        ]);
+        let (addr, server) = serve(Subscribe::Sequence {
+            calls: Arc::clone(&calls),
+            steps: Arc::new(Mutex::new(steps)),
+        })
+        .await;
+        let first = rank_worker(addr, 0, 2);
+        let second = rank_worker(addr, 1, 2);
+        let monitor = KvEventMonitor::new();
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Events)
+            .await;
+        let index = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        let blocks = |worker: &Arc<dyn Worker>| {
+            index
+                .worker_id(worker.url())
+                .map(|id| index.worker_block_count(id))
+        };
+        // The first stream delivers rank 0's three batches and ends; the
+        // reconnect opens and delivers nothing.
+        wait_until("the reconnect's call", || calls.lock().unwrap().len() == 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(blocks(&first), Some(3), "rank 0's cursor stands at 3");
+        monitor
+            .on_worker_added(&second, SubscriptionKind::Events)
+            .await;
+        wait_until("the restarted engine's batch of rank 1 lands", || {
+            blocks(&second) == Some(1)
+        })
+        .await;
+        let requests = calls.lock().unwrap().clone();
+        assert_eq!(
+            requests[1].start_sequence_number, 3,
+            "the reconnect resumed from rank 0's cursor"
+        );
+        assert_eq!(
+            requests[2].start_sequence_number, 0,
+            "the late join starts from zero"
+        );
+        assert_eq!(
+            blocks(&first),
+            Some(1),
+            "rank 0 holds the restarted engine's one block, not the dead process's three"
+        );
+        monitor.stop().await;
+        server.abort();
+    }
+
+    /// The skip is kept only when the dropped stream had moved every
+    /// cursor. The engine restarts in place; the reconnect delivers rank
+    /// 0's first batch of the new process (read as a restart, its blocks
+    /// rebuilt) and nothing of rank 1, whose cursor is still the dead
+    /// process's. A third rank joins late: the round from zero starts the
+    /// members over, so rank 1's new batch is not skipped under its old
+    /// cursor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_join_keeps_no_cursor_the_dropped_stream_never_moved() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let steps = std::collections::VecDeque::from([
+            Step::Ends(vec![
+                Ok(ranked_batch_at(0, 1)),
+                Ok(ranked_batch_at(0, 2)),
+                Ok(ranked_batch_at(0, 3)),
+                Ok(ranked_batch_at(1, 1)),
+                Ok(ranked_batch_at(1, 2)),
+            ]),
+            Step::Stays(vec![Ok(restarted_batch_at(0, 1))]),
+            Step::Stays(vec![
+                Ok(restarted_batch_at(0, 1)),
+                Ok(restarted_batch_at(1, 1)),
+                Ok(restarted_batch_at(2, 1)),
+            ]),
+        ]);
+        let (addr, server) = serve(Subscribe::Sequence {
+            calls: Arc::clone(&calls),
+            steps: Arc::new(Mutex::new(steps)),
+        })
+        .await;
+        let first = rank_worker(addr, 0, 3);
+        let second = rank_worker(addr, 1, 3);
+        let third = rank_worker(addr, 2, 3);
+        let monitor = KvEventMonitor::new();
+        for worker in [&first, &second] {
+            monitor
+                .on_worker_added(worker, SubscriptionKind::Events)
+                .await;
+        }
+        let index = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        let blocks = |worker: &Arc<dyn Worker>| {
+            index
+                .worker_id(worker.url())
+                .map(|id| index.worker_block_count(id))
+        };
+        // The first stream delivers both ranks' batches and ends; the
+        // reconnect delivers the new process's first batch of rank 0, read
+        // as a restart (three blocks down to one), and nothing of rank 1.
+        wait_until("rank 1's cursor stands at 2", || blocks(&second) == Some(2)).await;
+        wait_until("the reconnect delivers the restarted rank 0", || {
+            calls.lock().unwrap().len() == 2 && blocks(&first) == Some(1)
+        })
+        .await;
+        assert_eq!(blocks(&second), Some(2), "rank 1 took no batch since");
+        monitor
+            .on_worker_added(&third, SubscriptionKind::Events)
+            .await;
+        wait_until("the restarted engine's batch of rank 2 lands", || {
+            blocks(&third) == Some(1)
+        })
+        .await;
+        let requests = calls.lock().unwrap().clone();
+        assert_eq!(
+            requests[2].start_sequence_number, 0,
+            "the late join starts from zero"
+        );
+        assert_eq!(
+            blocks(&second),
+            Some(1),
+            "rank 1 holds the restarted engine's one block, not the dead process's two"
+        );
+        assert_eq!(blocks(&first), Some(1));
+        monitor.stop().await;
+        server.abort();
+    }
+
     /// A round that resumes from the cursor ends the replay skip: after a
     /// from-zero stream delivered the late rank's history but ended before
     /// the first rank's replay reached its cursor, the next round resumes
@@ -3120,6 +3517,20 @@ mod tests {
         if let Some(kv_cache_event::Data::Stored(stored)) = batch.events[0].data.as_mut() {
             stored.blocks[0].block_hash = hash;
             let first = 1_000 * (rank as u32 + 1) + 16 * seq as u32;
+            stored.blocks[0].token_ids = (first..first + 16).collect();
+        }
+        batch.events[0].event_id = hash as u64;
+        batch
+    }
+
+    /// `ranked_batch_at` as another process of the engine publishes it: the
+    /// same rank and sequence number over another block.
+    fn restarted_batch_at(rank: i32, seq: u64) -> KvEventBatch {
+        let mut batch = ranked_batch_at(rank, seq);
+        let hash = 5_000 + i64::from(rank) + 10 * seq as i64;
+        if let Some(kv_cache_event::Data::Stored(stored)) = batch.events[0].data.as_mut() {
+            stored.blocks[0].block_hash = hash;
+            let first = 50_000 * (rank as u32 + 1) + 16 * seq as u32;
             stored.blocks[0].token_ids = (first..first + 16).collect();
         }
         batch.events[0].event_id = hash as u64;

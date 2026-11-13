@@ -115,9 +115,11 @@ pub(super) struct EngineStreamState {
     /// snapshot came in whole: the joiner's window, if any is still to
     /// come, arrives on that stream or, after a break, through the refused
     /// cursor's restart from zero (a multi-rank relay refuses a nonzero
-    /// cursor). An engine with no batch past any cursor (idle since the
-    /// join) keeps asking for zero: a known limit, closed only by an
-    /// end-of-history mark on the stream.
+    /// cursor). A round from zero that follows a break starts every member
+    /// over when its answer opens and leaves the list as it is. An engine
+    /// with no batch past any cursor (idle since the join) keeps asking for
+    /// zero: a known limit, closed only by an end-of-history mark on the
+    /// stream.
     pub(super) history_owed: Vec<i32>,
 }
 
@@ -150,10 +152,12 @@ impl EngineStreamState {
     /// while a late-joined rank still owes its history (no cursor yet, a
     /// member still standing for it), a failed attempt included, and until
     /// a round from zero reached live for an incumbent or a snapshot came
-    /// in whole (`history_owed`). The ranks with cursors then skip the
-    /// replay up to them (`RankState::replay_from_zero`); a round that
-    /// resumes from the cursor ends that skip, so a sequence below the
-    /// cursor reads as a publisher restart again.
+    /// in whole (`history_owed`). The ranks with cursors are then armed to
+    /// skip the replay up to them (`RankState::replay_from_zero`): they do
+    /// on the round that continues the task's own drop of a live stream,
+    /// and the caller resets them when an answer opens after a break. A
+    /// round that resumes from the cursor ends that skip, so a sequence
+    /// below the cursor reads as a publisher restart again.
     pub(super) fn starts_from_zero(&mut self) -> bool {
         let (ranks, members) = (&self.ranks, &self.members);
         self.history_owed.retain(|rank| {
