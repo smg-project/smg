@@ -1086,13 +1086,6 @@ impl Router {
 
     /// Convert Python settings through the shared validating configuration builder.
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
-        self.router_config_for(&self.policy)
-    }
-
-    /// The configuration with `policy` as the main policy: the chosen one
-    /// for the router, each other family for the deprecation warnings of
-    /// the keywords the chosen policy does not carry.
-    fn router_config_for(&self, policy: &PolicyType) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
             PolicyConfig as ConfigPolicyConfig, RoutingMode,
@@ -1281,7 +1274,7 @@ impl Router {
             }
         };
 
-        let policy = convert_policy(policy)?;
+        let policy = convert_policy(&self.policy)?;
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
@@ -1586,33 +1579,31 @@ impl Router {
             .build()
     }
 
+    /// The routing keywords the constructor saw off their defaults, by the converter's
+    /// flag ids: a keyword at its default and one left out look the same here, so a value
+    /// off the signature's default stands for "given", as a flag the parser saw does on the
+    /// command line; the converter rows the ones the chosen policy or mode leaves unread.
+    fn given_routing_keywords(&self) -> config::policy_spec::GivenFlags {
+        ROUTING_KEYWORD_MARKS
+            .iter()
+            .filter(|(_, off_default)| off_default(self))
+            .flat_map(|(keyword, _)| config::policy_spec::flag_ids_of(keyword))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// One `DeprecationWarning` per routing keyword whose value differs from its default:
     /// the keywords compile into a policy specification at start (the design's step 2), and
-    /// the warning names the field each landed in. A keyword the chosen policy does not
-    /// carry (the configuration drops it with the policy) is compiled under the families
-    /// that read it and warned as compiling to nothing, with the reason. A configuration
-    /// the validator refuses warns nothing here; `start` reports it.
+    /// the warning names the field each landed in, or the reason nothing read it. A
+    /// configuration the validator refuses warns nothing here; `start` reports it.
     fn warn_deprecated_policy_keywords(&self, py: Python<'_>) -> PyResult<()> {
-        use config::policy_spec::{compile, unread_under, ROUTING_FLAGS_REMOVED_IN};
+        use config::policy_spec::{compile_given, ROUTING_FLAGS_REMOVED_IN};
         let Ok(router_config) = self.to_router_config() else {
             return Ok(());
         };
-        let chosen = compile(&router_config);
-        let others: Vec<config::RouterConfig> = [
-            PolicyType::CacheAware,
-            PolicyType::PowerOfTwo,
-            PolicyType::LeastLoad,
-            PolicyType::Bucket,
-            PolicyType::Manual,
-            PolicyType::PrefixHash,
-        ]
-        .iter()
-        .filter(|family| **family != self.policy)
-        .filter_map(|family| self.router_config_for(family).ok())
-        .collect();
-        let unread = unread_under(&chosen, router_config.policy.name(), &others);
+        let compiled = compile_given(&router_config, &self.given_routing_keywords());
         let category = py.get_type::<pyo3::exceptions::PyDeprecationWarning>();
-        for row in chosen.report.consumed.iter().chain(unread.iter()) {
+        for row in &compiled.report.consumed {
             let message = std::ffi::CString::new(row.keyword_warning(ROUTING_FLAGS_REMOVED_IN))?;
             PyErr::warn(py, &category, &message, 2)?;
         }
@@ -1620,12 +1611,176 @@ impl Router {
     }
 }
 
+/// The routing keywords' defaults, the constructor's signature and the given set
+/// reading the same values.
+const DEFAULT_POLICY: PolicyType = PolicyType::CacheAware;
+const DEFAULT_CACHE_THRESHOLD: f32 = 0.3;
+const DEFAULT_BALANCE_ABS_THRESHOLD: usize = 64;
+const DEFAULT_BALANCE_REL_THRESHOLD: f32 = 1.5;
+const DEFAULT_BALANCE_PREFIX_MARGIN_TOKENS: u32 = 0;
+const DEFAULT_BALANCE_UNCACHED_CREDIT: bool = false;
+const DEFAULT_BALANCE_TOKEN_USAGE_THRESHOLD: f32 = 1.0;
+const DEFAULT_OVERLOAD_TOKEN_USAGE_THRESHOLD: f32 = 1.0;
+const DEFAULT_OVERLAP_DECAY: f32 = 0.0;
+const DEFAULT_SELECTION_TEMPERATURE: f32 = 0.0;
+const DEFAULT_SELECTION_ACCOUNTING_TTL_MS: u64 = 0;
+const DEFAULT_EVICTION_INTERVAL_SECS: u64 = 120;
+const DEFAULT_MAX_TREE_SIZE: usize = 1 << 26;
+const DEFAULT_BLOCK_SIZE: usize = 16;
+const DEFAULT_CACHE_INDEX: &str = "tree";
+const DEFAULT_CACHE_TTL_SECS: u64 = 180;
+const DEFAULT_WORKER_WARMUP_SECS: u64 = 60;
+const DEFAULT_WORKER_WARMUP_SHARE: f32 = 0.25;
+const DEFAULT_WORKER_WARMUP_BLOCKS: usize = 1024;
+const DEFAULT_WORKER_WARMUP_THIN_RATIO: f32 = 0.5;
+const DEFAULT_WORKER_WARMUP_DIVERT_EVERY: u64 = 8;
+const DEFAULT_LEAST_LOAD_KV_PRESSURE_WEIGHT: f64 = 0.15;
+const DEFAULT_LEAST_LOAD_DEFAULT_THROUGHPUT: f64 = 2000.0;
+const DEFAULT_LEAST_LOAD_MEAN_PREFILL_TOKENS: u32 = 1024;
+const DEFAULT_POWER_OF_TWO_LOAD_METRIC: &str = "expected_wait";
+const DEFAULT_BUCKET_ADJUST_INTERVAL_SECS: usize = 5;
+const DEFAULT_MAX_IDLE_SECS: u64 = 14400;
+const DEFAULT_PREFIX_TOKEN_COUNT: usize = 256;
+const DEFAULT_PREFIX_HASH_LOAD_FACTOR: f64 = 1.25;
+const DEFAULT_PREFIX_HASH_BALANCE_ABS_THRESHOLD: usize = 10;
+const DEFAULT_ROUTING_KEY_OVERRIDE: bool = false;
+const DEFAULT_ROUTING_KEY_HEADER: &str = "x-smg-routing-key";
+const DEFAULT_WORKER_OVERLOAD_PROTECTION: bool = true;
+const DEFAULT_WORKER_OVERLOAD_WAITING_REQUESTS: Option<usize> = Some(8);
+const DEFAULT_WORKER_OVERLOAD_TOKEN_USAGE: Option<f64> = Some(0.8);
+const DEFAULT_WORKER_OVERLOAD_SHED: bool = false;
+const DEFAULT_PD_PAIRING_MODE: &str = "lenient";
+
+/// The test that a routing keyword's value is off the signature's default.
+type RoutingKeywordMark = fn(&Router) -> bool;
+
+/// Every routing keyword with the test that its value is off the signature's
+/// default: the given set reads this table and the converter names the flags.
+const ROUTING_KEYWORD_MARKS: &[(&str, RoutingKeywordMark)] = &[
+    ("policy", |router| router.policy != DEFAULT_POLICY),
+    ("prefill_policy", |router| router.prefill_policy.is_some()),
+    ("decode_policy", |router| router.decode_policy.is_some()),
+    ("encode_policy", |router| router.encode_policy.is_some()),
+    ("cache_threshold", |router| {
+        router.cache_threshold != DEFAULT_CACHE_THRESHOLD
+    }),
+    ("balance_abs_threshold", |router| {
+        router.balance_abs_threshold != DEFAULT_BALANCE_ABS_THRESHOLD
+    }),
+    ("balance_rel_threshold", |router| {
+        router.balance_rel_threshold != DEFAULT_BALANCE_REL_THRESHOLD
+    }),
+    ("balance_prefix_margin_tokens", |router| {
+        router.balance_prefix_margin_tokens != DEFAULT_BALANCE_PREFIX_MARGIN_TOKENS
+    }),
+    ("balance_uncached_credit", |router| {
+        router.balance_uncached_credit != DEFAULT_BALANCE_UNCACHED_CREDIT
+    }),
+    ("balance_token_usage_threshold", |router| {
+        router.balance_token_usage_threshold != DEFAULT_BALANCE_TOKEN_USAGE_THRESHOLD
+    }),
+    ("overload_token_usage_threshold", |router| {
+        router.overload_token_usage_threshold != DEFAULT_OVERLOAD_TOKEN_USAGE_THRESHOLD
+    }),
+    ("overlap_decay", |router| {
+        router.overlap_decay != DEFAULT_OVERLAP_DECAY
+    }),
+    ("selection_temperature", |router| {
+        router.selection_temperature != DEFAULT_SELECTION_TEMPERATURE
+    }),
+    ("selection_accounting_ttl_ms", |router| {
+        router.selection_accounting_ttl_ms != DEFAULT_SELECTION_ACCOUNTING_TTL_MS
+    }),
+    ("eviction_interval_secs", |router| {
+        router.eviction_interval_secs != DEFAULT_EVICTION_INTERVAL_SECS
+    }),
+    ("max_tree_size", |router| {
+        router.max_tree_size != DEFAULT_MAX_TREE_SIZE
+    }),
+    ("block_size", |router| {
+        router.block_size != DEFAULT_BLOCK_SIZE
+    }),
+    ("cache_boundaries", |router| {
+        !router.cache_boundaries.is_empty()
+    }),
+    ("cache_index", |router| {
+        router.cache_index != DEFAULT_CACHE_INDEX
+    }),
+    ("cache_ttl_secs", |router| {
+        router.cache_ttl_secs != DEFAULT_CACHE_TTL_SECS
+    }),
+    ("worker_warmup_secs", |router| {
+        router.worker_warmup_secs != DEFAULT_WORKER_WARMUP_SECS
+    }),
+    ("worker_warmup_share", |router| {
+        router.worker_warmup_share != DEFAULT_WORKER_WARMUP_SHARE
+    }),
+    ("worker_warmup_blocks", |router| {
+        router.worker_warmup_blocks != DEFAULT_WORKER_WARMUP_BLOCKS
+    }),
+    ("worker_warmup_thin_ratio", |router| {
+        router.worker_warmup_thin_ratio != DEFAULT_WORKER_WARMUP_THIN_RATIO
+    }),
+    ("worker_warmup_divert_every", |router| {
+        router.worker_warmup_divert_every != DEFAULT_WORKER_WARMUP_DIVERT_EVERY
+    }),
+    ("least_load_kv_pressure_weight", |router| {
+        router.least_load_kv_pressure_weight != DEFAULT_LEAST_LOAD_KV_PRESSURE_WEIGHT
+    }),
+    ("least_load_default_throughput", |router| {
+        router.least_load_default_throughput != DEFAULT_LEAST_LOAD_DEFAULT_THROUGHPUT
+    }),
+    ("least_load_mean_prefill_tokens", |router| {
+        router.least_load_mean_prefill_tokens != DEFAULT_LEAST_LOAD_MEAN_PREFILL_TOKENS
+    }),
+    ("power_of_two_load_metric", |router| {
+        router.power_of_two_load_metric != DEFAULT_POWER_OF_TWO_LOAD_METRIC
+    }),
+    ("bucket_adjust_interval_secs", |router| {
+        router.bucket_adjust_interval_secs != DEFAULT_BUCKET_ADJUST_INTERVAL_SECS
+    }),
+    ("max_idle_secs", |router| {
+        router.max_idle_secs != DEFAULT_MAX_IDLE_SECS
+    }),
+    ("assignment_mode", |router| router.assignment_mode.is_some()),
+    ("prefix_token_count", |router| {
+        router.prefix_token_count != DEFAULT_PREFIX_TOKEN_COUNT
+    }),
+    ("prefix_hash_load_factor", |router| {
+        router.prefix_hash_load_factor != DEFAULT_PREFIX_HASH_LOAD_FACTOR
+    }),
+    ("prefix_hash_balance_abs_threshold", |router| {
+        router.prefix_hash_balance_abs_threshold != DEFAULT_PREFIX_HASH_BALANCE_ABS_THRESHOLD
+    }),
+    ("routing_key_override", |router| {
+        router.routing_key_override != DEFAULT_ROUTING_KEY_OVERRIDE
+    }),
+    ("routing_key_headers", |router| {
+        router.routing_key_headers != [DEFAULT_ROUTING_KEY_HEADER]
+    }),
+    ("worker_overload_protection", |router| {
+        !router.worker_overload_protection
+    }),
+    ("worker_overload_waiting_requests", |router| {
+        router.worker_overload_waiting_requests != DEFAULT_WORKER_OVERLOAD_WAITING_REQUESTS
+    }),
+    ("worker_overload_token_usage", |router| {
+        router.worker_overload_token_usage != DEFAULT_WORKER_OVERLOAD_TOKEN_USAGE
+    }),
+    ("worker_overload_shed", |router| {
+        router.worker_overload_shed != DEFAULT_WORKER_OVERLOAD_SHED
+    }),
+    ("pd_pairing_mode", |router| {
+        router.pd_pairing_mode != DEFAULT_PD_PAIRING_MODE
+    }),
+];
+
 #[pymethods]
 impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::CacheAware,
+        policy = DEFAULT_POLICY,
         host = String::from("0.0.0.0"),
         port = 30000,
         // Every other parameter is keyword-only, in alphabetical order (the struct's
@@ -1639,19 +1794,19 @@ impl Router {
         api_key_file = None,
         assignment_mode = None,
         backend = None,
-        balance_abs_threshold = 64,
-        balance_prefix_margin_tokens = 0,
-        balance_rel_threshold = 1.5,
-        balance_token_usage_threshold = 1.0,
-        balance_uncached_credit = false,
-        block_size = 16,
+        balance_abs_threshold = DEFAULT_BALANCE_ABS_THRESHOLD,
+        balance_prefix_margin_tokens = DEFAULT_BALANCE_PREFIX_MARGIN_TOKENS,
+        balance_rel_threshold = DEFAULT_BALANCE_REL_THRESHOLD,
+        balance_token_usage_threshold = DEFAULT_BALANCE_TOKEN_USAGE_THRESHOLD,
+        balance_uncached_credit = DEFAULT_BALANCE_UNCACHED_CREDIT,
+        block_size = DEFAULT_BLOCK_SIZE,
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
-        bucket_adjust_interval_secs = 5,
+        bucket_adjust_interval_secs = DEFAULT_BUCKET_ADJUST_INTERVAL_SECS,
         ca_cert_paths = vec![],
         cache_boundaries = vec![],
-        cache_index = String::from("tree"),
-        cache_threshold = 0.3,
-        cache_ttl_secs = 180,
+        cache_index = String::from(DEFAULT_CACHE_INDEX),
+        cache_threshold = DEFAULT_CACHE_THRESHOLD,
+        cache_ttl_secs = DEFAULT_CACHE_TTL_SECS,
         cb_failure_threshold = 10,
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
@@ -1688,7 +1843,7 @@ impl Router {
         encode_urls = None,
         engine_metrics = false,
         epd_disaggregation = false,
-        eviction_interval_secs = 120,
+        eviction_interval_secs = DEFAULT_EVICTION_INTERVAL_SECS,
         grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
         health_check_endpoint = String::from("/health"),
@@ -1707,9 +1862,9 @@ impl Router {
         job_queue_concurrency = 200,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
-        least_load_default_throughput = 2000.0,
-        least_load_kv_pressure_weight = 0.15,
-        least_load_mean_prefill_tokens = 1024,
+        least_load_default_throughput = DEFAULT_LEAST_LOAD_DEFAULT_THROUGHPUT,
+        least_load_kv_pressure_weight = DEFAULT_LEAST_LOAD_KV_PRESSURE_WEIGHT,
+        least_load_mean_prefill_tokens = DEFAULT_LEAST_LOAD_MEAN_PREFILL_TOKENS,
         load_monitor_interval = 10,
         log_dir = None,
         log_json = false,
@@ -1719,9 +1874,9 @@ impl Router {
         max_buffered_request_bytes = 1_048_576,
         max_concurrent_requests = -1,
         max_connections = 0,
-        max_idle_secs = 14400,
+        max_idle_secs = DEFAULT_MAX_IDLE_SECS,
         max_payload_size = 512 * 1024 * 1024,
-        max_tree_size = 2usize.pow(26),
+        max_tree_size = DEFAULT_MAX_TREE_SIZE,
         mcp_config_path = None,
         mesh_advertise_host = None,
         mesh_host = String::from("0.0.0.0"),
@@ -1748,15 +1903,15 @@ impl Router {
         multimodal_tensor_transport = None,
         oracle_config = None,
         otlp_traces_endpoint = String::from("localhost:4317"),
-        overlap_decay = 0.0,
-        overload_token_usage_threshold = 1.0,
+        overlap_decay = DEFAULT_OVERLAP_DECAY,
+        overload_token_usage_threshold = DEFAULT_OVERLOAD_TOKEN_USAGE_THRESHOLD,
         parser = String::from("symphony"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
-        pd_pairing_mode = String::from("lenient"),
+        pd_pairing_mode = String::from(DEFAULT_PD_PAIRING_MODE),
         policy_engine = String::from("legacy"),
         postgres_config = None,
-        power_of_two_load_metric = String::from("expected_wait"),
+        power_of_two_load_metric = String::from(DEFAULT_POWER_OF_TWO_LOAD_METRIC),
         prefill_expected_workers = None,
         prefill_max_inflight_requests_per_worker = -1,
         prefill_min_ready_percent = None,
@@ -1766,9 +1921,9 @@ impl Router {
         prefill_queue_timeout_secs = None,
         prefill_selector = HashMap::new(),
         prefill_urls = None,
-        prefix_hash_balance_abs_threshold = 10,
-        prefix_hash_load_factor = 1.25,
-        prefix_token_count = 256,
+        prefix_hash_balance_abs_threshold = DEFAULT_PREFIX_HASH_BALANCE_ABS_THRESHOLD,
+        prefix_hash_load_factor = DEFAULT_PREFIX_HASH_LOAD_FACTOR,
+        prefix_token_count = DEFAULT_PREFIX_TOKEN_COUNT,
         priority_scheduler_config = None,
         priority_scheduler_default_max_class = String::from("default"),
         priority_scheduler_enabled = false,
@@ -1794,14 +1949,14 @@ impl Router {
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
         router_selector = HashMap::new(),
-        routing_key_headers = vec![String::from("x-smg-routing-key")],
-        routing_key_override = false,
+        routing_key_headers = vec![String::from(DEFAULT_ROUTING_KEY_HEADER)],
+        routing_key_override = DEFAULT_ROUTING_KEY_OVERRIDE,
         runtime_worker_threads = None,
         schema_config = None,
         secrets_auto_reload = false,
-        selection_accounting_ttl_ms = 0,
+        selection_accounting_ttl_ms = DEFAULT_SELECTION_ACCOUNTING_TTL_MS,
         selection_policy = String::from("cache-aware-default"),
-        selection_temperature = 0.0,
+        selection_temperature = DEFAULT_SELECTION_TEMPERATURE,
         selector = HashMap::new(),
         server_cert_path = None,
         server_key_path = None,
@@ -1831,21 +1986,21 @@ impl Router {
         upstream_pool_idle_timeout_secs = 3,
         webrtc_bind_addr = None,
         webrtc_stun_server = None,
-        worker_overload_protection = true,
-        worker_overload_shed = false,
-        worker_overload_token_usage = Some(0.8),
-        worker_overload_waiting_requests = Some(8),
+        worker_overload_protection = DEFAULT_WORKER_OVERLOAD_PROTECTION,
+        worker_overload_shed = DEFAULT_WORKER_OVERLOAD_SHED,
+        worker_overload_token_usage = DEFAULT_WORKER_OVERLOAD_TOKEN_USAGE,
+        worker_overload_waiting_requests = DEFAULT_WORKER_OVERLOAD_WAITING_REQUESTS,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
         worker_stale_secs = 15,
         worker_stall_secs = 2,
         worker_startup_check_interval = 30,
         worker_startup_delay = 0,
         worker_startup_timeout_secs = 1800,
-        worker_warmup_blocks = 1024,
-        worker_warmup_divert_every = 8,
-        worker_warmup_secs = 60,
-        worker_warmup_share = 0.25,
-        worker_warmup_thin_ratio = 0.5,
+        worker_warmup_blocks = DEFAULT_WORKER_WARMUP_BLOCKS,
+        worker_warmup_divert_every = DEFAULT_WORKER_WARMUP_DIVERT_EVERY,
+        worker_warmup_secs = DEFAULT_WORKER_WARMUP_SECS,
+        worker_warmup_share = DEFAULT_WORKER_WARMUP_SHARE,
+        worker_warmup_thin_ratio = DEFAULT_WORKER_WARMUP_THIN_RATIO,
         worker_wedge_secs = 3,
         zmq_engine_count = None,
         zmq_startup_timeout_secs = 3600,
@@ -2643,9 +2798,30 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // nothing about that: pyo3's `extension-module` is on either way).
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use config::RoutingMode;
 
     use super::*;
+
+    /// The given set's keyword table and the converter's keyword set are one
+    /// set, and the flags they name are every routing flag: a new flag cannot
+    /// go unwarned silently and a mark cannot name a flag the converter lacks.
+    #[test]
+    fn the_given_set_marks_every_converter_keyword_and_nothing_else() {
+        let marked: BTreeSet<&str> = ROUTING_KEYWORD_MARKS
+            .iter()
+            .map(|(keyword, _)| *keyword)
+            .collect();
+        let known: BTreeSet<&str> = config::policy_spec::keywords().collect();
+        assert_eq!(marked, known);
+        let named: BTreeSet<&str> = marked
+            .iter()
+            .flat_map(|keyword| config::policy_spec::flag_ids_of(keyword))
+            .collect();
+        let ids: BTreeSet<&str> = config::policy_spec::flag_ids().collect();
+        assert_eq!(named, ids);
+    }
 
     #[test]
     fn a_provider_backend_is_its_routing_mode_and_an_engine_backend_is_none() {
