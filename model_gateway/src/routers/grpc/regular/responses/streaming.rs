@@ -1861,10 +1861,10 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let transform = process_and_transform_sse_stream(
                 body,
-                ResponsesRequest {
+                Arc::new(ResponsesRequest {
                     store: Some(store),
                     ..Default::default()
-                },
+                }),
                 None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1976,10 +1976,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let transform = process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2028,10 +2028,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let transform = process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2097,10 +2097,10 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let transform = process_and_transform_sse_stream(
                 body,
-                ResponsesRequest {
+                Arc::new(ResponsesRequest {
                     store: Some(true),
                     ..Default::default()
-                },
+                }),
                 None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
