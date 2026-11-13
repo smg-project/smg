@@ -1086,6 +1086,13 @@ impl Router {
 
     /// Convert Python settings through the shared validating configuration builder.
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
+        self.router_config_for(&self.policy)
+    }
+
+    /// The configuration with `policy` as the main policy: the chosen one
+    /// for the router, each other family for the deprecation warnings of
+    /// the keywords the chosen policy does not carry.
+    fn router_config_for(&self, policy: &PolicyType) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
             PolicyConfig as ConfigPolicyConfig, RoutingMode,
@@ -1274,7 +1281,7 @@ impl Router {
             }
         };
 
-        let policy = convert_policy(&self.policy)?;
+        let policy = convert_policy(policy)?;
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
@@ -1581,17 +1588,32 @@ impl Router {
 
     /// One `DeprecationWarning` per routing keyword whose value differs from its default:
     /// the keywords compile into a policy specification at start (the design's step 2), and
-    /// the warning names the field each landed in. A configuration the validator refuses
-    /// warns nothing here; `start` reports it.
+    /// the warning names the field each landed in. A keyword the chosen policy does not
+    /// carry (the configuration drops it with the policy) is compiled under the families
+    /// that read it and warned as compiling to nothing, with the reason. A configuration
+    /// the validator refuses warns nothing here; `start` reports it.
     fn warn_deprecated_policy_keywords(&self, py: Python<'_>) -> PyResult<()> {
+        use config::policy_spec::{compile, unread_under, ROUTING_FLAGS_REMOVED_IN};
         let Ok(router_config) = self.to_router_config() else {
             return Ok(());
         };
+        let chosen = compile(&router_config);
+        let others: Vec<config::RouterConfig> = [
+            PolicyType::CacheAware,
+            PolicyType::PowerOfTwo,
+            PolicyType::LeastLoad,
+            PolicyType::Bucket,
+            PolicyType::Manual,
+            PolicyType::PrefixHash,
+        ]
+        .iter()
+        .filter(|family| **family != self.policy)
+        .filter_map(|family| self.router_config_for(family).ok())
+        .collect();
+        let unread = unread_under(&chosen, router_config.policy.name(), &others);
         let category = py.get_type::<pyo3::exceptions::PyDeprecationWarning>();
-        for row in &config::policy_spec::compile(&router_config).report.consumed {
-            let message = std::ffi::CString::new(
-                row.keyword_warning(config::policy_spec::ROUTING_FLAGS_REMOVED_IN),
-            )?;
+        for row in chosen.report.consumed.iter().chain(unread.iter()) {
+            let message = std::ffi::CString::new(row.keyword_warning(ROUTING_FLAGS_REMOVED_IN))?;
             PyErr::warn(py, &category, &message, 2)?;
         }
         Ok(())

@@ -591,6 +591,42 @@ pub fn compile_given(config: &RouterConfig, given: &GivenFlags) -> Compiled {
     .run()
 }
 
+/// The routing flags `candidates` carry off their defaults that `compiled`
+/// left out, as unused rows naming `policy` (the policy `compiled` was
+/// built with): a front end that drops the keywords its policy does not
+/// carry, as the Python constructor's configuration does, compiles the
+/// candidates the other families would see and warns these too. A
+/// policy-name flag is never among them.
+pub fn unread_under(
+    compiled: &Compiled,
+    policy: &str,
+    candidates: &[RouterConfig],
+) -> Vec<Consumed> {
+    let names = [
+        POLICY.id,
+        PREFILL_POLICY.id,
+        DECODE_POLICY.id,
+        ENCODE_POLICY.id,
+    ];
+    let mut seen: BTreeSet<&str> = compiled.report.consumed.iter().map(|row| row.id).collect();
+    let mut unread = Vec::new();
+    for candidate in candidates {
+        for row in compile(candidate).report.consumed {
+            if row.at_default || row.fields.is_empty() || names.contains(&row.id) {
+                continue;
+            }
+            if seen.insert(row.id) {
+                unread.push(Consumed {
+                    fields: Vec::new(),
+                    unused: Some(format!("the {policy} policy does not read it")),
+                    ..row
+                });
+            }
+        }
+    }
+    unread
+}
+
 /// The side of a plan a profile serves: the pair sides insert their
 /// capacity filter before `not-tried`, as the engine's pair presets do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -758,13 +794,14 @@ impl Compiler<'_> {
         let name = policy.name();
         let profile = self.profile(policy, Side::Single, name);
         self.binding.profile = Some(name.to_string());
-        self.row(
+        self.profile_row(
             POLICY,
-            vec!["bindings[0].profile".to_string()],
-            &name,
-            Some(&DEFAULT_POLICY),
+            "bindings[0].profile",
+            name,
+            &profile,
+            policy,
+            Some(DEFAULT_POLICY),
         );
-        self.profile_row(POLICY, name, &profile, name, Some(DEFAULT_POLICY));
         self.profiles.insert(name.to_string(), profile);
         if name == DEFAULT_POLICY && !self.given.contains(POLICY.id) {
             self.notes.push(format!(
@@ -801,9 +838,10 @@ impl Compiler<'_> {
             match encode {
                 Some(policy) => self.profile_row(
                     ENCODE_POLICY,
+                    "bindings[0].profiles.encode",
                     "encode",
                     &encode_profile,
-                    policy.name(),
+                    policy,
                     None,
                 ),
                 None => self.notes.push(format!(
@@ -816,32 +854,36 @@ impl Compiler<'_> {
         match prefill {
             Some(policy) => self.profile_row(
                 PREFILL_POLICY,
+                "bindings[0].profiles.prefill",
                 "prefill",
                 &prefill_profile,
-                policy.name(),
+                policy,
                 None,
             ),
             None => self.profile_row(
                 POLICY,
+                "bindings[0].profiles.prefill",
                 "prefill",
                 &prefill_profile,
-                main.name(),
+                main,
                 Some(DEFAULT_POLICY),
             ),
         }
         match decode {
             Some(policy) => self.profile_row(
                 DECODE_POLICY,
+                "bindings[0].profiles.decode",
                 "decode",
                 &decode_profile,
-                policy.name(),
+                policy,
                 None,
             ),
             None => self.profile_row(
                 POLICY,
+                "bindings[0].profiles.decode",
                 "decode",
                 &decode_profile,
-                main.name(),
+                main,
                 Some(DEFAULT_POLICY),
             ),
         }
@@ -1434,26 +1476,56 @@ impl Compiler<'_> {
 
     /// The idle-time and sweep rows of a sessions block. A zero idle time
     /// keeps keys for ever and writes the sweep as for ever too, so the idle
-    /// flag owns both fields then; the sweep flag owns its field otherwise
-    /// (a zero sweep, for ever as well, keeps its own row).
+    /// flag owns both fields then, and a sweep given beside it has its line
+    /// with the reason; a zero sweep does the same the other way round. Off
+    /// zero, each flag owns its field.
     fn lifetime_rows(&mut self, idle: u64, sweep: u64, ttl_s: u32, sweep_s: u32) {
-        let mut idle_fields = vec!["bindings[0].sessions.ttl_s".to_string()];
+        let ttl = "bindings[0].sessions.ttl_s".to_string();
+        let sweep_field = "bindings[0].sessions.sweep_s".to_string();
         if idle == 0 {
-            idle_fields.push("bindings[0].sessions.sweep_s".to_string());
-        }
-        self.row(MAX_IDLE_SECS, idle_fields, &ttl_s, Some(&14_400_u32));
-        if idle != 0 || sweep == 0 {
+            self.row(
+                MAX_IDLE_SECS,
+                vec![ttl, sweep_field.clone()],
+                &ttl_s,
+                Some(&14_400_u32),
+            );
+            if sweep == 0 {
+                self.row(
+                    EVICTION_INTERVAL,
+                    vec![sweep_field],
+                    &sweep_s,
+                    Some(&120_u32),
+                );
+            } else if self.given.contains(EVICTION_INTERVAL.id) {
+                self.unused_row(
+                    EVICTION_INTERVAL,
+                    sweep.to_string(),
+                    "a zero idle time keeps keys for ever, so the sweep is for ever too"
+                        .to_string(),
+                );
+            }
+        } else if sweep == 0 {
             self.row(
                 EVICTION_INTERVAL,
-                vec!["bindings[0].sessions.sweep_s".to_string()],
+                vec![sweep_field, ttl],
                 &sweep_s,
                 Some(&120_u32),
             );
-        } else if self.given.contains(EVICTION_INTERVAL.id) {
-            self.unused_row(
+            if self.given.contains(MAX_IDLE_SECS.id) {
+                self.unused_row(
+                    MAX_IDLE_SECS,
+                    idle.to_string(),
+                    "a zero sweep keeps keys for ever, so the idle time is for ever too"
+                        .to_string(),
+                );
+            }
+        } else {
+            self.row(MAX_IDLE_SECS, vec![ttl], &ttl_s, Some(&14_400_u32));
+            self.row(
                 EVICTION_INTERVAL,
-                sweep.to_string(),
-                "a zero idle time keeps keys for ever, so the sweep is for ever too".to_string(),
+                vec![sweep_field],
+                &sweep_s,
+                Some(&120_u32),
             );
         }
     }
@@ -1668,33 +1740,44 @@ impl Compiler<'_> {
         self.push(flag, fields, shown, rendered, default, at_default);
     }
 
-    /// Consume `flag` into a `profiles.<name>` field: the field holds the
-    /// profile's shape, the line shows the policy's name; a policy at its
-    /// default is consumed only when the front end saw the flag, as a value
-    /// is.
+    /// Consume a policy flag into two fields: the binding reference at
+    /// `binding` (the profile's name, what the document holds there) and
+    /// `profiles.<name>`, which holds the structure the flag fixes (see
+    /// [`fixed_shape`]); the line shows the policy's name. A policy at its
+    /// default is consumed only when the front end saw the flag, as a
+    /// value is.
     fn profile_row(
         &mut self,
         flag: Flag,
+        binding: &str,
         name: &str,
         profile: &ProfileSpec,
-        policy: &str,
+        policy: &PolicyConfig,
         default: Option<&str>,
     ) {
-        let at_default = default == Some(policy);
+        let shown = policy.name();
+        let at_default = default == Some(shown);
         if self.skips(&flag, at_default) {
             return;
         }
-        let field = Field {
-            path: format!("profiles.{name}"),
-            value: shape_of_profile(profile),
-            shown: policy.to_string(),
-        };
-        let rendered = Value::String(policy.to_string());
+        let fields = vec![
+            Field {
+                path: binding.to_string(),
+                value: Value::String(name.to_string()),
+                shown: shown.to_string(),
+            },
+            Field {
+                path: format!("profiles.{name}"),
+                value: fixed_shape(policy, profile),
+                shown: shown.to_string(),
+            },
+        ];
+        let rendered = Value::String(shown.to_string());
         let default = default.map_or(Value::Null, |default| Value::String(default.to_string()));
         self.push(
             flag,
-            vec![field],
-            policy.to_string(),
+            fields,
+            shown.to_string(),
             rendered,
             default,
             at_default,
@@ -1732,12 +1815,17 @@ impl Compiler<'_> {
         at_default: bool,
     ) {
         if let Some(row) = self.consumed.iter_mut().find(|row| row.id == flag.id) {
+            if row.unused.take().is_some() {
+                row.shown = shown;
+                row.value = value;
+                row.default = default;
+                row.at_default = at_default;
+            }
             for field in fields {
                 if !row.fields.iter().any(|known| known.path == field.path) {
                     row.fields.push(field);
                 }
             }
-            row.unused = None;
             return;
         }
         self.consumed.push(Consumed {
@@ -1754,14 +1842,50 @@ impl Compiler<'_> {
     }
 }
 
-/// A profile's shape: its filters, the names of its score stages and its
-/// picker, as a document value; the parameters are the knob rows' to
-/// check.
-fn shape_of_profile(profile: &ProfileSpec) -> Value {
-    shape_of_value(&serde_json::to_value(profile).unwrap_or(Value::Null))
+/// The structure a policy flag fixes in its profile, as a document value:
+/// the names of its score stages and its picker. The filters are the
+/// document's, and so is what a knob flag of the policy governs: the
+/// power-of-two profile's stages and picker all follow
+/// `--power-of-two-load-metric`, so `--policy power_of_two` fixes none of
+/// them, and the cache-aware picker follows `--selection-temperature`, so
+/// `--policy cache_aware` fixes its stage names only. Every other picker
+/// is the policy's own. The parameters are the knob rows' to check.
+fn fixed_shape(policy: &PolicyConfig, profile: &ProfileSpec) -> Value {
+    if matches!(policy, PolicyConfig::PowerOfTwo { .. }) {
+        return Value::Object(serde_json::Map::new());
+    }
+    let mut shape = shape_of_value(&serde_json::to_value(profile).unwrap_or(Value::Null));
+    if let Value::Object(map) = &mut shape {
+        map.remove("filter");
+        if matches!(policy, PolicyConfig::CacheAware { .. }) {
+            map.remove("pick");
+        }
+    }
+    shape
 }
 
-/// The shape of a rendered profile (see [`shape_of_profile`]): a stage
+/// Whether a document profile's shape holds what a policy flag fixes:
+/// every stage name the flag fixes is among the document's, and the picker
+/// is the flag's when the flag fixes one. The flag fixes which stages, not
+/// their order: a document that reorders them under the name passes.
+fn shape_holds(found: &Value, fixed: &Value) -> bool {
+    let stages = |shape: &Value| {
+        shape
+            .get("score")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let have = stages(found);
+    let stages_hold = stages(fixed).iter().all(|stage| have.contains(stage));
+    let pick_holds = match fixed.get("pick") {
+        Some(pick) => found.get("pick") == Some(pick),
+        None => true,
+    };
+    stages_hold && pick_holds
+}
+
+/// The shape of a rendered profile (see [`fixed_shape`]): a stage
 /// written with parameters reduces to its name.
 fn shape_of_value(profile: &Value) -> Value {
     let name_of = |stage: &Value| match stage {
@@ -1795,15 +1919,22 @@ fn is_profile_path(path: &str) -> bool {
     parts.next() == Some("profiles") && parts.next().is_some() && parts.next().is_none()
 }
 
-/// A profile's shape as a line shows it.
+/// A profile's shape as a line shows it: the parts it holds, in the
+/// document's order; "any structure" for a shape that fixes nothing.
 fn render_shape(shape: &Value) -> String {
-    let part = |key: &str| shape.get(key).map_or_else(|| "nothing".to_string(), render);
-    format!(
-        "filter {}, score {}, pick {}",
-        part("filter"),
-        part("score"),
-        part("pick")
-    )
+    let parts: Vec<String> = ["filter", "score", "pick"]
+        .iter()
+        .filter_map(|key| {
+            shape
+                .get(*key)
+                .map(|part| format!("{key} {}", render(part)))
+        })
+        .collect();
+    if parts.is_empty() {
+        "any structure".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 impl Compiled {
@@ -1813,7 +1944,10 @@ impl Compiled {
     /// default), the first flag whose value it does not hold otherwise.
     /// The policy names are checked first, so a document that names
     /// another profile is refused on `--policy` and not on a knob under the
-    /// profile it does not have; a flag the mode leaves unused is not
+    /// profile it does not have. A policy flag's profile field holds the
+    /// structure the flag fixes, its stage names and its picker: a document
+    /// may add filters and stages under the name, and chooses the parts a
+    /// knob flag never given governs. A flag the mode leaves unused is not
     /// checked.
     pub fn check_against(&self, spec: &PolicySpec) -> Result<(), Disagreement> {
         let document = serde_json::to_value(spec).unwrap_or(Value::Null);
@@ -1835,7 +1969,7 @@ impl Compiled {
                 let found = lookup(&document, &field.path);
                 let profile = is_profile_path(&field.path);
                 let agrees = match found {
-                    Some(found) if profile => same(&shape_of_value(found), &field.value),
+                    Some(found) if profile => shape_holds(&shape_of_value(found), &field.value),
                     Some(found) => holds(found, &field.value),
                     None => !profile && same(&row.default, &field.value),
                 };
@@ -2569,7 +2703,15 @@ bindings:
         );
         assert_eq!(ids(&compiled.report), ["policy", "pd_pairing_mode"]);
         let main = &compiled.report.consumed[0];
-        assert_eq!(paths(main), ["profiles.prefill", "profiles.decode"]);
+        assert_eq!(
+            paths(main),
+            [
+                "bindings[0].profiles.prefill",
+                "profiles.prefill",
+                "bindings[0].profiles.decode",
+                "profiles.decode"
+            ]
+        );
     }
 
     /// The encode side joins under the `epd` plan; its default is written
@@ -3026,6 +3168,173 @@ bindings:
 
     /// A policy flag is held by a document whose profile has the policy's
     /// stages; a profile of another shape under the same name is refused
+    /// A document that binds another profile under a side is refused on
+    /// the side's flag, the binding field named.
+    #[test]
+    fn a_document_binding_another_profile_under_the_side_is_refused() {
+        let compiled = compile(&pair(
+            Some(PolicyConfig::RoundRobin),
+            Some(PolicyConfig::RoundRobin),
+        ));
+        let mut document = serde_json::to_value(&compiled.spec).unwrap();
+        document["bindings"][0]["profiles"]["prefill"] = Value::String("decode".to_string());
+        let rebound: PolicySpec = serde_json::from_value(document).unwrap();
+        let refused = compiled
+            .check_against(&rebound)
+            .expect_err("the prefill side bound to the decode profile");
+        assert_eq!(refused.flag, "--prefill-policy");
+        assert_eq!(refused.field, "bindings[0].profiles.prefill");
+        assert_eq!(refused.held, "decode");
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+    }
+
+    /// A flag one side leaves unused and the other consumes keeps the
+    /// consumption's value and default, so the pair's own document passes.
+    #[test]
+    fn a_flag_unused_by_one_side_and_consumed_by_the_other_round_trips() {
+        let compiled = compile_given(
+            &pair(
+                Some(PolicyConfig::Manual {
+                    eviction_interval_secs: 120,
+                    max_idle_secs: 0,
+                    assignment_mode: ManualAssignmentMode::Random,
+                }),
+                Some(cache_aware()),
+            ),
+            &given(&["max_idle_secs", "eviction_interval"]),
+        );
+        let sweep = compiled
+            .report
+            .consumed
+            .iter()
+            .find(|row| row.id == "eviction_interval")
+            .expect("the sweep row");
+        assert_eq!(paths(sweep), ["index[\"*\"].sweep_s"]);
+        assert_eq!(sweep.default, serde_json::json!(120));
+        assert!(sweep.at_default && sweep.unused.is_none());
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+    }
+
+    /// A policy flag fixes its profile's stage names and picker, not its
+    /// filters and not what a knob flag never given governs: a document may
+    /// add a filter or a stage under the name, and the power-of-two profile
+    /// follows the metric knob whole.
+    #[test]
+    fn a_knob_the_flag_never_set_is_the_documents_choice() {
+        let compiled = compile_given(&regular(cache_aware()), &given(&["policy"]));
+        let mut document = serde_json::to_value(&compiled.spec).unwrap();
+        let profile = &mut document["profiles"]["cache_aware"];
+        profile["filter"]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::String("has-capacity".to_string()));
+        profile["score"]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::String("least-load".to_string()));
+        let widened: PolicySpec = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(compiled.check_against(&widened), Ok(()));
+        document["profiles"]["cache_aware"]["pick"] =
+            serde_json::json!({ "best-with-temperature": { "temperature": 0.5 } });
+        let tempered: PolicySpec = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(compiled.check_against(&tempered), Ok(()));
+        document["profiles"]["cache_aware"]["score"] = serde_json::json!(["least-load"]);
+        let narrowed: PolicySpec = serde_json::from_value(document).unwrap();
+        assert_eq!(
+            compiled
+                .check_against(&narrowed)
+                .expect_err("a stage removed")
+                .field,
+            "profiles.cache_aware"
+        );
+
+        let two = compile_given(
+            &regular(PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::ExpectedWait,
+            }),
+            &given(&["policy"]),
+        );
+        let requests = doc("\
+apiVersion: smg.policy/v1
+generation: 1
+profiles:
+  power_of_two:
+    filter: [healthy, not-overloaded, not-tried]
+    score: [least-load]
+    pick: power-of-two-count-first
+bindings:
+  - match: { model: \"*\" }
+    profile: power_of_two
+");
+        assert_eq!(two.check_against(&requests), Ok(()));
+    }
+
+    /// A knob the chosen policy does not carry, compiled under the family
+    /// that reads it, is an unused row naming the chosen policy; a knob at
+    /// its default and the family's own policy name are not.
+    #[test]
+    fn a_knob_the_chosen_policy_drops_is_unread_under_it() {
+        let chosen = compile(&regular(PolicyConfig::RoundRobin));
+        let candidates = [
+            regular(PolicyConfig::cache_aware(0.5, 64, 1.5, 120, 16_777_216)),
+            regular(least_load()),
+            regular(PolicyConfig::Manual {
+                eviction_interval_secs: 120,
+                max_idle_secs: 14_400,
+                assignment_mode: ManualAssignmentMode::Random,
+            }),
+        ];
+        let unread = unread_under(&chosen, "round_robin", &candidates);
+        let ids: Vec<&str> = unread.iter().map(|row| row.id).collect();
+        assert!(ids.contains(&"cache_threshold"), "{ids:?}");
+        assert!(
+            !ids.contains(&"policy") && !ids.contains(&"max_idle_secs"),
+            "{ids:?}"
+        );
+        let threshold = unread
+            .iter()
+            .find(|row| row.id == "cache_threshold")
+            .unwrap();
+        assert_eq!(
+            threshold.keyword_warning("1.17"),
+            "smg: the keyword cache_threshold is deprecated and is removed in 1.17; it compiled \
+             to nothing (the round_robin policy does not read it); write it in policy_spec"
+        );
+    }
+
+    /// A zero sweep keeps keys for ever, so the sweep flag owns both
+    /// sessions fields and an idle time given beside it has its line with
+    /// the reason.
+    #[test]
+    fn a_zero_sweep_owns_the_idle_field() {
+        let manual = |max_idle_secs| PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let compiled = compile(&regular(manual(14_400)));
+        assert_eq!(ids(&compiled.report), ["eviction_interval", "policy"]);
+        let sweep = &compiled.report.consumed[0];
+        assert_eq!(
+            paths(sweep),
+            ["bindings[0].sessions.sweep_s", "bindings[0].sessions.ttl_s"]
+        );
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+
+        let carried = compile_given(&regular(manual(600)), &given(&["max_idle_secs"]));
+        assert_eq!(
+            ids(&carried.report),
+            ["eviction_interval", "max_idle_secs", "policy"]
+        );
+        assert_eq!(
+            carried.report.consumed[1].deprecation_line("1.17", false),
+            "smg: --max-idle-secs is deprecated and is removed in 1.17; it compiled to \
+             nothing (a zero sweep keeps keys for ever, so the idle time is for ever too); \
+             write it in --policy-spec"
+        );
+        assert_eq!(carried.check_against(&carried.spec), Ok(()));
+    }
+
     /// naming the field and the shape held.
     #[test]
     fn a_profile_of_another_shape_refuses_the_policy_flag() {
