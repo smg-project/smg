@@ -7,6 +7,7 @@ mod messages_streaming_test;
 mod messages_test;
 mod messages_threads_test;
 mod parser_endpoints_test;
+mod path_refusals_conversations_test;
 mod query_path_refusals_test;
 mod request_formats_test;
 #[cfg(feature = "provider-openai")]

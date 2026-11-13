@@ -189,13 +189,25 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             let oracle_cfg = config
                 .oracle
                 .ok_or("oracle configuration is required when history_backend=oracle")?;
+            // The same numeric bounds as the Postgres and Redis paths, before
+            // any connection.
+            oracle_cfg
+                .validate_bounds()
+                .map_err(|e| format!("Invalid Oracle configuration: {e}"))?;
 
             info!(
-                "Initializing data connector: Oracle ATP (pool: {}-{})",
-                oracle_cfg.pool_min, oracle_cfg.pool_max
+                "Initializing data connector: Oracle ATP (pool: {}-{}, op_timeout_secs: {})",
+                oracle_cfg.pool_min, oracle_cfg.pool_max, oracle_cfg.op_timeout_secs
             );
 
-            let storages = create_oracle_storage(oracle_cfg).await?;
+            // The driver runs each call on a blocking thread, which the bound
+            // does not interrupt: the request is answered at the bound; the
+            // thread returns when the driver does (each round trip of a pooled
+            // connection ends within its own call timeout of twice the bound).
+            let storages = bounded(
+                create_oracle_storage(oracle_cfg).await?,
+                CallBound::new("oracle", oracle_cfg.op_timeout()),
+            );
 
             info!("Data connector initialized successfully: Oracle ATP");
             storages
@@ -394,7 +406,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        core::{NewConversation, NewConversationItem, StoredResponse},
+        core::{
+            NewConversation, NewConversationItem, ResponseId, ResponseResult, StorageFailure,
+            StoredResponse,
+        },
         test_support::RefusedAddress,
     };
 
@@ -449,6 +464,23 @@ mod tests {
             op_timeout_secs: BOUND_SECS,
             schema: None,
             retention_days: None,
+        }
+    }
+
+    /// An Oracle configuration with the given call bound; nothing answers at
+    /// its address, and no test below reaches the driver.
+    fn oracle_config(op_timeout_secs: u64) -> OracleConfig {
+        OracleConfig {
+            wallet_path: None,
+            connect_descriptor: "tcps://127.0.0.1:1/s".to_string(),
+            external_auth: false,
+            username: "u".to_string(),
+            password: "s3cr3t".to_string(),
+            pool_min: OracleConfig::default_pool_min(),
+            pool_max: 1,
+            pool_timeout_secs: OracleConfig::default_pool_timeout_secs(),
+            op_timeout_secs,
+            schema: None,
         }
     }
 
@@ -627,6 +659,7 @@ mod tests {
             pool_min: 1,
             pool_max: 1,
             pool_timeout_secs: BOUND_SECS,
+            op_timeout_secs: OracleConfig::default_op_timeout_secs(),
             schema: None,
         };
         let verdict = tokio::time::timeout(
@@ -830,6 +863,99 @@ mod tests {
         .err()
         .expect("a zero bound is refused");
         assert!(err.contains("op_timeout_secs"), "{err}");
+
+        // The Oracle arm checks the bounds before the driver is loaded or a
+        // connection is attempted: the refusal names the key.
+        let oracle_cfg = oracle_config(0);
+        let err = create_storage(StorageFactoryConfig {
+            backend: &HistoryBackend::Oracle,
+            oracle: Some(&oracle_cfg),
+            postgres: None,
+            redis: None,
+            memory: None,
+            hook: None,
+        })
+        .await
+        .err()
+        .expect("a zero bound is refused");
+        assert!(err.contains("op_timeout_secs"), "{err}");
+    }
+
+    /// The wrapper under the bound an Oracle configuration carries, with the
+    /// store's label: a call the store never answers fails at the configured
+    /// second as a timeout (which the API answers as `503 storage_unavailable`)
+    /// with the backend named. Building the Oracle bundle takes a live store,
+    /// so the factory's own wrapping of it is read, not run, here; the opt-in
+    /// live conformance suite goes through `create_storage`.
+    #[tokio::test]
+    async fn an_oracle_store_call_that_is_never_answered_ends_at_the_configured_bound() {
+        use async_trait::async_trait;
+
+        struct NeverAnswers;
+
+        #[async_trait]
+        impl ResponseStorage for NeverAnswers {
+            async fn store_response(
+                &self,
+                _response: StoredResponse,
+            ) -> ResponseResult<ResponseId> {
+                std::future::pending().await
+            }
+
+            async fn get_response(
+                &self,
+                _response_id: &ResponseId,
+            ) -> ResponseResult<Option<StoredResponse>> {
+                std::future::pending().await
+            }
+
+            async fn delete_response(&self, _response_id: &ResponseId) -> ResponseResult<()> {
+                std::future::pending().await
+            }
+
+            async fn list_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+                _limit: Option<usize>,
+            ) -> ResponseResult<Vec<StoredResponse>> {
+                std::future::pending().await
+            }
+
+            async fn delete_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+            ) -> ResponseResult<usize> {
+                std::future::pending().await
+            }
+        }
+
+        let oracle_cfg = oracle_config(1);
+        let bundle = bounded(
+            StorageBundle {
+                response_storage: Arc::new(NeverAnswers),
+                conversation_storage: Arc::new(NoOpConversationStorage::new()),
+                conversation_item_storage: Arc::new(NoOpConversationItemStorage::new()),
+            },
+            CallBound::new("oracle", oracle_cfg.op_timeout()),
+        );
+        let started = Instant::now();
+        let err = bundle
+            .response_storage
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .expect_err("a call the store never answers ends at the bound");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+            "ended after {elapsed:?}; the bound is 1 s"
+        );
+        assert!(err.timed_out(), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "Storage timeout: the oracle get_response call exceeded its bound of 1 s"
+        );
     }
 
     #[tokio::test]

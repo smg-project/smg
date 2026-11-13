@@ -1667,6 +1667,27 @@ impl Usage {
         self
     }
 
+    /// Report the prompt's image tokens: the tokens the gateway's multimodal
+    /// expansion wrote into the prompt for the request's images, as
+    /// `prompt_tokens_details.image_tokens`. `None` leaves the details as they
+    /// are: a request without an image the gateway expanded reports no image
+    /// count, as before. The count is kept within `prompt_tokens`, the total
+    /// the details break down.
+    pub fn with_image_tokens(mut self, image_tokens: Option<u32>) -> Self {
+        if let Some(image_tokens) = image_tokens {
+            self.prompt_tokens_details
+                .get_or_insert(PromptTokenUsageInfo {
+                    cached_tokens: 0,
+                    audio_tokens: None,
+                    text_tokens: None,
+                    image_tokens: None,
+                    cache_write_tokens: None,
+                })
+                .image_tokens = Some(image_tokens.min(self.prompt_tokens));
+        }
+        self
+    }
+
     /// Default detail counters to zero, except unknown speculative rejections.
     /// With explicit accepted tokens, unavailable/inconsistent drafts leave rejected
     /// absent. Default zeros for non-speculative usage are schema defaults, not
@@ -2275,6 +2296,55 @@ mod tests {
 
         let unchanged = Usage::from_counts(10, 4).with_unbilled_prompt_tokens(0);
         assert_eq!((unchanged.prompt_tokens, unchanged.total_tokens), (10, 14));
+    }
+
+    #[test]
+    fn image_tokens_are_reported_within_the_prompt_or_not_at_all() {
+        let none = Usage::from_counts(10, 4).with_image_tokens(None);
+        assert!(
+            none.prompt_tokens_details.is_none(),
+            "no image count opens no details"
+        );
+        let kept = Usage::from_counts(10, 4)
+            .with_cached_tokens(2)
+            .with_image_tokens(None);
+        assert_eq!(
+            kept.prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((2, None)),
+            "no image count leaves the cache details as they are"
+        );
+
+        let reported = Usage::from_counts(535, 4).with_image_tokens(Some(324));
+        assert_eq!(
+            reported
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((0, Some(324))),
+            "the details the count opens default the cache to zero"
+        );
+        let beside_cache = Usage::from_counts(535, 4)
+            .with_cached_tokens(100)
+            .with_image_tokens(Some(324));
+        assert_eq!(
+            beside_cache
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((100, Some(324)))
+        );
+
+        let clamped = Usage::from_counts(10, 4).with_image_tokens(Some(12));
+        assert_eq!(
+            clamped
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.image_tokens),
+            Some(10),
+            "the count stays within the prompt"
+        );
     }
 
     #[test]

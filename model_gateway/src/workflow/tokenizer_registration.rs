@@ -550,7 +550,7 @@ async fn fetch_tokenizer_from_worker(
             Ok(tokenizer) => return Ok(tokenizer),
             Err(e) => failures.push(format!(
                 "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
-                worker.url(),
+                worker.redacted_url(),
             )),
         };
     }
@@ -572,13 +572,13 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
         Ok(None) => {
             return Err(format!(
                 "worker {} (runtime: {runtime}) does not provide a gRPC client",
-                worker.url(),
+                worker.redacted_url(),
             ));
         }
         Err(e) => {
             return Err(format!(
                 "failed to create gRPC client for worker {} (runtime: {runtime}): {e}",
-                worker.url(),
+                worker.redacted_url(),
             ));
         }
     };
@@ -603,7 +603,7 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
         }
         format!(
             "worker {} (runtime: {runtime}) get_tokenizer failed: {e}",
-            worker.url(),
+            worker.redacted_url(),
         )
     })?;
     debug!(

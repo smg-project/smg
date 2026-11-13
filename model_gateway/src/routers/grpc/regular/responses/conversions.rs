@@ -1786,6 +1786,29 @@ mod tests {
             "unsupported_content_part"
         );
     }
+
+    /// A function output with a part that has no text (an image, a file, a
+    /// refusal) is refused under the chat route's `unsupported_content_part`,
+    /// and the refusal names the part, as the refusal of a message part does;
+    /// it used to answer one fixed message whatever the part was.
+    #[test]
+    fn a_function_output_part_without_text_is_refused_by_name() {
+        let input = serde_json::json!([
+            {"type": "message", "role": "user", "content": "What is in the picture?"},
+            {"type": "function_call", "call_id": "call_1", "name": "take_picture", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]}
+        ]);
+        let refused = responses_to_chat(&items_request("local-model", input))
+            .expect_err("an image part in a function output has no text form");
+        assert_eq!(refused.code(), "unsupported_content_part");
+        assert_eq!(
+            refused.to_string(),
+            "Unsupported content part type \"input_image\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
+    }
+
     #[test]
     fn namespace_chat_response_roundtrips_identity() {
         let request: ResponsesRequest = namespace_test_request();
