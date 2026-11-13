@@ -1,6 +1,7 @@
 //! Worker selection stage: Select appropriate worker(s) based on routing mode
 
 use std::{
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,6 +11,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
+use futures::{future::Either, FutureExt};
 use smg_policy_controller::{fingerprint, Side, Target};
 use tracing::{debug, error, warn};
 
@@ -226,49 +228,64 @@ impl WorkerSelectionStage {
     /// the bound: when the budget runs out the waiter is dropped (its queue
     /// ticket goes with it) and the request is refused as one held past the
     /// queue timeout; without a bound the wait is the prefill queue's own.
-    async fn admit_within_budget<T, F>(
-        &self,
-        ctx: &RequestContext,
+    ///
+    /// Returned as a future rather than awaited in an `async fn`: an async
+    /// body keeps the slot of a parameter it has moved on, so the admission
+    /// (over a kilobyte of selection state) sat in this frame and again in
+    /// the timeout it was moved into, and the stage's boxed future, one
+    /// allocation per request, paid for both.
+    fn admit_within_budget<'a, T, F>(
+        &'a self,
+        ctx: &'a RequestContext,
         accepted: Option<Instant>,
         admission: F,
-    ) -> Result<T, Response>
+    ) -> impl Future<Output = Result<T, Response>> + 'a
     where
-        F: std::future::Future<Output = Result<T, Response>>,
+        T: 'a,
+        F: Future<Output = Result<T, Response>> + 'a,
     {
         let (Some(timeout), Some(accepted)) = (self.queue_timeout, accepted) else {
-            return admission.await;
+            return Either::Left(admission);
         };
         let budget =
             timeout.saturating_sub(AcceptedAt::clock_now().saturating_duration_since(accepted));
-        match tokio::time::timeout(budget, admission).await {
-            Ok(result) => result,
-            Err(_) => Err(Self::queue_timeout_refusal(
-                ctx,
-                AcceptedAt::clock_now().saturating_duration_since(accepted),
-                timeout,
-            )),
-        }
+        Either::Right(
+            tokio::time::timeout(budget, admission).map(move |held| match held {
+                Ok(result) => result,
+                Err(_) => Err(Self::queue_timeout_refusal(
+                    ctx,
+                    AcceptedAt::clock_now().saturating_duration_since(accepted),
+                    timeout,
+                )),
+            }),
+        )
     }
 
     /// A disaggregated selection admitted within the budget
     /// ([`Self::admit_within_budget`]) and still within it afterwards: an
     /// admission that lands right at the bound gives its claim back instead
     /// of taking a worker.
-    async fn admit_selection_within_budget<T, F>(
-        &self,
-        ctx: &RequestContext,
+    fn admit_selection_within_budget<'a, T, F>(
+        &'a self,
+        ctx: &'a RequestContext,
         accepted: Option<Instant>,
         admission: F,
-    ) -> Result<(T, PrefillLoadGuard), Response>
+    ) -> impl Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a
     where
-        F: std::future::Future<Output = Result<(T, PrefillLoadGuard), Response>>,
+        T: 'a,
+        F: Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a,
     {
-        let (selected, guard) = self.admit_within_budget(ctx, accepted, admission).await?;
-        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
-            drop(guard);
-            return Err(refused);
-        }
-        Ok((selected, guard))
+        self.admit_within_budget(ctx, accepted, admission)
+            .map(move |admitted| {
+                let (selected, guard) = admitted?;
+                if let Some(refused) =
+                    accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted))
+                {
+                    drop(guard);
+                    return Err(refused);
+                }
+                Ok((selected, guard))
+            })
     }
 }
 
@@ -7635,6 +7652,30 @@ mod tests {
             body["error"]["message"],
             "All workers for model 'test-model' are unavailable (unhealthy or circuit breaker open)",
             "the client's message is unchanged"
+        );
+    }
+
+    /// The stage's `execute` future is boxed once per request (`async_trait`)
+    /// and fits the allocator's 2,048-byte class on 64-bit targets: 1,744
+    /// bytes. It read 4,112 when the admission budget's two async wrappers
+    /// each kept the admission they had moved on (three copies of a 1.1 KB
+    /// future, and a 16-byte field took the box from the 4,096 class to
+    /// 5,120); returned as futures they hold it once. A field that grows the
+    /// future past the class needs its own read.
+    #[test]
+    fn the_selection_stage_future_fits_its_class() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let mut ctx = prepared_ctx(registry, None);
+        let future = size_of_val(&*stage.execute(&mut ctx));
+        assert!(
+            future <= 2048,
+            "the stage's execute future is {future} bytes"
         );
     }
 }
