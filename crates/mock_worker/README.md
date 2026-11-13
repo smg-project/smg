@@ -166,12 +166,26 @@ experiments against it transfer to engines:
   prefill `16.50142 + 1.518344e-2·T + 4.209989e-7·T²` ms over the uncached
   tokens `T` of the pass, decode `max(1, 5.74 + 54.01·u − 25.74·u²)` ms over
   the KV utilisation `u` of the decoding requests; a pass lasts prefill plus
-  decode, and the first token of a prefill adds no decode time.
+  decode (plus any restore from the shared KV tier, below), and the first
+  token of a prefill adds no decode time.
   `--timing linear` is the simpler model: prefill at `--prefill-tps` tokens/s,
   decode `base + per-request · batch` ms.
 - **cached tokens** — a request sharing a prefix with cached blocks pays less
   prefill and reports `cached_tokens` (gRPC chunks, HTTP
   `usage.prompt_tokens_details.cached_tokens`).
+- **shared KV tier** — `--global-l3-blocks <n>` gives the process one LRU
+  store of `n` blocks that every engine writes its completed blocks to, as
+  engines do behind a 3FS- or Mooncake-style pool; a pass's blocks become
+  restorable at its end, as its events become visible. An admitted prompt
+  restores the run of blocks the tier holds right after its local prefix
+  hit: those blocks take KV room but no token budget, count in
+  `cached_tokens`, and add `--global-l3-ms-per-token` per restored token to
+  the pass (a synchronous load). The tier is per process (a fleet split over
+  several processes has one tier each), and a reset (`POST /admin/reset`)
+  leaves it as it is: a restarted engine does not empty a shared store. It
+  needs `--prefix-cache true` and one main-attention KV cache group
+  (`full_attention`, `mla_attention` or `sink_full_attention`): the tier holds
+  whole blocks of one group.
 - **repeatable output** — `--output-seed prompt` derives synthetic output from
   the complete prompt token sequence, including its partial last block. Equal
   token inputs then produce equal output regardless of transport request ID,
@@ -195,6 +209,8 @@ experiments against it transfer to engines:
 | `--max-batched-tokens` | 8192 | token budget per pass |
 | `--max-running` | 256 | sequences per pass |
 | `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
+| `--global-l3-blocks` | 0 (off) | capacity of the process-wide shared KV tier, in blocks (above) |
+| `--global-l3-ms-per-token` | 0 | pass time per token restored from the shared tier |
 | `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
 | `--prefix-cache` | true | prefix caching + KV events |
 | `--prefill-first` | false | SGLang-style prefill-only passes |
@@ -293,11 +309,16 @@ engines do not expose:
   alone (a realistic process lists its engines alone, since a listener
   registers before its engine spawns; a listener joins the fleet once its
   bootstrap port, when it has one, is bound, so a worker that stopped at
-  that bind is never listed);
+  that bind is never listed); with the shared KV tier on, `global_l3` beside
+  them: `blocks`, what the tier holds, and `restored_tokens`, every token
+  restored from it (a preempted request's restores on re-admission included,
+  which its record does not count);
 - `GET /admin/requests?since=<seq>&limit=<n>` — admitted requests with the
-  serving worker, prompt/cached tokens, queue wait and the **arrival-time
+  serving worker, prompt/cached tokens (`restored_tokens`: those of the cached
+  tokens restored from the shared KV tier), queue wait and the **arrival-time
   oracle**: the most cached tokens any worker of the process held when the
-  request arrived (the best a router could have obtained). Join on the
+  request arrived, with the shared tier on counting what the worker would
+  restore after its own hit (the best a router could have obtained). Join on the
   gateway's response `id`. `injected_failures` beside the records counts, per
   worker, the requests the `fail` hook answered before admission (they left no
   record) and the streams it cut;
@@ -344,8 +365,8 @@ path has no engine to hook.
 
 | Endpoint | Answer |
 |----------|--------|
-| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
-| `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
+| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included) |
+| `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, `restored_tokens` (the shared tier's share of `cached_tokens`), so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
 | `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
 A circuit-breaker or retry drill arms `fail` on one worker (`status=503&count=N`
@@ -663,7 +684,10 @@ engine cached_tokens, implied overlap, agree`. The implied overlap is the
 gateway's stated credit when its log carries one (`overlap_tokens=`,
 `overlap_blocks=` or the tree path's `matched_ratio=`); otherwise `agree`
 compares the branch's claim of an overlap (`event_hit`, `event_spill`) with
-whether the engine served cached tokens. With `--admin` the summary also
+whether the engine served cached tokens. With `--admin`, both comparisons read
+the engine's cached tokens less those it restored from the mock's shared KV
+tier (the gateway's index sees the workers' own caches), while the table's
+`engine cached_tokens` column shows them all. With `--admin` the summary also
 carries `engine_truth_per_worker`, each engine's own account of the prompt,
 cached and oracle tokens it served, and `fleet.csv` samples every worker's
 load, cached blocks, preemptions and KV batches once a second for the whole

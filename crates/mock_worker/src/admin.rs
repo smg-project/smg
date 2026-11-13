@@ -4,10 +4,12 @@
 //!
 //! - `GET /admin/fleet`: every worker of the process: a realistic engine with
 //!   its cache size and load and, in a canned process, each listener with its
-//!   name and mode.
+//!   name and mode; with the shared KV tier on (`--global-l3-blocks`), the
+//!   blocks it holds and the tokens restored from it.
 //! - `GET /admin/requests?since=<seq>&limit=<n>`: admitted-request records
-//!   (`request_id`, serving worker, prompt/cached/oracle tokens, queue wait),
-//!   oldest first, `seq` strictly greater than `since`.
+//!   (`request_id`, serving worker, prompt/cached/oracle tokens and the
+//!   cached tokens restored from the shared tier, queue wait), oldest first,
+//!   `seq` strictly greater than `since`.
 //! - `GET /admin/cache/{worker}`: the worker's cached block keys.
 //! - `POST /admin/reset/{worker}` and `POST /admin/reset`: clear one or every
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
@@ -21,7 +23,8 @@
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
-//!   request.
+//!   request; with the shared KV tier on, both give the tier's share as
+//!   `restored_tokens`.
 //! - `POST /admin/script/{worker}` with one scripted answer or an array of
 //!   them: what the worker's next requests get, in order (`all`: whichever
 //!   worker gets the request), or, with a `key` or `input_ids`, what every
@@ -366,7 +369,12 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
 }
 
 async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
-    Json(json!({ "workers": fleet_rows(&state.cfg) }))
+    let mut fleet = json!({ "workers": fleet_rows(&state.cfg) });
+    if state.cfg.engine.global_l3_blocks > 0 {
+        let (blocks, restored_tokens) = engine::global_l3_stats();
+        fleet["global_l3"] = json!({ "blocks": blocks, "restored_tokens": restored_tokens });
+    }
+    Json(fleet)
 }
 
 /// One row per worker of the process, in name order: a realistic engine with
@@ -440,6 +448,7 @@ async fn requests(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
                 "worker": r.worker,
                 "prompt_tokens": r.prompt_tokens,
                 "cached_tokens": r.cached_tokens,
+                "restored_tokens": r.restored_tokens,
                 "oracle_tokens": r.oracle_tokens,
                 "queued_ms": r.queued_ms,
                 "running_at_admit": r.running_at_admit,
@@ -676,6 +685,7 @@ async fn truth_prompt(Path(worker): Path<String>, Json(body): Json<Value>) -> Re
                         "worker": e.name(),
                         "cached_tokens": truth.cached_tokens,
                         "cached_blocks": truth.cached_blocks,
+                        "restored_tokens": truth.restored_tokens,
                         "block_size": truth.block_size,
                         "prompt_tokens": token_ids.len(),
                     })
@@ -690,13 +700,14 @@ async fn truth_prompt(Path(worker): Path<String>, Json(body): Json<Value>) -> Re
 /// Per worker, what it actually served over every admitted request, and
 /// what its fault hook refused or cut.
 async fn truth_served() -> Json<Value> {
-    let mut totals: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
+    let mut totals: BTreeMap<String, (u64, u64, u64, u64, u64)> = BTreeMap::new();
     for r in engine::records_since(0, usize::MAX) {
-        let t = totals.entry(r.worker).or_insert((0, 0, 0, 0));
+        let t = totals.entry(r.worker).or_insert((0, 0, 0, 0, 0));
         t.0 += 1;
         t.1 += u64::from(r.prompt_tokens);
         t.2 += u64::from(r.cached_tokens);
         t.3 += u64::from(r.oracle_tokens);
+        t.4 += u64::from(r.restored_tokens);
     }
     let injected: BTreeMap<String, (u64, u64)> = engine::fleet_engines()
         .iter()
@@ -706,11 +717,11 @@ async fn truth_served() -> Json<Value> {
         })
         .collect();
     for worker in injected.keys() {
-        totals.entry(worker.clone()).or_insert((0, 0, 0, 0));
+        totals.entry(worker.clone()).or_insert((0, 0, 0, 0, 0));
     }
     let workers: Vec<Value> = totals
         .iter()
-        .map(|(worker, (requests, prompt, cached, oracle))| {
+        .map(|(worker, (requests, prompt, cached, oracle, restored))| {
             let (failed, cut) = injected.get(worker).copied().unwrap_or((0, 0));
             json!({
                 "worker": worker,
@@ -718,6 +729,7 @@ async fn truth_served() -> Json<Value> {
                 "prompt_tokens": prompt,
                 "cached_tokens": cached,
                 "oracle_tokens": oracle,
+                "restored_tokens": restored,
                 "injected_failures": failed,
                 "cut_streams": cut,
             })
@@ -925,6 +937,32 @@ mod tests {
             (0, 1)
         );
         drop(engines);
+    }
+
+    /// The fleet reports the shared KV tier beside the workers while the tier
+    /// is on, and has no such key while it is off.
+    #[tokio::test]
+    async fn the_fleet_reports_the_shared_tier_while_it_is_on() {
+        let with_tier = |global_l3_blocks| {
+            let engine = engine::EngineParams {
+                global_l3_blocks,
+                ..Default::default()
+            };
+            let cfg = Arc::new(Config {
+                realistic: true,
+                engine,
+                ..Config::default()
+            });
+            State(Arc::new(AdminState { cfg }))
+        };
+        let Json(off) = fleet(with_tier(0)).await;
+        assert!(off.get("global_l3").is_none(), "{off}");
+        let Json(on) = fleet(with_tier(4096)).await;
+        let tier = &on["global_l3"];
+        assert!(
+            tier["blocks"].is_u64() && tier["restored_tokens"].is_u64(),
+            "{on}"
+        );
     }
 
     #[test]
