@@ -376,6 +376,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("granite-4.1-3b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
+    // Step-5-Preview writes ChatML after a DeepSeek-style beginning-of-sentence marker, the tools
+    // with Qwen 3.5's tagged call format, and `<think>` whatever the request says.
+    ("step-5-preview", GenerationPrompt::AlwaysOpensTheThought),
     ("nanbeige4.2-3b", GenerationPrompt::OpensTheThought),
     ("nanbeige4.3-33b", GenerationPrompt::OpensTheThought),
     // Arete-27B (a Qwen 3.5 stack) writes Qwen 3.5's prompt shapes with a reasoning-effort sentence
@@ -1121,6 +1124,7 @@ const MEASURED_AFTER: &[(&str, &str)] = &[
     ("lfm3-vl-2b", ""),
     ("lfm3-omni-2b", ""),
     ("d1-2b", ""),
+    ("step-5-preview", ""),
 ];
 
 #[test]
@@ -1645,6 +1649,11 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
         "nvidia-nemotronlabs-ai-for-media-sports-basketball",
         "parse/content-with-marker-in-code-fence",
     ),
+    // bellwether's hand-written set for Step-5-Preview holds the content cases alone (the two content
+    // probes and the turn with the switch off): its reference rejected the fourteen other common
+    // probes, the reasoning and fence probes among them.
+    ("step-5-preview", "parse/reasoning-with-marker-text"),
+    ("step-5-preview", "parse/content-with-marker-in-code-fence"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
