@@ -2,10 +2,11 @@
 //! style does not write: Ling's, with the template's newline after the call's name, after each
 //! `</arg_key>` and before `</tool_call>`; GLM 4.5 and 4.6's, with it after the name, after each
 //! `</arg_key>` and after each `</arg_value>`; K2-Horizon's, the same under `ifm|`-prefixed tags
-//! with the block's newline before each call and before its close; Hy4's, every tag suffixed
-//! `:opensource` and the calls in a block; and Hy V3's, K2-Horizon's newlines under the plain tags
-//! with `<tool_sep>` after the name. GLM 4.7's and IQuest's compact spelling keeps the
-//! `glm_xml` style, the shape the gateway writes for it today.
+//! with the block's newline before each call and before its close; LongCat's, the same under
+//! `longcat_`-prefixed tags with no block; Hy4's, every tag suffixed `:opensource` and the calls
+//! in a block; and Hy V3's, K2-Horizon's newlines under the plain tags with `<tool_sep>` after
+//! the name. GLM 4.7's and IQuest's compact spelling keeps the `glm_xml` style, the shape the
+//! gateway writes for it today.
 //!
 //! A call is the call's opener and the tool's name, then one `<arg_key>` and `<arg_value>` pair per
 //! property of the tool's schema, in the schema's order, each optional unless the schema requires
@@ -294,6 +295,35 @@ mod tests {
             tags[1]["end"].as_str().expect("end")
         );
         assert_eq!(written, "<tool_call>ping\n</tool_call>");
+    }
+
+    #[test]
+    fn longcat_writes_glm4s_newlines_under_its_prefixed_tags_with_no_block() {
+        // LongCat's template writes GLM 4.6's newlines under `longcat_`-prefixed tags, each call
+        // bare: in longcat-2.5's recorded parse sets, 18 of 18 calls read
+        // `<longcat_tool_call>NAME\n`, 28 of 28 pairs `</longcat_arg_key>\n<longcat_arg_value>`
+        // and `</longcat_arg_value>\n`, and the one without arguments
+        // `<longcat_tool_call>NAME\n</longcat_tool_call>`.
+        let payload = formats::longcat()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let tags = payload["format"]["tags"].as_array().expect("two tags");
+        assert_eq!(tags[0]["begin"], "<longcat_tool_call>get_weather\n");
+        assert_eq!(tags[0]["end"], "</longcat_tool_call>");
+        let pairs = tags[0]["content"]["elements"]
+            .as_array()
+            .expect("three pairs");
+        let city = pairs[0]["elements"].as_array().expect("a pair's parts");
+        assert_eq!(city[2]["value"], "</longcat_arg_key>\n<longcat_arg_value>");
+        assert_eq!(city[4]["value"], "</longcat_arg_value>\n");
+        // A call without arguments: the name's newline, then the close; no block around it.
+        let written = format!(
+            "{}{}",
+            tags[1]["begin"].as_str().expect("begin"),
+            tags[1]["end"].as_str().expect("end")
+        );
+        assert_eq!(written, "<longcat_tool_call>ping\n</longcat_tool_call>");
     }
 
     #[test]

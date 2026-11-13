@@ -1630,6 +1630,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "longcat-2.5",
+        model: "meituan-longcat/LongCat-2.5",
+        also: &[],
+        released: "2026-11-04",
+        smg: (None, None),
+        table: Some(Table::LongCat),
+        set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "mage-vl-cowork",
         model: "microsoft/Mage-VL-Cowork",
         also: &[],
