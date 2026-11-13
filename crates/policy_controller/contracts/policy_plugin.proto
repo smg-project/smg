@@ -235,6 +235,9 @@ message Candidate {
   // registration key's fingerprint, equal across one worker's handles and
   // across gateway replicas (where `id` is per handle); 0 when none.
   uint32 key = 26;  // u32
+  // Blocks the index holds for the worker: what a warm-up stage reads
+  // thinness from, against the fleet's level.
+  uint32 indexed_blocks = 27;
 }
 
 // One request as a decision sees it; the tenant and the session key travel
@@ -259,7 +262,9 @@ message RequestFacts {
   Phase phase = 11;
   uint32 attempt = 12;  // u8; 0 for the first attempt
   repeated fixed64 tried = 13 [packed = true];
-  // Time left for the decision, relative to the frame's receipt.
+  // Time left for the whole decision, relative to the frame's receipt (on a
+  // PluginDecide, rebased to that frame's receipt when the controller
+  // forwards it).
   uint32 budget_micros = 14;
   repeated Header headers = 15;  // allow-listed only
   MediaCounts media = 16;
@@ -269,6 +274,10 @@ message RequestFacts {
   // controller hashes it into `block_hashes` before any stage sees the view;
   // bounded by `view.max_prompt_text_bytes`, refused over it.
   bytes prompt_text = 18;
+  // The size in tokens of one of the request's blocks as the host counted
+  // them: an index's learned block size on an event-fed request, the
+  // configured one on a tree-fed request; 0 reads the view's.
+  uint32 block_size = 19;
 }
 
 // What only the deciding gateway knows now. Its standing vetoes are not here:
@@ -497,6 +506,10 @@ message Released {
     REASON_CLIENT_GONE = 3;
     // The commit refused every target (a removed worker, a lost room).
     REASON_COMMIT_FAILED = 4;
+    // The stream rule's grace passed without a Completed.
+    REASON_EXPIRED = 5;
+    // An immediate deregistration released the worker's leases.
+    REASON_WORKER_REMOVED = 6;
   }
   Reason reason = 3;
   // Unspecified releases every side; a pair's leases share an id, so name it.
@@ -627,6 +640,10 @@ message PluginDecide {
   PoolFacts pool = 4;
   uint32 stages = 5;
   repeated float scores_in = 6 [packed = true];
+  // The plugin's own deadline for this frame, relative to its receipt (the
+  // budget REASON_BUDGET declines are measured against). The controller
+  // clamps it to at most `request.budget_micros`, so a plugin may rely on
+  // this field never exceeding the request's.
   uint32 budget_micros = 7;
 }
 

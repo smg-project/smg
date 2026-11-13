@@ -4,7 +4,7 @@
 //! lengths of the pieces a grammar repeats (a value in each list that holds it, a call in each
 //! place one is written) are added up, not copied.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 use serde_json::{json, Map, Value};
 
@@ -359,7 +359,7 @@ impl Build for Tree {
 
     fn schema(&self, schema: &Value, whitespace: Whitespace) -> Grammar {
         Grammar::JsonSchema {
-            schema: schema.clone(),
+            schema: Arc::new(schema.clone()),
             style: None,
             excludes: Vec::new(),
             whitespace,
@@ -370,7 +370,7 @@ impl Build for Tree {
         let own = self.parts.own(json);
         let definitions = self.parts.definitions(root);
         Grammar::JsonSchema {
-            schema: Document::of(&own, &definitions).schema(),
+            schema: Arc::new(Document::of(&own, &definitions).schema()),
             style: None,
             excludes: excludes.to_vec(),
             whitespace: Whitespace::Free,
@@ -405,13 +405,13 @@ impl Length {
         let empty_len = json_len(&empty);
         let wrapped = |grammar: Grammar| json_len(&grammar) - empty_len;
         let json_schema = |excludes: Vec<String>| Grammar::JsonSchema {
-            schema: Value::Null,
+            schema: Arc::new(Value::Null),
             style: None,
             excludes,
             whitespace: Whitespace::Free,
         };
         let bounded = Grammar::JsonSchema {
-            schema: Value::Null,
+            schema: Arc::new(Value::Null),
             style: None,
             excludes: Vec::new(),
             whitespace: Whitespace::Bounded(0),
