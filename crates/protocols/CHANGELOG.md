@@ -6,6 +6,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `MessagesBetas`, beside `CreateMessageRequest`: the betas a Messages request names in its
+  `anthropic-beta` header, read once from the header's values as the public API names them (the
+  dated form `name-YYYY-MM-DD`; a header that repeats or lists several; a longer name that begins
+  with a known one is another beta), with `values_name` for a reader that keeps no set; and
+  `validate_with_betas`, the request rules that read a beta beside the body
+  (`thinking.budget_tokens` under `max_tokens` unless the interleaved-thinking beta is named;
+  `thread` only with the message-threads beta), refused with the codes and messages the gateway's
+  Messages route answered before. That route reads both through a typed header extractor, and the
+  external router's beta reading shares the grammar.
 - `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
   transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
   handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or

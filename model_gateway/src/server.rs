@@ -66,7 +66,10 @@ pub use tls::{blocking_http_client, http_client, http_client_builder, install_cr
 use crate::{
     app_context::AppContext,
     config::{redacted, ParserChoice, RouterConfig},
-    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
+    endpoints::{
+        conversations, messages::MessagesHeaders, models, parse, responses as response_handlers,
+        tokenize,
+    },
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
         MeshAdapters,
@@ -80,7 +83,7 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::{header_utils, realtime::ws::RealtimeQueryParams},
+        common::realtime::ws::RealtimeQueryParams,
         error as route_error,
         gateway::Gateway,
         grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
@@ -402,107 +405,19 @@ async fn v1_embeddings(
         .await
 }
 
-/// The public Messages API knows only its dated versions: a request whose
-/// `anthropic-version` is not a calendar date of 2023 or later is refused as
-/// the public API refuses it, before anything is routed. A request without
-/// the header is served as the current version: this gateway's own SDK
-/// clients send none, and the header selects nothing here.
-fn check_anthropic_version(headers: &HeaderMap) -> Result<(), Response> {
-    let Some(value) = headers.get("anthropic-version") else {
-        return Ok(());
-    };
-    let version = value.to_str().unwrap_or_default();
-    if is_anthropic_version(version) {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "invalid_anthropic_version",
-            format!("anthropic-version: \"{version}\" is not a valid version"),
-        ))
-    }
-}
-
-/// `YYYY-MM-DD`, a real calendar date, 2023 (the first public version) or
-/// later.
-fn is_anthropic_version(version: &str) -> bool {
-    let bytes = version.as_bytes();
-    let shaped = bytes.len() == 10
-        && bytes.iter().enumerate().all(|(i, b)| {
-            if i == 4 || i == 7 {
-                *b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }
-        });
-    if !shaped {
-        return false;
-    }
-    let field = |range: std::ops::Range<usize>| version[range].parse::<u32>().unwrap_or(0);
-    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    };
-    year >= 2023 && (1..=days).contains(&day)
-}
-
-/// `thinking.budget_tokens` must leave room under `max_tokens` for the
-/// answer, unless the interleaved-thinking beta is on: then the budget covers
-/// every thinking block of the turn and the public API takes a budget at or
-/// above `max_tokens`. The rule reads the `anthropic-beta` header, so it runs
-/// here rather than in the request's own validation.
-fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
-    let Some(openai_protocol::messages::ThinkingConfig::Enabled { budget_tokens, .. }) =
-        &body.thinking
-    else {
-        return Ok(());
-    };
-    let interleaved = header_utils::anthropic_beta_named(headers, "interleaved-thinking");
-    if interleaved || *budget_tokens < body.max_tokens {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "thinking_budget_exceeds_max_tokens",
-            "`max_tokens` must be greater than `thinking.budget_tokens`",
-        ))
-    }
-}
-
-/// A thread turn names the message-threads beta, as the public API requires
-/// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
-/// the body layer to parse the request before the route, so a `thread` field
-/// without it is refused here with the public API's own 400 on the parsed
-/// (buffered) path. A header-less turn on the raw pass-through path never
-/// reaches this handler: it is forwarded unparsed, `thread` and all.
-fn check_thread_beta(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
-    if body.thread.is_none() || header_utils::anthropic_beta_named(headers, "message-threads") {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "thread_beta_required",
-            "`thread` requires the `anthropic-beta: message-threads-2026-08-12` header",
-        ))
-    }
-}
-
+/// The Messages route: its typed headers ([`MessagesHeaders`]) are read
+/// before the body, so a malformed `anthropic-version` is refused before the
+/// body is buffered; the rules that read a beta beside the body run once the
+/// body is parsed. The raw headers are forwarded as they came.
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
+    parsed: MessagesHeaders,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
-    if let Err(refused) = check_anthropic_version(&headers) {
-        return refused;
-    }
-    if let Err(refused) = check_thinking_budget(&headers, &body) {
-        return refused;
-    }
-    if let Err(refused) = check_thread_beta(&headers, &body) {
+    if let Err(refused) = parsed.validate(&body) {
         return refused;
     }
     let model = body.model.clone();
@@ -515,16 +430,16 @@ async fn v1_messages(
         .await
 }
 
+/// The count-tokens route reads the typed headers for the version refusal
+/// alone: no rule of its body reads a beta.
 async fn v1_messages_count_tokens(
     State(state): State<Arc<AppState>>,
+    _parsed: MessagesHeaders,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
-    if let Err(refused) = check_anthropic_version(&headers) {
-        return refused;
-    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -3407,105 +3322,6 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
-
-    /// A request without `anthropic-version` is served (this gateway's own
-    /// SDK clients send none); a version that is not a real calendar date of
-    /// 2023 or later is refused, as the public API refuses it.
-    #[test]
-    fn messages_requests_take_a_missing_version_and_refuse_a_malformed_one() {
-        let with = |value: &'static str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("anthropic-version", http::HeaderValue::from_static(value));
-            headers
-        };
-        assert!(check_anthropic_version(&HeaderMap::new()).is_ok());
-        for ok in ["2023-06-01", "2023-01-01", "2024-02-29", "2026-12-31"] {
-            assert!(check_anthropic_version(&with(ok)).is_ok(), "{ok}");
-        }
-        for bad in [
-            "1999-01-01",
-            "latest",
-            "2023-6-1",
-            "2023-02-30",
-            "2023-13-01",
-            "2023-00-10",
-            "2023-02-29",
-        ] {
-            let refused = check_anthropic_version(&with(bad)).expect_err(bad);
-            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad}");
-            assert_eq!(
-                route_error::extract_error_code_from_response(&refused),
-                "invalid_anthropic_version",
-                "{bad}"
-            );
-        }
-    }
-
-    /// A thinking budget at or above `max_tokens` is refused as the public
-    /// API refuses it, except under the interleaved-thinking beta, where the
-    /// public API takes it.
-    #[test]
-    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
-        let request = |max_tokens: u32, budget: u32| -> CreateMessageRequest {
-            serde_json::from_value(serde_json::json!({
-                "model": "m", "max_tokens": max_tokens,
-                "thinking": {"type": "enabled", "budget_tokens": budget},
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .unwrap()
-        };
-        let plain = HeaderMap::new();
-        assert!(check_thinking_budget(&plain, &request(4096, 1024)).is_ok());
-        let refused = check_thinking_budget(&plain, &request(1024, 1024)).expect_err("refused");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            route_error::extract_error_code_from_response(&refused),
-            "thinking_budget_exceeds_max_tokens"
-        );
-
-        let mut interleaved = HeaderMap::new();
-        interleaved.insert(
-            "anthropic-beta",
-            http::HeaderValue::from_static(
-                "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
-            ),
-        );
-        assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
-        assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
-    }
-
-    /// A `thread` field needs the message-threads beta header, as the public
-    /// API requires; a request without `thread` needs no header.
-    #[test]
-    fn a_thread_field_needs_the_message_threads_beta_header() {
-        let request = |thread: bool| -> CreateMessageRequest {
-            let mut body = serde_json::json!({
-                "model": "m", "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}]
-            });
-            if thread {
-                body["thread"] = serde_json::json!({"type": "create"});
-            }
-            serde_json::from_value(body).unwrap()
-        };
-        let plain = HeaderMap::new();
-        assert!(check_thread_beta(&plain, &request(false)).is_ok());
-        let refused = check_thread_beta(&plain, &request(true)).expect_err("refused");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            route_error::extract_error_code_from_response(&refused),
-            "thread_beta_required"
-        );
-
-        let mut named = HeaderMap::new();
-        named.insert(
-            "anthropic-beta",
-            http::HeaderValue::from_static(
-                "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
-            ),
-        );
-        assert!(check_thread_beta(&named, &request(true)).is_ok());
-    }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.

@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue},
 };
 use http::header::HeaderName;
+use openai_protocol::messages::MessagesBetas;
 
 use crate::error::HEADER_X_SMG_ERROR_CODE;
 
@@ -65,30 +66,18 @@ pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
 }
 
 /// Whether the request's `anthropic-beta` header names the beta `name` in
-/// its dated form, `name-YYYY-MM-DD`: the header may repeat, and each value
-/// may list several betas, comma separated. A longer beta name that begins
-/// with `name` is another beta, not this one.
+/// its dated form, `name-YYYY-MM-DD` (the reading of [`MessagesBetas`],
+/// without building the set): the header may repeat, and each value may list
+/// several betas, comma separated. A longer beta name that begins with
+/// `name` is another beta, not this one.
 pub fn anthropic_beta_named(headers: &HeaderMap, name: &str) -> bool {
-    headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|beta| beta.trim().strip_prefix(name).is_some_and(is_dated_suffix))
-}
-
-/// `-YYYY-MM-DD`, the date a public beta's name ends with: the shape alone,
-/// not the calendar.
-fn is_dated_suffix(rest: &str) -> bool {
-    let bytes = rest.as_bytes();
-    bytes.len() == 11
-        && bytes.iter().enumerate().all(|(i, b)| {
-            if i == 0 || i == 5 || i == 8 {
-                *b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }
-        })
+    MessagesBetas::values_name(
+        headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+        name,
+    )
 }
 
 /// Declared size of the incoming raw body; pre-sizes reserialization buffers.

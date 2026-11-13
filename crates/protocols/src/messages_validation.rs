@@ -8,9 +8,11 @@
 //! role inside `messages` (kept in place for the clients that send one), the
 //! vendor's model-specific couplings of thinking with `temperature` or a
 //! forced `tool_choice` (a served model may take both), and the per-model
-//! output-token cap. The rule that `thinking.budget_tokens` stays under
-//! `max_tokens` reads the `anthropic-beta` header (the interleaved-thinking
-//! beta lifts it), so the gateway's handler applies it.
+//! output-token cap. The rules that read the request's betas beside its body
+//! (`thinking.budget_tokens` under `max_tokens` unless the interleaved-thinking
+//! beta is named; `thread` only with the message-threads beta) are
+//! [`validate_with_betas`], applied by the gateway's Messages handler with the
+//! betas it parsed from the `anthropic-beta` header.
 //!
 //! Tighter than the public API in one place, on purpose: `top_p` is refused
 //! at 0.0 and `top_k` outside 1 to `i32::MAX`, the bounds this gateway's Chat
@@ -29,8 +31,8 @@ use validator::ValidationError;
 use crate::{
     common::invalid,
     messages::{
-        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, MessageThread, Role,
-        ThinkingConfig, Tool,
+        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, MessageThread,
+        MessagesBetas, Role, ThinkingConfig, Tool,
     },
 };
 
@@ -52,6 +54,59 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
     validate_tools(req.tools.as_deref())?;
     validate_output_format(req)?;
     validate_thinking(req)
+}
+
+/// The rules that read the request's betas ([`MessagesBetas`], the
+/// `anthropic-beta` header parsed once) beside its body, applied by the
+/// gateway's Messages handler after the field-level validation and refused
+/// with the public API's own codes.
+pub fn validate_with_betas(
+    req: &CreateMessageRequest,
+    betas: &MessagesBetas,
+) -> Result<(), ValidationError> {
+    validate_thinking_budget(req, betas)?;
+    validate_thread_beta(req, betas)
+}
+
+/// `thinking.budget_tokens` must leave room under `max_tokens` for the
+/// answer, unless the interleaved-thinking beta is on: then the budget covers
+/// every thinking block of the turn and the public API takes a budget at or
+/// above `max_tokens`.
+fn validate_thinking_budget(
+    req: &CreateMessageRequest,
+    betas: &MessagesBetas,
+) -> Result<(), ValidationError> {
+    let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking else {
+        return Ok(());
+    };
+    if betas.interleaved_thinking() || *budget_tokens < req.max_tokens {
+        Ok(())
+    } else {
+        Err(invalid(
+            "thinking_budget_exceeds_max_tokens",
+            "`max_tokens` must be greater than `thinking.budget_tokens`",
+        ))
+    }
+}
+
+/// A thread turn names the message-threads beta, as the public API requires
+/// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
+/// the gateway's body layer to parse the request before the route, so a
+/// `thread` field without it is refused on the parsed (buffered) path with
+/// the public API's own 400. A header-less turn on the raw pass-through path
+/// never reaches this rule: it is forwarded unparsed, `thread` and all.
+fn validate_thread_beta(
+    req: &CreateMessageRequest,
+    betas: &MessagesBetas,
+) -> Result<(), ValidationError> {
+    if req.thread.is_none() || betas.message_threads() {
+        Ok(())
+    } else {
+        Err(invalid(
+            "thread_beta_required",
+            "`thread` requires the `anthropic-beta: message-threads-2026-08-12` header",
+        ))
+    }
 }
 
 /// `temperature` takes the public API's range, 0 to 1; `top_p` the same range
@@ -436,9 +491,9 @@ fn validate_output_format(req: &CreateMessageRequest) -> Result<(), ValidationEr
 }
 
 /// `enabled` needs a budget of at least 1024 tokens (that it stays under
-/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
-/// handler checks it); `between_tools` takes `type` alone (the public API
-/// refuses `display`, `budget_tokens` or `block_binding` sent with it).
+/// `max_tokens` depends on the betas, the rule of [`validate_with_betas`]);
+/// `between_tools` takes `type` alone (the public API refuses `display`,
+/// `budget_tokens` or `block_binding` sent with it).
 fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
     match &req.thinking {
         Some(ThinkingConfig::Enabled { budget_tokens, .. }) if *budget_tokens < 1024 => {
@@ -799,8 +854,8 @@ mod tests {
         accepted(
             json!({"max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
         );
-        // Whether the budget stays under max_tokens depends on the beta
-        // header: the handler decides, not the body alone.
+        // Whether the budget stays under max_tokens depends on the betas:
+        // validate_with_betas decides, not the body alone.
         accepted(
             json!({"max_tokens": 1024, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
         );
@@ -809,6 +864,87 @@ mod tests {
         accepted(
             json!({"max_tokens": 4096, "temperature": 0.6, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
         );
+    }
+
+    /// The betas of a request are its header's dated names: a header that
+    /// repeats or lists several, a longer name that begins with a known one
+    /// and a token without the dated suffix read as the public API reads them.
+    #[test]
+    fn betas_are_the_headers_dated_names() {
+        let none = MessagesBetas::from_header_values([]);
+        assert!(!none.message_threads() && !none.interleaved_thinking());
+        let listed = MessagesBetas::from_header_values([
+            "fine-grained-tool-streaming-2025-05-14, interleaved-thinking-2025-05-14",
+            "message-threads-2026-08-12",
+        ]);
+        assert!(listed.interleaved_thinking() && listed.message_threads());
+        assert!(listed.names("fine-grained-tool-streaming"));
+        assert!(!listed.names("fine-grained") && !listed.names("threads"));
+        for undated in [
+            "message-threads",
+            "message-threads-2026-8-12",
+            "message-threads-v2-2026-08-12",
+        ] {
+            let betas = MessagesBetas::from_header_values([undated]);
+            assert!(!betas.message_threads(), "{undated}");
+            assert!(
+                !MessagesBetas::values_name([undated], "message-threads"),
+                "{undated}"
+            );
+        }
+        assert!(MessagesBetas::values_name(
+            ["token-counting-2024-11-01"],
+            "token-counting"
+        ));
+        assert!(!MessagesBetas::values_name(
+            ["token-counting-2024-11-01"],
+            "token"
+        ));
+    }
+
+    /// A thinking budget at or above `max_tokens` is refused as the public
+    /// API refuses it, except under the interleaved-thinking beta, where the
+    /// public API takes it.
+    #[test]
+    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
+        let with_budget = |max_tokens: u32, budget_tokens: u32| {
+            request(json!({
+                "max_tokens": max_tokens,
+                "thinking": {"type": "enabled", "budget_tokens": budget_tokens},
+            }))
+        };
+        let plain = MessagesBetas::default();
+        assert!(validate_with_betas(&with_budget(4096, 1024), &plain).is_ok());
+        let refused = validate_with_betas(&with_budget(1024, 1024), &plain).expect_err("refused");
+        assert_eq!(refused.code, "thinking_budget_exceeds_max_tokens");
+        assert_eq!(
+            refused.message.as_deref(),
+            Some("`max_tokens` must be greater than `thinking.budget_tokens`")
+        );
+        let interleaved = MessagesBetas::from_header_values([
+            "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+        ]);
+        assert!(validate_with_betas(&with_budget(1024, 1024), &interleaved).is_ok());
+        assert!(validate_with_betas(&with_budget(1024, 8192), &interleaved).is_ok());
+    }
+
+    /// A `thread` field needs the message-threads beta, as the public API
+    /// requires; a request without `thread` needs no beta.
+    #[test]
+    fn a_thread_field_needs_the_message_threads_beta() {
+        let thread = request(json!({"thread": {"type": "create"}}));
+        let plain = MessagesBetas::default();
+        assert!(validate_with_betas(&request(json!({})), &plain).is_ok());
+        let refused = validate_with_betas(&thread, &plain).expect_err("refused");
+        assert_eq!(refused.code, "thread_beta_required");
+        assert_eq!(
+            refused.message.as_deref(),
+            Some("`thread` requires the `anthropic-beta: message-threads-2026-08-12` header")
+        );
+        let named = MessagesBetas::from_header_values([
+            "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
+        ]);
+        assert!(validate_with_betas(&thread, &named).is_ok());
     }
 
     #[test]
