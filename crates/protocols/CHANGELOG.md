@@ -85,6 +85,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages answer with a content block of a kind this build does not read (a web fetch, code
+  execution, bash or text editor result, a container upload, or any block the public API adds)
+  parses, the block kept as written in `ContentBlock::Other`, as `ToolUseCaller::Other` keeps an
+  unknown caller. A whole answer with such a block failed: the provider route answered a 502, and
+  a streamed thread turn was left unstored. Breaking: `ContentBlock` gains `Other(Value)`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
