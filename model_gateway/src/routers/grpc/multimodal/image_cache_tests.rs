@@ -261,6 +261,7 @@ fn context<'a>(
         model_config: config,
         vision_processors: config.vision_processors(spec),
         image_wire_dtype,
+        image_wire_cap: None,
         transparency: TransparencyPolicy::KeepAlpha,
         encoder_budget,
     }
@@ -739,6 +740,7 @@ async fn run_probe(
             model_config: config,
             vision_processors: config.vision_processors(spec),
             image_wire_dtype: None,
+            image_wire_cap: None,
             transparency: policy,
             encoder_budget: None,
         },
@@ -846,6 +848,7 @@ async fn bf16_batch_cache_reuses_large_batches_across_image_families() {
             model_config: &config,
             vision_processors: config.vision_processors(spec),
             image_wire_dtype: Some(EncoderDtype::BFloat16),
+            image_wire_cap: None,
             transparency: TransparencyPolicy::KeepAlpha,
             encoder_budget: None,
         };
@@ -1050,6 +1053,7 @@ async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
         model_config: &config,
         vision_processors: config.vision_processors(spec),
         image_wire_dtype: Some(EncoderDtype::BFloat16),
+        image_wire_cap: None,
         transparency: TransparencyPolicy::KeepAlpha,
         encoder_budget: None,
     };
@@ -1193,6 +1197,7 @@ async fn independent_bf16_images_match_uncached_with_mixed_hits_and_budget_bypas
                 model_config: &config,
                 vision_processors: config.vision_processors(spec),
                 image_wire_dtype: Some(EncoderDtype::BFloat16),
+                image_wire_cap: None,
                 transparency: TransparencyPolicy::KeepAlpha,
                 encoder_budget: None,
             };

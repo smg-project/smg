@@ -107,7 +107,8 @@ pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transparency::engine_transparency_policy;
 pub(crate) use transport::{
-    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype_over,
+    init_mm_transport_defaults, mm_image_wire_cap_over, mm_rdma_exporter,
+    mm_shared_image_wire_dtype_over,
 };
 
 /// The response for an error of assembling or planning a request's
