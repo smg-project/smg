@@ -90,6 +90,17 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An Interactions request keeps the fields the gateway does not model (`continuation_token`,
+  `safety_settings`, `service_tier`, `webhook_config`, `environment`, `labels`, `cached_content`,
+  and any the API adds), forwarded to the upstream as written, as the Messages request's `other`
+  keeps its. The Gemini router rebuilds the upstream body from the typed request, which dropped
+  them: the safety settings were lost, and a `store: false` client's continuation hop reached the
+  upstream without its token, so each hop started the answer over. A modeled field also reads its
+  camelCase spelling (`previousInteractionId`, `systemInstruction`, `generationConfig`, ...) into
+  the typed field, where the gateway's checks see it, and a body with both spellings is refused.
+  So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
+  `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
+  Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
 - `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
   `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
   "input_image" in a function output for text-only backends: only text parts are carried as a tool
