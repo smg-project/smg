@@ -1105,15 +1105,25 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// The attempt's start: the step state (running, or retrying from the
-    /// second attempt on) and the started event.
+    /// second attempt on) and the started event. A workflow cancelled by
+    /// then starts no attempt.
     async fn begin_attempt(
         &self,
         instance_id: WorkflowInstanceId,
         step: &StepDefinition<D>,
         attempt: u32,
     ) -> WorkflowResult<()> {
+        // The cancel read and the attempt's start are one store update: a
+        // step never moves to running once the cancel is written, so a
+        // waiter's snapshot after the cancel sees every step on its task
+        // (the `is_cancelled` read before this is the fast path).
+        let mut cancelled = false;
         self.state_store
             .update(instance_id, |s| {
+                if s.status == WorkflowStatus::Cancelled {
+                    cancelled = true;
+                    return;
+                }
                 s.current_step = Some(step.id.clone());
                 if let Some(step_state) = s.step_states.get_mut(&step.id) {
                     step_state.status = if attempt == 1 {
@@ -1126,6 +1136,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 }
             })
             .await?;
+        if cancelled {
+            return Err(WorkflowError::Cancelled(instance_id));
+        }
 
         self.event_bus
             .publish(WorkflowEvent::StepStarted {
