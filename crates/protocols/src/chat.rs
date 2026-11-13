@@ -203,11 +203,67 @@ impl<'de> Deserialize<'de> for AssistantReasoning {
 
 /// A message's content as the wire carries it: one text string, or a list of
 /// typed parts (text, image, audio, video, refusal).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+/// A string is the text, a list is the parts. A part's refusal is kept as
+/// the refusal, under the part's place in the list (`content[1]`): a derived
+/// untagged read would replace it with its own generic words, and serde's
+/// path stops at the message a tagged enum buffers.
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContentVisitor;
+
+        impl<'de> de::Visitor<'de> for ContentVisitor {
+            type Value = MessageContent;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string or a list of content parts")
+            }
+
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(text.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(text))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut parts = Vec::new();
+                while let Some(value) = seq.next_element::<Value>()? {
+                    let part = serde_json::from_value::<ContentPart>(value).map_err(|error| {
+                        <A::Error as de::Error>::custom(part_reason_at(parts.len(), &error))
+                    })?;
+                    parts.push(part);
+                }
+                Ok(MessageContent::Parts(parts))
+            }
+        }
+
+        deserializer.deserialize_any(ContentVisitor)
+    }
+}
+
+/// A part's refusal under its place in the list, in serde's own path form,
+/// so the reason keeps its opening words (the public code reads them) and
+/// the field its path: `missing field `image_url.url`` at the second part is
+/// `missing field `content[1].image_url.url``, `..., in `image_url`` is
+/// `..., in `content[1].image_url``, a reason naming no body ends
+/// `, in `content[1]``.
+fn part_reason_at(index: usize, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    if let Some(field) = reason.strip_prefix("missing field `") {
+        return format!("missing field `content[{index}].{field}");
+    }
+    match reason.rsplit_once(", in `") {
+        Some((head, body)) => format!("{head}, in `content[{index}].{body}"),
+        None => format!("{reason}, in `content[{index}]`"),
+    }
 }
 
 impl Default for MessageContent {
@@ -2466,6 +2522,82 @@ mod tool_choice_tests {
                 code.map(str::to_string),
                 "{tool_choice}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use serde_json::json;
+
+    use super::{ChatMessage, MessageContent};
+
+    fn content_of(message: ChatMessage) -> MessageContent {
+        match message {
+            ChatMessage::User { content, .. } => content,
+            other => panic!("not a user message: {other:?}"),
+        }
+    }
+
+    /// A string is the text, a list is the parts, an unknown part is kept.
+    #[test]
+    fn message_content_reads_text_and_parts() {
+        let text = serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": "hi"}))
+            .unwrap();
+        assert_eq!(content_of(text), MessageContent::Text("hi".to_string()));
+
+        let parts = serde_json::from_value::<ChatMessage>(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "vendor_media", "payload": {"items": [1]}}
+            ]
+        }))
+        .unwrap();
+        let MessageContent::Parts(parts) = content_of(parts) else {
+            panic!("not parts");
+        };
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].text(), Some("hi"));
+    }
+
+    /// A part's refusal reaches the message's error as the part's own
+    /// reason, under the part's place, never as the generic words of an
+    /// untagged read; a content that is neither a string nor a list names
+    /// both forms.
+    #[test]
+    fn message_content_keeps_a_parts_refusal_under_its_place() {
+        for (content, reason) in [
+            (
+                json!([{"type": "text", "text": "hi"}, {"type": "refusal", "refusal": null}]),
+                "invalid type: null, expected a string, in `content[1].refusal`",
+            ),
+            (
+                json!([{"type": "image_url", "image_url": {"detail": "high"}}]),
+                "missing field `content[0].image_url.url`",
+            ),
+            (
+                json!([{"type": "text", "text": "hi"}, {"type": "image_url"}]),
+                "missing field `content[1].image_url`",
+            ),
+            (
+                json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}]),
+                "invalid value: integer `-1`, expected u32, in `content[0].image_url`",
+            ),
+            (
+                json!([5]),
+                "invalid type: integer `5`, expected a map, in `content[0]`",
+            ),
+            (
+                json!(5),
+                "invalid type: integer `5`, expected a string or a list of content parts",
+            ),
+        ] {
+            let error =
+                serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": content}))
+                    .unwrap_err();
+            assert_eq!(error.to_string(), reason, "{content}");
         }
     }
 }

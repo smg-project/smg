@@ -47,6 +47,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   its content and role into the message item built from it, and every other item comes back as it
   was passed, so a caller that owns its input no longer copies each item; a caller holding a
   reference passes `item.clone()`, which costs what the old signature did.
+- `ContentPart`: a part whose `type` names a kind the gateway knows (`text`, `image_url`,
+  `audio_url`, `input_audio`, `video_url`, `refusal`) but whose body does not fit it is refused with
+  serde's reason for the field (`400`, `error.code` `invalid_type`, `integer_below_min_value` or
+  `missing_required_parameter`, `error.param` the part's path) instead of reading as an unknown part,
+  which the gRPC routes refused as an unsupported part type and the HTTP relay passed through.
+- `MessageContent`: a part's refusal reaches the request's error under the part's place
+  (`missing field `content[1].image_url.url``, `..., in `content[1].image_url``) instead of the
+  untagged read's generic words (`data did not match any variant of untagged enum MessageContent`),
+  so `error.code` and `error.param` are the field's.
+
 - `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
   `identity`, in whichever field of a repeated header or position of a comma-separated list it
   stands) before it reads the body, as a `415` in the gateway's JSON error envelope (`error.code`
