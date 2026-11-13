@@ -334,7 +334,7 @@ impl Attempt {
         let Some((principal_id, role)) = outcome else {
             return next.run(request).await;
         };
-        let facts = Arc::new(OutcomeFacts {
+        let record = OutcomeRecord::new(OutcomeFacts {
             principal_id,
             kind,
             role,
@@ -347,25 +347,23 @@ impl Attempt {
             clippy::disallowed_methods,
             reason = "the task is the admitted request's own work and ends with the handler's answer; a runtime shutdown drops it as it drops the request"
         )]
-        let mutation = tokio::spawn({
-            let facts = Arc::clone(&facts);
+        let mutation = tokio::spawn(
             async move {
                 let response = next.run(request).await;
                 let resource = response.extensions().get::<AuditResource>();
-                facts.write(response.status(), resource.map(|r| r.0.as_str()));
+                record.answered(response.status(), resource.map(|r| r.0.as_str()));
                 response
             }
             .instrument(tracing::Span::current())
-            .with_subscriber(tracing::dispatcher::get_default(Dispatch::clone))
-        });
+            .with_subscriber(tracing::dispatcher::get_default(Dispatch::clone)),
+        );
         match mutation.await {
             Ok(response) => response,
             Err(error) => {
                 error!(
-                    "{} {} by {} ended without an answer: {}",
-                    self.method, self.path, facts.principal_id, error
+                    "{} {} ended without an answer: {}",
+                    self.method, self.path, error
                 );
-                facts.write(StatusCode::INTERNAL_SERVER_ERROR, None);
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
@@ -373,10 +371,7 @@ impl Attempt {
 }
 
 /// What the outcome line of a recorded mutation says besides the status and
-/// the resource. The task that runs the mutation holds it and writes the line
-/// when the handler answers, whether or not the client still waits; the
-/// request that awaits the task writes the line at 500 when the task ends
-/// without an answer.
+/// the resource.
 struct OutcomeFacts {
     principal_id: String,
     kind: &'static str,
@@ -398,6 +393,38 @@ impl OutcomeFacts {
             self.request_id.as_deref(),
         );
         self.audit_logger.log_outcome(&ctx, status, resource);
+    }
+}
+
+/// The outcome line the task that runs a recorded mutation owes: written with
+/// the handler's answer, or at 500 with no resource when the record is
+/// dropped without one (the handler panicked, or the runtime shut down with
+/// the mutation in flight). The task owns it, so a client that leaves cannot
+/// skip it.
+struct OutcomeRecord {
+    facts: OutcomeFacts,
+    written: bool,
+}
+
+impl OutcomeRecord {
+    fn new(facts: OutcomeFacts) -> Self {
+        Self {
+            facts,
+            written: false,
+        }
+    }
+
+    fn answered(mut self, status: StatusCode, resource: Option<&str>) {
+        self.written = true;
+        self.facts.write(status, resource);
+    }
+}
+
+impl Drop for OutcomeRecord {
+    fn drop(&mut self) {
+        if !self.written {
+            self.facts.write(StatusCode::INTERNAL_SERVER_ERROR, None);
+        }
     }
 }
 
@@ -925,30 +952,25 @@ mod tests {
         );
     }
 
-    /// The client of a mutation leaves after the first poll: the middleware's
-    /// future is dropped, the handler's gate opens, and the outcome line still
-    /// reaches the audit log under the request's subscriber.
-    #[tokio::test]
-    async fn a_mutation_whose_client_leaves_still_writes_its_outcome_line() {
+    /// The audit lines of a mutation whose client leaves after the first
+    /// poll: `handler` waits at a gate, the middleware's future is polled
+    /// once and dropped, the gate opens, and the lines are read once the
+    /// task has written its outcome (or after a thousand yields).
+    async fn lines_after_the_client_left(
+        handler: axum::routing::MethodRouter<Arc<tokio::sync::Notify>>,
+    ) -> Vec<Vec<(String, String)>> {
         use std::{
             future::Future,
             task::{Context, Waker},
         };
 
-        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use axum::{middleware::from_fn_with_state, Router};
         use tokio::sync::Notify;
         use tower::ServiceExt;
         use tracing::instrument::WithSubscriber;
 
-        use crate::{
-            audit::tests::{field, FieldCapture},
-            config::ApiKeyEntry,
-        };
+        use crate::{audit::tests::FieldCapture, config::ApiKeyEntry};
 
-        async fn register(State(gate): State<Arc<Notify>>) -> Response {
-            gate.notified().await;
-            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
-        }
         let gate = Arc::new(Notify::new());
         let state = ControlPlaneAuthState::new(
             ControlPlaneAuthConfig {
@@ -959,7 +981,7 @@ mod tests {
             None,
         );
         let app = Router::new()
-            .route("/workers", post(register))
+            .route("/workers", handler)
             .layer(from_fn_with_state(state, control_plane_auth_middleware))
             .with_state(Arc::clone(&gate));
         let mut request = Request::builder()
@@ -987,8 +1009,26 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-
         let events = capture.events.lock().unwrap().clone();
+        events
+    }
+
+    /// The client of a mutation leaves after the first poll: the handler's
+    /// gate opens, and the outcome line still reaches the audit log under the
+    /// request's subscriber.
+    #[tokio::test]
+    async fn a_mutation_whose_client_leaves_still_writes_its_outcome_line() {
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        use crate::audit::tests::field;
+
+        async fn register(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
+        }
+        let events = lines_after_the_client_left(post(register)).await;
+
         assert_eq!(
             events.len(),
             2,
@@ -1004,6 +1044,32 @@ mod tests {
         assert_eq!(field(outcome, "outcome"), Some("success"), "{outcome:?}");
         assert_eq!(field(outcome, "resource"), Some("worker-1"), "{outcome:?}");
         assert_eq!(field(outcome, "request_id"), Some("req-7"), "{outcome:?}");
+    }
+
+    /// The client leaves, then the handler panics: the task's record still
+    /// writes the outcome line, at 500 with no resource.
+    #[tokio::test]
+    async fn a_handler_that_panics_after_the_client_left_still_writes_its_outcome_line() {
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        use crate::audit::tests::field;
+
+        async fn give_up(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            panic!("the handler gave up after the client left")
+        }
+        let events = lines_after_the_client_left(post(give_up)).await;
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the admission line, then the outcome line: {events:?}"
+        );
+        let outcome = &events[1];
+        assert_eq!(field(outcome, "status"), Some("500"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), None, "{outcome:?}");
     }
 
     /// A handler that ends without an answer: the request answers 500 and
