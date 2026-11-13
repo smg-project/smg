@@ -879,6 +879,9 @@ impl WorkerMediaPipeline {
             } else {
                 None
             },
+            // In-process: the tensors ride no gRPC message of this worker's
+            // own; the framing of the hop that carries them answers.
+            None,
             super::transparency::runtime_transparency_policy(runtime),
             self.encoder_budget,
         )
@@ -1406,6 +1409,52 @@ mod tests {
         (dir, pipeline)
     }
 
+    /// The GLM pipeline the video tests share: the family's image tokens, its
+    /// video token and the pieces of a frame timestamp.
+    async fn glm_video_test_pipeline() -> (tempfile::TempDir, WorkerMediaPipeline) {
+        vision_test_pipeline(
+            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
+            &[
+                ("<|image|>", 32000),
+                ("<|begin_of_image|>", 32001),
+                ("<|end_of_image|>", 32002),
+                ("<|video|>", 32003),
+                ("0.0", 32004),
+                ("seconds", 32005),
+            ],
+        )
+        .await
+    }
+
+    /// A blank 56x56 PNG as an image item.
+    fn blank_png_item() -> WorkerMediaItem {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        WorkerMediaItem {
+            modality: Modality::Image,
+            url: format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(png.into_inner())
+            ),
+        }
+    }
+
+    /// The one-second test clip as a video item.
+    fn testsrc_video_item() -> WorkerMediaItem {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let video = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
+        ));
+        WorkerMediaItem {
+            modality: Modality::Video,
+            url: format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
+        }
+    }
+
     #[tokio::test]
     /// Compare BF16 pixels with an independent nearest-even reference and unchanged metadata.
     async fn sglang_worker_bfloat16_rounds_once_and_preserves_metadata() {
@@ -1478,7 +1527,6 @@ mod tests {
     /// placeholders as sent. A caller that wants no identity gets none.
     #[tokio::test]
     async fn the_worker_side_identity_is_the_batch_without_its_pixels() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
         let (_dir, pipeline) = vision_test_pipeline(
             r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
             &[
@@ -1488,17 +1536,7 @@ mod tests {
             ],
         )
         .await;
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let items = [WorkerMediaItem {
-            modality: Modality::Image,
-            url: format!(
-                "data:image/png;base64,{}",
-                STANDARD.encode(png.into_inner())
-            ),
-        }];
+        let items = [blank_png_item()];
         let output = pipeline
             .process(vec![1, 32000, 2], &items, true)
             .await
@@ -1524,6 +1562,7 @@ mod tests {
         assert_eq!(stripped.mm_placeholders, batch.mm_placeholders);
         assert_eq!(stripped.im_token_id, batch.im_token_id);
         assert_eq!(stripped.batched_keys, ["image_grid_thw"]);
+        assert_eq!(stripped.keep_on_cpu_keys, ["image_grid_thw"]);
         // This family lays its pixels out flat: they are named in `flat_keys`
         // with their sizes tensor, never in `batched_keys`, and the identity
         // drops the entry with the pixels.
@@ -1541,44 +1580,14 @@ mod tests {
     /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
     async fn sglang_mixed_media_preserves_interleaved_anchors() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
         if !video_tools_available() {
             return;
         }
-        let (_dir, pipeline) = vision_test_pipeline(
-            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
-            &[
-                ("<|image|>", 32000),
-                ("<|begin_of_image|>", 32001),
-                ("<|end_of_image|>", 32002),
-                ("<|video|>", 32003),
-                ("0.0", 32004),
-                ("seconds", 32005),
-            ],
-        )
-        .await;
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let video = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
-        ));
-        let item = |modality, url| WorkerMediaItem { modality, url };
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
         // Match the reference adapter: URLs grouped by modality, while the
         // actual prompt interleaves media in either order.
-        let image = item(
-            Modality::Image,
-            format!(
-                "data:image/png;base64,{}",
-                STANDARD.encode(png.into_inner())
-            ),
-        );
-        let video = item(
-            Modality::Video,
-            format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
-        );
+        let image = blank_png_item();
+        let video = testsrc_video_item();
         for prompt in [
             vec![1, 32000, 2, 32003, 2, 32000, 2],
             vec![1, 32003, 2, 32000, 2, 32000, 2],
@@ -1633,30 +1642,11 @@ mod tests {
     /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
     async fn sglang_glm_video_preserves_tensors_and_temporal_patch_offsets() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
         if !video_tools_available() {
             return;
         }
-        let (_dir, pipeline) = vision_test_pipeline(
-            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
-            &[
-                ("<|image|>", 32000),
-                ("<|begin_of_image|>", 32001),
-                ("<|end_of_image|>", 32002),
-                ("<|video|>", 32003),
-                ("0.0", 32004),
-                ("seconds", 32005),
-            ],
-        )
-        .await;
-        let bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
-        ));
-        let items = [WorkerMediaItem {
-            modality: Modality::Video,
-            url: format!("data:video/mp4;base64,{}", STANDARD.encode(bytes)),
-        }];
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let items = [testsrc_video_item()];
         let (tokens, sglang, _) = pipeline
             .process_sglang(vec![1, 32003, 2], &items)
             .await
@@ -1712,43 +1702,11 @@ mod tests {
     /// installed, skips elsewhere.
     #[tokio::test]
     async fn the_worker_side_identity_strips_the_extra_batch_too() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
         if !video_tools_available() {
             return;
         }
-        let (_dir, pipeline) = vision_test_pipeline(
-            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
-            &[
-                ("<|image|>", 32000),
-                ("<|begin_of_image|>", 32001),
-                ("<|end_of_image|>", 32002),
-                ("<|video|>", 32003),
-                ("0.0", 32004),
-                ("seconds", 32005),
-            ],
-        )
-        .await;
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let video = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
-        ));
-        let items = [
-            WorkerMediaItem {
-                modality: Modality::Image,
-                url: format!(
-                    "data:image/png;base64,{}",
-                    STANDARD.encode(png.into_inner())
-                ),
-            },
-            WorkerMediaItem {
-                modality: Modality::Video,
-                url: format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
-            },
-        ];
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let items = [blank_png_item(), testsrc_video_item()];
         let output = pipeline
             .process(vec![1, 32000, 2, 32003, 2], &items, true)
             .await
@@ -1787,11 +1745,13 @@ mod tests {
         assert_eq!(extra.mm_placeholders, video_batch.mm_placeholders);
         assert_eq!(extra.modality, video_batch.modality);
         assert_eq!(extra.im_token_id, video_batch.im_token_id);
-        // The key lists shrink to the tensors that stay: the pixels' entry goes.
-        assert!(extra
-            .batched_keys
-            .iter()
-            .all(|key| extra.model_specific_tensors.contains_key(key)));
+        // The key lists shrink to the tensors that stay: the pixels' entry
+        // goes, the two grids keep theirs. Pinned whole: an emptied list
+        // passes any check over its members.
+        let mut batched: Vec<&String> = extra.batched_keys.iter().collect();
+        batched.sort();
+        assert_eq!(batched, ["video_grid_thw", "video_second_per_grid"]);
+        assert_eq!(extra.keep_on_cpu_keys, ["video_grid_thw"]);
         assert!(extra.flat_keys.is_empty());
         let first = identity
             .mm_inputs
@@ -1799,6 +1759,9 @@ mod tests {
             .expect("the first batch's identity");
         assert!(first.pixel_values.is_none());
         assert_eq!(first.mm_hashes, output.batches[0].mm_hashes);
+        assert_eq!(first.batched_keys, ["image_grid_thw"]);
+        assert_eq!(first.keep_on_cpu_keys, ["image_grid_thw"]);
+        assert!(first.flat_keys.is_empty());
     }
 
     /// Only GLM with both tokenizer files can advertise the pixel-less contract.
@@ -1946,6 +1909,7 @@ mod tests {
                 CONFIG_KEY,
                 &pipeline.model_dir,
                 pipeline.assembly.image_wire_dtype(),
+                None,
                 llm_multimodal::TransparencyPolicy::CompositeOverWhite,
                 None,
             )

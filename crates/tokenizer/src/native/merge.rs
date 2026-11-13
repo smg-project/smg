@@ -796,7 +796,10 @@ impl MergeTable {
     /// pre-forms under the vocabulary: the caller merges from the bytes
     /// then. The caller sends a cold piece of a unit that holds a non-ASCII
     /// byte here first (a piece of an ASCII unit never comes); an ASCII
-    /// piece of a mixed unit leaves at the pays-off test.
+    /// piece of a mixed unit leaves at the pays-off test. A piece from the
+    /// stages over the byte-level image is not always whole text (a cut may
+    /// fall inside a character): a byte outside a whole character is its own
+    /// symbol here, as under the byte merge.
     #[inline(never)]
     pub(super) fn merge_preformed(&self, piece: &[u8], ids: &mut Vec<u32>) -> bool {
         debug_assert!(
@@ -822,8 +825,11 @@ impl MergeTable {
                     && i + len <= piece.len()
                     && piece[i + 1..i + len].iter().all(|&b| is_continuation(b)));
             if !whole {
-                // A byte that starts no character of the text (the piece is
-                // text, so none is met; a bare byte string merges as bytes).
+                // A byte outside a whole character: a piece from the stages
+                // over the byte-level image may begin on a continuation byte
+                // or end inside a character (see `pieces_in_alphabet`), and a
+                // bare byte string merges as bytes; such a byte is its own
+                // symbol, as the byte merge has it.
                 push_symbol(
                     &mut segment,
                     &mut n,

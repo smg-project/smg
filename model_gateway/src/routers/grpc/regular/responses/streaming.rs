@@ -28,7 +28,7 @@ use openai_protocol::{
         ChatCompletionStreamResponse,
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
-    responses::{ResponseStatus, ResponsesRequest, ResponsesUsage},
+    responses::{ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesUsage},
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
@@ -92,7 +92,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     ctx: &ResponsesContext,
     chat_request: Arc<ChatCompletionRequest>,
     params: ResponsesCallContext,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     background: Option<BackgroundStream>,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
@@ -134,8 +134,9 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     // Create channel for transformed SSE events
     let (tx, rx) = sse_channel();
 
-    // Spawn background task to transform stream
-    let original_request_clone = original_request.clone();
+    // Spawn background task to transform stream; it takes a share of the
+    // request (a count), not a copy of it.
+    let original_request_clone = Arc::clone(original_request);
     let response_storage = ctx.response_storage.clone();
     let conversation_storage = ctx.conversation_storage.clone();
     let conversation_item_storage = ctx.conversation_item_storage.clone();
@@ -335,7 +336,7 @@ async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
 )]
 async fn record_departure(
     mut event_emitter: ResponseStreamEventEmitter,
-    usage: Option<Usage>,
+    usage: Option<ResponsesUsage>,
     original_request: &ResponsesRequest,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
@@ -353,7 +354,8 @@ async fn record_departure(
             event_emitter.set_finish_reason(Some("cancelled"));
         }
         event_emitter.close_items(tx).await?;
-        let final_response = event_emitter.finalize(usage);
+        let mut final_response = event_emitter.finalize(None);
+        final_response.usage = usage;
         if let Err(e) = persist_response_if_needed(
             conversation_storage,
             conversation_item_storage,
@@ -382,7 +384,7 @@ async fn record_departure(
 )]
 async fn process_and_transform_sse_stream(
     body: Body,
-    original_request: ResponsesRequest,
+    original_request: Arc<ResponsesRequest>,
     response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
@@ -400,13 +402,12 @@ async fn process_and_transform_sse_stream(
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
-    event_emitter.set_original_request(original_request.clone());
+    event_emitter.set_original_request(ResponsesRequest::clone(&original_request));
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = event_emitter.emit_created();
     event_emitter
-        .send_event(&event, &tx)
+        .send_created(&tx)
         .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
 
@@ -418,9 +419,8 @@ async fn process_and_transform_sse_stream(
             .map_err(|_| "Failed to send response.queued event".to_string())?;
     }
 
-    let event = event_emitter.emit_in_progress();
     event_emitter
-        .send_event(&event, &tx)
+        .send_in_progress(&tx)
         .await
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
@@ -490,7 +490,9 @@ async fn process_and_transform_sse_stream(
     if client_left {
         return record_departure(
             event_emitter,
-            usage,
+            usage
+                .as_ref()
+                .map(|usage| ResponsesUsage::Modern(ResponseUsage::from(usage))),
             &original_request,
             response_storage,
             conversation_storage,
@@ -562,7 +564,7 @@ async fn process_and_transform_sse_stream(
 pub(super) async fn execute_tool_loop_streaming(
     ctx: &ResponsesContext,
     current_request: ResponsesRequest,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
     background: Option<BackgroundStream>,
@@ -571,9 +573,9 @@ pub(super) async fn execute_tool_loop_streaming(
     let (tx, rx) = sse_channel();
     let (startup_tx, startup_rx) = stream_startup_channel();
 
-    // Clone data for background task
+    // Clone data for background task; the request is shared by count, not copied.
     let ctx_clone = ctx.clone();
-    let original_request_clone = original_request.clone();
+    let original_request_clone = Arc::clone(original_request);
     // A background stream's events go through a relay, so the work and its
     // terminal record outlive a client that leaves.
     let tx = match &background {
@@ -746,15 +748,22 @@ async fn stream_mcp_call(
         Some(tool_output.server_label.as_str()),
         Some(&response_format),
     );
-
-    if success {
-        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
-        emitter.send_event(&event, tx).await?;
-    } else {
-        let err_text = tool_output
+    // The call executed: its item is stored and marked complete, and its
+    // metrics and place in the loop's history recorded, before the sends
+    // that follow, so a client who left during the call changes neither the
+    // record nor the counts; `output_item.done` is still sent after the
+    // completion event, in order.
+    emitter.store_output_item_data(output_index, item_done.clone());
+    emitter.complete_output_item(output_index);
+    let failure = (!success).then(|| {
+        tool_output
             .error_message
             .clone()
-            .unwrap_or_else(|| output_str.clone());
+            .unwrap_or_else(|| output_str.clone())
+    });
+    record_mcp_call(state, site.model, tool_output, output_str, output_item);
+
+    if let Some(err_text) = failure {
         warn!("Tool execution returned error: {}", err_text);
 
         // `response.mcp_call.failed` is the only `*.failed` event
@@ -769,14 +778,40 @@ async fn stream_mcp_call(
             let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
             emitter.send_event(&event, tx).await?;
         }
+    } else {
+        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
+        emitter.send_event(&event, tx).await?;
     }
 
     let event = emitter.emit_output_item_done(output_index, &item_done);
     emitter.send_event(&event, tx).await?;
-    emitter.complete_output_item(output_index);
-
-    record_mcp_call(state, site.model, tool_output, output_str, output_item);
     Ok(())
+}
+
+/// How the tool loop's turns ended: done (the terminal event follows), failed
+/// with the terminal error object, or left by the client (the departure is
+/// recorded, no event follows).
+enum Turns {
+    Done,
+    Failed(Value),
+    /// The client left: at the loop's own sends between generations (the
+    /// tool list, a call's events, the reasoning item), or inside one.
+    ClientLeft {
+        between: bool,
+    },
+}
+
+impl Turns {
+    /// A failure met at the loop's own sends while the client is gone is the
+    /// client's leaving; any other one answers as before (the loop's error,
+    /// nothing recorded).
+    fn left_or(tx: &SseSender, message: String) -> Result<Self, String> {
+        if tx.is_closed() {
+            Ok(Self::ClientLeft { between: true })
+        } else {
+            Err(message)
+        }
+    }
 }
 
 /// Internal streaming tool loop implementation
@@ -815,14 +850,12 @@ async fn execute_tool_loop_streaming_internal(
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = emitter.emit_created();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_created(&tx).await?;
     if original_request.background.unwrap_or(false) {
         let event = emitter.emit_queued();
         emitter.send_event(&event, &tx).await?;
     }
-    let event = emitter.emit_in_progress();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_in_progress(&tx).await?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&session);
@@ -834,7 +867,7 @@ async fn execute_tool_loop_streaming_internal(
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
 
-    let terminal_error = loop {
+    let turns = 'turns: loop {
         trace!("Streaming MCP tool loop iteration {}", state.iteration);
 
         // Emit mcp_list_tools as first output item (only once, on first iteration)
@@ -842,9 +875,12 @@ async fn execute_tool_loop_streaming_internal(
             for binding in session.mcp_servers() {
                 let tools_for_server = session.list_tools_for_server(&binding.server_key);
 
-                emitter
+                if let Err(message) = emitter
                     .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, &tx)
-                    .await?;
+                    .await
+                {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
             mcp_list_tools_emitted = true;
         }
@@ -903,6 +939,10 @@ async fn execute_tool_loop_streaming_internal(
             ));
         }
 
+        // A fresh generation: no finish until its terminal chunk names one, so
+        // the finish of an earlier turn of the request never reads for this
+        // one (as the Harmony loop does).
+        emitter.set_finish_reason(None);
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
@@ -912,7 +952,15 @@ async fn execute_tool_loop_streaming_internal(
             .await
             {
                 Ok(response) => response,
-                Err(error) => break Some(error),
+                // The client's leaving is read at the next frame (or at
+                // the send the emitter could not make): a departure, not a
+                // failure of the stream; the error it came with stays in the
+                // log for a reader of the cancelled record.
+                Err(error) if tx.is_closed() => {
+                    debug!(%error, "The chat stream's error met after the client left");
+                    break Turns::ClientLeft { between: false };
+                }
+                Err(error) => break Turns::Failed(error),
             };
         state.record_usage(accumulated_response.usage.as_ref());
         // Truncated or failed generation cannot request MCP execution.
@@ -922,14 +970,14 @@ async fn execute_tool_loop_streaming_internal(
             .and_then(|choice| choice.finish_reason.as_deref())
             .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"))
         {
-            break None;
+            break Turns::Done;
         }
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
         // Neither can a server call the generation did not finish.
         if has_unfinished_mcp_call(&tool_calls, &session) {
-            break None;
+            break Turns::Done;
         }
 
         if !tool_calls.is_empty() {
@@ -944,13 +992,17 @@ async fn execute_tool_loop_streaming_internal(
                 model: &current_request.model,
             };
             for tool_call in mcp_tool_calls {
-                stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await?;
+                if let Err(message) =
+                    stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await
+                {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
 
             if let Some(limit) = tool_call_limit {
                 break match limit {
-                    McpToolCallLimit::User => None,
-                    McpToolCallLimit::Safety => Some(json!({
+                    McpToolCallLimit::User => Turns::Done,
+                    McpToolCallLimit::Safety => Turns::Failed(json!({
                         "code": "max_tool_calls_exceeded",
                         "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
                     })),
@@ -960,7 +1012,7 @@ async fn execute_tool_loop_streaming_internal(
             // process_chunk already emitted these function-call items.
             // Return them to the client without duplicating their events.
             if !function_tool_calls.is_empty() {
-                break None;
+                break Turns::Done;
             }
 
             // Build next request with conversation history
@@ -981,16 +1033,46 @@ async fn execute_tool_loop_streaming_internal(
         // Emit reasoning item if present
         if let Some(reasoning) = reasoning_content {
             if !reasoning.is_empty() {
-                emitter.emit_reasoning_item(&tx, Some(reasoning)).await?;
+                if let Err(message) = emitter.emit_reasoning_item(&tx, Some(reasoning)).await {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
         }
 
         // Text message events already emitted naturally by process_chunk during stream processing
         // (OpenAI router approach - text only appears on final iteration when no tool calls)
 
-        break None;
+        break Turns::Done;
     };
 
+    let terminal_error = match turns {
+        Turns::Done => None,
+        Turns::Failed(error) => Some(error),
+        // A stored foreground stream its client left is recorded as the
+        // regular stream records it: cancelled, the open items in progress,
+        // under the id it announced; the answer is the departure.
+        Turns::ClientLeft { between } => {
+            // Only a finish that ended the loop's last generation stands. A
+            // departure between generations, or in a generation that ended
+            // with tool calls, cut the response short: cancelled.
+            if between || emitter.finish_reason() == Some("tool_calls") {
+                emitter.set_finish_reason(None);
+            }
+            let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+            return record_departure(
+                emitter,
+                state.usage.clone().map(ResponsesUsage::Modern),
+                original_request,
+                ctx.response_storage.clone(),
+                ctx.conversation_storage.clone(),
+                ctx.conversation_item_storage.clone(),
+                tenant.as_deref(),
+                ctx.request_context.clone(),
+                &tx,
+            )
+            .await;
+        }
+    };
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
     // The final object, read before the terminal event drains the emitter's
     // items; a background response needs its terminal record under the id
@@ -1252,10 +1334,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(false),
                 ..Default::default()
-            },
+            }),
             None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1376,10 +1458,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..request
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1860,10 +1942,10 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let transform = process_and_transform_sse_stream(
                 body,
-                ResponsesRequest {
+                Arc::new(ResponsesRequest {
                     store: Some(store),
                     ..Default::default()
-                },
+                }),
                 None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1975,10 +2057,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let transform = process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2027,10 +2109,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let transform = process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2096,10 +2178,10 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let transform = process_and_transform_sse_stream(
                 body,
-                ResponsesRequest {
+                Arc::new(ResponsesRequest {
                     store: Some(true),
                     ..Default::default()
-                },
+                }),
                 None,
                 storage.clone(),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -2338,10 +2420,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             response_storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),

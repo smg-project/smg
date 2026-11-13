@@ -98,7 +98,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     message: format!(
                         "ZMQ worker {} has no model identity: EngineCore does not report a \
                          served model name, so --model-path (or a model_id label) is required",
-                        config.url
+                        Endpoint::redacted_str(&config.url)
                     ),
                 })?
         } else {
@@ -198,7 +198,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 message: format!(
                     "ZMQ worker {} has unsupported runtime {}: only vllm, tokenspeed and \
                      sglang are supported over the ZMQ direct backend",
-                    config.url, runtime_type
+                    Endpoint::redacted_str(&config.url),
+                    runtime_type
                 ),
             });
         }
@@ -561,8 +562,9 @@ pub(super) fn validate_parser_overrides(
     )
     .map_err(|why| {
         format!(
-            "worker {worker_url} declares a parser override for model '{}' the gateway cannot \
+            "worker {} declares a parser override for model '{}' the gateway cannot \
              read with: {why}",
+            Endpoint::redacted_str(worker_url),
             card.id
         )
     })
@@ -623,11 +625,12 @@ fn registry_reads_over_the_flags(
     let spell =
         |name: Option<&str>| name.map_or_else(|| "unset".to_string(), |name| format!("'{name}'"));
     Some(format!(
-        "the registry's table '{}' reads model '{}' for worker {worker_url}, whose labels select \
+        "the registry's table '{}' reads model '{}' for worker {}, whose labels select \
          no reader; the gateway's --tool-call-parser {} / --reasoning-parser {} name {named}, which \
          reads only the models the registry does not know",
         table.name(),
         card.id,
+        Endpoint::redacted_str(worker_url),
         spell(flags.tool.as_deref()),
         spell(flags.reasoning.as_deref()),
     ))
@@ -818,7 +821,7 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
         return Err(format!(
             "worker {} sets overload.waiting_requests to 0: Must be >= 1 \
              (0 would mark every worker overloaded)",
-            config.url
+            Endpoint::redacted_str(&config.url)
         ));
     }
     if let Some(threshold) = config.overload.token_usage {
@@ -826,7 +829,7 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
             return Err(format!(
                 "worker {} sets overload.token_usage to {threshold}: Must be a \
                  fraction in (0.0, 1.0]",
-                config.url
+                Endpoint::redacted_str(&config.url)
             ));
         }
     }
@@ -857,7 +860,7 @@ fn validate_zmq_handshake_override(
         return Err(format!(
             "worker {} sets zmq_handshake_address but its connection mode is \
              {connection_mode:?}: the field is only meaningful for ZMQ workers",
-            config.url
+            Endpoint::redacted_str(&config.url)
         ));
     }
     Ok(())
@@ -903,9 +906,11 @@ fn validate_zmq_handshake_address(
         };
         if existing_handshake == handshake {
             return Err(format!(
-                "ZMQ worker {url} would bind handshake address {handshake}, already claimed by \
-                 worker {existing_url}: the derived port is a hash of the ipc path, so rename \
-                 this worker's ipc path or set zmq_handshake_address to a free tcp:// address"
+                "ZMQ worker {} would bind handshake address {handshake}, already claimed by \
+                 worker {}: the derived port is a hash of the ipc path, so rename \
+                 this worker's ipc path or set zmq_handshake_address to a free tcp:// address",
+                Endpoint::redacted_str(url),
+                Endpoint::redacted_str(existing_url)
             ));
         }
     }
@@ -990,7 +995,10 @@ fn validate_zmq_worker_type(
     };
     Err(WorkflowError::StepFailed {
         step_id: StepId::new("create_worker"),
-        message: format!("ZMQ worker {url} cannot serve worker type {worker_type}: {reason}"),
+        message: format!(
+            "ZMQ worker {} cannot serve worker type {worker_type}: {reason}",
+            Endpoint::redacted_str(url)
+        ),
     })
 }
 
@@ -1136,8 +1144,9 @@ fn validate_zmq_dp(
         return Err(WorkflowError::StepFailed {
             step_id: StepId::new("create_worker"),
             message: format!(
-                "ZMQ worker {url} cannot be dp-aware expanded (dp_size={dp_size}); \
-                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead"
+                "ZMQ worker {} cannot be dp-aware expanded (dp_size={dp_size}); \
+                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead",
+                Endpoint::redacted_str(url)
             ),
         });
     }
@@ -1312,9 +1321,11 @@ mod tests {
                 registry_reads_over_the_flags(card, url, parser, flags, registry)
             };
 
+        // The worker is named through the mask: a credential in its address
+        // is in no message (the helper masks, so no caller can forget).
         let first = said(
             &known,
-            "grpc://a:1",
+            "grpc://user:secret@a:1",
             ParserChoice::Symphony,
             &flags,
             &registry,
@@ -1324,7 +1335,8 @@ mod tests {
             first.contains("'Qwen/Qwen3-8B'")
                 && first.contains("'qwen3'")
                 && first.contains("the table 'mistral_v13'")
-                && first.contains("grpc://a:1"),
+                && first.contains("***@a:1")
+                && !first.contains("secret"),
             "{first}"
         );
         registry
@@ -1900,6 +1912,41 @@ mod tests {
         labels.insert("kv_role".to_string(), "kv_consumer".to_string());
         let (_, role, _) = take_kv_transfer_metadata(&spec, &mut labels);
         assert_eq!(role.as_deref(), Some("kv_consumer"));
+    }
+
+    /// A registration refused for a worker whose address carries userinfo
+    /// names the address through the mask: the credential is in no refusal
+    /// text (the job log prints the refusal beside the masked worker).
+    #[tokio::test]
+    async fn a_refusal_names_the_workers_address_through_the_mask() {
+        use openai_protocol::worker::{OverloadUpdate, WorkerModels};
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("http://user:secret@worker:8000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.overload = OverloadUpdate {
+            waiting_requests: Some(0),
+            ..Default::default()
+        };
+        let mut data =
+            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        let text = CreateLocalWorkerStep
+            .execute(&mut ctx)
+            .await
+            .expect_err("the overload override is refused")
+            .to_string();
+        assert!(text.contains("http://***@worker:8000"), "{text}");
+        assert!(
+            !text.contains("secret") && !text.contains("user:"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2504,27 +2551,37 @@ mod tests {
         )
         .is_ok());
 
+        // The refusal names the worker through the mask: a credential in its
+        // address is in no refusal (the helper masks, so no caller can forget).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://w:1",
+            "http://user:secret@w:1",
             ParserChoice::Legacy,
             Some(&tool_factory),
             None,
         )
         .expect_err("unknown tool parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
+        assert!(
+            err.contains("http://***@w:1") && !err.contains("secret"),
+            "{err}"
+        );
 
         let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://w:1",
+            "http://user:secret@w:1",
             ParserChoice::Legacy,
             None,
             Some(&reasoning_factory),
         )
         .expect_err("unknown reasoning parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
+        assert!(
+            err.contains("http://***@w:1") && !err.contains("secret"),
+            "{err}"
+        );
 
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");

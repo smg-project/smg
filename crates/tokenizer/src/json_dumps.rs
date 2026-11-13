@@ -2,9 +2,10 @@
 //! spaced `", "` / `": "` separators, single line, raw UTF-8.
 //!
 //! serde_json only ships compact (`{"a":1}`) and pretty (multi-line) formatters,
-//! neither of which matches `json.dumps`. The DeepSeek V3.2/V4 prompt encoders
-//! embed tool schemas and argument values as JSON, and the engine's reference encoder
-//! uses `json.dumps`, so compact output would shift the model off its training
+//! neither of which matches `json.dumps`. The DeepSeek and GLM-5.3 prompt encoders
+//! and the DeepSeek V3.1 tools block embed tool schemas and argument values as JSON,
+//! and their references (the engine's encoder or the template's `tojson`) write them
+//! as `json.dumps` does, so compact output would shift the model off its training
 //! distribution. The spacing is the chat template's `tojson` formatter with no
 //! indent, Python's default separators and `ensure_ascii = false`, so the prompt
 //! encoders and the template filter render a value the same way.

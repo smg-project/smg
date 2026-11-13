@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 
 	"github.com/smg-project/smg/bindings/golang/internal/ffi"
@@ -162,82 +161,7 @@ func (c *MultiClient) CreateChatCompletion(ctx context.Context, req ChatCompleti
 	}
 	defer stream.Close()
 
-	var fullContent strings.Builder
-	var toolCalls toolCallAssembler
-	var finishReason string
-	var usage Usage
-	var responseID string
-	var created int64
-	var model string
-	var systemFingerprint string
-
-	for {
-		chunkJSON, err := stream.RecvJSON()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		var chunk ChatCompletionStreamResponse
-		if err := json.Unmarshal([]byte(chunkJSON), &chunk); err != nil {
-			return nil, fmt.Errorf("failed to parse chunk: %w", err)
-		}
-
-		if chunk.ID != "" {
-			responseID = chunk.ID
-		}
-		if chunk.Created > 0 {
-			created = chunk.Created
-		}
-		if chunk.Model != "" {
-			model = chunk.Model
-		}
-		if chunk.SystemFingerprint != "" {
-			systemFingerprint = chunk.SystemFingerprint
-		}
-
-		for _, choice := range chunk.Choices {
-			if choice.Delta.Content != "" {
-				fullContent.WriteString(choice.Delta.Content)
-			}
-			toolCalls.add(choice.Delta.ToolCalls)
-			if choice.FinishReason != "" {
-				finishReason = choice.FinishReason
-			}
-		}
-
-		if chunk.Usage != nil {
-			usage = *chunk.Usage
-		}
-	}
-
-	message := Message{
-		Role:      "assistant",
-		Content:   fullContent.String(),
-		ToolCalls: toolCalls.toolCalls(),
-	}
-
-	if finishReason == "" {
-		finishReason = "stop"
-	}
-
-	return &ChatCompletionResponse{
-		ID:                responseID,
-		Object:            "chat.completion",
-		Created:           created,
-		Model:             model,
-		SystemFingerprint: systemFingerprint,
-		Choices: []Choice{
-			{
-				Index:        0,
-				Message:      message,
-				FinishReason: finishReason,
-			},
-		},
-		Usage: usage,
-	}, nil
+	return collectChatCompletion(stream)
 }
 
 // MultiClientStream represents a streaming chat completion from a multi-worker client
