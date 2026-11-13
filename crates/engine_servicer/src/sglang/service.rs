@@ -39,6 +39,11 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        if self.state.managed {
+            return Err(Status::failed_precondition(
+                "managed pool requires the managed control service",
+            ));
+        }
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
         let stream = generate::generate(
             &self.state,

@@ -254,7 +254,7 @@ def test_the_ready_response_declares_the_request_structs_field_order():
         "padded_input_ids",
         "im_token_id",
     ]
-    assert layouts["MultimodalDataItem"] == [
+    assert layouts["MultimodalDataItem"][:9] == [
         "modality",
         "hash",
         "pad_value",
@@ -291,11 +291,15 @@ def test_the_rust_servicers_media_decodes_as_the_schedulers_processor_output():
     offsets, the token id, the modality, and the slots neither side fills at
     the scheduler's defaults (its hash and pad value are its own to derive)."""
     torch = pytest.importorskip("torch")
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalInputFormat,
-        MultimodalProcessorOutput,
-    )
+    try:
+        from sglang.srt.managers.req_types import MultimodalProcessorOutput
+        from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+    except ImportError:
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalInputFormat,
+            MultimodalProcessorOutput,
+        )
 
     (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_REQUEST)])
     assert req.rid == "mm" and list(req.input_ids) == [1, 7, 7, 7, 2]
@@ -415,48 +419,73 @@ def test_abort_frame_fans_out_one_abort_per_rid():
         wire.decode_request_frames([b"\x07", b""])
 
 
+def _embedding_output(**values):
+    """Construct the same native embedding output across full-column and sparse-stats releases."""
+    cls = sglang_io.BatchEmbeddingOutput
+    if "prompt_tokens" not in cls.__struct_fields__:
+        prompts, cached = values.pop("prompt_tokens"), values.pop("cached_tokens")
+        stats_type = sglang_io.RequestOutputStats
+        values["request_stats"] = [
+            stats_type(
+                **(
+                    {name: 0 for name in stats_type.__struct_fields__}
+                    | dict(
+                        prompt_tokens=p,
+                        cached_tokens=c,
+                        cached_tokens_details=None,
+                        time_stats=None,
+                    )
+                )
+            )
+            for p, c in zip(prompts, cached)
+        ]
+    return cls(**values)
+
+
 def _full_output():
     none2 = [None, None]
     # Fields this SGLang version has that we do not set stay None (the slim
     # output never reads them; required ones vary across versions).
     unset = {name: None for name in BatchTokenIDOutput.__struct_fields__}
+    values = dict(
+        rids=["a", "b"],
+        http_worker_ipcs=none2,
+        finished_reasons=[None, {"type": "stop", "matched": 42}],
+        decoded_texts=["", ""],
+        decode_ids=[array.array("q"), array.array("q")],
+        read_offsets=[0, 0],
+        output_ids=[array.array("q", [10]), array.array("q", [20, 21])],
+        output_ids_flat=array.array("q", [10, 20, 21]),
+        output_ids_offsets=[0, 1, 3],
+        skip_special_tokens=[True, True],
+        spaces_between_special_tokens=[True, True],
+        no_stop_trim=[False, False],
+        prompt_tokens=[3, 4],
+        reasoning_tokens=[0, 0],
+        completion_tokens=[1, 2],
+        cached_tokens=[0, 1],
+        input_token_logprobs_val=none2,
+        input_token_logprobs_idx=none2,
+        output_token_logprobs_val=[None, [-0.5, -0.25]],
+        output_token_logprobs_idx=[None, [20, 21]],
+        input_top_logprobs_val=none2,
+        input_top_logprobs_idx=none2,
+        output_top_logprobs_val=[None, [[-0.5, -1.0]]],
+        output_top_logprobs_idx=[None, [[21, 22]]],
+        input_token_ids_logprobs_val=none2,
+        input_token_ids_logprobs_idx=none2,
+        output_token_ids_logprobs_val=none2,
+        output_token_ids_logprobs_idx=none2,
+        output_token_entropy_val=None,
+        output_token_sampling_mask=None,
+        output_hidden_states=None,
+        routed_experts=None,
+        indexer_topk=None,
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+    )
     return BatchTokenIDOutput(
-        **unset
-        | dict(
-            rids=["a", "b"],
-            http_worker_ipcs=none2,
-            finished_reasons=[None, {"type": "stop", "matched": 42}],
-            decoded_texts=["", ""],
-            decode_ids=[array.array("q"), array.array("q")],
-            read_offsets=[0, 0],
-            output_ids=[array.array("q", [10]), array.array("q", [20, 21])],
-            skip_special_tokens=[True, True],
-            spaces_between_special_tokens=[True, True],
-            no_stop_trim=[False, False],
-            prompt_tokens=[3, 4],
-            reasoning_tokens=[0, 0],
-            completion_tokens=[1, 2],
-            cached_tokens=[0, 1],
-            input_token_logprobs_val=none2,
-            input_token_logprobs_idx=none2,
-            output_token_logprobs_val=[None, [-0.5, -0.25]],
-            output_token_logprobs_idx=[None, [20, 21]],
-            input_top_logprobs_val=none2,
-            input_top_logprobs_idx=none2,
-            output_top_logprobs_val=[None, [[-0.5, -1.0]]],
-            output_top_logprobs_idx=[None, [[21, 22]]],
-            input_token_ids_logprobs_val=none2,
-            input_token_ids_logprobs_idx=none2,
-            output_token_ids_logprobs_val=none2,
-            output_token_ids_logprobs_idx=none2,
-            output_token_entropy_val=None,
-            output_token_sampling_mask=None,
-            output_hidden_states=None,
-            routed_experts=None,
-            indexer_topk=None,
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-        )
+        **(unset | {key: value for key, value in values.items() if key in unset})
     )
 
 
@@ -792,7 +821,7 @@ def test_sender_slims_embeddings_and_answers_control_replies():
     sender.attach(sink, 2, None)
     unset = {name: None for name in BatchEmbeddingOutput.__struct_fields__}
     sender.send_output(
-        BatchEmbeddingOutput(
+        _embedding_output(
             **unset
             | dict(
                 rids=["e1", "e2"],
@@ -913,7 +942,7 @@ def test_sender_handles_scalar_and_sparse_embeddings_and_never_raises():
     sender.attach(sink, 0, None)
     unset = {name: None for name in BatchEmbeddingOutput.__struct_fields__}
     sender.send_output(
-        BatchEmbeddingOutput(
+        _embedding_output(
             **unset
             | dict(
                 rids=["s1", "d1"],
@@ -1104,11 +1133,54 @@ def test_sender_cpu_hash_preserves_engine_identity_padding_and_features(
         [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(payload), bytearray(raw), b"\x80"]
     )
     actual = candidate.mm_inputs.mm_items[0]
-    monkeypatch.setattr(
-        mm_utils, "hash_feature", lambda _: pytest.fail("sender hash must be reused")
-    )
+    if "identity" in type(actual).__struct_fields__:
+        # Current native engines domain-separate full identities: a legacy
+        # 64-bit hint is no longer equivalent to hashing raw feature bytes.
+        # Verify the wire follows that native contract; managed full-identity
+        # parity is covered independently in test_sglang_managed_native.
+        expected = msgspec.structs.replace(
+            expected,
+            hash=item[1],
+            identity=None,
+            pad_value=None,
+            pad_values=None,
+        )
+        expected.set_pad_value()
+    else:
+        monkeypatch.setattr(
+            mm_utils, "hash_feature", lambda _: pytest.fail("sender hash must be reused")
+        )
     actual.set_pad_value()
     assert (actual.hash, actual.pad_value) == (expected.hash, expected.pad_value)
     assert actual.feature.dtype == expected.feature.dtype
     assert torch.equal(actual.feature, expected.feature)
     assert actual.offsets == expected.offsets
+
+
+def test_sparse_native_request_stats_preserve_counts_and_release_terminal_rows():
+    """Native sparse stats retain usage between updates; legacy columns remain authoritative."""
+    from types import SimpleNamespace
+
+    rows = wire.RequestStatsRows()
+    output = SimpleNamespace(
+        rids=["a", "b"],
+        prompt_tokens=None,
+        cached_tokens=None,
+        request_stats=[
+            SimpleNamespace(prompt_tokens=82, cached_tokens=10),
+            SimpleNamespace(prompt_tokens=148, cached_tokens=20),
+        ],
+        finished_reasons=[None, None],
+    )
+    assert rows.column(output) == [(82, 10), (148, 20)]
+    output.rids = ["b", "a"]
+    output.request_stats = None
+    output.finished_reasons = [None, {"type": "stop"}]
+    sparse = rows.column(output)
+    assert wire._token_count_column(output, "prompt_tokens", 2, sparse) == [148, 82]
+    assert wire._token_count_column(output, "cached_tokens", 2, sparse) == [20, 10]
+    assert "a" not in rows.rows
+    rows.forget("b")
+    assert not rows.rows
+    output.prompt_tokens = [7, 8]
+    assert wire._token_count_column(output, "prompt_tokens", 2, sparse) == [7, 8]

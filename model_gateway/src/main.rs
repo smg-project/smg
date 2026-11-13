@@ -192,6 +192,9 @@ struct CliArgs {
 #[derive(clap::Args, Debug)]
 #[group(skip)]
 struct RoutingArgs {
+    /// Enable managed SGLang EPD using an explicit deployment JSON configuration.
+    #[arg(long, help_heading = "Worker Configuration")]
+    sglang_managed_epd: Option<String>,
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server: an IP literal, IPv6 with or
     /// without brackets (`0.0.0.0`, `::`, `[::]`, `[fd00::1]`)

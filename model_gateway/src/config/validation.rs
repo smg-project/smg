@@ -15,7 +15,7 @@ use crate::{
         cost as selection_cost,
         engine_host::{encode_preset_name, preset_name, Decider},
     },
-    worker::endpoint::Endpoint,
+    worker::{endpoint::Endpoint, ConnectionMode},
 };
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
@@ -78,7 +78,7 @@ fn names_a_local_path(source: &str) -> bool {
 /// register); or a start-up URL names a gRPC worker itself. The connection
 /// mode alone misses the middle two: it follows the start-up URLs only.
 fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
-    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+    if config.connection_mode == ConnectionMode::Grpc
         || config.enable_igw
         || config.discovery.is_some()
     {
@@ -547,6 +547,18 @@ impl ConfigValidator {
 
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
+        if let Some(path) = &config.sglang_managed_epd {
+            if path.is_empty()
+                || config.enable_igw
+                || config.discovery.is_some()
+                || config.connection_mode != ConnectionMode::Grpc
+                || !matches!(&config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "sglang_managed_epd requires its explicit worker configuration and cannot be combined with legacy workers, discovery or IGW".into(),
+                });
+            }
+        }
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_routing_key_headers(config)?;

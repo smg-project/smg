@@ -28,6 +28,11 @@ pub struct RouterConfigBuilder {
 }
 
 impl RouterConfigBuilder {
+    /// Select the separate managed planner and control protocol only when explicitly configured.
+    pub fn sglang_managed_epd(mut self, path: Option<String>) -> Self {
+        self.config.sglang_managed_epd = path;
+        self
+    }
     pub fn new() -> Self {
         Self::default()
     }
