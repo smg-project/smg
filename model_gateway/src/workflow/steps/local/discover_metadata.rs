@@ -629,7 +629,8 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 
         debug!(
             "Discovering metadata for {} ({:?})",
-            config.url, connection_mode
+            Endpoint::redacted_str(&config.url),
+            connection_mode
         );
 
         let (discovered_labels, detected_runtime) = match connection_mode {
@@ -641,7 +642,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .unwrap_or_else(|| {
                         warn!(
                             "No detected_runtime_type for {}, defaulting to sglang",
-                            config.url
+                            Endpoint::redacted_str(&config.url)
                         );
                         "sglang"
                     });
@@ -688,14 +689,18 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             }
         }
         .unwrap_or_else(|e| {
-            warn!("Failed to fetch metadata for {}: {}", config.url, e);
+            warn!(
+                "Failed to fetch metadata for {}: {}",
+                Endpoint::redacted_str(&config.url),
+                e
+            );
             (HashMap::new(), None)
         });
 
         debug!(
             "Discovered {} labels for {}",
             discovered_labels.len(),
-            config.url
+            Endpoint::redacted_str(&config.url)
         );
         context.data.discovered_labels = discovered_labels;
         if let Some(runtime) = detected_runtime {

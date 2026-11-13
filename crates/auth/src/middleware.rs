@@ -397,10 +397,12 @@ impl OutcomeFacts {
 }
 
 /// The outcome line the task that runs a recorded mutation owes: written with
-/// the handler's answer, or at 500 with no resource when the record is
-/// dropped without one (the handler panicked, or the runtime shut down with
-/// the mutation in flight). The task owns it, so a client that leaves cannot
-/// skip it.
+/// the handler's answer, or at 500 with no resource when the handler
+/// panicked (the record is dropped on the unwind, whichever frame drops it).
+/// A record the runtime drops with the mutation in flight writes nothing: no
+/// client was answered a 500 and the handler's blocking work may still
+/// complete, so the admission line stands alone. The task owns it, so a
+/// client that leaves cannot skip it.
 struct OutcomeRecord {
     facts: OutcomeFacts,
     written: bool,
@@ -422,7 +424,7 @@ impl OutcomeRecord {
 
 impl Drop for OutcomeRecord {
     fn drop(&mut self) {
-        if !self.written {
+        if !self.written && std::thread::panicking() {
             self.facts.write(StatusCode::INTERNAL_SERVER_ERROR, None);
         }
     }
@@ -1070,6 +1072,81 @@ mod tests {
         assert_eq!(field(outcome, "status"), Some("500"), "{outcome:?}");
         assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
         assert_eq!(field(outcome, "resource"), None, "{outcome:?}");
+    }
+
+    /// The runtime drops the task of a mutation in flight (the process stops
+    /// with the handler at work, no panic): the record writes no outcome
+    /// line. No client was answered a 500, so the audit trail keeps the
+    /// admission line alone.
+    #[test]
+    fn a_task_the_runtime_drops_writes_no_outcome_line() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        async fn wait_at_the_gate(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            StatusCode::ACCEPTED.into_response()
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let capture = Arc::new(FieldCapture::default());
+        let gate = Arc::new(Notify::new());
+        runtime.block_on(async {
+            let state = ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            );
+            let app = Router::new()
+                .route("/workers", post(wait_at_the_gate))
+                .layer(from_fn_with_state(state, control_plane_auth_middleware))
+                .with_state(Arc::clone(&gate));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/workers")
+                .header(header::AUTHORIZATION, "Bearer admin-key")
+                .body(Body::empty())
+                .unwrap();
+            let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                call.as_mut().poll(&mut cx).is_pending(),
+                "the handler waits at its gate"
+            );
+            // The client leaves; the task runs on to its gate.
+            drop(call);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+        // The runtime goes with the task at its gate: the task's future is
+        // dropped on this thread, under the capture, with no panic.
+        tracing::subscriber::with_default(capture.clone(), || drop(runtime));
+
+        let events = capture.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "the admission line alone: {events:?}");
+        assert_eq!(
+            field(&events[0], "message"),
+            Some("control_plane_audit"),
+            "{events:?}"
+        );
     }
 
     /// A handler that ends without an answer: the request answers 500 and
