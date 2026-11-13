@@ -70,6 +70,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An Interactions request with a typed `response_format` (`text`, `image`, `audio` or `video`, or
+  a list of them), which names its own `mime_type`, validates without `response_mime_type`, as the
+  public API's polymorphic field takes it. Only the legacy form, a raw JSON schema, still needs
+  `response_mime_type`, which the public API has deprecated. Every typed format had been refused
+  as `response_mime_type_required`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

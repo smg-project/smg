@@ -44,7 +44,9 @@ pub struct InteractionsRequest {
     /// Response format for structured outputs
     pub response_format: Option<Value>,
 
-    /// MIME type for the response (required if response_format is set)
+    /// MIME type for the response, which the legacy `response_format` (a raw
+    /// JSON schema) requires. A typed format (`text`, `image`, `audio`,
+    /// `video`, or a list of them) carries its own `mime_type`.
     pub response_mime_type: Option<String>,
 
     /// Whether to stream the response
@@ -1074,6 +1076,18 @@ pub enum ResponseModality {
     Audio,
 }
 
+/// Whether a `response_format` is the legacy form, a raw JSON schema: an
+/// object whose `type` is none of the typed formats' (`text`, `image`,
+/// `audio`, `video`). A list holds typed formats.
+fn is_legacy_response_format(format: &Value) -> bool {
+    format.as_object().is_some_and(|object| {
+        !matches!(
+            object.get("type").and_then(Value::as_str),
+            Some("text" | "image" | "audio" | "video")
+        )
+    })
+}
+
 fn is_option_blank(v: Option<&String>) -> bool {
     v.map(|s| s.trim().is_empty()).unwrap_or(true)
 }
@@ -1090,8 +1104,14 @@ fn validate_interactions_request(req: &InteractionsRequest) -> Result<(), Valida
         ));
     }
 
-    // response_mime_type is required when response_format is set
-    if req.response_format.is_some() && is_option_blank(req.response_mime_type.as_ref()) {
+    // The legacy response_format, a raw JSON schema, needs a response_mime_type.
+    // A typed format, or a list of them, names its own mime_type.
+    if req
+        .response_format
+        .as_ref()
+        .is_some_and(is_legacy_response_format)
+        && is_option_blank(req.response_mime_type.as_ref())
+    {
         return Err(ValidationError::new("response_mime_type_required"));
     }
 
@@ -1235,6 +1255,37 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typed `response_format`, which names its own `mime_type`, needs no
+    /// `response_mime_type`, nor does a list of them, as the public API's
+    /// polymorphic field takes them. The legacy form, a raw JSON schema,
+    /// still does.
+    #[test]
+    fn a_typed_response_format_needs_no_response_mime_type() {
+        let request = |response_format: Value| InteractionsRequest {
+            model: Some("m".to_string()),
+            store: false,
+            response_format: Some(response_format),
+            ..Default::default()
+        };
+        let text = serde_json::json!({
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+        });
+        assert!(validate_interactions_request(&request(text.clone())).is_ok());
+        let formats = serde_json::json!([text, {"type": "image", "mime_type": "image/png"}]);
+        assert!(validate_interactions_request(&request(formats)).is_ok());
+
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let (code, _) = refusal(validate_interactions_request(&request(schema.clone())));
+        assert_eq!(code, "response_mime_type_required");
+        let with_mime = InteractionsRequest {
+            response_mime_type: Some("application/json".to_string()),
+            ..request(schema)
+        };
+        assert!(validate_interactions_request(&with_mime).is_ok());
+    }
 
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {
         let err = result.expect_err("a refusal");
