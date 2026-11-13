@@ -1401,6 +1401,39 @@ fn a_stage_after_the_byte_level_reads_the_image() {
             }
         }
     }
+
+    // A `Digits` after the map with the anchored digit stages after it:
+    // `\A`, `\z` and `\G` read the bounds of each image piece (a piece can
+    // start with an image numeric outside `Nd`, the `\u{B2}` of `\u{4E32}`).
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        PreTokenizerWrapper::Digits(Digits::new(false)),
+        split(DIGIT_GROUP_HEAD, SplitDelimiterBehavior::Isolated, false),
+        split(
+            DIGIT_GROUPS_FROM_THE_START,
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+    ]))));
+    let native = seeded(&tokenizer);
+    assert_eq!(native.mapped_from, Some(0));
+    for text in [
+        "12345\u{4E32}678901",
+        "1234567\u{B2}890",
+        "\u{B9}2345",
+        "1234567",
+        "12 345\n6789",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "anchored digit stages: {text:?} parallel {parallel}"
+            );
+        }
+    }
 }
 
 #[test]
