@@ -26,7 +26,8 @@ pub struct TranscriptionRequest {
     /// Optional text prompt to guide the model's style / preserve continuity.
     pub prompt: Option<String>,
 
-    /// Response format: `json` (default), `text`, `srt`, `verbose_json`, `vtt`.
+    /// Response format: `json` (default), `text`, `srt`, `verbose_json`, `vtt`,
+    /// `diarized_json`.
     pub response_format: Option<String>,
 
     /// Sampling temperature (0..=1).
@@ -37,6 +38,14 @@ pub struct TranscriptionRequest {
 
     /// If true, stream partial transcription events as SSE.
     pub stream: Option<bool>,
+
+    /// The form's other text parts, in order and under the names they came
+    /// with: the public API's `include[]`, `chunking_strategy` (or the SDK's
+    /// `chunking_strategy[type]` and its other bracketed keys),
+    /// `known_speaker_names[]` and the fields the gateway does not model,
+    /// forwarded to the worker as sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other: Vec<(String, String)>,
 }
 
 impl GenerationRequest for TranscriptionRequest {

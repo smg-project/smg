@@ -94,6 +94,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- The `/v1/audio/transcriptions` relay forwards the form's text fields the gateway's types do not
+  model: the public API's `include[]`, `chunking_strategy` (and the SDK's bracketed
+  `chunking_strategy[...]` keys), `known_speaker_names[]`, `known_speaker_references[]` and the
+  next field the API adds. The extractor drained them and the HTTP router rebuilt the worker's
+  form from the typed fields alone, so a transcription answered without the logprobs, speaker
+  names or chunking the client asked for. `TranscriptionRequest.other` keeps them in order under
+  the names they came with, and the router appends them to the worker's form; a file part under
+  another name is still drained. Breaking: `TranscriptionRequest` gains `other`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

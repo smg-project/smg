@@ -1787,6 +1787,10 @@ fn build_transcription_form(
     if let Some(stream) = body.stream {
         form = form.text("stream", stream.to_string());
     }
+    // The form's other text parts, in order, under the names they came with.
+    for (name, value) in &body.other {
+        form = form.text(name.clone(), value.clone());
+    }
 
     Ok(form)
 }
