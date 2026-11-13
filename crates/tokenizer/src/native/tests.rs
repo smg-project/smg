@@ -5185,19 +5185,23 @@ fn a_failed_run_before_a_character_that_never_comes_is_left_behind() {
 
 /// The skip changes no result: class-run patterns before a character the run
 /// may or may not reach, bounded and unbounded, as the first stage over the
-/// raw text and as a stage after the map over the image, on random short
-/// texts, pieces and ids against the reference.
+/// raw text and as a stage after the map over the image, on fixed and random
+/// short texts, pieces and ids against the reference. The table says where
+/// each pattern loads and every row asserts it, so a row that stops loading
+/// fails instead of running nothing; after the map an optional prefix before
+/// the run would rescan the run from every start and is declined at load.
 #[test]
 fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
+    // (pattern, loads as a first stage, loads after the map)
     let patterns = [
-        r"\p{L}+!",
-        r"\p{L}+a",
-        r"\p{L}{1,3}!",
-        r"[a-z]+b",
-        r"\p{N}+\.",
-        r"\p{L}++!",
-        r" ?\p{L}+",
-        r"(?:\p{L}|\.)+!",
+        (r"\p{L}+!", true, true),
+        (r"\p{L}+a", true, true),
+        (r"\p{L}{1,3}!", true, true),
+        (r"[a-z]+b", true, true),
+        (r"\p{N}+\.", true, true),
+        (r"\p{L}++!", true, true),
+        (r" ?\p{L}+", true, false),
+        (r"[\p{L}.]+!", true, true),
     ];
     let alphabet: Vec<char> = "ab c!a.1\n\u{E9}".chars().collect();
     // A start outside the run (a `!`, a digit, a stop before the letters)
@@ -5211,8 +5215,10 @@ fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
         *state
     };
     let table = bytes_char();
-    for pattern in patterns {
+    let mut ran = 0;
+    for (pattern, loads_first, loads_after) in patterns {
         for mapped in [false, true] {
+            let loads = if mapped { loads_after } else { loads_first };
             let pre_tokenizers = if mapped {
                 vec![
                     byte_level(false),
@@ -5234,10 +5240,20 @@ fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
                 stripped: &[],
             };
             let tokenizer = tokenizer_of(&shape, &mut state);
-            let Ok(mut native) = NativeEncoder::from_tokenizer(&tokenizer) else {
-                // A shape the native path declines is the reference's alone.
-                continue;
+            let mut native = match NativeEncoder::from_tokenizer(&tokenizer) {
+                Ok(native) => {
+                    assert!(
+                        loads,
+                        "{pattern} mapped {mapped} loads where the table says it declines"
+                    );
+                    native
+                }
+                Err(declined) => {
+                    assert!(!loads, "{pattern} mapped {mapped} declined: {declined}");
+                    continue;
+                }
             };
+            ran += 1;
             native.seed_vocabulary(tokenizer.get_model(), None);
             let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
             let mut image = String::new();
@@ -5284,4 +5300,57 @@ fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
             }
         }
     }
+    assert_eq!(ran, 15, "the rows that ran");
+}
+
+/// A stage over the image whose program holds an unbounded run anywhere but
+/// first would rescan an ordinary text's run of letters from every start
+/// (the search passes over a failed run only when the program opens with
+/// it), so it is declined at load; the same shapes before the map load, as
+/// does a leading run after it.
+#[test]
+fn image_stages_whose_pattern_rescans_a_run_are_declined() {
+    let mut state = 0x5245_5343_414E_0001u64;
+    let shape_of = |pre_tokenizers: Vec<PreTokenizerWrapper>| Shape {
+        name: "a-run-anywhere-but-first",
+        normalizer: Normalizer::None,
+        pre_tokenizers,
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    for pattern in [
+        r" ?\p{L}+!",
+        r"\p{L}+!|\p{N}+",
+        r"\p{L}\p{L}*!",
+        r"[a-z]\p{L}+!",
+        r"\p{L}*\p{N}+!",
+    ] {
+        let stage = || split(pattern, SplitDelimiterBehavior::Isolated, false);
+        let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
+        assert_eq!(
+            NativeEncoder::from_tokenizer(&after)
+                .expect_err("declined")
+                .to_string(),
+            "a pre-tokenizer stage over the byte-level image whose pattern rescans a run from every start",
+            "{pattern} after the map"
+        );
+        let before = tokenizer_of(&shape_of(vec![stage(), byte_level(false)]), &mut state);
+        assert!(
+            NativeEncoder::from_tokenizer(&before).is_ok(),
+            "{pattern} before the map"
+        );
+    }
+    let leading = tokenizer_of(
+        &shape_of(vec![
+            byte_level(false),
+            split(r"\p{L}+!", SplitDelimiterBehavior::Isolated, false),
+        ]),
+        &mut state,
+    );
+    assert!(
+        NativeEncoder::from_tokenizer(&leading).is_ok(),
+        "a leading run after the map"
+    );
 }

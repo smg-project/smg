@@ -1921,6 +1921,21 @@ impl NativeEncoder {
             .iter()
             .any(|stage| !stage.pattern.within_printable_ascii())
             .then_some(after);
+        // Over the image an ordinary text is one run of letters (a space
+        // maps to one), and the search passes over a failed run only when
+        // the program opens with it (see `Matches::next`): a stage whose
+        // program holds an unbounded run anywhere else would rescan that
+        // run from every start, so it is declined.
+        if let Some(from) = mapped_from {
+            if stages[from..]
+                .iter()
+                .any(|stage| stage.pattern.rescans_a_run())
+            {
+                return Err(Declined::from(
+                    "a pre-tokenizer stage over the byte-level image whose pattern rescans a run from every start",
+                ));
+            }
+        }
         Ok((stages, mapped_from))
     }
 
