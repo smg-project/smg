@@ -724,6 +724,12 @@ pub struct ToolUseBlock {
     /// Cache control for this block
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+
+    /// Who issued the call, as the public API reports it and takes it back
+    /// on a replayed block: the model, or a code execution that called the
+    /// tool. Absent when the block came without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolUseCaller>,
 }
 
 /// Tool result block (in user messages)
@@ -823,6 +829,12 @@ pub struct ServerToolUseBlock {
     /// Cache control for this block
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+
+    /// Who issued the call, as the public API reports it and takes it back
+    /// on a replayed block: the model, or a code execution that called the
+    /// tool. Absent when the block came without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolUseCaller>,
 }
 
 /// Search result block
@@ -857,6 +869,11 @@ pub struct WebSearchToolResultBlock {
     /// Cache control for this block
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+
+    /// Who issued the search, as the public API reports it and takes it back
+    /// on a replayed block. Absent when the block came without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolUseCaller>,
 }
 
 /// Web search tool result content
@@ -1444,11 +1461,20 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// Who issued the call, as the public API reports it: the model, or a
+        /// code execution that called the tool. Absent when the upstream
+        /// wrote none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolUseCaller>,
     },
     /// Web search tool result
     WebSearchToolResult {
         tool_use_id: String,
         content: WebSearchToolResultContent,
+        /// Who issued the search, as the public API reports it. Absent when
+        /// the upstream wrote none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ToolUseCaller>,
     },
     /// Tool search tool result
     ToolSearchToolResult {
@@ -1626,10 +1652,14 @@ pub const SERVICE_TIER_STANDARD: &str = "standard";
 /// The inference geography of a deployment that reports none.
 pub const INFERENCE_GEO_NOT_AVAILABLE: &str = "not_available";
 
-/// Server tool usage information
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// Server tool usage information: the requests each server tool made, as
+/// the public API counts them. A count the upstream leaves out reads as 0.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerToolUsage {
+    #[serde(default)]
     pub web_search_requests: u32,
+    #[serde(default)]
+    pub web_fetch_requests: u32,
 }
 
 // ============================================================================
@@ -3641,6 +3671,77 @@ mod tests {
         }
     }
 
+    /// A tool block's caller, and the usage's web fetch count, read and write
+    /// as the public API writes them, in an answer and in a replayed
+    /// conversation: a code execution's caller, a caller kind this build does
+    /// not know, and a block without one, which is written without one.
+    #[test]
+    fn a_tool_block_keeps_its_caller_and_the_usage_its_web_fetch_count() {
+        let blocks = json!([
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {"query": "weather"},
+                "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_0"}
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+                "caller": {"type": "code_execution_20260120", "tool_id": "srvtoolu_0"}
+            },
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_2",
+                "name": "web_fetch",
+                "input": {"url": "https://example.com"}
+            }
+        ]);
+        let server_tool_use = json!({"web_search_requests": 1, "web_fetch_requests": 2});
+        let message: Message = serde_json::from_value(json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": blocks,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "server_tool_use": server_tool_use}
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&message).unwrap();
+        assert_eq!(written["content"], blocks);
+        assert_eq!(written["usage"]["server_tool_use"], server_tool_use);
+
+        let mut replayed = blocks.as_array().unwrap().clone();
+        replayed.push(json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "get_weather",
+            "input": {},
+            "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_0"}
+        }));
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "What is the weather?"},
+                {"role": "assistant", "content": replayed}
+            ]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(written["messages"][1]["content"], json!(replayed));
+
+        let usage: ServerToolUsage =
+            serde_json::from_value(json!({"web_search_requests": 3})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"web_search_requests": 3, "web_fetch_requests": 0})
+        );
+    }
+
     #[test]
     fn test_content_block_server_tool_use_deserialization() {
         let json = r#"{
@@ -3653,7 +3754,7 @@ mod tests {
         let block: ContentBlock =
             serde_json::from_str(json).expect("Failed to deserialize server_tool_use ContentBlock");
         match block {
-            ContentBlock::ServerToolUse { id, name, input: _ } => {
+            ContentBlock::ServerToolUse { id, name, .. } => {
                 assert_eq!(id, "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2");
                 assert_eq!(name, "tool_search_tool_regex");
             }
