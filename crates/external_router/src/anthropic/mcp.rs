@@ -10,7 +10,8 @@ use openai_protocol::messages::{
     ContentBlock, CreateMessageRequest, CustomTool, InputContent, InputContentBlock, InputMessage,
     InputSchema, Message, RedactedThinkingBlock, Role, ServerToolUseBlock, StopReason, TextBlock,
     ThinkingBlock, Tool, ToolChoice, ToolReferenceBlock, ToolResultBlock, ToolResultContent,
-    ToolResultContentBlock, ToolSearchToolResultBlock, ToolUseBlock, WebSearchToolResultBlock,
+    ToolResultContentBlock, ToolSearchToolResultBlock, ToolUseBlock, ToolUseCaller,
+    WebSearchToolResultBlock,
 };
 use serde_json::{Map, Value};
 use smg_mcp::{McpToolSession, ToolEntry, ToolExecutionInput};
@@ -145,6 +146,7 @@ pub(crate) fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolUseBlock> 
                 name: name.clone(),
                 input: input.clone(),
                 cache_control: None,
+                caller: None,
             }),
             _ => None,
         })
@@ -267,6 +269,7 @@ fn plain_block(block: InputContentBlock) -> InputContentBlock {
             name: mcp.name,
             input: mcp.input,
             cache_control: mcp.cache_control,
+            caller: None,
         }),
         InputContentBlock::McpToolResult(mcp) => InputContentBlock::ToolResult(ToolResultBlock {
             tool_use_id: mcp.tool_use_id,
@@ -617,13 +620,20 @@ fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentB
                 }));
             }
             ContentBlock::ToolUse {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                caller,
             } => {
+                // A call the model made keeps its caller implicit, as the
+                // history wrote it before; one a code execution made keeps the
+                // caller the answer named.
                 blocks.push(InputContentBlock::ToolUse(ToolUseBlock {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
                     cache_control: None,
+                    caller: (*caller != ToolUseCaller::Direct).then(|| caller.clone()),
                 }));
             }
             ContentBlock::Thinking {
@@ -640,23 +650,31 @@ fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentB
                     data: data.clone(),
                 }));
             }
-            ContentBlock::ServerToolUse { id, name, input } => {
+            ContentBlock::ServerToolUse {
+                id,
+                name,
+                input,
+                caller,
+            } => {
                 blocks.push(InputContentBlock::ServerToolUse(ServerToolUseBlock {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
                     cache_control: None,
+                    caller: caller.clone(),
                 }));
             }
             ContentBlock::WebSearchToolResult {
                 tool_use_id,
                 content,
+                caller,
             } => {
                 blocks.push(InputContentBlock::WebSearchToolResult(
                     WebSearchToolResultBlock {
                         tool_use_id: tool_use_id.clone(),
                         content: content.clone(),
                         cache_control: None,
+                        caller: caller.clone(),
                     },
                 ));
             }
@@ -958,6 +976,55 @@ mod tests {
             serde_json::to_value(&request.messages).unwrap(),
             serde_json::to_value(&before).unwrap()
         );
+    }
+
+    /// The next round's history keeps the caller each block of the answer
+    /// named: a code execution's call keeps its caller, as do a server tool
+    /// call and its result, while a call the model made stays without one,
+    /// as the history wrote it before.
+    #[test]
+    fn the_next_rounds_history_keeps_the_callers_the_answer_named() {
+        let code_execution = ToolUseCaller::CodeExecution20250825 {
+            tool_id: "srvtoolu_0".to_string(),
+        };
+        let content = vec![
+            ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "get_weather".to_string(),
+                input: json!({}),
+                caller: code_execution.clone(),
+            },
+            ContentBlock::ToolUse {
+                id: "toolu_2".to_string(),
+                name: "get_time".to_string(),
+                input: json!({}),
+                caller: ToolUseCaller::Direct,
+            },
+            ContentBlock::ServerToolUse {
+                id: "srvtoolu_1".to_string(),
+                name: "web_search".to_string(),
+                input: json!({"query": "weather"}),
+                caller: Some(code_execution.clone()),
+            },
+            ContentBlock::WebSearchToolResult {
+                tool_use_id: "srvtoolu_1".to_string(),
+                content: serde_json::from_value(json!({
+                    "type": "web_search_tool_result_error",
+                    "error_code": "unavailable"
+                }))
+                .expect("a web search error"),
+                caller: Some(code_execution),
+            },
+        ];
+        let history: Vec<Value> = build_assistant_content_blocks(&content)
+            .iter()
+            .map(|block| serde_json::to_value(block).expect("a block as JSON"))
+            .collect();
+        let caller = json!({"type": "code_execution_20250825", "tool_id": "srvtoolu_0"});
+        assert_eq!(history[0]["caller"], caller);
+        assert!(history[1].get("caller").is_none(), "{}", history[1]);
+        assert_eq!(history[2]["caller"], caller);
+        assert_eq!(history[3]["caller"], caller);
     }
 
     /// A round's message as the model answers it: text, tool calls and a

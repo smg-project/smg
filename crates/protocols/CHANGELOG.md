@@ -85,6 +85,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages tool block keeps its `caller`, as the public API writes it and takes it back: a
+  `server_tool_use` or `web_search_tool_result` block in an answer, and a replayed `tool_use`,
+  `server_tool_use` or `web_search_tool_result` block in a request. The usage's `server_tool_use`
+  keeps its `web_fetch_requests`. Each was dropped, so a call a code execution made was replayed as
+  one the model made, and the web fetch count was lost. The Anthropic MCP loop's next round keeps
+  a caller other than the model's too. Breaking: `ToolUseBlock`, `ServerToolUseBlock`,
+  `WebSearchToolResultBlock` and the `ContentBlock::ServerToolUse` and
+  `ContentBlock::WebSearchToolResult` variants gain `caller`, and `ServerToolUsage` gains
+  `web_fetch_requests`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one

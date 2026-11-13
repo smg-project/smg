@@ -427,6 +427,7 @@ impl BlockAccumulator {
                     name: name.clone(),
                     input: input.clone(),
                     cache_control: None,
+                    caller: None,
                 };
                 (
                     ContentBlock::ToolUse {
