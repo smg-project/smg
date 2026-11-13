@@ -422,7 +422,11 @@ pub fn member_transition_line(entry: &NodeState, how: impl std::fmt::Display) ->
 
 /// Broadcast node state updates to target nodes, each dialed through
 /// `dialer` (the channel the probes keep to it, with the node's TLS identity
-/// when the mesh has one).
+/// when the mesh has one). `timeout` (3 s when `None`) bounds each dial, not
+/// the wait for all of them: a peer that stalls costs the broadcast the
+/// deadline and nothing else, the answers that arrived are counted, and no
+/// dial outlives the call (the dials are the call's own futures, so dropping
+/// the call drops them too).
 /// Returns (success_count, total_count)
 pub(crate) async fn broadcast_node_states(
     nodes_to_broadcast: Vec<NodeState>,
@@ -439,61 +443,44 @@ pub(crate) async fn broadcast_node_states(
         return (0, target_nodes.len());
     }
 
-    let mut broadcast_tasks = Vec::new();
-    for target_node in &target_nodes {
-        let target_node_clone = target_node.clone();
-        let nodes_for_task = nodes_to_broadcast.clone();
-        let dialer = Arc::clone(&dialer);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "broadcast tasks are collected and awaited via join_all with a timeout immediately below"
-        )]
-        let task = tokio::spawn(async move {
-            let state_sync = StateSync {
-                nodes: nodes_for_task,
-            };
+    let deadline = timeout.unwrap_or(Duration::from_secs(3));
+    let broadcasts = target_nodes.iter().map(|target_node| {
+        let nodes = nodes_to_broadcast.clone();
+        let dialer = &dialer;
+        async move {
             let ping_payload = gossip_message::Payload::Ping(Ping {
-                state_sync: Some(state_sync),
+                state_sync: Some(StateSync { nodes }),
             });
-            match dialer.ping(&target_node_clone, Some(ping_payload)).await {
+            let answer =
+                tokio::time::timeout(deadline, dialer.ping(target_node, Some(ping_payload)))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(tonic::Status::deadline_exceeded(format!(
+                            "no answer within {deadline:?}"
+                        )))
+                    });
+            match answer {
                 Ok(_) => {
-                    log::debug!("Successfully broadcasted to {}", target_node_clone.name);
+                    log::debug!("Successfully broadcasted to {}", target_node.name);
                     Ok(())
                 }
                 Err(e) => {
-                    log::warn!("Failed to broadcast to {}: {}", target_node_clone.name, e);
+                    log::warn!("Failed to broadcast to {}: {}", target_node.name, e);
                     Err(e)
                 }
             }
-        });
-        broadcast_tasks.push(task);
-    }
-
-    let timeout_duration = timeout.unwrap_or(Duration::from_secs(3));
-    let broadcast_result = tokio::time::timeout(timeout_duration, async {
-        futures::future::join_all(broadcast_tasks).await
-    })
-    .await;
-
-    match broadcast_result {
-        Ok(results) => {
-            let success_count = results.iter().filter(|r| matches!(r, Ok(Ok(())))).count();
-            let total_count = target_nodes.len();
-            log::info!(
-                "Broadcast completed: {}/{} successful",
-                success_count,
-                total_count
-            );
-            (success_count, total_count)
         }
-        Err(_) => {
-            log::warn!(
-                "Broadcast timeout after {} seconds",
-                timeout_duration.as_secs()
-            );
-            (0, target_nodes.len())
-        }
-    }
+    });
+
+    let results: Vec<Result<(), tonic::Status>> = futures::future::join_all(broadcasts).await;
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    let total_count = target_nodes.len();
+    log::info!(
+        "Broadcast completed: {}/{} successful",
+        success_count,
+        total_count
+    );
+    (success_count, total_count)
 }
 
 #[macro_export]
@@ -1024,6 +1011,59 @@ mod tests {
             Some(NodeStatus::Leaving as i32),
             "B's own table does not show B as Leaving: {b_on_b:?}"
         );
+        handler_a.shutdown();
+    }
+
+    /// A broadcast's deadline bounds each dial, not the wait for all of
+    /// them: with one member that answers at once and one listener that
+    /// accepts the connection and never answers, the count reads the answer
+    /// that arrived, the member holds the state it carried, and the call
+    /// returns at the deadline rather than at the dialer's own bounds.
+    #[tokio::test]
+    async fn a_broadcast_counts_the_answers_that_arrived_before_its_deadline() {
+        init();
+        let (listener_a, addr_a) = bind_node().await;
+        let handler_a = mesh_run!("A", listener_a, addr_a, Vec::new());
+        wait_for(
+            || std::net::TcpStream::connect(addr_a).is_ok(),
+            Duration::from_secs(5),
+            "A listens",
+        )
+        .await;
+        // Accepted by the kernel, never answered: the dial connects and its
+        // ping waits until something bounds it.
+        let silent = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr_silent = silent.local_addr().unwrap();
+        let mut leaving_b = node_state("B", SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        leaving_b.status = NodeStatus::Leaving as i32;
+        let deadline = Duration::from_secs(2);
+
+        let started = std::time::Instant::now();
+        let counts = broadcast_node_states(
+            vec![leaving_b],
+            vec![node_state("A", addr_a), node_state("S", addr_silent)],
+            Some(deadline),
+            Dialer::new(None),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            counts,
+            (1, 2),
+            "the answer that arrived before the deadline is not counted"
+        );
+        let b_on_a = handler_a.state.read().get("B").cloned();
+        assert_eq!(
+            b_on_a.as_ref().map(|node| node.status),
+            Some(NodeStatus::Leaving as i32),
+            "A did not record B's status from the broadcast: {b_on_a:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the broadcast waited past its deadline for the silent peer: {elapsed:?}"
+        );
+        drop(silent);
         handler_a.shutdown();
     }
 
