@@ -85,7 +85,7 @@ use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
         assistant_choice, forces_tool_call, opening_choice, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
+        CompletionChunkFrame, EscapedText, FrameSink, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 #[cfg(test)]
@@ -1669,23 +1669,6 @@ impl StreamingProcessor {
         Self::flush_when_full(tx, buffer).await
     }
 
-    /// [`Self::push_chunk`] for a bare text delta, written in one pass
-    /// ([`ChatChunkFrame::write_text_delta`]).
-    #[expect(clippy::too_many_arguments)]
-    async fn push_text_delta(
-        tx: &SseSender,
-        buffer: &mut BytesMut,
-        frame: &ChatChunkFrame,
-        index: u32,
-        field: TextDelta,
-        text: &str,
-        usage: Option<&Usage>,
-        emit_usage_null: bool,
-    ) -> Result<(), ()> {
-        frame.write_text_delta(buffer, index, field, text, usage, emit_usage_null);
-        Self::flush_when_full(tx, buffer).await
-    }
-
     /// Hand the buffered chunks to the channel as one frame once they hold
     /// [`CHUNK_FLUSH_BYTES`], so one frame stays a bounded burst.
     async fn flush_when_full(tx: &SseSender, buffer: &mut BytesMut) -> Result<(), ()> {
@@ -1770,18 +1753,23 @@ impl StreamingProcessor {
     /// is written from there, with no copy of its own. A bare text delta, the
     /// per-token case, is written in one pass ([`ChatChunkFrame::write_text_delta`]);
     /// every other chunk goes through serde.
-    #[expect(clippy::too_many_arguments)]
-    async fn push_events(
-        tx: &SseSender,
+    ///
+    /// Returns whether the buffer reached its flush size, checked after every
+    /// event: the caller then awaits the flush and calls again until the
+    /// step's events (its `Drain`, which the caller holds across the flush -
+    /// one dropped early would discard the rest) are exhausted, so one frame
+    /// stays a bounded burst; a step whose frames fit makes one call and
+    /// builds and moves no future.
+    fn write_events(
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
         index: u32,
-        events: &mut Events<'_>,
-        mut logprobs: Option<ChatLogProbs>,
+        events: &mut std::vec::Drain<'_, Event<'_>>,
+        logprobs: &mut Option<ChatLogProbs>,
         usage: Option<&Usage>,
         emit_usage_null: bool,
-    ) -> Result<(), String> {
-        for event in events.consume() {
+    ) -> bool {
+        for event in events.by_ref() {
             let Some(mut choice) = adapt::chat::into_delta_ref(index, event) else {
                 continue;
             };
@@ -1791,30 +1779,20 @@ impl StreamingProcessor {
             choice.logprobs = logprobs.take();
             match text_delta(&choice) {
                 Some((field, text)) => {
-                    Self::push_text_delta(
-                        tx,
-                        buffer,
-                        frame,
-                        index,
-                        field,
-                        text,
-                        usage,
-                        emit_usage_null,
-                    )
-                    .await
+                    frame.write_text_delta(buffer, index, field, text, usage, emit_usage_null);
                 }
-                None => Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null).await,
+                None => frame.write_chunk(buffer, &choice, usage, emit_usage_null),
             }
-            .map_err(|()| "Failed to send chunk".to_string())?;
+            if buffer.len() >= CHUNK_FLUSH_BYTES {
+                return true;
+            }
         }
         if utils::has_entries(logprobs.as_ref()) {
             let mut choice = assistant_choice(index, None, None, None);
-            choice.logprobs = logprobs;
-            Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
-                .await
-                .map_err(|()| "Failed to send chunk".to_string())?;
+            choice.logprobs = logprobs.take();
+            frame.write_chunk(buffer, &choice, usage, emit_usage_null);
         }
-        Ok(())
+        buffer.len() >= CHUNK_FLUSH_BYTES
     }
 
     /// Hand the buffered chunks, if any, to the channel as one frame.
@@ -3478,21 +3456,27 @@ impl<'a> ChatStream<'a> {
     /// special token the decoder skips, a partial UTF-8 sequence): a client
     /// timing its first chunk otherwise waits for the next step's text.
     async fn open_choice(&mut self, index: u32) -> Result<(), String> {
-        if !self.choices[index as usize].opened {
-            let usage = self.usage_snapshot();
-            StreamingProcessor::send_role_chunk(
-                self.tx,
-                &mut self.sse_buffer,
-                &self.chunk_frame,
-                index,
-                self.opens_tool_call,
-                usage.as_ref(),
-                self.emit_usage_null,
-            )
-            .await?;
-            self.choices[index as usize].opened = true;
-        }
+        debug_assert!(!self.is_open(index), "open_choice after the choice opened");
+        let usage = self.usage_snapshot();
+        StreamingProcessor::send_role_chunk(
+            self.tx,
+            &mut self.sse_buffer,
+            &self.chunk_frame,
+            index,
+            self.opens_tool_call,
+            usage.as_ref(),
+            self.emit_usage_null,
+        )
+        .await?;
+        self.choices[index as usize].opened = true;
         Ok(())
+    }
+
+    /// Whether the choice's opening chunk went out. The check sits before
+    /// every `open_choice` await: a chunk of an open choice, the common one,
+    /// builds and moves no future for it.
+    fn is_open(&self, index: u32) -> bool {
+        self.choices[index as usize].opened
     }
 
     /// The logprobs of an engine chunk whose text made no delta (a marker a
@@ -3711,7 +3695,9 @@ impl<'a> ChatStream<'a> {
             usage.record_chunk(chunk);
         }
 
-        self.open_choice(index).await?;
+        if !self.is_open(index) {
+            self.open_choice(index).await?;
+        }
 
         // The choice's stop decoder, made on its first chunk as a copy of the
         // request's rules with a decode state of its own, and the fields the
@@ -3802,18 +3788,22 @@ impl<'a> ChatStream<'a> {
                 }
             }
             let usage = self.usage_snapshot();
-            let choice_logprobs = self.logprobs_of(chunk);
-            StreamingProcessor::push_events(
-                self.tx,
+            let mut choice_logprobs = self.logprobs_of(chunk);
+            let mut pending = events.consume();
+            while StreamingProcessor::write_events(
                 &mut self.sse_buffer,
                 &self.chunk_frame,
                 index,
-                &mut events,
-                choice_logprobs,
+                &mut pending,
+                &mut choice_logprobs,
                 usage.as_ref(),
                 self.emit_usage_null,
-            )
-            .await?;
+            ) {
+                StreamingProcessor::flush_when_full(self.tx, &mut self.sse_buffer)
+                    .await
+                    .map_err(|()| "Failed to send chunk".to_string())?;
+            }
+            drop(pending);
             self.spare = events.recycle();
             self.delta = delta;
             // The stop ended the choice's output: the reader ends it now,
@@ -3924,7 +3914,9 @@ impl<'a> ChatStream<'a> {
         // records the stream's first-token time; its usage, as a
         // first Chunk's, counts the output it rides on.
         self.note_first_token();
-        self.open_choice(index).await?;
+        if !self.is_open(index) {
+            self.open_choice(index).await?;
+        }
 
         let choice = &mut self.choices[index as usize];
         choice.cached_tokens = complete.cached_tokens();
@@ -4018,17 +4010,22 @@ impl<'a> ChatStream<'a> {
             *parsed_reasoning_tokens = finished.reasoning_tokens;
         }
         let usage = self.usage_snapshot();
-        StreamingProcessor::push_events(
-            self.tx,
+        let mut no_logprobs: Option<ChatLogProbs> = None;
+        let mut pending = events.consume();
+        while StreamingProcessor::write_events(
             &mut self.sse_buffer,
             &self.chunk_frame,
             index,
-            &mut events,
-            None,
+            &mut pending,
+            &mut no_logprobs,
             usage.as_ref(),
             self.emit_usage_null,
-        )
-        .await?;
+        ) {
+            StreamingProcessor::flush_when_full(self.tx, &mut self.sse_buffer)
+                .await
+                .map_err(|()| "Failed to send chunk".to_string())?;
+        }
+        drop(pending);
         self.spare = events.recycle();
         self.delta = delta;
         Ok(())
@@ -4143,17 +4140,22 @@ impl<'a> ChatStream<'a> {
                 *parsed_reasoning_tokens = finished.reasoning_tokens;
             }
             let usage = self.usage_snapshot();
-            StreamingProcessor::push_events(
-                self.tx,
+            let mut no_logprobs: Option<ChatLogProbs> = None;
+            let mut pending = events.consume();
+            while StreamingProcessor::write_events(
                 &mut self.sse_buffer,
                 &self.chunk_frame,
                 index,
-                &mut events,
-                None,
+                &mut pending,
+                &mut no_logprobs,
                 usage.as_ref(),
                 self.emit_usage_null,
-            )
-            .await?;
+            ) {
+                StreamingProcessor::flush_when_full(self.tx, &mut self.sse_buffer)
+                    .await
+                    .map_err(|()| "Failed to send chunk".to_string())?;
+            }
+            drop(pending);
             self.spare = events.recycle();
             self.delta = delta;
         }
@@ -4231,7 +4233,9 @@ impl<'a> ChatStream<'a> {
 
         // Text that reaches here without an engine chunk before it (a
         // decoder flush on the terminal frame) still opens its choice.
-        self.open_choice(index).await?;
+        if !self.is_open(index) {
+            self.open_choice(index).await?;
+        }
 
         // Calculate delta
         let mut delta = text;
