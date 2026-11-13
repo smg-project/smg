@@ -559,6 +559,21 @@ impl PrefillBook {
         })
     }
 
+    /// How long, as of `now_ms`, the worker's prompts have gone unanswered
+    /// since its latest answer: the current run's wait while it has not
+    /// answered, plus what earlier runs left ([`Self::unanswered_run`]
+    /// without its idle condition, so a worker that holds nothing still
+    /// reports the silence it owes). Zero after an answer, or for a worker
+    /// never dispatched to.
+    fn unanswered_total(&self, now_ms: u64) -> Duration {
+        let run = if self.run_since_ms > 0 && !self.run_answered {
+            now_ms.saturating_sub(self.run_since_ms)
+        } else {
+            0
+        };
+        Duration::from_millis(self.unanswered_ms.saturating_add(run))
+    }
+
     /// Whether the engine is on a shape it has not shown it runs: a prompt
     /// pending here, or one of `extra` tokens about to be dispatched, longer
     /// than any answered, on a worker that has answered one. A worker that
@@ -916,6 +931,15 @@ impl WorkerRuntime {
     /// [`Self::prefill_unanswered_run`] as of `now_ms` on the gateway clock.
     pub fn prefill_unanswered_run_at(&self, now_ms: u64) -> Option<Duration> {
         self.prefill.lock().unanswered_run(now_ms)
+    }
+
+    pub fn prefill_unanswered_total(&self) -> Duration {
+        self.prefill_unanswered_total_at(super::liveness::now_ms().max(1))
+    }
+
+    /// [`Self::prefill_unanswered_total`] as of `now_ms` on the gateway clock.
+    pub fn prefill_unanswered_total_at(&self, now_ms: u64) -> Duration {
+        self.prefill.lock().unanswered_total(now_ms)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -1516,6 +1540,53 @@ mod tests {
         runtime.note_tracked_ended();
         runtime.note_tracked_started_at(9_000);
         assert_eq!(runtime.busy_since_ms.load(Ordering::Relaxed), 9_000);
+    }
+
+    #[test]
+    fn unanswered_total_is_the_open_run_plus_what_earlier_runs_banked() {
+        // A side behind an encode worker spends the cold-shape grace against
+        // this total: the run still awaiting its first answer counts from
+        // its start, a run released without an answer leaves its wait
+        // banked for the runs after it, and an answer clears the lot.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(5_000),
+            Duration::ZERO,
+            "nothing at all"
+        );
+        runtime.note_prefill_started_at(1_000, true, 1_000);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(4_000),
+            Duration::from_secs(3),
+            "the open run, from its start"
+        );
+        // Released without an answer: the wait stays on the book; idle time adds nothing.
+        runtime.note_prefill_ended_at(1_000, true, None, 4_500);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(10_000),
+            Duration::from_millis(3_500),
+            "banked, not growing"
+        );
+        // The next run adds its own wait to what was banked.
+        runtime.note_prefill_started_at(1_000, true, 10_000);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(12_000),
+            Duration::from_millis(5_500),
+            "banked plus the open run"
+        );
+        // An answer clears it; the run after the answer counts from its own start.
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 12_500);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(20_000),
+            Duration::ZERO,
+            "answered"
+        );
+        runtime.note_prefill_started_at(1_000, true, 20_000);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(21_000),
+            Duration::from_secs(1),
+            "the run after the answer, from its start"
+        );
     }
 
     #[test]
