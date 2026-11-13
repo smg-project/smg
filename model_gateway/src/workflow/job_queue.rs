@@ -1312,7 +1312,8 @@ fn apply_startup_worker_config(spec: &mut WorkerSpec, router_config: &RouterConf
     // Health config is resolved at worker build time from router defaults +
     // per-worker overrides (spec.health). No need to set spec.health here since
     // these workers have no overrides.
-    spec.max_connection_attempts = router_config.health_check.success_threshold.max(1) * 10;
+    spec.max_connection_attempts = router_config
+        .connection_attempt_budget(RouterConfig::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS);
 }
 
 /// Submit AddWorker jobs for external provider endpoints (OpenAI/Anthropic/Gemini).
@@ -1368,7 +1369,8 @@ fn build_external_worker_config(
     // Health config is resolved at worker build time from router
     // defaults + per-worker overrides (spec.health). No need to
     // set spec.health here since these workers have no overrides.
-    spec.max_connection_attempts = router_config.health_check.success_threshold.max(1) * 10;
+    spec.max_connection_attempts = router_config
+        .connection_attempt_budget(RouterConfig::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS);
     spec
 }
 
@@ -2041,7 +2043,9 @@ mod tests {
     }
 
     /// The connection budget scales with the health-check success threshold,
-    /// and a zero threshold must not collapse it to zero attempts.
+    /// and a zero threshold must not collapse it to zero attempts. A startup
+    /// worker and an external endpoint share the configured budget, the one
+    /// derivation on `RouterConfig`.
     #[test]
     fn connection_attempts_scale_with_the_success_threshold_floor() {
         let mut config = RouterConfig::default();
@@ -2050,11 +2054,21 @@ mod tests {
             spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
             10
         );
+        assert_eq!(
+            build_external_worker_config("https://api.example.com", None, &config)
+                .max_connection_attempts,
+            10
+        );
 
         config.health_check.success_threshold = 3;
         assert_eq!(
             spec_for("http://127.0.0.1:8000", &config).max_connection_attempts,
             30
+        );
+        assert_eq!(
+            build_external_worker_config("https://api.example.com", None, &config)
+                .max_connection_attempts,
+            config.connection_attempt_budget(RouterConfig::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS)
         );
     }
 }

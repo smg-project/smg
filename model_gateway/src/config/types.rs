@@ -2350,6 +2350,26 @@ impl RouterConfig {
         ConfigValidator::validate(self)
     }
 
+    /// Connection attempts per health-check success for a worker named at
+    /// startup or an external API endpoint.
+    pub(crate) const CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 10;
+
+    /// Connection attempts per health-check success for a worker a
+    /// discovery provider registers: twice a configured worker's, since a
+    /// discovered engine is often published while it is still loading.
+    pub(crate) const DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 20;
+
+    /// The connection attempts a registration gets before it fails
+    /// (`WorkerSpec::max_connection_attempts`, the connection-detection
+    /// step's budget): `attempts_per_success` tries for each health-check
+    /// success the worker must then show, one success counted at least.
+    /// Every registration path derives its budget here, with its own
+    /// multiplier ([`Self::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS`],
+    /// [`Self::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS`]).
+    pub(crate) fn connection_attempt_budget(&self, attempts_per_success: u32) -> u32 {
+        self.health_check.success_threshold.max(1) * attempts_per_success
+    }
+
     /// Which Failed workers the health checker removes: the setting as
     /// given, resolved against whether a discovery provider is selected. The
     /// CLI, the Python binding and a configuration file all keep the setting
