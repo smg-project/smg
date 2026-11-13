@@ -977,8 +977,9 @@ class RouterArgs:
             help=(
                 "The policy specification the engine applies at start: a YAML or JSON"
                 " document of smg.policy/v1. Needs --policy-engine engine; a document the"
-                " engine refuses stops the start naming the field it refused. Absent, the"
-                " routing flags decide as before"
+                " engine refuses stops the start naming the field it refused. The document"
+                " alone decides the regular path: --policy and a worker's policy label are"
+                " not read beside it. Absent, the routing flags decide as before"
             ),
         )
         routing_group.add_argument(

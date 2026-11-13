@@ -279,22 +279,29 @@ fn read_policy_spec(path: &std::path::Path) -> Result<PolicySpec, String> {
 /// The policy registry of `config`: the flags' policies, with the engine
 /// behind `--policy-engine engine`; or, when `--policy-spec` names a
 /// document, the document's engine over a neutral legacy configuration
-/// (`--policy` is not read beside a document and the start says so; the
-/// override and its headers are refused by the validator when set; no
-/// instance of theirs is built). One constructor for the
-/// gateway and its test harness. A document the engine refuses, or one that
-/// cannot be read, is the error, naming the path and the field.
+/// (`--policy` and a worker's `policy` label are not read beside a document
+/// and the start says so; the override and its headers are refused by the
+/// validator when set; no instance of theirs is built). One constructor for
+/// the gateway and its test harness. A document the engine refuses, or one
+/// that cannot be read, is the error, naming the path and the field.
 pub fn policy_registry_for(config: &RouterConfig) -> Result<PolicyRegistry, String> {
     let registry = match &config.policy_spec {
         Some(path) => {
+            let registry = PolicyRegistry::with_override(
+                PolicyConfig::Random,
+                RoutingKeyOverrideConfig::default(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode)
+            .with_policy_spec(&read_policy_spec(path)?)
+            .map_err(|error| format!("--policy-spec {}: {error}", path.display()))?;
+            // Said once the document is read and its engine hosted: a
+            // document that cannot be read, or one the engine refuses,
+            // leaves no such line above its error.
             info!(
                 document = %path.display(),
-                "policy document applied: it decides the regular path; --policy is not read beside it, and the pair modes and --enable-igw refuse a document on this base"
+                "policy document applied: it decides the regular path; --policy and a worker's policy label are not read beside it, and the pair modes and --enable-igw refuse a document on this release"
             );
-            PolicyRegistry::with_override(PolicyConfig::Random, RoutingKeyOverrideConfig::default())
-                .with_pd_pairing_mode(config.pd_pairing_mode)
-                .with_policy_spec(&read_policy_spec(path)?)
-                .map_err(|error| format!("--policy-spec {}: {error}", path.display()))?
+            registry
         }
         None => PolicyRegistry::with_override(
             config.policy.clone(),

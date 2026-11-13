@@ -1,7 +1,11 @@
 //! Regular placement through the policy engine: under `--policy-engine
 //! engine` each preset the engine serves routes every request of the HTTP
-//! router, as it does under the legacy default, and so does each preset
-//! written as a document and read from a file as `--policy-spec` is.
+//! router, as it does under the legacy default. So does each of them a
+//! document carries, written as a document and read from a file as
+//! `--policy-spec` is; and under a document a worker's `policy` label takes
+//! no model off it.
+
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -13,7 +17,10 @@ use smg::config::{PolicyConfig, PolicyEngineMode, RouterConfig};
 use smg_policy_controller::spec::PolicySpec;
 use tower::ServiceExt;
 
-use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
+use crate::common::{
+    mock_worker::{set_request_recorder, MockWorker, RequestRecorder},
+    wait_for_worker_registration, AppTestContext, TestRouterConfig, TestWorkerConfig,
+};
 
 /// The harness's regular configuration under `policy`, decided through the
 /// engine.
@@ -173,9 +180,12 @@ async fn cache_aware_routes_through_the_engine() {
     .await;
 }
 
-/// Each preset the engine serves, written as a document and read from a
-/// file as `--policy-spec` is, routes as the flag does: every request
-/// placed, every one decided through the engine.
+/// Each preset of the flag cases above that a document carries, written as
+/// a document and read from a file as `--policy-spec` is, routes as the flag
+/// does: every request placed, every one decided through the engine.
+/// `cache_aware` is the flag's alone: nothing feeds a document the prefix
+/// index, so its document is refused at start (the registry's
+/// `a_document_whose_stage_reads_an_unfed_input_is_refused_at_the_apply`).
 #[tokio::test]
 async fn each_preset_as_a_spec_file_routes_as_the_flag_does() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -190,4 +200,87 @@ async fn each_preset_as_a_spec_file_routes_as_the_flag_does() {
         let i = u16::try_from(i).expect("five presets");
         placed_through_the_engine(3930 + i, 19960 + 2 * i, 2, Decider::Document(name, &dir)).await;
     }
+}
+
+/// Under a document nothing but the document chooses a policy. A worker
+/// registered with a `policy` label is one more worker of the document's:
+/// the label is not read, as `--policy` is not, and no legacy policy is built
+/// for its model. Two workers serve one model under the round-robin
+/// document, the first registered with the label `passthrough`, the policy
+/// that sends every request to the first healthy worker: each worker takes a
+/// share of the model's requests, as the document says. (The decider's
+/// `decisions()` cannot tell the two apart: the regular path draws a
+/// sequence for every request at its capture, whoever places it.)
+#[tokio::test]
+async fn a_workers_policy_label_is_not_read_under_a_document() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let ctx =
+        AppTestContext::new_with_config(spec_file_config(3935, "round_robin", &dir), vec![]).await;
+    let app = ctx.create_app();
+
+    let mut workers = Vec::new();
+    let mut recorders = Vec::new();
+    for (port, labels) in [
+        (19970, json!({ "policy": "passthrough" })),
+        (19971, json!({})),
+    ] {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(port, recorder.clone());
+        let mut worker = MockWorker::new(TestWorkerConfig::healthy(port));
+        let url = worker.start().await.expect("the worker's address");
+        let registration = json!({ "url": url, "labels": labels });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(registration.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "worker {port}");
+        wait_for_worker_registration(&ctx.app_context, &url, Duration::from_secs(10)).await;
+        workers.push(worker);
+        recorders.push(recorder);
+    }
+    let model = ctx
+        .app_context
+        .worker_registry
+        .get_all()
+        .first()
+        .map(|worker| worker.model_id().to_string())
+        .expect("a registered worker");
+
+    let requests = 20;
+    for i in 0..requests {
+        let payload = json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": format!("Request {i}") }],
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "request {i} is placed");
+    }
+    let shares: Vec<usize> = recorders
+        .iter()
+        .map(|recorder| recorder.bodies().len())
+        .collect();
+    assert_eq!(
+        shares.iter().sum::<usize>(),
+        requests,
+        "every request reached a worker: {shares:?}"
+    );
+    assert!(
+        shares.iter().all(|share| *share > 0),
+        "the document's round-robin gives each worker a share, where the label's passthrough \
+         gives the first worker every request: {shares:?}"
+    );
+    for mut worker in workers {
+        worker.stop().await;
+    }
+    ctx.shutdown().await;
 }

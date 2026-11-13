@@ -107,12 +107,13 @@ pub enum EngineHostError {
     #[error("the document's session header {0:?} is not an HTTP header name")]
     SessionHeader(String),
     /// Bindings of one document that read a session key from different
-    /// header lists; the registry resolves one list per gateway on this base.
-    #[error("the document's bindings disagree on their session headers ({0}); one list per gateway on this base")]
+    /// header lists; the registry resolves one list per gateway on this
+    /// release.
+    #[error("the document's bindings disagree on their session headers ({0}); one list per gateway on this release")]
     SessionHeaders(String),
     /// A stage of a document that reads an input this host does not feed a
-    /// document on this base.
-    #[error("profile {profile:?}: the {stage} stage reads {need}, which this gateway does not feed a document on this base")]
+    /// document on this release.
+    #[error("profile {profile:?}: the {stage} stage reads {need}, which this gateway does not feed a document on this release")]
     Unfed {
         profile: String,
         stage: &'static str,

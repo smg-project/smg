@@ -214,6 +214,11 @@ pub struct PolicyRegistry {
     /// step's remote mode puts the controller client and the local fallback
     /// engine behind this same handle.
     decider: Option<Arc<Decider>>,
+    /// Whether the hosted engine is a `--policy-spec` document's
+    /// ([`Self::with_policy_spec`]), not the flags'. Under a document
+    /// nothing but the document chooses a policy, so no worker's `policy`
+    /// label is read ([`Self::on_worker_added`]).
+    document: bool,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -298,6 +303,7 @@ impl PolicyRegistry {
             routing_key_override,
             pd_pairing_mode: PdPairingMode::default(),
             decider: None,
+            document: false,
         }
     }
 
@@ -384,7 +390,9 @@ impl PolicyRegistry {
     /// stage that reads an input this host does not feed a document on this
     /// base (the prefix index, a ring), refused by its profile, stage and
     /// input instead of applied to score nothing (the decider's
-    /// `fed_as_a_document`).
+    /// `fed_as_a_document`). From the apply on nothing but the document
+    /// chooses a policy: no worker's `policy` label is read
+    /// ([`Self::on_worker_added`]).
     pub fn with_policy_spec(mut self, spec: &PolicySpec) -> Result<Self, EngineHostError> {
         let decider = Decider::from_spec(spec)?;
         decider.fed_as_a_document()?;
@@ -393,6 +401,7 @@ impl PolicyRegistry {
             self.routing_key_headers = Arc::new(headers);
         }
         self.host(decider);
+        self.document = true;
         Ok(self)
     }
 
@@ -448,7 +457,8 @@ impl PolicyRegistry {
     /// The engine is built from the default policy and serves it by name: a
     /// model whose registration hint named another policy keeps that policy's
     /// legacy instance, and a hint naming the default's own preset shares the
-    /// engine's one instance of it. A keyed request under the default policy
+    /// engine's one instance of it (under a document no hint is read, so
+    /// every model is the engine's). A keyed request under the default policy
     /// is the engine's too: its binding carries the sticky routing-key
     /// override's sessions rule, or the manual policy's own.
     pub(crate) fn engine_for(&self, policy: &dyn LoadBalancingPolicy) -> Option<&Arc<Decider>> {
@@ -920,6 +930,11 @@ impl PolicyRegistry {
     /// for every later one, until no worker of this node serves the model
     /// ([`Self::on_model_unserved`]). Registering or replacing a worker of
     /// the model calls this as often as it likes.
+    ///
+    /// Under a `--policy-spec` document nothing but the document chooses a
+    /// policy: the label is not read, as `--policy` is not, and the model
+    /// stands under the neutral default, which the engine serves by name. A
+    /// labelled first worker says so, once per model.
     pub fn on_worker_added(
         &self,
         model_id: &str,
@@ -935,14 +950,26 @@ impl PolicyRegistry {
             return Arc::clone(&existing_policy);
         }
 
-        // New model - determine policy
-        let policy = self.determine_policy_for_model(model_id, policy_hint);
-
-        info!(
-            "Assigning policy {} to new model {}",
-            policy.name(),
-            model_id
-        );
+        // New model - determine policy. Under a document the label is
+        // dropped here, before a legacy instance is built: every source of
+        // a registration passes this one place.
+        let policy = if self.document {
+            match policy_hint {
+                Some(label) => warn!(
+                    "Worker label policy={label:?} is not read under a policy document: the document decides model {model_id}"
+                ),
+                None => info!("The policy document decides new model {model_id}"),
+            }
+            Arc::clone(&self.default_policy)
+        } else {
+            let policy = self.determine_policy_for_model(model_id, policy_hint);
+            info!(
+                "Assigning policy {} to new model {}",
+                policy.name(),
+                model_id
+            );
+            policy
+        };
 
         self.publish_with_shared_state(&policy, || {
             self.model_policies
@@ -3743,6 +3770,24 @@ mod tests {
         assert!(error.contains("unknown scorer \"nope\""), "{error}");
     }
 
+    /// Under a document nothing but the document chooses a policy: a
+    /// worker's `policy` label builds no policy of its own, the model stands
+    /// under the neutral default, and the engine serves it. (Under the flags
+    /// the label names the model's policy: the hinted cases above.)
+    #[test]
+    fn with_policy_spec_reads_no_worker_policy_label() {
+        let spec = PolicySpec::preset("least_load").expect("a preset document");
+        let registry = PolicyRegistry::new(PolicyConfig::Random)
+            .with_policy_spec(&spec)
+            .expect("the document's engine");
+        let policy = registry.on_worker_added("labelled", Some("round_robin"));
+        assert_eq!(policy.name(), "random", "the label built no policy");
+        assert!(
+            registry.engine_for(policy.as_ref()).is_some(),
+            "the document decides the labelled model"
+        );
+    }
+
     /// Under a document whose binding keeps sessions, the registry resolves
     /// a request's routing key from the document's session headers in their
     /// declared order, not from the command line's list: the first header
@@ -3811,7 +3856,7 @@ mod tests {
         let refused = |profile: &str, stage: &str, need: &str| {
             Err(format!(
                 "profile {profile:?}: the {stage} stage reads {need}, which this gateway does \
-                 not feed a document on this base"
+                 not feed a document on this release"
             ))
         };
         for name in smg_policy_controller::PRESETS {

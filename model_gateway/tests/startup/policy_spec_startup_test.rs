@@ -114,7 +114,8 @@ fn a_policy_spec_the_engine_accepts_starts_the_gateway() {
 }
 
 /// A document the engine refuses stops the start, the error naming the flag
-/// and the field the engine refused.
+/// and the field the engine refused; no start-up line says a document was
+/// applied.
 #[test]
 fn a_policy_spec_the_engine_refuses_stops_the_start_naming_the_field() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -138,6 +139,11 @@ fn a_policy_spec_the_engine_refuses_stops_the_start_naming_the_field() {
         "an unknown scorer",
         &launch,
         &["--policy-spec", "profile", "unknown scorer", "nope"],
+    );
+    assert!(
+        !launch.log.contains("policy document applied"),
+        "a refused document is not said to be applied\n{}",
+        launch.log
     );
 }
 
