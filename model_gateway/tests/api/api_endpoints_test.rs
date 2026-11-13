@@ -259,6 +259,46 @@ mod generation_tests {
         ctx.shutdown().await;
     }
 
+    /// SGLang's `/generate` reads `max_new_tokens: null` as no limit and an
+    /// absent key as its default of 128: the router writes the typed request
+    /// back for the worker, and the `null` reaches it as sent.
+    #[tokio::test]
+    async fn test_generate_null_max_new_tokens_reaches_the_worker() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18116, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18116,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "text": "Write until the model stops.",
+            "sampling_params": {"max_new_tokens": null, "temperature": 0.0},
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let forwarded = recorder.only_body();
+        assert_eq!(
+            forwarded["sampling_params"], payload["sampling_params"],
+            "the null reaches the worker as sent: {forwarded}"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_v1_chat_completions_success() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {

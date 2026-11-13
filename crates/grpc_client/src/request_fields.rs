@@ -224,7 +224,7 @@ impl PlainSampling {
             no_stop_trim: p.no_stop_trim.unwrap_or(false),
             stop: stop_strings(p.stop.as_ref()),
             stop_token_ids: p.stop_token_ids.clone().unwrap_or_default(),
-            max_new_tokens: p.max_new_tokens,
+            max_new_tokens: p.max_new_tokens.flatten(),
             min_new_tokens: p.min_new_tokens,
             n: p.n.unwrap_or(1),
             sampling_seed: p.sampling_seed,

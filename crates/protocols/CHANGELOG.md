@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `/generate` request's `max_new_tokens: null` asks for no limit, as SGLang reads it: an
+  explicit `null` and an absent key both read as `None` and neither was written, so SGLang applied
+  its default of 128 tokens where the client asked for none. `SamplingParams.max_new_tokens` keeps
+  the two apart and writes the `null` back; an absent key stays absent. Breaking:
+  `max_new_tokens` is an `Option<Option<u32>>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

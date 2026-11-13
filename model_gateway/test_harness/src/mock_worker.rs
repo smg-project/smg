@@ -724,9 +724,11 @@ async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>)
 )]
 async fn generate_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_request(config.port, version, &payload);
     let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config) {

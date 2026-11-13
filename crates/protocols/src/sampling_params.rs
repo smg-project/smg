@@ -12,9 +12,17 @@ pub struct SamplingParams {
     /// Temperature for sampling (must be >= 0.0, no upper limit)
     #[validate(range(min = 0.0))]
     pub temperature: Option<f32>,
-    /// Maximum number of new tokens to generate (must be >= 0)
-    #[validate(range(min = 0))]
-    pub max_new_tokens: Option<u32>,
+    /// Maximum number of new tokens to generate. An explicit `null` asks for
+    /// no limit and an absent key for the engine's default, as SGLang reads
+    /// them (`max_new_tokens: Optional[int] = 128`), so the two are kept
+    /// apart.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_with::rust::double_option"
+    )]
+    #[schemars(with = "Option<u32>")]
+    pub max_new_tokens: Option<Option<u32>>,
     /// Top-p nucleus sampling (0.0 < top_p <= 1.0)
     #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
@@ -92,7 +100,7 @@ pub fn validate_top_k_value(top_k: i32) -> Result<(), validator::ValidationError
 /// Validation function for SamplingParams - cross-field validation only
 fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::ValidationError> {
     // 1. Cross-field validation: min_new_tokens <= max_new_tokens
-    if let (Some(min), Some(max)) = (params.min_new_tokens, params.max_new_tokens) {
+    if let (Some(min), Some(max)) = (params.min_new_tokens, params.max_new_tokens.flatten()) {
         if min > max {
             return Err(invalid_at(
                 "min_new_tokens",

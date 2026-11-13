@@ -380,7 +380,7 @@ impl MlxEngineClient {
         if let Some(stop_token_ids) = &p.stop_token_ids {
             sampling.stop_token_ids.clone_from(stop_token_ids);
         }
-        if let Some(max_new_tokens) = p.max_new_tokens {
+        if let Some(max_new_tokens) = p.max_new_tokens.flatten() {
             sampling.max_tokens = Some(max_new_tokens);
         }
         if let Some(seed) = p.sampling_seed {

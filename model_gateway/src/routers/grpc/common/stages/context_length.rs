@@ -239,7 +239,7 @@ fn output_budget(request_type: &RequestType) -> Option<u32> {
         RequestType::Generate(request) => request
             .sampling_params
             .as_ref()
-            .and_then(|params| params.max_new_tokens),
+            .and_then(|params| params.max_new_tokens.flatten()),
         RequestType::Embedding(_)
         | RequestType::Classify(_)
         | RequestType::Decisions(_)
