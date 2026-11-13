@@ -96,13 +96,13 @@ pub struct Consumed {
     pub flag: &'static str,
     /// The binding's keyword: `cache_threshold`.
     pub keyword: &'static str,
-    /// The document fields, by path
-    /// (`profiles.cache_aware.score.prefix-affinity.threshold`); empty for
-    /// a flag the routing mode leaves unused.
-    pub fields: Vec<String>,
-    /// The value as the deprecation line shows it.
+    /// The document fields the flag landed in, each with the value written
+    /// there; empty for a flag nothing in the configuration reads, with
+    /// [`Self::unused`] saying why.
+    pub fields: Vec<Field>,
+    /// The flag's value as the deprecation line shows it.
     pub shown: String,
-    /// The value as the document renders it.
+    /// The flag's value as the document renders it.
     pub value: Value,
     /// The value the flag has when it is left out, rendered the same way;
     /// `null` for a flag with no default.
@@ -110,6 +110,21 @@ pub struct Consumed {
     /// Whether the value is the default: the row exists because the flag
     /// was given.
     pub at_default: bool,
+    /// Why a flag landed nowhere: the policies in use do not read it, or the
+    /// mode routes nothing by it.
+    pub unused: Option<String>,
+}
+
+/// One document field a flag landed in: its path
+/// (`profiles.cache_aware.score.prefix-affinity.threshold`) and the value
+/// written there, as the document renders it and as a line shows it. A
+/// `profiles.<name>` field holds a profile's shape (its filters, the names
+/// of its score stages, its picker): the policy flag that named it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field {
+    pub path: String,
+    pub value: Value,
+    pub shown: String,
 }
 
 impl Consumed {
@@ -139,17 +154,31 @@ impl Consumed {
         )
     }
 
-    /// "`<fields> = <value>`", or what became of a flag with no field.
+    /// "`<fields> = <value>`" (fields with one value grouped, fields with
+    /// values of their own named each), or what became of a flag with no
+    /// field.
     fn landing(&self, spec_holds: bool) -> String {
         if self.fields.is_empty() {
-            return format!("nothing ({} routes no request in this mode)", self.shown);
+            let reason = self.unused.as_deref().unwrap_or("nothing reads it");
+            return format!("nothing ({reason})");
         }
         let holds = if spec_holds {
             ", which the spec already holds"
         } else {
             ""
         };
-        format!("{} = {}{holds}", self.fields.join(" and "), self.shown)
+        let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+        for field in &self.fields {
+            match groups.iter_mut().find(|(shown, _)| *shown == field.shown) {
+                Some((_, paths)) => paths.push(&field.path),
+                None => groups.push((&field.shown, vec![&field.path])),
+            }
+        }
+        let parts: Vec<String> = groups
+            .iter()
+            .map(|(shown, paths)| format!("{} = {shown}", paths.join(" and ")))
+            .collect();
+        format!("{}{holds}", parts.join(" and "))
     }
 }
 
@@ -360,6 +389,54 @@ const WORKER_OVERLOAD_SHED: Flag = flag(
     "worker_overload_shed",
 );
 const PD_PAIRING_MODE: Flag = flag("pd_pairing_mode", "--pd-pairing-mode", "pd_pairing_mode");
+
+/// Every routing flag with a home in the document, for the rows of the
+/// flags a configuration leaves unread.
+const FLAGS: [Flag; 43] = [
+    POLICY,
+    PREFILL_POLICY,
+    DECODE_POLICY,
+    ENCODE_POLICY,
+    CACHE_THRESHOLD,
+    BALANCE_ABS_THRESHOLD,
+    BALANCE_REL_THRESHOLD,
+    BALANCE_PREFIX_MARGIN_TOKENS,
+    BALANCE_UNCACHED_CREDIT,
+    BALANCE_TOKEN_USAGE_THRESHOLD,
+    OVERLOAD_TOKEN_USAGE_THRESHOLD,
+    OVERLAP_DECAY,
+    SELECTION_TEMPERATURE,
+    SELECTION_ACCOUNTING_TTL_MS,
+    EVICTION_INTERVAL,
+    MAX_TREE_SIZE,
+    BLOCK_SIZE,
+    CACHE_BOUNDARIES,
+    CACHE_INDEX,
+    CACHE_TTL_SECS,
+    WORKER_WARMUP_SECS,
+    WORKER_WARMUP_SHARE,
+    WORKER_WARMUP_BLOCKS,
+    WORKER_WARMUP_THIN_RATIO,
+    WORKER_WARMUP_DIVERT_EVERY,
+    LEAST_LOAD_KV_PRESSURE_WEIGHT,
+    LEAST_LOAD_DEFAULT_THROUGHPUT,
+    LEAST_LOAD_MEAN_PREFILL_TOKENS,
+    POWER_OF_TWO_LOAD_METRIC,
+    BUCKET_ADJUST_INTERVAL_SECS,
+    MAX_IDLE_SECS,
+    ASSIGNMENT_MODE,
+    PREFIX_TOKEN_COUNT,
+    PREFIX_HASH_LOAD_FACTOR,
+    PREFIX_HASH_BALANCE_ABS_THRESHOLD,
+    ROUTING_KEY_OVERRIDE,
+    ROUTING_KEY_HEADERS,
+    WORKER_OVERLOAD_PROTECTION,
+    DISABLE_WORKER_OVERLOAD_PROTECTION,
+    WORKER_OVERLOAD_WAITING_REQUESTS,
+    WORKER_OVERLOAD_TOKEN_USAGE,
+    WORKER_OVERLOAD_SHED,
+    PD_PAIRING_MODE,
+];
 
 /// A flag's value as the document renders it and as the line shows it.
 trait Rendered {
@@ -624,6 +701,7 @@ impl Compiler<'_> {
         self.sessions();
         self.overload();
         self.boundaries();
+        self.unused_given();
         if config.discovery.is_some() {
             self.notes.push(LABEL_NOTE.to_string());
         }
@@ -651,6 +729,27 @@ impl Compiler<'_> {
         }
     }
 
+    /// A row for every routing flag the front end saw that nothing in this
+    /// configuration read: it gets its line and its series like the rest,
+    /// and the reason instead of a field.
+    fn unused_given(&mut self) {
+        let config = self.config;
+        let reason = match &config.mode {
+            RoutingMode::PrefillDecode { .. } => {
+                "the prefill and decode policies do not read it".to_string()
+            }
+            RoutingMode::EncodePrefillDecode { .. } => {
+                "the encode, prefill and decode policies do not read it".to_string()
+            }
+            _ => format!("the {} policy does not read it", config.policy.name()),
+        };
+        for flag in FLAGS {
+            if self.given.contains(flag.id) {
+                self.unused_row(flag, String::new(), reason.clone());
+            }
+        }
+    }
+
     /// The regular modes: one profile named after the policy, bound to
     /// every model.
     fn single(&mut self) {
@@ -658,17 +757,15 @@ impl Compiler<'_> {
         let policy = &config.policy;
         let name = policy.name();
         let profile = self.profile(policy, Side::Single, name);
-        self.profiles.insert(name.to_string(), profile);
         self.binding.profile = Some(name.to_string());
         self.row(
             POLICY,
-            vec![
-                "bindings[0].profile".to_string(),
-                format!("profiles.{name}"),
-            ],
+            vec!["bindings[0].profile".to_string()],
             &name,
             Some(&DEFAULT_POLICY),
         );
+        self.profile_row(POLICY, name, &profile, name, Some(DEFAULT_POLICY));
+        self.profiles.insert(name.to_string(), profile);
         if name == DEFAULT_POLICY && !self.given.contains(POLICY.id) {
             self.notes.push(format!(
                 "no --policy given: the default profile {name} was written"
@@ -690,8 +787,6 @@ impl Compiler<'_> {
         let main = &config.policy;
         let prefill_profile = self.profile(prefill.unwrap_or(main), Side::Prefill, "prefill");
         let decode_profile = self.profile(decode.unwrap_or(main), Side::Decode, "decode");
-        self.profiles.insert("prefill".to_string(), prefill_profile);
-        self.profiles.insert("decode".to_string(), decode_profile);
         let mut sides = BTreeMap::new();
         sides.insert("prefill".to_string(), "prefill".to_string());
         sides.insert("decode".to_string(), "decode".to_string());
@@ -700,18 +795,15 @@ impl Compiler<'_> {
         if let Some(encode) = epd {
             let policy = encode.unwrap_or(&DEFAULT_ENCODE_POLICY);
             let encode_profile = self.profile(policy, Side::Encode, "encode");
-            self.profiles.insert("encode".to_string(), encode_profile);
             sides.insert("encode".to_string(), "encode".to_string());
             phases.insert(0, Phase::Encode);
             plan = PlanName::Epd;
             match encode {
-                Some(policy) => self.row(
+                Some(policy) => self.profile_row(
                     ENCODE_POLICY,
-                    vec![
-                        "bindings[0].profiles.encode".to_string(),
-                        "profiles.encode".to_string(),
-                    ],
-                    &policy.name(),
+                    "encode",
+                    &encode_profile,
+                    policy.name(),
                     None,
                 ),
                 None => self.notes.push(format!(
@@ -719,39 +811,55 @@ impl Compiler<'_> {
                     DEFAULT_ENCODE_POLICY.name()
                 )),
             }
+            self.profiles.insert("encode".to_string(), encode_profile);
         }
-        let mut main_fields = Vec::new();
         match prefill {
-            Some(policy) => self.row(
+            Some(policy) => self.profile_row(
                 PREFILL_POLICY,
-                vec![
-                    "bindings[0].profiles.prefill".to_string(),
-                    "profiles.prefill".to_string(),
-                ],
-                &policy.name(),
+                "prefill",
+                &prefill_profile,
+                policy.name(),
                 None,
             ),
-            None => main_fields.push("profiles.prefill".to_string()),
+            None => self.profile_row(
+                POLICY,
+                "prefill",
+                &prefill_profile,
+                main.name(),
+                Some(DEFAULT_POLICY),
+            ),
         }
         match decode {
-            Some(policy) => self.row(
+            Some(policy) => self.profile_row(
                 DECODE_POLICY,
-                vec![
-                    "bindings[0].profiles.decode".to_string(),
-                    "profiles.decode".to_string(),
-                ],
-                &policy.name(),
+                "decode",
+                &decode_profile,
+                policy.name(),
                 None,
             ),
-            None => main_fields.push("profiles.decode".to_string()),
+            None => self.profile_row(
+                POLICY,
+                "decode",
+                &decode_profile,
+                main.name(),
+                Some(DEFAULT_POLICY),
+            ),
         }
-        if main_fields.is_empty() {
+        if prefill.is_some() && decode.is_some() {
             self.notes.push(format!(
                 "the main policy {} routes no request under {mode_flag}: it compiled to nothing",
                 main.name()
             ));
+            if main.name() != DEFAULT_POLICY || self.given.contains(POLICY.id) {
+                self.unused_row(
+                    POLICY,
+                    main.name().to_string(),
+                    format!("{} routes no request under {mode_flag}", main.name()),
+                );
+            }
         }
-        self.row(POLICY, main_fields, &main.name(), Some(&DEFAULT_POLICY));
+        self.profiles.insert("prefill".to_string(), prefill_profile);
+        self.profiles.insert("decode".to_string(), decode_profile);
         self.binding.plan = Some(plan);
         self.binding.profiles = sides;
         self.binding.matcher.phase = phases;
@@ -940,17 +1048,23 @@ impl Compiler<'_> {
     /// the engine's count-first pickers (the fewest in flight, then the
     /// expected wait); the resident-tokens form over every candidate.
     fn power_of_two(&mut self, p: &str, side: Side, metric: PowerOfTwoLoadMetric) -> ProfileSpec {
-        let (score, pick): (ScoreSpec, &str) = match metric {
-            PowerOfTwoLoadMetric::ExpectedWait => ("least-load".into(), "power-of-two"),
-            PowerOfTwoLoadMetric::Requests => ("least-load".into(), "power-of-two-count-first"),
-            PowerOfTwoLoadMetric::LeastRequests => ("least-load".into(), "count-first"),
-            PowerOfTwoLoadMetric::ResidentTokens { request_tokens } => (
-                ScoreSpec::Params(ScoreStage::ResidentWork(ResidentWorkParams {
-                    weight: 1.0,
-                    request_tokens: saturating_u32(request_tokens),
-                })),
-                "best",
-            ),
+        let (score, pick, resident): (ScoreSpec, &str, Option<u32>) = match metric {
+            PowerOfTwoLoadMetric::ExpectedWait => ("least-load".into(), "power-of-two", None),
+            PowerOfTwoLoadMetric::Requests => {
+                ("least-load".into(), "power-of-two-count-first", None)
+            }
+            PowerOfTwoLoadMetric::LeastRequests => ("least-load".into(), "count-first", None),
+            PowerOfTwoLoadMetric::ResidentTokens { request_tokens } => {
+                let request_tokens = saturating_u32(request_tokens);
+                (
+                    ScoreSpec::Params(ScoreStage::ResidentWork(ResidentWorkParams {
+                        weight: 1.0,
+                        request_tokens,
+                    })),
+                    "best",
+                    Some(request_tokens),
+                )
+            }
         };
         self.row(
             POWER_OF_TWO_LOAD_METRIC,
@@ -958,6 +1072,14 @@ impl Compiler<'_> {
             &pick,
             Some(&"power-of-two"),
         );
+        if let Some(request_tokens) = resident {
+            self.row(
+                POWER_OF_TWO_LOAD_METRIC,
+                vec![format!("{p}.score.resident-work.request_tokens")],
+                &request_tokens,
+                None,
+            );
+        }
         ProfileSpec {
             filter: side.filters(&STANDARD),
             score: vec![score],
@@ -1269,22 +1391,20 @@ impl Compiler<'_> {
             &margin,
             Some(&10_u32),
         );
-        let bounded = BoundedLoadParams {
-            factor: off(factor, 1.25),
-            abs_margin: off(margin, 10),
-        };
+        // Written whole: the engine reads the prefix form from the presence
+        // of `prefix_tokens` and the bound from the presence of its block,
+        // so the defaults are the meaning here, not an omission.
         let params = ConsistentHashParams {
             weight: 1.0,
-            prefix_tokens: off(prefix_tokens, 256),
-            bounded_load: (bounded != BoundedLoadParams::default()).then_some(bounded),
+            prefix_tokens: Some(prefix_tokens),
+            bounded_load: Some(BoundedLoadParams {
+                factor: Some(factor),
+                abs_margin: Some(margin),
+            }),
         };
         ProfileSpec {
             filter: side.filters(&STANDARD),
-            score: vec![stage(
-                params != ConsistentHashParams::default(),
-                ScoreStage::ConsistentHash(params),
-                "consistent-hash",
-            )],
+            score: vec![ScoreSpec::Params(ScoreStage::ConsistentHash(params))],
             pick: "best".into(),
         }
     }
@@ -1293,18 +1413,7 @@ impl Compiler<'_> {
     /// sweep, how a first-seen key is placed, the cap of two in flight.
     fn manual_sessions(&mut self, sweep: u64, idle: u64, mode: ManualAssignmentMode) {
         let (ttl_s, sweep_s) = lifetime(idle, sweep);
-        self.row(
-            MAX_IDLE_SECS,
-            vec!["bindings[0].sessions.ttl_s".to_string()],
-            &ttl_s,
-            Some(&14_400_u32),
-        );
-        self.row(
-            EVICTION_INTERVAL,
-            vec!["bindings[0].sessions.sweep_s".to_string()],
-            &sweep_s,
-            Some(&120_u32),
-        );
+        self.lifetime_rows(idle, sweep, ttl_s, sweep_s);
         self.row(
             ASSIGNMENT_MODE,
             vec!["bindings[0].sessions.assignment".to_string()],
@@ -1321,6 +1430,32 @@ impl Compiler<'_> {
             issue_session_id: false,
             recovery: Recovery::Original,
         });
+    }
+
+    /// The idle-time and sweep rows of a sessions block. A zero idle time
+    /// keeps keys for ever and writes the sweep as for ever too, so the idle
+    /// flag owns both fields then; the sweep flag owns its field otherwise
+    /// (a zero sweep, for ever as well, keeps its own row).
+    fn lifetime_rows(&mut self, idle: u64, sweep: u64, ttl_s: u32, sweep_s: u32) {
+        let mut idle_fields = vec!["bindings[0].sessions.ttl_s".to_string()];
+        if idle == 0 {
+            idle_fields.push("bindings[0].sessions.sweep_s".to_string());
+        }
+        self.row(MAX_IDLE_SECS, idle_fields, &ttl_s, Some(&14_400_u32));
+        if idle != 0 || sweep == 0 {
+            self.row(
+                EVICTION_INTERVAL,
+                vec!["bindings[0].sessions.sweep_s".to_string()],
+                &sweep_s,
+                Some(&120_u32),
+            );
+        } else if self.given.contains(EVICTION_INTERVAL.id) {
+            self.unused_row(
+                EVICTION_INTERVAL,
+                sweep.to_string(),
+                "a zero idle time keeps keys for ever, so the sweep is for ever too".to_string(),
+            );
+        }
     }
 
     /// The binding's sessions block: the sticky override's when it is on,
@@ -1371,17 +1506,11 @@ impl Compiler<'_> {
             &headers,
             Some(&vec![MANUAL_SESSION_HEADER.to_string()]),
         );
-        self.row(
-            MAX_IDLE_SECS,
-            vec!["bindings[0].sessions.ttl_s".to_string()],
-            &ttl_s,
-            Some(&14_400_u32),
-        );
-        self.row(
-            EVICTION_INTERVAL,
-            vec!["bindings[0].sessions.sweep_s".to_string()],
-            &sweep_s,
-            Some(&120_u32),
+        self.lifetime_rows(
+            sticky.max_idle_secs,
+            sticky.eviction_interval_secs,
+            ttl_s,
+            sweep_s,
         );
         self.row(
             ASSIGNMENT_MODE,
@@ -1498,6 +1627,13 @@ impl Compiler<'_> {
         self.view.boundaries = boundaries;
     }
 
+    /// A flag at its default is consumed only when the front end saw it:
+    /// a value the operator wrote is the operator's, default or not; one
+    /// nobody wrote has no line.
+    fn skips(&self, flag: &Flag, at_default: bool) -> bool {
+        at_default && !self.given.contains(flag.id)
+    }
+
     /// Consume `flag` into `fields` with `value`: a flag at its default is
     /// consumed only when the front end saw it; a flag seen twice (one
     /// value landing in two fields) keeps one row with both fields.
@@ -1517,15 +1653,91 @@ impl Compiler<'_> {
             }
             None => (Value::Null, false),
         };
-        if at_default && !self.given.contains(flag.id) {
+        if self.skips(&flag, at_default) {
             return;
         }
+        let shown = value.shown();
+        let fields = fields
+            .into_iter()
+            .map(|path| Field {
+                path,
+                value: rendered.clone(),
+                shown: shown.clone(),
+            })
+            .collect();
+        self.push(flag, fields, shown, rendered, default, at_default);
+    }
+
+    /// Consume `flag` into a `profiles.<name>` field: the field holds the
+    /// profile's shape, the line shows the policy's name; a policy at its
+    /// default is consumed only when the front end saw the flag, as a value
+    /// is.
+    fn profile_row(
+        &mut self,
+        flag: Flag,
+        name: &str,
+        profile: &ProfileSpec,
+        policy: &str,
+        default: Option<&str>,
+    ) {
+        let at_default = default == Some(policy);
+        if self.skips(&flag, at_default) {
+            return;
+        }
+        let field = Field {
+            path: format!("profiles.{name}"),
+            value: shape_of_profile(profile),
+            shown: policy.to_string(),
+        };
+        let rendered = Value::String(policy.to_string());
+        let default = default.map_or(Value::Null, |default| Value::String(default.to_string()));
+        self.push(
+            flag,
+            vec![field],
+            policy.to_string(),
+            rendered,
+            default,
+            at_default,
+        );
+    }
+
+    /// A row for a flag that landed nowhere, with the reason; nothing when
+    /// the flag has a row.
+    fn unused_row(&mut self, flag: Flag, shown: String, reason: String) {
+        if self.consumed.iter().any(|row| row.id == flag.id) {
+            return;
+        }
+        self.consumed.push(Consumed {
+            id: flag.id,
+            flag: flag.flag,
+            keyword: flag.keyword,
+            fields: Vec::new(),
+            shown,
+            value: Value::Null,
+            default: Value::Null,
+            at_default: false,
+            unused: Some(reason),
+        });
+    }
+
+    /// One row per flag: a second consumption adds its fields, each with
+    /// the value written there.
+    fn push(
+        &mut self,
+        flag: Flag,
+        fields: Vec<Field>,
+        shown: String,
+        value: Value,
+        default: Value,
+        at_default: bool,
+    ) {
         if let Some(row) = self.consumed.iter_mut().find(|row| row.id == flag.id) {
             for field in fields {
-                if !row.fields.contains(&field) {
+                if !row.fields.iter().any(|known| known.path == field.path) {
                     row.fields.push(field);
                 }
             }
+            row.unused = None;
             return;
         }
         self.consumed.push(Consumed {
@@ -1533,12 +1745,65 @@ impl Compiler<'_> {
             flag: flag.flag,
             keyword: flag.keyword,
             fields,
-            shown: value.shown(),
-            value: rendered,
+            shown,
+            value,
             default,
             at_default,
+            unused: None,
         });
     }
+}
+
+/// A profile's shape: its filters, the names of its score stages and its
+/// picker, as a document value; the parameters are the knob rows' to
+/// check.
+fn shape_of_profile(profile: &ProfileSpec) -> Value {
+    shape_of_value(&serde_json::to_value(profile).unwrap_or(Value::Null))
+}
+
+/// The shape of a rendered profile (see [`shape_of_profile`]): a stage
+/// written with parameters reduces to its name.
+fn shape_of_value(profile: &Value) -> Value {
+    let name_of = |stage: &Value| match stage {
+        Value::Object(map) => map
+            .keys()
+            .next()
+            .cloned()
+            .map_or(Value::Null, Value::String),
+        other => other.clone(),
+    };
+    let mut shape = serde_json::Map::new();
+    if let Some(filter) = profile.get("filter") {
+        shape.insert("filter".to_string(), filter.clone());
+    }
+    if let Some(Value::Array(stages)) = profile.get("score") {
+        shape.insert(
+            "score".to_string(),
+            Value::Array(stages.iter().map(name_of).collect()),
+        );
+    }
+    if let Some(pick) = profile.get("pick") {
+        shape.insert("pick".to_string(), name_of(pick));
+    }
+    Value::Object(shape)
+}
+
+/// Whether a field path names a profile whole (`profiles.<name>`): such a
+/// field is compared by the profile's shape.
+fn is_profile_path(path: &str) -> bool {
+    let mut parts = path.split('.');
+    parts.next() == Some("profiles") && parts.next().is_some() && parts.next().is_none()
+}
+
+/// A profile's shape as a line shows it.
+fn render_shape(shape: &Value) -> String {
+    let part = |key: &str| shape.get(key).map_or_else(|| "nothing".to_string(), render);
+    format!(
+        "filter {}, score {}, pick {}",
+        part("filter"),
+        part("score"),
+        part("pick")
+    )
 }
 
 impl Compiled {
@@ -1567,17 +1832,24 @@ impl Compiled {
             .chain(self.report.consumed.iter().filter(|row| !is_name(row)));
         for row in rows {
             for field in &row.fields {
-                let found = lookup(&document, field);
+                let found = lookup(&document, &field.path);
+                let profile = is_profile_path(&field.path);
                 let agrees = match found {
-                    Some(found) => holds(found, &row.value),
-                    None => same(&row.default, &row.value),
+                    Some(found) if profile => same(&shape_of_value(found), &field.value),
+                    Some(found) => holds(found, &field.value),
+                    None => !profile && same(&row.default, &field.value),
                 };
                 if !agrees {
+                    let held = match found {
+                        Some(found) if profile => render_shape(&shape_of_value(found)),
+                        Some(found) => render(found),
+                        None => "nothing".to_string(),
+                    };
                     return Err(Disagreement {
                         flag: row.flag,
-                        shown: row.shown.clone(),
-                        field: field.clone(),
-                        held: found.map_or_else(|| "nothing".to_string(), render),
+                        shown: field.shown.clone(),
+                        field: field.path.clone(),
+                        held,
                     });
                 }
             }
@@ -1747,6 +2019,10 @@ mod tests {
 
     fn given(ids: &[&str]) -> GivenFlags {
         ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    fn paths(row: &Consumed) -> Vec<&str> {
+        row.fields.iter().map(|field| field.path.as_str()).collect()
     }
 
     fn ids(report: &Report) -> Vec<&'static str> {
@@ -2202,7 +2478,7 @@ bindings:
             .find(|row| row.id == "eviction_interval")
             .expect("the sweep row");
         assert_eq!(
-            sweep.fields,
+            paths(sweep),
             ["index[\"*\"].sweep_s", "bindings[0].sessions.sweep_s"]
         );
         assert_eq!(sweep.shown, "90");
@@ -2258,7 +2534,9 @@ bindings:
         );
         let unused = both.report.deprecation_lines("1.17", false)[2].clone();
         assert!(
-            unused.contains("it compiled to nothing (cache_aware routes no request in this mode)"),
+            unused.contains(
+                "it compiled to nothing (cache_aware routes no request under --pd-disaggregation)"
+            ),
             "{unused}"
         );
         assert!(both.report.notes.iter().any(|note| note
@@ -2291,7 +2569,7 @@ bindings:
         );
         assert_eq!(ids(&compiled.report), ["policy", "pd_pairing_mode"]);
         let main = &compiled.report.consumed[0];
-        assert_eq!(main.fields, ["profiles.prefill", "profiles.decode"]);
+        assert_eq!(paths(main), ["profiles.prefill", "profiles.decode"]);
     }
 
     /// The encode side joins under the `epd` plan; its default is written
@@ -2620,6 +2898,160 @@ bindings:
         assert_eq!(ROUTING_FLAGS_REMOVED_IN, "1.17");
     }
 
+    /// The prefix form is written whole: the engine reads the prefix from
+    /// the presence of `prefix_tokens` and the bound from its block, so a
+    /// default `prefix_hash` carries both.
+    #[test]
+    fn a_default_prefix_hash_is_written_whole() {
+        let compiled = compile(&regular(PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: Vec::new(),
+        }));
+        assert_eq!(
+            compiled.spec,
+            doc("\
+apiVersion: smg.policy/v1
+generation: 1
+profiles:
+  prefix_hash:
+    filter: [healthy, not-overloaded, not-tried]
+    score:
+      - consistent-hash:
+          prefix_tokens: 256
+          bounded_load: { factor: 1.25, abs_margin: 10 }
+    pick: best
+bindings:
+  - match: { model: \"*\" }
+    profile: prefix_hash
+")
+        );
+        assert_eq!(ids(&compiled.report), ["policy"]);
+    }
+
+    /// A routing flag the front end saw that the policy in use does not
+    /// read still gets its row: the line names the reason instead of a
+    /// field, and the series counts it.
+    #[test]
+    fn a_given_flag_the_policy_does_not_read_gets_a_row_naming_the_reason() {
+        let compiled = compile_given(
+            &regular(PolicyConfig::RoundRobin),
+            &given(&["policy", "cache_threshold", "max_idle_secs"]),
+        );
+        assert_eq!(
+            ids(&compiled.report),
+            ["policy", "cache_threshold", "max_idle_secs"]
+        );
+        let unread = &compiled.report.consumed[1];
+        assert!(unread.fields.is_empty());
+        assert_eq!(
+            unread.deprecation_line("1.17", false),
+            "smg: --cache-threshold is deprecated and is removed in 1.17; it compiled to \
+             nothing (the round_robin policy does not read it); write it in --policy-spec"
+        );
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+    }
+
+    /// A zero idle time keeps keys for ever and owns the sweep field too; no
+    /// row claims a sweep that was never given.
+    #[test]
+    fn a_zero_idle_time_owns_the_sweep_field() {
+        let compiled = compile(&regular(PolicyConfig::Manual {
+            eviction_interval_secs: 120,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::Random,
+        }));
+        assert_eq!(ids(&compiled.report), ["max_idle_secs", "policy"]);
+        let idle = &compiled.report.consumed[0];
+        assert_eq!(
+            paths(idle),
+            ["bindings[0].sessions.ttl_s", "bindings[0].sessions.sweep_s"]
+        );
+        assert_eq!(
+            idle.deprecation_line("1.17", false),
+            "smg: --max-idle-secs is deprecated and is removed in 1.17; it compiled to \
+             bindings[0].sessions.ttl_s and bindings[0].sessions.sweep_s = 4294967295; write \
+             it in --policy-spec"
+        );
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+
+        let carried = compile_given(
+            &regular(PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 0,
+                assignment_mode: ManualAssignmentMode::Random,
+            }),
+            &given(&["max_idle_secs", "eviction_interval"]),
+        );
+        assert_eq!(
+            ids(&carried.report),
+            ["max_idle_secs", "eviction_interval", "policy"]
+        );
+        assert_eq!(
+            carried.report.consumed[1].deprecation_line("1.17", false),
+            "smg: --eviction-interval is deprecated and is removed in 1.17; it compiled to \
+             nothing (a zero idle time keeps keys for ever, so the sweep is for ever too); \
+             write it in --policy-spec"
+        );
+        assert_eq!(carried.check_against(&carried.spec), Ok(()));
+    }
+
+    /// The resident-tokens form names its request tokens beside the picker.
+    #[test]
+    fn the_resident_form_names_its_request_tokens() {
+        let compiled = compile(&regular(PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::ResidentTokens {
+                request_tokens: 4096,
+            },
+        }));
+        let row = &compiled.report.consumed[0];
+        assert_eq!(row.id, "power_of_two_load_metric");
+        assert_eq!(
+            paths(row),
+            [
+                "profiles.power_of_two.pick",
+                "profiles.power_of_two.score.resident-work.request_tokens"
+            ]
+        );
+        assert_eq!(
+            row.deprecation_line("1.17", false),
+            "smg: --power-of-two-load-metric is deprecated and is removed in 1.17; it compiled \
+             to profiles.power_of_two.pick = best and \
+             profiles.power_of_two.score.resident-work.request_tokens = 4096; write it in \
+             --policy-spec"
+        );
+        assert_eq!(compiled.check_against(&compiled.spec), Ok(()));
+    }
+
+    /// A policy flag is held by a document whose profile has the policy's
+    /// stages; a profile of another shape under the same name is refused
+    /// naming the field and the shape held.
+    #[test]
+    fn a_profile_of_another_shape_refuses_the_policy_flag() {
+        let compiled = compile_given(&regular(cache_aware()), &given(&["policy"]));
+        let other = doc("\
+apiVersion: smg.policy/v1
+generation: 1
+profiles:
+  cache_aware:
+    filter: [healthy, not-overloaded, not-tried]
+    score: [least-load]
+    pick: best
+bindings:
+  - match: { model: \"*\" }
+    profile: cache_aware
+");
+        let refused = compiled
+            .check_against(&other)
+            .expect_err("another shape under the name");
+        assert_eq!(refused.field, "profiles.cache_aware");
+        assert_eq!(
+            refused.held,
+            "filter [healthy, not-overloaded, not-tried], score [least-load], pick best"
+        );
+    }
+
     /// Every document the converter writes validates under the engine, or
     /// is refused only for a stage, a plan or a binding rule this build
     /// lacks: never for its shape.
@@ -2651,6 +3083,33 @@ bindings:
                     load_metric: PowerOfTwoLoadMetric::ExpectedWait,
                 }),
             ),
+            regular(PolicyConfig::PrefixHash {
+                prefix_token_count: 256,
+                load_factor: 1.25,
+                balance_abs_threshold: 10,
+                cache_boundaries: Vec::new(),
+            }),
+            regular(PolicyConfig::PowerOfTwo {
+                load_metric: PowerOfTwoLoadMetric::ResidentTokens {
+                    request_tokens: 4096,
+                },
+            }),
+            regular(PolicyConfig::Manual {
+                eviction_interval_secs: 60,
+                max_idle_secs: 0,
+                assignment_mode: ManualAssignmentMode::Random,
+            }),
+            RouterConfig::builder()
+                .regular_mode(vec!["http://worker-a:8000".to_string()])
+                .policy(cache_aware())
+                .routing_key_override(RoutingKeyOverrideConfig {
+                    enabled: true,
+                    eviction_interval_secs: 60,
+                    max_idle_secs: 0,
+                    assignment_mode: ManualAssignmentMode::Delegate,
+                    headers: vec!["x-session-id".to_string()],
+                })
+                .build_unchecked(),
         ];
         for config in &configs {
             let compiled = compile(config);
@@ -2658,6 +3117,22 @@ bindings:
                 Ok(_) | Err(SpecError::NotInBuild { .. }) => {}
                 Err(other) => panic!("{other}: {:?}", compiled.spec),
             }
+            // The round trip: every flag the converter consumed is held by
+            // the document it wrote, whatever the flag set.
+            assert_eq!(
+                compiled.check_against(&compiled.spec),
+                Ok(()),
+                "{:?}",
+                compiled.report
+            );
+            let every: GivenFlags = FLAGS.iter().map(|flag| flag.id.to_string()).collect();
+            let given = compile_given(config, &every);
+            assert_eq!(
+                given.check_against(&given.spec),
+                Ok(()),
+                "{:?}",
+                given.report
+            );
         }
     }
 }
