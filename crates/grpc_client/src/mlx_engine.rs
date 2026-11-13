@@ -6,7 +6,7 @@ use openai_protocol::{
 
 use crate::{
     channel::Channel,
-    request_fields::{logit_bias_by_token_id, OutputConstraint},
+    request_fields::{legacy_seed_i32, logit_bias_by_token_id, seed_folded_i32, OutputConstraint},
     BoxedTraceInjector,
 };
 
@@ -299,7 +299,7 @@ impl MlxEngineClient {
             ignore_eos: request.ignore_eos,
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            seed: request.seed.and_then(|s| i32::try_from(s).ok()),
+            seed: request.seed.map(legacy_seed_i32),
         }
     }
 
@@ -319,7 +319,7 @@ impl MlxEngineClient {
             ignore_eos: request.ignore_eos,
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            seed: request.seed.and_then(|s| i32::try_from(s).ok()),
+            seed: request.seed.map(legacy_seed_i32),
         }
     }
 
@@ -381,7 +381,7 @@ impl MlxEngineClient {
             sampling.max_tokens = Some(max_new_tokens);
         }
         if let Some(seed) = p.sampling_seed {
-            sampling.seed = i32::try_from(seed).ok();
+            sampling.seed = Some(seed_folded_i32(seed));
         }
 
         sampling
@@ -412,7 +412,7 @@ mod tests {
     use crate::channel::testing::refused_endpoint;
 
     #[test]
-    fn plain_sampling_seed_is_forwarded_when_it_fits() {
+    fn plain_sampling_seed_is_forwarded_folded_past_the_wire_width() {
         let seeded = |seed| GenerateSamplingParams {
             sampling_seed: seed,
             ..Default::default()
@@ -423,7 +423,7 @@ mod tests {
         );
         assert_eq!(
             MlxEngineClient::build_sampling_params_from_plain(Some(&seeded(Some(u64::MAX)))).seed,
-            None
+            Some(0)
         );
     }
 

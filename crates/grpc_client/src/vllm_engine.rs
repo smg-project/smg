@@ -9,8 +9,9 @@ use tracing::{debug, warn};
 use crate::{
     channel::Channel,
     request_fields::{
-        body_format, completion_constraint, logit_bias_by_token_id, plain_constraint, stop_strings,
-        ConstraintKind, OutputConstraint, PlainSampling,
+        body_format, completion_constraint, legacy_seed_i32, logit_bias_by_token_id,
+        plain_constraint, seed_folded_i32, stop_strings, ConstraintKind, OutputConstraint,
+        PlainSampling,
     },
     BoxedTraceInjector,
 };
@@ -210,13 +211,9 @@ impl VllmEngineClient {
             n: request.n.unwrap_or(1),
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            // Proto seed is i32 (line 48 of generated vllm.grpc.engine.rs);
-            // OpenAI request seed is i64. Saturating cast keeps "set" vs
-            // "unset" distinction (None stays None — vLLM will pick a random
-            // seed itself, matching prior behaviour).
-            seed: request
-                .seed
-                .map(|s| s.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+            // The proto seed is a signed 32-bit word, the OpenAI-compatible seed an int64: itself
+            // when it fits, else its bits folded; None stays None and the engine picks its own.
+            seed: request.seed.map(legacy_seed_i32),
             constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
@@ -451,9 +448,7 @@ impl VllmEngineClient {
             n: request.n.unwrap_or(1),
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            seed: request
-                .seed
-                .map(|s| s.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+            seed: request.seed.map(legacy_seed_i32),
             constraint,
             ..Default::default()
         })
@@ -494,12 +489,8 @@ impl VllmEngineClient {
             ignore_eos: plain.ignore_eos,
             include_stop_str_in_output: plain.no_stop_trim,
             n: plain.n,
-            // The proto seed is i32; the plain seed is u64. Fold the high half into
-            // the low so distinct seeds stay distinct (a saturating cast would send
-            // every seed >= 2^31 to one value).
-            seed: plain
-                .sampling_seed
-                .map(|seed| ((seed ^ (seed >> 32)) as u32) as i32),
+            // The proto seed is a signed 32-bit word, the plain seed a u64: its bits folded.
+            seed: plain.sampling_seed.map(seed_folded_i32),
             constraint: match params {
                 Some(p) => Self::constraint_of(plain_constraint(p)?),
                 None => None,
@@ -697,7 +688,9 @@ mod tests {
         .expect("build sampling params");
         assert_eq!(unset_params.seed, None);
 
-        // Saturating cast: request.seed is i64, proto seed is i32.
+        // A seed past the wire's width is folded, not clamped, so two distinct wide
+        // seeds stay distinct on the wire (a clamp sent every seed from 2^31 up to
+        // one value).
         let huge = ChatCompletionRequest {
             seed: Some(i64::MAX),
             ..Default::default()
@@ -707,7 +700,17 @@ mod tests {
             OutputConstraint::default(),
         )
         .expect("build sampling params");
-        assert_eq!(huge_params.seed, Some(i32::MAX));
+        assert_eq!(huge_params.seed, Some(i32::MIN));
+        let next = ChatCompletionRequest {
+            seed: Some(i64::MAX - 1),
+            ..Default::default()
+        };
+        let next_params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+            &next,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(next_params.seed, Some(i32::MIN + 1));
     }
 
     #[test]
@@ -791,14 +794,22 @@ mod tests {
             .expect("build sampling params");
         assert_eq!(unset_params.seed, None);
 
-        // Saturating cast: request.seed is i64, proto seed is i32.
+        // A seed past the wire's width is folded, not clamped, so two distinct wide
+        // seeds stay distinct on the wire.
         let huge = CompletionRequest {
             seed: Some(i64::MAX),
             ..minimal_completion_request()
         };
         let huge_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&huge)
             .expect("build sampling params");
-        assert_eq!(huge_params.seed, Some(i32::MAX));
+        assert_eq!(huge_params.seed, Some(i32::MIN));
+        let next = CompletionRequest {
+            seed: Some(i64::MAX - 1),
+            ..minimal_completion_request()
+        };
+        let next_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&next)
+            .expect("build sampling params");
+        assert_eq!(next_params.seed, Some(i32::MIN + 1));
     }
 
     /// A chat or completion request's `logit_bias` reaches the proto keyed by

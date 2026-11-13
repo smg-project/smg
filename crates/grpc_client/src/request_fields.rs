@@ -255,6 +255,27 @@ impl Default for PlainSampling {
     }
 }
 
+/// An OpenAI-compatible `seed` (any int64) on a wire whose seed is an unsigned 64-bit word:
+/// the same bits, so every seed is a seed and distinct seeds stay distinct; a negative one
+/// lands in the upper half of the word.
+pub fn seed_bits(seed: i64) -> u64 {
+    seed as u64
+}
+
+/// A 64-bit seed on a wire whose seed is a signed 32-bit word: the two halves of its bits
+/// folded into one, so distinct seeds stay distinct as far as 32 bits allow (a saturating cast
+/// would send every seed past 2^31 to one value).
+pub fn seed_folded_i32(seed: u64) -> i32 {
+    ((seed ^ (seed >> 32)) as u32) as i32
+}
+
+/// An OpenAI-compatible `seed` (any int64) on a wire whose seed is a signed 32-bit word: itself
+/// when it fits, else its bits folded ([`seed_folded_i32`]); a refusal or a silent drop would make
+/// the public field narrower than the public API's.
+pub fn legacy_seed_i32(seed: i64) -> i32 {
+    i32::try_from(seed).unwrap_or_else(|_| seed_folded_i32(seed_bits(seed)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +470,30 @@ mod tests {
             assert_eq!(completion_constraint(&completion), read, "{field}");
             assert_eq!(plain_constraint(&plain), read, "{field}");
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn a_seed_keeps_its_bits_on_an_unsigned_wire() {
+        assert_eq!(seed_bits(7), 7);
+        assert_eq!(seed_bits(-1), u64::MAX);
+        assert_eq!(seed_bits(i64::MIN), 1 << 63);
+    }
+
+    #[test]
+    fn a_seed_folds_onto_a_signed_32_bit_wire_only_past_its_range() {
+        assert_eq!(legacy_seed_i32(7), 7);
+        assert_eq!(legacy_seed_i32(-1), -1);
+        assert_eq!(legacy_seed_i32(i64::from(i32::MIN)), i32::MIN);
+        assert_eq!(legacy_seed_i32(1 << 32), 1);
+        assert_eq!(legacy_seed_i32(i64::MIN), i32::MIN);
+        assert_ne!(legacy_seed_i32(i64::MAX), legacy_seed_i32(i64::MAX - 1));
+        assert_eq!(seed_folded_i32(7), 7);
+        assert_eq!(seed_folded_i32(1 << 32), 1);
+        assert_eq!(seed_folded_i32(u64::MAX), 0);
     }
 }
