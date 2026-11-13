@@ -859,7 +859,9 @@ impl WorkerSelectionStage {
 
     /// Select a PD pair and take its Prefill admission slot. With admission
     /// enabled the selection runs at the head of the admission queue, so a
-    /// queued request commits to a worker only once it is admitted.
+    /// queued request commits to a worker only once it is admitted, under
+    /// the lock on both paths: the legacy policies, or the engine's decision
+    /// and commit ([`Self::place_pd_pair_through_engine`]).
     async fn admit_pd_pair(
         &self,
         model_id: &str,
@@ -869,11 +871,17 @@ impl WorkerSelectionStage {
         media: MediaDemands,
         demand: PairDemands,
     ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
+        let decider = placement::pair_decider(&self.policy_registry, &inputs);
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _, _): &PdWorkerPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, wire, capacity, demand),
+            |capacity| match decider {
+                Some(decider) => self.place_pd_pair_through_engine(
+                    decider, model_id, inputs, wire, capacity, demand,
+                ),
+                None => self.select_pd_pair(model_id, inputs, wire, capacity, demand),
+            },
         )
         .await
         .map_err(|error| {
@@ -1852,16 +1860,87 @@ impl WorkerSelectionStage {
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
-        // Both pools derive from ONE membership snapshot: separate pool
-        // lookups could straddle a concurrent replacement and pair workers
-        // that never coexisted. The pools hold the workers whose wire carries
-        // the PD bootstrap info (gRPC, and TokenSpeed's direct ZMQ, see
-        // `RoutingPool::GrpcPrefill`; the wildcard model maps to the global
-        // snapshot). The pools must
-        // share a runtime, the rendezvous being runtime-specific, and a retry
-        // pins both to the retained plan's runtime.
+        let pairs = self.pd_pairs(model_id);
+        let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, demand, &pairs, |inputs| {
+            placement::select_pair(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                &pairs,
+                wire,
+                true,
+                prefill_capacity,
+                inputs,
+            )
+        })?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// [`Self::select_pd_pair`] through the policy engine under
+    /// `--policy-engine engine`, inside the admission callback as the legacy
+    /// selection runs: the pair decided over the window as the lock reads it
+    /// and committed under the same hold, by the request the queue lets
+    /// select; a commit every target of which missed re-decides once with
+    /// the misses excluded, then the request waits for a slot. The snapshot
+    /// is read and the inputs narrowed afresh on every run, as the legacy
+    /// callback does.
+    fn place_pd_pair_through_engine(
+        &self,
+        decider: &Decider,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        wire: Option<WireConstraint>,
+        capacity: Option<&PrefillSelectionContext<'_>>,
+        demand: PairDemands,
+    ) -> Result<PdWorkerPair, PdSelectionFailure> {
+        let pairs = self.pd_pairs(model_id);
+        let has_capacity = |worker: &Arc<dyn Worker>| {
+            capacity.is_none_or(|capacity| capacity.has_capacity(worker))
+        };
+        let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, demand, &pairs, |inputs| {
+            placement::place_pair_through_engine(
+                &self.worker_registry,
+                &self.policy_registry,
+                decider,
+                model_id,
+                &pairs,
+                wire,
+                true,
+                &has_capacity,
+                inputs,
+            )
+        })?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// The pair index of `model_id`'s snapshot. Both pools derive from ONE
+    /// membership snapshot: separate pool lookups could straddle a concurrent
+    /// replacement and pair workers that never coexisted. The pools hold the
+    /// workers whose wire carries the PD bootstrap info (gRPC, and
+    /// TokenSpeed's direct ZMQ, see `RoutingPool::GrpcPrefill`; the wildcard
+    /// model maps to the global snapshot). The pools must share a runtime,
+    /// the rendezvous being runtime-specific, and a retry pins both to the
+    /// retained plan's runtime.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode())
+    }
+
+    /// The per-request narrowing of a pair placement over `pairs`, then
+    /// `select` with the inputs narrowed: the shapes membership can never
+    /// serve are refused first (a request needing a vision encoder no
+    /// prefill worker has, a prompt no pair's context takes), and the
+    /// candidate filter composes the caller's predicate with the request's
+    /// media demands. Run by the legacy selection and by each closure of
+    /// the decided path.
+    fn with_pd_pair_inputs<R>(
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        wire: Option<WireConstraint>,
+        demand: PairDemands,
+        pairs: &PdPairIndex,
+        select: impl FnOnce(PlacementInputs<'_>) -> Result<R, Box<PairFailure>>,
+    ) -> Result<R, PdSelectionFailure> {
         // A side that needs a vision encoder (see `PairDemands`) is kept off
         // the workers without one. The prefill side must find one: a request
         // carrying pixel media is refused when the index pairs no prefill
@@ -1887,8 +1966,8 @@ impl WorkerSelectionStage {
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
             && pairs.refusal.is_none()
-            && pair_admitted_by(&pairs, wire, &takes_refs)
-            && !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+            && pair_admitted_by(pairs, wire, &takes_refs)
+            && !pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
                 prefill_vision_capable(worker) && takes_refs(worker)
             })
         {
@@ -1901,7 +1980,7 @@ impl WorkerSelectionStage {
         };
         let prefill_with_vision =
             move |worker: &dyn Worker| prefill_vision_capable(worker) && admitted(worker);
-        let require_decode_vision = demand.decode && pair_admitted_by(&pairs, wire, &with_vision);
+        let require_decode_vision = demand.decode && pair_admitted_by(pairs, wire, &with_vision);
         let candidate_filter: Option<CandidateFilter<'_>> = if require_decode_vision {
             Some(&with_vision)
         } else if demand.prefill {
@@ -1922,7 +2001,7 @@ impl WorkerSelectionStage {
         };
         // Membership, not health, decides whether a request can ever fit.
         // Inspect actual partners: independently large pools need not pair.
-        if !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+        if !pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
             takes_media(worker) && demand.context.admits(worker, model_id)
         }) {
             let mut largest = None;
@@ -1963,17 +2042,7 @@ impl WorkerSelectionStage {
             candidate_filter: Some(&fits),
             ..inputs
         };
-        let pair = placement::select_pair(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            &pairs,
-            wire,
-            true,
-            prefill_capacity,
-            inputs,
-        )?;
-        Ok((pair.prefill, pair.decode, pair.runtime))
+        select(inputs).map_err(PdSelectionFailure::from)
     }
 
     /// Select per-item encode workers + a prefill/decode pair for EPD routing.
@@ -2701,6 +2770,59 @@ mod tests {
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
         }
         (prefill_hits, decode_hits)
+    }
+
+    /// Under `--policy-engine engine` the stage admits its pair through the
+    /// engine's decision: round robin on both roles covers every worker of
+    /// both pools evenly over 40 admissions, every one a decision of the
+    /// engine.
+    #[tokio::test]
+    async fn the_engine_decides_the_pair_through_the_stage() {
+        use crate::config::PolicyEngineMode;
+
+        let model_id = "test-model-engine-pair";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
+        let round_robin = PolicyConfig::RoundRobin;
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+                PolicyEngineMode::Engine,
+                &round_robin,
+                &round_robin,
+            )),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let mut prefill_hits = HashMap::new();
+        let mut decode_hits = HashMap::new();
+        for _ in 0..40 {
+            let ((prefill, decode, _), guard) = stage
+                .admit_pd_pair(
+                    model_id,
+                    PlacementInputs::default(),
+                    None,
+                    None,
+                    MediaDemands::NONE,
+                    PairDemands::default(),
+                )
+                .await
+                .unwrap_or_else(|response| panic!("a pair is admitted: {response:?}"));
+            *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
+            *decode_hits.entry(decode.url().to_string()).or_default() += 1;
+            drop(guard);
+        }
+        assert_even_pd_round_robin_coverage(
+            &prefill_urls,
+            &decode_urls,
+            &prefill_hits,
+            &decode_hits,
+        );
+        assert_eq!(
+            stage.policy_registry.decider().expect("hosted").decisions(),
+            40,
+            "every admission was decided through the engine"
+        );
     }
 
     /// A saturated prefill pool is a pressure condition, not model absence.
