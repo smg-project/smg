@@ -2198,14 +2198,14 @@ mod tests {
 
     /// A streamed answer with a block of a kind this gateway does not read
     /// reaches the client as it came and is stored with the block as the
-    /// upstream sent it, beside the text it reads.
+    /// upstream sent it, beside the text it reads. A continue from it reads
+    /// the stored blocks as the request's input, which has no form for a kind
+    /// no API has, so it is the 404.
     #[tokio::test]
     async fn a_streamed_block_this_gateway_does_not_read_is_stored_as_sent() {
         let threads = MessageThreads::new();
-        let block = json!({
-            "type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1",
-            "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}
-        });
+        let block =
+            json!({"type": "a_block_kind_of_no_api", "tool_use_id": "srvtoolu_1", "detail": "x"});
         let mut events = text_events("msg_unknown", "known");
         events.splice(
             4..4,
@@ -2237,6 +2237,16 @@ mod tests {
         let stored = &turns[0].raw_response;
         assert_eq!(stored["content"][0]["text"], "known");
         assert_eq!(stored["content"][1], block);
+        let refused = refusal(
+            threads
+                .resolve(continue_from("msg_unknown", "again"), None)
+                .await,
+        );
+        assert_eq!(
+            refused.status(),
+            StatusCode::NOT_FOUND,
+            "the request does not read the block"
+        );
     }
 
     /// A stream with data this gateway cannot read (a tool call whose input

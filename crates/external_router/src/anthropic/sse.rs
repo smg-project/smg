@@ -451,8 +451,9 @@ impl BlockAccumulator {
             Self::Passthrough { content_block } => {
                 // Deserialize the raw content_block JSON into a ContentBlock:
                 // any object reads, a kind this build does not know as
-                // `ContentBlock::Other`. A block that is not an object falls
-                // back to empty text.
+                // `ContentBlock::Other`. A block that is no object (an event
+                // without its `content_block`, read as null) falls back to
+                // empty text.
                 match serde_json::from_value::<ContentBlock>(content_block.clone()) {
                     Ok(block) => (block, None),
                     Err(e) => {

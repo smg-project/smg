@@ -12,6 +12,7 @@ use openai_protocol::messages::{
     ThinkingBlock, Tool, ToolChoice, ToolReferenceBlock, ToolResultBlock, ToolResultContent,
     ToolResultContentBlock, ToolSearchToolResultBlock, ToolUseBlock, WebSearchToolResultBlock,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use smg_mcp::{McpToolSession, ToolEntry, ToolExecutionInput};
 use tracing::{debug, info, warn};
@@ -115,13 +116,17 @@ pub(crate) async fn process_iteration(
         "Executing MCP tool calls"
     );
 
-    let (mcp_calls, assistant_blocks, tool_result_blocks) = execute_mcp_tool_calls(
+    let (mcp_calls, assistant_blocks, tool_result_blocks) = match execute_mcp_tool_calls(
         &result.content_blocks,
         &result.tool_use_blocks,
         session,
         model_id,
     )
-    .await;
+    .await
+    {
+        Ok(executed) => executed,
+        Err(msg) => return ToolLoopAction::Error(msg),
+    };
 
     ToolLoopAction::Continue(ToolLoopContinuation {
         mcp_calls,
@@ -320,12 +325,17 @@ async fn execute_mcp_tool_calls(
     tool_calls: &[ToolUseBlock],
     session: &McpToolSession<'_>,
     model_id: &str,
-) -> (
-    Vec<McpToolCall>,
-    Vec<InputContentBlock>,
-    Vec<InputContentBlock>,
-) {
-    let assistant_content_blocks = build_assistant_content_blocks(content);
+) -> Result<
+    (
+        Vec<McpToolCall>,
+        Vec<InputContentBlock>,
+        Vec<InputContentBlock>,
+    ),
+    String,
+> {
+    // Built before any tool runs: an answer the next round cannot carry
+    // stops the loop with no tool's side effect.
+    let assistant_content_blocks = build_assistant_content_blocks(content)?;
 
     let mut mcp_calls = Vec::new();
     let mut tool_result_blocks: Vec<InputContentBlock> = Vec::new();
@@ -386,7 +396,7 @@ async fn execute_mcp_tool_calls(
         }));
     }
 
-    (mcp_calls, assistant_content_blocks, tool_result_blocks)
+    Ok((mcp_calls, assistant_content_blocks, tool_result_blocks))
 }
 
 // ============================================================================
@@ -605,7 +615,14 @@ fn convert_tool_entry_to_anthropic_tool(entry: &ToolEntry, defer_loading: bool) 
     }
 }
 
-fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentBlock> {
+/// The answer's blocks as the assistant turn of the next round's request: each
+/// block in its input form. A block of a kind this build does not read goes
+/// back as the upstream wrote it when the request reads it; one the request
+/// cannot carry is the error, naming its type, so the loop stops before it
+/// runs a tool rather than send the upstream an incomplete history.
+fn build_assistant_content_blocks(
+    content: &[ContentBlock],
+) -> Result<Vec<InputContentBlock>, String> {
     let mut blocks = Vec::new();
     for block in content {
         match block {
@@ -684,20 +701,19 @@ fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentB
             }
             // MCP blocks are handled separately by rebuild_response_with_mcp_blocks
             ContentBlock::McpToolUse { .. } | ContentBlock::McpToolResult { .. } => {}
-            // A block this build does not read goes back in the next round's
-            // history when the request reads it, and is left out otherwise.
-            ContentBlock::Other(block) => {
-                match serde_json::from_value::<InputContentBlock>(block.clone()) {
-                    Ok(block) => blocks.push(block),
-                    Err(error) => warn!(
-                        %error,
-                        "leaving a content block of a kind this build does not read out of the next round's history"
-                    ),
+            ContentBlock::Other(block) => match InputContentBlock::deserialize(block) {
+                Ok(block) => blocks.push(block),
+                Err(error) => {
+                    let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+                    warn!(%error, block_type, "an answer block the next round cannot carry");
+                    return Err(format!(
+                        "The answer holds a '{block_type}' block, which the MCP loop cannot carry into its next round; tool calls will not be executed"
+                    ));
                 }
-            }
+            },
         }
     }
-    blocks
+    Ok(blocks)
 }
 
 fn push_mcp_blocks(content: &mut Vec<ContentBlock>, call: &McpToolCall) {
@@ -990,6 +1006,39 @@ mod tests {
         .expect("a message")
     }
 
+    /// A block of a kind the answer does not read goes back in the next
+    /// round's history as the upstream wrote it when the request reads it (a
+    /// `search_result` here, which only the request names); one the request
+    /// cannot read either is the loop's error, naming the block, so no tool
+    /// runs with a history the upstream would get incomplete.
+    #[test]
+    fn an_answer_block_the_next_round_cannot_carry_stops_the_loop() {
+        let readable: Vec<ContentBlock> = serde_json::from_value(json!([
+            {"type": "text", "text": "before"},
+            {"type": "search_result", "source": "https://example.com", "title": "t",
+             "content": [{"type": "text", "text": "found"}]},
+            {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
+        ]))
+        .unwrap();
+        assert!(matches!(readable[1], ContentBlock::Other(_)));
+        let blocks = build_assistant_content_blocks(&readable).expect("the request reads it");
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            matches!(blocks[1], InputContentBlock::SearchResult(_)),
+            "{:?}",
+            blocks[1]
+        );
+
+        let unreadable: Vec<ContentBlock> = serde_json::from_value(json!([
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "a_tool", "input": {}},
+            {"type": "a_block_kind_of_no_api", "tool_use_id": "srvtoolu_1"},
+            {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
+        ]))
+        .unwrap();
+        let error = build_assistant_content_blocks(&unreadable).expect_err("the loop stops");
+        assert!(error.contains("'a_block_kind_of_no_api'"), "{error}");
+    }
+
     /// What a round does with the message's content: the iteration result,
     /// the conversion into the next request's input blocks, the blocks kept
     /// for the final response. Taken and moved, the blocks are copied once
@@ -1011,7 +1060,7 @@ mod tests {
         let before = counting_alloc::calls();
         let content_blocks = copied.content.clone();
         let tool_use_blocks = extract_tool_calls(&content_blocks);
-        let assistant = build_assistant_content_blocks(&content_blocks);
+        let assistant = build_assistant_content_blocks(&content_blocks).expect("readable blocks");
         let mut prior: Vec<ContentBlock> = Vec::new();
         prior.extend(copied.content.clone());
         let copied_calls = counting_alloc::calls() - before;
@@ -1020,7 +1069,8 @@ mod tests {
         // The shape now: taken, converted, moved.
         let before = counting_alloc::calls();
         let result = IterationResult::take_from(&mut moved);
-        let assistant = build_assistant_content_blocks(&result.content_blocks);
+        let assistant =
+            build_assistant_content_blocks(&result.content_blocks).expect("readable blocks");
         let mut prior: Vec<ContentBlock> = Vec::new();
         prior.extend(result.content_blocks);
         let moved_calls = counting_alloc::calls() - before;

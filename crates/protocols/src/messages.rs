@@ -1477,9 +1477,21 @@ pub enum ContentBlock {
     /// A block this build does not read, kept as the upstream sent it: an
     /// upstream answer must parse whatever block the public API adds (a web
     /// fetch or code execution result, a container upload, ...), and leave
-    /// with the same object.
-    #[serde(untagged)]
+    /// with the same object. Only a JSON object reads here, as a content block
+    /// is always one.
+    #[serde(untagged, deserialize_with = "deserialize_block_object")]
     Other(Value),
+}
+
+/// A content block of a kind this build does not read: any JSON object, and
+/// nothing else.
+fn deserialize_block_object<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+    let block = Value::deserialize(deserializer)?;
+    if block.is_object() {
+        Ok(block)
+    } else {
+        Err(de::Error::custom("a content block is a JSON object"))
+    }
 }
 
 /// The caller of a `tool_use` block, as the public API reports it: the model
@@ -3671,6 +3683,14 @@ mod tests {
             let event: MessageStreamEvent =
                 serde_json::from_value(start.clone()).unwrap_or_else(|e| panic!("{block}: {e}"));
             assert_eq!(serde_json::to_value(&event).unwrap(), start);
+        }
+        // A content block is always an object: a value of another JSON type
+        // is no block at all, not one this build does not read.
+        for not_a_block in [json!("text"), json!(1), json!(null), json!([])] {
+            assert!(
+                serde_json::from_value::<ContentBlock>(not_a_block.clone()).is_err(),
+                "{not_a_block}"
+            );
         }
     }
 
