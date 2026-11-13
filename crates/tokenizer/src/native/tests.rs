@@ -3479,6 +3479,12 @@ const SENTENCEPIECE_ADDED: &[(&str, bool)] = &[("<think>", false), ("[note]", tr
 /// one merge joins a word to the marker after it, so a token spans a word
 /// boundary.
 fn sentencepiece_model(state: &mut u64) -> BPE {
+    sentencepiece_model_with(state, true)
+}
+
+/// [`sentencepiece_model`] with or without the tab's byte token (`<0x09>`;
+/// the tab itself stays a token, as every other pool character is).
+fn sentencepiece_model_with(state: &mut u64, tab_byte_token: bool) -> BPE {
     let mut vocab = Vocab::default();
     let add = |vocab: &mut Vocab, token: String| {
         if !vocab.contains_key(&token) {
@@ -3489,7 +3495,7 @@ fn sentencepiece_model(state: &mut u64) -> BPE {
     for token in ["<unk>", "<s>", "</s>"] {
         add(&mut vocab, token.to_owned());
     }
-    for byte in 0..=255u8 {
+    for byte in (0..=255u8).filter(|&byte| tab_byte_token || byte != b'\t') {
         add(&mut vocab, format!("<0x{byte:02X}>"));
     }
     add(&mut vocab, WORD_MARKER.to_string());
@@ -3560,6 +3566,9 @@ struct SentencepieceShape {
     prepend: bool,
     /// The post-processor frames the ids with `<s>`.
     bos: bool,
+    /// The vocabulary holds the tab's byte token (`<0x09>`); without it
+    /// the tab, a token of its own, never falls back to the byte.
+    tab_byte_token: bool,
 }
 
 fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
@@ -3572,6 +3581,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             metaspace: None,
             prepend: false,
             bos: true,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "replace",
@@ -3581,6 +3591,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             metaspace: None,
             prepend: false,
             bos: false,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "metaspace-first",
@@ -3590,6 +3601,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             metaspace: Some(PrependScheme::First),
             prepend: false,
             bos: true,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "metaspace-always",
@@ -3599,6 +3611,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             metaspace: Some(PrependScheme::Always),
             prepend: false,
             bos: false,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "metaspace-never",
@@ -3608,6 +3621,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             metaspace: Some(PrependScheme::Never),
             prepend: false,
             bos: false,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "replace-in-sequence",
@@ -3617,6 +3631,7 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             metaspace: None,
             prepend: false,
             bos: true,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "prepend-replace",
@@ -3626,12 +3641,26 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             metaspace: None,
             prepend: true,
             bos: true,
+            tab_byte_token: true,
+        },
+        // The `Replace` shape over a vocabulary without the tab's byte
+        // token: the tab is a token of its own, so the fallback never
+        // spells its byte.
+        SentencepieceShape {
+            name: "replace-without-the-tab-byte-token",
+            replace: true,
+            sequence: false,
+            split: false,
+            metaspace: None,
+            prepend: false,
+            bos: false,
+            tab_byte_token: false,
         },
     ]
 }
 
 fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTokenizer {
-    let mut tokenizer = HfTokenizer::new(sentencepiece_model(state));
+    let mut tokenizer = HfTokenizer::new(sentencepiece_model_with(state, shape.tab_byte_token));
     if shape.replace {
         let replace = Replace::new(" ", "\u{2581}").expect("a Replace normalizer");
         let normalizer: NormalizerWrapper = if shape.prepend {
@@ -4196,6 +4225,56 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
 }
 
 #[test]
+fn a_tab_without_its_byte_token_encodes_as_the_library_does() {
+    // The byte-fallback shape whose vocabulary lacks the tab's byte token:
+    // the tab is a token of its own, so a tab anywhere (alone, in runs,
+    // beside words, spaces, characters that fall back to their bytes and
+    // added tokens) encodes to the same ids, serial and pooled, and a long
+    // text as one unit.
+    let mut state = 0x7AB0_09B1_0000_0007u64;
+    let shape = sentencepiece_shapes()
+        .into_iter()
+        .find(|shape| shape.name == "replace-without-the-tab-byte-token")
+        .expect("the shape");
+    let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+    assert!(
+        tokenizer.get_model().token_to_id("<0x09>").is_none()
+            && tokenizer.get_model().token_to_id("\t").is_some(),
+        "the vocabulary lacks the tab's byte token and holds the tab"
+    );
+    let native = seeded(&tokenizer);
+    let mut texts: Vec<String> = [
+        "\t",
+        "a\tb",
+        "\t\t\t",
+        "the\tend",
+        " \t ",
+        "the the\tthe",
+        "\u{E9}\t\u{4E2D}",
+        "\u{1F600}\t\u{1F44D}",
+        "x\t\n",
+        "<think>\tnote",
+        "[note]\t",
+        "\u{7F}\t\u{0}",
+    ]
+    .iter()
+    .map(|text| (*text).to_owned())
+    .collect();
+    let long: String = texts.concat().repeat(1 + PARALLEL_MIN_BYTES / 40);
+    texts.push(long);
+    for text in &texts {
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{text:?} parallel {parallel}"
+            );
+        }
+    }
+}
+
+#[test]
 fn sentencepiece_shapes_outside_the_path_are_declined() {
     let mut state = 0xDEC1_1DED_5EED_0001u64;
     let shapes = sentencepiece_shapes();
@@ -4362,6 +4441,15 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         tokenizer
     };
     assert_eq!(declined(&small(&[], "<0x7F>")), "byte 0x7f has no token");
+    // The tab's byte token missing: the tab as a token of its own never
+    // falls back, so the path stays; without the tab token, or for a byte
+    // beyond ASCII (inside any character that is no token), it declines.
+    assert!(NativeEncoder::from_tokenizer(&small(&["\t"], "<0x09>")).is_ok());
+    assert_eq!(declined(&small(&[], "<0x09>")), "byte 0x09 has no token");
+    assert_eq!(
+        declined(&small(&["\t"], "<0xE2>")),
+        "byte 0xe2 has no token"
+    );
     assert_eq!(
         declined(&small(&["a<0x41>"], "")),
         "the token \"a<0x41>\" spells a byte token inside it"
