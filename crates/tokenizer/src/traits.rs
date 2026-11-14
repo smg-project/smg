@@ -5,8 +5,11 @@ use std::{
 
 use anyhow::Result;
 
-use crate::chat_template::{
-    ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+use crate::{
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+    },
+    decode_activity::note_prefix_mismatch,
 };
 
 /// Type alias for token IDs
@@ -252,7 +255,7 @@ pub(crate) fn past_emitted(decoded: &str, prefix: &str) -> DecodeStep {
                 .zip(prefix.chars())
                 .find(|((_, a), b)| a != b)
                 .map_or_else(|| decoded.len().min(prefix.len()), |((index, _), _)| index);
-            crate::decode_activity::note_prefix_mismatch(false);
+            note_prefix_mismatch(false);
             (decoded[common..].to_string(), true)
         }
     };
