@@ -1,16 +1,13 @@
 //! Step to find workers to remove based on URL.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::{
-    worker::endpoint::Endpoint,
-    workflow::data::{WorkerList, WorkerRemovalWorkflowData},
-};
+use crate::{worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
 
 /// Request structure for worker removal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -76,10 +73,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
                     ?expected_revisions,
                     "Skipping stale worker removal job after same-URL replacement"
                 );
-                context.data.workers_to_remove = Some(WorkerList::new());
-                context.data.actual_workers_to_remove = Some(Vec::new());
-                context.data.worker_urls = Vec::new();
-                context.data.affected_models = HashSet::new();
+                context.data.keep_only(Vec::new());
                 return Ok(StepResult::Success);
             }
         } else if workers_to_remove.is_empty() {
@@ -95,22 +89,8 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             Endpoint::redacted_str(&request.url)
         );
 
-        // Store workers and their model IDs for subsequent steps
-        let worker_urls: Vec<String> = workers_to_remove
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect();
-
-        let affected_models: HashSet<String> = workers_to_remove
-            .iter()
-            .map(|w| w.model_id().to_string())
-            .collect();
-
-        // Update workflow data
-        context.data.workers_to_remove = Some(WorkerList::from_workers(&workers_to_remove));
-        context.data.actual_workers_to_remove = Some(workers_to_remove);
-        context.data.worker_urls = worker_urls;
-        context.data.affected_models = affected_models;
+        // The workers, their URLs and their models for the steps after this one.
+        context.data.keep_only(workers_to_remove);
 
         Ok(StepResult::Success)
     }

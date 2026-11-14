@@ -1,11 +1,14 @@
 //! Step to remove workers from worker registry.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::endpoint::Endpoint,
+    worker::{endpoint::Endpoint, Worker},
     workflow::{
         data::WorkerRemovalWorkflowData,
         steps::shared::{pool_group, refresh_worker_pool_sizes, PoolGroups},
@@ -15,8 +18,15 @@ use crate::{
 /// Step to remove workers from the worker registry.
 ///
 /// A pinned removal (`WorkerRemovalRequest::expected_revisions`) removes the
-/// workers it selected, by id; an unguarded one removes whatever stands
-/// under each URL.
+/// incarnation it selected: an id pinned at a revision while the worker is
+/// at that revision or still reads `Draining` (a removal's own mark, this
+/// job's or an earlier one's that never completed, which a rebuild under the
+/// id inherits and nothing but an activation reverses),
+/// an id pinned at no revision (a `DELETE`'s) as it stands. A replacement
+/// that stands on its own (activated to `Ready`, or never drained) and a
+/// registration under the URL since the selection are left standing and
+/// leave the job, so the policy step touches nothing of them. An unguarded
+/// removal removes whatever stands under each URL.
 pub struct RemoveFromWorkerRegistryStep;
 
 #[async_trait]
@@ -25,12 +35,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let worker_urls = &context.data.worker_urls;
+        let app_context =
+            Arc::clone(
+                context.data.app_context.as_ref().ok_or_else(|| {
+                    WorkflowError::ContextValueNotFound("app_context".to_string())
+                })?,
+            );
+        let registry = &app_context.worker_registry;
+        let worker_urls = context.data.worker_urls.clone();
+        let pins = context.data.config.expected_revisions.clone();
 
         debug!(
             "Removing {} worker(s) from worker registry",
@@ -45,49 +58,86 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         // `LoadMonitor` path used to do here is now handled by
         // `WorkerMonitor` reacting to `WorkerEvent::Removed`.
         let mut unique_configs = PoolGroups::new();
-        for url in worker_urls {
-            if let Some(w) = app_context.worker_registry.get_by_url(url) {
+        for url in &worker_urls {
+            if let Some(w) = registry.get_by_url(url) {
                 unique_configs.insert(pool_group(w.as_ref()));
             }
         }
 
-        // A pinned removal takes the worker it selected, by id: a worker
-        // registered under the URL since the selection is not in its map and
-        // stays, while a worker rebuilt under its id during the drain
-        // inherits the drained runtime and goes with it. An unguarded removal
-        // takes whatever stands under the URL. Either way the worker removed
-        // can differ from the worker found; the policy step asks after the
-        // models of both.
-        let registry = &app_context.worker_registry;
-        let pins = context.data.config.expected_revisions.as_ref();
-        let removed: Vec<_> = worker_urls
-            .iter()
-            .filter_map(|worker_url| match pins {
+        // The worker removed can differ from the worker found (a rebuild
+        // under its id during the drain); the policy step asks after the
+        // models of both. A URL whose worker is left standing leaves the job
+        // below, so that step touches nothing of it.
+        let mut removed: Vec<Arc<dyn Worker>> = Vec::with_capacity(worker_urls.len());
+        let mut standing: Vec<&str> = Vec::new();
+        for worker_url in &worker_urls {
+            let outcome = match &pins {
+                // An unguarded removal takes whatever stands under the URL.
                 None => registry.remove_by_url(worker_url),
                 Some(pins) => {
-                    let worker_id = registry.get_id_by_url(worker_url)?;
-                    if pins.contains_key(worker_id.as_str()) {
-                        registry.remove(&worker_id)
-                    } else {
-                        debug!(
-                            "Worker {} was registered under the URL after the removal's selection, left alone",
-                            Endpoint::redacted_str(worker_url)
-                        );
-                        None
+                    let Some(worker_id) = registry.get_id_by_url(worker_url) else {
+                        continue;
+                    };
+                    match pins.get(worker_id.as_str()) {
+                        // A registration under the URL since the selection.
+                        None => {
+                            debug!(
+                                "Worker {} was registered under the URL after the removal's selection, left alone",
+                                Endpoint::redacted_str(worker_url)
+                            );
+                            standing.push(worker_url);
+                            None
+                        }
+                        // The `DELETE`'s pin: the id as it stands.
+                        Some(None) => registry.remove(&worker_id),
+                        // The incarnation selected: at its pinned revision, or
+                        // a rebuild of it that still reads `Draining`. That
+                        // state is a removal's own mark, this job's drain's or
+                        // an earlier removal's that never completed; a rebuild
+                        // inherits it and only an activation reverses it, so a
+                        // worker still reading it is the drained worker
+                        // continued, and this removal's to take. A worker the
+                        // drain never marked (it was not `Ready`) that was
+                        // replaced since, and a replacement activated since,
+                        // read neither the revision nor the mark: they stand
+                        // on their own and keep their place.
+                        Some(Some(pinned)) => {
+                            let pinned = *pinned;
+                            let removed = registry.remove_if(&worker_id, |worker| {
+                                worker.revision() == pinned
+                                    || worker.status() == WorkerStatus::Draining
+                            });
+                            if removed.is_none() && registry.get(&worker_id).is_some() {
+                                debug!(
+                                    worker_url = %Endpoint::redacted_str(worker_url),
+                                    pinned_revision = pinned,
+                                    "Worker was replaced after the removal's selection and stands on its own, left alone"
+                                );
+                                standing.push(worker_url);
+                            }
+                            removed
+                        }
                     }
                 }
-            })
-            .collect();
+            };
+            removed.extend(outcome);
+        }
         let removed_count = removed.len();
+        let expected = worker_urls.len() - standing.len();
 
         // Log if some workers were already removed (e.g., by another process)
-        if removed_count == worker_urls.len() {
-            debug!("Removed {} worker(s) from registry", removed_count);
+        if removed_count == expected {
+            debug!(
+                "Removed {} worker(s) from registry, {} left standing",
+                removed_count,
+                standing.len()
+            );
         } else {
             warn!(
-                "Removed {} of {} workers (some may have been removed by another process)",
+                "Removed {} of {} workers (some may have been removed by another process), {} left standing",
                 removed_count,
-                worker_urls.len()
+                expected,
+                standing.len()
             );
         }
 
@@ -96,7 +146,18 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         // directly and reconciles per-group polling state on its own,
         // so this step no longer needs to push group-removed
         // notifications.
-        refresh_worker_pool_sizes(&app_context.worker_registry, &unique_configs);
+        refresh_worker_pool_sizes(registry, &unique_configs);
+        if !standing.is_empty() {
+            let kept: Vec<Arc<dyn Worker>> = context
+                .data
+                .actual_workers_to_remove
+                .iter()
+                .flatten()
+                .filter(|worker| !standing.contains(&worker.url()))
+                .map(Arc::clone)
+                .collect();
+            context.data.keep_only(kept);
+        }
         context.data.removed_workers = removed;
 
         Ok(StepResult::Success)
@@ -211,15 +272,94 @@ mod tests {
             ctx.data.removed_workers.is_empty(),
             "the step removed nothing"
         );
+        // The job carries nothing of the URL any more: the policy step after
+        // this one leaves the fresh worker's state alone.
+        assert!(
+            ctx.data.worker_urls.is_empty(),
+            "the fresh worker's URL is out of the job"
+        );
+        assert!(
+            ctx.data
+                .actual_workers_to_remove
+                .as_ref()
+                .is_some_and(Vec::is_empty),
+            "the old snapshot is out of the job"
+        );
+        assert!(
+            ctx.data.affected_models.is_empty(),
+            "the fresh worker's model is out of the job"
+        );
     }
 
-    /// A pinned removal removes the worker it selected by id: a worker rebuilt
-    /// under that id after the selection (a `PUT`, a label refresh) inherits
-    /// the drained worker's runtime, `Draining` included, and goes with the
-    /// removal, whether the pin named a revision or none.
+    /// A rebuild under a revision-pinned id that still reads `Draining` is the
+    /// drained worker continued (the rebuild inherited the drain's mark and
+    /// nothing re-activated it): it goes with the removal, by id.
     #[tokio::test]
-    async fn a_pinned_removal_removes_the_worker_rebuilt_under_its_id() {
-        for pin_at_revision in [true, false] {
+    async fn a_rebuild_that_still_drains_goes_with_a_revision_pinned_removal() {
+        let url = "http://w1:8080";
+        let registry = Arc::new(WorkerRegistry::new());
+        let found = build_worker(url);
+        let found_id = registry
+            .register(Arc::clone(&found))
+            .expect("the worker registers");
+        let pinned = found.revision();
+        let mut ctx = make_context(
+            make_app_context(Arc::clone(&registry)),
+            url,
+            vec![Arc::clone(&found)],
+            Some(HashMap::from([(
+                found_id.as_str().to_string(),
+                Some(pinned),
+            )])),
+        );
+        // The drain wrote `Draining`; the rebuild under the id inherits it.
+        found.set_status(WorkerStatus::Draining);
+        let rebuilt = build_worker(url);
+        assert!(
+            registry.replace(&found_id, Arc::clone(&rebuilt)),
+            "the rebuild lands"
+        );
+        assert_ne!(rebuilt.revision(), pinned, "the rebuild moved the revision");
+        assert_eq!(
+            rebuilt.status(),
+            WorkerStatus::Draining,
+            "the rebuild inherits the drained runtime"
+        );
+
+        let result = RemoveFromWorkerRegistryStep
+            .execute(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(result, StepResult::Success);
+        assert!(
+            registry.get_by_url(url).is_none(),
+            "the rebuild that still drains is removed"
+        );
+        assert_eq!(ctx.data.removed_workers.len(), 1, "one worker removed");
+        assert!(
+            Arc::ptr_eq(&ctx.data.removed_workers[0], &rebuilt),
+            "the worker removed is the rebuild"
+        );
+        assert_eq!(
+            ctx.data.worker_urls,
+            vec![url.to_string()],
+            "the job keeps the URL it removed"
+        );
+    }
+
+    /// A replacement under a revision-pinned id that stands on its own is left
+    /// standing and leaves the job: one a `PUT` activated during the drain
+    /// wait (`Ready` over the inherited `Draining`), and one of a worker the
+    /// drain never marked (it was not `Ready`, so nothing was written). Removed
+    /// by id at any revision, the step took a successful replacement for the
+    /// old worker's removal.
+    #[tokio::test]
+    async fn a_replacement_that_stands_on_its_own_survives_a_revision_pinned_removal() {
+        for (drained, after) in [
+            (WorkerStatus::Draining, WorkerStatus::Ready),
+            (WorkerStatus::NotReady, WorkerStatus::NotReady),
+        ] {
             let url = "http://w1:8080";
             let registry = Arc::new(WorkerRegistry::new());
             let found = build_worker(url);
@@ -227,26 +367,87 @@ mod tests {
                 .register(Arc::clone(&found))
                 .expect("the worker registers");
             let pinned = found.revision();
-            let pin = pin_at_revision.then_some(pinned);
             let mut ctx = make_context(
                 make_app_context(Arc::clone(&registry)),
                 url,
                 vec![Arc::clone(&found)],
-                Some(HashMap::from([(found_id.as_str().to_string(), pin)])),
+                Some(HashMap::from([(
+                    found_id.as_str().to_string(),
+                    Some(pinned),
+                )])),
             );
-            // The drain wrote `Draining`; the rebuild under the id inherits it.
+            found.set_status(drained);
+            let replacement = build_worker(url);
+            assert!(
+                registry.replace(&found_id, Arc::clone(&replacement)),
+                "the replacement lands"
+            );
+            assert_ne!(
+                replacement.revision(),
+                pinned,
+                "the replacement moved the revision"
+            );
+            // The replacement's own workflow activates it (a PUT's), or it
+            // was never drained: either way it stands on its own.
+            replacement.set_status(after);
+
+            let result = RemoveFromWorkerRegistryStep
+                .execute(&mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(result, StepResult::Success);
+            let standing = registry
+                .get_by_url(url)
+                .expect("the replacement stays under the URL ({drained:?} -> {after:?})");
+            assert!(
+                Arc::ptr_eq(&standing, &replacement),
+                "the worker under the URL is the replacement"
+            );
+            assert!(
+                ctx.data.removed_workers.is_empty(),
+                "the step removed nothing ({drained:?} -> {after:?})"
+            );
+            assert!(
+                ctx.data.worker_urls.is_empty()
+                    && ctx
+                        .data
+                        .actual_workers_to_remove
+                        .as_ref()
+                        .is_some_and(Vec::is_empty)
+                    && ctx.data.affected_models.is_empty(),
+                "the replacement is out of the job ({drained:?} -> {after:?})"
+            );
+        }
+    }
+
+    /// An id pinned at no revision (a `DELETE`'s pin) is removed as it
+    /// stands: a rebuild under the id goes whether it still drains or its
+    /// own workflow activated it, since the `DELETE` named the id.
+    #[tokio::test]
+    async fn a_no_revision_pin_removes_the_rebuild_under_its_id_as_it_stands() {
+        for after in [WorkerStatus::Draining, WorkerStatus::Ready] {
+            let url = "http://w1:8080";
+            let registry = Arc::new(WorkerRegistry::new());
+            let found = build_worker(url);
+            let found_id = registry
+                .register(Arc::clone(&found))
+                .expect("the worker registers");
+            let pinned = found.revision();
+            let mut ctx = make_context(
+                make_app_context(Arc::clone(&registry)),
+                url,
+                vec![Arc::clone(&found)],
+                Some(HashMap::from([(found_id.as_str().to_string(), None)])),
+            );
             found.set_status(WorkerStatus::Draining);
             let rebuilt = build_worker(url);
             assert!(
                 registry.replace(&found_id, Arc::clone(&rebuilt)),
                 "the rebuild lands"
             );
-            assert_eq!(
-                rebuilt.status(),
-                WorkerStatus::Draining,
-                "the rebuild inherits the drained runtime"
-            );
             assert_ne!(rebuilt.revision(), pinned, "the rebuild moved the revision");
+            rebuilt.set_status(after);
 
             let result = RemoveFromWorkerRegistryStep
                 .execute(&mut ctx)
@@ -256,7 +457,7 @@ mod tests {
             assert_eq!(result, StepResult::Success);
             assert!(
                 registry.get_by_url(url).is_none(),
-                "the rebuild under the pinned id is removed (pinned at a revision: {pin_at_revision})"
+                "the rebuild under the id the DELETE named is removed ({after:?})"
             );
             assert_eq!(ctx.data.removed_workers.len(), 1, "one worker removed");
             assert!(

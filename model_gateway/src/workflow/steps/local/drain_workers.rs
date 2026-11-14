@@ -20,7 +20,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     worker::{endpoint::Endpoint, Worker},
-    workflow::data::{WorkerList, WorkerRemovalWorkflowData},
+    workflow::data::WorkerRemovalWorkflowData,
 };
 
 /// Step that transitions Ready workers to `Draining` and waits for the
@@ -144,10 +144,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
         }
 
         if kept.len() != workers_to_remove.len() {
-            context.data.worker_urls = kept.iter().map(|w| w.url().to_string()).collect();
-            context.data.affected_models = kept.iter().map(|w| w.model_id().to_string()).collect();
-            context.data.workers_to_remove = Some(WorkerList::from_workers(&kept));
-            context.data.actual_workers_to_remove = Some(kept);
+            context.data.keep_only(kept);
         }
 
         if transitioned == 0 {
@@ -504,6 +501,10 @@ mod tests {
                 .as_ref()
                 .is_some_and(Vec::is_empty),
             "the replacement is out of the job's workers"
+        );
+        assert!(
+            ctx.data.affected_models.is_empty(),
+            "the replacement's model is out of the job's models"
         );
     }
 
