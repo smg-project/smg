@@ -283,15 +283,7 @@ impl Registry {
         ranked.truncate(self.config.max_pd_candidates);
         // Rank E candidates only for shortlisted P/D pairs, never the complete E×P×D product.
         for (pair, _) in &mut ranked {
-            pair.encoders.clone_from(&encoders);
-            pair.encoders.sort_by_key(|e| {
-                (
-                    !e.has_capacity,
-                    e.cost.media_ready_ms().unwrap_or(u64::MAX),
-                    e.stable_tie_break,
-                )
-            });
-            pair.encoders.truncate(self.config.max_encoder_candidates);
+            shortlist_encoders(pair, &encoders, self.config.max_encoder_candidates);
         }
         let (candidates, prefills) = ranked.into_iter().unzip();
         Ok((candidates, prefills, state.generation))
@@ -601,6 +593,23 @@ impl AttemptObserver for Registry {
     }
 }
 
+/// Filter each P's representation/transport contract before applying its candidate bound.
+fn shortlist_encoders(pair: &mut PdCandidate, encoders: &[EncoderCandidate], limit: usize) {
+    pair.encoders = encoders
+        .iter()
+        .filter(|e| pair.prefill.contract.accepts_encoder(&e.worker.contract))
+        .cloned()
+        .collect();
+    pair.encoders.sort_by_key(|e| {
+        (
+            !e.has_capacity,
+            e.cost.media_ready_ms().unwrap_or(u64::MAX),
+            e.stable_tie_break,
+        )
+    });
+    pair.encoders.truncate(limit);
+}
+
 /// Instance generations are a separate namespace for occupancy and snapshot coverage.
 fn instance_key(instance: &proto::Instance) -> String {
     format!("{}\0{}", instance.worker_id, instance.generation)
@@ -790,6 +799,60 @@ impl LoadTracker {
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+
+    /// An incompatible cheap encoder must not crowd compatible capacity out of a bounded list.
+    #[test]
+    fn encoder_shortlist_filters_contract_before_truncation() {
+        let p = worker(
+            "http://p:1",
+            &proto::Capabilities {
+                instance: Some(proto::Instance {
+                    worker_id: "p".into(),
+                    generation: "g".into(),
+                }),
+                embedding_backend: "mooncake".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut incompatible = p.clone();
+        incompatible.contract.transfer = "zmq_to_scheduler".into();
+        let mut pair = PdCandidate {
+            prefill: p.clone(),
+            decode: p.clone(),
+            encoders: Vec::new(),
+            has_capacity: true,
+            layout_ms: 0,
+            manifest_delivery_ms: 0,
+            decode_registration_ms: 0,
+            bind_submit_ms: 0,
+            native_pd_ms: 0,
+        };
+        let mut cheap = EncodeCost::cold();
+        cheap.cpu_wait_ms = 0;
+        let mut expensive = cheap;
+        expensive.cpu_wait_ms = 100;
+        let encoders = vec![
+            EncoderCandidate {
+                worker: incompatible,
+                cost: cheap,
+                fresh: true,
+                has_capacity: true,
+                stable_tie_break: 0,
+            },
+            EncoderCandidate {
+                worker: p,
+                cost: expensive,
+                fresh: true,
+                has_capacity: true,
+                stable_tie_break: 1,
+            },
+        ];
+        shortlist_encoders(&mut pair, &encoders, 1);
+        assert_eq!(pair.encoders.len(), 1);
+        assert_eq!(pair.encoders[0].worker.contract.transfer, "mooncake");
+        assert_eq!(pair.encoders[0].cost.cpu_wait_ms, 100);
+    }
 
     /// Saturation is an admission outcome; stale or incompatible workers remove readiness.
     #[test]

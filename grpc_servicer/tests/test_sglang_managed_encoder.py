@@ -251,36 +251,6 @@ def test_receiver_fanout_preserves_memory_bound_and_advertised_capacity(backend)
     config["generation"] = "generation"
     service = EncoderService(config, SimpleNamespace(scheduler=None), None)
     assert config["max_receivers"] == 8
-    if backend == "mooncake":
-        # Exercise native staging on CPU tensors: this checks the ownership
-        # contract, not GPU/RDMA completion (covered by real transport tests).
-        import torch
-        from sglang.srt.disaggregation.encoder.server import MMEncoder
-        from sglang.srt.managers.req_types import Modality
-
-        staged = []
-        native = SimpleNamespace(
-            rank=0,
-            _register_shared_mr=lambda *args: None,
-            _deregister_shared_mr=lambda *args: None,
-            _stage_embedding_batch=staged.extend,
-        )
-        batch = torch.arange(12, dtype=torch.float32).reshape(6, 2)
-        ctx = SimpleNamespace(
-            items_per_req=[1, 1],
-            preprocess_result=SimpleNamespace(
-                token_counts=[2, 4], grid_thw=torch.ones((2, 3), dtype=torch.int64)
-            ),
-            aux_data={},
-            modality=Modality.IMAGE,
-            use_global_cache=False,
-        )
-        requests = [{"req_id": str(i), "num_parts": 1, "part_idx": 0} for i in range(2)]
-        MMEncoder._stage_embeddings(native, ctx, requests, batch, keep_on_gpu=True)
-        for item, expected in zip(staged, (batch[:2], batch[2:])):
-            assert torch.equal(item.embedding, expected)
-            assert item.embedding.data_ptr() != expected.data_ptr()
-            assert item.embedding.untyped_storage().nbytes() == item.embedding.nbytes
     # Physical storage is shared only for native Mooncake GPU-direct sends.
     assert service.execution_capacity == (14 if backend == "mooncake" else 5)
     controls = service.capacity * config["max_control_bytes"]
@@ -294,6 +264,40 @@ def test_receiver_fanout_preserves_memory_bound_and_advertised_capacity(backend)
     config["max_context_bytes"] = controls + reserved - 1
     with pytest.raises(ValueError, match="cannot admit"):
         EncoderService(config, SimpleNamespace(scheduler=None), None)
+
+
+def test_native_mooncake_staging_owns_per_request_storage():
+    """Optional native staging checks do not skip dependency-free capacity coverage."""
+    # Exercise native staging on CPU tensors: this checks the ownership
+    # contract, not GPU/RDMA completion (covered by real transport tests).
+    torch = pytest.importorskip("torch")
+    server = pytest.importorskip("sglang.srt.disaggregation.encoder.server")
+    Modality = pytest.importorskip("sglang.srt.managers.req_types").Modality
+    MMEncoder = server.MMEncoder
+
+    staged = []
+    native = SimpleNamespace(
+        rank=0,
+        _register_shared_mr=lambda *args: None,
+        _deregister_shared_mr=lambda *args: None,
+        _stage_embedding_batch=staged.extend,
+    )
+    batch = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    ctx = SimpleNamespace(
+        items_per_req=[1, 1],
+        preprocess_result=SimpleNamespace(
+            token_counts=[2, 4], grid_thw=torch.ones((2, 3), dtype=torch.int64)
+        ),
+        aux_data={},
+        modality=Modality.IMAGE,
+        use_global_cache=False,
+    )
+    requests = [{"req_id": str(i), "num_parts": 1, "part_idx": 0} for i in range(2)]
+    MMEncoder._stage_embeddings(native, ctx, requests, batch, keep_on_gpu=True)
+    for item, expected in zip(staged, (batch[:2], batch[2:])):
+        assert torch.equal(item.embedding, expected)
+        assert item.embedding.data_ptr() != expected.data_ptr()
+        assert item.embedding.untyped_storage().nbytes() == item.embedding.nbytes
 
 
 def test_receiver_errors_retain_native_timeout_and_admission_semantics():
@@ -397,6 +401,10 @@ def test_cancelled_queued_encode_retires_early_receiver_control(monkeypatch, kin
         monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.encoder.server", server)
         if parent := sys.modules.get("sglang.srt.disaggregation.encoder"):
             monkeypatch.setattr(parent, "server", server, raising=False)
+        else:
+            monkeypatch.setitem(
+                sys.modules, "sglang.srt.disaggregation.encoder", SimpleNamespace(server=server)
+            )
         service = object.__new__(EncoderService)
         service.config = {"max_receivers": 2}
         service.backend = SimpleNamespace(
