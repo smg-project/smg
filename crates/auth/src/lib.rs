@@ -11,6 +11,8 @@ mod config;
 mod jwks;
 mod jwt;
 mod middleware;
+#[cfg(test)]
+mod test_alloc;
 
 pub use audit::{AuditEvent, AuditLogger, AuditOutcome, AuditResource};
 pub use config::{ApiKeyEntry, ApiKeyMatch, ApiKeySet, ControlPlaneAuthConfig, JwtConfig, Role};

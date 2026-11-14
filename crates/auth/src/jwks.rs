@@ -13,6 +13,7 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -208,9 +209,10 @@ struct OidcDiscovery {
     issuer: String,
 }
 
-/// Cached JWKS with expiration tracking.
+/// Cached JWKS with expiration tracking. The set is shared with every
+/// caller of [`JwksProvider::get_jwks`] until the next refresh replaces it.
 struct CachedJwks {
-    jwks: JwkSet,
+    jwks: Arc<JwkSet>,
     fetched_at: Instant,
     ttl: Duration,
 }
@@ -406,24 +408,26 @@ impl JwksProvider {
 
     /// Fetch the key set and make it the cached one: the step behind an expiry
     /// refresh and an unknown-`kid` refresh alike.
-    async fn refresh(&self) -> Result<JwkSet, JwksError> {
-        let jwks = self.fetch_jwks().await?;
+    async fn refresh(&self) -> Result<Arc<JwkSet>, JwksError> {
+        let jwks = Arc::new(self.fetch_jwks().await?);
         *self.cache.write() = Some(CachedJwks {
-            jwks: jwks.clone(),
+            jwks: Arc::clone(&jwks),
             fetched_at: Instant::now(),
             ttl: self.ttl,
         });
         Ok(jwks)
     }
 
-    /// Get the cached JWKS, refreshing if expired or not present.
-    pub async fn get_jwks(&self) -> Result<JwkSet, JwksError> {
+    /// Get the cached JWKS, refreshing if expired or not present. The set is
+    /// shared, not copied: a key lookup per token takes a pointer under the
+    /// read lock and clones the one key it answers.
+    pub async fn get_jwks(&self) -> Result<Arc<JwkSet>, JwksError> {
         // Check cache first
         {
             let cache = self.cache.read();
             if let Some(cached) = cache.as_ref() {
                 if !cached.is_expired() {
-                    return Ok(cached.jwks.clone());
+                    return Ok(Arc::clone(&cached.jwks));
                 }
             }
         }
@@ -517,10 +521,11 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{test_support::discovery_server, *};
+    use crate::test_alloc::calls;
 
     #[test]
     fn test_cached_jwks_expiration() {
-        let jwks = JwkSet { keys: vec![] };
+        let jwks = Arc::new(JwkSet { keys: vec![] });
         let cached = CachedJwks {
             jwks,
             fetched_at: Instant::now() - Duration::from_secs(100),
@@ -528,7 +533,7 @@ mod tests {
         };
         assert!(cached.is_expired());
 
-        let jwks = JwkSet { keys: vec![] };
+        let jwks = Arc::new(JwkSet { keys: vec![] });
         let cached = CachedJwks {
             jwks,
             fetched_at: Instant::now(),
@@ -943,5 +948,43 @@ mod tests {
             panic!("a document naming the issuer with a slash is not for the issuer without it");
         };
         assert!(matches!(err, JwksError::IssuerMismatch { .. }), "{err:?}");
+    }
+
+    const SIXTEEN_KIDS: [&str; 16] = [
+        "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11", "k12", "k13",
+        "k14", "k15", "k16",
+    ];
+
+    /// The allocation calls of one cached key lookup on `provider`, warm (the
+    /// fetch and the cache behind it are not the lookup's).
+    async fn calls_per_cached_lookup(provider: &JwksProvider, kid: &str) -> usize {
+        provider.get_key(kid).await.unwrap();
+        let before = calls();
+        let key = provider.get_key(kid).await.unwrap();
+        let during = calls() - before;
+        assert_eq!(key.common.key_id.as_deref(), Some(kid));
+        during
+    }
+
+    /// A cached key lookup clones the one key it answers, not the set the
+    /// key is in: it allocates as much on a sixteen-key set as on a one-key
+    /// set (a lookup that copied the whole set would grow with it).
+    #[expect(
+        clippy::print_stderr,
+        reason = "the counts a pin reads are printed for the Numbers table"
+    )]
+    #[tokio::test]
+    async fn a_cached_key_lookup_allocates_the_same_whatever_the_set_size() {
+        let one = JwksServer::start(&["k01"]).await;
+        let sixteen = JwksServer::start(&SIXTEEN_KIDS).await;
+        let on_one = calls_per_cached_lookup(&one.provider(), "k01").await;
+        let on_sixteen = calls_per_cached_lookup(&sixteen.provider(), "k16").await;
+        eprintln!(
+            "allocation calls for a cached key lookup: {on_one} on a one-key set, {on_sixteen} on a sixteen-key set"
+        );
+        assert_eq!(
+            on_sixteen, on_one,
+            "a lookup clones its one key, not the set it is in"
+        );
     }
 }
