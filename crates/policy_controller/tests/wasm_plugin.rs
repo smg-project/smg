@@ -1013,6 +1013,7 @@ fn pair_decide_under(engine: &Engine, budget_micros: u32) -> Decision {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1497,6 +1498,7 @@ fn a_pair_shares_one_decision_budget() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1555,6 +1557,7 @@ fn a_fault_on_one_side_of_a_two_profile_pair_rebuilds_once() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1832,6 +1835,7 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -3463,4 +3467,151 @@ fn a_decode_side_plugin_is_sampled_at_its_own_last_close() {
         "the decode plugin's own last close sampled its decision and the window opened it: {d:?}"
     );
     assert_eq!(p.breaker_opens, 0, "the prefill plugin stays: {p:?}");
+}
+
+/// A plugin's declared needs reach the profile's needs whichever stage it is
+/// bound as. A plugin that reads the affinity column as the filter alone, or
+/// as the picker alone, beside built-in stages that declare nothing, counts
+/// as a reader of it: a host that fills the column where it is declared
+/// leaves it empty only where nothing reads it.
+#[test]
+fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
+    let runtime = runtime();
+    let mut reading = spec("reader", guest::record_guest(), mode::LEAST_IN_FLIGHT);
+    reading.needs.affinity = true;
+    let plugin = Plugin::load(&runtime, reading).expect("the guest loads");
+    let scorers = || {
+        vec![Weighted {
+            scorer: Box::new(LeastRequests),
+            weight: 1.0,
+        }]
+    };
+    let as_filter = Profile {
+        name: "filter".into(),
+        filters: vec![Box::new(WasmFilter::new(plugin.bind(), None))],
+        scorers: scorers(),
+        picker: Box::new(Best),
+    };
+    let as_picker = Profile {
+        name: "picker".into(),
+        filters: vec![Box::new(Healthy)],
+        scorers: scorers(),
+        picker: Box::new(WasmPicker::new(plugin.bind(), None)),
+    };
+    assert!(as_filter.needs().affinity, "the plugin as the filter alone");
+    assert!(as_picker.needs().affinity, "the plugin as the picker alone");
+}
+
+/// A fallback answers when its plugin fails, so what it reads counts as
+/// what the plugin reads does: a plugin that declares nothing, bound over a
+/// fallback that reads the affinity column, is a reader of it. Each of the
+/// three adapters hands its own fallback's needs on, so the same reader is
+/// asked behind the filter, behind a scorer and behind the picker.
+#[test]
+fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
+    use smg_policy_controller::{Filter, Picker, Scorer, Targets, TieBand};
+
+    #[derive(Debug)]
+    struct ColumnReader;
+
+    fn reads_the_column() -> Needs {
+        Needs {
+            affinity: true,
+            ..Needs::default()
+        }
+    }
+
+    impl Lifecycle for ColumnReader {}
+
+    impl Filter for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    impl Scorer for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    impl Picker for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Best.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "plain",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    // The plugin declares nothing: alone, no adapter reads the column.
+    let alone: [(&str, Needs); 3] = [
+        ("the filter", WasmFilter::new(plugin.bind(), None).needs()),
+        ("a scorer", WasmScorer::new(plugin.bind(), None).needs()),
+        ("the picker", WasmPicker::new(plugin.bind(), None).needs()),
+    ];
+    // Over the reader, each adapter declares its fallback's needs.
+    let over: [(&str, Needs); 3] = [
+        (
+            "the filter",
+            WasmFilter::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+        (
+            "a scorer",
+            WasmScorer::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+        (
+            "the picker",
+            WasmPicker::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+    ];
+    for (bound_as, needs) in alone {
+        assert!(!needs.affinity, "the plugin alone, bound as {bound_as}");
+    }
+    for (bound_as, needs) in over {
+        assert!(needs.affinity, "the fallback's needs, bound as {bound_as}");
+    }
 }

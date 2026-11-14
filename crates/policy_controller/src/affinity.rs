@@ -5,9 +5,12 @@
 //! affinity yields to load). The three read one set of [`Gates`], so a
 //! profile's spill and KV-pressure parameters configure all of them: the
 //! `kv-pressure` stage orders nothing itself, and the spill gate the slice
-//! checks its candidates against is the affinity stage's. A stateful part
-//! (the slice's period, the diversion's window per worker) keeps its state
-//! behind the lifecycle alone, and no stage allocates per decision.
+//! checks its candidates against is the affinity stage's. What they read of
+//! a candidate beyond its row (the request's blocks it holds, its age in the
+//! pool, its index size) is the affinity column the host fills beside the
+//! rows ([`RequestFacts::affinity`]), never the row. A stateful part (the
+//! slice's period, the diversion's window per worker) keeps its state behind
+//! the lifecycle alone, and no stage allocates per decision.
 //!
 //! The affinity score is a rank, not a share: the candidates holding the
 //! deepest match of the request and under the spill gate come first, the
@@ -25,7 +28,7 @@ use crate::{
     framework::{Scorer, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
-    view::{Candidate, HashKind, Phase, RequestFacts, WorkerId},
+    view::{AffinityFacts, Candidate, HashKind, Phase, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -200,12 +203,13 @@ impl Gates {
     }
 }
 
-/// What one pass of the warm-up stage over a decision reads: the rows, the
-/// fleet's index level, the request's deepest index match and size, and the
-/// decision's draw.
+/// What one pass of the warm-up stage over a decision reads: the rows, their
+/// affinity column (one entry a row), the fleet's index level, the request's
+/// deepest index match and size, and the decision's draw.
 struct Pass<'a> {
     candidates: &'a [Candidate],
     kept: &'a [u32],
+    column: &'a [AffinityFacts],
     level: u32,
     best: u32,
     request_blocks: u32,
@@ -215,12 +219,15 @@ struct Pass<'a> {
 impl Pass<'_> {
     /// The slot of the least-loaded kept row `wanted` admits, equal loads
     /// drawn uniformly from the decision's seed.
-    fn least_loaded(&mut self, mut wanted: impl FnMut(&Candidate) -> bool) -> Option<usize> {
+    fn least_loaded(
+        &mut self,
+        mut wanted: impl FnMut(&Candidate, AffinityFacts) -> bool,
+    ) -> Option<usize> {
         let mut pick: Option<(usize, u32)> = None;
         let mut tied = 0usize;
         for (slot, &i) in self.kept.iter().enumerate() {
             let c = &self.candidates[i as usize];
-            if !wanted(c) {
+            if !wanted(c, self.column[i as usize]) {
                 continue;
             }
             match pick {
@@ -285,18 +292,18 @@ impl PrefixAffinity {
         }
     }
 
-    /// The blocks of the request `c` holds by this stage's source.
-    fn matched(&self, c: &Candidate, request_blocks: u32) -> u32 {
+    /// The blocks of the request a candidate holds by this stage's source.
+    fn matched(&self, held: AffinityFacts, request_blocks: u32) -> u32 {
         let index = match self.source {
             AffinitySource::Predictor => 0,
-            AffinitySource::Index | AffinitySource::Merged => c.overlap_blocks,
+            AffinitySource::Index | AffinitySource::Merged => held.overlap_blocks,
         };
         let predicted = match self.source {
             AffinitySource::Index => 0,
             AffinitySource::Predictor | AffinitySource::Merged
-                if c.predicted_blocks as f32 / request_blocks as f32 > self.threshold =>
+                if held.predicted_blocks as f32 / request_blocks as f32 > self.threshold =>
             {
-                c.predicted_blocks
+                held.predicted_blocks
             }
             AffinitySource::Predictor | AffinitySource::Merged => 0,
         };
@@ -322,11 +329,19 @@ impl Scorer for PrefixAffinity {
             return neutral(out);
         }
         let request_blocks = self.gates.request_blocks(facts);
-        let best = kept
-            .iter()
-            .map(|&i| self.matched(&candidates[i as usize], request_blocks))
-            .max()
-            .unwrap_or(0);
+        // The column is taken once a pass: a read by index tests its
+        // emptiness and its bound for every row. Empty, nobody holds
+        // anything and the deepest match is zero without a pass; any other
+        // column holds one entry a candidate and a kept row reads its own.
+        let column = facts.affinity;
+        let best = if column.is_empty() {
+            0
+        } else {
+            kept.iter()
+                .map(|&i| self.matched(column[i as usize], request_blocks))
+                .max()
+                .unwrap_or(0)
+        };
         let avg = mean_in_flight(candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
@@ -339,8 +354,9 @@ impl Scorer for PrefixAffinity {
         for (o, &i) in out.iter_mut().zip(kept) {
             let c = &candidates[i as usize];
             let load = c.in_flight as f32;
+            // A match above zero was read from a column that holds entries.
             *o = if best > 0
-                && self.matched(c, request_blocks) == best
+                && self.matched(column[i as usize], request_blocks) == best
                 && !self.gates.over(load, avg, held)
             {
                 1.0
@@ -356,6 +372,10 @@ impl Scorer for PrefixAffinity {
     fn needs(&self) -> Needs {
         let placements = self.source != AffinitySource::Index;
         Needs {
+            // Every source reads the column: the index's overlap and the
+            // predictor's placement are fields of a candidate's entry. What
+            // feeds the entry differs by source and is declared beside it.
+            affinity: true,
             token_hashes: true,
             events: self.source != AffinitySource::Predictor,
             text: placements,
@@ -465,17 +485,17 @@ impl WarmupSlice {
 
     /// Whether a worker is young: admitted within the window and short of
     /// its first blocks.
-    fn is_young(&self, c: &Candidate) -> bool {
-        u64::from(c.admitted_age_ms).saturating_mul(1_000) < self.secs_micros
-            && c.indexed_growth < self.blocks
+    fn is_young(&self, held: AffinityFacts) -> bool {
+        u64::from(held.admitted_age_ms).saturating_mul(1_000) < self.secs_micros
+            && held.indexed_growth < self.blocks
     }
 
-    /// The fleet's index level: the upper median of the rows' sizes, so one
-    /// emptied worker does not drag it down.
-    fn fleet_level(&self, candidates: &[Candidate]) -> u32 {
+    /// The fleet's index level: the upper median of the index sizes in the
+    /// decision's column, so one emptied worker does not drag it down.
+    fn fleet_level(&self, column: &[AffinityFacts]) -> u32 {
         let mut sizes = self.sizes.lock();
         sizes.clear();
-        sizes.extend(candidates.iter().map(|c| c.indexed_blocks));
+        sizes.extend(column.iter().map(|held| held.indexed_blocks));
         if sizes.is_empty() {
             return 0;
         }
@@ -491,15 +511,16 @@ impl WarmupSlice {
         // A thin worker is a candidate whatever the fleet's age; workers
         // warming only because they are young are candidates only when the
         // fleet is not all young.
-        let warming = |c: &Candidate| {
+        let warming = |held: AffinityFacts| {
             if thin_any {
-                self.is_thin(c.indexed_blocks, level)
+                self.is_thin(held.indexed_blocks, level)
             } else {
-                !young_all && self.is_young(c)
+                !young_all && self.is_young(held)
             }
         };
-        let slot =
-            pass.least_loaded(|c| warming(c) && !self.gates.over(c.in_flight as f32, avg, 0.0))?;
+        let slot = pass.least_loaded(|c, held| {
+            warming(held) && !self.gates.over(c.in_flight as f32, avg, 0.0)
+        })?;
         let seen = self.misses.fetch_add(1, Ordering::Relaxed);
         seen.is_multiple_of(self.period()).then_some(slot)
     }
@@ -512,6 +533,7 @@ impl WarmupSlice {
         let Pass {
             candidates,
             kept,
+            column,
             level,
             best,
             request_blocks,
@@ -535,9 +557,8 @@ impl WarmupSlice {
             None
         } else {
             kept.iter()
-                .map(|&i| &candidates[i as usize])
-                .filter(|c| c.overlap_blocks == best)
-                .map(|c| c.in_flight)
+                .filter(|&&i| column[i as usize].overlap_blocks == best)
+                .map(|&i| candidates[i as usize].in_flight)
                 .min()
         };
         // The eligibility read and the window's reservation on one lock
@@ -545,10 +566,11 @@ impl WarmupSlice {
         // thin worker inside one window.
         let slot = {
             let mut until = self.divert_until.lock();
-            let slot = pass.least_loaded(|c| {
-                self.is_thin(c.indexed_blocks, level)
+            let slot = pass.least_loaded(|c, held| {
+                self.is_thin(held.indexed_blocks, level)
                     && !(c.in_flight > 0 && until.get(&c.id).is_some_and(|&t| now < t))
-                    && !(holder_load.is_some_and(|h| c.in_flight >= h) && c.overlap_blocks != best)
+                    && !(holder_load.is_some_and(|h| c.in_flight >= h)
+                        && held.overlap_blocks != best)
             })?;
             until.insert(
                 candidates[kept[slot] as usize].id,
@@ -595,31 +617,42 @@ impl Scorer for WarmupSlice {
         if self.share <= 0.0 || self.gates.kv_imbalanced(candidates, kept) {
             return neutral(out);
         }
-        // A settled fleet (no index size fed, nobody young) costs one pass.
+        // A decision fed no column has nothing to slice: every row reads as
+        // just admitted with nothing indexed, a young fleet, and a young
+        // fleet slices nothing.
+        if facts.affinity.is_empty() {
+            return neutral(out);
+        }
+        // The column is taken once: one entry a candidate, walked by the
+        // passes over the pool and indexed by the reads of a kept row. One
+        // that ends before the candidates is a host's mistake and fails
+        // here, as an index past its end does. A settled fleet (no index
+        // size fed, nobody young) costs one pass over it.
+        let column = &facts.affinity[..candidates.len()];
         let mut any_indexed = false;
         let mut young = 0usize;
-        for c in candidates {
-            any_indexed |= c.indexed_blocks > 0;
-            young += usize::from(self.is_young(c));
+        for &held in column {
+            any_indexed |= held.indexed_blocks > 0;
+            young += usize::from(self.is_young(held));
         }
         if !any_indexed && young == 0 {
             return neutral(out);
         }
         let level = if any_indexed {
-            self.fleet_level(candidates)
+            self.fleet_level(column)
         } else {
             0
         };
-        let thin_any = candidates
+        let thin_any = column
             .iter()
-            .any(|c| self.is_thin(c.indexed_blocks, level));
+            .any(|held| self.is_thin(held.indexed_blocks, level));
         if !thin_any && (young == 0 || young == candidates.len()) {
             return neutral(out);
         }
         let request_blocks = self.gates.request_blocks(facts);
         let best = kept
             .iter()
-            .map(|&i| candidates[i as usize].overlap_blocks)
+            .map(|&i| column[i as usize].overlap_blocks)
             .max()
             .unwrap_or(0);
         let thin_overlap = best as f32 / request_blocks as f32 <= self.miss_share
@@ -627,6 +660,7 @@ impl Scorer for WarmupSlice {
         let mut pass = Pass {
             candidates,
             kept,
+            column,
             level,
             best,
             request_blocks,
@@ -649,6 +683,9 @@ impl Scorer for WarmupSlice {
 
     fn needs(&self) -> Needs {
         Needs {
+            // The admitted age, the index's growth and size and the overlap
+            // are all read from a candidate's entry of the column.
+            affinity: true,
             events: true,
             loads: true,
             ..Needs::default()
@@ -664,19 +701,35 @@ mod tests {
         view::{Health, LoadRow},
     };
 
-    fn candidate(position: u32, in_flight: u32, overlap_blocks: u32) -> Candidate {
-        Candidate {
-            position,
-            id: WorkerId(u64::from(position) + 1),
-            health: Health {
-                healthy: true,
-                ..Health::default()
+    /// A row and its entry of the affinity column, as a case writes a pool.
+    type Held = (Candidate, AffinityFacts);
+
+    fn candidate(position: u32, in_flight: u32, overlap_blocks: u32) -> Held {
+        (
+            Candidate {
+                position,
+                id: WorkerId(u64::from(position) + 1),
+                health: Health {
+                    healthy: true,
+                    ..Health::default()
+                },
+                in_flight,
+                ..Candidate::default()
             },
-            in_flight,
-            overlap_blocks,
-            admitted_age_ms: u32::MAX,
-            ..Candidate::default()
-        }
+            AffinityFacts {
+                overlap_blocks,
+                admitted_age_ms: u32::MAX,
+                ..AffinityFacts::default()
+            },
+        )
+    }
+
+    fn rows(pool: &[Held]) -> Vec<Candidate> {
+        pool.iter().map(|(row, _)| *row).collect()
+    }
+
+    fn column(pool: &[Held]) -> Vec<AffinityFacts> {
+        pool.iter().map(|(_, held)| *held).collect()
     }
 
     fn kept(n: u32) -> Vec<u32> {
@@ -701,10 +754,26 @@ mod tests {
         PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)))
     }
 
-    fn scores(scorer: &dyn Scorer, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Vec<f32> {
-        let kept = kept(pool.len() as u32);
-        let mut out = vec![0.0; pool.len()];
-        scorer.score(facts, pool, &kept, &mut out);
+    /// The scores of `pool`'s rows, the facts carrying the pool's column.
+    fn scores(scorer: &dyn Scorer, facts: &RequestFacts<'_>, pool: &[Held]) -> Vec<f32> {
+        let column = column(pool);
+        scores_beside(scorer, facts, &rows(pool), &column)
+    }
+
+    /// The scores of `rows` beside a column of the case's own length.
+    fn scores_beside(
+        scorer: &dyn Scorer,
+        facts: &RequestFacts<'_>,
+        rows: &[Candidate],
+        column: &[AffinityFacts],
+    ) -> Vec<f32> {
+        let facts = RequestFacts {
+            affinity: column,
+            ..*facts
+        };
+        let kept = kept(rows.len() as u32);
+        let mut out = vec![0.0; rows.len()];
+        scorer.score(&facts, rows, &kept, &mut out);
         out
     }
 
@@ -730,7 +799,7 @@ mod tests {
             rel: Some(1.5),
             ..SpillParams::default()
         }));
-        let mean = mean_in_flight(&pool, &kept(3));
+        let mean = mean_in_flight(&rows(&pool), &kept(3));
         assert!((mean - 40.0 / 3.0).abs() < 1e-6);
         assert_eq!(scores(&gated, &facts(16), &pool), vec![0.0, 0.5, 0.5]);
         // Under a lifted relative part the holder keeps the request.
@@ -788,14 +857,17 @@ mod tests {
             ..PrefixAffinityParams::default()
         };
         let merged = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
-        let shallow = Candidate {
-            predicted_blocks: 4,
-            ..candidate(0, 0, 0)
+        let predicted = |(row, held): Held, predicted_blocks: u32| {
+            (
+                row,
+                AffinityFacts {
+                    predicted_blocks,
+                    ..held
+                },
+            )
         };
-        let deep = Candidate {
-            predicted_blocks: 9,
-            ..candidate(1, 0, 0)
-        };
+        let shallow = predicted(candidate(0, 0, 0), 4);
+        let deep = predicted(candidate(1, 0, 0), 9);
         let indexed = candidate(2, 0, 1);
         // 4 of 16 is under the threshold, 9 of 16 over it; the index's one
         // block is a match whatever the threshold, and the deepest wins.
@@ -819,16 +891,20 @@ mod tests {
         );
     }
 
-    fn reporting(position: u32, in_flight: u32, overlap_blocks: u32, active_kv: u16) -> Candidate {
-        Candidate {
-            load: Some(LoadRow {
-                active_kv_permille: active_kv,
-                kv_usage_permille: active_kv,
-                live_rate: 1000,
-                ..LoadRow::default()
-            }),
-            ..candidate(position, in_flight, overlap_blocks)
-        }
+    fn reporting(position: u32, in_flight: u32, overlap_blocks: u32, active_kv: u16) -> Held {
+        let (row, held) = candidate(position, in_flight, overlap_blocks);
+        (
+            Candidate {
+                load: Some(LoadRow {
+                    active_kv_permille: active_kv,
+                    kv_usage_permille: active_kv,
+                    live_rate: 1000,
+                    ..LoadRow::default()
+                }),
+                ..row
+            },
+            held,
+        )
     }
 
     #[test]
@@ -863,12 +939,16 @@ mod tests {
         WarmupSlice::new(&params, Gates::of(None, None, Some(16)))
     }
 
-    fn sized(position: u32, in_flight: u32, overlap_blocks: u32, indexed: u32) -> Candidate {
-        Candidate {
-            indexed_blocks: indexed,
-            indexed_growth: indexed,
-            ..candidate(position, in_flight, overlap_blocks)
-        }
+    fn sized(position: u32, in_flight: u32, overlap_blocks: u32, indexed: u32) -> Held {
+        let (row, held) = candidate(position, in_flight, overlap_blocks);
+        (
+            row,
+            AffinityFacts {
+                indexed_blocks: indexed,
+                indexed_growth: indexed,
+                ..held
+            },
+        )
     }
 
     #[test]
@@ -967,7 +1047,7 @@ mod tests {
         }
         assert_eq!(scores(&slice, &now, &pool), vec![0.0, 0.0, 1.0]);
         assert_eq!(
-            slice.divert_until.lock().get(&pool[2].id).copied(),
+            slice.divert_until.lock().get(&pool[2].0.id).copied(),
             Some(1_000 + DIVERT_WINDOW_MICROS),
             "the diverted worker holds its window from the turn that picked it"
         );
@@ -976,11 +1056,15 @@ mod tests {
     #[test]
     fn a_young_fleet_slices_nothing_and_a_young_worker_among_warm_ones_takes_its_share() {
         let slice = warmup(1.0, 0);
-        let young = Candidate {
-            admitted_age_ms: 1_000,
-            indexed_growth: 2,
-            ..sized(2, 0, 0, 2)
-        };
+        let (row, held) = sized(2, 0, 0, 2);
+        let young = (
+            row,
+            AffinityFacts {
+                admitted_age_ms: 1_000,
+                indexed_growth: 2,
+                ..held
+            },
+        );
         let all_young = [young, young, young];
         assert_eq!(scores(&slice, &facts(16), &all_young), vec![1.0, 1.0, 1.0]);
         // No size fed (a fleet below the level that makes anyone thin), one
@@ -1048,6 +1132,51 @@ mod tests {
         assert_eq!(scores(&slice, &now, &shallow), vec![0.0, 0.0, 1.0]);
     }
 
+    /// The stages read the column and never the row: a decision fed no
+    /// column reads as a miss for every row, and leaves the warm-up stage
+    /// neutral before any counter moves, the answer its pass gives over rows
+    /// that all read as just admitted.
+    #[test]
+    fn no_column_is_a_miss_for_every_row_and_slices_nothing() {
+        let pool = [candidate(0, 1, 8), candidate(1, 1, 8), candidate(2, 1, 8)];
+        let (held_rows, held_column) = (rows(&pool), column(&pool));
+        let stage = affinity(None);
+        assert_eq!(
+            scores_beside(&stage, &facts(16), &held_rows, &held_column),
+            vec![1.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            scores_beside(&stage, &facts(16), &held_rows, &[]),
+            vec![0.5, 0.5, 0.5],
+            "no column: a miss for every row, the spill gate alone orders"
+        );
+        // The warm-up stage: a thin worker takes a miss beside its column,
+        // and nothing is sliced without one.
+        let slice = warmup(1.0, 0);
+        let thin = [sized(0, 3, 0, 64), sized(1, 2, 0, 64), sized(2, 5, 0, 0)];
+        let (thin_rows, thin_column) = (rows(&thin), column(&thin));
+        assert_eq!(
+            scores_beside(&slice, &facts(16), &thin_rows, &[]),
+            vec![1.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            scores_beside(
+                &slice,
+                &facts(16),
+                &thin_rows,
+                &[AffinityFacts::default(); 3]
+            ),
+            vec![1.0, 1.0, 1.0],
+            "rows that all read as just admitted are a young fleet"
+        );
+        assert_eq!(slice.misses.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            scores_beside(&slice, &facts(16), &thin_rows, &thin_column),
+            vec![0.0, 0.0, 1.0]
+        );
+        assert_eq!(slice.misses.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn the_gates_read_their_parameters_and_their_defaults() {
         let gates = Gates::of(None, None, None);
@@ -1100,5 +1229,132 @@ mod tests {
             8,
             "1024 tokens at the learned 128 a block, not 32 at the view's 32"
         );
+    }
+
+    /// One index, one worker: with the pool's FIRST rows dropped, each kept
+    /// row scores by its own entry of the column, not by the entry at its
+    /// place among the kept.
+    #[test]
+    fn a_narrowed_pool_scores_each_kept_row_by_its_own_entry() {
+        // The dropped rows hold the deepest matches; of the two kept, the
+        // last holds more.
+        let pool = [
+            candidate(0, 1, 8),
+            candidate(1, 1, 6),
+            candidate(2, 1, 2),
+            candidate(3, 1, 4),
+        ];
+        let column = column(&pool);
+        let facts = RequestFacts {
+            affinity: &column,
+            ..facts(16)
+        };
+        let mut out = [0.0; 2];
+        affinity(None).score(&facts, &rows(&pool), &[2, 3], &mut out);
+        assert_eq!(out, [0.5, 1.0]);
+    }
+
+    /// The same for the slice: with the pool's FIRST row dropped, the thin
+    /// worker among the kept is found by its own entry.
+    #[test]
+    fn a_narrowed_pool_finds_the_thin_worker_by_its_own_entry() {
+        let params = WarmupSliceParams {
+            share: Some(1.0),
+            divert_every: Some(0),
+            blocks: Some(8),
+            miss_share: Some(0.0),
+            ..WarmupSliceParams::default()
+        };
+        let slice = WarmupSlice::new(&params, Gates::of(None, None, Some(16)));
+        // Thin at the first and at the last index; the first is dropped.
+        let pool = [
+            sized(0, 5, 0, 0),
+            sized(1, 3, 0, 64),
+            sized(2, 2, 0, 64),
+            sized(3, 4, 0, 0),
+        ];
+        let column = column(&pool);
+        let facts = RequestFacts {
+            affinity: &column,
+            ..facts(16)
+        };
+        let mut out = [0.0; 3];
+        slice.score(&facts, &rows(&pool), &[1, 2, 3], &mut out);
+        assert_eq!(out, [0.0, 0.0, 1.0]);
+    }
+
+    /// A decision fed no column reads as one whose column holds nothing for
+    /// every candidate: the whole score vector of each stage is the same,
+    /// and it is the vector the stage wrote when the five facts were fields
+    /// of the row and every one of them was zero.
+    #[test]
+    fn an_empty_column_scores_as_a_column_of_nothing_held() {
+        let rows: Vec<Candidate> = (0..)
+            .zip([3, 0, 7, 1, 4])
+            .map(|(position, in_flight)| Candidate {
+                position,
+                id: WorkerId(u64::from(position) + 1),
+                health: Health {
+                    healthy: true,
+                    ..Health::default()
+                },
+                in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let nothing = vec![AffinityFacts::default(); rows.len()];
+        let prefix = affinity(None);
+        let slice = warmup(1.0, 0);
+        let stages: [(&dyn Scorer, [f32; 5]); 3] = [
+            (&prefix, [0.5; 5]),
+            (&KvPressure, [1.0; 5]),
+            (&slice, [1.0; 5]),
+        ];
+        for (stage, over_zero_fields) in stages {
+            let empty = scores_beside(stage, &facts(16), &rows, &[]);
+            let zeros = scores_beside(stage, &facts(16), &rows, &nothing);
+            assert_eq!(empty, zeros, "{}", stage.name());
+            assert_eq!(empty, over_zero_fields, "{}", stage.name());
+        }
+    }
+
+    /// The warm-up stage takes one entry a candidate. A column that ends
+    /// before the candidates is a host's mistake and fails the stage, as an
+    /// index past its end does: walked as it stands it would read as a
+    /// smaller fleet.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn the_warmup_stage_fails_on_a_column_that_ends_before_the_candidates() {
+        let pool = [sized(0, 0, 0, 4096), sized(1, 0, 0, 4096)];
+        let column = column(&pool[..1]);
+        scores_beside(&warmup(1.0, 0), &facts(16), &rows(&pool), &column);
+    }
+
+    /// What a stage reads of the host it declares under its own name. The
+    /// affinity stage reads the column on every source: the predictor's
+    /// placements are entries of it, and that source asks for no events. The
+    /// warm-up stage reads it too. The KV gate reads loads alone.
+    #[test]
+    fn every_reader_of_the_column_declares_it_whatever_feeds_it() {
+        for source in [
+            AffinitySource::Index,
+            AffinitySource::Predictor,
+            AffinitySource::Merged,
+        ] {
+            let params = PrefixAffinityParams {
+                source: Some(source),
+                ..PrefixAffinityParams::default()
+            };
+            let needs =
+                PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16))).needs();
+            assert!(needs.affinity, "{source:?} reads the column");
+            assert_eq!(
+                needs.events,
+                source != AffinitySource::Predictor,
+                "{source:?}: events feed the index, they do not name the column"
+            );
+        }
+        assert!(warmup(1.0, 0).needs().affinity);
+        assert!(!KvPressure.needs().affinity);
     }
 }

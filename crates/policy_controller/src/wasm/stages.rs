@@ -4,10 +4,9 @@
 //! the first scorer or picker made in an engine build, whichever of the
 //! build's profiles binds the plugin, forwards the lifecycle, so an event
 //! reaches the plugin once per engine. A fallback is a built-in stage: the
-//! engine opens the scopes of a profile's own stages, not a fallback's. The
-//! scorer declares the plugin's needs (or its fallback's), which the engine's
-//! summary folds in; the framework's filters and pickers declare none, so a
-//! binding without a scorer leaves them to the host ([`super::Plugin::needs`]).
+//! engine opens the scopes of a profile's own stages, not a fallback's. Each
+//! adapter declares the plugin's needs and its fallback's, so the profile's
+//! needs hold them whichever stage the plugin is bound as.
 
 use std::sync::Arc;
 
@@ -23,6 +22,15 @@ use crate::{
     spec::Needs,
     view::{Candidate, Constraints, RequestFacts},
 };
+
+/// What one adapter needs from the host: its plugin's declared needs and
+/// its fallback's, since either answers the call. The same for each stage
+/// kind: a plugin that reads the affinity facts as the filter alone or as
+/// the picker alone is a reader as one that scores is.
+fn stage_needs(bound: &Bound, fallback: Option<Needs>) -> Needs {
+    let own = bound.plugin().needs();
+    fallback.map_or(own, |fallback| own.or(fallback))
+}
 
 /// The plugin's `filter` stage. Without a fallback, a failure keeps every
 /// row under `failure: open` and empties the pool under `closed`. A filter
@@ -69,6 +77,10 @@ impl Filter for WasmFilter {
 
     fn soft(&self) -> bool {
         self.soft
+    }
+
+    fn needs(&self) -> Needs {
+        stage_needs(&self.bound, self.fallback.as_ref().map(|f| f.needs()))
     }
 
     fn retain(
@@ -141,11 +153,7 @@ impl Scorer for WasmScorer {
     }
 
     fn needs(&self) -> Needs {
-        let own = self.bound.plugin().needs();
-        match &self.fallback {
-            Some(fallback) => own.or(fallback.needs()),
-            None => own,
-        }
+        stage_needs(&self.bound, self.fallback.as_ref().map(|f| f.needs()))
     }
 
     fn scope(&self) -> Option<&dyn DecisionScope> {
@@ -215,6 +223,10 @@ impl Picker for WasmPicker {
                 }
             }
         }
+    }
+
+    fn needs(&self) -> Needs {
+        stage_needs(&self.bound, self.fallback.as_ref().map(|f| f.needs()))
     }
 
     fn scope(&self) -> Option<&dyn DecisionScope> {

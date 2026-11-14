@@ -625,11 +625,9 @@ impl Plugin {
         self.failure
     }
 
-    /// What the host must feed for the plugin's stages, as declared. The
-    /// engine's summary folds the needs of a profile's scorers, so a plugin
-    /// bound as a scorer carries these into it; a plugin bound as a filter
-    /// or a picker alone does not (those stage kinds declare no needs), and
-    /// a host that must feed it reads them here.
+    /// What the host must feed for the plugin's stages, as declared. Each
+    /// stage the plugin is bound as carries these into its profile's needs
+    /// ([`crate::Profile::needs`]), and so into the engine's summary.
     pub fn needs(&self) -> Needs {
         self.needs
     }

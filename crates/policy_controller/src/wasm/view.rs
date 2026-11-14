@@ -11,8 +11,8 @@ use crate::{
     decision::{Decision, Target, MAX_TARGETS},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     view::{
-        Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase, PoolFacts,
-        RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
+        AffinityFacts, Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
+        PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
     },
 };
 
@@ -153,7 +153,10 @@ pub(crate) fn load(row: &LoadRow) -> wit::Load {
     }
 }
 
-pub(crate) fn candidate(c: &Candidate) -> wit::Candidate {
+/// One candidate as the record form carries it: the row, and the affinity
+/// facts the host holds for it beside the row (`held`), which the record
+/// keeps as fields of its own.
+pub(crate) fn candidate(c: &Candidate, held: AffinityFacts) -> wit::Candidate {
     wit::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -165,15 +168,15 @@ pub(crate) fn candidate(c: &Candidate) -> wit::Candidate {
         connector: c.connector,
         in_flight: c.in_flight,
         load: c.load.as_ref().map(load),
-        overlap_blocks: c.overlap_blocks,
-        predicted_blocks: c.predicted_blocks,
+        overlap_blocks: held.overlap_blocks,
+        predicted_blocks: held.predicted_blocks,
         session_hit: c.session_hit,
         session_in_flight: c.session_in_flight,
         pair_class: c.pair_class,
         has_capacity: c.has_capacity,
         has_room: c.has_room,
-        admitted_age_ms: c.admitted_age_ms,
-        indexed_growth: c.indexed_growth,
+        admitted_age_ms: held.admitted_age_ms,
+        indexed_growth: held.indexed_growth,
         zone: c.zone,
         labels: c.labels,
         ec_compatible: c.ec_compatible,
@@ -181,7 +184,7 @@ pub(crate) fn candidate(c: &Candidate) -> wit::Candidate {
         host_local: c.host_local,
         active_sessions: c.active_sessions,
         key: c.key,
-        indexed_blocks: c.indexed_blocks,
+        indexed_blocks: held.indexed_blocks,
     }
 }
 
@@ -278,7 +281,15 @@ impl Records {
         pool: &PoolFacts<'_>,
     ) {
         self.candidates.clear();
-        self.candidates.extend(candidates.iter().map(candidate));
+        // A candidate's affinity facts ride the request's column, by its
+        // index: the same index reads the row and its entry. The packed fill
+        // walks the column instead; this one keeps the read by index, whose
+        // two tests are lost in what a record a candidate costs.
+        self.candidates.extend(
+            (0u32..)
+                .zip(candidates)
+                .map(|(index, c)| candidate(c, facts.affinity_at(index))),
+        );
         self.zones.clear();
         self.zones.extend(pool.zones.iter().map(zone));
         self.tried.clear();
@@ -289,7 +300,10 @@ impl Records {
 /// The packed form's layout: the committed WIT's table, byte for byte. A
 /// change to the table changes these numbers and the test that pins them.
 pub mod layout {
-    /// One candidate row.
+    /// One candidate row, with the five affinity facts in it. The engine's
+    /// own row is 104 bytes WITHOUT them: the two numbers are equal by
+    /// accident, each pinned in its own file, and nothing ties one to the
+    /// other.
     pub const ROW: usize = 104;
     /// The request block's fixed header; the variable sections follow.
     pub const HEADER: usize = 80;
@@ -632,7 +646,7 @@ impl Packed {
         exposure: &Exposure,
     ) -> Result<(), TooLong> {
         self.fill_request(facts, exposure)?;
-        self.fill_candidates(candidates);
+        self.fill_candidates(facts, candidates);
         self.fill_pool(pool);
         Ok(())
     }
@@ -705,61 +719,84 @@ impl Packed {
         Ok(())
     }
 
-    fn fill_candidates(&mut self, candidates: &[Candidate]) {
-        use layout::*;
+    fn fill_candidates(&mut self, facts: &RequestFacts<'_>, candidates: &[Candidate]) {
+        use layout::ROW;
         let buf = &mut self.candidates;
         buf.clear();
         buf.resize(candidates.len() * ROW, 0);
-        for (c, row) in candidates.iter().zip(buf.as_chunks_mut::<ROW>().0) {
-            put(row, ROW_ID, &c.id.0.to_le_bytes());
-            put(row, ROW_IN_FLIGHT, &c.in_flight.to_le_bytes());
-            let load = c.load.unwrap_or_default();
-            put(row, ROW_RUNNING, &load.running.to_le_bytes());
-            put(row, ROW_QUEUED, &load.queued.to_le_bytes());
-            put(
-                row,
-                ROW_WAITING_UNCACHED,
-                &load.waiting_uncached_tokens.to_le_bytes(),
-            );
-            put(row, ROW_OVERLAP, &c.overlap_blocks.to_le_bytes());
-            put(row, ROW_PREDICTED, &c.predicted_blocks.to_le_bytes());
-            put(row, ROW_RESIDENT, &load.resident_tokens.to_le_bytes());
-            put(row, ROW_PAIR_CLASS, &c.pair_class.to_le_bytes());
-            put(row, ROW_ADMITTED_AGE, &c.admitted_age_ms.to_le_bytes());
-            put(row, ROW_REPORT_AGE, &load.report_age_ms.to_le_bytes());
-            put(row, ROW_INDEXED_GROWTH, &c.indexed_growth.to_le_bytes());
-            put(row, ROW_LIVE_RATE, &load.live_rate.to_le_bytes());
-            put(row, ROW_MAX_RUNNING, &load.max_running.to_le_bytes());
-            put(row, ROW_KV_USAGE, &load.kv_usage_permille.to_le_bytes());
-            put(row, ROW_ACTIVE_KV, &load.active_kv_permille.to_le_bytes());
-            put(row, ROW_DP_RANK, &c.dp_rank.to_le_bytes());
-            put(row, ROW_DP_SIZE, &c.dp_size.to_le_bytes());
-            put(row, ROW_ZONE, &c.zone.to_le_bytes());
-            put(row, ROW_ENGINE_KIND, &c.engine_kind.to_le_bytes());
-            put(row, ROW_CONNECTOR, &c.connector.to_le_bytes());
-            put(
-                row,
-                ROW_SESSION_IN_FLIGHT,
-                &c.session_in_flight.to_le_bytes(),
-            );
-            row[ROW_HEALTH] = health_bits(c.health);
-            row[ROW_WIRE_MODES] = c.wire_modes.bits();
-            row[ROW_ROLE] = c.role as u8;
-            row[ROW_SOURCE] = load.source as u8;
-            row[ROW_BITS] = bits([
-                (c.session_hit, BIT_SESSION_HIT),
-                (c.has_capacity, BIT_HAS_CAPACITY),
-                (c.has_room, BIT_HAS_ROOM),
-                (c.ec_compatible, BIT_EC_COMPATIBLE),
-                (c.vision, BIT_VISION),
-                (c.host_local, BIT_HOST_LOCAL),
-                (c.load.is_some(), BIT_LOAD_PRESENT),
-            ]);
-            put(row, ROW_ACTIVE_SESSIONS, &c.active_sessions.to_le_bytes());
-            put(row, ROW_KEY, &c.key.to_le_bytes());
-            put(row, ROW_LABELS, &c.labels.to_le_bytes());
-            put(row, ROW_INDEXED_BLOCKS, &c.indexed_blocks.to_le_bytes());
+        let rows = buf.as_chunks_mut::<ROW>().0;
+        // The candidates' affinity facts ride the request's column; the
+        // table keeps them in the row. The column is walked beside the
+        // candidates and its emptiness decided once: read by index, the
+        // emptiness and the bound are tested for every row, which cost the
+        // fill 2.5 ns a row at 512 candidates. An empty column is nothing
+        // held by any candidate. Any other holds one entry a candidate, and
+        // one that ends before the candidates fails here, as an index past
+        // its end does.
+        if facts.affinity.is_empty() {
+            let nothing = AffinityFacts::default();
+            for (c, row) in candidates.iter().zip(rows) {
+                Self::fill_row(row, c, nothing);
+            }
+        } else {
+            let column = &facts.affinity[..candidates.len()];
+            for ((c, held), row) in candidates.iter().zip(column).zip(rows) {
+                Self::fill_row(row, c, *held);
+            }
         }
+    }
+
+    /// One candidate's row of the table, its affinity facts in it.
+    fn fill_row(row: &mut [u8; layout::ROW], c: &Candidate, held: AffinityFacts) {
+        use layout::*;
+        put(row, ROW_ID, &c.id.0.to_le_bytes());
+        put(row, ROW_IN_FLIGHT, &c.in_flight.to_le_bytes());
+        let load = c.load.unwrap_or_default();
+        put(row, ROW_RUNNING, &load.running.to_le_bytes());
+        put(row, ROW_QUEUED, &load.queued.to_le_bytes());
+        put(
+            row,
+            ROW_WAITING_UNCACHED,
+            &load.waiting_uncached_tokens.to_le_bytes(),
+        );
+        put(row, ROW_OVERLAP, &held.overlap_blocks.to_le_bytes());
+        put(row, ROW_PREDICTED, &held.predicted_blocks.to_le_bytes());
+        put(row, ROW_RESIDENT, &load.resident_tokens.to_le_bytes());
+        put(row, ROW_PAIR_CLASS, &c.pair_class.to_le_bytes());
+        put(row, ROW_ADMITTED_AGE, &held.admitted_age_ms.to_le_bytes());
+        put(row, ROW_REPORT_AGE, &load.report_age_ms.to_le_bytes());
+        put(row, ROW_INDEXED_GROWTH, &held.indexed_growth.to_le_bytes());
+        put(row, ROW_LIVE_RATE, &load.live_rate.to_le_bytes());
+        put(row, ROW_MAX_RUNNING, &load.max_running.to_le_bytes());
+        put(row, ROW_KV_USAGE, &load.kv_usage_permille.to_le_bytes());
+        put(row, ROW_ACTIVE_KV, &load.active_kv_permille.to_le_bytes());
+        put(row, ROW_DP_RANK, &c.dp_rank.to_le_bytes());
+        put(row, ROW_DP_SIZE, &c.dp_size.to_le_bytes());
+        put(row, ROW_ZONE, &c.zone.to_le_bytes());
+        put(row, ROW_ENGINE_KIND, &c.engine_kind.to_le_bytes());
+        put(row, ROW_CONNECTOR, &c.connector.to_le_bytes());
+        put(
+            row,
+            ROW_SESSION_IN_FLIGHT,
+            &c.session_in_flight.to_le_bytes(),
+        );
+        row[ROW_HEALTH] = health_bits(c.health);
+        row[ROW_WIRE_MODES] = c.wire_modes.bits();
+        row[ROW_ROLE] = c.role as u8;
+        row[ROW_SOURCE] = load.source as u8;
+        row[ROW_BITS] = bits([
+            (c.session_hit, BIT_SESSION_HIT),
+            (c.has_capacity, BIT_HAS_CAPACITY),
+            (c.has_room, BIT_HAS_ROOM),
+            (c.ec_compatible, BIT_EC_COMPATIBLE),
+            (c.vision, BIT_VISION),
+            (c.host_local, BIT_HOST_LOCAL),
+            (c.load.is_some(), BIT_LOAD_PRESENT),
+        ]);
+        put(row, ROW_ACTIVE_SESSIONS, &c.active_sessions.to_le_bytes());
+        put(row, ROW_KEY, &c.key.to_le_bytes());
+        put(row, ROW_LABELS, &c.labels.to_le_bytes());
+        put(row, ROW_INDEXED_BLOCKS, &held.indexed_blocks.to_le_bytes());
     }
 
     fn fill_pool(&mut self, pool: &PoolFacts<'_>) {
@@ -959,15 +996,11 @@ mod tests {
                 max_running: 16,
             }),
             load_sampled_at_micros: 99,
-            overlap_blocks: 17,
-            predicted_blocks: 18,
             session_hit: true,
             session_in_flight: 19,
             pair_class: 20,
             has_capacity: false,
             has_room: true,
-            admitted_age_ms: 21,
-            indexed_growth: 22,
             zone: 23,
             labels: 0xff00,
             ec_compatible: true,
@@ -975,6 +1008,16 @@ mod tests {
             host_local: true,
             active_sessions: 24,
             key: 25,
+        }
+    }
+
+    /// The affinity facts the host holds for [`candidate_row`], beside it.
+    fn candidate_held() -> AffinityFacts {
+        AffinityFacts {
+            overlap_blocks: 17,
+            predicted_blocks: 18,
+            admitted_age_ms: 21,
+            indexed_growth: 22,
             indexed_blocks: 26,
         }
     }
@@ -996,7 +1039,7 @@ mod tests {
     #[test]
     fn the_record_row_carries_every_field_and_the_flags_by_name() {
         let c = candidate_row();
-        let r = candidate(&c);
+        let r = candidate(&c, candidate_held());
         assert_eq!(r.id, c.id.0);
         assert_eq!(r.role, wit::Role::Decode);
         assert!(r
@@ -1016,14 +1059,58 @@ mod tests {
             (r.labels, r.key, r.active_sessions, r.indexed_blocks),
             (0xff00, 25, 24, 26)
         );
+        assert_eq!(
+            (
+                r.overlap_blocks,
+                r.predicted_blocks,
+                r.admitted_age_ms,
+                r.indexed_growth
+            ),
+            (17, 18, 21, 22)
+        );
         assert_eq!(health_bits(c.health), 0b1_0001);
+    }
+
+    /// The record fill reads each row's entry of the request's column by the
+    /// row's index, as the packed fill does.
+    #[test]
+    fn the_record_fill_gives_each_row_its_own_entry_of_the_column() {
+        let column = [AffinityFacts::default(), candidate_held()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let mut records = Records::default();
+        records.fill(
+            &facts,
+            &[Candidate::default(), candidate_row()],
+            &PoolFacts::default(),
+        );
+        let held = |r: &wit::Candidate| {
+            (
+                r.overlap_blocks,
+                r.predicted_blocks,
+                r.admitted_age_ms,
+                r.indexed_growth,
+                r.indexed_blocks,
+            )
+        };
+        assert_eq!(held(&records.candidates[0]), (0, 0, 0, 0, 0));
+        assert_eq!(held(&records.candidates[1]), (17, 18, 21, 22, 26));
     }
 
     #[test]
     fn the_packed_row_puts_every_field_at_the_tables_offset() {
         let c = candidate_row();
         let mut packed = Packed::default();
-        packed.fill_candidates(&[Candidate::default(), c]);
+        // The second row's affinity facts are the second entry of the
+        // request's column: one index reads the row and its entry.
+        let column = [AffinityFacts::default(), candidate_held()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        packed.fill_candidates(&facts, &[Candidate::default(), c]);
         assert_eq!(packed.candidates.len(), 2 * ROW);
         let row = &packed.candidates[ROW..];
         assert_eq!(le_u64(row, ROW_ID), c.id.0);
@@ -1067,6 +1154,54 @@ mod tests {
             0,
             "no load row: the bit is clear"
         );
+        // The first row reads the column's first entry, which holds nothing:
+        // a fill that gave every row one entry would write the second's here.
+        let held = [
+            ROW_OVERLAP,
+            ROW_PREDICTED,
+            ROW_ADMITTED_AGE,
+            ROW_INDEXED_GROWTH,
+            ROW_INDEXED_BLOCKS,
+        ]
+        .map(|at| le_u32(empty, at));
+        assert_eq!(held, [0; 5]);
+    }
+
+    /// An empty column is nothing held by any candidate: the five read zero
+    /// in every row, and the rest of each row is written.
+    #[test]
+    fn the_packed_fill_reads_an_empty_column_as_nothing_held() {
+        let c = candidate_row();
+        let mut packed = Packed::default();
+        packed.fill_candidates(&RequestFacts::default(), &[c, c]);
+        assert_eq!(packed.candidates.len(), 2 * ROW);
+        for row in packed.candidates.as_chunks::<ROW>().0 {
+            assert_eq!(le_u64(row, ROW_ID), c.id.0);
+            let held = [
+                ROW_OVERLAP,
+                ROW_PREDICTED,
+                ROW_ADMITTED_AGE,
+                ROW_INDEXED_GROWTH,
+                ROW_INDEXED_BLOCKS,
+            ]
+            .map(|at| le_u32(row, at));
+            assert_eq!(held, [0; 5]);
+        }
+    }
+
+    /// A column that holds an entry holds one a candidate. One that ends
+    /// before the candidates is a host's mistake and fails the fill, as an
+    /// index past its end does: a fill that stopped where the column ends
+    /// would hand the guest rows of zeros for the candidates left.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn the_packed_fill_fails_on_a_column_that_ends_before_the_candidates() {
+        let column = [candidate_held()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        Packed::default().fill_candidates(&facts, &[Candidate::default(), candidate_row()]);
     }
 
     #[test]
@@ -1109,6 +1244,8 @@ mod tests {
             seed: 9,
             block_size: 16,
             now_micros: 0,
+            // Host-only: the request block carries no affinity column.
+            affinity: &[],
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,

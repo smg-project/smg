@@ -11,7 +11,7 @@ use crate::{
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
-    view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, WorkerId},
+    view::{AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -25,6 +25,14 @@ pub trait Filter: Send + Sync + Debug {
 
     fn soft(&self) -> bool {
         false
+    }
+
+    /// What the host must feed for this filter to mean anything. A filter
+    /// that reads the affinity column ([`RequestFacts::affinity`]) declares
+    /// [`Needs::affinity`]; one that does not may be handed an empty
+    /// column, which reads as nothing held.
+    fn needs(&self) -> Needs {
+        Needs::default()
     }
 
     /// The per-decision scope this stage reads, if it holds one.
@@ -81,7 +89,10 @@ pub trait Scorer: Lifecycle + Debug {
         out: &mut [f32],
     ) -> TieBand;
 
-    /// What the host must feed for this scorer to mean anything.
+    /// What the host must feed for this scorer to mean anything. A scorer
+    /// that reads the affinity column ([`RequestFacts::affinity`]) declares
+    /// [`Needs::affinity`]; one that does not may be handed an empty
+    /// column, which reads as nothing held.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -107,6 +118,14 @@ pub trait Picker: Lifecycle + Debug {
         band: TieBand,
         out: &mut Targets,
     );
+
+    /// What the host must feed for this picker to mean anything. A picker
+    /// that reads the affinity column ([`RequestFacts::affinity`]) declares
+    /// [`Needs::affinity`]; one that does not may be handed an empty
+    /// column, which reads as nothing held.
+    fn needs(&self) -> Needs {
+        Needs::default()
+    }
 
     /// The per-decision scope this stage reads, if it holds one.
     fn scope(&self) -> Option<&dyn DecisionScope> {
@@ -145,12 +164,16 @@ pub struct Profile {
 
 impl Profile {
     /// What this profile's stages read from the host beyond the facts every
-    /// view carries. The engine's summary ([`Engine::needs`]) adds the view's
+    /// view carries: every stage of every kind, so a stage that reads the
+    /// affinity column as a filter or as the picker counts as one that
+    /// scores does, and a host that fills the column where
+    /// [`Needs::affinity`] is declared leaves it empty only where nothing
+    /// reads it. The engine's summary ([`Engine::needs`]) adds the view's
     /// own list of headers.
     pub fn needs(&self) -> Needs {
-        self.scorers
-            .iter()
-            .fold(Needs::default(), |needs, w| needs.or(w.scorer.needs()))
+        let filters = self.filters.iter().map(|f| f.needs());
+        let scorers = self.scorers.iter().map(|w| w.scorer.needs());
+        filters.chain(scorers).fold(self.picker.needs(), Needs::or)
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -612,20 +635,113 @@ struct AssignmentStages {
 }
 
 /// The two pools of a pair decision: the open prefills and the decodes, each
-/// decode row carrying the pair class it belongs to.
-#[derive(Clone, Copy)]
+/// decode row carrying the pair class it belongs to; and beside each pool its
+/// affinity column, by the candidate's index, empty for a side nothing reads
+/// it on.
+#[derive(Clone, Copy, Default)]
 pub struct PairPools<'a> {
     pub prefills: &'a [Candidate],
     pub decodes: &'a [Candidate],
+    /// The prefills' affinity facts: what the prefill side's stages find in
+    /// [`RequestFacts::affinity`].
+    pub prefill_affinity: &'a [AffinityFacts],
+    /// The decodes' affinity facts, the same for the decode side's stages.
+    pub decode_affinity: &'a [AffinityFacts],
+}
+
+/// One side of a pair decision.
+#[derive(Clone, Copy)]
+enum PairSide {
+    Prefill,
+    Decode,
+}
+
+impl<'a> PairPools<'a> {
+    /// One side of the pair as its stages read it: the side's pool, and the
+    /// request's facts with the side's phase, its draw sequence and its own
+    /// pool's affinity column. `None` when that column was not filled for
+    /// that pool ([`column_fits`]). The one place a pair's column meets its
+    /// pool, so no call site hands one side's column with the other side's
+    /// candidates.
+    fn side(
+        self,
+        side: PairSide,
+        facts: &RequestFacts<'a>,
+    ) -> Option<(&'a [Candidate], RequestFacts<'a>)> {
+        let (pool, affinity, phase, seed) = match side {
+            PairSide::Prefill => (
+                self.prefills,
+                self.prefill_affinity,
+                Phase::Prefill,
+                facts.seed,
+            ),
+            // The decode side draws its own sequence, derived from the
+            // request's seed: one seed on both sides made the decode picker
+            // replay the prefill picker's draws, so the decode chosen
+            // followed the prefill chosen (random over four prefills of four
+            // decodes each reached four of the sixteen). The decision still
+            // replays from the trace's seed.
+            PairSide::Decode => (
+                self.decodes,
+                self.decode_affinity,
+                Phase::Decode,
+                Draw::new(facts.seed).next_u64(),
+            ),
+        };
+        column_fits(affinity, pool).then(|| {
+            let facts = RequestFacts {
+                phase,
+                seed,
+                affinity,
+                ..*facts
+            };
+            (pool, facts)
+        })
+    }
+}
+
+/// The stage a decision names when it is refused for its affinity column:
+/// what a host counts its sheds under.
+const AFFINITY_COLUMN: &str = "affinity-column";
+
+/// Whether an affinity column stands for `pool`: empty, or one entry a
+/// candidate, in the candidates' order. Asked once where a decision takes
+/// its inputs and never at a read. A column of any other length was filled
+/// for another pool: nothing held is a real answer (a cold worker), so
+/// reading such a column as zeros would turn a host's mistake into a routing
+/// change no case sees.
+///
+/// A debug build also asserts here that every row's `position` is its index
+/// in `pool`. A row is found by where it stands in the pool the decision was
+/// given, and the readers that still take a row's position for its index
+/// (the plugin's filter adapter, the pair plan's lookup of a chosen prefill
+/// and its row-by-row filter passes) would answer for another row. The
+/// assertion leaves with the last of those readers.
+fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
+    debug_assert!(
+        pool.iter()
+            .zip(0u32..)
+            .all(|(row, index)| row.position == index),
+        "a row's position is its index in the pool the decision was given"
+    );
+    column.is_empty() || column.len() == pool.len()
 }
 
 impl Engine {
+    /// The engine of `profiles` under `bindings`. `needs` is what no stage
+    /// declares: a sessions rule's counts and the view's list of headers.
+    /// Every profile's stages are folded in here, so the summary
+    /// ([`Self::needs`]) holds a stage's needs however the engine was built.
     pub fn new(
         profiles: Vec<Profile>,
         bindings: Vec<Binding>,
         generation: u64,
         needs: Needs,
     ) -> Self {
+        // Each profile's needs, asked of its stages once: the summary and
+        // the phase answers below fold them.
+        let profile_needs: Vec<Needs> = profiles.iter().map(Profile::needs).collect();
+        let needs = profile_needs.iter().fold(needs, |all, &own| all.or(own));
         // Per phase, the bindings that cover it in the spec's order; a
         // binding behind a catch-all model glob decides no request of the
         // phase and adds nothing (the gateway's own document binds every
@@ -636,12 +752,11 @@ impl Engine {
                 .iter()
                 .filter(|b| b.phases.is_empty() || b.phases.contains(&phase))
             {
-                if let Some(profile) =
-                    profile_index(binding, phase).and_then(|i| profiles.get(usize::from(i)))
+                if let Some(&own) =
+                    profile_index(binding, phase).and_then(|i| profile_needs.get(usize::from(i)))
                 {
-                    phase_needs[slot(phase)] = phase_needs[slot(phase)]
-                        .or(profile.needs())
-                        .or(session_needs(binding));
+                    phase_needs[slot(phase)] =
+                        phase_needs[slot(phase)].or(own).or(session_needs(binding));
                 }
                 if binding.model == "*" {
                     break;
@@ -658,10 +773,10 @@ impl Engine {
             .filter(|b| b.phases.is_empty() || b.phases.contains(&Phase::Prefill))
         {
             if matches!(binding.plan, Plan::PdPair | Plan::Epd { .. }) {
-                if let Some(profile) =
-                    profile_index(binding, Phase::Decode).and_then(|i| profiles.get(usize::from(i)))
+                if let Some(&own) = profile_index(binding, Phase::Decode)
+                    .and_then(|i| profile_needs.get(usize::from(i)))
                 {
-                    phase_needs[decode_slot] = phase_needs[decode_slot].or(profile.needs());
+                    phase_needs[decode_slot] = phase_needs[decode_slot].or(own);
                 }
             }
             if binding.model == "*" {
@@ -762,7 +877,9 @@ impl Engine {
     /// of the `epd` plan (the request's phase is `Encode` and the plan's
     /// compatibility and vision rules filter the pool before the profile);
     /// under a `single` binding's sessions rule a keyed request goes to its
-    /// pinned worker first.
+    /// pinned worker first. The request's affinity column is empty or holds
+    /// one entry a candidate; any other is refused, as a decline under the
+    /// stage name `affinity-column`.
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -771,16 +888,16 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
+        let bare = Trace {
+            seed: facts.seed,
+            generation: pool.generation,
+            ..Trace::default()
+        };
+        if !column_fits(facts.affinity, candidates) {
+            return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
+        }
         let Some((binding, index, profile)) = self.resolve(facts.model, facts.phase) else {
-            return shed(
-                ShedReason::PolicyDeclined,
-                "binding",
-                Trace {
-                    seed: facts.seed,
-                    generation: pool.generation,
-                    ..Trace::default()
-                },
-            );
+            return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
         let _opened =
             self.scoped[usize::from(index)].then(|| profile.open(facts, candidates, pool));
@@ -1003,7 +1120,10 @@ impl Engine {
     /// alternate decodes of the same prefill after it. Pair class `0` is
     /// outside any pairing on either side: such a decode partners nobody and
     /// such a prefill is dropped at the `partnered` stage, so a host that
-    /// leaves the classes unset sheds instead of pairing all with all.
+    /// leaves the classes unset sheds instead of pairing all with all. Each
+    /// side's affinity column rides its pool ([`PairPools`]); the request
+    /// carries none here, and a non-empty one is refused under the stage
+    /// name `affinity-column`.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -1013,11 +1133,23 @@ impl Engine {
         decode_cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        let PairPools { prefills, decodes } = pools;
         let bare = Trace {
             seed: facts.seed,
             generation: pool.generation,
             ..Trace::default()
+        };
+        // A pair's columns ride its two pools. One on the request names
+        // neither pool: refused, where it would be dropped in silence and
+        // both sides scored as if nothing were held.
+        if !facts.affinity.is_empty() {
+            return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
+        }
+        // Each side's stages read their own pool and its own column.
+        let (Some((prefills, prefill_facts)), Some((decodes, decode_facts))) = (
+            pools.side(PairSide::Prefill, facts),
+            pools.side(PairSide::Decode, facts),
+        ) else {
+            return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         };
         // One binding for both sides: the prefill's lookup, whose decode
         // profile is the pair's decode side. A binding of the single plan
@@ -1034,20 +1166,6 @@ impl Engine {
             self.profiles.get(usize::from(decode_index)),
         ) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
-        };
-        let prefill_facts = RequestFacts {
-            phase: Phase::Prefill,
-            ..*facts
-        };
-        // The decode side draws its own sequence, derived from the request's
-        // seed: one seed on both sides made the decode picker replay the
-        // prefill picker's draws, so the decode chosen followed the prefill
-        // chosen (random over four prefills of four decodes each reached four
-        // of the sixteen). The decision still replays from the trace's seed.
-        let decode_facts = RequestFacts {
-            phase: Phase::Decode,
-            seed: Draw::new(facts.seed).next_u64(),
-            ..*facts
         };
         // One scope per side: the WIT view has one candidate list, so the
         // prefill stages read the prefill pool and the decode stages the
@@ -1517,11 +1635,369 @@ mod tests {
         engine.decide_pair(
             &facts,
             &PoolFacts::default(),
-            PairPools { prefills, decodes },
+            PairPools {
+                prefills,
+                decodes,
+                ..PairPools::default()
+            },
             &Constraints::default(),
             &Constraints::default(),
             &mut scratch,
         )
+    }
+
+    /// A scorer for the affinity column's cases: each kept row scores the
+    /// overlap its own entry of the column holds, and declares that it reads
+    /// the column.
+    #[derive(Debug)]
+    struct ByOverlap;
+
+    impl Lifecycle for ByOverlap {}
+
+    impl Scorer for ByOverlap {
+        fn name(&self) -> &'static str {
+            "by-overlap"
+        }
+
+        fn score(
+            &self,
+            facts: &RequestFacts<'_>,
+            _: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            for (score, &i) in out.iter_mut().zip(kept) {
+                *score = facts.affinity_at(i).overlap_blocks as f32 / 100.0;
+            }
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Needs {
+                affinity: true,
+                ..Needs::default()
+            }
+        }
+    }
+
+    fn single_binding() -> Binding {
+        Binding {
+            plan: Plan::Single,
+            decode_profile: None,
+            ..pair_binding()
+        }
+    }
+
+    /// One profile that keeps the healthy rows and leads with the deepest
+    /// overlap, under `binding`.
+    fn overlap_engine(binding: Binding) -> Engine {
+        let profile = Profile {
+            name: "overlap".into(),
+            filters: vec![Box::new(Healthy)],
+            scorers: vec![Weighted {
+                scorer: Box::new(ByOverlap),
+                weight: 1.0,
+            }],
+            picker: Box::new(Best),
+        };
+        Engine::new(vec![profile], vec![binding], 1, Needs::default())
+    }
+
+    /// A column whose entries hold `overlaps`, in the candidates' order.
+    fn held(overlaps: &[u32]) -> Vec<AffinityFacts> {
+        overlaps
+            .iter()
+            .map(|&overlap_blocks| AffinityFacts {
+                overlap_blocks,
+                ..AffinityFacts::default()
+            })
+            .collect()
+    }
+
+    /// `n` routable candidates of pair class 1.
+    fn paired(n: u32) -> Vec<Candidate> {
+        (0..n)
+            .map(|position| Candidate {
+                pair_class: 1,
+                ..candidate(position, 0)
+            })
+            .collect()
+    }
+
+    /// The position a decision leads with.
+    fn lead(decision: &Decision) -> Option<u32> {
+        decision
+            .pick()
+            .and_then(|pick| pick.targets.first().map(|target| target.position))
+    }
+
+    fn refused_for_its_column(decision: &Decision) -> bool {
+        matches!(
+            decision,
+            Decision::Shed(shed)
+                if (shed.reason, shed.emptied_by) == (ShedReason::PolicyDeclined, "affinity-column")
+        )
+    }
+
+    #[test]
+    fn a_column_of_another_length_is_refused_at_the_regular_entry() {
+        let engine = overlap_engine(Binding {
+            model: "m".into(),
+            ..single_binding()
+        });
+        let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        let decide = |model: &'static str, column: &[AffinityFacts]| {
+            let facts = RequestFacts {
+                model,
+                affinity: column,
+                ..RequestFacts::default()
+            };
+            engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+        };
+        // One entry a candidate: the holder of the deepest overlap leads.
+        assert_eq!(lead(&decide("m", &held(&[10, 90, 20]))), Some(1));
+        // An empty column decides too: nothing held, every row alike.
+        assert!(decide("m", &[]).pick().is_some());
+        // Shorter or longer: refused, under the column's own stage name.
+        for column in [held(&[10, 90]), held(&[10, 90, 20, 30])] {
+            let decision = decide("m", &column);
+            assert!(
+                refused_for_its_column(&decision),
+                "a column of {} for three candidates answered {decision:?}",
+                column.len()
+            );
+        }
+        // A decision's inputs are checked before anything is resolved from
+        // them: a model no binding covers is refused for its column when the
+        // column is another pool's, and for its binding only beside a column
+        // that fits.
+        assert!(refused_for_its_column(&decide("unbound", &held(&[10, 90]))));
+        assert!(matches!(
+            decide("unbound", &held(&[10, 90, 20])),
+            Decision::Shed(shed) if shed.emptied_by == "binding"
+        ));
+    }
+
+    /// The pair entry of the cases below: `prefills` and `decodes` beside the
+    /// two columns as the call hands them.
+    fn decide_pair_beside(
+        engine: &Engine,
+        prefills: &[Candidate],
+        decodes: &[Candidate],
+        prefill_affinity: &[AffinityFacts],
+        decode_affinity: &[AffinityFacts],
+    ) -> Decision {
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        engine.decide_pair(
+            &facts,
+            &PoolFacts::default(),
+            PairPools {
+                prefills,
+                decodes,
+                prefill_affinity,
+                decode_affinity,
+            },
+            &Constraints::default(),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    }
+
+    #[test]
+    fn a_column_of_another_length_is_refused_at_each_side_of_the_pair_entry() {
+        let engine = overlap_engine(pair_binding());
+        let (prefills, decodes) = (paired(2), paired(3));
+        let (two, three) = (held(&[10, 90]), held(&[10, 90, 20]));
+        let refused = |prefill_affinity: &[AffinityFacts], decode_affinity: &[AffinityFacts]| {
+            refused_for_its_column(&decide_pair_beside(
+                &engine,
+                &prefills,
+                &decodes,
+                prefill_affinity,
+                decode_affinity,
+            ))
+        };
+        // Each pool beside its own column, or beside none, is decided.
+        assert!(!refused(&two, &three));
+        assert!(!refused(&[], &[]));
+        assert!(!refused(&two, &[]));
+        // The prefills beside a column of the decodes' length, then the
+        // decodes beside one of the prefills': each side is refused alone.
+        assert!(refused(&three, &three));
+        assert!(refused(&two, &two));
+    }
+
+    /// A pair's columns ride its pools. A column on the request itself names
+    /// neither pool, whatever its length: refused, never dropped in silence.
+    #[test]
+    fn a_column_on_the_request_is_refused_at_the_pair_entry() {
+        let engine = overlap_engine(pair_binding());
+        let (prefills, decodes) = (paired(2), paired(2));
+        let decide = |on_the_request: &[AffinityFacts]| {
+            let facts = RequestFacts {
+                model: "m",
+                affinity: on_the_request,
+                ..RequestFacts::default()
+            };
+            engine.decide_pair(
+                &facts,
+                &PoolFacts::default(),
+                PairPools {
+                    prefills: &prefills,
+                    decodes: &decodes,
+                    ..PairPools::default()
+                },
+                &Constraints::default(),
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+        };
+        assert!(decide(&[]).pick().is_some());
+        // As long as either pool: its length fits both, and it is refused.
+        assert!(refused_for_its_column(&decide(&held(&[10, 90]))));
+    }
+
+    /// Each side of a pair reads its own pool's column: with the two columns
+    /// swapped between pools of equal length, the pair moves.
+    #[test]
+    fn each_side_of_a_pair_reads_its_own_pools_column() {
+        let engine = overlap_engine(pair_binding());
+        let (prefills, decodes) = (paired(2), paired(2));
+        let (rising, falling) = (held(&[10, 90]), held(&[90, 10]));
+        let pair = |prefill_affinity: &[AffinityFacts], decode_affinity: &[AffinityFacts]| {
+            let decision = decide_pair_beside(
+                &engine,
+                &prefills,
+                &decodes,
+                prefill_affinity,
+                decode_affinity,
+            );
+            let target = *decision
+                .pick()
+                .and_then(|pick| pick.targets.first())
+                .expect("a pair");
+            (
+                target.position,
+                target.pair.expect("a decode").decode_position,
+            )
+        };
+        assert_eq!(pair(&rising, &falling), (1, 0));
+        assert_eq!(pair(&falling, &rising), (0, 1));
+    }
+
+    /// One index, one worker: a pool whose filters drop its FIRST candidates
+    /// reads each survivor's own entry of the column, not the entry at the
+    /// survivor's place among the kept.
+    #[test]
+    fn a_narrowed_pool_reads_each_survivors_own_entry_of_the_column() {
+        let engine = overlap_engine(single_binding());
+        let mut pool = [
+            candidate(0, 0),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+        ];
+        pool[0].health.healthy = false;
+        pool[1].health.healthy = false;
+        let column = held(&[90, 80, 10, 70]);
+        let facts = RequestFacts {
+            model: "m",
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            &pool,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert_eq!(lead(&decision), Some(3));
+    }
+
+    /// A stage that reads the affinity column as a filter alone, or as the
+    /// picker alone, counts in the profile's needs as one that scores does:
+    /// a host that fills the column where it is declared leaves it empty
+    /// only where nothing reads it.
+    #[test]
+    fn a_profiles_needs_fold_its_filters_and_its_picker() {
+        #[derive(Debug)]
+        struct Reader;
+
+        impl Lifecycle for Reader {}
+
+        impl Filter for Reader {
+            fn name(&self) -> &'static str {
+                "reader"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> Needs {
+                Needs {
+                    affinity: true,
+                    ..Needs::default()
+                }
+            }
+        }
+
+        impl Picker for Reader {
+            fn name(&self) -> &'static str {
+                "reader"
+            }
+
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                Best.pick(facts, candidates, kept, scores, band, out);
+            }
+
+            fn needs(&self) -> Needs {
+                Needs {
+                    affinity: true,
+                    ..Needs::default()
+                }
+            }
+        }
+
+        let as_filter = Profile {
+            filters: vec![Box::new(Reader)],
+            ..least_requests_profile()
+        };
+        let as_picker = Profile {
+            picker: Box::new(Reader),
+            ..least_requests_profile()
+        };
+        assert!(!least_requests_profile().needs().affinity);
+        assert!(as_filter.needs().affinity, "a filter's needs");
+        assert!(as_picker.needs().affinity, "the picker's needs");
+        // The engine's summary holds them however the engine was built: a
+        // caller that hands no needs of its own still gets its stages'.
+        for (profile, bound_as) in [(as_filter, "a filter"), (as_picker, "the picker")] {
+            let engine = Engine::new(vec![profile], vec![single_binding()], 1, Needs::default());
+            assert!(engine.needs().affinity, "the summary, bound as {bound_as}");
+            assert!(
+                engine.needs_for("m", Phase::Single).affinity,
+                "the decision's needs, bound as {bound_as}"
+            );
+        }
     }
 
     #[test]
@@ -1857,6 +2333,7 @@ mod tests {
                 PairPools {
                     prefills: &prefills,
                     decodes: &decodes,
+                    ..PairPools::default()
                 },
                 &Constraints::default(),
                 &Constraints::default(),
@@ -1894,17 +2371,31 @@ mod tests {
         }
     }
 
+    /// A row whose position is not its index is a host's mistake. A debug
+    /// build stops at the assertion where a decision takes its inputs; the
+    /// assertion reads every row, and the misplaced one here is the second.
+    /// A release build keeps the pair plan's guard: the lookup of the chosen
+    /// prefill finds no row at that position and the target loses its turn,
+    /// never the process. No hosted job builds these cases for release: the
+    /// release side runs by hand with every change of the pair entry, until
+    /// the last reader of a row's position goes and the assertion with it.
     #[test]
-    fn a_prefill_position_outside_the_slice_costs_the_target_and_not_the_process() {
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "a row's position is its index")
+    )]
+    fn a_misplaced_prefill_stops_a_debug_build_and_costs_a_release_build_its_target() {
         let engine = Engine::new(
             vec![strict_profile()],
             vec![pair_binding()],
             1,
             Needs::default(),
         );
-        let mut prefills = [candidate(0, 0)];
-        prefills[0].position = 5;
-        prefills[0].pair_class = 7;
+        // The first prefill is outside any pairing, so the plan chooses the
+        // second: the misplaced one.
+        let mut prefills = [candidate(0, 0), candidate(1, 0)];
+        prefills[1].position = 5;
+        prefills[1].pair_class = 7;
         let mut decodes = [candidate(0, 0)];
         decodes[0].pair_class = 7;
         match decide_pair(&engine, &prefills, &decodes) {
@@ -1970,6 +2461,7 @@ mod tests {
                 PairPools {
                     prefills: &prefills,
                     decodes: &decodes,
+                    ..PairPools::default()
                 },
                 &Constraints::default(),
                 &Constraints::default(),
@@ -2092,6 +2584,7 @@ mod tests {
             PairPools {
                 prefills: &prefills,
                 decodes: &decodes,
+                ..PairPools::default()
             },
             &Constraints::default(),
             &Constraints::default(),
@@ -2153,6 +2646,7 @@ mod tests {
                 PairPools {
                     prefills: &prefills,
                     decodes: &decodes,
+                    ..PairPools::default()
                 },
                 &Constraints::default(),
                 &Constraints::default(),
@@ -2210,6 +2704,7 @@ mod tests {
             PairPools {
                 prefills: &prefills,
                 decodes: &decodes,
+                ..PairPools::default()
             },
             &Constraints::default(),
             &Constraints::default(),
@@ -2506,15 +3001,23 @@ mod tests {
             "a pin holds under load"
         );
         assert_eq!(place_keyed(&engine, &pool, 8, 30).position, 2);
+        // A host that drops a row numbers the rest again: a row's position
+        // is its index in the pool a decision is given.
+        let renumber = |pool: &mut [Candidate]| {
+            for (row, index) in pool.iter_mut().zip(0u32..) {
+                row.position = index;
+            }
+        };
         // The host removes 102: key 8's failover is its owner, loaded or not.
         engine.on_membership(&Membership::Removed(WorkerId(102)));
         pool.remove(2);
+        renumber(&mut pool);
         assert_eq!(
             engine.sessions.pins(Identity::hashed(8).hash),
             Some([WorkerId(100), WorkerId(0)]),
             "the removed owner left the pins, not just the routable set"
         );
-        assert_eq!(place_keyed(&engine, &pool, 8, 40).position, 0);
+        assert_eq!(place_keyed(&engine, &pool, 8, 40).id, WorkerId(100));
         // The host replaces 100: both keys have no pin left and are placed
         // afresh by the rule's assignment (the fewest requests).
         engine.on_membership(&Membership::Replaced {
@@ -2522,10 +3025,11 @@ mod tests {
             new: WorkerId(200),
         });
         pool.remove(0);
+        renumber(&mut pool);
         assert_eq!(engine.sessions.pins(Identity::hashed(7).hash), None);
         assert_eq!(engine.sessions.pins(Identity::hashed(8).hash), None);
-        assert_eq!(place_keyed(&engine, &pool, 7, 50).position, 3);
-        assert_eq!(place_keyed(&engine, &pool, 8, 50).position, 3);
+        assert_eq!(place_keyed(&engine, &pool, 7, 50).id, WorkerId(103));
+        assert_eq!(place_keyed(&engine, &pool, 8, 50).id, WorkerId(103));
     }
 
     #[test]

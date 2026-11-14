@@ -15,11 +15,14 @@
 )]
 
 mod common;
+#[path = "common/placed.rs"]
+mod placed;
 
 use std::hint::black_box;
 
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use placed::page_start_buffer;
 use smg_policy_controller::{
     Constraints, Lease, Lifecycle, PolicySpec, PoolFacts, RequestFacts, Scratch, Side, Target,
     PRESETS,
@@ -31,7 +34,10 @@ fn view_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/view_build");
     for &n in &SIZES {
         let fleet = fleet(n);
-        let mut out = Vec::with_capacity(n);
+        // Where a page boundary falls in the rows' buffer is an input of
+        // the build's time (`placed`): the timed buffer stands on a page's
+        // start, on both sides of the gate.
+        let mut out = page_start_buffer(n);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
