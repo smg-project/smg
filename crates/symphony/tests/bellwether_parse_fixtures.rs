@@ -296,6 +296,18 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // base's chat template byte for byte: ChatML, Qwen 3.5's tagged calls, and the thought opened
     // in the prompt (closed there when the request turns thinking off).
     ("minimax-h3-image-pe", GenerationPrompt::OpensTheThought),
+    // MiniCPM-V 4.7 (the 35B-A3B on a Qwen 3.5 mixture-of-experts text stack, the 1B on the dense
+    // one, each with its own tokenizer) ships one chat template for both: ChatML, Qwen 3.5's tagged
+    // calls, and the thought opened in the prompt only when the request asks for it (closed there
+    // otherwise, by default too, as Qwen3.5-2B's).
+    (
+        "minicpm-v-4.7-1b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "minicpm-v-4.7-35b-a3b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
