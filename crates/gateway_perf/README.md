@@ -184,18 +184,22 @@ or hub id>`.
   request read 530 us with the counters on and 320 us without, on the same binary and bed);
   the column is comparable between the two sides of one run, and `alloc` mode gives the
   absolute.
-- **RSS**: after the window, from `/proc`, whole and in its two parts; `VmHWM` is the peak.
-  The anonymous part (`RssAnon`) is what the gateway allocated. It moves with the
-  allocator's decay and the request mix in flight at the moment of reading, a few percent,
-  and it is the part the gate judges. The file part (`RssFile`) is the pages of the
-  gateway's own binary the kernel has mapped: a fault maps the neighbours the page cache
-  holds, so the part follows how much of the measured FILE is cached, not the code. Two
-  copies of one binary read apart by it, in either direction (the copy whose pages the
-  cache has dropped reads lower), so the whole set and the file part are reported and
-  never judged. To compare them, read both binaries whole before the run on an idle
-  machine, and on a machine under memory pressure keep both files locked in memory for
-  its length. `perf-mem` separates a slope (growth per 10,000 requests on one gateway)
-  from the band.
+- **RSS**: after the window, from `/proc`: the whole set (`VmRSS`), its anonymous part and
+  its file part; `VmHWM` is the peak. The whole set is those two parts and shared memory
+  (`RssShmem`, zero for the gateway on the bed). The anonymous part (`RssAnon`) is what the
+  gateway allocated. It moves with the allocator's decay and the request mix in flight at
+  the moment of reading, a few percent, and it is the part the gate judges. The file part
+  (`RssFile`) is the file pages the kernel has mapped: mostly the gateway's own binary, and
+  its shared libraries (3.8 MB of 40 at idle on the bed). A fault maps the cached
+  neighbours inside the 64 KB window around it, so the part follows two things that are
+  not the gateway's work. One is how much of the measured FILE is cached: two copies of
+  one binary read apart, and the copy whose pages the cache has dropped reads lower. The
+  other is where the linker put the code that runs: a change that touched as many pages of
+  its binary on both sides held one megabyte more, the same code lying in more windows.
+  So the whole set and the file part are reported and never judged. To compare them, read
+  both binaries whole before the run on an idle machine, and on a machine under memory
+  pressure keep both files locked in memory for its length. `perf-mem` separates a slope
+  (growth per 10,000 requests on one gateway) from the band.
 - **The spread** in the setup column is the base's (max - min) / median over its repeats:
   the floor under which a change is not a change. The verdict table applies the rule of
   `scripts/bench_gate.py`: an id regresses only when its change is worse than the threshold
@@ -222,7 +226,7 @@ to 8 cores, over the five paths ((max - min) / median of the per-side repeats):
 | KiB requested per request | 0.01 - 0.02 % | the judgement; 2 % is a change |
 | anonymous RSS after the window | 0.0 - 5.7 % (the pull-request job's cell: 4,000 requests, three paths; 95 of 96 per-side samples, one at 10.4 %) | 10 % is a change |
 | RSS after the window, whole | 1.3 - 2.6 % with both files cached alike; it carries the file part | report only |
-| file-backed RSS after the window | follows the page cache of the measured file | report only |
+| file-backed RSS after the window | follows the page cache of the measured file and where the linker put the code that runs | report only |
 | instructions per request, user + kernel | 0.5 - 3.2 % | the kernel share is the host's noise: report only |
 | CPU time per request | 6.8 - 18.8 % | load-dependent: report only; read it with the load line under the table |
 | cycles per request | 9 - 29 % | load-dependent: report only |

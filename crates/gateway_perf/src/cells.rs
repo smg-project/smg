@@ -448,11 +448,13 @@ pub fn per_request(c: &CellRecord, idle: Option<&CellRecord>) -> BTreeMap<String
     let kb = |key: &str| c.status_1.get(key).copied().unwrap_or(0) as f64 / 1024.0;
     out.insert("rss_mb_after_window".to_string(), kb("VmRSS"));
     out.insert("hwm_mb".to_string(), kb("VmHWM"));
-    // The resident set in its two parts, where the kernel reports them. The anonymous
-    // part is what the gateway allocated. The file part is the pages of its own binary
-    // the kernel has mapped: a fault maps the neighbours the page cache holds, so the
-    // part follows how much of the measured file is cached, and two copies of one
-    // binary read apart. The gate judges the anonymous part.
+    // The anonymous and the file part of the resident set, where the kernel reports them
+    // (the whole set is these two and shared memory). The anonymous part is what the
+    // gateway allocated. The file part is the file pages the kernel has mapped, mostly
+    // the gateway's own binary (and its shared libraries): a fault maps the cached
+    // neighbours inside the 64 KB window around it, so the part follows how much of the
+    // measured file is cached and where the linker put the code that runs, and two
+    // copies of one binary read apart. The gate judges the anonymous part.
     for (field, metric) in [
         ("RssAnon", "rss_anon_mb_after_window"),
         ("RssFile", "rss_file_mb_after_window"),
