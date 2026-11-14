@@ -3824,11 +3824,13 @@ impl Metrics {
     // Worker cleanup
     // ========================================================================
 
-    /// A worker registered at `worker_url`: its series record again if the
-    /// address was retired by an earlier removal.
-    pub fn worker_registered(worker_url: &str) {
+    /// A worker registered at `worker_url` under `worker_id`: its series
+    /// record again if the address was retired by an earlier removal, and
+    /// the store learns the id a masked label is told apart by.
+    pub fn worker_registered(worker_url: &str, worker_id: &str) {
         if let Some(series) = worker_metrics::installed() {
             series.activate(worker_url);
+            series.identify(worker_url, worker_id);
         }
         handles::worker_set_changed();
     }
