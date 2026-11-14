@@ -372,8 +372,10 @@ fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
 /// control bytes, a tab, a newline, a carriage return, characters of two,
 /// three and four bytes, a line separator, an empty chunk, a JSON-looking
 /// text) pushed one at a time, each step written as a chunk event and as a
-/// finish event, with and without logprobs, over several indices, with and
-/// without the frame's room owed.
+/// finish event (the finish reasons length, stop, a raw object and a raw
+/// string), without logprobs and with each of the two logprob lists present
+/// or absent, over several indices, ids and weight versions that are empty,
+/// escaped and non-ASCII, with and without the frame's room owed.
 #[test]
 fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
     /// The event as serde serializes it from the raw text: the oracle.
@@ -404,6 +406,7 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
     let output_logprobs = [
         GenerateTokenLogprob(Some(-0.5), 3, None),
         GenerateTokenLogprob(Some(-1.0), 4, Some("four".to_string())),
+        GenerateTokenLogprob(Some(f64::NEG_INFINITY), 5, None),
     ];
     for index in [0u32, 1, 7, u32::MAX] {
         let mut escaped = EscapedText::default();
@@ -412,27 +415,63 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
             escaped.push_str(chunk);
             raw.push_str(chunk);
             let ids: Vec<u32> = chunk.chars().map(u32::from).collect();
-            for with_logprobs in [false, true] {
+            for (logprob_lists, id, weight_version) in [
+                (None, "gen-frames-0", "v7"),
+                (Some((true, true)), "gen-frames-0", "v7"),
+                (Some((true, false)), "", ""),
+                (Some((false, true)), "gen-frames-0", "v7"),
+                (Some((false, false)), "gen-frames-0", "v7"),
+                (
+                    None,
+                    "gen \"quoted\" back\\slash\ttab",
+                    "v7 \u{2028} caf\u{e9}",
+                ),
+                (
+                    Some((true, true)),
+                    "\u{65e5}\u{672c}\u{8a9e} \u{1f600}",
+                    "\u{0}\u{1f}\u{7f}",
+                ),
+            ] {
                 for (what, finish_reason, e2e_latency) in [
                     ("chunk", None, None),
                     (
-                        "finish",
+                        "finish-length",
                         Some(utils::parse_finish_reason("length", 7)),
                         Some(0.0123),
                     ),
+                    (
+                        "finish-stop",
+                        Some(utils::parse_finish_reason("stop", 7)),
+                        Some(1.5),
+                    ),
+                    (
+                        "finish-raw-object",
+                        Some(utils::parse_finish_reason(
+                            "{\"type\":\"abort\",\"why\":\"x\"}",
+                            7,
+                        )),
+                        Some(0.0),
+                    ),
+                    (
+                        "finish-raw-string",
+                        Some(utils::parse_finish_reason("eos", 7)),
+                        Some(12345.678),
+                    ),
                 ] {
-                    let logprobs = with_logprobs.then_some(GenerateLogprobs::new(
-                        Some(input_logprobs.as_slice()),
-                        Some(output_logprobs.as_slice()),
-                    ));
+                    let logprobs = logprob_lists.map(|(with_input, with_output)| {
+                        GenerateLogprobs::new(
+                            with_input.then_some(input_logprobs.as_slice()),
+                            with_output.then_some(output_logprobs.as_slice()),
+                        )
+                    });
                     let event = GenerateEvent {
                         text: &escaped,
                         output_ids: &ids,
                         meta_info: GenerateMetaInfo {
-                            id: "gen-frames-0",
+                            id,
                             finish_reason,
                             prompt_tokens: 10,
-                            weight_version: "v7",
+                            weight_version,
                             logprobs,
                             completion_tokens: step as u32 + 1,
                             cached_tokens: 3,
@@ -461,7 +500,7 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
                         assert_eq!(
                             got.as_ref(),
                             expected.as_slice(),
-                            "index {index}, step {step} {chunk:?}, logprobs {with_logprobs}, {what}, room owed {room_owed}"
+                            "index {index}, step {step} {chunk:?}, logprob lists {logprob_lists:?}, id {id:?}, weight version {weight_version:?}, {what}, room owed {room_owed}"
                         );
                         assert_eq!(owed, 0, "the write takes the room owed");
                     }

@@ -90,7 +90,7 @@ impl LogGate {
 
 /// The guest's log levels: 0 error, 1 warn, 2 info, 3 debug, 4 and above
 /// trace. A level below the plugin's cap is raised to the cap.
-pub(crate) fn capped_level(level: u8, cap: u8) -> u8 {
+fn capped_level(level: u8, cap: u8) -> u8 {
     level.max(cap)
 }
 

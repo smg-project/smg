@@ -26,6 +26,7 @@ use crate::{
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_failure::{PdSide, SidePhase},
+            prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
@@ -48,7 +49,7 @@ use crate::{
             },
         },
     },
-    worker::{liveness, PrefillLoadGuard, Worker},
+    worker::{liveness, Worker},
 };
 
 /// The message a sequential decode side's silence verdict starts with (see

@@ -19,14 +19,14 @@ use smg_auth::AuditResource;
 use uuid::Uuid;
 
 use crate::{
+    admin::{
+        json::{refusal, AdminJson},
+        params::AdminPath,
+    },
     server::AppState,
     wasm::{
         WasmMetrics, WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult,
         WasmModuleListResponse,
-    },
-    worker::{
-        admin_json::{refusal, AdminJson},
-        admin_params::AdminPath,
     },
     workflow::{
         job_queue::{Job, JobOutcomeError},
