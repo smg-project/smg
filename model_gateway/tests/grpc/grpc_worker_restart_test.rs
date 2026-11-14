@@ -29,17 +29,18 @@ use smg::{
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         manager::{WorkerManager, WorkerManagerConfig},
+        test_support::RefusedAddress,
         BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
     },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::oneshot,
     task::JoinHandle,
 };
 
-use crate::common::{self, grpc_harness::free_port};
+use crate::common;
 
 const MODEL: &str = "restart-test-model";
 
@@ -54,9 +55,10 @@ const BREAKER_TIMEOUT: Duration = Duration::from_secs(600);
 /// intervals, a small fraction of the breaker's timeout.
 const RECOVERY_BOUND: Duration = Duration::from_secs(10);
 
-/// An in-process mock engine on a fixed port that can be stopped: the stop
-/// closes its listener and its connections, which is what a killed engine
-/// process looks like to the gateway, and the port is free for a restart.
+/// An in-process mock engine on the case's reserved address that can be
+/// stopped: the stop closes its listener and its connections, which is what a
+/// killed engine process looks like to the gateway, and the reservation keeps
+/// the port, refused, for the restart.
 struct MockEngine {
     stop: oneshot::Sender<()>,
     served: JoinHandle<()>,
@@ -68,8 +70,9 @@ impl MockEngine {
         reason = "test helper: the mock engine's serve task ends with its stop signal, \
                   which the test sends before it returns"
     )]
-    async fn start(port: u16) -> Self {
-        let listener = bind(port).await;
+    fn start(address: &RefusedAddress) -> Self {
+        let listener = address.listen_shared();
+        let port = address.port();
         let cfg = Arc::new(mock_worker::config::Config {
             admin_port: None,
             context_length: 32768,
@@ -104,24 +107,6 @@ impl MockEngine {
     async fn kill(self) {
         let _ = self.stop.send(());
         let _ = self.served.await;
-    }
-}
-
-/// Bind the engine's fixed port; a restart may find the address still being
-/// released by the kernel, so the bind is retried for a moment.
-async fn bind(port: u16) -> TcpListener {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(listener) => return listener,
-            Err(err) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "bind 127.0.0.1:{port} for the mock engine: {err}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
     }
 }
 
@@ -242,8 +227,9 @@ async fn build_router_with(
 /// breaker on trial instead of leaving it to its timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
-    let port = free_port().await;
-    let engine = MockEngine::start(port).await;
+    let address = RefusedAddress::reserve_shared();
+    let port = address.port();
+    let engine = MockEngine::start(&address);
     let (router, worker, mut manager) = build_router(port, 1, None).await;
 
     // Pending until the first probe passes; then it serves.
@@ -271,7 +257,7 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
 
     // The engine comes back on the same address.
     let restarted = Instant::now();
-    let engine = MockEngine::start(port).await;
+    let engine = MockEngine::start(&address);
     let mut first_success = None;
     while restarted.elapsed() < RECOVERY_BOUND {
         if request_status(router.as_ref()).await == 200 {
@@ -318,8 +304,9 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_two() {
     const INTERVAL: Duration = Duration::from_secs(3);
-    let port = free_port().await;
-    let engine = MockEngine::start(port).await;
+    let address = RefusedAddress::reserve_shared();
+    let port = address.port();
+    let engine = MockEngine::start(&address);
     let (router, worker, mut manager) = build_router_with(port, 1, None, 2, INTERVAL).await;
 
     // Two passing probes an interval apart: the registration's promotion.
@@ -337,7 +324,7 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
     })
     .await;
     let restarted = Instant::now();
-    let engine = MockEngine::start(port).await;
+    let engine = MockEngine::start(&address);
 
     // The passing probes since the restart as offsets from it, the promoting
     // one last, stamped by the worker's contact clock (a contact older than
@@ -414,8 +401,8 @@ impl ResettingPeer {
         clippy::disallowed_methods,
         reason = "test helper: the peer's accept loop is aborted by the test before it returns"
     )]
-    async fn start(port: u16) -> Self {
-        let listener = bind(port).await;
+    fn start(address: &RefusedAddress) -> Self {
+        let listener = address.listen_shared();
         let connections = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&connections);
         let served = tokio::spawn(async move {
@@ -492,8 +479,9 @@ async fn read_the_request(stream: &mut TcpStream) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_before_it() {
     const ATTEMPTS: u32 = 3;
-    let port = free_port().await;
-    let engine = MockEngine::start(port).await;
+    let address = RefusedAddress::reserve_shared();
+    let port = address.port();
+    let engine = MockEngine::start(&address);
     // The breaker outlasts the attempts: every one of them reaches the worker.
     let (router, worker, mut manager) = build_router(
         port,
@@ -517,7 +505,7 @@ async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_bef
     manager.shutdown().await;
 
     engine.kill().await;
-    let peer = ResettingPeer::start(port).await;
+    let peer = ResettingPeer::start(&address);
     let response = request(router.as_ref()).await;
     let status = response.status().as_u16();
     let body = to_bytes(response.into_body(), 64 * 1024)

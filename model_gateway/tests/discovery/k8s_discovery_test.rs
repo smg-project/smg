@@ -35,7 +35,7 @@ use smg::{
         start_service_discovery_with_client, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
         DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
     },
-    worker::BasicWorkerBuilder,
+    worker::{test_support::RefusedAddress, BasicWorkerBuilder},
 };
 use tokio::sync::broadcast;
 
@@ -596,10 +596,10 @@ async fn failed_registration_retries_until_engine_appears() {
     let fake = FakeK8s::start().await;
     let app_context = test_context().await;
 
-    // Reserve a free port, then release it so nothing listens there yet.
-    let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = reserved.local_addr().unwrap().port();
-    drop(reserved);
+    // A port nothing answers at, held by this case: no other test of the
+    // binary can be handed it while the engine is down.
+    let reserved = RefusedAddress::reserve();
+    let port = reserved.port();
 
     fake.apply_pod(worker_pod("late-0", "uid-late-0", &port.to_string(), true));
     let handle = start_service_discovery_with_client(
@@ -616,7 +616,8 @@ async fn failed_registration_retries_until_engine_appears() {
         "no worker may exist while the engine is unreachable"
     );
 
-    // Engine comes up on the annotated port: a later pass must register it.
+    // Engine comes up on the annotated port, on the held socket itself: a
+    // later pass must register it.
     let mut engine = MockWorker::new(MockWorkerConfig {
         port,
         worker_type: WorkerType::Regular,
@@ -624,7 +625,7 @@ async fn failed_registration_retries_until_engine_appears() {
         response_delay_ms: 0,
         fail_rate: 0.0,
     });
-    engine.start().await.unwrap();
+    engine.start_on(reserved.listen()).await.unwrap();
     wait_for(
         &app_context,
         "worker registered once the engine came up",
