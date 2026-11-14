@@ -61,7 +61,7 @@ async fn context_with_media_refs() -> (RequestContext, JoinHandle<()>) {
         client: BackendClient::Grpc(GrpcClient::Vllm(client)),
     });
     ctx.state.multimodal_refs = Some(MediaPlan::new([MediaContentPart::ImageUrl {
-        url: "data:image/png;base64,AAAA".to_string(),
+        url: "data:image/png;base64,AAAA".to_string().into(),
         detail: None,
         uuid: None,
         max_long_side_pixel: None,

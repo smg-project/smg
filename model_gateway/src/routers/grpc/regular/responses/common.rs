@@ -355,7 +355,10 @@ pub(super) fn build_next_request(
     state: &ToolLoopState,
     current_request: ResponsesRequest,
 ) -> ResponsesRequest {
-    let mut input_items = current_input_items(&state.base_input);
+    // Every iteration is rebuilt on the loop's base input, so this copy is the
+    // one the rebuild needs; the normaliser moves it through instead of
+    // copying each item once more.
+    let mut input_items = current_input_items(state.base_input.clone());
     input_items.extend_from_slice(&state.conversation_history);
 
     // Build new request for next iteration, moving fields from old request to avoid cloning
