@@ -202,10 +202,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// its peers hold for the key, so the claim's publication outranks it.
     fn raise_revision_to(&self, _floor: u64) {}
 
-    /// Epochs reported during metadata discovery, invalidated after a health
-    /// failure. These are observations, not proof against an undetected restart.
-    fn cache_trace_epochs(&self) -> Vec<String> {
+    /// Epochs reported during metadata discovery, as the registration
+    /// advertises them: current only while
+    /// [`Self::cache_trace_epochs_valid`] holds. These are observations, not
+    /// proof against an undetected restart.
+    fn advertised_cache_trace_epochs(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Whether the advertised epochs are current: a health failure withdraws
+    /// them. The epochs' one live read: a routing-evidence row keeps this
+    /// bit where its pick runs and reads the advertised list when the
+    /// evidence is written.
+    fn cache_trace_epochs_valid(&self) -> bool {
+        false
     }
 
     /// Set the worker's lifecycle status.
@@ -1576,16 +1586,17 @@ impl Worker for BasicWorker {
         self.runtime.load().raise_revision_to(floor);
     }
 
-    fn cache_trace_epochs(&self) -> Vec<String> {
-        if !self.runtime.load().cache_trace_epochs_valid() {
-            return Vec::new();
-        }
+    fn advertised_cache_trace_epochs(&self) -> Vec<String> {
         self.metadata
             .spec
             .labels
             .get("cache_trace_epochs")
             .and_then(|epochs| serde_json::from_str(epochs).ok())
             .unwrap_or_default()
+    }
+
+    fn cache_trace_epochs_valid(&self) -> bool {
+        self.runtime.load().cache_trace_epochs_valid()
     }
 
     fn set_status(&self, status: WorkerStatus) {

@@ -30,7 +30,7 @@ use minijinja::{
 use serde::Serialize;
 use serde_json::{self, ser::Formatter, Value as JsonValue};
 
-use crate::{encoders::marks, native::AddedTokens};
+use crate::{encoders::marks, native::AddedTokens, traits::SpecialTokens};
 
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -915,7 +915,7 @@ pub struct ChatTemplateParams<'a> {
     pub template_kwargs: Option<&'a HashMap<String, serde_json::Value>>,
     /// Special tokens to inject into the template context.
     /// Many templates reference `{{ bos_token }}`, `{{ eos_token }}`, etc.
-    pub special_tokens: Option<&'a crate::traits::SpecialTokens>,
+    pub special_tokens: Option<&'a SpecialTokens>,
     /// Resolved thinking preference. When `Some`, `apply` sets the template's
     /// own thinking-toggle key (`enable_thinking`/`thinking`, per detection) to
     /// this value as a default. An explicit `template_kwargs` entry for that
