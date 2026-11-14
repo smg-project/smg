@@ -37,8 +37,7 @@ use crate::{
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     routers::common::header_utils::{
-        extract_routing_key_hint, extract_routing_key_hint_named, parse_routing_tokens_hint,
-        ROUTING_KEY_HINT_MAX_BYTES,
+        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
 };
@@ -435,40 +434,6 @@ impl PolicyRegistry {
     pub(crate) fn engine_for(&self, policy: &dyn LoadBalancingPolicy) -> Option<&Arc<Decider>> {
         let decider = self.decider.as_ref()?;
         (policy.name() == self.default_policy.name()).then_some(decider)
-    }
-
-    /// The policy engine for a pair placement (`--policy-engine engine`), or
-    /// `None` when the legacy path decides. The engine was built from the
-    /// prefill and decode policies, so it serves both by construction; a
-    /// keyed request keeps the keyed path when the sticky routing-key
-    /// override places it on either side or a side's policy pins the key
-    /// itself (`manual`: the engine's pair binding pins no session), and
-    /// the pins move behind the engine's view in a later step.
-    pub(crate) fn pair_engine_for(&self, info: &SelectWorkerInfo<'_>) -> Option<&Arc<Decider>> {
-        let decider = self.decider.as_ref()?;
-        let (prefill, decode) = (self.get_prefill_policy(), self.get_decode_policy());
-        let keyed = self.sticky_for(prefill.as_ref(), info).is_some()
-            || self.sticky_for(decode.as_ref(), info).is_some()
-            || ((Self::pins_its_own_key(prefill.as_ref())
-                || Self::pins_its_own_key(decode.as_ref()))
-                && Self::carries_its_own_key(info));
-        (!keyed).then_some(decider)
-    }
-
-    /// Whether `policy` pins a keyed request itself (`manual` and
-    /// `consistent_hashing`, the policies the sticky override leaves alone).
-    fn pins_its_own_key(policy: &dyn LoadBalancingPolicy) -> bool {
-        !Self::routing_key_override_applies(policy.name())
-    }
-
-    /// Whether `info` carries the key a key-native policy reads: the routing
-    /// key as placement derived it, else the routing-key header, else the
-    /// rid-derived key, the precedence of [`ManualPolicy`] itself.
-    fn carries_its_own_key(info: &SelectWorkerInfo<'_>) -> bool {
-        info.routing_key
-            .or_else(|| extract_routing_key_hint(info.headers))
-            .or(info.rid_key)
-            .is_some()
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and
@@ -3522,79 +3487,5 @@ mod tests {
             legacy.worker_needs_kv_events(worker.as_ref()),
             encode.needs_kv_events()
         );
-    }
-
-    /// The engine decides a pair unless the sticky routing-key override
-    /// places the request on one of its sides; the override off, a key is
-    /// only a fact in the view.
-    #[test]
-    fn the_engine_decides_a_pair_outside_the_sticky_override() {
-        let round_robin = PolicyConfig::RoundRobin;
-        let policies = PolicyRegistry::with_override(
-            round_robin.clone(),
-            RoutingKeyOverrideConfig {
-                enabled: true,
-                ..Default::default()
-            },
-        )
-        .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
-        let unkeyed = SelectWorkerInfo::default();
-        assert!(policies.pair_engine_for(&unkeyed).is_some());
-        let headers = headers_with_routing_key("session-7");
-        let keyed = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..SelectWorkerInfo::default()
-        };
-        assert!(policies.pair_engine_for(&keyed).is_none());
-        let by_rid = SelectWorkerInfo {
-            rid_key: Some("session-7"),
-            ..SelectWorkerInfo::default()
-        };
-        assert!(policies.pair_engine_for(&by_rid).is_none());
-
-        let no_override = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &round_robin,
-            &round_robin,
-        );
-        assert!(no_override.pair_engine_for(&keyed).is_some());
-        let legacy = PolicyRegistry::new(round_robin);
-        assert!(legacy.pair_engine_for(&unkeyed).is_none());
-    }
-
-    /// A side whose policy pins the key itself (`manual`) keeps a keyed
-    /// request on the legacy pair path, override or not: the engine's pair
-    /// binding pins no session. The unkeyed request takes the engine.
-    #[test]
-    fn a_keyed_pair_with_a_manual_side_keeps_the_legacy_path() {
-        let round_robin = PolicyConfig::RoundRobin;
-        let manual = PolicyConfig::Manual {
-            eviction_interval_secs: 60,
-            max_idle_secs: 3600,
-            assignment_mode: ManualAssignmentMode::Random,
-        };
-        let headers = headers_with_routing_key("session-7");
-        let keyed = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..SelectWorkerInfo::default()
-        };
-        let by_rid = SelectWorkerInfo {
-            rid_key: Some("session-7"),
-            ..SelectWorkerInfo::default()
-        };
-        for (prefill, decode) in [(&manual, &round_robin), (&round_robin, &manual)] {
-            let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-                PolicyEngineMode::Engine,
-                prefill,
-                decode,
-            );
-            policies.set_prefill_policy(PolicyFactory::create_from_config(prefill));
-            policies.set_decode_policy(PolicyFactory::create_from_config(decode));
-            assert!(policies
-                .pair_engine_for(&SelectWorkerInfo::default())
-                .is_some());
-            assert!(policies.pair_engine_for(&keyed).is_none());
-            assert!(policies.pair_engine_for(&by_rid).is_none());
-        }
     }
 }

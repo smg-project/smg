@@ -306,8 +306,3 @@ workspace = true
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }
-
-[[bench]]
-name = "policy_decider"
-harness = false
-path = "benches/policy_decider.rs"
