@@ -82,6 +82,7 @@ pub mod store;
 pub mod view;
 #[cfg(feature = "wasm")]
 pub mod wasm;
+pub mod wit;
 
 pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
