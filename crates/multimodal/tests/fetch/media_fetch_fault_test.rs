@@ -61,7 +61,7 @@ async fn fault_of(url: String, fetch_timeout: Duration) -> (MediaFault, String) 
     )
     .expect("media connector");
     let error = connector
-        .fetch_image(MediaSource::Url(url), ImageFetchConfig::default())
+        .fetch_image(MediaSource::Url(url.into()), ImageFetchConfig::default())
         .await
         .expect_err("the fetch fails");
     (error.fault(), error.to_string())

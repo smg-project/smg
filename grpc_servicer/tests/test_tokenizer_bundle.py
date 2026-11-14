@@ -31,12 +31,15 @@ def test_build_tokenizer_zip_includes_processor_config(tmp_path):
     # video_processor block; omitting it from the bundle would make bundle
     # and lazy deployments of the same repo resolve different video configs.
     (tmp_path / "video_preprocessor_config.json").write_text("{}", encoding="utf-8")
+    policy = '{"patch_size":40,"include_extra_column":false}'
+    (tmp_path / "image_preprocessing.json").write_text(policy, encoding="utf-8")
 
     bundle = build_tokenizer_zip(tmp_path)
 
     with zipfile.ZipFile(bundle) as archive:
         assert "processor_config.json" in archive.namelist()
         assert "video_preprocessor_config.json" in archive.namelist()
+        assert archive.read("image_preprocessing.json").decode("utf-8") == policy
 
 
 # ---------------------------------------------------------------------------
