@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     marker::PhantomData,
+    sync::Arc,
 };
 
 use serde::{
@@ -676,8 +677,14 @@ pub struct ImageBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 { media_type: String, data: String },
-    Url { url: String },
+    /// Base64 text with its media type; the text is shared with the readers
+    /// that decode it, never re-encoded into a data URL.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
+    /// A URL or `data:` URL, shared with its readers.
+    Url { url: Arc<String> },
 }
 
 /// Document content block
@@ -1686,6 +1693,34 @@ pub enum MessageStreamEvent {
     Ping,
     /// Error event
     Error { error: ErrorResponse },
+}
+
+impl MessageStreamEvent {
+    /// The events that close a streamed `thinking` block at `index` as the
+    /// public API closes one: a `signature_delta` just before the
+    /// `content_block_stop`, preceded by one empty `thinking_delta` when the
+    /// block's text was withheld (`thinking.display: omitted`). The gateway
+    /// has no signature to give, so the delta carries the empty string the
+    /// whole answer reports too.
+    pub fn thinking_block_close(index: u32, text_withheld: bool) -> impl Iterator<Item = Self> {
+        text_withheld
+            .then(|| Self::ContentBlockDelta {
+                index,
+                delta: ContentBlockDelta::ThinkingDelta {
+                    thinking: String::new(),
+                },
+            })
+            .into_iter()
+            .chain([
+                Self::ContentBlockDelta {
+                    index,
+                    delta: ContentBlockDelta::SignatureDelta {
+                        signature: String::new(),
+                    },
+                },
+                Self::ContentBlockStop { index },
+            ])
+    }
 }
 
 /// Message delta for streaming updates: the public API writes all four

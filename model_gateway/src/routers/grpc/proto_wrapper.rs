@@ -41,7 +41,7 @@ use crate::{
             zmq_client::ZmqGenerateStream,
         },
     },
-    worker::{liveness, Worker},
+    worker::{liveness, runtime::WorkerRuntime, Worker},
 };
 
 mod embed;
@@ -961,6 +961,10 @@ impl PrefillCachedTokens {
 pub struct TrackedStream {
     inner: ProtoStream,
     worker: Arc<dyn Worker>,
+    /// The worker's runtime, captured at the stream's start, that every
+    /// response is noted on (see [`Worker::liveness_runtime`]); `None` for a
+    /// worker without one, whose notes go through the worker.
+    runtime: Option<Arc<WorkerRuntime>>,
     prefill: Option<PrefillTicket>,
     /// The request's place in the worker's pile; a non-streaming generation
     /// holds none.
@@ -1163,7 +1167,7 @@ mod tracked_tests {
         sglang, tokenspeed, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
         ProtoGenerateResponse, ProtoStream,
     };
-    use crate::worker::{BasicWorkerBuilder, Worker};
+    use crate::worker::{runtime::StallReason, BasicWorkerBuilder, Worker};
 
     #[test]
     fn the_cache_hit_a_first_response_reports_is_read_from_a_chunk_or_a_complete() {
@@ -1225,6 +1229,69 @@ mod tracked_tests {
         );
         drop(stream);
         assert_eq!((inner.tracked_load(), outer.tracked_load()), (0, 0));
+    }
+
+    /// A stream over one chunk, read through a fan-out so the chunk reaches
+    /// this stream's tracked layer as a response and not as a replay.
+    fn one_chunk_tracked(worker: &Arc<dyn Worker>) -> ProtoStream {
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        }));
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let mut child = ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(
+            Arc::clone(&engine),
+            0,
+            false,
+        );
+        if let ProtoStream::Tracked(tracked) = &mut child {
+            tracked.replay = Some(Some(Ok(chunk)));
+        }
+        ProtoStream::Fanout(FanoutStream::new(vec![child])).tracked(Arc::clone(worker), 0, true)
+    }
+
+    /// Review finding on the second head: the veto clear on the captured
+    /// runtime path had no case of its own (the veto pins drive the worker
+    /// path), so a stream's response clears a veto here.
+    #[tokio::test]
+    async fn a_tracked_streams_response_clears_the_workers_veto() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
+        let mut stream = one_chunk_tracked(&worker);
+        assert!(worker.set_stall(Some(StallReason::Wedged)));
+        assert!(stream.next().await.is_some_and(|item| item.is_ok()));
+        assert!(
+            worker.stall_reason().is_none(),
+            "the response clears the veto"
+        );
+    }
+
+    /// Review finding on the first head of this change: a millisecond stamp
+    /// kept per worker handle in front of the runtime load left a failure
+    /// noted through another handle of the same runtime (a clone, or the
+    /// handle a monitor holds) pending until the next millisecond. The
+    /// stream notes the shared runtime itself, so the runtime's own rule
+    /// decides, whichever handle noted the failure.
+    #[tokio::test]
+    async fn a_tracked_streams_response_clears_a_failure_noted_through_another_handle() {
+        let basic = BasicWorkerBuilder::new("grpc://w1:30000").build();
+        let other: Arc<dyn Worker> = Arc::new(basic.clone());
+        let worker: Arc<dyn Worker> = Arc::new(basic);
+        let mut stream = one_chunk_tracked(&worker);
+        // A token through this handle, then a failure through the other,
+        // within one millisecond as far as the clock allows.
+        worker.note_token_progress();
+        other.note_transport_failure();
+        assert!(
+            worker.transport_failure_pending(),
+            "the handles share the runtime"
+        );
+        assert!(stream.next().await.is_some_and(|item| item.is_ok()));
+        assert!(
+            !worker.transport_failure_pending(),
+            "the response clears it"
+        );
+        assert!(!other.transport_failure_pending());
     }
 
     #[test]
@@ -1592,9 +1659,11 @@ impl ProtoStream {
     #[must_use]
     pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
         let DispatchBooking { prefill, progress } = booking;
+        let runtime = worker.liveness_runtime();
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
+            runtime,
             prefill,
             progress,
             output: None,
@@ -1618,9 +1687,11 @@ impl ProtoStream {
         worker: Arc<dyn Worker>,
         prefill: Option<PrefillTicket>,
     ) -> Self {
+        let runtime = worker.liveness_runtime();
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
+            runtime,
             prefill,
             progress: None,
             output: None,
@@ -1863,7 +1934,12 @@ impl ProtoStream {
                 // One stamp for the message: the worker's progress note and,
                 // on the first response, the end of the prompt's prefill.
                 let now_ms = liveness::now_ms();
-                liveness::on_token_progress_at(&tracked.worker, now_ms);
+                match &tracked.runtime {
+                    Some(runtime) => {
+                        liveness::on_token_progress_on(runtime, &tracked.worker, now_ms);
+                    }
+                    None => liveness::on_token_progress_at(&tracked.worker, now_ms),
+                }
                 if std::mem::take(&mut tracked.samples_success) {
                     tracked.worker.record_outcome(200);
                 }
@@ -2024,6 +2100,7 @@ impl ProtoStream {
                 let TrackedStream {
                     inner,
                     worker,
+                    runtime,
                     prefill,
                     progress,
                     output,
@@ -2033,6 +2110,7 @@ impl ProtoStream {
                 Self::Tracked(Box::new(TrackedStream {
                     inner: inner.defer_abort_within(bound),
                     worker,
+                    runtime,
                     prefill,
                     progress,
                     output,
@@ -2948,6 +3026,52 @@ mod tests {
         // Engines without the proto field ignore the pin
         let mut mlx_req = ProtoGenerateRequest::Mlx(Box::default());
         mlx_req.set_data_parallel_rank(1);
+    }
+
+    /// A PD room moves into a rank's residue class and keeps its other bits,
+    /// within `[0, i64::MAX)` from every room; a request without a room, or a
+    /// rank outside the ranks, is left as it was.
+    #[test]
+    fn a_kv_bootstrap_room_moves_into_its_ranks_residue_class() {
+        let room_of = |request: &ProtoGenerateRequest| match request {
+            ProtoGenerateRequest::TokenSpeed(req) => req
+                .kv_bootstrap_info
+                .as_ref()
+                .map(|info| info.bootstrap_room),
+            _ => None,
+        };
+        for room in [0, 41, 1 << 40, i64::MAX - 3, i64::MAX - 1, -5] {
+            for (rank, ranks) in [(0, 1), (3, 4), (1, 2), (6, 8)] {
+                let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
+                request.set_kv_bootstrap_info("prefill".to_string(), 8998, room);
+                assert!(request.set_kv_bootstrap_room_residue(rank, ranks));
+                let moved = room_of(&request).unwrap();
+                assert!(
+                    (0..i64::MAX).contains(&moved),
+                    "{room} as {rank} of {ranks}"
+                );
+                assert_eq!(
+                    moved % ranks as i64,
+                    rank as i64,
+                    "{room} as {rank} of {ranks}"
+                );
+                if (0..i64::MAX - ranks as i64).contains(&room) {
+                    assert_eq!(moved / ranks as i64, room / ranks as i64, "other bits kept");
+                }
+            }
+        }
+
+        let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
+        request.set_kv_bootstrap_info("prefill".to_string(), 8998, 41);
+        for (rank, ranks) in [(4, 4), (0, 0), (0, i64::MAX as usize), (1, usize::MAX)] {
+            assert!(!request.set_kv_bootstrap_room_residue(rank, ranks));
+            assert_eq!(room_of(&request), Some(41));
+        }
+        let mut roomless = ProtoGenerateRequest::TokenSpeed(Box::default());
+        assert!(!roomless.set_kv_bootstrap_room_residue(1, 4));
+        assert_eq!(room_of(&roomless), None);
+        let mut sglang = ProtoGenerateRequest::Sglang(Box::default());
+        assert!(!sglang.set_kv_bootstrap_room_residue(1, 4));
     }
 
     fn vllm_mm_data(modality: common::Modality) -> VllmMultimodalData {

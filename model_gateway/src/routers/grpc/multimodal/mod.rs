@@ -107,7 +107,8 @@ pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transparency::engine_transparency_policy;
 pub(crate) use transport::{
-    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype_over,
+    init_mm_transport_defaults, mm_image_wire_cap_over, mm_rdma_exporter,
+    mm_shared_image_wire_dtype_over,
 };
 
 /// The response for an error of assembling or planning a request's
@@ -250,6 +251,13 @@ pub(crate) struct MultimodalIntermediate {
     /// The format the spec's processors emitted the batches in
     /// (`ModelProcessorSpec::encoder_input_format`).
     encoder_input_format: EncoderInputFormat,
+    /// The tokens the expansion wrote into the prompt for the request's
+    /// images, summed over them (each image's whole replacement; the
+    /// template's own markers around an anchor are text tokens): what the
+    /// chat usage reports as `prompt_tokens_details.image_tokens`. `None`
+    /// when no batch is images; a video's or an audio clip's placeholders
+    /// are not image tokens.
+    image_prompt_tokens: Option<u32>,
 }
 
 impl MultimodalIntermediate {
@@ -273,6 +281,7 @@ impl MultimodalIntermediate {
         Ok(Self {
             batches,
             encoder_input_format: EncoderInputFormat::Reference,
+            image_prompt_tokens: None,
         })
     }
 
@@ -283,6 +292,15 @@ impl MultimodalIntermediate {
 
     pub(crate) fn encoder_input_format(&self) -> EncoderInputFormat {
         self.encoder_input_format
+    }
+
+    pub(crate) fn with_image_prompt_tokens(mut self, image_prompt_tokens: Option<u32>) -> Self {
+        self.image_prompt_tokens = image_prompt_tokens;
+        self
+    }
+
+    pub(crate) fn image_prompt_tokens(&self) -> Option<u32> {
+        self.image_prompt_tokens
     }
 
     pub(crate) fn batches(&self) -> &[PrecomputedMultimodalIntermediate] {
