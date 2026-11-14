@@ -12,6 +12,11 @@
 //! order (ops interleave only ACROSS holders), matching §7. The
 //! convergence tests additionally reorder within that scope.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test workload: a broken step ends the test"
+)]
+
 use super::{Op, Rng};
 
 #[derive(Debug, Clone)]
@@ -295,7 +300,7 @@ pub fn reinterleave(seed: u64, ops: &[Op], holders: usize) -> Vec<Op> {
         per_holder[op.holder()].push(op.clone());
     }
     let mut rng0 = Rng::new(seed ^ 0x5EED);
-    for script in per_holder.iter_mut() {
+    for script in &mut per_holder {
         if !script.iter().any(|op| op.orders_holder()) && script.len() > 1 {
             // Fisher-Yates over the store-only script. Parent links
             // may now arrive before their anchor: §7 excludes

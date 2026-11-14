@@ -25,6 +25,12 @@
 //!   RADIX_FUZZ_SEEDS=10000 cargo test -p smg-radix-tree --release \
 //!     --test fuzz_differential -- --ignored --nocapture
 
+#![expect(
+    clippy::panic,
+    clippy::print_stdout,
+    reason = "test helpers: a diverging core ends the test; the seed counts are printed"
+)]
+
 mod common;
 
 use std::collections::BTreeMap;
@@ -133,13 +139,13 @@ fn run_one_in_contract(seed: u64, wide: bool) {
             // store at blocks[run-1] and applies only the suffix, so a
             // wrong run means silently corrupted placements.
             let expect = model.dup_prefix(*holder, *parent, blocks);
-            for subject in subjects.iter() {
+            for subject in &subjects {
                 assert_eq!(
                     subject.dup_prefix(*holder, *parent, blocks),
                     expect,
                     "dup_prefix diverged from model"
                 );
-                for &(key, _) in blocks.iter() {
+                for &(key, _) in blocks {
                     assert_eq!(
                         subject.position_of(*holder, key),
                         model.position_of(*holder, key),
@@ -433,7 +439,7 @@ fn run_one_chaos(seed: u64) {
                             model.dup_prefix(*slot, parent, blocks),
                             "dup_prefix diverged from model (chaos)"
                         );
-                        for &(key, _) in blocks.iter() {
+                        for &(key, _) in blocks {
                             assert_eq!(
                                 tree.position_of(id, key),
                                 model.position_of(*slot, key),
@@ -506,7 +512,7 @@ fn run_one_chaos(seed: u64) {
                 COp::Query { probe } => {
                     tree.overlap(probe, &mut qscratch, &mut scratch);
                     let mut by_slot = BTreeMap::new();
-                    for o in scratch.iter() {
+                    for o in &scratch {
                         // Map subject holder ids back to chaos slots;
                         // an unmapped id would be a stale-holder leak.
                         let slot = ids
