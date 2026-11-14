@@ -117,10 +117,14 @@ jobs:
       # four cores for the gateway, four engines and the client together), three
       # interleaved repeats per side. The driver writes the tables to the step summary.
       # The verdict's exit code is recorded, never the job's: advisory.
+      # Both gateway binaries are read whole first: the head's is built before two more
+      # builds, which push its pages out of the page cache, and a binary with fewer cached
+      # pages reads a smaller file-backed RSS (a fault maps the cached neighbours alone).
       - name: Measure base against head on the mock bed
         id: measure
         timeout-minutes: 30
         run: |
+          cat "$RUNNER_TEMP/gateway-perf/base/smg" "$RUNNER_TEMP/gateway-perf/pr/smg" > /dev/null
           set +e
           "$RUNNER_TEMP/gateway-perf/gateway-perf" cpu --repo . \
             --base "$RUNNER_TEMP/gateway-perf/base/smg" --head "$RUNNER_TEMP/gateway-perf/pr/smg" \

@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use vllm_proto::vllm_engine_server::{VllmEngine, VllmEngineServer};
 
 use super::*;
+use crate::worker::BasicWorker;
 
 /// The engine's answer to one call: the ids' count and the first id, as two
 /// dimensions a test reads the call back from.
@@ -31,6 +32,9 @@ struct EmbedStub {
     seen_texts: Arc<Mutex<Vec<String>>>,
     /// The call whose ids are this list is failed with UNAVAILABLE.
     fail_ids: Option<Vec<u32>>,
+    /// The call whose ids are this list is refused with INVALID_ARGUMENT: the
+    /// input's own fault, which says nothing about the worker.
+    reject_ids: Option<Vec<u32>>,
     /// The call whose ids are this list answers late (a sibling still in
     /// flight when another call fails).
     slow_ids: Option<Vec<u32>>,
@@ -71,6 +75,9 @@ impl VllmEngine for EmbedStub {
             .push(tokenized.input_ids.clone());
         if self.fail_ids.as_deref() == Some(tokenized.input_ids.as_slice()) {
             return Err(Status::unavailable("the stub fails this input"));
+        }
+        if self.reject_ids.as_deref() == Some(tokenized.input_ids.as_slice()) {
+            return Err(Status::invalid_argument("the stub refuses this input"));
         }
         Ok(TonicResponse::new(vllm_proto::EmbedResponse {
             embedding: vector_of(&tokenized.input_ids),
@@ -161,6 +168,8 @@ struct Bed {
     components: Arc<SharedComponents>,
     tokenizer: Arc<dyn Tokenizer>,
     stub: EmbedStub,
+    /// The one registered worker, for its circuit breaker's counts.
+    worker: Arc<dyn Worker>,
 }
 
 impl Bed {
@@ -172,7 +181,7 @@ impl Bed {
         let router = Server::builder().add_service(VllmEngineServer::new(stub.clone()));
         let port = serve_on_loopback(router).await.0.port();
         let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_of_runtime(
+        let worker = register_worker_of_runtime(
             &worker_registry,
             port,
             WorkerType::Regular,
@@ -201,7 +210,19 @@ impl Bed {
             components,
             tokenizer,
             stub,
+            worker,
         }
+    }
+
+    /// The worker's circuit breaker counts so far: (failures, successes).
+    fn breaker_counts(&self) -> (u64, u64) {
+        let worker = self
+            .worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .expect("the bed's worker is a basic worker");
+        let breaker = worker.circuit_breaker.load();
+        (breaker.total_failures(), breaker.total_successes())
     }
 
     /// The pipeline's answer to a `/v1/embeddings` `body`: its status and its JSON.
@@ -491,4 +512,46 @@ async fn a_failed_call_fails_the_whole_request() {
         "the slow sibling ran to its end: {:?}",
         bed.finished_ids()
     );
+}
+
+/// A batch answered by several calls is one breaker sample for the request,
+/// read from every answer: a worker failure on one input charges the worker
+/// whatever its place in the batch, so a rejection of an earlier input (the
+/// request's own fault, which the breaker does not charge) hides nothing and
+/// the successes beside it credit nothing. One request, one sample. The
+/// client's answer stays the first failing input's in input order (the
+/// rejection, a 400, with the refused input first; the failure, a 5xx, with
+/// the failed one first), so the sample and the answer come from different
+/// inputs.
+#[tokio::test]
+async fn a_mixed_batch_is_one_breaker_sample_and_it_is_the_worker_failure() {
+    for (input, client_fault) in [
+        (json!([[1], [3], [5]]), true),
+        (json!([[3], [1], [5]]), false),
+    ] {
+        let stub = EmbedStub {
+            reject_ids: Some(vec![1]),
+            fail_ids: Some(vec![3]),
+            ..EmbedStub::default()
+        };
+        let bed = Bed::over(Endpoint::Embeddings, stub).await;
+
+        let (status, body) = bed.embed(json!({"model": MODEL, "input": input})).await;
+
+        assert_eq!(
+            status.is_client_error(),
+            client_fault,
+            "{input}: {status}: {body}"
+        );
+        assert_eq!(
+            status.is_server_error(),
+            !client_fault,
+            "{input}: {status}: {body}"
+        );
+        assert_eq!(
+            bed.breaker_counts(),
+            (1, 0),
+            "{input}: one failure sample for the request, no success credited: {body}"
+        );
+    }
 }

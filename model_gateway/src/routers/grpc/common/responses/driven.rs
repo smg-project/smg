@@ -42,8 +42,10 @@ use tokio::sync::mpsc::{self, error::TryRecvError};
 use super::streaming::build_sse_response_from_stream;
 use crate::{
     middleware::edge_body::BodyFailure,
-    routers::common::sse::{SseReceiver, SseSender},
-    worker::GuardedStream,
+    routers::common::{
+        sse::{SseReceiver, SseSender},
+        stream::GuardedStream,
+    },
 };
 
 /// How a reading ended: with its stream complete, or with the client told of
