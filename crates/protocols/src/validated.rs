@@ -1551,7 +1551,10 @@ mod tests {
     /// front; the Messages rules print the public API's words alone.
     #[tokio::test]
     async fn the_public_requests_refusals_name_the_field_without_the_internal_key() {
-        use crate::{chat::ChatCompletionRequest, messages::CreateMessageRequest};
+        use crate::{
+            chat::ChatCompletionRequest, interactions::InteractionsRequest,
+            messages::CreateMessageRequest, responses::ResponsesRequest,
+        };
 
         for (body, code, param, message) in [
             (
@@ -1583,6 +1586,19 @@ mod tests {
                 "invalid_type",
                 "tools[0].function.parameters",
                 "Invalid 'tools[0].function.parameters': expected an object, but got an array instead",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}},{"type":"function","function":{"name":""}}]}"#,
+                "empty_string",
+                "tools[1].function.name",
+                "Invalid 'tools[1].function.name': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+            ),
+            // The deprecated `functions` list is judged where its migration put it.
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[{"name":""}]}"#,
+                "empty_string",
+                "tools[0].function.name",
+                "Invalid 'tools[0].function.name': empty string. Expected a string with minimum length 1, but got an empty string instead.",
             ),
             (
                 r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"regex":"a+","ebnf":"root ::= \"a\""}"#,
@@ -1625,6 +1641,23 @@ mod tests {
             json["error"]["message"], "temperature: range: 0..1",
             "{json}"
         );
+
+        // A function declared with an empty name on the two surfaces that name it flat: the
+        // refusal is the `tools` field's, and its message says which tool.
+        let body = r#"{"model":"m","input":"hi","tools":[{"type":"function","name":"f"},{"type":"function","name":""}]}"#;
+        for (surface, (status, json)) in [
+            ("responses", rejected::<ResponsesRequest>(body).await),
+            ("interactions", rejected::<InteractionsRequest>(body).await),
+        ] {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface}: {json}");
+            assert_eq!(json["error"]["code"], "empty_string", "{surface}: {json}");
+            assert_eq!(json["error"]["param"], "tools", "{surface}: {json}");
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("Invalid 'tools[1].name': empty string."),
+                "{surface}: {json}"
+            );
+        }
     }
 
     #[test]

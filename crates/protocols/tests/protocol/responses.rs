@@ -4675,6 +4675,79 @@ fn function_tool_parameters_must_be_an_object() {
     );
 }
 
+fn function_tool(name: &str) -> serde_json::Value {
+    json!({"type": "function", "name": name, "parameters": {"type": "object"}})
+}
+
+/// The refusal of the tool named nothing at `field`, read in the validator's
+/// verdict.
+fn names_the_unnamed_tool(code: &str, field: &str) -> bool {
+    code.contains("empty_string")
+        && code.contains(&format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1"
+        ))
+}
+
+/// A function declared with an empty name is refused with its place in
+/// `tools`: no client can dispatch a call that names nothing. The place counts
+/// every tool, a built-in one ahead of the function too. A named function
+/// passes.
+#[test]
+fn a_function_tool_has_a_name() {
+    for ahead in [function_tool("f"), json!({"type": "web_search_preview"})] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [ahead, function_tool("")]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(names_the_unnamed_tool(&code, "tools[1].name"), "{code}");
+    }
+
+    let request = plain_request(json!({
+        "model": "m", "input": "hi", "tools": [function_tool("f")]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "a named function passes");
+}
+
+/// A custom tool, a namespace and a namespace's members are called by name as
+/// a function is: an empty name is refused at its place, a member's inside its
+/// namespace, the two places told apart. Named ones pass.
+#[test]
+fn a_custom_tool_a_namespace_and_its_members_have_names() {
+    let custom = |name: &str| json!({"type": "custom", "name": name});
+    let namespace = |name: &str, tools: serde_json::Value| json!({"type": "namespace", "name": name, "description": "d", "tools": tools});
+    for (tools, field) in [
+        (json!([function_tool("f"), custom("")]), "tools[1].name"),
+        (
+            json!([namespace("", json!([function_tool("f")]))]),
+            "tools[0].name",
+        ),
+        (
+            json!([
+                function_tool("f"),
+                namespace("ns", json!([function_tool("")]))
+            ]),
+            "tools[1].tools[0].name",
+        ),
+        (
+            json!([namespace("ns", json!([function_tool("g"), custom("")]))]),
+            "tools[0].tools[1].name",
+        ),
+    ] {
+        let request = plain_request(json!({"model": "m", "input": "hi", "tools": tools})).unwrap();
+        let code = validation_code(&request);
+        assert!(names_the_unnamed_tool(&code, field), "{field}: {code}");
+    }
+
+    let named = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [custom("c"), namespace("ns", json!([function_tool("g"), custom("h")]))]
+    }))
+    .unwrap();
+    assert!(named.validate().is_ok(), "named tools pass");
+}
+
 /// One of OpenAI's own models: the public API's structured-output rules apply.
 const OPENAI_MODEL: &str = "gpt-4.1";
 /// A self-hosted model: those rules are the engine's business, not the gateway's.
