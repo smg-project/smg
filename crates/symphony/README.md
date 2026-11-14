@@ -267,6 +267,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-15 | [hy-memory-30b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/hy-memory-30b-a3b) | tencent/Hy-Memory-30B-A3B | Hy-Memory-30B-A3B-FP8 | `hy_v3` | 19 | replaying the set | none |
 | 2026-10-15 | [memt-1.0-nano](https://github.com/smg-project/bellwether/tree/main/fixtures/memt-1.0-nano) | MemTensor/MemT-1.0-Nano |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-15 | [muse-spark-open-816b-a42b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-spark-open-816b-a42b) | meta-models/Muse-Spark-Open-816B-A42B | Muse-Spark-Open-816B-A42B-NVFP4 | `muse_spark` | — | awaiting fixtures | none |
+| 2026-10-15 | [sage-a1.5](https://github.com/smg-project/bellwether/tree/main/fixtures/sage-a1.5) | InternScience/Sage-A1.5 |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-14 | [granite-switch-4.1-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-switch-4.1-8b) | ibm-granite/granite-switch-4.1-8b | granite-switch-4.1-30b | `qwen2.5` | 19 | replaying the set | none |
 | 2026-10-13 | [ling-3.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/ling-3.1-flash) | inclusionAI/Ling-3.1-flash | Ling-3.1-flash-1019 | `ling` | 28 | replaying the set | none |
 | 2026-10-12 | [lfm2.5-24b-a2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm2.5-24b-a2b) | LiquidAI/LFM2.5-24B-A2B | LFM2.5-24B-A2B-FP8 | `lfm2.5` | 9 | replaying the set | none |

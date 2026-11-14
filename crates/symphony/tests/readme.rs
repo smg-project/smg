@@ -2791,6 +2791,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "sage-a1.5",
+        model: "InternScience/Sage-A1.5",
+        also: &[],
+        released: "2026-10-15",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "seed-oss-36b-instruct",
         model: "ByteDance-Seed/Seed-OSS-36B-Instruct",
         also: &["Seed-OSS-36B-Base-woSyn"],
