@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::types::ImageSize;
 
 /// An icon file the way the serving engine's own image library writes
 /// one from an image: one PNG entry per size in the image's own colour
@@ -73,7 +74,7 @@ fn an_icons_rgb_png_entry_decodes_as_the_png() {
     assert_eq!(image.to_rgb8().as_raw(), largest.as_raw());
     assert_eq!(
         encoded_image_size(&ico, None).expect("the icon's header"),
-        crate::types::ImageSize::new(256, 256)
+        ImageSize::new(256, 256)
     );
 }
 

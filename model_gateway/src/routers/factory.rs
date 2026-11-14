@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    config::{PolicyConfig, RoutingMode, DEFAULT_ENCODE_POLICY},
+    config::{PolicyConfig, RoutingMode},
     policies::{DPRankLoadPolicy, MinimumTokensPolicy, PolicyFactory},
     worker::ConnectionMode,
 };
@@ -208,8 +208,9 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
+        let default_encode_policy = PolicyConfig::ConsistentHashing;
         let encode_policy = PolicyFactory::create_from_config(
-            encode_policy_config.unwrap_or(&DEFAULT_ENCODE_POLICY),
+            encode_policy_config.unwrap_or(&default_encode_policy),
         );
         let prefill_policy =
             PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
