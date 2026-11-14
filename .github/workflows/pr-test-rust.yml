@@ -2142,10 +2142,14 @@ jobs:
       # A few megabytes per model, kept between runs so the hub serves one
       # download per model list, not one per run (its rate limit answers a
       # share of a busy day's requests with 429). The key follows the list
-      # (this file) and the specs; a run that misses fetches the files and
-      # saves the entry.
+      # (this file) and the specs. Every ref restores and main alone saves
+      # (the step after the fetch): an entry a pull request saves is visible
+      # to that pull request only, so each one saved its own copy, and the
+      # copies helped push main's larger entries out of the repository's
+      # 10 GB cache. A run that misses fetches the files.
       - name: Restore the tokenizer files
-        uses: actions/cache@v6
+        id: tokenizers
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/models
           key: e2e-cpu-mock-tokenizers-${{ hashFiles('.github/workflows/pr-test-rust.yml', 'e2e_test/infra/model_specs.py') }}
@@ -2176,6 +2180,15 @@ jobs:
           echo "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d  $vocab" | sha256sum -c --status 2>/dev/null \
             || bash scripts/ci_retry.sh 3 30 curl -fsSL --connect-timeout 10 --max-time 120 -o "$vocab" \
               https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+
+      # Right after the fetch and before the tests, so a run on main that the
+      # next push cancels during the tests has saved already.
+      - name: Save the tokenizer files
+        if: github.ref == 'refs/heads/main' && steps.tokenizers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/models
+          key: ${{ steps.tokenizers.outputs.cache-primary-key }}
 
       - name: Run the mock e2e tests
         timeout-minutes: 15
