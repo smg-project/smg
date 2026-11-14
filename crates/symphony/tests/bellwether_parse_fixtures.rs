@@ -282,6 +282,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // an older template without a thought; the recorded outputs follow the former.
     ("qwen-agentworld-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
+    // Ripple-65B-Preview writes Qwen3's JSON calls under ChatML, and its generation prompt ends at
+    // the turn opener under every thinking kwarg: the model writes its own `<think>` or not.
+    ("ripple-65b-preview", GenerationPrompt::ModelDecides),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
