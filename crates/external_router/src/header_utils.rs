@@ -131,7 +131,7 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 /// Convert headers from reqwest Response to axum HeaderMap.
 ///
 /// Filters out hop-by-hop and SMG-owned headers that must not be forwarded, and
-/// the upstream's `server` header: the engine's software and version are not the
+/// the upstream's `server` header: the upstream's software and version are not the
 /// client's to read, and the gateway's own answers carry no `server` header.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -171,10 +171,14 @@ pub fn is_smg_owned_error_code_header(name: &str) -> bool {
     name.eq_ignore_ascii_case(HEADER_X_SMG_ERROR_CODE)
 }
 
-/// Determine if a header should be forwarded without allocating (case-insensitive)
-fn should_forward_header_no_alloc(name: &str) -> bool {
+/// Whether an upstream response header crosses the relay (case-insensitive, no allocation).
+///
+/// Every HTTP relay reads this one list: `preserve_response_headers` for the buffered
+/// and the OpenAI-style streamed answers, `anthropic::sse::build_sse_response` for the
+/// Messages streamed ones.
+pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
     // List of headers that should NOT be forwarded: hop-by-hop, the SMG error-code
-    // marker, and the upstream's `server` header, which names the engine's software
+    // marker, and the upstream's `server` header, which names the upstream's software
     // and version to every client while the gateway's own answers carry none.
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
