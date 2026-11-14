@@ -3,6 +3,7 @@
 //! advertises worker-side processing, and build the wire payload.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashSet},
     sync::Arc,
 };
@@ -634,10 +635,9 @@ pub(crate) fn ensure_selection_supports_media_refs(
         return Ok(());
     };
     for part in plan.parts() {
-        let Some(url) = part_url(part) else {
+        let Some(scheme) = part_scheme(part) else {
             continue;
         };
-        let scheme = url_scheme(url);
         if !accepted.contains(&scheme) {
             let mut accepted: Vec<_> = accepted.into_iter().collect();
             accepted.sort();
@@ -650,13 +650,23 @@ pub(crate) fn ensure_selection_supports_media_refs(
     Ok(())
 }
 
-fn part_url(part: &MediaContentPart) -> Option<&str> {
+/// The scheme a part's reference is fetched by: a URL part's own, `data`
+/// for a base64 source.
+fn part_scheme(part: &MediaContentPart) -> Option<String> {
     match part {
         MediaContentPart::ImageUrl { url, .. }
         | MediaContentPart::VideoUrl { url, .. }
-        | MediaContentPart::AudioUrl { url, .. } => Some(url),
+        | MediaContentPart::AudioUrl { url, .. } => Some(url_scheme(url)),
+        MediaContentPart::ImageBase64 { .. } | MediaContentPart::AudioBase64 { .. } => {
+            Some("data".to_string())
+        }
         _ => None,
     }
+}
+
+/// The data URL a base64 source stands for, built for a wire that takes URLs.
+fn data_url(media_type: &str, data: &str) -> String {
+    format!("data:{media_type};base64,{data}")
 }
 
 /// Lower-cased URL scheme; `data` for data URLs, empty for bare paths.
@@ -677,31 +687,58 @@ fn url_scheme(url: &str) -> String {
 /// router's byte cap for inline payloads.
 fn forwardable_ref(
     part: &MediaContentPart,
-) -> Result<(common::Modality, &str, usize), MmRefsError> {
+) -> Result<(common::Modality, Cow<'_, str>, usize), MmRefsError> {
     match part {
         MediaContentPart::ImageUrl {
             url,
             max_long_side_pixel: None,
             ..
-        } => Ok((common::Modality::Image, url, media::image_max_input_bytes())),
+        } => Ok((
+            common::Modality::Image,
+            Cow::Borrowed(url.as_str()),
+            media::image_max_input_bytes(),
+        )),
+        MediaContentPart::ImageBase64 {
+            media_type,
+            data,
+            max_long_side_pixel: None,
+            ..
+        } => Ok((
+            common::Modality::Image,
+            Cow::Owned(data_url(media_type, data)),
+            media::image_max_input_bytes(),
+        )),
         MediaContentPart::VideoUrl {
             url,
             fps: None,
             max_long_side_pixel: None,
             ..
-        } => Ok((common::Modality::Video, url, media::video_max_input_bytes())),
-        MediaContentPart::ImageUrl { .. } | MediaContentPart::VideoUrl { .. } => {
-            Err(MmRefsError::HintUnsupported)
-        }
+        } => Ok((
+            common::Modality::Video,
+            Cow::Borrowed(url.as_str()),
+            media::video_max_input_bytes(),
+        )),
+        MediaContentPart::ImageUrl { .. }
+        | MediaContentPart::ImageBase64 { .. }
+        | MediaContentPart::VideoUrl { .. } => Err(MmRefsError::HintUnsupported),
         MediaContentPart::ImageData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline image bytes"))
         }
         MediaContentPart::VideoData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline video bytes"))
         }
-        MediaContentPart::AudioUrl { url, .. } => {
-            Ok((common::Modality::Audio, url, media::audio_max_input_bytes()))
-        }
+        MediaContentPart::AudioUrl { url, .. } => Ok((
+            common::Modality::Audio,
+            Cow::Borrowed(url.as_str()),
+            media::audio_max_input_bytes(),
+        )),
+        MediaContentPart::AudioBase64 {
+            media_type, data, ..
+        } => Ok((
+            common::Modality::Audio,
+            Cow::Owned(data_url(media_type, data)),
+            media::audio_max_input_bytes(),
+        )),
         MediaContentPart::AudioData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline audio bytes"))
         }
@@ -732,7 +769,7 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
     let mut items = Vec::with_capacity(plan.parts().len());
     for (index, part) in plan.parts().iter().enumerate() {
         let (modality, url, limit) = forwardable_ref(part)?;
-        if let Some(bytes) = data_url_payload_bytes(url) {
+        if let Some(bytes) = data_url_payload_bytes(&url) {
             if bytes > limit {
                 return Err(MmRefsError::RefTooLarge {
                     index,
@@ -743,7 +780,7 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
         }
         items.push(vllm::MediaRef {
             modality: modality as i32,
-            url: url.to_string(),
+            url: url.into_owned(),
         });
     }
     Ok(vllm::MediaRefs { items })
@@ -768,7 +805,7 @@ mod tests {
 
     fn image_url(url: &str) -> MediaContentPart {
         MediaContentPart::ImageUrl {
-            url: url.to_string(),
+            url: url.to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
@@ -1043,7 +1080,7 @@ mod tests {
         let registry = registry_with(vec![capable("grpc://127.0.0.1:9500")]);
 
         let hinted = plan(vec![MediaContentPart::ImageUrl {
-            url: "https://a/1.png".to_string(),
+            url: "https://a/1.png".to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: Some(512),
@@ -1168,7 +1205,7 @@ mod tests {
         );
 
         let hinted = plan(vec![MediaContentPart::ImageUrl {
-            url: "https://a/1.png".to_string(),
+            url: "https://a/1.png".to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: Some(512),
@@ -1351,7 +1388,7 @@ mod tests {
 
     fn hinted_image(url: &str, max_long_side_pixel: u32) -> MediaContentPart {
         MediaContentPart::ImageUrl {
-            url: url.to_string(),
+            url: url.to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: Some(max_long_side_pixel),
@@ -1364,7 +1401,7 @@ mod tests {
         max_long_side_pixel: Option<u32>,
     ) -> MediaContentPart {
         MediaContentPart::VideoUrl {
-            url: url.to_string(),
+            url: url.to_string().into(),
             uuid: None,
             fps,
             max_long_side_pixel,
@@ -1477,7 +1514,7 @@ mod tests {
         // decode that worker selection would refuse, while the same audio
         // without a hint still forwards.
         let audio = MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
+            url: "https://a/x.wav".to_string().into(),
             uuid: None,
         };
         let mut with_audio = expandable_placeholders();
@@ -1644,7 +1681,7 @@ mod tests {
         // The pin selection reads: the pipeline alone for an unopted anchor,
         // never the pipeline for audio, either otherwise.
         let audio = plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
+            url: "https://a/x.wav".to_string().into(),
             uuid: None,
         }]);
         let mut audio_opted = PlaceholderTokens::default();
@@ -1710,7 +1747,7 @@ mod tests {
         // The pipeline takes no audio, so an unopted audio anchor is refused
         // here, with the opt-in named, rather than forwarded to a refusal.
         let audio = plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
+            url: "https://a/x.wav".to_string().into(),
             uuid: None,
         }]);
         let mut unopted_audio = PlaceholderTokens::default();
@@ -1770,7 +1807,7 @@ mod tests {
     fn selection_check_pins_unopted_models_to_pipeline_workers_and_audio_off_them() {
         let image = plan(vec![image_url("https://a/1.png")]);
         let audio = plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
+            url: "https://a/x.wav".to_string().into(),
             uuid: None,
         }]);
         let pipeline_single = WorkerSelection::Single {
@@ -1820,7 +1857,7 @@ mod tests {
         let refs = assemble_media_refs(&plan(vec![
             image_url("https://a/1.png"),
             MediaContentPart::VideoUrl {
-                url: "data:video/mp4;base64,AAAA".to_string(),
+                url: "data:video/mp4;base64,AAAA".to_string().into(),
                 uuid: None,
                 fps: None,
                 max_long_side_pixel: None,
@@ -1847,7 +1884,7 @@ mod tests {
     fn audio_refs_require_an_expandable_model_and_stay_in_prompt_order() {
         let plan = plan(vec![
             MediaContentPart::AudioUrl {
-                url: "data:audio/wav;base64,AAAA".to_string(),
+                url: "data:audio/wav;base64,AAAA".to_string().into(),
                 uuid: None,
             },
             image_url("https://a/1.png"),

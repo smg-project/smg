@@ -123,7 +123,7 @@ fn build_chat_request(
     messages.push(ChatMessage::User {
         content: MessageContent::Parts(vec![ContentPart::InputAudio {
             input_audio: InputAudio {
-                data: BASE64_STANDARD.encode(&audio.bytes),
+                data: BASE64_STANDARD.encode(&audio.bytes).into(),
                 format: audio_format(audio),
             },
         }]),
@@ -223,7 +223,7 @@ mod tests {
                 ..
             } => match &parts[0] {
                 ContentPart::InputAudio { input_audio } => {
-                    assert_eq!(input_audio.data, "UklGRnRlc3Q=");
+                    assert_eq!(*input_audio.data, "UklGRnRlc3Q=");
                     assert_eq!(input_audio.format, "wav");
                 }
                 other => panic!("expected audio content part, got {other:?}"),

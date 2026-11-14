@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use rustc_hash::FxBuildHasher;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -80,14 +81,16 @@ pub struct TokenizerEntry {
 /// Registry for managing tokenizers keyed by UUID
 ///
 /// Features:
-/// - Thread-safe concurrent access using DashMap
+/// - Thread-safe concurrent access using DashMap; the two lookup maps hash
+///   with Fx, their keys being the operator's ids and names (a request's
+///   string looks one up and never inserts one), read on every request
 /// - Per-key locking to prevent duplicate loading
 /// - Lookup by UUID (primary) or name (secondary index)
 pub struct TokenizerRegistry {
     /// Storage for loaded tokenizers, keyed by UUID
-    tokenizers: DashMap<String, TokenizerEntry>,
+    tokenizers: DashMap<String, TokenizerEntry, FxBuildHasher>,
     /// Secondary index: name -> UUID for lookup
-    name_to_id: DashMap<String, String>,
+    name_to_id: DashMap<String, String, FxBuildHasher>,
     /// Per-key locks to prevent duplicate loading
     loading_locks: DashMap<String, Arc<Mutex<()>>>,
 }
@@ -109,8 +112,8 @@ impl TokenizerRegistry {
     /// Create a new empty registry
     pub fn new() -> Self {
         Self {
-            tokenizers: DashMap::new(),
-            name_to_id: DashMap::new(),
+            tokenizers: DashMap::with_hasher(FxBuildHasher),
+            name_to_id: DashMap::with_hasher(FxBuildHasher),
             loading_locks: DashMap::new(),
         }
     }
