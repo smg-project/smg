@@ -17,12 +17,12 @@ use tokenizers::{
     Tokenizer,
 };
 
-use crate::common::FEW_MERGES;
+use crate::{common, common::FEW_MERGES};
 
 /// A byte-level BPE of the common shape with a few merges and one special
 /// token, with the byte-level post-processor, which adds no tokens.
 fn byte_level_bpe() -> Tokenizer {
-    crate::common::byte_level_bpe(&FEW_MERGES, &["<|endoftext|>"])
+    common::byte_level_bpe(&FEW_MERGES, &["<|endoftext|>"])
 }
 
 /// The template that puts the special token (`id` in the vocabulary) in
