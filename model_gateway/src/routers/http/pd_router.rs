@@ -2135,10 +2135,10 @@ impl PDRouter {
         }
     }
 
+    /// Whether the body is read for the pair policies' sake: the registry's
+    /// static answer for the two pair sides.
     fn policies_need_request_text(&self) -> bool {
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
-        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+        self.policy_registry.pair_needs_request_text()
     }
 
     /// The text the placement policies read from a count request, if they
@@ -2190,26 +2190,19 @@ impl PDRouter {
         Ok(((prefill, decode), guards))
     }
 
-    fn select_pd_pair(
-        &self,
-        model_id: &str,
-        inputs: PlacementInputs<'_>,
-        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
-        debug!("Selecting PD pair: model_id={:?}", model_id);
-
-        // Shared HTTP-transport projections: this router proxies plain HTTP
-        // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both pools derive from ONE snapshot's pair index:
-        // separate lookups could straddle a concurrent membership change and
-        // pair workers that never coexisted.
+    /// The pair index `model_id` routes within. Shared HTTP-transport
+    /// projections: this router proxies plain HTTP to the selected worker's
+    /// URL, so a gRPC or ZMQ worker must never be selectable. Both pools
+    /// derive from ONE snapshot's pair index: separate lookups could straddle
+    /// a concurrent membership change and pair workers that never coexisted.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
         let mode = self.policy_registry.pd_pairing_mode();
         let by_model = self
             .worker_registry
             .model_routing_snapshot(model_id)
             .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
-        let pairs = match by_model {
+        match by_model {
             // A named model routes within its own entry. The wildcard's
             // literal "unknown" entry wins while it can pair at all; when it
             // cannot (a pool empty, or no compatible pair) both pools widen
@@ -2222,8 +2215,17 @@ impl PDRouter {
                 .get_routing_snapshot(UNKNOWN_MODEL_ID)
                 .pd_pairs(PdWire::Http, mode),
             _ => Arc::new(PdPairIndex::empty()),
-        };
+        }
+    }
 
+    fn select_pd_pair(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdPair, Box<PairFailure>> {
+        debug!("Selecting PD pair: model_id={:?}", model_id);
+        let pairs = self.pd_pairs(model_id);
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,

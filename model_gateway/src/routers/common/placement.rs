@@ -1038,7 +1038,7 @@ pub(crate) fn select_pair(
         ) {
             return pair;
         }
-        debug!("No available prefill workers");
+        debug!(role = ?WorkerRole::Prefill, "No available PD pair");
         return Err(fail(
             WorkerRole::Prefill,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
@@ -1101,7 +1101,7 @@ pub(crate) fn select_pair(
         ) {
             return pair;
         }
-        debug!(?pair_runtime, "No available PD pair");
+        debug!(?role, "No available PD pair");
         return Err(fail(
             role,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
@@ -1793,6 +1793,23 @@ mod tests {
         assert!(pair_from(&registry, &off).is_ok());
     }
 
+    /// A pair over a pool whose only decode is not ready is the decode
+    /// role's unavailability.
+    #[test]
+    fn a_pair_whose_only_decode_is_not_ready_is_the_decode_roles_unavailability() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        decode.set_status(WorkerStatus::NotReady);
+        let failure = pair_from(&registry, &cohort_policies())
+            .err()
+            .expect("no partner is open");
+        assert_eq!(failure.role, WorkerRole::Decode);
+        assert!(matches!(failure.verdict, PlacementFailure::Unavailable));
+    }
+
     #[test]
     fn an_unknown_transport_pairs_leniently_and_fails_strictly() {
         let registry = pd_registry(&[
@@ -2402,6 +2419,66 @@ mod tests {
             },
         )
         .is_some());
+    }
+
+    /// The holder of a prompt's prefix keeps it over repeated placements, and
+    /// a retry leaves the holder.
+    #[test]
+    fn a_cache_aware_prefix_keeps_its_holder() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(cache_aware_policy());
+        let text = "a prompt long enough to fill a few blocks of the tree on its first request";
+        let inputs = PlacementInputs {
+            text: Some(text),
+            ..Default::default()
+        };
+        let holder = pick(&registry, &policies, inputs);
+        for _ in 0..8 {
+            assert_eq!(
+                pick(&registry, &policies, inputs).url(),
+                holder.url(),
+                "the prefix pins the prompt to its holder"
+            );
+        }
+        let tried = vec![holder.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(moved.url(), holder.url(), "the retry leaves the holder");
+    }
+
+    /// `select_from` under round robin rotates the pool it is given: three
+    /// candidates, nine picks, three each.
+    #[test]
+    fn select_from_rotates_the_pool_it_is_given() {
+        let registry = registry_with(&[
+            ("grpc://r:1", ConnectionMode::Grpc, RuntimeType::Vllm),
+            ("grpc://r:2", ConnectionMode::Grpc, RuntimeType::Vllm),
+            ("grpc://r:3", ConnectionMode::Grpc, RuntimeType::Vllm),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let candidates: Vec<Arc<dyn Worker>> = ["grpc://r:1", "grpc://r:2", "grpc://r:3"]
+            .iter()
+            .map(|url| registry.get_by_url(url).expect("registered"))
+            .collect();
+        let mut picks = BTreeMap::new();
+        for _ in 0..9 {
+            let worker = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                &candidates,
+                PlacementInputs::default(),
+            )
+            .expect("a worker is picked");
+            *picks.entry(worker.url().to_string()).or_insert(0) += 1;
+        }
+        assert_eq!(picks.into_values().collect::<Vec<usize>>(), [3, 3, 3]);
     }
 
     /// An explicit target under consistent hashing indexes the unfiltered
@@ -3358,6 +3435,151 @@ mod tests {
             owner.url(),
             "without the override a new turn is a new key"
         );
+    }
+
+    /// Under the override a round-robin default keeps every turn of a
+    /// conversation on the owner of its key.
+    #[test]
+    fn a_round_robin_defaults_turns_share_one_owner_under_the_override() {
+        let keyed = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            headers
+        };
+        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
+        let policies = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let base = keyed("conv");
+        let owner = pick(&registry, &policies, with_headers(&base));
+        // A vacant key would go to a lighter worker.
+        owner.increment_load();
+        for turn in turns {
+            let headers = keyed(turn);
+            assert_eq!(
+                pick(&registry, &policies, with_headers(&headers)).url(),
+                owner.url(),
+                "{turn} left the owner of conv"
+            );
+        }
+    }
+
+    /// The manual policy reads the `x-smg-routing-key` hint under an
+    /// override whose configured list names other headers: a conversation
+    /// keyed by the hint alone keeps its owner across turns with fresh
+    /// request ids, and across a turn with none.
+    #[test]
+    fn the_manual_policy_reads_the_hint_under_a_configured_list() {
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let hinted = keyed_headers();
+        let policies = PolicyRegistry::with_override(
+            manual,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                headers: vec!["x-session-id".into()],
+                ..Default::default()
+            },
+        );
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let turn = |rid_key: Option<&'static str>| PlacementInputs {
+            headers: Some(&hinted),
+            rid_key,
+            ..Default::default()
+        };
+        let owner = pick(&registry, &policies, turn(Some("request-1")));
+        // A vacant key would go to a lighter worker.
+        owner.increment_load();
+        for rid_key in [Some("request-2"), Some("request-3"), None] {
+            assert_eq!(
+                pick(&registry, &policies, turn(rid_key)).url(),
+                owner.url(),
+                "the turn keyed {rid_key:?} left the owner of the hint"
+            );
+        }
+    }
+
+    /// The hint keys nothing for a default the override places: with the
+    /// override's configured list naming other headers, a round-robin
+    /// request carrying the hint alone rotates.
+    #[test]
+    fn the_hint_keys_nothing_under_the_override() {
+        let hinted = keyed_headers();
+        let policies = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                headers: vec!["x-session-id".into()],
+                ..Default::default()
+            },
+        );
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            seen.insert(
+                pick(&registry, &policies, with_headers(&hinted))
+                    .url()
+                    .to_string(),
+            );
+        }
+        assert_eq!(seen.len(), 3, "the hint alone rotates: {seen:?}");
+    }
+
+    /// A key whose owner is not ready takes a failover. Once that worker is
+    /// back the key returns to it under the manual policy; under the
+    /// override it stays on the failover, as the override pins the newest
+    /// worker first.
+    #[test]
+    fn a_key_recovers_under_manual_and_stays_on_the_failover_under_the_override() {
+        let headers = keyed_headers();
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let cases = [
+            (manual, false, true),
+            (PolicyConfig::RoundRobin, true, false),
+        ];
+        for (config, override_on, returns) in cases {
+            let policies = PolicyRegistry::with_override(
+                config.clone(),
+                RoutingKeyOverrideConfig {
+                    enabled: override_on,
+                    ..Default::default()
+                },
+            );
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let owner = pick(&registry, &policies, with_headers(&headers));
+            owner.set_status(WorkerStatus::NotReady);
+            let failover = pick(&registry, &policies, with_headers(&headers));
+            assert_ne!(failover.url(), owner.url(), "{}", config.name());
+            for _ in 0..3 {
+                assert_eq!(
+                    pick(&registry, &policies, with_headers(&headers)).url(),
+                    failover.url(),
+                    "{}: the failover holds the key",
+                    config.name()
+                );
+            }
+            owner.set_status(WorkerStatus::Ready);
+            let back = pick(&registry, &policies, with_headers(&headers));
+            assert_eq!(
+                back.url() == owner.url(),
+                returns,
+                "{}: the key went to {}",
+                config.name(),
+                back.url()
+            );
+        }
     }
 
     /// Every worker over the thresholds, the owner the busier: the session

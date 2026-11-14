@@ -429,8 +429,10 @@ impl AppContextBuilder {
         // The configuration's liveness budgets (the stall, wedge and stale
         // thresholds and the warm-up slice, see `worker::liveness`) take
         // effect for every context built from it, the server's and a test's
-        // alike, here and nowhere else. They are process-wide and the first
-        // call wins, so the first context built in a process sets them.
+        // alike. They are process-wide and the first call wins, so a
+        // constructor that builds the policy registry itself configures them
+        // before that build (`from_config` and the test harness do).
+        // This call covers a context assembled without such a constructor.
         liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
@@ -496,6 +498,9 @@ impl AppContextBuilder {
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
+        let policy_registry = self
+            .policy_registry
+            .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
@@ -550,9 +555,7 @@ impl AppContextBuilder {
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
             prefill_admission,
-            policy_registry: self
-                .policy_registry
-                .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
+            policy_registry,
             gateway: self.gateway,
             response_storage: self
                 .response_storage
@@ -602,6 +605,10 @@ impl AppContextBuilder {
                 .iter()
                 .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
         );
+        // The configuration's liveness budgets take effect before the policy
+        // registry is built below (the first call wins; `build` keeps its
+        // call for a context assembled without this constructor).
+        liveness::configure_from(&router_config);
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -1266,6 +1273,26 @@ mod tests {
         let cache_aware =
             as_cache_aware(policy.as_ref()).expect("the label's policy is cache-aware");
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
+    }
+
+    /// A dropped context lets its worker monitor go: the monitor holds the
+    /// policy registry, and nothing the context builds holds the monitor
+    /// back.
+    #[tokio::test]
+    async fn a_dropped_context_lets_its_worker_monitor_go() {
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context");
+        let monitor = Arc::downgrade(context.worker_monitor.as_ref().expect("the worker monitor"));
+        drop(context);
+        assert!(
+            monitor.upgrade().is_none(),
+            "the worker monitor outlives its context"
+        );
     }
 
     #[test]

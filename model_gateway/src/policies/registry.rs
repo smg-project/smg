@@ -75,16 +75,19 @@ impl TextNeeds {
 
     /// What `policy` answers.
     fn of(policy: &dyn LoadBalancingPolicy) -> Self {
-        let keeps_text_under_key = !PolicyRegistry::routing_key_override_applies(policy.name());
+        Self::from_answers(
+            policy.needs_request_text(),
+            policy.needs_request_text_with_tokens(),
+            !PolicyRegistry::routing_key_override_applies(policy.name()),
+        )
+    }
+
+    fn from_answers(text: bool, text_with_tokens: bool, keeps_text_under_key: bool) -> Self {
         let mut bits = 0;
         for (wants, any, under_key) in [
+            (text, Self::TEXT, Self::TEXT_UNDER_KEY),
             (
-                policy.needs_request_text(),
-                Self::TEXT,
-                Self::TEXT_UNDER_KEY,
-            ),
-            (
-                policy.needs_request_text_with_tokens(),
+                text_with_tokens,
                 Self::TEXT_WITH_TOKENS,
                 Self::TEXT_WITH_TOKENS_UNDER_KEY,
             ),
@@ -186,7 +189,7 @@ pub struct PolicyRegistry {
 /// pinned worker (router-local, counted per replica) is bypassed and the
 /// request reassigned. Guards one conversation stacking onto its pin; total
 /// worker load is not a respill trigger.
-const STICKY_INFLIGHT_CAP: usize = 2;
+const STICKY_INFLIGHT_CAP: u16 = 2;
 
 /// `conv_t2_r1` -> `conv`: strip one trailing `_r<n>` retry suffix, then one
 /// trailing `_t<n>` turn suffix. A bare retry suffix is stripped too: a retry
@@ -358,12 +361,29 @@ impl PolicyRegistry {
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
-    /// Select a worker, applying the sticky routing-key override when it is
-    /// enabled, the request carries a key from the configured source, and the
-    /// configured policy does not already honor the key (`manual` /
-    /// `consistent_hashing`, which read `rid_key` and the header themselves
-    /// with the same header-first precedence). Otherwise delegates to `policy`.
-    /// `policy.name()` stays the real policy (for metrics).
+    /// The sticky routing-key override's selector, with the request's key and
+    /// its source, when the override places this request: it is enabled,
+    /// `policy` does not honor the key itself (`manual` and
+    /// `consistent_hashing` read `rid_key` and the header themselves with the
+    /// same header-first precedence), and the request carries a key from a
+    /// configured source. The one predicate the keyed path is entered by; the
+    /// policy's name is read only when the override is enabled.
+    fn sticky_for<'a>(
+        &self,
+        policy: &dyn LoadBalancingPolicy,
+        info: &SelectWorkerInfo<'a>,
+    ) -> Option<(&Arc<ManualPolicy>, &'a str, &'static str)> {
+        let sticky = self.routing_key_sticky.as_ref()?;
+        if !Self::routing_key_override_applies(policy.name()) {
+            return None;
+        }
+        let (key, source) = self.effective_sticky_key(info)?;
+        Some((sticky, key, source))
+    }
+
+    /// Select a worker, applying the sticky routing-key override when it
+    /// places the request (`sticky_for`); otherwise delegates to
+    /// `policy`. `policy.name()` stays the real policy (for metrics).
     pub fn select_worker_for_model(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -372,14 +392,8 @@ impl PolicyRegistry {
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         cache_trace::begin_selection(workers);
-        if let Some(sticky) = self.routing_key_sticky.as_ref() {
-            if Self::routing_key_override_applies(policy.name()) {
-                if let Some((key, source)) = self.effective_sticky_key(info) {
-                    return Self::select_sticky(
-                        sticky, policy, model_id, workers, info, key, source,
-                    );
-                }
-            }
+        if let Some((sticky, key, source)) = self.sticky_for(policy.as_ref(), info) {
+            return Self::select_sticky(sticky, policy, model_id, workers, info, key, source);
         }
         let selected = policy.select_worker(workers, info);
         cache_trace::selection(policy.name(), "policy", workers, selected);
@@ -429,8 +443,9 @@ impl PolicyRegistry {
         let namespaced = format!("{}:{model}:{role}:{key}", model.len());
         let key = namespaced.as_str();
 
-        let over_cap =
-            |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
+        let over_cap = |idx: usize| {
+            workers[idx].routing_key_inflight(load_key) >= usize::from(STICKY_INFLIGHT_CAP)
+        };
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
             cache_trace::selection(policy.name(), branch.as_str(), workers, result);
             Metrics::record_worker_manual_policy_branch(branch.as_str());
@@ -962,7 +977,8 @@ impl PolicyRegistry {
         let _one_at_a_time = self.text_needs_refresh.lock();
         let mut needs = TextNeeds::of(self.default_policy.as_ref());
         for entry in self.model_policies.iter() {
-            needs = needs.join(TextNeeds::of(entry.value().as_ref()));
+            let policy = entry.value().as_ref();
+            needs = needs.join(TextNeeds::of(policy));
         }
         self.text_needs.store(needs.0, Ordering::Release);
     }
@@ -974,6 +990,20 @@ impl PolicyRegistry {
         let mut needs = false;
         self.each_policy(|policy| needs |= policy.needs_backend_loads());
         needs
+    }
+
+    /// Whether the prefill or the decode policy reads the request text: the
+    /// pair routers' body question.
+    pub(crate) fn pair_needs_request_text(&self) -> bool {
+        self.get_prefill_policy().needs_request_text()
+            || self.get_decode_policy().needs_request_text()
+    }
+
+    /// Whether `worker`'s stream carries its KV events into its model's
+    /// index: what the policy that places requests on it reads
+    /// ([`Self::policy_for_worker`]).
+    pub(crate) fn worker_needs_kv_events(&self, worker: &dyn Worker) -> bool {
+        self.policy_for_worker(worker).needs_kv_events()
     }
 
     /// Initialize cache-aware policy with workers if applicable
@@ -1138,6 +1168,40 @@ mod tests {
             HashRing, Worker, WorkerLoadGuard, WorkerType,
         },
     };
+
+    /// The static needs the host answers before any request exists: a
+    /// cache-aware default policy reads the request text, the load poll and
+    /// a regular worker's KV events, and the pair's text question is the two
+    /// pair policies'.
+    #[test]
+    fn a_cache_aware_default_needs_the_text_the_load_poll_and_the_kv_events() {
+        let registry = PolicyRegistry::new(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        let regular = worker_of("http://w1:8000", WorkerType::Regular);
+        assert!(registry.any_policy_needs_request_text(None));
+        assert!(registry.needs_backend_loads());
+        assert!(registry.worker_needs_kv_events(regular.as_ref()));
+        assert!(registry.pair_needs_request_text());
+    }
+
+    /// An encode worker's KV-event question is the encode policy's own
+    /// answer, not the default policy's: the encode policy places the
+    /// requests on it.
+    #[test]
+    fn an_encode_workers_kv_event_need_is_the_encode_policys_own() {
+        let encode = worker_of("grpc://encode:9000", WorkerType::Encode);
+        let regular = worker_of("http://w1:8000", WorkerType::Regular);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // The encode router publishes the mode's encode policy at start-up.
+        policies.set_encode_policy(cache_aware_policy());
+        assert!(
+            policies.worker_needs_kv_events(encode.as_ref()),
+            "the encode policy reads the KV events"
+        );
+        assert!(
+            !policies.worker_needs_kv_events(regular.as_ref()),
+            "the round-robin default reads none"
+        );
+    }
 
     fn cache_aware_policy() -> Arc<dyn LoadBalancingPolicy> {
         Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
@@ -1846,7 +1910,10 @@ mod tests {
                 Some(("conversation", "header"))
             );
             let selected = reg.select_worker(&policy, &workers, &info).unwrap();
-            assert_eq!(selected, usize::from(guards.len() == STICKY_INFLIGHT_CAP));
+            assert_eq!(
+                selected,
+                usize::from(guards.len() == usize::from(STICKY_INFLIGHT_CAP))
+            );
             guards.push(WorkerLoadGuard::with_key(
                 workers[selected].clone(),
                 reg.sticky_key(Some(&headers), info.rid_key),

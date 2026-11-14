@@ -199,8 +199,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             // the model's (see `start_kv_stream`).
             let needs_kv_events = app_context
                 .policy_registry
-                .policy_for_worker(worker.as_ref())
-                .needs_kv_events();
+                .worker_needs_kv_events(worker.as_ref());
             start_kv_stream(&app_context, worker, needs_kv_events).await;
 
             Self::warn_on_cache_aware_without_kv_events(&model_id, worker, needs_kv_events);

@@ -473,6 +473,11 @@ async fn build_test_app_context(
         }
     };
 
+    // The configuration's liveness budgets before the policy registry is
+    // built, as `AppContextBuilder::from_config` orders them: the first call
+    // in a process wins.
+    smg::worker::configure_liveness(&config);
+
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::with_override(

@@ -258,7 +258,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 Some(update) => update.apply_to(existing_health),
                 None => existing_health.clone(),
             };
-            let health_endpoint = worker.metadata().health_endpoint.clone();
 
             // Determine API key: use new one if provided, otherwise keep existing
             let updated_api_key = request
@@ -281,47 +280,19 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             } else {
                 worker.status()
             };
-            // `from_spec` starts the rebuilt worker on the built-in breaker
-            // config. Carry the one resolved at registration (gateway defaults
-            // plus this worker's overrides) so an update neither loosens nor
-            // tightens the breaker; with matching configs the registry
-            // replacement adopts the live breaker as well, so its state
-            // (open, half-open, failure counts) survives the update.
-            let circuit_breaker_config = worker
-                .as_any()
-                .downcast_ref::<BasicWorker>()
-                .map(BasicWorker::circuit_breaker_config);
-            let mut builder = BasicWorkerBuilder::from_spec((*worker.metadata().spec).clone())
-                .http2(worker.http2())
+            let mut builder = BasicWorkerBuilder::carrying(worker)
                 .labels(updated_labels)
                 .models(models)
                 .discovered_labels(discovered_labels)
                 .health_config(updated_health_config.clone())
-                .health_endpoint(&health_endpoint)
-                .resilience(worker.resilience().clone())
                 .priority(updated_priority)
                 .cost(updated_cost)
-                // The overload block is not updatable here, but it must survive
-                // the rebuild; effective thresholds re-resolve against the same
-                // gateway defaults registration used.
-                .overload(worker.metadata().spec.overload)
+                // The effective overload thresholds re-resolve against the
+                // same gateway defaults registration used.
                 .overload_defaults(OverloadThresholds::from_gateway_config(
                     &app_context.router_config,
                 ))
-                // The ZMQ handshake bound is the router config's, set at registration;
-                // the rebuilt worker keeps the live value rather than the builder's
-                // default, so the bound an operator set stays in force across an update.
-                .zmq_startup_timeout(worker.metadata().zmq_startup_timeout)
                 .status(next_status);
-            if let Some(config) = circuit_breaker_config {
-                builder = builder.circuit_breaker_config(config);
-            }
-            // The ZMQ link's request bound, resolved at registration (the
-            // worker's own pool timeout, else the router's), is kept across the
-            // rebuild as the handshake bound is.
-            if let Some(timeout) = worker.metadata().zmq_request_timeout {
-                builder = builder.zmq_request_timeout(timeout);
-            }
             if refresh {
                 // A connector or role the operator configured none of follows
                 // the engine's report; a configured one stands, as at

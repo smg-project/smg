@@ -1862,16 +1862,49 @@ impl WorkerSelectionStage {
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
-        // Both pools derive from ONE membership snapshot: separate pool
-        // lookups could straddle a concurrent replacement and pair workers
-        // that never coexisted. The pools hold the workers whose wire carries
-        // the PD bootstrap info (gRPC, and TokenSpeed's direct ZMQ, see
-        // `RoutingPool::GrpcPrefill`; the wildcard model maps to the global
-        // snapshot). The pools must
-        // share a runtime, the rendezvous being runtime-specific, and a retry
-        // pins both to the retained plan's runtime.
+        let pairs = self.pd_pairs(model_id);
+        let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, demand, &pairs, |inputs| {
+            placement::select_pair(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                &pairs,
+                wire,
+                true,
+                prefill_capacity,
+                inputs,
+            )
+        })?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// The pair index of `model_id`'s snapshot. Both pools derive from ONE
+    /// membership snapshot: separate pool lookups could straddle a concurrent
+    /// replacement and pair workers that never coexisted. The pools hold the
+    /// workers whose wire carries the PD bootstrap info (gRPC, and
+    /// TokenSpeed's direct ZMQ, see `RoutingPool::GrpcPrefill`; the wildcard
+    /// model maps to the global snapshot). The pools must share a runtime,
+    /// the rendezvous being runtime-specific, and a retry pins both to the
+    /// retained plan's runtime.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode())
+    }
+
+    /// The per-request narrowing of a pair placement over `pairs`, then
+    /// `select` with the inputs narrowed: the shapes membership can never
+    /// serve are refused first (a request needing a vision encoder no
+    /// prefill worker has, a prompt no pair's context takes), and the
+    /// candidate filter composes the caller's predicate with the request's
+    /// media demands.
+    fn with_pd_pair_inputs<R>(
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        wire: Option<WireConstraint>,
+        demand: PairDemands,
+        pairs: &PdPairIndex,
+        select: impl FnOnce(PlacementInputs<'_>) -> Result<R, Box<PairFailure>>,
+    ) -> Result<R, PdSelectionFailure> {
         // A side that needs a vision encoder (see `PairDemands`) is kept off
         // the workers without one. The prefill side must find one: a request
         // carrying pixel media is refused when the index pairs no prefill
@@ -1897,8 +1930,8 @@ impl WorkerSelectionStage {
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
             && pairs.refusal.is_none()
-            && pair_admitted_by(&pairs, wire, &takes_refs)
-            && !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+            && pair_admitted_by(pairs, wire, &takes_refs)
+            && !pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
                 prefill_vision_capable(worker) && takes_refs(worker)
             })
         {
@@ -1911,7 +1944,7 @@ impl WorkerSelectionStage {
         };
         let prefill_with_vision =
             move |worker: &dyn Worker| prefill_vision_capable(worker) && admitted(worker);
-        let require_decode_vision = demand.decode && pair_admitted_by(&pairs, wire, &with_vision);
+        let require_decode_vision = demand.decode && pair_admitted_by(pairs, wire, &with_vision);
         let candidate_filter: Option<CandidateFilter<'_>> = if require_decode_vision {
             Some(&with_vision)
         } else if demand.prefill {
@@ -1932,7 +1965,7 @@ impl WorkerSelectionStage {
         };
         // Membership, not health, decides whether a request can ever fit.
         // Inspect actual partners: independently large pools need not pair.
-        if !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+        if !pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
             takes_media(worker) && demand.context.admits(worker, model_id)
         }) {
             let mut largest = None;
@@ -1973,17 +2006,7 @@ impl WorkerSelectionStage {
             candidate_filter: Some(&fits),
             ..inputs
         };
-        let pair = placement::select_pair(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            &pairs,
-            wire,
-            true,
-            prefill_capacity,
-            inputs,
-        )?;
-        Ok((pair.prefill, pair.decode, pair.runtime))
+        select(inputs).map_err(PdSelectionFailure::from)
     }
 
     /// Select per-item encode workers + a prefill/decode pair for EPD routing.
@@ -2105,11 +2128,13 @@ impl WorkerSelectionStage {
         )
         .map_err(EpdSelectionFailure::Placement)?;
         let handoff = PdProtocol::encode_handoff(pair.runtime);
-        available_encode.retain(|worker| {
+        // The encoders that pair with the chosen prefill side: its runtime
+        // and, under a push handoff, its EC roles and connector.
+        let pairs_with_prefill = |worker: &Arc<dyn Worker>| {
             worker.metadata().spec.runtime_type == pair.runtime
                 && (handoff != Some(EncodeHandoff::Push)
                     || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
-        });
+        };
         // Only image-only reference requests can merge a push encoder's prompt updates.
         let prompt_hash;
         let hashes = if handoff == Some(EncodeHandoff::Push) && needs_encode && !demand.image_fanout
@@ -2124,6 +2149,7 @@ impl WorkerSelectionStage {
         } else {
             encode_item_hashes
         };
+        available_encode.retain(pairs_with_prefill);
         let assignments = assign_encode_workers(
             &available_encode,
             hashes,
@@ -3963,6 +3989,86 @@ mod tests {
         }
     }
 
+    /// Two capable encoders of the pair's runtime, one on the prefill's EC
+    /// connector and one on another: under a rotating encode policy both
+    /// items of a request land on the pairing encoder (the pool is narrowed
+    /// before the policy); without the narrowing the rotation would hand the
+    /// second item to the other encoder.
+    #[test]
+    fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let model = "epd-pairing";
+        for (port, role, connector) in [
+            (8910, WorkerType::Encode, "ECCPUConnector"),
+            (8911, WorkerType::Encode, "ECOtherConnector"),
+            (8912, WorkerType::Prefill, "ECCPUConnector"),
+            (8913, WorkerType::Decode, "ECCPUConnector"),
+        ] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new(model))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Vllm)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .label("supports_ec_transfer", "true")
+                        .label("ec_connector", connector)
+                        .label(
+                            "ec_role",
+                            if role == WorkerType::Encode {
+                                "ec_producer"
+                            } else {
+                                "ec_consumer"
+                            },
+                        )
+                        .label("kv_connector", "NixlConnector")
+                        .label("mm_processor", "inprocess")
+                        .label("mm_media_ref_schemes", "http,https,data")
+                        .label("supports_vision", "true")
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_encode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            registry,
+            Arc::new(policies),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        for _ in 0..3 {
+            let (encoders, prefill, _decode, _runtime) = stage
+                .select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs::default(),
+                    &[vec![1], vec![2]],
+                    EpdDemands {
+                        wire: None,
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                        image_fanout: true,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("the EPD set is selected"));
+            assert_eq!(prefill.url(), "grpc://127.0.0.1:8912");
+            assert_eq!(encoders.len(), 2);
+            for assignment in &encoders {
+                assert_eq!(
+                    assignment.worker.url(),
+                    "grpc://127.0.0.1:8910",
+                    "only the encoder on the prefill's connector takes an item"
+                );
+            }
+        }
+    }
+
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
     #[test]
     fn epd_filters_capabilities_and_pairs_before_encoding() {
@@ -4073,6 +4179,24 @@ mod tests {
                 assert_eq!(encoders.len(), if image_fanout { 2 } else { 1 });
                 assert_eq!(prefill.url(), "grpc://127.0.0.1:8805");
                 assert_eq!(decode.url(), "grpc://127.0.0.1:8807");
+                // The assignment is narrowed to the encoders that pair with
+                // the chosen prefill side.
+                for assignment in &encoders {
+                    let encoder = assignment.worker.as_ref();
+                    assert_eq!(
+                        encoder.metadata().spec.runtime_type,
+                        runtime,
+                        "an assigned encoder shares the pair's runtime: {}",
+                        encoder.url()
+                    );
+                    if PdProtocol::encode_handoff(runtime) == Some(EncodeHandoff::Push) {
+                        assert!(
+                            ec_pair(encoder, prefill.as_ref()),
+                            "an assigned encoder pairs with the prefill: {}",
+                            encoder.url()
+                        );
+                    }
+                }
             }
             let encoder = stage
                 .worker_registry
