@@ -2469,10 +2469,13 @@ impl NativeEncoder {
     /// A candidate without a window within the check's reach
     /// ([`Self::window_start`], [`Self::window_end`]: a stretch without a
     /// space longer than the reach on one side of it) is skipped, with the
-    /// skip after it ([`CUT_SEARCH_SKIP`]: the walks of the candidates there
-    /// meet the same stretch), and not counted: its own space begins a whitespace run,
-    /// where the next candidate's walk back can stop, so a blob followed by
-    /// prose keeps its cuts past the blob. `None` when
+    /// bytes after it up to [`CUT_SEARCH_SKIP`] (the candidates there may
+    /// have a window, this one's space among their starts, but the step
+    /// bounds the walks' cost and moves the cut on by less than that), and
+    /// not counted: without a stage that reads a space inside a match its
+    /// own space begins a whitespace run, where the next candidate's walk
+    /// back can stop, so a blob followed by prose keeps its cuts past the
+    /// blob. `None` when
     /// the text has no such point past `from`, or when
     /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
     /// check: a stretch without candidates (a blob, a table of numbers) costs
@@ -2511,9 +2514,10 @@ impl NativeEncoder {
             {
                 let Some(start) = self.window_start(text, p) else {
                     // No window within the check's reach before the candidate: a stretch
-                    // without a space there, which the walks of every candidate within
-                    // the skip of this one meet too. A skip, not a rejection: the
-                    // rejections count the candidates the check read.
+                    // without a space there. The candidates within the skip of this one
+                    // may have a window (this one's space among their starts); skipping
+                    // them bounds the walks' cost and only moves the cut on. A skip, not
+                    // a rejection: the rejections count the candidates the check read.
                     p += CUT_SEARCH_SKIP;
                     continue;
                 };
