@@ -757,8 +757,9 @@ pub(super) async fn handle_simple_streaming_passthrough(
     *response.status_mut() = status;
 
     let headers_mut = response.headers_mut();
+    // One pair per value: a repeated upstream header keeps every value here too.
     for (name, value) in &preserved_headers {
-        headers_mut.insert(name, value.clone());
+        headers_mut.append(name, value.clone());
     }
 
     if !headers_mut.contains_key(CONTENT_TYPE) {
