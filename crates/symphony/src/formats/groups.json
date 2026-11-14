@@ -93,6 +93,7 @@
   {"model": "moonshotai/Kimi-K2.6", "also": [], "table": "kimi_k2", "opener": null, "after": null},
   {"model": "moonshotai/Kimi-K2.7-Code", "also": [], "table": "kimi_k2", "opener": null, "after": null},
   {"model": "moonshotai/Kimi-K3", "also": ["Kimi-K3.1-Pro", "nvidia/Kimi-K3.1-Pro-NVFP4"], "table": "kimi_k3", "opener": null, "after": null},
+  {"model": "Aleph-Alpha/Kolibri-1", "also": [], "table": "qwen3", "opener": null, "after": null},
   {"model": "poolside/Laguna-XS.2", "also": [], "table": "glm4", "opener": "<assistant>", "after": null},
   {"model": "inclusionAI/LBS-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "LiquidAI/LFM2.5-1.2B-Instruct", "also": ["LFM2.5-1.2B-Thinking"], "table": "lfm2.5", "opener": null, "after": null},

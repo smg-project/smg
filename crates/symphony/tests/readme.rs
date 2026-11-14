@@ -1431,6 +1431,16 @@ const GROUPS: &[Group] = &[
         status: Status::Ready,
     },
     Group {
+        slug: "kolibri-1",
+        model: "Aleph-Alpha/Kolibri-1",
+        also: &[],
+        released: "2026-10-02",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "laguna-xs.2",
         model: "poolside/Laguna-XS.2",
         also: &[],
