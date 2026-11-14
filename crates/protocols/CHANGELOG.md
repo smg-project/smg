@@ -94,6 +94,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A replayed `computer_call_output` input item with `acknowledged_safety_checks: null`, which the
+  public API allows (`ComputerCallOutputItemParam`), parses as none acknowledged. The crate refused
+  the request whole, as matching no variant of `ResponseInput`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

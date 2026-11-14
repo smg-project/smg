@@ -9,12 +9,12 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, json_type_name, strict_schema_missing_additional_properties,
-        validate_json_schema_shape, validate_stop, ChatLogProbs, ContextManagementEntry,
-        ConversationRef, Detail, Function, FunctionChoice, GenerationRequest, PromptCacheRetention,
-        PromptTokenUsageInfo, ResponsePrompt, StreamOptions, StringOrArray,
-        ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage,
-        UsageInfo,
+        default_true, deserialize_null_as_empty_vec, json_type_name,
+        strict_schema_missing_additional_properties, validate_json_schema_shape, validate_stop,
+        ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
+        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
+        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -1886,7 +1886,13 @@ pub enum ResponseInputOutputItem {
         id: Option<String>,
         call_id: String,
         output: ComputerCallOutputContent,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// The safety checks the developer acknowledged. The public API's
+        /// input item takes an array or `null`; `null` reads as none.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_null_as_empty_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
         acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ComputerCallStatus>,
