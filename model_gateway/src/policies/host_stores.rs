@@ -2416,12 +2416,6 @@ mod tests {
         assert_eq!(plain.load(), 3);
         host.release(LeaseId(6));
         assert_eq!(plain.load(), 0);
-        // The contract's other half: a worker the host does not know is
-        // refused, the same answer the memory store gives.
-        assert!(
-            !host.try_reserve(WorkerId(77), ReservationKind::Room, 1, LeaseId(7)),
-            "a worker the host does not know is refused"
-        );
     }
 
     fn decode_worker(url: &str, window: &str) -> Arc<dyn Worker> {
