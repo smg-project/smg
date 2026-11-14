@@ -61,6 +61,8 @@ async fn probe_http(
 ) -> Result<HttpProbe, String> {
     let config = &data.config;
     let cache = &app_context.worker_client_cache;
+    let endpoint = &app_context.router_config.health_check.endpoint;
+    let api_key = config.api_key.as_ref();
     let policy = HttpVersionPolicy::resolve(
         &config.url,
         config.http_pool.http2,
@@ -69,15 +71,15 @@ async fn probe_http(
     match policy {
         HttpVersionPolicy::Fixed(http2) => {
             let client = cache.get(&config.http_pool, http2)?;
-            try_http_reachable(&config.url, timeout, &client).await?;
+            try_http_reachable(&config.url, endpoint, api_key, timeout, &client).await?;
             Ok(HttpProbe { http2, client })
         }
         HttpVersionPolicy::Negotiate => {
             let h2 = cache.get(&config.http_pool, true)?;
             let h1 = cache.get(&config.http_pool, false)?;
             let (h2_result, h1_result) = tokio::join!(
-                try_http_reachable(&config.url, timeout, &h2),
-                try_http_reachable(&config.url, timeout, &h1)
+                try_http_reachable(&config.url, endpoint, api_key, timeout, &h2),
+                try_http_reachable(&config.url, endpoint, api_key, timeout, &h1)
             );
             match (h2_result, h1_result) {
                 (Ok(()), _) => Ok(HttpProbe {
@@ -231,10 +233,13 @@ mod tests {
     };
 
     fn app_context(upstream_http2: bool) -> Arc<AppContext> {
-        let router_config = RouterConfig {
+        app_context_with(RouterConfig {
             upstream_http2,
             ..RouterConfig::default()
-        };
+        })
+    }
+
+    fn app_context_with(router_config: RouterConfig) -> Arc<AppContext> {
         Arc::new(
             AppContext::builder()
                 .client(http_client())
@@ -268,8 +273,9 @@ mod tests {
     }
 
     /// axum::serve answers HTTP/1.1 and prior-knowledge h2c on one listener.
-    async fn spawn_dual_protocol_server() -> String {
-        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+    /// Only `health_path` is routed; every other path is 404.
+    async fn spawn_dual_protocol_server(health_path: &'static str) -> String {
+        let app = axum::Router::new().route(health_path, axum::routing::get(|| async { "ok" }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -318,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn negotiates_http2_with_a_dual_protocol_worker() {
-        let url = spawn_dual_protocol_server().await;
+        let url = spawn_dual_protocol_server("/health").await;
         let app_context = app_context(true);
         let mut ctx = local_context(Arc::clone(&app_context), WorkerSpec::new(url));
 
@@ -359,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn stays_on_http1_without_upstream_http2() {
-        let url = spawn_dual_protocol_server().await;
+        let url = spawn_dual_protocol_server("/health").await;
         let mut ctx = local_context(app_context(false), WorkerSpec::new(url));
 
         let result = DetectConnectionModeStep.execute(&mut ctx).await.unwrap();
@@ -370,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn declared_http2_false_skips_negotiation() {
-        let url = spawn_dual_protocol_server().await;
+        let url = spawn_dual_protocol_server("/health").await;
         let mut spec = WorkerSpec::new(url);
         spec.http_pool.http2 = Some(false);
         let mut ctx = local_context(app_context(true), spec);
@@ -429,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn bare_host_port_negotiates_too() {
-        let url = spawn_dual_protocol_server().await;
+        let url = spawn_dual_protocol_server("/health").await;
         let bare = url.trim_start_matches("http://").to_string();
         let mut ctx = local_context(app_context(true), WorkerSpec::new(bare));
 
@@ -438,5 +444,18 @@ mod tests {
         assert_eq!(result, StepResult::Success);
         assert_eq!(ctx.data.connection_mode, Some(ConnectionMode::Http));
         assert_eq!(ctx.data.http2, Some(true));
+    }
+
+    #[tokio::test]
+    async fn probes_the_configured_health_endpoint() {
+        let url = spawn_dual_protocol_server("/healthz").await;
+        let mut router_config = RouterConfig::default();
+        router_config.health_check.endpoint = "/healthz".to_string();
+        let mut ctx = local_context(app_context_with(router_config), WorkerSpec::new(url));
+
+        let result = DetectConnectionModeStep.execute(&mut ctx).await.unwrap();
+
+        assert_eq!(result, StepResult::Success);
+        assert_eq!(ctx.data.connection_mode, Some(ConnectionMode::Http));
     }
 }

@@ -140,14 +140,21 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
         let timeout = CLASSIFY_PROBE_TIMEOUT_SECS;
         let client = &app_context.client;
+        let endpoint = &app_context.router_config.health_check.endpoint;
 
-        // 4. /health → Local (only local backends expose this)
-        if try_http_reachable(&config.url, timeout, client)
-            .await
-            .is_ok()
+        // 4. health endpoint → Local (only local backends expose this)
+        if try_http_reachable(
+            &config.url,
+            endpoint,
+            config.api_key.as_ref(),
+            timeout,
+            client,
+        )
+        .await
+        .is_ok()
         {
             debug!(
-                "Worker {} responded to /health → Local",
+                "Worker {} responded to the health endpoint → Local",
                 Endpoint::redacted_str(&config.url)
             );
             context.data.worker_kind = Some(WorkerKind::Local);

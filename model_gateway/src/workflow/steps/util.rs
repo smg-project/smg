@@ -50,9 +50,9 @@ pub(crate) fn grpc_base_url(url: &str) -> String {
     }
 }
 
-fn http_health_url(url: &str) -> Result<String, String> {
+fn http_health_url(url: &str, endpoint: &str) -> Result<String, String> {
     match url_scheme(url).as_deref() {
-        Some("http") | Some("https") => Ok(format!("{}/health", url.trim_end_matches('/'))),
+        Some("http") | Some("https") => Ok(format!("{}{endpoint}", url.trim_end_matches('/'))),
         // The refusals name the address masked: on the detection step's
         // auto-detect arm (a URL whose scheme names no mode) a scheme neither
         // probe accepts ends in the step's failure message, which a log line
@@ -65,7 +65,7 @@ fn http_health_url(url: &str) -> Result<String, String> {
             "HTTP health check does not accept URL scheme '{scheme}': {}",
             Endpoint::redacted_str(url)
         )),
-        None => Ok(format!("http://{}/health", url.trim_end_matches('/'))),
+        None => Ok(format!("http://{}{endpoint}", url.trim_end_matches('/'))),
     }
 }
 
@@ -84,21 +84,26 @@ fn grpc_reachable_url(url: &str) -> Result<String, String> {
     }
 }
 
-/// Try HTTP health check (2xx response required).
+/// Try HTTP health check at the configured `endpoint` (2xx response required).
 pub(crate) async fn try_http_reachable(
     url: &str,
+    endpoint: &str,
+    api_key: Option<&String>,
     timeout_secs: u64,
     client: &Client,
 ) -> Result<(), String> {
-    let health_url = http_health_url(url)?;
+    let health_url = http_health_url(url, endpoint)?;
 
-    client
+    let mut req = client
         .get(&health_url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
+        .timeout(Duration::from_secs(timeout_secs));
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    req.send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("Health check failed: {e}"))?;
+        .map_err(|e| format!("Health check failed: {}", e.without_url()))?;
 
     Ok(())
 }
@@ -323,23 +328,23 @@ mod tests {
     #[test]
     fn http_health_url_accepts_http_https_and_bare_urls() {
         assert_eq!(
-            http_health_url("http://localhost:30000").unwrap(),
+            http_health_url("http://localhost:30000", "/health").unwrap(),
             "http://localhost:30000/health"
         );
         assert_eq!(
-            http_health_url("https://example.com/").unwrap(),
-            "https://example.com/health"
+            http_health_url("https://example.com/", "/healthz").unwrap(),
+            "https://example.com/healthz"
         );
         assert_eq!(
-            http_health_url("localhost:30000").unwrap(),
+            http_health_url("localhost:30000", "/health").unwrap(),
             "http://localhost:30000/health"
         );
     }
 
     #[test]
     fn http_health_url_rejects_grpc_schemes() {
-        assert!(http_health_url("grpc://localhost:30001").is_err());
-        assert!(http_health_url("grpcs://localhost:30001").is_err());
+        assert!(http_health_url("grpc://localhost:30001", "/health").is_err());
+        assert!(http_health_url("grpcs://localhost:30001", "/health").is_err());
     }
 
     #[test]
@@ -367,8 +372,8 @@ mod tests {
         for refusal in [
             grpc_reachable_url("http://user:secret@worker:3000").unwrap_err(),
             grpc_reachable_url("https://user:secret@worker:3000/").unwrap_err(),
-            http_health_url("grpc://user:secret@worker:3000").unwrap_err(),
-            http_health_url("grpcs://user:secret@worker:3000/").unwrap_err(),
+            http_health_url("grpc://user:secret@worker:3000", "/health").unwrap_err(),
+            http_health_url("grpcs://user:secret@worker:3000/", "/health").unwrap_err(),
         ] {
             assert!(!refusal.contains("secret"), "{refusal}");
             assert!(refusal.contains("://***@worker:3000"), "{refusal}");
