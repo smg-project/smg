@@ -214,11 +214,8 @@ impl GrpcClient {
     /// Get the full load response from the backend.
     /// Returns `Unimplemented` for backends without scheduler load metrics.
     pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        // Optional sections beyond `core` (disagg/queues/memory) are dropped by
-        // engines that do not report them, so requesting them is always safe and
-        // leaves routing consumers, which only read `core`, unaffected.
         let include = || {
-            ["core", "disagg", "queues", "memory"]
+            smg_grpc_client::engine_load::LOAD_SECTIONS
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()

@@ -232,6 +232,7 @@ impl<'a> CompletionStream<'a> {
             &dispatch.model,
             dispatch.created,
             dispatch.weight_version.as_deref(),
+            spec.include_usage,
         );
         // Where every choice's logprobs offsets start: after the echoed
         // prompt, counted only for a request that asked for logprobs.
