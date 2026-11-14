@@ -1060,6 +1060,39 @@ mod tests {
         assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
     }
 
+    /// A worker URL that ends in `@` and digits is refused with a 400 and
+    /// its reason: every line would name a rank of the host before the
+    /// digits while the probe dialled the digits as the host. The answer
+    /// shows the scheme of the address and no other part: the last two are
+    /// a token alone, and a user with a password of digits, which the
+    /// gateway's own rendering reads as a host and writes whole.
+    #[tokio::test]
+    async fn create_worker_refuses_an_address_read_two_ways() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+        for url in [
+            "http://127.0.0.1:35099@2130706433",
+            "http://user:s3cret@127.0.0.1:52605@2130706433",
+            "grpc://127.0.0.1:61845@2130706433",
+            "http://s3cret-token@8080",
+            "http://s3cret-user:8080@2130706433",
+        ] {
+            let err = service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err(url);
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{url}");
+            let WorkerServiceError::BadRequest { message } = err else {
+                panic!("expected a bad request, got {err}");
+            };
+            assert!(
+                message.contains("cannot end in '@' and digits"),
+                "{url}: {message}"
+            );
+            assert!(!message.contains("s3cret"), "{url}: {message}");
+        }
+    }
+
     #[tokio::test]
     async fn create_worker_accepts_schemed_url() {
         let registry = Arc::new(WorkerRegistry::new());
