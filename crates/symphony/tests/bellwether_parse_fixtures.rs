@@ -431,6 +431,19 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Arete-27B (a Qwen 3.5 stack) writes Qwen 3.5's prompt shapes with a reasoning-effort sentence
     // in the system turn.
     ("arete-27b", GenerationPrompt::OpensTheThought),
+    // LBS-27B writes Qwen 3.5's prompt shapes with a reasoning-effort sentence in the system turn
+    // (Arete-27B's template, the same bytes); SingVL_S1_4B and ZoomGain-9B write
+    // Qwen 3.5's own.
+    ("lbs-27b", GenerationPrompt::OpensTheThought),
+    ("singvl-s1-4b", GenerationPrompt::OpensTheThought),
+    ("zoomgain-9b", GenerationPrompt::OpensTheThought),
+    // ZwZ2 writes Qwen 3.5's shapes under a template of its own: a default system turn that asks
+    // for the reasoning and an `<answer>` block, and the thought opened only when the request
+    // turns thinking on (closed in the prompt otherwise, as Qwen3.5-2B's); bellwether's reference
+    // refused the thought-bearing probes, so each slug's common set holds eleven of the sixteen
+    // cases and its turns set eight of the twelve.
+    ("zwz2-27b", GenerationPrompt::OpensTheThoughtWhenAsked),
+    ("zwz2-9b", GenerationPrompt::OpensTheThoughtWhenAsked),
     // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     ("mimo-v2.5", GenerationPrompt::ModelWritesTheThought),
     // The V2.6 line writes the same tags with no newline between them; the generation prompt
