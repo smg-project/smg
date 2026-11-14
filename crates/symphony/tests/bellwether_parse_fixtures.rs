@@ -310,6 +310,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Kolibri-1 writes Qwen 3's JSON calls under ChatML; its prompt ends bare (the model writes its
     // own thought); thinking off closes it in the prompt as the empty `<think>` block.
     ("kolibri-1", GenerationPrompt::ModelWritesTheThought),
+    // Spark-X2.6 writes GLM's keyed calls with nothing between the tags under a DeepSeek-style
+    // frame; the prompt opens the thought after `<|Bot|>` (`<think>`, no newline), or writes a
+    // bare `</think>` there when the request turns thinking off.
+    ("spark-x2.6-4b", GenerationPrompt::OpensTheThought),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
@@ -1135,6 +1139,7 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
     ("laguna-xs.2", "<assistant>"),
+    ("spark-x2.6-4b", "<｜start▁of▁sentence｜><|Bot|>"),
     ("a.x-3.1-light", "<|im_start|><|assistant|>"),
     ("a.x-4.0", "<|im_start|><|assistant|>"),
     ("a.x-4.0-light", "<|im_start|><|assistant|>"),
