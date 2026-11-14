@@ -1729,24 +1729,32 @@ impl ProtoStream {
     /// returns at once as if a response had come (the dispatch paths wrap a
     /// side before they bound it).
     pub async fn first_response_within(&mut self, deadline: Instant) -> Result<FirstItem, Elapsed> {
+        tokio::time::timeout_at(deadline.into(), self.first_response()).await
+    }
+
+    /// [`Self::first_response_within`] with no deadline: the first item, a
+    /// response or the end, however long it takes (the prefill side of an
+    /// EPD request with the silence rule off waits for it beside its
+    /// request's encode watch).
+    pub async fn first_response(&mut self) -> FirstItem {
         if let Self::Watched(watched) = self {
             return match watched.inner.as_mut() {
-                Some(inner) => Box::pin(inner.first_response_within(deadline)).await,
-                None => Ok(FirstItem::End),
+                Some(inner) => Box::pin(inner.first_response()).await,
+                None => FirstItem::End,
             };
         }
         let Self::Tracked(tracked) = self else {
-            return Ok(FirstItem::Response);
+            return FirstItem::Response;
         };
         if let Some(held) = &tracked.replay {
-            return Ok(FirstItem::of(held.as_ref()));
+            return FirstItem::of(held.as_ref());
         }
-        let item = tokio::time::timeout_at(deadline.into(), self.next()).await?;
+        let item = self.next().await;
         let first = FirstItem::of(item.as_ref());
         if let Self::Tracked(tracked) = self {
             tracked.replay = Some(item);
         }
-        Ok(first)
+        first
     }
 
     /// The stream's first item (`None`: its end), pulled ahead of its reader
