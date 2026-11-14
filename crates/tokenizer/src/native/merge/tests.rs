@@ -1023,6 +1023,38 @@ fn a_lookup_walks_a_full_bucket_into_the_next_and_stops_at_the_first_empty_entry
     assert_eq!(table.merge_of(a, b), Merge::NONE);
 }
 
+/// The walk goes on at the first bucket after the last: pairs that hash to
+/// the last bucket, one more than its entries, are all found (the walk
+/// wraps for the last of them at the latest), and a pair that hashes there
+/// too and passes the filter but was never inserted is none.
+#[test]
+fn a_lookup_walking_past_the_last_bucket_goes_on_at_the_first() {
+    let bpe = model_with(&merges(), false);
+    let mut table = table_of(&bpe);
+    let last = table.buckets.len() - 1;
+    // Pairs of ids no token of the model has whose first bucket is the last.
+    let pairs: Vec<(u32, u32)> = (1_000_000..1_100_000u32)
+        .map(|a| (a, a + 1))
+        .filter(|&(a, b)| table.first_bucket(MergeTable::pair_key(a, b)) == last)
+        .collect();
+    let (inserted, rest) = pairs.split_at(BUCKET + 1);
+    for (rank, &(a, b)) in inserted.iter().enumerate() {
+        table.insert(a, b, Merge::new(rank as u32, a));
+    }
+    for (rank, &(a, b)) in inserted.iter().enumerate() {
+        assert_eq!(
+            table.merge_of(a, b),
+            Merge::new(rank as u32, a),
+            "pair {rank}"
+        );
+    }
+    let &(a, b) = rest.first().expect("a pair left over");
+    let (word, bits) = table.pair_filter_slot(MergeTable::pair_key(a, b));
+    table.pair_filter[word] |= bits;
+    assert!(table.pair_filter_admits(a, b));
+    assert_eq!(table.merge_of(a, b), Merge::NONE);
+}
+
 /// A byte-fallback vocabulary may number its tokens anywhere in the id
 /// space, and its table has no hot grid: no pair is answered from the grid
 /// whatever the ids, so operands at 2^31 load and merge through the

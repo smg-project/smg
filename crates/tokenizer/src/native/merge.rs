@@ -243,11 +243,6 @@ pub(super) struct MergeTable {
     /// or the first empty entry, going on to the next bucket only when every
     /// entry holds another pair (see [`Self::merge_of`]).
     buckets: Box<[Bucket]>,
-    /// The bucket count as the first-bucket pick multiplies it: the high
-    /// word of the key's hash times the count, so the table holds exactly
-    /// the buckets its merges need and not the next power of two (a table of
-    /// 269-322k merges held 16 MiB where 8-10 are used).
-    bucket_count: u64,
     /// The pairs' filter: one 64-bit word per pair key and two bits of it,
     /// set by [`Self::insert`], [`PAIR_FILTER_BITS_PER_MERGE`] bits per
     /// merge at least (64-512 KiB for the vocabularies in use, a table the
@@ -545,7 +540,6 @@ impl MergeTable {
             hot,
             hot_base: NO_HOT_BASE,
             buckets: vec![Bucket::EMPTY; buckets].into_boxed_slice(),
-            bucket_count: buckets as u64,
             pair_filter: vec![0; filter_words].into_boxed_slice(),
             pair_filter_shift: u64::BITS - filter_words.trailing_zeros(),
             merges,
@@ -610,13 +604,18 @@ impl MergeTable {
         self.merges
     }
 
+    /// The bucket a pair key's walk starts at: the high word of the key's
+    /// hash times the bucket count, so the table holds exactly the buckets
+    /// its merges need and not the next power of two (a table of 269-322k
+    /// merges held 16 MiB where 8-10 are used). The count is the slice's
+    /// own length, kept in one place.
     #[inline(always)]
     fn first_bucket(&self, key: u64) -> usize {
         // Fibonacci hashing spreads the pair's two ids over the high bits;
         // the high word of the hash times the count maps them onto the
         // buckets without a power-of-two count (one multiplication).
         let hash = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        ((u128::from(hash) * u128::from(self.bucket_count)) >> 64) as usize
+        ((u128::from(hash) * self.buckets.len() as u128) >> 64) as usize
     }
 
     /// The bucket after `bucket` in the walk, the first after the last.
