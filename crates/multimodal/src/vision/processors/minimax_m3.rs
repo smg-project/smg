@@ -40,9 +40,6 @@
 
 use std::{borrow::Cow, ops::Deref};
 
-#[path = "minimax_sglang_video.rs"]
-mod sglang_video;
-
 use image::DynamicImage;
 
 use super::{
@@ -59,6 +56,9 @@ use crate::{
     },
     EncoderDtype,
 };
+
+#[path = "minimax_sglang_video.rs"]
+mod sglang_video;
 
 /// Default patch size.
 pub const DEFAULT_PATCH_SIZE: usize = 14;
