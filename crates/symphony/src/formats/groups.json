@@ -150,6 +150,7 @@
   {"model": "mistralai/Mistral-Small-4-119B-2603", "also": [], "table": "mistral_v13", "opener": null, "after": null},
   {"model": "meta-models/Muse-Glimmer-30B", "also": [], "table": "muse_spark", "opener": null, "after": null},
   {"model": "meta-models/Muse-Spark-Open-816B-A42B", "also": ["Muse-Spark-Open-816B-A42B-NVFP4"], "table": "muse_spark", "opener": null, "after": null},
+  {"model": "NaiveAI/Naive-N0.5-Flash", "also": [], "table": "qwen3_tagged_direct", "opener": null, "after": null},
   {"model": "Nanbeige/Nanbeige4.2-3B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "Nanbeige/Nanbeige4.3-33B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "nvidia/Nemotron-Cascade-14B-Thinking", "also": ["Nemotron-Cascade-8B", "Nemotron-Cascade-8B-Thinking"], "table": "qwen3", "opener": null, "after": null},
