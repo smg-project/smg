@@ -997,8 +997,11 @@ impl ResponsesDecode {
                 "role": "assistant",
                 "content": []
             });
-            let event = emitter.emit_output_item_added(output_index, &item);
-            emitter.send_event_best_effort(&event, tx).await;
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_output_item_added(output_index, &item, tx)
+                    .await,
+            );
             self.message = Some((output_index, item_id));
         }
         let Some((output_index, item_id)) = &self.message else {
@@ -1099,8 +1102,11 @@ impl ResponsesDecode {
             .map(|s| s.resolve_tool_server_label(tool_name))
             .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
         attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
-        let event = emitter.emit_output_item_added(output_index, &item);
-        emitter.send_event_best_effort(&event, tx).await;
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_added(output_index, &item, tx)
+                .await,
+        );
 
         // Emit in_progress event for MCP tools
         if let Some(fmt) = response_format {
@@ -1241,9 +1247,10 @@ impl ResponsesDecode {
                 .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
             attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
 
-            let event = emitter.emit_output_item_done(*output_index, &item);
+            ResponseStreamEventEmitter::sent(
+                emitter.send_output_item_done(*output_index, item, tx).await,
+            );
             emitter.complete_output_item(*output_index);
-            emitter.send_event_best_effort(&event, tx).await;
         }
     }
 
@@ -1276,10 +1283,12 @@ impl ResponsesDecode {
             // typed read keeps an item only with one.
             "status": emitter.message_status()
         });
-        let event = emitter.emit_output_item_done(*output_index, &item);
-        // Mark as completed before sending (so it's included in final output even if send fails)
+        // The sender keeps the item before the frame goes out: the item is in the final output
+        // whether or not the frame reached the client.
+        ResponseStreamEventEmitter::sent(
+            emitter.send_output_item_done(*output_index, item, tx).await,
+        );
         emitter.complete_output_item(*output_index);
-        emitter.send_event_best_effort(&event, tx).await;
     }
 
     /// After the loop: a stream that brought frames but no calls from a terminal frame has its
