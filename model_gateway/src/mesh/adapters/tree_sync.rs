@@ -33,7 +33,10 @@ use smg_mesh::{DrainHandle, StreamNamespace, MAX_STREAM_CHUNK_BYTES};
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
-use crate::policies::{TreeHandle, TreeKind};
+use crate::{
+    policies::{TreeHandle, TreeKind},
+    worker::endpoint::Endpoint,
+};
 
 const PREFIX: &str = "td:";
 pub(crate) const REPAIR_REQUEST_PREFIX: &str = "tree:req:";
@@ -770,7 +773,7 @@ impl TreeSyncAdapter {
                     model_id,
                     kind = ?delta.tree_kind,
                     hash = delta.node_hash,
-                    worker_url = %delta.worker_url,
+                    worker_url = %Endpoint::redacted_str(&delta.worker_url),
                     epoch = delta.epoch,
                     "applied remote tenant delta against local tree",
                 );
@@ -779,7 +782,7 @@ impl TreeSyncAdapter {
                     model_id,
                     kind = ?delta.tree_kind,
                     hash = delta.node_hash,
-                    worker_url = %delta.worker_url,
+                    worker_url = %Endpoint::redacted_str(&delta.worker_url),
                     epoch = delta.epoch,
                     "unknown remote tenant delta hash, requesting repair",
                 );

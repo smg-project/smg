@@ -1042,7 +1042,7 @@ impl LeastLoadPolicy {
 
         debug!(
             "{policy} selected {} (score {:.4}, in_flight {})",
-            workers[best].url(),
+            workers[best].redacted_url(),
             best_score,
             workers[best].load()
         );
@@ -1116,6 +1116,24 @@ mod tests {
             BasicWorkerBuilder, WorkerType,
         },
     };
+
+    /// The selection's debug line names the worker it selected masked.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_selection_line_names_the_worker_masked() {
+        let workers = [
+            make_worker("http://user:s3cret@a:8000/v1?token=s3cret"),
+            make_worker("http://user:s3cret@b:8000/v1?token=s3cret"),
+        ];
+        let selected = LeastLoadPolicy::new()
+            .select_worker(&workers, &SelectWorkerInfo::default())
+            .expect("one of two healthy workers");
+        let host = ["a", "b"][selected];
+        assert!(logs_contain(&format!(
+            "least_load selected http://***@{host}:8000/v1 (score"
+        )));
+        assert!(!logs_contain("s3cret"));
+    }
 
     /// Invalid or incomplete rank capacity falls back to the fleet input rate.
     #[test]
