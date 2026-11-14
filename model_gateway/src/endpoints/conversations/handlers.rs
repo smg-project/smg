@@ -199,9 +199,10 @@ fn apply_metadata_patches(
 /// batch is checked before the conversation exists (`prepare_items`: the
 /// bounds, an unsupported type, a message without a role, an unknown
 /// reference, an id of another tenant), so a refused create creates no
-/// conversation; a store fault during the writes, or a reference the writes
-/// evicted from a bounded store, deletes the conversation just created (the
-/// records the batch wrote stay in the item store, unlinked).
+/// conversation; a store fault during the writes, a reference the writes
+/// evicted from a bounded store, or an id another caller's write took since
+/// the batch was prepared, deletes the conversation just created (the records
+/// the batch wrote stay in the item store, unlinked).
 pub async fn create_conversation(
     storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
@@ -245,7 +246,8 @@ pub async fn create_conversation(
                 }
             }
             Err(response) => {
-                // A store fault, or a referenced item the writes evicted,
+                // A store fault, a referenced item the writes evicted, or an
+                // id another tenant's write took since the batch was prepared
                 // reaches here: every other refusal was found before the
                 // conversation was created.
                 if let Err(e) = storage.delete_conversation(&conversation.id).await {
@@ -659,9 +661,11 @@ async fn refuse_an_item_the_conversation_has(
 /// the answer that names that id (the adoption, a reference to it, a repeat
 /// of it) lists the item as it is stored then. A batch without a new item
 /// asks the stores nothing more. A write under a caller-supplied id answers
-/// the item the store already holds under it: one another caller wrote since
-/// the batch was prepared, which `tenant` may not see, is refused before any
-/// link, as the prepare step refuses such an id.
+/// the item the store already holds under it, and the re-check reads whatever
+/// item sits under an adopted or referenced id: one another caller wrote
+/// since the batch was prepared, which `tenant` may not see, is refused
+/// before any link, as the prepare step refuses such an id (an adoption) or
+/// does not find it (a reference).
 async fn store_items(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
@@ -730,7 +734,7 @@ async fn store_items(
     if wrote {
         for Adoption { id: item_id, own } in adopted {
             match item_storage.get_item(&item_id).await {
-                Ok(Some(_)) => {}
+                Ok(Some(item)) => refuse_an_item_the_caller_may_not_see(&item, tenant)?,
                 Ok(None) => match own.map(|boxed| *boxed) {
                     Some((new_item, warning)) => {
                         let created = item_storage
@@ -755,8 +759,8 @@ async fn store_items(
         }
         for item_id in &referenced {
             match item_storage.get_item(item_id).await {
-                Ok(Some(_)) => {}
-                Ok(None) => {
+                Ok(Some(item)) if item.is_visible_to(tenant) => {}
+                Ok(_) => {
                     return Err(not_found(format!(
                         "Referenced item '{}' not found",
                         item_id.0
@@ -1980,6 +1984,114 @@ mod tests {
                     .is_none(),
                 "{route}: the other stored item went to make room for the recreation"
             );
+        }
+    }
+
+    /// The post-write re-check applies the prepare step's visibility rule: when
+    /// the batch's own writes evicted an adopted or referenced item and another
+    /// caller's write took the id before the re-check, the item now under the id
+    /// is refused as the prepare step refuses it (an adoption's 400, a
+    /// reference's 404) and nothing of the batch is linked; the other caller's
+    /// item is untouched.
+    #[tokio::test]
+    async fn an_id_another_caller_took_before_the_re_check_is_refused_before_the_link() {
+        for (case, entry, status) in [
+            (
+                "adoption",
+                json!({"id": "msg_o", "type": "message", "role": "user", "content": "own"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "reference",
+                json!({"type": "item_reference", "id": "msg_o"}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let two_items = MemoryConfig {
+                max_items: 2,
+                ..MemoryConfig::default()
+            };
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            let stored = |id: &str, tenant: Option<&str>| NewConversationItem {
+                id: Some(ConversationItemId::from(id)),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([{"type": "input_text", "text": id}]),
+                status: None,
+                tenant: tenant.map(str::to_string),
+            };
+            items.create_item(stored("msg_o", A)).await.unwrap();
+            items.create_item(stored("msg_u", A)).await.unwrap();
+            let created =
+                json_of(create_conversation(&conversations, &items, A, json!({})).await).await;
+            let conv_id = created["id"].as_str().unwrap().to_string();
+            let conversation = ConversationId::from(conv_id.as_str());
+
+            // The batch is prepared while msg_o is a's own item.
+            let batch = [
+                json!({"id": "msg_new", "type": "message", "role": "user", "content": "new"}),
+                entry,
+            ];
+            let prepared = match prepare_items(&items, Some(&conversation), &batch, A).await {
+                Ok(prepared) => prepared,
+                Err(response) => panic!("{case}: prepared: {}", json_of(response).await),
+            };
+            // Between the prepare and the writes: a write evicts msg_o (the
+            // oldest record of the bounded store) and another caller's write
+            // takes the id.
+            items.create_item(stored("msg_filler", A)).await.unwrap();
+            items.create_item(stored("msg_o", B)).await.unwrap();
+
+            let response = store_items(&items, &conversation, prepared, A)
+                .await
+                .expect_err("the id now holds another caller's item");
+            assert_eq!(response.status(), status, "{case}");
+            let body = json_of(response).await;
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("msg_o"),
+                "{case}: the answer names the id: {body}"
+            );
+            for id in ["msg_o", "msg_new"] {
+                assert!(
+                    !items
+                        .is_item_linked(&conversation, &ConversationItemId::from(id))
+                        .await
+                        .unwrap(),
+                    "{case}: {id} is not linked"
+                );
+            }
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    A,
+                    &conv_id,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                listed["data"].as_array().map(Vec::len),
+                Some(0),
+                "{case}: {listed}"
+            );
+            let other = items
+                .get_item(&ConversationItemId::from("msg_o"))
+                .await
+                .unwrap()
+                .expect("the other caller's item stands");
+            assert_eq!(other.tenant.as_deref(), B, "{case}");
+            assert_eq!(other.content[0]["text"], "msg_o", "{case}");
         }
     }
 }
