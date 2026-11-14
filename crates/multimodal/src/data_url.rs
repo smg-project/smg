@@ -2,6 +2,8 @@
 //! it: the router's plan check, the worker's item cap and the serving
 //! engine's own check bound inline media by this one rule.
 
+use crate::error::MediaConnectorError;
+
 /// Approximate decoded byte size of a `data:` URL's payload; `None` for any
 /// other URL.
 ///
@@ -31,9 +33,71 @@ pub fn data_url_payload_bytes(url: &str) -> Option<usize> {
     })
 }
 
+/// The base64 payload of `data_url`, as every reader of the crate takes it:
+/// the header must end in `;base64` (the only encoding the fetch decodes) and
+/// the payload must carry something to decode ([`base64_payload`]). One rule
+/// for the router-side fetch and the reference placement's door, so a data
+/// URL no engine serves is refused in the same words wherever the request's
+/// media is processed.
+pub fn data_url_payload(data_url: &str) -> Result<&str, MediaConnectorError> {
+    let (metadata, data) = data_url
+        .split_once(',')
+        .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+    if !metadata.ends_with(";base64") {
+        return Err(MediaConnectorError::DataUrl(
+            "only base64 encoded data URLs are supported".into(),
+        ));
+    }
+    base64_payload(data)
+}
+
+/// A base64 payload with something to decode: the text without its
+/// surrounding whitespace, or the data URL refusal for an empty one (an empty
+/// payload decodes to no bytes, which no decoder takes).
+pub fn base64_payload(data: &str) -> Result<&str, MediaConnectorError> {
+    let data = data.trim();
+    if data.is_empty() {
+        return Err(MediaConnectorError::DataUrl("empty payload".into()));
+    }
+    Ok(data)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::data_url_payload_bytes;
+    use super::{base64_payload, data_url_payload, data_url_payload_bytes};
+
+    /// The payload rules every reader shares: the header must end in
+    /// `;base64`, the payload must carry something; the text comes back
+    /// without its surrounding whitespace.
+    #[test]
+    fn the_payload_rules_are_the_readers() {
+        assert_eq!(
+            data_url_payload("data:image/png;base64,AAAA").unwrap(),
+            "AAAA"
+        );
+        assert_eq!(
+            data_url_payload("data:image/png;base64, AAAA ").unwrap(),
+            "AAAA"
+        );
+        for (url, why) in [
+            ("data:image/png;base64", "missing comma in data url"),
+            (
+                "data:image/png,%89PNG%0D%0A",
+                "only base64 encoded data URLs are supported",
+            ),
+            ("data:image/png;base64,", "empty payload"),
+            ("data:image/png;base64,   ", "empty payload"),
+        ] {
+            let error = data_url_payload(url).expect_err(url);
+            assert_eq!(
+                error.to_string(),
+                format!("data URL parse error: {why}"),
+                "{url}"
+            );
+        }
+        assert_eq!(base64_payload(" AQ== ").unwrap(), "AQ==");
+        assert!(base64_payload(" ").is_err());
+    }
 
     #[test]
     fn sizes_base64_and_plain_payloads() {
