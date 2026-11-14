@@ -41,6 +41,7 @@ use super::{
         responses, stages::decisions::supports_worker as supports_decisions_worker,
         streaming::StreamingProcessor,
     },
+    spec::MessagesTools,
     utils::{message_utils, missing_tokenizer_response, ParserResolver},
 };
 use crate::{
@@ -754,7 +755,7 @@ impl GrpcRouter {
         &self,
         body: CreateMessageRequest,
         model_id: &str,
-    ) -> (Arc<CreateMessageRequest>, String) {
+    ) -> (Arc<CreateMessageRequest>, String, MessagesTools) {
         debug!("Processing messages request for model: {}", model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
@@ -763,7 +764,12 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model.clone_from(&model_id_cloned);
-        (Arc::new(canonical_body), model_id_cloned)
+        // The tools leave the request here, while it is still owned: converted
+        // once, by value, into the chat tools the pipeline carries beside the
+        // request; the request's own `tools` reads `None` from here on, and
+        // whether it was set travels with them.
+        let tools = MessagesTools::take_from(&mut canonical_body);
+        (Arc::new(canonical_body), model_id_cloned, tools)
     }
 
     /// Main route_messages implementation, over the request
@@ -774,6 +780,7 @@ impl GrpcRouter {
         tenant_meta: &TenantRequestMeta,
         canonical_body: Arc<CreateMessageRequest>,
         model_id_cloned: String,
+        tools: MessagesTools,
     ) -> Response {
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
@@ -789,7 +796,7 @@ impl GrpcRouter {
                 canonical_body.stream.unwrap_or(false),
             );
             let response = self
-                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
+                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned, &tools)
                 .await;
             if !response.status().is_success() {
                 self.messages_pipeline
@@ -804,6 +811,7 @@ impl GrpcRouter {
                 self.messages_pipeline
                     .execute_messages(
                         canonical_body,
+                        tools,
                         headers.cloned(),
                         model_id,
                         self.shared_components.clone(),
@@ -938,12 +946,13 @@ impl GrpcRouter {
         tenant_meta: &TenantRequestMeta,
         body: Arc<CreateMessageRequest>,
         model_id: &str,
+        tools: &MessagesTools,
     ) -> Response {
         let input_tokens = match self
             .count_prompt_tokens(
                 model_id,
                 message_utils::MessagesPrompt::from(&*body),
-                &body.chat_tools(),
+                &tools.chat_tools,
                 body.tool_choice.as_ref(),
                 true,
             )
@@ -1316,8 +1325,8 @@ impl RouterTrait for GrpcRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        let (body, model_id) = self.messages_request_for_pipeline(body, model_id);
-        self.route_messages_impl(headers, tenant_meta, body, model_id)
+        let (body, model_id, tools) = self.messages_request_for_pipeline(body, model_id);
+        self.route_messages_impl(headers, tenant_meta, body, model_id, tools)
             .await
     }
 

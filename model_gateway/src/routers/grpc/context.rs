@@ -49,7 +49,7 @@ use super::{
         stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
         symphony::{PromptReplay, Reading},
     },
-    spec::ResponseSpec,
+    spec::{MessagesTools, ResponseSpec},
     utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
@@ -289,6 +289,13 @@ pub(crate) struct ProcessingState {
     /// endpoints whose preparation decides nothing, and when the names refused (the constraint
     /// carries the refusal); the assignment then decides itself.
     pub reading: Option<Reading>,
+
+    /// A Messages request's tools, taken out of the request by the route
+    /// while it still owned it (`MessagesTools::take_from`) and stored by
+    /// `RequestContext::for_messages`: the Messages preparation clones them
+    /// (a flag and an `Arc`) into the response spec. `None` only for a
+    /// context of another request type.
+    pub messages_tools: Option<MessagesTools>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
@@ -1388,19 +1395,38 @@ impl RequestContext {
         )
     }
 
-    /// Create context for messages request
+    /// A Messages context: it carries the request's tools beside the request
+    /// (`tools`, taken out of the request by the route while it still owned
+    /// it), and the preparation builds the response spec from them.
     pub fn for_messages(
+        request: Arc<CreateMessageRequest>,
+        tools: MessagesTools,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        let mut ctx = Self::new(
+            RequestType::Messages(request),
+            headers,
+            model_id,
+            components,
+        );
+        ctx.state.messages_tools = Some(tools);
+        ctx
+    }
+
+    /// A Messages context over a request that still carries its tools, as the
+    /// tests build theirs: the tools are converted from the request by
+    /// reference.
+    #[cfg(test)]
+    pub fn for_messages_carrying_its_tools(
         request: Arc<CreateMessageRequest>,
         headers: Option<HeaderMap>,
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self::new(
-            RequestType::Messages(request),
-            headers,
-            model_id,
-            components,
-        )
+        let tools = MessagesTools::from(&*request);
+        Self::for_messages(request, tools, headers, model_id, components)
     }
 
     /// Get Arc clone of chat request (panics if not chat)

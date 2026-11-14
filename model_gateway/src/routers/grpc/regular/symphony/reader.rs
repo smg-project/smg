@@ -1809,10 +1809,7 @@ mod tests {
             super::assign(
                 ParserChoice::Symphony,
                 &ModelNames::default(),
-                Asks::Messages {
-                    request: &message_request(extra),
-                    continues: false,
-                },
+                Asks::for_messages(&message_request(extra), false),
                 None,
                 PROMPT,
                 &templates(),
@@ -1852,10 +1849,7 @@ mod tests {
         let messages = super::assign(
             ParserChoice::Symphony,
             &ModelNames::default(),
-            Asks::Messages {
-                request: &message_request(json!({})),
-                continues: false,
-            },
+            Asks::for_messages(&message_request(json!({})), false),
             None,
             PROMPT,
             &templates(),
@@ -2647,10 +2641,7 @@ mod tests {
             let assigned = super::assign(
                 ParserChoice::Symphony,
                 &ModelNames::default(),
-                Asks::Messages {
-                    request: &message,
-                    continues: false,
-                },
+                Asks::for_messages(&message, false),
                 Some(&schema),
                 PROMPT,
                 &templates(),

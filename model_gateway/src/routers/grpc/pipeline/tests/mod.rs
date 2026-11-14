@@ -904,10 +904,12 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
         let components = components_with_multimodal(worker_registry, true).await;
         let request: Arc<CreateMessageRequest> =
             Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
+        let tools = MessagesTools::from(&*request);
         let response = tokio::time::timeout(
             Duration::from_secs(10),
             pipeline.execute_messages(
                 request,
+                tools,
                 None,
                 MODEL.to_string(),
                 components,

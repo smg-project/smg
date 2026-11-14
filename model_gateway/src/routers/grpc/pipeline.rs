@@ -69,7 +69,7 @@ use super::{
         },
         streaming, symphony,
     },
-    spec::ResponseSpec,
+    spec::{MessagesTools, ResponseSpec},
     utils,
     utils::{error_reason_for_response, error_type_for_response},
 };
@@ -1308,6 +1308,7 @@ impl RequestPipeline {
     pub async fn execute_messages(
         &self,
         request: Arc<CreateMessageRequest>,
+        tools: MessagesTools,
         headers: Option<http::HeaderMap>,
         model_id: String,
         components: Arc<SharedComponents>,
@@ -1317,7 +1318,8 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
         let run = {
-            let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+            let mut ctx =
+                RequestContext::for_messages(request, tools, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
