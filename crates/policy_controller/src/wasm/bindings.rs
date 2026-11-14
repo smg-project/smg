@@ -55,6 +55,31 @@ pub(crate) struct HostState {
     pub(crate) log: LogGate,
     /// The host's clock, for `now-micros` outside a decision.
     pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// What the ticks keep of the call in flight.
+    pub(crate) watch: Watch,
+}
+
+/// What the ticks keep of the guest call in flight on a store. A plugin's
+/// bound is measured on the clock the plugin can spend: a guest of these
+/// worlds cannot wait (its four imports return at once, and it has no WASI),
+/// so the time its call is off the CPU is the host's, and its bound is the
+/// CPU its thread had since a reading of the thread's clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Watch {
+    /// The call's bound, in microseconds of its thread's CPU.
+    pub(crate) bound_micros: u64,
+    /// Whether the bound counts the CPU; `false` where nothing is watched
+    /// (`init`; a host with no thread clock) and the call ends at its
+    /// deadline on the wall clock.
+    pub(crate) watched: bool,
+    /// The thread's CPU clock at the call's start, in microseconds: read
+    /// only on a thread that is armed, and the one reading that says what a
+    /// late call's thread had.
+    pub(crate) start: Option<u64>,
+    /// The thread's CPU clock at the first tick that found the call in
+    /// flight, where there is no reading of its start: the bound counts
+    /// from here, and the time before it is unread.
+    pub(crate) first_tick: Option<u64>,
 }
 
 /// The per-plugin log gate: a level cap and a token bucket refilled once a

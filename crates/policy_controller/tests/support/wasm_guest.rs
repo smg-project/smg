@@ -47,8 +47,9 @@ pub mod mode {
     pub const DRAW_IN_PICK: u8 = 12;
     /// `filter` grows the table past the host's cap first.
     pub const GROW_TABLE: u8 = 13;
-    /// `score` fills the whole memory (grown to the cap) in a loop: cheap in
-    /// fuel, long on the clock.
+    /// `score` fills the whole memory (grown to the cap) in a loop: fuel
+    /// prices each fill by its size, so the loop is long on the clock and
+    /// cheap in fuel only under a calibration that underprices it.
     pub const FILL_IN_SCORE: u8 = 14;
     /// `filter` traps when the decision has four candidates: the decode side
     /// of a pair of three prefills and four decodes.
@@ -64,7 +65,8 @@ pub mod mode {
     pub const SLOW_DESTRUCTOR: u8 = 18;
     /// The lifecycle export traps.
     pub const TRAP_IN_OBSERVE: u8 = 19;
-    /// The destructor fills its memory without end: wall, little fuel.
+    /// The destructor fills its memory without end: the clock ends it where
+    /// the calibration underprices a fill, its fuel elsewhere.
     pub const FILL_IN_DESTRUCTOR: u8 = 20;
     /// `init` burns eight fixed loops: heavier than a small decision budget.
     pub const BURN_IN_INIT: u8 = 21;
@@ -74,6 +76,12 @@ pub mod mode {
     pub const SPIN_IN_PICK: u8 = 23;
     /// The decision's constructor traps.
     pub const TRAP_IN_CONSTRUCTOR: u8 = 24;
+    /// `score` writes a log line first: a host call a test can hold the
+    /// thread in.
+    pub const LOG_IN_SCORE: u8 = 26;
+    /// The destructor writes a log line, then loops once: a host call a test
+    /// can hold the thread in, and a check of the clock after it.
+    pub const LOG_IN_DESTRUCTOR: u8 = 27;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -427,6 +435,8 @@ fn guest_wat(guest: Guest) -> String {
     (local.set $len (i32.load offset=4 (local.get $rep)))
     (if (i32.eq (global.get $mode) (i32.const {spin})) (then (loop $spin (br $spin))))
     (if (i32.eq (global.get $mode) (i32.const {burn})) (then (call $burn)))
+    (if (i32.eq (global.get $mode) (i32.const {log_in_score}))
+      (then (call $log (i32.const 2) (i32.const 32) (i32.const 8))))
     (if (i32.or (i32.eq (global.get $mode) (i32.const {fill})) (i32.eq (global.get $mode) (i32.const {fill_then_fill})))
       (then
         ;; The filter of the second mode grew the memory already: a second
@@ -527,6 +537,10 @@ fn guest_wat(guest: Guest) -> String {
           (drop (call $now))
           (local.set $i (i32.sub (local.get $i) (i32.const 1)))
           (br_if $calls (local.get $i)))))
+    (if (i32.eq (global.get $mode) (i32.const {log_dtor}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (loop $once (br_if $once (i32.const 0)))))
     (global.set $heap (i32.const 1024)))
 )"#,
         iface = iface,
@@ -558,6 +572,8 @@ fn guest_wat(guest: Guest) -> String {
         fill_dtor = mode::FILL_IN_DESTRUCTOR,
         burn_init = mode::BURN_IN_INIT,
         trap_ctor = mode::TRAP_IN_CONSTRUCTOR,
+        log_in_score = mode::LOG_IN_SCORE,
+        log_dtor = mode::LOG_IN_DESTRUCTOR,
     )
 }
 
