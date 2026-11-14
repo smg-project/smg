@@ -37,7 +37,7 @@ impl ModelProcessorSpec for Inkling2Spec {
     }
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
-        metadata.config_model_type() == Some("inkling2_mm_model")
+        metadata.config_model_type() == Some("inkling2")
             || metadata
                 .config
                 .get("architectures")
@@ -147,7 +147,7 @@ mod tests {
     fn exact_model_metadata_selects_new_spec_before_old_family() {
         let tokenizer = TestTokenizer::new(&[]);
         for config in [
-            json!({"model_type":"inkling2_mm_model"}),
+            json!({"model_type":"inkling2"}),
             json!({"architectures":["Inkling2ForConditionalGeneration"]}),
         ] {
             let metadata = ModelMetadata {
@@ -178,7 +178,7 @@ mod tests {
     fn image_contract_keeps_header_outside_explicit_features() {
         let tokenizer =
             TestTokenizer::new(&[("<|unused_200054|>", 200054), ("<|content_image|>", 200005)]);
-        let config = json!({"model_type":"inkling2_mm_model"});
+        let config = json!({"model_type":"inkling2"});
         let metadata = ModelMetadata {
             model_id: "checkpoint",
             tokenizer: &tokenizer,
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn vision_processor_requires_the_native_policy() {
-        let config = json!({"model_type": "inkling2_mm_model"});
+        let config = json!({"model_type": "inkling2"});
         let native = PreProcessorConfig::from_value(json!({
             "patch_size": 40, "temporal_patch_size": 2,
             "include_extra_column": false,

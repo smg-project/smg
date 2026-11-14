@@ -1156,7 +1156,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("config.json"),
-            r#"{"model_type":"inkling2_mm_model"}"#,
+            r#"{"model_type":"inkling2"}"#,
         )
         .unwrap();
         fs::write(

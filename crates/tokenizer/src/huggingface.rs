@@ -2686,9 +2686,7 @@ fn detect_renderer_from_config(dir: &Path, has_chat_template: bool) -> Renderer 
     // Checked before the V4 arm below: V4.1 ships its own architecture name,
     // but some checkpoints identify themselves only via `model_type`.
     let model_type = value.get("model_type").and_then(|v| v.as_str());
-    if arch_strs.contains(&"Inkling2ForConditionalGeneration")
-        || model_type == Some("inkling2_mm_model")
-    {
+    if arch_strs.contains(&"Inkling2ForConditionalGeneration") || model_type == Some("inkling2") {
         debug!(?path, "selected Inkling2 typed renderer");
         return Renderer::Inkling2;
     }

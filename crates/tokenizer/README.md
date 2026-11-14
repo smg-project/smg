@@ -68,8 +68,8 @@ as of `tokenizer/src/*`.
 
 ### Native Inkling2 requests (`encoders/inkling2.rs`)
 
-The tokenizer selects the native renderer only for `Inkling2ForConditionalGeneration` or
-`inkling2_mm_model`. It uses the checkpoint's `tokenizer.json`, not a built-in
+The tokenizer selects the native renderer only for `Inkling2ForConditionalGeneration` or model type
+`inkling2`. It uses the checkpoint's `tokenizer.json`, not a built-in
 OpenAI vocabulary or a Jinja template. Loading validates the structural token IDs.
 
 Use `apply_chat_template_with_encoding` and run its deferred `EncodeJob`. The

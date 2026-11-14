@@ -137,7 +137,7 @@ fn continuation_is_unclosed_text_and_rejects_other_shapes() {
 
 #[test]
 fn json_response_contract_requires_separation_and_an_empty_prefix() {
-    let (_directory, tokenizer) = tiny_tokenizer(json!({"model_type":"inkling2_mm_model"}), true);
+    let (_directory, tokenizer) = tiny_tokenizer(json!({"model_type":"inkling2"}), true);
     let capabilities = tokenizer.unwrap().renderer_capabilities();
     assert!(capabilities.validate_json_response(true, None).is_ok());
     assert!(capabilities.validate_json_response(true, Some("")).is_ok());
@@ -232,7 +232,7 @@ fn deferred_encoding_keeps_literal_controls_ordinary_and_images_typed() {
 
 #[test]
 fn detection_requires_new_architecture_and_exact_checkpoint_tokens() {
-    let (_dir, tokenizer) = tiny_tokenizer(json!({"model_type":"inkling2_mm_model"}), false);
+    let (_dir, tokenizer) = tiny_tokenizer(json!({"model_type":"inkling2"}), false);
     assert!(tokenizer.err().unwrap().to_string().contains("200054"));
     let (_dir, tokenizer) = tiny_tokenizer(
         json!({"architectures":["InklingForConditionalGeneration"]}),
@@ -246,7 +246,7 @@ fn detection_requires_new_architecture_and_exact_checkpoint_tokens() {
 
 #[test]
 fn cached_wrapper_keeps_different_typed_ids_for_identical_display_text() {
-    let (_dir, tokenizer) = tiny_tokenizer(json!({"model_type":"inkling2_mm_model"}), true);
+    let (_dir, tokenizer) = tiny_tokenizer(json!({"model_type":"inkling2"}), true);
     let tokenizer = CachedTokenizer::new(
         Arc::new(tokenizer.unwrap()),
         CacheConfig {

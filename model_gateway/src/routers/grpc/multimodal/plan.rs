@@ -1294,7 +1294,7 @@ pub(crate) mod tests {
     async fn inkling2_image_plan_rejects_request_resize_before_fetch() {
         let tokenizer = MockTokenizer::new();
         for config in [
-            serde_json::json!({"model_type": "inkling2_mm_model"}),
+            serde_json::json!({"model_type": "inkling2"}),
             serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
         ] {
             let components = image_components(config);
@@ -1314,7 +1314,7 @@ pub(crate) mod tests {
     async fn inkling2_image_plan_accepts_missing_or_null_resize() {
         let (_dir, tokenizer) = image_tokenizer();
         for config in [
-            serde_json::json!({"model_type": "inkling2_mm_model"}),
+            serde_json::json!({"model_type": "inkling2"}),
             serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
         ] {
             let components = image_components(config);
