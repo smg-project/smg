@@ -167,6 +167,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   The message reaches a client on both routes that read it: the chat-family Responses conversion
   (`400 unsupported_content_part`) and the Harmony builder's tool message
   (`400 harmony_build_failed`).
+- A Response linked to a conversation writes it as the public API does, `{"id": "conv_..."}`
+  (`ResponseConversation`), where the crate wrote the bare id, and reads either shape: the crate
+  refused a Response carrying the object with ``invalid type: map, expected a string``. The field
+  keeps the id alone (`Option<String>`), so code that reads it is unchanged, and its schema takes
+  both shapes, so a client generated from it also reads a response stored with the bare id.
 - The generate route's request rule refuses an empty `text` under `prompt_empty` only when the body
   has no `input_ids` and no media field carries an item (beside ids the engine serves the ids without
   reading the text; a media-only prompt is sent with an empty `text`, as the engine reads it);
