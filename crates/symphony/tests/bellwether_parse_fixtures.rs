@@ -411,6 +411,14 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "hy-memory-30b-a3b",
         GenerationPrompt::OpensTheThoughtByEffort,
     ),
+    // LongCat writes GLM 4.5 and 4.6's keyed spelling under `longcat_`-prefixed tags, each call
+    // bare after the content; its template writes the thinking switch into the user turn
+    // (`/think_on` under `enable_thinking`, `/think_off` otherwise, the default) and opens the
+    // thought in the prompt only when it is on (`<longcat_think>` alone), closing an empty one
+    // otherwise (the tail's newlines are not read, its markers are); bellwether's reference
+    // refused the thought-bearing probes, so the common set holds eleven of the sixteen cases
+    // and the turns set eight of the twelve.
+    ("longcat-2.5", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("ling-3.0-flash", GenerationPrompt::OpensTheThought),
     // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
     // whatever the request says (the template has no thinking switch).
@@ -736,6 +744,7 @@ impl Recorded for Table {
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
+            Self::LongCat => ("<longcat_think>", "</longcat_think>"),
             Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
@@ -776,9 +785,9 @@ impl Recorded for Table {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::Qwen3TaggedDirect => KNOWN_TAGGED_DIFFERENCES,
             // Seed-OSS, Hy4, Olmo 3, Llama 4, xLAM, the json table, Kimi K3, Muse Spark, K2-Horizon,
-            // Inkling, Gemma 4 and the plain table read neither of the probes' Qwen markers:
-            // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content,
-            // as the reference says.
+            // Inkling, Gemma 4, LongCat and the plain table read neither of the probes' Qwen
+            // markers: `</think>` stays reasoning text and the fenced `<tool_call>` block stays
+            // content, as the reference says.
             Self::SeedOss
             | Self::Hy4
             | Self::Olmo3
@@ -793,6 +802,7 @@ impl Recorded for Table {
             | Self::FunctionGemma
             | Self::Mistral
             | Self::MistralV13
+            | Self::LongCat
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a
@@ -847,6 +857,7 @@ impl Recorded for Table {
                 | Self::Ling
                 | Self::IQuest
                 | Self::Glm
+                | Self::LongCat
         ) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
