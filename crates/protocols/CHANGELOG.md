@@ -90,6 +90,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
+  writes it, parses, with no completion tokens. The crate refused the whole answer with
+  ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
+  read the same way; a usage the gateway writes is unchanged.
 - `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
   `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
   "input_image" in a function output for text-only backends: only text parts are carried as a tool
