@@ -774,8 +774,9 @@ pub(super) async fn handle_simple_streaming_passthrough(
     *response.status_mut() = status;
 
     let headers_mut = response.headers_mut();
+    // One pair per value: a repeated upstream header keeps every value here too.
     for (name, value) in &preserved_headers {
-        headers_mut.insert(name, value.clone());
+        headers_mut.append(name, value.clone());
     }
 
     if !headers_mut.contains_key(CONTENT_TYPE) {
@@ -1002,7 +1003,6 @@ pub(super) fn handle_streaming_with_tool_interception(
     let client_clone = client.clone();
     let url_clone = url.clone();
     let headers_opt = headers.cloned();
-    let payload_clone = payload.clone();
     let orchestrator_clone = Arc::clone(orchestrator);
     let forwarded_headers = extract_forwardable_request_headers(headers);
 
@@ -1022,7 +1022,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             &session_request_id,
             forwarded_headers.clone(),
         );
-        let mut current_payload = payload_clone;
+        let mut current_payload = payload;
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
         let mut flags = RelayFlags {
             first_iteration: true,
@@ -1553,6 +1553,93 @@ mod tests {
         assert_eq!(header, format!("http://***@127.0.0.1:{port}"));
     }
 
+    /// A header the upstream sent more than once reaches the client of a
+    /// streamed answer with every value, in order: the relay's copy of the
+    /// preserved headers appends a pair per value instead of keeping the last.
+    #[tokio::test]
+    async fn the_streamed_answer_keeps_every_value_of_a_repeated_upstream_header() {
+        use std::sync::Arc;
+
+        use axum::{
+            http::{
+                header::{CONTENT_TYPE, SET_COOKIE},
+                StatusCode,
+            },
+            response::AppendHeaders,
+            routing::any,
+            Router,
+        };
+        use openai_protocol::responses::ResponsesRequest;
+        use serde_json::json;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            openai::context::StorageHandles,
+            test_support::{http_client, StubWorker},
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("an address").port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub upstream answering one event stream; aborted at the test's end"
+        )]
+        let upstream = tokio::spawn(async move {
+            // `AppendHeaders`: the plain header array would insert and keep one cookie.
+            let app = Router::new().fallback(any(|| async {
+                (
+                    AppendHeaders([
+                        (CONTENT_TYPE, "text/event-stream"),
+                        (SET_COOKIE, "a=1"),
+                        (SET_COOKIE, "b=2"),
+                    ]),
+                    "event: response.completed\ndata: {}\n\n",
+                )
+            }));
+            axum::serve(listener, app).await.expect("the stub serves");
+        });
+        let worker_url = format!("http://127.0.0.1:{port}");
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("{worker_url}/v1/responses"),
+            payload: json!({}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::new(MemoryResponseStorage::new()),
+                conversation: Arc::new(MemoryConversationStorage::new()),
+                conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+                request_context: None,
+                tenant: None,
+            },
+        };
+
+        let response = handle_simple_streaming_passthrough(
+            &http_client(),
+            &StubWorker::at(&worker_url),
+            None,
+            req,
+        )
+        .await;
+        upstream.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("an ascii cookie"))
+            .collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+    }
+
     /// The relay's inputs: a stream of chunks, one SSE block per chunk.
     fn chunks(blocks: &[&str]) -> impl Stream<Item = reqwest::Result<Bytes>> + Unpin {
         let frames: Vec<reqwest::Result<Bytes>> = blocks
@@ -1836,5 +1923,140 @@ mod tests {
         assert!(text.contains("event: response.completed\n"), "{text}");
         assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
         upstream.abort();
+    }
+
+    /// The streaming MCP relay hands its request payload to the loop it
+    /// spawns instead of copying it: what the call itself allocates before
+    /// the loop runs a single turn (the task, the channel, the loop's own
+    /// state) does not grow with the request body, where a copy of the whole
+    /// JSON tree would grow with it byte for byte. The stub upstream's
+    /// received body is the one serialization the turn needs, as before. The
+    /// counts are printed for the Numbers table.
+    #[tokio::test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the exchange's allocation counts, read from the test's output by the measurement of the relay"
+    )]
+    async fn a_streaming_mcp_request_hands_its_payload_to_the_loop_without_a_copy() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::{
+            extract::Request,
+            http::{header::CONTENT_TYPE, StatusCode},
+            routing::any,
+            Router,
+        };
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+        use smg_mcp::McpConfig;
+
+        use crate::{
+            openai::context::StorageHandles,
+            openai_bridge::FormatRegistry,
+            test_support::{counting_alloc, http_client},
+        };
+
+        let orchestrator = Arc::new(
+            McpOrchestrator::new(McpConfig::default())
+                .await
+                .expect("an orchestrator with no servers"),
+        );
+        let client = http_client();
+        let answer = [CREATED, IN_PROGRESS, COMPLETED].join("\n\n") + "\n\n";
+
+        // (input length, body length, bytes the call allocated) per request.
+        let mut by_the_call = Vec::new();
+        for input_len in [2usize, 64 * 1024] {
+            let input = "x".repeat(input_len);
+            let payload = json!({"model": "m", "input": input, "stream": true});
+            let body_len = serde_json::to_vec(&payload).expect("the body").len();
+            let request: ResponsesRequest =
+                serde_json::from_value(payload.clone()).expect("a request");
+
+            // The stub keeps the body of the one request it answers.
+            let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a listener");
+            let port = listener.local_addr().expect("an address").port();
+            let (bodies, answer) = (Arc::clone(&received), answer.clone());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test stub upstream answering one event stream per request; aborted at the test's end"
+            )]
+            let upstream = tokio::spawn(async move {
+                let app = Router::new().fallback(any(move |req: Request| {
+                    let (bodies, answer) = (Arc::clone(&bodies), answer.clone());
+                    async move {
+                        let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                            .await
+                            .expect("the request body");
+                        bodies.lock().expect("the bodies").push(body.to_vec());
+                        ([(CONTENT_TYPE, "text/event-stream")], answer)
+                    }
+                }));
+                axum::serve(listener, app).await.expect("the stub serves");
+            });
+            let req = StreamingRequest {
+                url: format!("http://127.0.0.1:{port}/v1/responses"),
+                payload,
+                original_body: request,
+                previous_response_id: None,
+                existing_mcp_list_tools_labels: Vec::new(),
+                storage: StorageHandles {
+                    response: Arc::new(MemoryResponseStorage::new()),
+                    conversation: Arc::new(MemoryConversationStorage::new()),
+                    conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+                    request_context: None,
+                    tenant: None,
+                },
+            };
+
+            // The call spawns the loop and returns; on this current-thread
+            // runtime the loop has not run yet, so the counters move only by
+            // what the call itself allocated.
+            let (calls_before, bytes_before) = (counting_alloc::calls(), counting_alloc::bytes());
+            let response = handle_streaming_with_tool_interception(
+                &client,
+                None,
+                None,
+                req,
+                &orchestrator,
+                FormatRegistry::new(),
+                Vec::new(),
+            );
+            let bytes_by_the_call = counting_alloc::bytes() - bytes_before;
+            assert_eq!(response.status(), StatusCode::OK);
+            let stream = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the stream to its end");
+            let (exchange_calls, exchange_bytes) = (
+                counting_alloc::calls() - calls_before,
+                counting_alloc::bytes() - bytes_before,
+            );
+            upstream.abort();
+
+            eprintln!(
+                "input {input_len} bytes (body {body_len} bytes): the call allocated {bytes_by_the_call} bytes before the loop ran; the exchange {exchange_calls} allocation calls, {exchange_bytes} bytes"
+            );
+            let stream = String::from_utf8(stream.to_vec()).expect("utf-8");
+            assert!(stream.ends_with("data: [DONE]\n\n"), "{stream}");
+            let bodies = received.lock().expect("the bodies");
+            assert_eq!(bodies.len(), 1, "one turn, one upstream request");
+            let on_the_wire: Value = serde_json::from_slice(&bodies[0]).expect("the body is JSON");
+            assert_eq!(on_the_wire["input"].as_str().map(str::len), Some(input_len));
+            assert_eq!(on_the_wire["model"], json!("m"));
+            by_the_call.push((input_len, body_len, bytes_by_the_call));
+        }
+
+        let [(_, _, small), (_, large_body, large)] = by_the_call[..] else {
+            panic!("two requests measured, {by_the_call:?}");
+        };
+        let growth = large.saturating_sub(small);
+        assert!(
+            growth * 4 < large_body,
+            "the call's allocation grew by {growth} bytes for a {large_body}-byte body (small request {small} bytes, large {large}): the payload was copied, not moved"
+        );
     }
 }
