@@ -156,6 +156,52 @@ async fn a_loaded_tokenizer_keeps_its_answer_shape() {
     assert_eq!(info.id, "tokenizer-id");
 }
 
+/// `POST /v1/tokenize` answers the model's context window as SGLang's
+/// `/tokenize` does, `max_model_len`: -1 while no worker serves the model,
+/// then the smallest window a worker of the model reports.
+#[tokio::test]
+async fn tokenize_answers_the_models_context_window() {
+    let (app, context) = app_and_context_with_a_loaded_tokenizer().await;
+    let body = format!(r#"{{"model":"{LOADED}","prompt":"hi"}}"#);
+    let max_model_len = |text: &str| -> i64 {
+        let answer: TokenizeResponse = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("not a TokenizeResponse ({e}): {text}"));
+        answer.max_model_len
+    };
+
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        max_model_len(&text),
+        -1,
+        "no worker serves the model: {text}"
+    );
+
+    for (url, window) in [
+        ("http://tokenize-wide.invalid:8000", 32768),
+        ("http://tokenize-narrow.invalid:8000", 8192),
+    ] {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .models(vec![ModelCard::new(LOADED).with_context_length(window)])
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        context.worker_registry.register(worker);
+    }
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        max_model_len(&text),
+        8192,
+        "the smallest window of the model's workers: {text}"
+    );
+}
+
 /// `POST /v1/tokenize` and `/v1/detokenize` by an alias answer as by the
 /// model the alias names, the way the chat route and the model card read it;
 /// a name no worker carries is a `404 model_not_found` in the public envelope.

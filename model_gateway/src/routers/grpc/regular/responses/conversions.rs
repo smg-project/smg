@@ -1278,6 +1278,9 @@ mod tests {
             reasoning: Some(ResponseReasoningParam {
                 effort: Some(ReasoningEffort::High),
                 summary: None,
+                mode: None,
+                context: None,
+                generate_summary: None,
             }),
             ..Default::default()
         };
@@ -1302,6 +1305,9 @@ mod tests {
                 reasoning: Some(ResponseReasoningParam {
                     effort: Some(effort),
                     summary: None,
+                    mode: None,
+                    context: None,
+                    generate_summary: None,
                 }),
                 ..Default::default()
             };
