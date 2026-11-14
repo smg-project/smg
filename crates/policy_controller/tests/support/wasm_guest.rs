@@ -35,6 +35,8 @@ pub mod mode {
     pub const PICK_FILTERED_OUT: u8 = 7;
     /// `pick` declines.
     pub const DECLINE_PICK: u8 = 8;
+    /// `score` declines as not applicable.
+    pub const DECLINE_SCORE: u8 = 25;
     /// `filter` names a position twice.
     pub const FILTER_DUPLICATE: u8 = 9;
     /// `filter` grows the linear memory by 32 MiB first.
@@ -431,6 +433,11 @@ fn guest_wat(guest: Guest) -> String {
           (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
           (br $fill))))
     (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
+    (if (i32.eq (global.get $mode) (i32.const {decline_score}))
+      (then
+        (i32.store8 (local.get $r) (i32.const 1))
+        (i32.store8 offset=4 (local.get $r) (i32.const 0))
+        (return (local.get $r))))
     (local.set $out (call $alloc (i32.mul (local.get $len) (i32.const 4)) (i32.const 4)))
     (local.set $i (i32.const 0))
     (block $done
@@ -531,6 +538,7 @@ fn guest_wat(guest: Guest) -> String {
         grow = mode::GROW_32_MIB,
         spin = mode::SPIN_IN_SCORE,
         nan_score = mode::NAN_SCORE,
+        decline_score = mode::DECLINE_SCORE,
         decline_pick = mode::DECLINE_PICK,
         pick_filtered_out = mode::PICK_FILTERED_OUT,
         burn = mode::BURN_IN_STAGES,

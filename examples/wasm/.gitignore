@@ -5,6 +5,9 @@ target/
 # Cargo lock files (examples don't need locked dependencies)
 Cargo.lock
 **/Cargo.lock
+# The policy guest is the exception: CI builds it with the tests of the
+# policy crate, so its dependencies are pinned.
+!wasm-guest-policy/Cargo.lock
 
 # Generated WASM files
 *.wasm

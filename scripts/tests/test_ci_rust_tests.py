@@ -244,6 +244,44 @@ class ShardTableTests(unittest.TestCase):
         ):
             self.assertFalse(filter_matches(filters["rust-gateway"], path), path)
 
+    def test_the_kv_shard_builds_the_example_policy_plugin_and_requires_it(self):
+        # The policy crate's tests load the example plugin as its own build
+        # line wrote it: the shard that runs them builds it first, requires
+        # it, and runs on a change to the example or to the tool's installer.
+        row = next(r for r in shard_table() if r["shard"] == "kv")
+        self.assertEqual(row["needs"], "policy-guest")
+        workflow = WORKFLOW.read_text()
+        # The step: the pinned tool, the line a user runs, then, inside the
+        # guest's directory, the repository's formatter (nightly) and the
+        # pinned clippy, which the workspace's own runs do not reach.
+        step = workflow.split("- name: Build the example policy plugin", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        for line in (
+            "bash scripts/ci_install_wasm_tools.sh",
+            "bash examples/wasm/wasm-guest-policy/build.sh",
+            "cd examples/wasm/wasm-guest-policy",
+            "rustup toolchain install nightly --profile minimal --component rustfmt",
+            "cargo +nightly fmt -- --check",
+            "cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings",
+        ):
+            self.assertIn(line, step)
+        self.assertIn(
+            "SMG_REQUIRE_POLICY_GUEST: ${{ contains(matrix.needs, 'policy-guest') && '1' || '' }}",
+            workflow,
+        )
+        filters = path_filters()
+        for path in (
+            "examples/wasm/wasm-guest-policy/src/lib.rs",
+            "examples/wasm/wasm-guest-policy/Cargo.lock",
+            "examples/wasm/wasm-guest-policy/build.sh",
+            "scripts/ci_install_wasm_tools.sh",
+        ):
+            self.assertTrue(filter_matches(filters["rust-kv"], path), path)
+        # The other guests are the agentic shard's: they do not run this one.
+        self.assertFalse(
+            filter_matches(filters["rust-kv"], "examples/wasm/wasm-guest-storage-hook/src/lib.rs")
+        )
+
     def test_every_shard_has_a_filter_and_setup_flags_the_workflow_knows(self):
         filters = path_filters()
         workflow = WORKFLOW.read_text()

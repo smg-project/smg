@@ -7,7 +7,9 @@
 //! (`smg:policy/policy-packed`, the view as the bytes of the WIT's layout
 //! table); the host reads which from its exports. The host accepts
 //! `smg:policy@1.x` up to [`Abi::SUPPORTED_MINOR`] and a spec may pin the
-//! version.
+//! version. `examples/wasm/wasm-guest-policy` is a record-world module to
+//! copy, with its build line; `tests/wasm_example.rs` loads what that line
+//! builds.
 //!
 //! The sandbox: no WASI. A component importing any `wasi:` interface, or
 //! anything but `smg:policy/host`, is refused at load. The host lends four
