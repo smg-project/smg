@@ -28,6 +28,8 @@ use std::{
     sync::{Arc, LazyLock, OnceLock},
 };
 
+use rustc_hash::FxBuildHasher;
+
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
     gemma4, glm, glm4, hy4, hy_v3, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5,
@@ -301,15 +303,16 @@ include!(concat!(env!("OUT_DIR"), "/groups.rs"));
 /// regard to ASCII case ([`Caseless`]): worked out once, since a request looks its model up more
 /// than once, and read in constant time whatever the registry's size; a name two groups spell
 /// keeps the first in the registry's order, as the scan it replaces did.
-static REPOSITORIES: LazyLock<HashMap<Caseless<'static>, usize>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    for (index, group) in GROUPS.iter().enumerate() {
-        for own in group.repositories() {
-            map.entry(Caseless(own)).or_insert(index);
+static REPOSITORIES: LazyLock<HashMap<Caseless<'static>, usize, FxBuildHasher>> =
+    LazyLock::new(|| {
+        let mut map = HashMap::with_hasher(FxBuildHasher);
+        for (index, group) in GROUPS.iter().enumerate() {
+            for own in group.repositories() {
+                map.entry(Caseless(own)).or_insert(index);
+            }
         }
-    }
-    map
-});
+        map
+    });
 
 /// A repository name as a map key, equal to another spelled in any ASCII case: hashed over its
 /// ASCII-lowercased bytes, compared with `eq_ignore_ascii_case`.
@@ -350,7 +353,7 @@ fn group_for(model: &str) -> Option<(usize, &'static Group)> {
     if repository.is_empty() {
         return None;
     }
-    let repositories: &HashMap<Caseless<'_>, usize> = &REPOSITORIES;
+    let repositories: &HashMap<Caseless<'_>, usize, FxBuildHasher> = &REPOSITORIES;
     repositories
         .get(&Caseless(repository))
         .map(|&index| (index, &GROUPS[index]))

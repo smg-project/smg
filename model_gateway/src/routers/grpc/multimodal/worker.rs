@@ -775,7 +775,7 @@ impl WorkerMediaPipeline {
     pub async fn process(
         &self,
         prompt_token_ids: Vec<u32>,
-        items: &[WorkerMediaItem],
+        items: Vec<WorkerMediaItem>,
         want_identity: bool,
     ) -> Result<WorkerMediaOutput, WorkerMediaError> {
         let output = self
@@ -804,7 +804,7 @@ impl WorkerMediaPipeline {
     pub async fn process_sglang(
         &self,
         prompt_token_ids: Vec<u32>,
-        items: &[WorkerMediaItem],
+        items: Vec<WorkerMediaItem>,
     ) -> Result<
         (
             Vec<u32>,
@@ -832,7 +832,7 @@ impl WorkerMediaPipeline {
     async fn process_inputs(
         &self,
         prompt_token_ids: Vec<u32>,
-        items: &[WorkerMediaItem],
+        items: Vec<WorkerMediaItem>,
         runtime: RuntimeType,
     ) -> Result<super::MultimodalOutput, WorkerMediaError> {
         if items.is_empty() {
@@ -840,9 +840,9 @@ impl WorkerMediaPipeline {
                 "media_refs is set but carries no items".to_string(),
             ));
         }
-        check_item_counts(items, &self.item_limits)?;
+        check_item_counts(&items, &self.item_limits)?;
         let parts = items
-            .iter()
+            .into_iter()
             .enumerate()
             .map(|(index, item)| self.part(index, item))
             .collect::<Result<Vec<_>, _>>()?;
@@ -900,7 +900,7 @@ impl WorkerMediaPipeline {
     fn part(
         &self,
         index: usize,
-        item: &WorkerMediaItem,
+        item: WorkerMediaItem,
     ) -> Result<MediaContentPart, WorkerMediaError> {
         let scheme = item
             .url
@@ -922,13 +922,13 @@ impl WorkerMediaPipeline {
         }
         Ok(match item.modality {
             Modality::Image => MediaContentPart::ImageUrl {
-                url: item.url.clone(),
+                url: Arc::new(item.url),
                 detail: None,
                 max_long_side_pixel: None,
                 uuid: None,
             },
             Modality::Video => MediaContentPart::VideoUrl {
-                url: item.url.clone(),
+                url: Arc::new(item.url),
                 uuid: None,
                 fps: None,
                 max_long_side_pixel: None,
@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(pipeline.encoder_budget(), Some(192_000));
 
         let error = pipeline
-            .process(vec![1, 2, 3], &image_items(9), false)
+            .process(vec![1, 2, 3], image_items(9), false)
             .await
             .unwrap_err();
         assert!(
@@ -1262,7 +1262,7 @@ mod tests {
         // Within the limit the request reaches the pipeline proper (which the
         // mock tokenizer, lacking the placeholder token, then refuses).
         let error = pipeline
-            .process(vec![1, 2, 3], &image_items(1), false)
+            .process(vec![1, 2, 3], image_items(1), false)
             .await
             .unwrap_err();
         assert!(!error.to_string().contains("limit of"), "{error}");
@@ -1295,7 +1295,7 @@ mod tests {
             ..pipeline_settings(&path)
         };
         let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
-        let items = vec![WorkerMediaItem {
+        let items = [WorkerMediaItem {
             modality: Modality::Image,
             url: PIXEL.to_string(),
         }];
@@ -1304,7 +1304,7 @@ mod tests {
             .await
             .unwrap();
         let error = pipeline
-            .process(vec![1, 32000, 2], &items, false)
+            .process(vec![1, 32000, 2], items.to_vec(), false)
             .await
             .unwrap_err();
         assert!(
@@ -1321,7 +1321,7 @@ mod tests {
             .await
             .unwrap();
         let output = pipeline
-            .process(vec![1, 32000, 2], &items, false)
+            .process(vec![1, 32000, 2], items.to_vec(), false)
             .await
             .unwrap();
         assert_eq!(output.prompt_token_ids.len(), 2 + 576);
@@ -1335,7 +1335,7 @@ mod tests {
         );
         assert_eq!(output.batches.len(), 1);
         let (tokens, sglang, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap();
         assert_eq!(tokens, output.prompt_token_ids);
@@ -1358,10 +1358,10 @@ mod tests {
         );
         // PIXEL stores half-transparent blue. SGLang drops alpha, so its
         // tensor must equal opaque blue, while vLLM composites it over white.
-        let mut opaque = items.clone();
+        let mut opaque = items.to_vec();
         opaque[0].url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC".into();
         let (_, opaque_sglang, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &opaque)
+            .process_sglang(vec![1, 32000, 2], opaque.clone())
             .await
             .unwrap();
         let pixels = &sglang.pixel_values.as_ref().unwrap().data;
@@ -1483,12 +1483,12 @@ mod tests {
             ),
         }];
         let (float_tokens, float, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap();
         pipeline.assembly.encoder_dtype = "bfloat16".into();
         let (bf_tokens, bf, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap();
         assert_eq!(float_tokens, bf_tokens);
@@ -1514,7 +1514,7 @@ mod tests {
         }
         pipeline.assembly.encoder_dtype = "int8".into();
         assert!(pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap_err()
             .to_string()
@@ -1538,7 +1538,7 @@ mod tests {
         .await;
         let items = [blank_png_item()];
         let output = pipeline
-            .process(vec![1, 32000, 2], &items, true)
+            .process(vec![1, 32000, 2], items.to_vec(), true)
             .await
             .unwrap();
         let batch = &output.batches[0];
@@ -1570,7 +1570,7 @@ mod tests {
         assert!(stripped.flat_keys.is_empty());
 
         let output = pipeline
-            .process(vec![1, 32000, 2], &items, false)
+            .process(vec![1, 32000, 2], items.to_vec(), false)
             .await
             .unwrap();
         assert!(output.identity.is_none());
@@ -1595,11 +1595,11 @@ mod tests {
             let video_first = prompt[1] == 32003;
             let items = [image.clone(), image.clone(), video.clone()];
             let (tokens, mm, extras) = pipeline
-                .process_sglang(prompt.clone(), &items)
+                .process_sglang(prompt.clone(), items.to_vec())
                 .await
                 .unwrap();
             let expected = pipeline
-                .process_inputs(prompt, &items, RuntimeType::Sglang)
+                .process_inputs(prompt, items.to_vec(), RuntimeType::Sglang)
                 .await
                 .unwrap();
             assert_eq!(tokens, expected.expanded_token_ids);
@@ -1648,11 +1648,11 @@ mod tests {
         let (_dir, pipeline) = glm_video_test_pipeline().await;
         let items = [testsrc_video_item()];
         let (tokens, sglang, _) = pipeline
-            .process_sglang(vec![1, 32003, 2], &items)
+            .process_sglang(vec![1, 32003, 2], items.to_vec())
             .await
             .unwrap();
         let vllm = pipeline
-            .process(vec![1, 32003, 2], &items, false)
+            .process(vec![1, 32003, 2], items.to_vec(), false)
             .await
             .unwrap();
         assert_eq!(tokens, vllm.prompt_token_ids);
@@ -1708,7 +1708,7 @@ mod tests {
         let (_dir, pipeline) = glm_video_test_pipeline().await;
         let items = [blank_png_item(), testsrc_video_item()];
         let output = pipeline
-            .process(vec![1, 32000, 2, 32003, 2], &items, true)
+            .process(vec![1, 32000, 2, 32003, 2], items.to_vec(), true)
             .await
             .unwrap();
         assert_eq!(output.batches.len(), 2, "one batch per modality");
@@ -1877,7 +1877,7 @@ mod tests {
                 ),
             };
             let output = pipeline
-                .process(vec![1, 32000, 2], std::slice::from_ref(&item), false)
+                .process(vec![1, 32000, 2], vec![item.clone()], false)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1895,7 +1895,7 @@ mod tests {
             // The router also accepts a non-grid request cap, before handing
             // the aligned dimensions to the same cached image processor.
             let plan = MediaPlan::new(vec![MediaContentPart::ImageUrl {
-                url: item.url,
+                url: item.url.into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: Some(1000),
@@ -1956,12 +1956,12 @@ mod tests {
             "data:image/png;base64,AAAAAAAA",
             "DATA:image/png;base64,AAAAAAAA",
         ] {
-            let items = vec![WorkerMediaItem {
+            let items = [WorkerMediaItem {
                 modality: Modality::Image,
                 url: url.to_string(),
             }];
             let error = pipeline
-                .process(vec![1, 2, 3], &items, false)
+                .process(vec![1, 2, 3], items.to_vec(), false)
                 .await
                 .unwrap_err();
             assert!(
@@ -2154,7 +2154,7 @@ mod tests {
                 ),
             };
             let (ids, mm, _) = pipeline
-                .process_sglang(vec![1, 32000, 2], &[item])
+                .process_sglang(vec![1, 32000, 2], vec![item])
                 .await
                 .unwrap();
             assert_eq!(ids.iter().filter(|&&id| id == 32000).count(), tokens);

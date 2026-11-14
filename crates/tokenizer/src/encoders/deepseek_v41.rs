@@ -93,7 +93,7 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // `thinking: false` (or the engine's `enable_thinking` alias, see the
     // capabilities) turns it off.
     thinking_toggle: ThinkingToggle::DefaultOn,
-    thinking_key_name: ThinkingKeyName::Thinking,
+    thinking_key_name: Some(ThinkingKeyName::Thinking),
     native_effort_values: NATIVE_EFFORT_VALUES,
     // Switches off on the protocol's `none` / `minimal`: no words of its own.
     native_effort_off_values: &[],
