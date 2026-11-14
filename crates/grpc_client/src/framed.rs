@@ -100,19 +100,26 @@ impl Frames {
     /// The one frame of a message none of whose payloads rides as a frame
     /// of its own: the prefix reserved, the message written once, the
     /// length taken from the buffer, as the crate's codec writes a plain
-    /// request: no walk over the message's length before the write, the
-    /// buffer reserved to that length first only when `reserve` says the
-    /// message carries media (the codec's own rule), else started at tonic's
-    /// eager size, so a plain request grows it no more than the codec's
-    /// buffer grows.
-    fn whole<M: Message>(message: &M, reserve: bool) -> Result<Vec<Bytes>, Status> {
-        let mut scratch = if reserve {
+    /// request. A text-only request that carries a prompt goes through the
+    /// codec's one-pass writer, as the codec writes it, with this frame as
+    /// the buffer: the writer reserves the frame's length for one walk of
+    /// the request's other fields. A message the writer's entry refuses is
+    /// prost's one write, with no walk over its length before it unless it
+    /// carries media: then the buffer is reserved to that length first (the
+    /// codec's own rule, [`reserves_for`]); else it starts at tonic's eager
+    /// size, so a plain request grows it no more than the codec's buffer
+    /// grows. The message is consumed: the writer takes its request id and
+    /// its prompt out of it.
+    fn whole<M: Message + 'static>(mut message: M) -> Result<Vec<Bytes>, Status> {
+        let mut scratch = if reserves_for(&message) {
             BytesMut::with_capacity(PREFIX_BYTES + message.encoded_len())
         } else {
             BytesMut::with_capacity(EAGER_BUFFER_BYTES)
         };
         scratch.put_bytes(0, PREFIX_BYTES);
-        message.encode_raw(&mut scratch);
+        if !crate::codec::encode_prompt_carrier(&mut message, &mut scratch) {
+            message.encode_raw(&mut scratch);
+        }
         let prefix = prefix_of(scratch.len() - PREFIX_BYTES)?;
         scratch[1..PREFIX_BYTES].copy_from_slice(&prefix.to_be_bytes());
         Ok(vec![scratch.freeze()])
@@ -195,7 +202,7 @@ pub(crate) fn tokenspeed_frames(req: ts::GenerateRequest) -> Result<Vec<Bytes>, 
         .as_ref()
         .map_or(0, |mm| mm.items.iter().filter_map(framed_payload_len).sum());
     if framed_bytes == 0 {
-        return Frames::whole(&req, reserves_for(&req));
+        return Frames::whole(req);
     }
     let mut out = Frames::for_message(req.encoded_len(), framed_bytes)?;
     let mm_len = req.mm_inputs.as_ref().map_or(0, Message::encoded_len);
@@ -343,7 +350,7 @@ pub(crate) fn vllm_frames(req: vllm::GenerateRequest) -> Result<Vec<Bytes>, Stat
             .map(framed_inputs_len)
             .sum::<usize>();
     if framed_bytes == 0 {
-        return Frames::whole(&req, reserves_for(&req));
+        return Frames::whole(req);
     }
     let mut out = Frames::for_message(req.encoded_len(), framed_bytes)?;
     // Every field named, so a field added to the message is a compile error
@@ -506,7 +513,7 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
             .map(sglang_framed_inputs_len)
             .sum::<usize>();
     if framed_bytes == 0 {
-        return Frames::whole(&req, reserves_for(&req));
+        return Frames::whole(req);
     }
     let mut out = Frames::for_message(req.encoded_len(), framed_bytes)?;
     // Every field named, so a field added to the message is a compile error
@@ -961,6 +968,65 @@ mod tests {
         assert_identical(&plain, &frames);
     }
 
+    /// A tokenized prompt: ids across the varint widths and the rendered text.
+    fn prompt() -> ts::TokenizedInput {
+        ts::TokenizedInput {
+            input_ids: (0..1_114u32)
+                .map(|i| i.wrapping_mul(2_654_435_761) % 150_000 + 10)
+                .collect(),
+            original_text: "a rendered conversation ".repeat(175),
+        }
+    }
+
+    /// A text-only request that carries a prompt is one frame of prost's
+    /// bytes, written by the codec's one-pass writer: on a fresh thread the
+    /// writer's scratch holds its packed ids afterwards.
+    #[test]
+    fn a_text_only_prompt_is_one_frame_through_the_one_pass_writer() {
+        std::thread::spawn(|| {
+            let req = ts::GenerateRequest {
+                request_id: "chatcmpl-0123456789abcdef".into(),
+                tokenized: Some(prompt()),
+                sampling_params: Some(ts::SamplingParams::default()),
+                stream: true,
+                ..Default::default()
+            };
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
+            assert_identical(&req, &frames);
+            let ids = crate::codec::scratch_capacity();
+            assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
+        })
+        .join()
+        .expect("the text-only pin holds");
+    }
+
+    /// A request with media never reaches the one-pass writer, whatever
+    /// carries the media: a payload that rides as a frame of its own, a small
+    /// payload inline in the one frame, a shared-memory handle. Each is
+    /// prost's bytes and the thread's scratch stays empty: the writer's entry
+    /// refused the request.
+    #[test]
+    fn a_request_with_media_never_reaches_the_one_pass_writer() {
+        std::thread::spawn(|| {
+            for items in [
+                vec![inline_item(1, CLASS_1080P)],
+                vec![inline_item(2, FRAME_MIN_BYTES - 1)],
+                vec![shm_item()],
+            ] {
+                let req = ts::GenerateRequest {
+                    tokenized: Some(prompt()),
+                    ..request(items)
+                };
+                assert_identical(&req, &frames_of(&req));
+            }
+            assert_eq!(crate::codec::scratch_capacity(), 0);
+        })
+        .join()
+        .expect("the media pin holds");
+    }
+
     fn trailers_only(status: &str, message: Option<&str>) -> http::Response<tonic::body::Body> {
         let mut response = http::Response::builder()
             .status(200)
@@ -1281,6 +1347,80 @@ mod tests {
             assert_identical(&plain, &frames);
         }
 
+        /// A tokenized prompt: ids across the varint widths and the rendered
+        /// text.
+        fn prompt() -> vllm::generate_request::Input {
+            vllm::generate_request::Input::Tokenized(vllm::TokenizedInput {
+                original_text: "a rendered conversation ".repeat(175),
+                input_ids: (0..1_114u32)
+                    .map(|i| i.wrapping_mul(2_654_435_761) % 150_000 + 10)
+                    .collect(),
+            })
+        }
+
+        /// A text-only request that carries a prompt is one frame of prost's
+        /// bytes, written by the codec's one-pass writer: on a fresh thread
+        /// the writer's scratch holds its packed ids afterwards.
+        #[test]
+        fn a_text_only_prompt_is_one_frame_through_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let req = vllm::GenerateRequest {
+                    request_id: "chatcmpl-0123456789abcdef".into(),
+                    input: Some(prompt()),
+                    sampling_params: Some(vllm::SamplingParams::default()),
+                    stream: true,
+                    ..Default::default()
+                };
+                let frames = frames_of(&req);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
+                assert_identical(&req, &frames);
+                let ids = crate::codec::scratch_capacity();
+                assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
+            })
+            .join()
+            .expect("the text-only pin holds");
+        }
+
+        /// A request with media never reaches the one-pass writer, whatever
+        /// carries the media: a payload that rides as a frame of its own, a
+        /// small payload inline in the one frame, an extra media input, a
+        /// media reference. Each is prost's bytes and the thread's scratch
+        /// stays empty: the writer's entry refused the request.
+        #[test]
+        fn a_request_with_media_never_reaches_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let extra = vllm::GenerateRequest {
+                    extra_mm_inputs: vec![inputs(Some(inline_tensor(3, CLASS_1080P)), [])],
+                    ..Default::default()
+                };
+                let reference = vllm::GenerateRequest {
+                    media_refs: Some(vllm::MediaRefs {
+                        items: vec![vllm::MediaRef {
+                            modality: 1,
+                            url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                        }],
+                    }),
+                    ..Default::default()
+                };
+                for media in [
+                    request(inputs(Some(inline_tensor(1, CLASS_1080P)), [])),
+                    request(inputs(Some(inline_tensor(2, FRAME_MIN_BYTES - 1)), [])),
+                    extra,
+                    reference,
+                ] {
+                    let req = vllm::GenerateRequest {
+                        input: Some(prompt()),
+                        ..media
+                    };
+                    assert_identical(&req, &frames_of(&req));
+                }
+                assert_eq!(crate::codec::scratch_capacity(), 0);
+            })
+            .join()
+            .expect("the media pin holds");
+        }
+
         #[test]
         fn the_largest_tensor_class_is_one_frame_of_its_own() {
             let req = request(inputs(Some(inline_tensor(5, CLASS_4K)), []));
@@ -1559,6 +1699,82 @@ mod tests {
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].len(), PREFIX_BYTES + plain.encoded_len());
             assert_identical(&plain, &frames);
+        }
+
+        /// A tokenized prompt: ids across the varint widths and the rendered
+        /// text.
+        fn prompt() -> sg::TokenizedInput {
+            sg::TokenizedInput {
+                original_text: "a rendered conversation ".repeat(175),
+                input_ids: (0..1_114u32)
+                    .map(|i| i.wrapping_mul(2_654_435_761) % 150_000 + 10)
+                    .collect(),
+            }
+        }
+
+        /// A text-only request that carries a prompt is one frame of prost's
+        /// bytes, written by the codec's one-pass writer: on a fresh thread
+        /// the writer's scratch holds its packed ids afterwards.
+        #[test]
+        fn a_text_only_prompt_is_one_frame_through_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let req = sg::GenerateRequest {
+                    request_id: "chatcmpl-0123456789abcdef".into(),
+                    tokenized: Some(prompt()),
+                    sampling_params: Some(sg::SamplingParams::default()),
+                    stream: true,
+                    ..Default::default()
+                };
+                let frames = frames_of(&req);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
+                assert_identical(&req, &frames);
+                let ids = crate::codec::scratch_capacity();
+                assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
+            })
+            .join()
+            .expect("the text-only pin holds");
+        }
+
+        /// A request with media never reaches the one-pass writer, whatever
+        /// carries the media: a payload that rides as a frame of its own, a
+        /// small payload inline in the one frame, an extra media input of
+        /// either size, raw media bytes, a media reference. Each is prost's
+        /// bytes and the thread's scratch stays empty: the writer's entry
+        /// refused the request.
+        #[test]
+        fn a_request_with_media_never_reaches_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let extra_framed = sg::GenerateRequest {
+                    extra_mm_inputs: vec![inputs(Some(inline_tensor(3, CLASS_1080P)), [])],
+                    ..Default::default()
+                };
+                let extra_inline = sg::GenerateRequest {
+                    extra_mm_inputs: vec![inputs(Some(inline_tensor(4, 16)), [])],
+                    ..Default::default()
+                };
+                let mut raw = inputs(None, []);
+                raw.image_data = vec![vec![9; 1024]];
+                let mut reference = inputs(None, []);
+                reference.image_urls = vec!["data:image/png;base64,iVBORw0KGgo=".into()];
+                for media in [
+                    request(inputs(Some(inline_tensor(1, CLASS_1080P)), [])),
+                    request(inputs(Some(inline_tensor(2, FRAME_MIN_BYTES - 1)), [])),
+                    extra_framed,
+                    extra_inline,
+                    request(raw),
+                    request(reference),
+                ] {
+                    let req = sg::GenerateRequest {
+                        tokenized: Some(prompt()),
+                        ..media
+                    };
+                    assert_identical(&req, &frames_of(&req));
+                }
+                assert_eq!(crate::codec::scratch_capacity(), 0);
+            })
+            .join()
+            .expect("the media pin holds");
         }
 
         #[test]

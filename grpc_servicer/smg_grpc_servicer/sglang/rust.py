@@ -91,6 +91,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
 )
 from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.lora import PreloadedLoras
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, media_warmup, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
@@ -233,6 +234,11 @@ def server_facts(server_args: Any, model_config: Any | None = None) -> dict[str,
         from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
 
         args_dict["multimodal_encoder_dtype"] = encoder_dtype(None, lambda: model_config.dtype)
+    # LoRARef is an array-like msgspec struct; generic stringification loses
+    # the IDs the scheduler loaded. Preserve its resolved fields explicitly.
+    loras = PreloadedLoras(server_args)
+    args_dict["enable_lora"] = loras.enabled
+    args_dict["lora_paths"] = loras.adapters
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol

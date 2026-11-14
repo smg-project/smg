@@ -54,7 +54,7 @@ async fn image_data_url_tracker() {
             for index in 0..count {
                 tracker
                     .push_part(MediaContentPart::ImageUrl {
-                        url: urls[index % unique].clone(),
+                        url: urls[index % unique].clone().into(),
                         detail: None,
                         uuid: None,
                         max_long_side_pixel: None,
