@@ -215,6 +215,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
   its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
   declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- The preview web search tool takes the public API's dated type, `web_search_preview_2025_03_11`,
+  written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
+  refused a request declaring either, as an unknown tool type or field. Breaking:
+  `WebSearchPreviewTool` gains `search_content_types: Option<Vec<String>>`.
 - `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
   an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
   member of another kind than the first is refused by its index), and `EmbeddingRequest` the
