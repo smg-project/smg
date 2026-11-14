@@ -94,6 +94,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `/generate` request's `bootstrap_room` takes a 63-bit room id, as SGLang's PD contract types
+  it (int64): rooms are drawn from `[0, 2^63 - 1]`, so nearly every real one was refused as past
+  `i32`. Breaking: `GenerateRequest.bootstrap_room` is an `Option<i64>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
