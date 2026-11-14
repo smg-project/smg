@@ -140,9 +140,26 @@ enum Stage {
 // --- The view: RequestFacts, Candidate, LoadRow, Constraints, PoolFacts -----
 
 // A tenant or a session key: the gateway fills `plain`, a plugin receives
-// `hash` unless its exposure says `plain`, nothing under `none`. The hash is
-// 64-bit FNV-1a over the key's bytes (offset basis 0xcbf29ce484222325, prime
-// 0x100000001b3, a zero result mapped to 1), the lease and pin keys' form.
+// `hash` unless its exposure says `plain`, nothing under `none`. A key's
+// fingerprint is 64-bit FNV-1a over the key's bytes (offset basis
+// 0xcbf29ce484222325, prime 0x100000001b3, a zero result mapped to 1). A
+// tenant's `hash` is its key's fingerprint. A session key's `hash` is the
+// session's value: the key within the request's model and phase, the number
+// a lease's `session_key`, a pin's `key` and a session row's `key` carry.
+//
+// The session's value, in wrapping 64-bit arithmetic, from the key's
+// fingerprint k, the fingerprint m of the model's name (the bytes of
+// `RequestFacts.model`, a name of no bytes included) and the request's
+// `Phase` number p (single 1, prefill 2, decode 3, encode 4):
+//   s = k ^ ((m ^ (p * 0x9e3779b97f4a7c15)) * 0x9e3779b97f4a7c15)
+//   s = (s ^ (s >> 30)) * 0xbf58476d1ce4e5b9
+//   s = (s ^ (s >> 27)) * 0x94d049bb133111eb
+//   s = s ^ (s >> 31), a zero result mapped to 1; 0 is no session
+// The key "conversation-7" (k = 0xd4499eccc7402a12) under the model
+// "model-a" gives 0x6e88ff71cc982a42 single, 0x619fdbb0c2629a55 prefill,
+// 0x3e92fbbd183df4b6 decode and 0x3780ba54336a57d0 encode. A plugin that
+// receives the key in `plain` and matches a lease to it makes the value by
+// this formula.
 message Identity {
   oneof form {
     fixed64 hash = 1;
@@ -161,6 +178,8 @@ message LoadRow {
   // The share of the KV cache the running requests hold.
   uint32 active_kv_permille = 5;  // u16
   uint32 live_rate = 6;  // tokens per second; 0 when unknown
+  // 0 when the engine holds none and when it does not count them: this
+  // version does not tell the two apart.
   uint32 resident_tokens = 7;
   // Age of the sample at the decision; the instant itself is host-only.
   uint32 report_age_ms = 8;
@@ -257,7 +276,8 @@ message RequestFacts {
   // Prefix block hashes, capped by `view.max_block_hashes`.
   repeated fixed64 block_hashes = 8 [packed = true];
   HashKind hash_kind = 9;
-  // The routing key as the host derives it.
+  // The routing key as the host derives it; its `hash` form is the
+  // session's value (see Identity).
   Identity session_key = 10;
   Phase phase = 11;
   uint32 attempt = 12;  // u8; 0 for the first attempt
@@ -368,7 +388,9 @@ message Lease {
   // Which target of the pick this lease books.
   uint32 target_index = 4;  // u8
   uint64 generation = 5;
-  // Fingerprint of the session key, for the sticky cap; 0 when none.
+  // The request's session: its key within its model and phase, the value
+  // the request's session key carries in its hash form (see Identity); 0
+  // when none.
   fixed64 session_key = 6;
   // Token-work booked on the target.
   uint32 tokens = 7;

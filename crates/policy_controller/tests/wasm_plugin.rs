@@ -26,9 +26,9 @@ use smg_policy_controller::{
         Abi, Bound, BreakerSpec, Failure, LoadError, Plugin, PluginSpec, Reveal, Runtime,
         WasmFilter, WasmPicker, WasmScorer, World,
     },
-    Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Lease, Lifecycle, Needs,
-    PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scratch, ShedReason, Side, Target,
-    Weighted, WorkerId,
+    Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Identity, Lease, Lifecycle,
+    Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scratch, ShedReason, Side,
+    Target, Weighted, WorkerId,
 };
 use support::wasm_guest::{self as guest, canonical, counter, mode};
 use wit_component::{ComponentEncoder, StringEncoding};
@@ -1270,8 +1270,16 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
         withheld.view.session_key = Reveal::None;
         let withheld = Plugin::load(&runtime, withheld).expect("the guest loads");
         let hashed = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
+        // A lease carries a request's session, which the request's facts
+        // alone make.
+        let session = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(0xBEEF),
+            ..RequestFacts::default()
+        }
+        .session();
         let lease = Lease {
-            session_key: 0xBEEF,
+            session,
             ..Lease::default()
         };
         for plugin in [&withheld, &hashed] {
@@ -1284,8 +1292,8 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
         );
         assert_eq!(
             counter_value(&hashed, counter::OBSERVE_SESSION),
-            0xBEEF,
-            "{name}: the fingerprint, as in the request"
+            session.get(),
+            "{name}: the session's value, as in the request"
         );
     }
 }
