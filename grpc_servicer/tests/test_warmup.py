@@ -270,7 +270,7 @@ def test_a_prompt_never_exceeds_the_step_nor_the_context_less_its_output():
     assert max(lengths) == 999  # the context's bound stands in for the step
 
 
-# The window/step pairs the plans are built from on the test runs and the
+# The window/step pairs the plans are built from on the test lanes and the
 # fleet's recipes: an 8k context at the engine's default 8k step (the pair
 # that reached the context's edge), a 16k context at a 16k step, a long
 # context at a 16k step, a 4k chunk under a long context, a 1k chunk under an

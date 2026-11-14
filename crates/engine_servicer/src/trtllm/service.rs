@@ -16,7 +16,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, rpc, BoxStream};
+use crate::{kv_events, rpc, trace_context, BoxStream};
 
 /// What neither servicer serves: the engine's Python servicer does not
 /// implement `Embed`, and the wire carries no embedding request.
@@ -39,7 +39,7 @@ impl TrtllmService for TrtllmServicer {
         &self,
         request: Request<trt::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let trace_headers = crate::trace_context::trace_headers(request.metadata());
+        let trace_headers = trace_context::trace_headers(request.metadata());
         let stream = generate::generate(&self.state, request.into_inner(), trace_headers).await;
         rpc::generated(&self.state, stream)
     }

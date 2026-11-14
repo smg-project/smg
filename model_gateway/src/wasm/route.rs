@@ -11,7 +11,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Json, Path, State},
+    extract::{Json, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -24,7 +24,10 @@ use crate::{
         WasmMetrics, WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult,
         WasmModuleListResponse,
     },
-    worker::admin_json::{refusal, AdminJson},
+    worker::{
+        admin_json::{refusal, AdminJson},
+        admin_params::AdminPath,
+    },
     workflow::{
         job_queue::{Job, JobOutcomeError},
         WasmModuleConfigRequest,
@@ -102,9 +105,9 @@ pub(crate) async fn add_wasm_module(
     AuditResource::name(response, added.join(","))
 }
 
-pub async fn remove_wasm_module(
+pub(crate) async fn remove_wasm_module(
     State(state): State<Arc<AppState>>,
-    Path(module_uuid_str): Path<String>,
+    AdminPath(module_uuid_str): AdminPath<String>,
 ) -> Response {
     let Ok(module_uuid) = Uuid::parse_str(&module_uuid_str) else {
         return refusal(

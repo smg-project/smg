@@ -857,8 +857,6 @@ impl Default for MemoryResponseStorage {
 }
 
 impl InnerStore {
-    /// Puts `response` under its id (the index keeps one entry per id); a
-    /// new id joins the order at `now`, a replaced record keeps its place.
     /// Whether `held` is the record under its id: the same allocation, not an
     /// equal record, so a place the bounds dropped and another record took
     /// since is not it.
@@ -868,7 +866,9 @@ impl InnerStore {
             .is_some_and(|stored| Arc::ptr_eq(stored, held))
     }
 
-    /// The record stored under its id, handed back as stored.
+    /// Puts `response` under its id (the index keeps one entry per id); a
+    /// new id joins the order at `now`, a replaced record keeps its place.
+    /// Answers the record as stored.
     fn insert(&mut self, response: StoredResponse, now: DateTime<Utc>) -> Arc<StoredResponse> {
         let response_id = response.id.clone();
         if let Some(ref safety_identifier) = response.safety_identifier {
@@ -1430,7 +1430,6 @@ mod tests {
         assert_eq!(retrieved.unwrap().raw_response["output"], json!("Output"));
     }
 
-    /// A write under a taken id is refused, the record handed back, and the
     /// A record the count bound dropped, whose id another record took
     /// since, is not written over and not removed by the writer that held
     /// it: the held writes answer false and the newer record stays.
@@ -1480,6 +1479,7 @@ mod tests {
         );
     }
 
+    /// A write under a taken id is refused, the record handed back, and the
     /// first record stays.
     #[tokio::test]
     async fn a_write_under_a_taken_id_leaves_the_first_record() {

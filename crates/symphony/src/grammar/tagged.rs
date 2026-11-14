@@ -21,6 +21,8 @@
 //! property without a type, or a schema without properties, takes any text. When the calls sit in a
 //! block, the block's ways in frame one or more calls, as Kimi K3's do.
 
+use std::sync::Arc;
+
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
@@ -117,7 +119,7 @@ impl Values<'_> {
 /// JSON the schema accepts, or one of Python's words for it.
 fn words<const N: usize>(schema: Value, python: [&str; N]) -> Grammar {
     let mut options = vec![Grammar::JsonSchema {
-        schema,
+        schema: Arc::new(schema),
         style: None,
         excludes: Vec::new(),
         whitespace: Whitespace::Free,

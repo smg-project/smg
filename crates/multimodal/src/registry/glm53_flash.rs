@@ -6,8 +6,8 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
-        MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
-        RegistryResult,
+        layouts::grid_patch_fields, MediaItemInfo, MediaPartOrder, ModelMetadata,
+        ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{
         FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
@@ -341,17 +341,7 @@ impl ModelProcessorSpec for Glm53FlashSpec {
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        grid_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
@@ -364,7 +354,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::registry::{test_helpers::*, ModelRegistry};
+    use crate::registry::{layouts::grid_patch_fields, test_helpers::*, ModelRegistry};
 
     const IMAGE_ID: u32 = 154854;
     const BEGIN_ID: u32 = 154830;
@@ -654,5 +644,56 @@ mod tests {
         assert!(spec.worker_expandable(Modality::Image));
         assert!(!spec.worker_expandable(Modality::Video));
         assert!(!spec.worker_expandable(Modality::Audio));
+    }
+
+    /// The entry's legacy field map is the grid-patch table: the pixels flat
+    /// over `patches_per_image`, the image and video grids, counts and frame
+    /// spacing one row per item. The engine slices a batch by this map, so an
+    /// emptied map or another tower's table reads here, key for key against
+    /// the shared table and against the rows themselves.
+    #[test]
+    fn the_field_map_is_the_grid_patch_table() {
+        let fields = Glm53FlashSpec.field_layouts();
+        assert_eq!(fields, grid_patch_fields());
+        let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "image_grid_thw",
+                "patches_per_image",
+                "patches_per_video",
+                "pixel_values",
+                "video_grid_thw",
+                "video_second_per_grid"
+            ]
+        );
+        assert_eq!(
+            fields["pixel_values"],
+            FieldLayout::flat("patches_per_image")
+        );
+        assert!(fields
+            .iter()
+            .filter(|(key, _)| *key != "pixel_values")
+            .all(|(_, layout)| *layout == FieldLayout::Batched));
+    }
+
+    /// The entry has no per-modality override, so a video batch takes the
+    /// legacy map through `from_legacy_fields` too: its pixels are sliced by
+    /// `patches_per_image`, the count the video processor writes beside
+    /// `patches_per_video`. A tidy of either side that forgets the pair fails
+    /// every clip at assembly; this pin and the processor's read it first.
+    #[test]
+    fn a_video_batch_is_sliced_by_the_image_patch_count() {
+        let layouts = Glm53FlashSpec.encoder_field_layouts_for(Modality::Video);
+        assert_eq!(
+            layouts.encoder_input,
+            FieldLayout::flat("patches_per_image")
+        );
+        assert_eq!(
+            layouts.model_specific.get("patches_per_image"),
+            Some(&FieldLayout::Batched)
+        );
+        assert!(!layouts.model_specific.contains_key("pixel_values"));
     }
 }

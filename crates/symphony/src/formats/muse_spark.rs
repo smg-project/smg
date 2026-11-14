@@ -191,6 +191,8 @@ fn word() -> Class {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use openai_protocol::common::Tool;
     use serde_json::{json as value, Value};
 
@@ -650,7 +652,7 @@ mod tests {
     #[test]
     fn a_json_answer_is_the_answers_message_with_the_schema_in_it() {
         let grammar = muse_spark()
-            .answer_grammar(&value!({"type": "object"}), false)
+            .answer_grammar(&Arc::new(value!({"type": "object"})), false)
             .expect("an answer tag");
         let payload = grammar.payload();
         assert_eq!(payload["format"]["type"], "tag");

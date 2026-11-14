@@ -117,10 +117,7 @@ impl HashRing {
             Vec::with_capacity(urls.len().saturating_mul(VIRTUAL_NODES_PER_WORKER));
 
         for (index, url) in urls.iter().enumerate() {
-            for vnode in 0..VIRTUAL_NODES_PER_WORKER {
-                let vnode_key = format!("{url}#{vnode}");
-                entries.push((Self::hash_position(&vnode_key), index as u32));
-            }
+            entries.extend(vnodes_for(url, index as u32));
         }
 
         entries.sort_unstable_by_key(|(pos, _)| *pos);
@@ -207,7 +204,7 @@ impl HashRing {
         clippy::expect_used,
         reason = "blake3 always produces 32 bytes — converting a fixed 8-byte slice to [u8; 8] is infallible"
     )]
-    fn hash_position(s: &str) -> u64 {
+    pub(crate) fn hash_position(s: &str) -> u64 {
         let hash = blake3::hash(s.as_bytes());
         u64::from_le_bytes(
             hash.as_bytes()[..8]

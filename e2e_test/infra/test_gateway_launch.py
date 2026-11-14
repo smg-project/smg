@@ -308,6 +308,24 @@ def test_the_wait_holds_for_a_missing_worker_behind_a_data_parallel_count(fake_r
     assert f"missing: {WORKERS[1]}" in message
 
 
+def test_a_data_parallel_fleet_releases_the_wait_once_each_worker_is_registered(fake_router):
+    """Each worker registered with two ranks: four entries for two workers
+    release the wait, since the gate is each worker's URL. A gate comparing
+    the rank entries with the worker count would never release on a
+    data-parallel fleet, the wait timing out at ``workers: 2/2``."""
+    gateway = Gateway()
+    try:
+        gateway.start(
+            worker_urls=WORKERS,
+            model_path="m",
+            timeout=15,
+            extra_args=["--fake-dp", "--fake-dp-ranks", "2"],
+        )
+        assert gateway.is_running
+    finally:
+        gateway.shutdown()
+
+
 def test_the_log_goes_under_e2e_log_dir_when_start_gets_no_log_dir(
     fake_router, tmp_path, monkeypatch
 ):

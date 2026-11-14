@@ -3,6 +3,8 @@
 //! answers with `BatchTokenIDSlimOutput` batches, as the SMG plugin inside a
 //! headless scheduler does.
 
+mod lora;
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -40,6 +42,7 @@ use tonic_health::pb::{
 
 use super::*;
 use crate::{
+    kv_events::{LoadFromState, LoadSource},
     testing::{
         assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
         next_batch, servicer_config, Bounded,
@@ -1424,6 +1427,67 @@ async fn abort_rpc_ends_the_stream_and_reaches_the_scheduler() {
         .into_inner();
     assert!(!unknown.success, "an unknown id is reported as not found");
     assert!(unknown.message.contains("not found"));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info()).await;
+    let mut req = generate_request("r7", true, Vec::new());
+    if let Some(params) = req.sampling_params.as_mut() {
+        params.n = 2;
+    }
+    let mut stream = h.client.generate(req).await.expect("generate").into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7-1", vec![21], 1, None, None)).await;
+    assert_eq!(
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
+        vec![21]
+    );
+
+    let response = h
+        .client
+        .abort(sg::AbortRequest {
+            request_id: "r7".to_string(),
+            reason: "client left".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success);
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.index,
+                done.finish_reason.clone(),
+                done.output_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -3970,11 +4034,10 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![(1, 0)]
     );
-    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    let record =
-        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let record = LoadSource::load(&source, Some(1)).expect("the idle rank's record");
     assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
-    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    assert!(LoadSource::load(&source, Some(2)).is_none());
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -4278,8 +4341,8 @@ async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
     assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
     assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
     assert_eq!(rank0.num_waiting_uncached_tokens, 0);
-    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let record = LoadSource::load(&source, Some(0)).expect("rank 0's record");
     assert_eq!(record.prefill_throughput, Some(rate));
     assert_eq!(record.waiting_uncached_tokens, Some(0));
     assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
@@ -4418,8 +4481,6 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
 /// connected ones has no record.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let record_of = |load: &sg::SchedulerLoad| {
         let mut record = common::EngineLoad::from(load);
         record.waiting_uncached_tokens =

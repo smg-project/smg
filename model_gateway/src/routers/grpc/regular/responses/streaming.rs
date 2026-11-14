@@ -28,7 +28,7 @@ use openai_protocol::{
         ChatCompletionStreamResponse,
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
-    responses::{ResponseStatus, ResponsesRequest, ResponsesUsage},
+    responses::{ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesUsage},
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
@@ -92,7 +92,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     ctx: &ResponsesContext,
     chat_request: Arc<ChatCompletionRequest>,
     params: ResponsesCallContext,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     background: Option<BackgroundStream>,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
@@ -134,8 +134,9 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     // Create channel for transformed SSE events
     let (tx, rx) = sse_channel();
 
-    // Spawn background task to transform stream
-    let original_request_clone = original_request.clone();
+    // Spawn background task to transform stream; it takes a share of the
+    // request (a count), not a copy of it.
+    let original_request_clone = Arc::clone(original_request);
     let response_storage = ctx.response_storage.clone();
     let conversation_storage = ctx.conversation_storage.clone();
     let conversation_item_storage = ctx.conversation_item_storage.clone();
@@ -305,7 +306,7 @@ enum BodyRead {
 /// client left only when the body next yields, and the engine request behind
 /// the body would run on as long. Here every read races the body against the
 /// client's leaving, looked at first so a busy body cannot outrun it; on
-/// [`BodyRead::ClientLeft`] the caller returns, the body is dropped with it,
+/// [`BodyRead::ClientLeft`] the caller ends its read and drops the body,
 /// and the chat layer ends the engine request the way it does for its own
 /// clients. A background response's `tx` is the sender of its relay, which
 /// closes with the work and not with the client: its reads are the body's
@@ -318,6 +319,64 @@ async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
     }
 }
 
+/// The record of a stored foreground stream whose client left mid-stream, as
+/// the `response.created` it announced promised: the items streamed so far
+/// (the open ones closed, in progress), status `cancelled` when no finish had
+/// been read (a finish the stream had read stands, with its own statuses), the
+/// status the background cancel path writes for a response stopped before its end; the
+/// GET and a `previous_response_id` chain answer from it. The emitter is
+/// abandoned first: its item events are built into the object and sent to
+/// nobody. An unstored stream records nothing, as before; a background one
+/// never meets the departure (its relay outlives the client). The chat body
+/// has gone with the frame loop, which ended the generation on the engine.
+/// The answer is the departure, as before.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the record takes the storage handles of the transform it ends"
+)]
+async fn record_departure(
+    mut event_emitter: ResponseStreamEventEmitter,
+    usage: Option<ResponsesUsage>,
+    original_request: &ResponsesRequest,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
+    request_context: Option<StorageRequestContext>,
+    tx: &SseSender,
+) -> Result<(), String> {
+    if stored_foreground(original_request) {
+        event_emitter.abandon();
+        // A finish the stream had already read stands (a `length` finish
+        // keeps its `incomplete_details`); only a generation cut before its
+        // finish is recorded as cancelled.
+        if event_emitter.finish_reason().is_none() {
+            event_emitter.set_finish_reason(Some("cancelled"));
+        }
+        event_emitter.close_items(tx).await?;
+        let mut final_response = event_emitter.finalize(None);
+        final_response.usage = usage;
+        if let Err(e) = persist_response_if_needed(
+            conversation_storage,
+            conversation_item_storage,
+            response_storage,
+            &final_response,
+            original_request,
+            tenant,
+            request_context,
+        )
+        .await
+        {
+            debug!(
+                response_id = %final_response.id,
+                error = %e.message,
+                "The record of a stream its client left could not be written"
+            );
+        }
+    }
+    Err("Client disconnected".to_string())
+}
+
 /// Process chat SSE stream and transform to responses format
 #[expect(
     clippy::too_many_arguments,
@@ -325,7 +384,7 @@ async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
 )]
 async fn process_and_transform_sse_stream(
     body: Body,
-    original_request: ResponsesRequest,
+    original_request: Arc<ResponsesRequest>,
     response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
@@ -343,13 +402,12 @@ async fn process_and_transform_sse_stream(
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id, model, created_at);
-    event_emitter.set_original_request(original_request.clone());
+    event_emitter.set_original_request(ResponsesRequest::clone(&original_request));
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = event_emitter.emit_created();
     event_emitter
-        .send_event(&event, &tx)
+        .send_created(&tx)
         .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
 
@@ -361,9 +419,8 @@ async fn process_and_transform_sse_stream(
             .map_err(|_| "Failed to send response.queued event".to_string())?;
     }
 
-    let event = event_emitter.emit_in_progress();
     event_emitter
-        .send_event(&event, &tx)
+        .send_in_progress(&tx)
         .await
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
@@ -371,6 +428,9 @@ async fn process_and_transform_sse_stream(
     let mut stream = body.into_data_stream();
 
     let mut terminal_error = None;
+    // The client left: met by the body read, by an event it no longer takes,
+    // or by the emitter's send. The loop ends there.
+    let mut client_left = false;
     // Process the stream frame by frame; a frame holds one or more SSE events.
     'frames: loop {
         let chunk = match next_frame(&mut stream, &tx).await {
@@ -380,10 +440,10 @@ async fn process_and_transform_sse_stream(
                 break;
             }
             BodyRead::End => break,
-            // The chat body goes with this return, which ends the generation
-            // on the engine; the stream ends as it does when the client's
-            // leaving is met at the next frame, and nothing of it is stored.
-            BodyRead::ClientLeft => return Err("Client disconnected".to_string()),
+            BodyRead::ClientLeft => {
+                client_left = true;
+                break;
+            }
         };
 
         let frame = frame_text(&chunk);
@@ -394,7 +454,13 @@ async fn process_and_transform_sse_stream(
                     if let Some(chunk_usage) = &chat_chunk.usage {
                         usage = Some(chunk_usage.clone());
                     }
-                    event_emitter.process_chunk(&chat_chunk, &tx).await?;
+                    if let Err(error) = event_emitter.process_chunk(&chat_chunk, &tx).await {
+                        if tx.is_closed() {
+                            client_left = true;
+                            break 'frames;
+                        }
+                        return Err(error);
+                    }
                 }
                 ChatSseEvent::UpstreamError(error) => {
                     terminal_error = Some(error);
@@ -408,11 +474,34 @@ async fn process_and_transform_sse_stream(
                         .await
                         .is_err()
                     {
-                        return Err("Client disconnected".to_string());
+                        client_left = true;
+                        break 'frames;
                     }
                 }
             }
         }
+    }
+
+    // The chat body goes here, which ends the generation on the engine (on
+    // the client's leaving as the early return did; on every other end the
+    // body is spent). A stored foreground stream its client left is still
+    // recorded, under the id it announced; the answer is the departure.
+    drop(stream);
+    if client_left {
+        return record_departure(
+            event_emitter,
+            usage
+                .as_ref()
+                .map(|usage| ResponsesUsage::Modern(ResponseUsage::from(usage))),
+            &original_request,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            tenant.as_deref(),
+            request_context,
+            &tx,
+        )
+        .await;
     }
 
     // The final object is the emitter's own: the items its events announced,
@@ -475,7 +564,7 @@ async fn process_and_transform_sse_stream(
 pub(super) async fn execute_tool_loop_streaming(
     ctx: &ResponsesContext,
     current_request: ResponsesRequest,
-    original_request: &ResponsesRequest,
+    original_request: &Arc<ResponsesRequest>,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
     background: Option<BackgroundStream>,
@@ -484,9 +573,9 @@ pub(super) async fn execute_tool_loop_streaming(
     let (tx, rx) = sse_channel();
     let (startup_tx, startup_rx) = stream_startup_channel();
 
-    // Clone data for background task
+    // Clone data for background task; the request is shared by count, not copied.
     let ctx_clone = ctx.clone();
-    let original_request_clone = original_request.clone();
+    let original_request_clone = Arc::clone(original_request);
     // A background stream's events go through a relay, so the work and its
     // terminal record outlive a client that leaves.
     let tx = match &background {
@@ -540,7 +629,9 @@ struct CallSite<'a> {
     session: &'a McpToolSession<'a>,
     format_registry: &'a FormatRegistry,
     original_request: &'a ResponsesRequest,
-    model: &'a str,
+    /// The loop's current request: its model labels the call's metrics, its
+    /// tools name the call's namespace.
+    request: &'a ResponsesRequest,
 }
 
 /// One MCP call's whole life on the stream: announced with its progress
@@ -588,8 +679,9 @@ async fn stream_mcp_call(
     );
 
     // Emit output_item.added
-    let event = emitter.emit_output_item_added(output_index, &item);
-    emitter.send_event(&event, tx).await?;
+    emitter
+        .send_output_item_added(output_index, &item, tx)
+        .await?;
 
     // Emit tool_call.in_progress
     let event = emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
@@ -659,15 +751,22 @@ async fn stream_mcp_call(
         Some(tool_output.server_label.as_str()),
         Some(&response_format),
     );
-
-    if success {
-        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
-        emitter.send_event(&event, tx).await?;
-    } else {
-        let err_text = tool_output
+    // The call executed: its item is stored and marked complete, and its
+    // metrics and place in the loop's history recorded, before the sends
+    // that follow, so a client who left during the call changes neither the
+    // record nor the counts; `output_item.done` is still sent after the
+    // completion event, in order.
+    emitter.keep_output_item(output_index, item_done);
+    emitter.complete_output_item(output_index);
+    let failure = (!success).then(|| {
+        tool_output
             .error_message
             .clone()
-            .unwrap_or_else(|| output_str.clone());
+            .unwrap_or_else(|| output_str.clone())
+    });
+    record_mcp_call(state, site.request, tool_output, output_str, output_item);
+
+    if let Some(err_text) = failure {
         warn!("Tool execution returned error: {}", err_text);
 
         // `response.mcp_call.failed` is the only `*.failed` event
@@ -682,14 +781,39 @@ async fn stream_mcp_call(
             let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
             emitter.send_event(&event, tx).await?;
         }
+    } else {
+        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
+        emitter.send_event(&event, tx).await?;
     }
 
-    let event = emitter.emit_output_item_done(output_index, &item_done);
-    emitter.send_event(&event, tx).await?;
-    emitter.complete_output_item(output_index);
-
-    record_mcp_call(state, site.model, tool_output, output_str, output_item);
+    emitter.send_kept_output_item_done(output_index, tx).await?;
     Ok(())
+}
+
+/// How the tool loop's turns ended: done (the terminal event follows), failed
+/// with the terminal error object, or left by the client (the departure is
+/// recorded, no event follows).
+enum Turns {
+    Done,
+    Failed(Value),
+    /// The client left: at the loop's own sends between generations (the
+    /// tool list, a call's events, the reasoning item), or inside one.
+    ClientLeft {
+        between: bool,
+    },
+}
+
+impl Turns {
+    /// A failure met at the loop's own sends while the client is gone is the
+    /// client's leaving; any other one answers as before (the loop's error,
+    /// nothing recorded).
+    fn left_or(tx: &SseSender, message: String) -> Result<Self, String> {
+        if tx.is_closed() {
+            Ok(Self::ClientLeft { between: true })
+        } else {
+            Err(message)
+        }
+    }
 }
 
 /// Internal streaming tool loop implementation
@@ -704,7 +828,7 @@ async fn execute_tool_loop_streaming_internal(
 ) -> Result<(), String> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
-    let mut state = ToolLoopState::new(&current_request);
+    let mut state = ToolLoopState::default();
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
@@ -728,14 +852,12 @@ async fn execute_tool_loop_streaming_internal(
 
     // Emit initial response.created and response.in_progress events (a
     // background stream reports response.queued between the two)
-    let event = emitter.emit_created();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_created(&tx).await?;
     if original_request.background.unwrap_or(false) {
         let event = emitter.emit_queued();
         emitter.send_event(&event, &tx).await?;
     }
-    let event = emitter.emit_in_progress();
-    emitter.send_event(&event, &tx).await?;
+    emitter.send_in_progress(&tx).await?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&session);
@@ -747,7 +869,7 @@ async fn execute_tool_loop_streaming_internal(
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
 
-    let terminal_error = loop {
+    let turns = 'turns: loop {
         trace!("Streaming MCP tool loop iteration {}", state.iteration);
 
         // Emit mcp_list_tools as first output item (only once, on first iteration)
@@ -755,9 +877,12 @@ async fn execute_tool_loop_streaming_internal(
             for binding in session.mcp_servers() {
                 let tools_for_server = session.list_tools_for_server(&binding.server_key);
 
-                emitter
+                if let Err(message) = emitter
                     .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, &tx)
-                    .await?;
+                    .await
+                {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
             mcp_list_tools_emitted = true;
         }
@@ -816,6 +941,10 @@ async fn execute_tool_loop_streaming_internal(
             ));
         }
 
+        // A fresh generation: no finish until its terminal chunk names one, so
+        // the finish of an earlier turn of the request never reads for this
+        // one (as the Harmony loop does).
+        emitter.set_finish_reason(None);
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
@@ -825,7 +954,15 @@ async fn execute_tool_loop_streaming_internal(
             .await
             {
                 Ok(response) => response,
-                Err(error) => break Some(error),
+                // The client's leaving is read at the next frame (or at
+                // the send the emitter could not make): a departure, not a
+                // failure of the stream; the error it came with stays in the
+                // log for a reader of the cancelled record.
+                Err(error) if tx.is_closed() => {
+                    debug!(%error, "The chat stream's error met after the client left");
+                    break Turns::ClientLeft { between: false };
+                }
+                Err(error) => break Turns::Failed(error),
             };
         state.record_usage(accumulated_response.usage.as_ref());
         // Truncated or failed generation cannot request MCP execution.
@@ -835,14 +972,14 @@ async fn execute_tool_loop_streaming_internal(
             .and_then(|choice| choice.finish_reason.as_deref())
             .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"))
         {
-            break None;
+            break Turns::Done;
         }
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
         // Neither can a server call the generation did not finish.
         if has_unfinished_mcp_call(&tool_calls, &session) {
-            break None;
+            break Turns::Done;
         }
 
         if !tool_calls.is_empty() {
@@ -854,16 +991,20 @@ async fn execute_tool_loop_streaming_internal(
                 session: &session,
                 format_registry: &ctx.mcp_format_registry,
                 original_request,
-                model: &current_request.model,
+                request: &current_request,
             };
             for tool_call in mcp_tool_calls {
-                stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await?;
+                if let Err(message) =
+                    stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await
+                {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
 
             if let Some(limit) = tool_call_limit {
                 break match limit {
-                    McpToolCallLimit::User => None,
-                    McpToolCallLimit::Safety => Some(json!({
+                    McpToolCallLimit::User => Turns::Done,
+                    McpToolCallLimit::Safety => Turns::Failed(json!({
                         "code": "max_tool_calls_exceeded",
                         "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
                     })),
@@ -873,11 +1014,11 @@ async fn execute_tool_loop_streaming_internal(
             // process_chunk already emitted these function-call items.
             // Return them to the client without duplicating their events.
             if !function_tool_calls.is_empty() {
-                break None;
+                break Turns::Done;
             }
 
             // Build next request with conversation history
-            current_request = build_next_request(&state, current_request);
+            current_request = build_next_request(&mut state, current_request);
 
             continue;
         }
@@ -894,16 +1035,46 @@ async fn execute_tool_loop_streaming_internal(
         // Emit reasoning item if present
         if let Some(reasoning) = reasoning_content {
             if !reasoning.is_empty() {
-                emitter.emit_reasoning_item(&tx, Some(reasoning)).await?;
+                if let Err(message) = emitter.emit_reasoning_item(&tx, Some(reasoning)).await {
+                    break 'turns Turns::left_or(&tx, message)?;
+                }
             }
         }
 
         // Text message events already emitted naturally by process_chunk during stream processing
         // (OpenAI router approach - text only appears on final iteration when no tool calls)
 
-        break None;
+        break Turns::Done;
     };
 
+    let terminal_error = match turns {
+        Turns::Done => None,
+        Turns::Failed(error) => Some(error),
+        // A stored foreground stream its client left is recorded as the
+        // regular stream records it: cancelled, the open items in progress,
+        // under the id it announced; the answer is the departure.
+        Turns::ClientLeft { between } => {
+            // Only a finish that ended the loop's last generation stands. A
+            // departure between generations, or in a generation that ended
+            // with tool calls, cut the response short: cancelled.
+            if between || emitter.finish_reason() == Some("tool_calls") {
+                emitter.set_finish_reason(None);
+            }
+            let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+            return record_departure(
+                emitter,
+                state.usage.clone().map(ResponsesUsage::Modern),
+                original_request,
+                ctx.response_storage.clone(),
+                ctx.conversation_storage.clone(),
+                ctx.conversation_item_storage.clone(),
+                tenant.as_deref(),
+                ctx.request_context.clone(),
+                &tx,
+            )
+            .await;
+        }
+    };
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
     // The final object, read before the terminal event drains the emitter's
     // items; a background response needs its terminal record under the id
@@ -1165,10 +1336,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(false),
                 ..Default::default()
-            },
+            }),
             None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1289,10 +1460,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..request
-            },
+            }),
             None,
             storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
@@ -1759,6 +1930,291 @@ mod tests {
             .contains("connection reset"));
     }
 
+    /// A stored foreground stream whose client leaves mid-stream keeps the
+    /// promise `response.created` made: its record is written with the items
+    /// streamed so far (closed in progress) and status `cancelled`, while the
+    /// chat body is dropped with the read, as before; an unstored one records
+    /// nothing. The transform answers the departure either way.
+    #[tokio::test]
+    async fn a_stored_stream_whose_client_leaves_is_recorded_as_cancelled() {
+        for store in [true, false] {
+            let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let body = Body::from_stream(ReceiverStream::new(body_rx));
+            let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+            let (tx, mut rx) = mpsc::channel(64);
+            let transform = process_and_transform_sse_stream(
+                body,
+                Arc::new(ResponsesRequest {
+                    store: Some(store),
+                    ..Default::default()
+                }),
+                None,
+                storage.clone(),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                None,
+                tx,
+            );
+            let client = async move {
+                body_tx
+                    .send(Ok(Bytes::from(chat_event(
+                        json!({"content":"Hello"}),
+                        None,
+                    ))))
+                    .await
+                    .unwrap();
+                // The client reads up to the text it was streamed, then leaves.
+                let mut id = None;
+                'read: while let Some(Ok(bytes)) = rx.recv().await {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                        let event: Value = serde_json::from_str(data).unwrap();
+                        if event["type"] == "response.created" {
+                            id = event["response"]["id"].as_str().map(str::to_string);
+                        }
+                        if event["type"] == "response.output_text.delta" {
+                            break 'read;
+                        }
+                    }
+                }
+                drop(rx);
+                (id.expect("response.created names the id"), body_tx)
+            };
+            // The joined futures are large; boxed, they stay off the test's stack.
+            let (outcome, (id, body_tx)) = Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async { tokio::join!(transform, client) },
+            ))
+            .await
+            .expect("the body never ends; the client's leaving ends the read");
+            assert_eq!(outcome.unwrap_err(), "Client disconnected");
+            assert!(
+                body_tx.is_closed(),
+                "the chat body is dropped with the read"
+            );
+            let record = storage
+                .get_response(&smg_data_connector::ResponseId::from(id.as_str()))
+                .await
+                .unwrap();
+            if !store {
+                assert!(record.is_none(), "an unstored response records nothing");
+                continue;
+            }
+            let stored = record.expect("the stored stream's record").raw_response;
+            assert_eq!(stored["status"], "cancelled", "{stored}");
+            assert!(stored["error"].is_null(), "{stored}");
+            assert!(stored["incomplete_details"].is_null(), "{stored}");
+            assert_eq!(stored["output"][0]["type"], "message", "{stored}");
+            assert_eq!(stored["output"][0]["status"], "in_progress", "{stored}");
+            assert_eq!(stored["output"][0]["content"][0]["text"], "Hello");
+            assert!(
+                stored["output"][0]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("msg_")),
+                "{stored}"
+            );
+        }
+    }
+
+    /// Reads the client's SSE frames up to the first event of `event_type`
+    /// and returns the id `response.created` announced.
+    async fn read_until<E>(rx: &mut mpsc::Receiver<Result<Bytes, E>>, event_type: &str) -> String {
+        let mut id = None;
+        'read: while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                let event: Value = serde_json::from_str(data).unwrap();
+                if event["type"] == "response.created" {
+                    id = event["response"]["id"].as_str().map(str::to_string);
+                }
+                if event["type"] == event_type {
+                    break 'read;
+                }
+            }
+        }
+        id.expect("response.created names the id")
+    }
+
+    /// The stored object of the response `id`.
+    async fn stored_record(storage: &smg_data_connector::MemoryResponseStorage, id: &str) -> Value {
+        storage
+            .get_response(&smg_data_connector::ResponseId::from(id))
+            .await
+            .unwrap()
+            .expect("the stored stream's record")
+            .raw_response
+    }
+
+    /// The client leaves while the message's closing events are being sent
+    /// (an SSE channel of one slot: the client reads up to the text delta and
+    /// leaves, so the first closing event's send meets the dead client). The
+    /// item was stored before that send, and the finish had been read: the
+    /// record keeps the message, completed, under the stream's own finish.
+    #[tokio::test]
+    async fn a_client_that_leaves_during_the_closing_events_keeps_the_streamed_message() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        let transform = process_and_transform_sse_stream(
+            body,
+            Arc::new(ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            }),
+            None,
+            storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        );
+        let client = async move {
+            for frame in [
+                chat_event(json!({"content":"Hello"}), None),
+                chat_event(json!({}), Some("stop")),
+            ] {
+                body_tx.send(Ok(Bytes::from(frame))).await.unwrap();
+            }
+            let id = read_until(&mut rx, "response.output_text.delta").await;
+            drop(rx);
+            (id, body_tx)
+        };
+        let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(transform, client) },
+        ))
+        .await
+        .expect("the client's leaving ends the read");
+        assert_eq!(outcome.unwrap_err(), "Client disconnected");
+        let stored = stored_record(&storage, &id).await;
+        assert_eq!(stored["status"], "completed", "{stored}");
+        assert_eq!(stored["output"][0]["type"], "message", "{stored}");
+        assert_eq!(stored["output"][0]["status"], "completed", "{stored}");
+        assert_eq!(
+            stored["output"][0]["content"][0]["text"], "Hello",
+            "{stored}"
+        );
+    }
+
+    /// A finish the stream had already read stands when the client leaves
+    /// before the body ends: a `length` finish is recorded `incomplete` with
+    /// its `incomplete_details`, not `cancelled`, and the message it closed
+    /// keeps its text.
+    #[tokio::test]
+    async fn a_client_that_leaves_after_the_finish_keeps_the_finish() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(64);
+        let transform = process_and_transform_sse_stream(
+            body,
+            Arc::new(ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            }),
+            None,
+            storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        );
+        let client = async move {
+            for frame in [
+                chat_event(json!({"content":"Hello"}), None),
+                chat_event(json!({}), Some("length")),
+            ] {
+                body_tx.send(Ok(Bytes::from(frame))).await.unwrap();
+            }
+            // The message closed under the finish; the client leaves before
+            // the body ends (no usage chunk, no `[DONE]` yet).
+            let id = read_until(&mut rx, "response.output_item.done").await;
+            drop(rx);
+            (id, body_tx)
+        };
+        let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(transform, client) },
+        ))
+        .await
+        .expect("the client's leaving ends the read");
+        assert_eq!(outcome.unwrap_err(), "Client disconnected");
+        let stored = stored_record(&storage, &id).await;
+        assert_eq!(stored["status"], "incomplete", "{stored}");
+        assert_eq!(
+            stored["incomplete_details"]["reason"], "max_output_tokens",
+            "{stored}"
+        );
+        assert_eq!(
+            stored["output"][0]["content"][0]["text"], "Hello",
+            "{stored}"
+        );
+        assert_ne!(stored["output"][0]["status"], "in_progress", "{stored}");
+    }
+
+    /// Under `cancelled` every item still open when the client left reads
+    /// `in_progress`: a reasoning item, a function call with partial
+    /// arguments, as the message does.
+    #[tokio::test]
+    async fn a_cancelled_record_closes_the_open_reasoning_and_call_items_in_progress() {
+        for (delta, leave_at, item_type) in [
+            (
+                json!({"reasoning_content":"think"}),
+                "response.reasoning_text.delta",
+                "reasoning",
+            ),
+            (
+                json!({"tool_calls":[{"index":0,"id":"call_open","type":"function",
+                    "function":{"name":"lookup","arguments":"{\"q\":"}}]}),
+                "response.function_call_arguments.delta",
+                "function_call",
+            ),
+        ] {
+            let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let body = Body::from_stream(ReceiverStream::new(body_rx));
+            let storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+            let (tx, mut rx) = mpsc::channel(64);
+            let transform = process_and_transform_sse_stream(
+                body,
+                Arc::new(ResponsesRequest {
+                    store: Some(true),
+                    ..Default::default()
+                }),
+                None,
+                storage.clone(),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                None,
+                tx,
+            );
+            let client = async move {
+                body_tx
+                    .send(Ok(Bytes::from(chat_event(delta, None))))
+                    .await
+                    .unwrap();
+                let id = read_until(&mut rx, leave_at).await;
+                drop(rx);
+                (id, body_tx)
+            };
+            let (outcome, (id, _body_tx)) = Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async { tokio::join!(transform, client) },
+            ))
+            .await
+            .expect("the client's leaving ends the read");
+            assert_eq!(outcome.unwrap_err(), "Client disconnected");
+            let stored = stored_record(&storage, &id).await;
+            assert_eq!(stored["status"], "cancelled", "{item_type}: {stored}");
+            assert_eq!(stored["output"][0]["type"], item_type, "{stored}");
+            assert_eq!(stored["output"][0]["status"], "in_progress", "{stored}");
+        }
+    }
+
     /// The reader parked on a chat body that stalled (nothing more on it)
     /// ends the moment its client leaves, with the error it ends with when
     /// it meets the dead client at the next frame, and the chat body goes
@@ -1966,10 +2422,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         process_and_transform_sse_stream(
             body,
-            ResponsesRequest {
+            Arc::new(ResponsesRequest {
                 store: Some(true),
                 ..Default::default()
-            },
+            }),
             None,
             response_storage.clone(),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),

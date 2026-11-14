@@ -92,9 +92,12 @@ const NO_KEY: u32 = u32::MAX;
 const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
-/// The id a byte with no token stands under in a table's byte ids: never
-/// merged (a piece that holds the byte is the model's, see
-/// [`MergeTable::lacks_a_token_for`]).
+/// The id of a byte the vocabulary has no token for. On the byte-level path
+/// a piece that holds the byte is the model's (see
+/// [`MergeTable::lacks_a_token_for`]); on the character symbols' table such
+/// a byte is never reached (`CharSymbols::from_model` declines one the
+/// fallback could reach, and `CharSymbols::merge` asserts it in debug
+/// builds).
 const NO_BYTE_TOKEN: u32 = u32::MAX;
 /// Filter bits per merge of the pair table (see `MergeTable::pair_filter`),
 /// at least: two set per pair in one word, so at eight bits per merge about
@@ -203,10 +206,11 @@ pub(super) enum ByteTokens {
 pub(super) struct MergeTable {
     /// The id of each byte's token ([`NO_BYTE_TOKEN`] for a byte without one).
     byte_ids: [u32; 256],
-    /// The bytes the vocabulary has no token for, when it lacks any: a piece
-    /// that holds one is the model's to merge (see
-    /// [`Self::lacks_a_token_for`]). `None` over a complete alphabet, the
-    /// usual case.
+    /// The bytes the vocabulary has no token for, when it lacks any: on the
+    /// byte-level path a piece that holds one is the model's to merge (see
+    /// [`Self::lacks_a_token_for`]); the character symbols' table never
+    /// reaches one (see `CharSymbols::from_model`). `None` over a complete
+    /// alphabet, the usual case.
     missing: Option<Box<[bool; 256]>>,
     /// `hot[(a - hot_base) << HOT_SIDE_BITS | (b - hot_base)]`: the merge of
     /// the pair `(a, b)` when both ids are within [`HOT_SIDE`] of the window
@@ -311,15 +315,14 @@ impl MergeTable {
                 ByteTokens::Alphabet => Cow::Borrowed(&*alphabet.encode_utf8(&mut utf8)),
                 ByteTokens::Hex => Cow::Owned(format!("<0x{byte:02X}>")),
             };
-            // A byte-level vocabulary without a token for a byte (some lack
-            // one for a byte no text of theirs holds): the pieces that hold
-            // it stay the model's, every other piece merges here. The
-            // character symbols' table spells every byte it falls back to.
+            // A vocabulary without a token for a byte (some lack one for a
+            // byte no text of theirs holds): on the byte-level path the
+            // pieces that hold it stay the model's, every other piece merges
+            // here; the character symbols' table spells a byte only for a
+            // character that is no token, and declines a missing byte that
+            // could be reached (`CharSymbols::from_model`).
             byte_ids[byte] = match model.token_to_id(&spelling) {
                 Some(id) => id,
-                None if tokens == ByteTokens::Hex => {
-                    return Err(Declined::from(format!("byte {byte:#04x} has no token")));
-                }
                 None => {
                     missing.get_or_insert_with(|| Box::new([false; 256]))[byte] = true;
                     NO_BYTE_TOKEN
@@ -575,6 +578,11 @@ impl MergeTable {
         self.byte_ids[usize::from(byte)]
     }
 
+    /// Whether the vocabulary has no token for `byte`.
+    pub(super) fn lacks_a_token_for_byte(&self, byte: u8) -> bool {
+        self.byte_ids[usize::from(byte)] == NO_BYTE_TOKEN
+    }
+
     /// Whether `piece` holds a byte the vocabulary has no token for: such a
     /// piece is the model's to merge (the table has no id for that byte).
     /// A table over a complete alphabet answers without a look at the piece.
@@ -788,7 +796,10 @@ impl MergeTable {
     /// pre-forms under the vocabulary: the caller merges from the bytes
     /// then. The caller sends a cold piece of a unit that holds a non-ASCII
     /// byte here first (a piece of an ASCII unit never comes); an ASCII
-    /// piece of a mixed unit leaves at the pays-off test.
+    /// piece of a mixed unit leaves at the pays-off test. A piece from the
+    /// stages over the byte-level image is not always whole text (a cut may
+    /// fall inside a character): a byte outside a whole character is its own
+    /// symbol here, as under the byte merge.
     #[inline(never)]
     pub(super) fn merge_preformed(&self, piece: &[u8], ids: &mut Vec<u32>) -> bool {
         debug_assert!(
@@ -814,8 +825,11 @@ impl MergeTable {
                     && i + len <= piece.len()
                     && piece[i + 1..i + len].iter().all(|&b| is_continuation(b)));
             if !whole {
-                // A byte that starts no character of the text (the piece is
-                // text, so none is met; a bare byte string merges as bytes).
+                // A byte outside a whole character: a piece from the stages
+                // over the byte-level image may begin on a continuation byte
+                // or end inside a character (see `pieces_in_alphabet`), and a
+                // bare byte string merges as bytes; such a byte is its own
+                // symbol, as the byte merge has it.
                 push_symbol(
                     &mut segment,
                     &mut n,

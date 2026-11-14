@@ -180,20 +180,24 @@ impl TokenCounts {
 /// The usage of a chat completion from `engine_usage`, the usage the
 /// engine's counters make: the rendered prompt tokens the provider does not
 /// bill are dropped, the reasoning the gateway's own parser split off is
-/// accounted (`parsed_reasoning`, see `with_parsed_reasoning_tokens`), and
-/// default counters are present, except unavailable speculative rejections
-/// remain absent even when accepted is zero. The streamed answer's usage
-/// chunk and the non-streamed answer both build their usage here, so a
-/// request's two usage objects are the same.
+/// accounted (`parsed_reasoning`, see `with_parsed_reasoning_tokens`), the
+/// image tokens the gateway's own expansion wrote into the prompt are
+/// reported (`image_tokens`, `None` for a request without one), and default
+/// counters are present, except unavailable speculative rejections remain
+/// absent even when accepted is zero. The streamed answer's usage chunk and
+/// the non-streamed answer both build their usage here, so a request's two
+/// usage objects are the same.
 pub(crate) fn chat_usage(
     engine_usage: Usage,
     parsed_reasoning: Option<u32>,
     unbilled_prompt_tokens: u32,
+    image_tokens: Option<u32>,
 ) -> Usage {
     with_parsed_reasoning_tokens(
         engine_usage.with_unbilled_prompt_tokens(unbilled_prompt_tokens),
         parsed_reasoning,
     )
+    .with_image_tokens(image_tokens)
     .with_complete_details()
 }
 
@@ -444,8 +448,13 @@ mod tests {
 
     #[test]
     fn chat_usage_has_every_detail_counter_and_no_unbilled_prompt_tokens() {
-        let usage = serde_json::to_value(chat_usage(build_usage(&[complete(10, 8, 4)]), None, 3))
-            .expect("a JSON usage");
+        let usage = serde_json::to_value(chat_usage(
+            build_usage(&[complete(10, 8, 4)]),
+            None,
+            3,
+            None,
+        ))
+        .expect("a JSON usage");
         assert_eq!(
             usage,
             serde_json::json!({
@@ -461,12 +470,40 @@ mod tests {
                 },
             })
         );
-        let parsed = chat_usage(build_usage(&[complete(10, 8, 4)]), Some(2), 0);
+        let parsed = chat_usage(build_usage(&[complete(10, 8, 4)]), Some(2), 0, None);
         assert_eq!(
             parsed
                 .completion_tokens_details
                 .and_then(|details| details.reasoning_tokens),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn chat_usage_reports_the_image_tokens_the_gateway_expanded() {
+        let with_images = serde_json::to_value(chat_usage(
+            build_usage(&[complete(535, 0, 8)]),
+            None,
+            0,
+            Some(324),
+        ))
+        .expect("a JSON usage");
+        assert_eq!(with_images["prompt_tokens"], 535);
+        assert_eq!(
+            with_images["prompt_tokens_details"],
+            serde_json::json!({"cached_tokens": 0, "audio_tokens": 0, "image_tokens": 324})
+        );
+        let text_only = serde_json::to_value(chat_usage(
+            build_usage(&[complete(207, 0, 8)]),
+            None,
+            0,
+            None,
+        ))
+        .expect("a JSON usage");
+        assert_eq!(
+            text_only["prompt_tokens_details"],
+            serde_json::json!({"cached_tokens": 0, "audio_tokens": 0}),
+            "a request without an image the gateway expanded reports no image count"
         );
     }
 
@@ -632,7 +669,7 @@ mod tests {
                         })
                     })
                     .collect();
-                let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0);
+                let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0, None);
                 let json = serde_json::to_value(usage).unwrap();
                 assert_eq!(
                     json["completion_tokens_details"]["accepted_prediction_tokens"],
@@ -666,7 +703,7 @@ mod tests {
                     })
                 })
                 .collect();
-            let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0);
+            let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0, None);
             let details = usage.completion_tokens_details.unwrap();
             assert_eq!(details.accepted_prediction_tokens, Some(0));
             assert_eq!(details.rejected_prediction_tokens, None);

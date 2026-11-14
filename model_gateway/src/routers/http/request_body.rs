@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 
 use serde::{
-    de::{MapAccess, Visitor},
+    de::{self, MapAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -144,12 +144,14 @@ fn value_request_body<T: Serialize>(
 /// `preserve_order`: [`Self::insert`] replaces in place or appends,
 /// [`Self::remove`] swap-removes (the last field moves into the freed slot).
 /// A body built here is therefore byte-identical to one built through a
-/// `Value`, which the tests use as the oracle. Cloning copies field names
-/// and slice pointers, not the payload, which is what the PD router's two
+/// `Value`, which the tests use as the oracle. Cloning copies the pointers
+/// to the borrowed names and slices, not the payload; only an owned entry
+/// (a value an edit already replaced, such as the model rewrite, or a name
+/// the parser had to unescape) is copied, which is what the PD router's two
 /// sides need.
 #[derive(Clone)]
 pub(crate) struct RawBody<'a> {
-    fields: Vec<(String, Cow<'a, RawValue>)>,
+    fields: Vec<(Cow<'a, str>, Cow<'a, RawValue>)>,
     mutated: bool,
 }
 
@@ -191,8 +193,9 @@ impl<'a> RawBody<'a> {
 
     /// `serde_json::Map::insert` under `preserve_order`: an existing field
     /// keeps its position, a new one goes last. A value equal to the one
-    /// present changes nothing, so the body stays unmutated.
-    pub(crate) fn insert(&mut self, name: &str, value: Box<RawValue>) {
+    /// present changes nothing, so the body stays unmutated. `name` outlives
+    /// the body (a constant, as every caller's is) and is kept as it is.
+    pub(crate) fn insert(&mut self, name: &'a str, value: Box<RawValue>) {
         match self.fields.iter_mut().find(|(field, _)| field == name) {
             Some((_, slot)) => {
                 if slot.get() == value.get() {
@@ -200,7 +203,7 @@ impl<'a> RawBody<'a> {
                 }
                 *slot = Cow::Owned(value);
             }
-            None => self.fields.push((name.to_owned(), Cow::Owned(value))),
+            None => self.fields.push((Cow::Borrowed(name), Cow::Owned(value))),
         }
         self.mutated = true;
     }
@@ -239,6 +242,43 @@ impl<'a> RawBody<'a> {
     }
 }
 
+/// A top-level field's name: borrowed from the body's bytes where the
+/// parser lends them (a name without an escape, as every field a typed
+/// request declares is), owned where it had to unescape one (a client's key
+/// kept in a flattened `other` map can carry an escape).
+struct FieldName<'a>(Cow<'a, str>);
+
+impl<'de> Deserialize<'de> for FieldName<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldNameVisitor;
+
+        impl<'de> Visitor<'de> for FieldNameVisitor {
+            type Value = FieldName<'de>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a field name")
+            }
+
+            fn visit_borrowed_str<E: de::Error>(self, name: &'de str) -> Result<Self::Value, E> {
+                Ok(FieldName(Cow::Borrowed(name)))
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                Ok(FieldName(Cow::Owned(name.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, name: String) -> Result<Self::Value, E> {
+                Ok(FieldName(Cow::Owned(name)))
+            }
+        }
+
+        deserializer.deserialize_str(FieldNameVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for RawBody<'de> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -258,7 +298,9 @@ impl<'de> Deserialize<'de> for RawBody<'de> {
                 A: MapAccess<'de>,
             {
                 let mut fields = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some((name, value)) = map.next_entry::<String, &'de RawValue>()? {
+                while let Some((FieldName(name), value)) =
+                    map.next_entry::<FieldName<'de>, &'de RawValue>()?
+                {
                     fields.push((name, Cow::Borrowed(value)));
                 }
                 Ok(RawBody {
@@ -681,6 +723,30 @@ mod tests {
         assert!(raw.contains("d"));
         assert!(!raw.contains("a"));
         assert!(RawBody::parse(b"[1,2]").is_err());
+    }
+
+    /// A name the parser had to unescape is owned and a plain one stays
+    /// borrowed from the bytes; the edits read both alike.
+    #[test]
+    fn an_unescaped_name_is_owned_and_a_plain_one_stays_borrowed() {
+        let bytes = br#"{"a\"b":1,"c":2}"#;
+        let mut raw = RawBody::parse(bytes).unwrap();
+        assert!(matches!(raw.fields[0].0, Cow::Owned(_)));
+        assert!(matches!(raw.fields[1].0, Cow::Borrowed(_)));
+        assert_eq!(raw.get("a\"b").map(RawValue::get), Some("1"));
+
+        let mut oracle: Value = serde_json::from_slice(bytes).unwrap();
+        raw.insert("d", to_raw_value(&3).unwrap());
+        oracle
+            .as_object_mut()
+            .unwrap()
+            .insert("d".to_owned(), json!(3));
+        assert!(raw.remove("a\"b"));
+        oracle.as_object_mut().unwrap().remove("a\"b");
+        assert_eq!(
+            raw.to_bytes(None).unwrap(),
+            serde_json::to_vec(&oracle).unwrap()
+        );
     }
 
     /// The prefill side always sets `stream: false`; a non-streaming request

@@ -23,7 +23,7 @@
 //! which makes it deterministically unit-testable with no real timers.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -34,7 +34,7 @@ use std::{
 
 use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::common_proto as common;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tonic::Status;
 
 // ---------------------------------------------------------------------------
@@ -842,7 +842,7 @@ enum EngineMsg {
     Reset,
     /// The publisher restarts: sequence numbers start over, the replay
     /// buffer is emptied, the cache is kept. Acknowledged once applied.
-    RestartPublisher(tokio::sync::oneshot::Sender<()>),
+    RestartPublisher(oneshot::Sender<()>),
 }
 
 /// One admitted request as seen by the engine: the ground truth for routing
@@ -1101,7 +1101,7 @@ impl Engine {
     /// (after its current pass, at most), so a status read right after sees
     /// the new generation.
     pub(crate) async fn restart_publisher(&self) {
-        let (ack, applied) = tokio::sync::oneshot::channel();
+        let (ack, applied) = oneshot::channel();
         if self.tx.send(EngineMsg::RestartPublisher(ack)).is_ok() {
             let _ = tokio::time::timeout(Duration::from_secs(2), applied).await;
         }
@@ -1403,7 +1403,7 @@ async fn run(
         // them (`Engine::output_silence`).
         while shared.faults.paused.load(Ordering::Relaxed) {
             tokio::select! {
-                _ = shared.resume.notified() => {}
+                () = shared.resume.notified() => {}
                 msg = rx.recv() => match msg {
                     Some(msg) => handle_msg(&mut state, &shared, &params, msg),
                     None => return,
@@ -1717,6 +1717,17 @@ impl BlockPool {
         self.refs.len()
     }
 
+    /// Blocks running requests hold: every allocated block but the idle
+    /// cached ones, so a block several requests reference counts once.
+    fn referenced(&self) -> u64 {
+        let idle = self.free_lru.len() as u64;
+        debug_assert!(
+            self.allocated >= idle,
+            "idle cached blocks are allocated blocks"
+        );
+        self.allocated.saturating_sub(idle)
+    }
+
     /// Blocks from the start of `keys` the engine serves from cache: the
     /// main group's leading run of cached blocks, bounded by what the other
     /// groups keep ([`hit_over_groups`]).
@@ -1786,12 +1797,12 @@ impl BlockPool {
     /// already exists the anonymous block is given back and a reference taken.
     fn register(&mut self, h: u64) -> bool {
         match self.refs.entry(h) {
-            std::collections::hash_map::Entry::Occupied(_) => {
+            Entry::Occupied(_) => {
                 self.hit(h);
                 self.release_anonymous(1);
                 false
             }
-            std::collections::hash_map::Entry::Vacant(slot) => {
+            Entry::Vacant(slot) => {
                 slot.insert(1);
                 true
             }
@@ -2030,10 +2041,14 @@ impl SchedulerState {
         });
     }
 
-    /// Tokens of running sequences resident in KV (what `token_usage` reports;
-    /// idle cached blocks are evictable and not counted, as in SGLang).
-    fn active_tokens(&self) -> u64 {
-        self.running.iter().map(|r| u64::from(r.seq_len())).sum()
+    /// Tokens of KV the running sequences hold (what `token_usage` reports):
+    /// the pool's referenced blocks, so a block several of them reference
+    /// counts once, as SGLang and vLLM count a shared prefix. Idle cached
+    /// blocks are evictable and not counted. The pool models one attention
+    /// group and merges any blocks of equal content, which an engine may
+    /// keep apart.
+    fn active_tokens(&self, p: &EngineParams) -> u64 {
+        self.pool.referenced() * u64::from(p.block_size)
     }
 
     /// The measured input capacity while the last prefill pass is within
@@ -2050,7 +2065,7 @@ impl SchedulerState {
     }
 
     fn snapshot(&self, p: &EngineParams) -> LoadSnapshot {
-        let used = self.active_tokens();
+        let used = self.active_tokens(p);
         let waiting_uncached: i64 = self
             .waiting
             .iter()
@@ -2230,7 +2245,9 @@ impl SchedulerState {
             }
             let running_at_admit = self.running.len() as u32;
             let waiting_at_admit = self.waiting.len() as u32;
-            let w = self.waiting.pop_front().expect("front exists");
+            let Some(w) = self.waiting.pop_front() else {
+                break;
+            };
             let NewRequest {
                 request_id,
                 prompt_token_ids,
@@ -2682,17 +2699,19 @@ impl SchedulerState {
                 });
             }
             last_index = Some(c.index);
-            runs.last_mut().expect("run exists").blocks.push((
-                c.index,
-                common::KvBlock {
-                    block_hash: c.key as i64,
-                    token_ids: c.tokens,
-                    block_size: p.block_size as i32,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-            ));
+            if let Some(run) = runs.last_mut() {
+                run.blocks.push((
+                    c.index,
+                    common::KvBlock {
+                        block_hash: c.key as i64,
+                        token_ids: c.tokens,
+                        block_size: p.block_size as i32,
+                        lora_id: None,
+                        cache_level: None,
+                        ..Default::default()
+                    },
+                ));
+            }
         }
         let groups = p.kv_cache_groups.iter().take(8).enumerate();
         for CompletedRun { parent, blocks } in runs {
@@ -3313,6 +3332,46 @@ mod tests {
                 assert!(st.abort("cancelled", &p).is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_block_two_running_sequences_share_counts_once_in_the_reported_usage() {
+        let p = EngineParams {
+            block_size: 4,
+            kv_capacity_tokens: 64,
+            prefix_cache: true,
+            ..EngineParams::default()
+        };
+        let mut st = SchedulerState::new();
+        // Two full blocks both prompts start with, then one full block of each one's own.
+        let shared: Vec<u32> = (70_001..70_009).collect();
+        let prompt = |own: u32| {
+            shared
+                .iter()
+                .copied()
+                .chain(own..own + 4)
+                .collect::<Vec<u32>>()
+        };
+        let (a, _a) = req("a", prompt(71_001), 100);
+        st.enqueue(a, &p);
+        st.step(&p);
+        let (b, _b) = req("b", prompt(72_001), 100);
+        st.enqueue(b, &p);
+        st.step(&p);
+        assert_eq!(st.running.len(), 2);
+        assert!(st.running.iter().all(|r| !r.prefilling()));
+
+        // Each sequence's blocks past the shared two are its own, a partial tail included.
+        let own_blocks: u32 = st.running.iter().map(|r| r.seq_len().div_ceil(4) - 2).sum();
+        let lengths: u32 = st.running.iter().map(RunningReq::seq_len).sum();
+        let snapshot = st.snapshot(&p);
+        let used = u32::try_from(snapshot.num_used_tokens).expect("usage is not negative");
+        assert_eq!(used, 4 * (2 + own_blocks), "the shared blocks count once");
+        assert!(
+            used < lengths,
+            "{used} is below the summed lengths {lengths}"
+        );
+        assert_eq!(snapshot.token_usage, f64::from(used) / 64.0);
     }
 
     #[test]

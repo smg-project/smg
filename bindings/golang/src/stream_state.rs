@@ -9,7 +9,6 @@ use llm_tokenizer::{stream::DecodeStream, StopSequenceDecoder};
 pub struct StreamIndexState {
     pub stop_decoder: Option<StopSequenceDecoder>,
     pub decode_stream: Option<DecodeStream>,
-    pub has_tool_calls: bool,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
 }

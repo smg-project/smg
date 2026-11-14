@@ -20,7 +20,8 @@ pub(crate) use chat_utils::{
     filter_tools_by_tool_choice, generate_tool_call_id, keep_first_tool_call,
     keep_first_tool_call_items, missing_tokenizer_response, parse_finish_reason,
     parse_json_schema_response, process_chat_messages_with_placeholders, resolve_tokenizer,
-    send_error_sse, validate_chat_content_parts, InPlaceBudget,
+    send_error_sse, validate_chat_content_parts, validate_chat_template_content_parts,
+    InPlaceBudget,
 };
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,

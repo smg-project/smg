@@ -1022,10 +1022,9 @@ pub fn translate_encode_request(
 /// viewing the request's bytes rather than copying them: a tensor of the
 /// auxiliary size then travels to the engine as a frame sharing that view.
 /// SHM/remote payloads never reach this translate: ZMQ assembly runs with SHM
-/// disabled and RDMA staging off.
-pub(crate) fn wire_tensor_tokenspeed(
-    tensor: tokenspeed_proto::TensorData,
-) -> Result<WireTensor, String> {
+/// disabled and RDMA staging off. The mock worker reads a request's tensors
+/// through it too, so it refuses exactly the tensors this wire refuses.
+pub fn wire_tensor_tokenspeed(tensor: tokenspeed_proto::TensorData) -> Result<WireTensor, String> {
     let bytes = match tensor.payload {
         Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
         Some(_) => {
@@ -1056,8 +1055,9 @@ pub(crate) fn wire_tensor_tokenspeed(
 }
 
 /// Byte width of the wire dtypes the gateway emits; `None` for dtypes we do
-/// not recognize (passed through unvalidated rather than rejected).
-pub(crate) fn tensor_dtype_width(dtype: &str) -> Option<usize> {
+/// not recognize (passed through unvalidated rather than rejected). The mock
+/// worker reads an SHM handle's byte length with it.
+pub fn tensor_dtype_width(dtype: &str) -> Option<usize> {
     match dtype {
         "float64" | "int64" | "uint64" => Some(8),
         "float32" | "int32" | "uint32" => Some(4),

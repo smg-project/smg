@@ -2,6 +2,12 @@
 //! `POST /admin/script/{worker}` make a worker answer, frame by frame, and
 //! what a request no script covers still gets.
 
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test binary: a failed step panics with what failed"
+)]
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -21,7 +27,6 @@ use engine_zmq_client::{
 };
 use futures::StreamExt;
 use mock_worker::{
-    admin,
     config::{Config, ReplayConfig},
     grpc, http, script, zmq,
 };
@@ -113,12 +118,12 @@ fn chunk(
     }
 }
 
-fn logprobs(token_ids: &[u32], values: &[f32]) -> Option<ts::OutputLogProbs> {
-    Some(ts::OutputLogProbs {
+fn logprobs(token_ids: &[u32], values: &[f32]) -> ts::OutputLogProbs {
+    ts::OutputLogProbs {
         token_logprobs: values.to_vec(),
         token_ids: token_ids.to_vec(),
         top_logprobs: Vec::new(),
-    })
+    }
 }
 
 #[tokio::test]
@@ -148,7 +153,7 @@ async fn grpc_streams_the_scripted_answer_frame_for_frame() {
             prompt_tokens: 7,
             completion_tokens: 3,
             cached_tokens: 2,
-            output_logprobs: logprobs(&[10, 11, 12], &[-0.5, -1.0, -1.5]),
+            output_logprobs: Some(logprobs(&[10, 11, 12], &[-0.5, -1.0, -1.5])),
             matched_stop: Some(ts::generate_complete::MatchedStop::MatchedStopStr(
                 "</s>".to_string(),
             )),
@@ -160,9 +165,9 @@ async fn grpc_streams_the_scripted_answer_frame_for_frame() {
     assert_eq!(
         streamed,
         vec![
-            chunk("s", vec![10], 7, 1, 2, logprobs(&[10], &[-0.5])),
-            chunk("s", vec![11], 7, 2, 2, logprobs(&[11], &[-1.0])),
-            chunk("s", vec![12], 7, 3, 2, logprobs(&[12], &[-1.5])),
+            chunk("s", vec![10], 7, 1, 2, Some(logprobs(&[10], &[-0.5]))),
+            chunk("s", vec![11], 7, 2, 2, Some(logprobs(&[11], &[-1.0]))),
+            chunk("s", vec![12], 7, 3, 2, Some(logprobs(&[12], &[-1.5]))),
             complete.clone(),
         ]
     );
@@ -313,23 +318,9 @@ async fn grpc_fails_a_text_answer_it_cannot_encode_instead_of_answering_canned()
 #[tokio::test]
 async fn the_admin_api_enqueues_answers_in_order_reads_the_counts_and_clears() {
     let (client, worker) = start_grpc(config(None)).await;
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(config(None)),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    let admin_port = common::start_admin(config(None)).await;
     let http = common::http_client();
     let url = |worker: &str| format!("http://127.0.0.1:{admin_port}/admin/script/{worker}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while http.get(url(&worker)).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 
     // Two in order for this worker, one keyed for every worker. (The shared
     // queue, `all`, is not fed here: the tests of this binary run together
@@ -750,8 +741,8 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
     assert_eq!(
         streamed,
         vec![
-            chunk("c", vec![30], 3, 1, 0, logprobs(&[30], &[-0.1])),
-            chunk("c", vec![31], 3, 2, 0, logprobs(&[31], &[-0.2])),
+            chunk("c", vec![30], 3, 1, 0, Some(logprobs(&[30], &[-0.1]))),
+            chunk("c", vec![31], 3, 2, 0, Some(logprobs(&[31], &[-0.2]))),
             ts::GenerateResponse {
                 request_id: "c".to_string(),
                 response: Some(GenResp::Complete(ts::GenerateComplete {
@@ -760,7 +751,7 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
                     prompt_tokens: 3,
                     completion_tokens: 2,
                     cached_tokens: 0,
-                    output_logprobs: logprobs(&[30, 31], &[-0.1, -0.2]),
+                    output_logprobs: Some(logprobs(&[30, 31], &[-0.1, -0.2])),
                     matched_stop: None,
                     index: 0,
                     weight_version: None,
@@ -1338,8 +1329,10 @@ async fn zmq_reports_top_alternatives_with_their_ranks() {
             "logprobs": [-0.25, -0.75],
         })],
     );
-    // Rank 8 and prompts of this test's own: the store is process-wide.
-    let rank = 8;
+    // Rank 9 and prompts of this test's own: the store is process-wide and a
+    // rank's entry is keyed by its index, so two live ranks of one index would
+    // share it and the second one's start would wipe the first's.
+    let rank = 9;
     #[expect(
         clippy::disallowed_methods,
         reason = "serve loops until the test drops its handles"

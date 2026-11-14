@@ -28,6 +28,9 @@ use crate::{
     types::*,
 };
 
+/// How often a step waiting out its backoff reads its workflow's cancellation.
+const CANCELLATION_READ_INTERVAL: Duration = Duration::from_millis(250);
+
 #[derive(Default)]
 struct StepTracker {
     completed: HashSet<StepId>,
@@ -1248,7 +1251,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// Between attempts: the backoff's next delay (a second when it has none
-    /// left), the retrying event, and the wait.
+    /// left), the retrying event, and the wait, which ends early when the
+    /// workflow is cancelled.
     async fn wait_before_retry(
         &self,
         instance_id: WorkflowInstanceId,
@@ -1269,7 +1273,27 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             })
             .await;
 
-        tokio::time::sleep(delay).await;
+        // The cancellation is read between slices of the sleep: a step that
+        // polls a starting engine sleeps minutes between attempts, and the
+        // read before the next attempt would otherwise come after the whole
+        // sleep. A state the store no longer holds ends the wait as well; the
+        // next attempt's read reports it.
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            tokio::time::sleep((deadline - now).min(CANCELLATION_READ_INTERVAL)).await;
+            if self
+                .state_store
+                .is_cancelled(instance_id)
+                .await
+                .unwrap_or(true)
+            {
+                return;
+            }
+        }
     }
 
     /// The last failure: the executor's `on_failure` hook with the step's

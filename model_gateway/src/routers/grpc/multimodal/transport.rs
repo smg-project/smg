@@ -17,10 +17,10 @@ use std::{
 
 use llm_multimodal::{EncoderDtype, Modality};
 use openai_protocol::worker::{ConnectionMode, RuntimeType, TransportMode};
-use smg_mm_rdma::{RdmaConfig, RdmaExporter};
+use smg_mm_rdma::{RdmaConfig, RdmaExporter, STAGES_OVER_RDMA};
 use tracing::{error, info, warn};
 
-use super::{serialize::wire_dtype, settings::mm_settings};
+use super::{encoder_budget::WIRE_MESSAGE_CAP, serialize::wire_dtype, settings::mm_settings};
 use crate::{
     routers::grpc::{
         backend_client::BackendClient, context::WorkerSelection, proto_wrapper::mm_shm_dev_writable,
@@ -597,6 +597,100 @@ fn shared_image_wire_dtype(
     shared
 }
 
+/// The byte bound a request's pixel tensors must stay within before any image
+/// is decoded, when every worker the selection can pick (over `pools`) takes
+/// them inline in the gateway's own Generate message: the gRPC framing's
+/// [`WIRE_MESSAGE_CAP`]. `None` when any candidate may take them another way
+/// (an SHM handle, the RDMA lane, a TRT-LLM worker's file bytes, a ZMQ wire
+/// with no such framing) or when no candidate is known: the framing itself
+/// still refuses a message it cannot carry, as the request's own size.
+pub(crate) fn mm_image_wire_cap_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+) -> Option<usize> {
+    image_wire_cap_over(registry, model_id, pools, &rdma_lane_stages)
+}
+
+/// Whether the RDMA lane stages pixels in this process: a build with the real
+/// exporter ([`STAGES_OVER_RDMA`]; the default build's exporter constructs but
+/// exports nothing, so its bytes ride inline) and the exporter built (the lane
+/// on, a listener IP, NIXL up). The build is asked first, so a build without
+/// the lane never constructs the exporter from this reading.
+fn rdma_lane_stages() -> bool {
+    STAGES_OVER_RDMA && mm_rdma_exporter().is_some()
+}
+
+/// [`mm_image_wire_cap_over`] with the RDMA lane's reading given as a closure,
+/// evaluated only when a TokenSpeed candidate comes up (the exporter is built
+/// lazily on its first read, an arena and its registration, which a fleet
+/// without TokenSpeed never needs), and so that a test reads both states.
+fn image_wire_cap_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+    rdma_lane_stages: &dyn Fn() -> bool,
+) -> Option<usize> {
+    let workers: Vec<Arc<dyn Worker>> = pools
+        .iter()
+        .flat_map(|pool| {
+            registry
+                .get_routing_pool(model_id, *pool)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (!workers.is_empty()
+        && workers
+            .iter()
+            .all(|worker| pixels_ride_in_the_message(worker, rdma_lane_stages)))
+    .then_some(WIRE_MESSAGE_CAP)
+}
+
+/// Whether `worker` takes a request's pixel tensors inline in the Generate
+/// message the gateway encodes: a gRPC worker whose runtime reads them from
+/// the message. SGLang always does. TokenSpeed stages every encoder input
+/// over the RDMA lane whenever the lane stages in this process
+/// (`rdma_lane_stages`, read only here: the dispatch's `into_proto(true)` and
+/// the EPD encode stage read no per-worker mode); otherwise it and vLLM follow the
+/// transport mode (the per-worker override or the router default, read as
+/// the SHM path reads it): `inline` rides in the message, and so does `rdma`
+/// (vLLM never pulls RDMA, and TokenSpeed without a staging lane falls back
+/// to inline); `shm`, and `auto` on a shared `/dev/shm`, send a handle
+/// instead. A TRT-LLM worker takes the files' bytes and a ZMQ wire has no
+/// such framing.
+fn pixels_ride_in_the_message(
+    worker: &Arc<dyn Worker>,
+    rdma_lane_stages: &dyn Fn() -> bool,
+) -> bool {
+    let spec = &worker.metadata().spec;
+    if spec.connection_mode != ConnectionMode::Grpc {
+        return false;
+    }
+    match spec.runtime_type {
+        RuntimeType::Sglang => true,
+        RuntimeType::TokenSpeed if rdma_lane_stages() => false,
+        RuntimeType::Vllm | RuntimeType::TokenSpeed => match spec
+            .multimodal_tensor_transport
+            .unwrap_or_else(|| mm_transport_defaults().mode)
+        {
+            TransportMode::Inline | TransportMode::Rdma => true,
+            TransportMode::Shm => !mm_shm_dev_writable(),
+            TransportMode::Auto => {
+                !(mm_shm_dev_writable()
+                    && local_shm_namespace_id()
+                        .is_some_and(|local| worker_matches_shm_namespace(worker, local)))
+            }
+        },
+        RuntimeType::Trtllm
+        | RuntimeType::Mlx
+        | RuntimeType::External
+        | RuntimeType::Generic
+        | RuntimeType::Unspecified => false,
+    }
+}
+
 /// Use one connection snapshot for both the dtype and pending-handshake check.
 /// Initialization between those decisions must not freeze a float32 layout.
 fn image_wire_dtype_with_backend(
@@ -1067,6 +1161,146 @@ mod tests {
             mm_shared_image_wire_dtype_over(&registry, "qwen3-vl", pools),
             expected,
             "the stages see the fleet's wire dtype unless the switch turns the one-pass write off"
+        );
+    }
+
+    /// The up-front pixel bound holds only where every worker the selection
+    /// can pick takes the tensors inline in the gateway's gRPC message: one
+    /// worker on the SHM transport, a TRT-LLM pool or a ZMQ wire drops it.
+    #[test]
+    fn the_image_wire_cap_holds_only_for_an_inline_grpc_fleet() {
+        use openai_protocol::worker::WorkerSpec;
+
+        use crate::{
+            routers::grpc::{mode::Mode, proto_wrapper::mm_shm_dev_writable},
+            worker::{ConnectionMode, WorkerRegistry},
+        };
+
+        let pools = Mode::Regular.multimodal_wire_pools();
+        let fleet = |specs: Vec<WorkerSpec>, rdma_lane_stages: &dyn Fn() -> bool| {
+            let registry = WorkerRegistry::new();
+            for spec in specs {
+                registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::from_spec(spec)
+                            .model(ModelCard::new("qwen3-vl"))
+                            .worker_type(WorkerType::Regular)
+                            .health_config(no_health_check())
+                            .build(),
+                    ))
+                    .expect("register");
+            }
+            image_wire_cap_over(&registry, "qwen3-vl", pools, rdma_lane_stages)
+        };
+        let grpc = |url: &str, runtime: RuntimeType, transport: Option<TransportMode>| WorkerSpec {
+            connection_mode: ConnectionMode::Grpc,
+            runtime_type: runtime,
+            multimodal_tensor_transport: transport,
+            ..WorkerSpec::new(url)
+        };
+        let inline_fleet = || {
+            vec![
+                grpc(
+                    "grpc://inline-1:8000",
+                    RuntimeType::Vllm,
+                    Some(TransportMode::Inline),
+                ),
+                grpc(
+                    "grpc://inline-2:8000",
+                    RuntimeType::TokenSpeed,
+                    Some(TransportMode::Inline),
+                ),
+                grpc("grpc://inline-3:8000", RuntimeType::Sglang, None),
+            ]
+        };
+        assert_eq!(
+            fleet(inline_fleet(), &|| false),
+            Some(WIRE_MESSAGE_CAP),
+            "an inline gRPC fleet keeps the bound"
+        );
+        assert_eq!(
+            fleet(inline_fleet(), &|| true),
+            None,
+            "a live RDMA exporter takes every TokenSpeed input over NIXL, whatever the worker's mode"
+        );
+        assert_eq!(
+            fleet(
+                vec![
+                    grpc(
+                        "grpc://inline-1:8000",
+                        RuntimeType::Vllm,
+                        Some(TransportMode::Inline),
+                    ),
+                    grpc("grpc://rdma-1:8000", RuntimeType::Vllm, Some(TransportMode::Rdma)),
+                ],
+                &|| true,
+            ),
+            Some(WIRE_MESSAGE_CAP),
+            "vLLM never pulls RDMA: its pixels ride inline under a live exporter and the rdma mode alike"
+        );
+        if mm_shm_dev_writable() {
+            assert_eq!(
+                fleet(
+                    vec![
+                        grpc(
+                            "grpc://inline-1:8000",
+                            RuntimeType::Vllm,
+                            Some(TransportMode::Inline)
+                        ),
+                        grpc(
+                            "grpc://shm-1:8000",
+                            RuntimeType::Vllm,
+                            Some(TransportMode::Shm)
+                        ),
+                    ],
+                    &|| false
+                ),
+                None,
+                "one worker on the SHM transport drops it"
+            );
+        }
+        assert_eq!(
+            fleet(
+                vec![grpc("grpc://trt-1:8000", RuntimeType::Trtllm, None)],
+                &|| false
+            ),
+            None,
+            "a TRT-LLM pool takes the files' bytes"
+        );
+        assert_eq!(
+            fleet(
+                vec![WorkerSpec {
+                    connection_mode: ConnectionMode::Zmq,
+                    runtime_type: RuntimeType::Vllm,
+                    ..WorkerSpec::new("ipc:///vllm-1")
+                }],
+                &|| false
+            ),
+            None,
+            "a ZMQ wire has no such framing"
+        );
+        assert_eq!(fleet(vec![], &|| false), None, "no candidate, no bound");
+    }
+
+    /// A build without the lane (the default build: the exporter constructs but
+    /// exports nothing, so every byte rides inline) never reads the lane as
+    /// staging, whatever the lane's switches and listener say, and so keeps
+    /// the bound for TokenSpeed; the build is asked before any exporter is
+    /// built. The build's own answer is pinned at compile time (a const
+    /// block, as clippy asks of an assertion on a constant), the reading's
+    /// at run time.
+    #[cfg(not(feature = "mm-rdma"))]
+    #[test]
+    fn a_build_without_the_rdma_lane_keeps_the_bound() {
+        const {
+            assert!(
+                !STAGES_OVER_RDMA,
+                "the default build carries the no-op exporter"
+            );
+        };
+        assert!(
+            !rdma_lane_stages(),
+            "the inert exporter is never read as a staging lane"
         );
     }
 

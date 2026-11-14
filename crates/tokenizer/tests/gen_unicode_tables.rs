@@ -85,6 +85,8 @@ fn print_unicode_tables() {
         ("OTHER_LETTER", r"\p{Lo}"),
         ("SPACE", r"\s"),
         ("HAN", r"\p{Han}"),
+        ("DIGIT", r"\d"),
+        ("WORD", r"\w"),
     ] {
         let ranges = ranges_of(pattern);
         println!(

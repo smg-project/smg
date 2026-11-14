@@ -871,7 +871,11 @@ pub fn active() -> bool {
 /// A worker that started, by name (`grpc:<port>`, `http:<port>`,
 /// `zmq:<index>`): the admin routes accept it from then on. The name starts
 /// clean: a port a stopped worker of this process had, bound again, hands
-/// its successor no queued or filed answers and no hits or misses.
+/// its successor no queued or filed answers and no hits or misses. The name
+/// must be one live worker's: a port is, as the bind precedes the start, and
+/// a ZMQ rank's index is the caller's to keep unique, since a second live
+/// rank of one index would start the first rank's entry clean while it
+/// still serves.
 pub fn register(worker: &str) {
     store().start(worker);
 }
@@ -1189,7 +1193,7 @@ mod tests {
             r#"{"output_ids": [1], "matched_stop": true}"#,
             r#"{"output_ids": [1], "delay": 5}"#,
             r#"{"output_ids": ["x"]}"#,
-            r#"[1]"#,
+            r"[1]",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }

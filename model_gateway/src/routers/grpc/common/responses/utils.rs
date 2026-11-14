@@ -53,10 +53,10 @@ pub(crate) fn generation_failure_error(finish_reason: Option<&str>) -> Option<Va
 /// whole one: cut by the token limit or an abort, or ended by the model and not read whole (a
 /// tagged syntax that refused bytes inside the call writes no close for it; a JSON syntax carries
 /// the bytes as written from where they stopped being JSON), the turn ending on the call
-/// (`tool_calls`) all the same; a failed generation stays `in_progress`.
+/// (`tool_calls`) all the same; a failed or cancelled generation stays `in_progress`.
 pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
     match finish_reason {
-        Some("failed" | "error") => "in_progress",
+        Some("failed" | "error" | "cancelled") => "in_progress",
         _ if serde_json::from_str::<Value>(arguments).is_err() => "incomplete",
         _ => "completed",
     }
@@ -78,7 +78,8 @@ pub(crate) fn cut_call<'a>(
 /// The response's status for the Chat finish reason, with why it is incomplete: a `length`
 /// finish is the token limit; a call that is no whole call under any other finish (`cut_call`,
 /// read on the calls' function-shaped arguments) leaves the response incomplete with no stated
-/// reason. Every
+/// reason; `cancelled` is the gateway's own finish for a stream stopped before its end (the
+/// client left a stored stream), `cancelled` with no reason. Every
 /// builder of a Responses object reads its status here: the non-streaming conversions,
 /// regular and Harmony, the stored object of a regular streamed turn, and the emitter for its
 /// terminal event and stored object under the finish it holds, whether chat chunks or a
@@ -89,6 +90,7 @@ pub(crate) fn response_status(
 ) -> (ResponseStatus, Option<IncompleteDetails>) {
     match finish_reason {
         Some("failed" | "error") => (ResponseStatus::Failed, None),
+        Some("cancelled") => (ResponseStatus::Cancelled, None),
         Some("length") => (
             ResponseStatus::Incomplete,
             Some(IncompleteDetails {
@@ -324,6 +326,14 @@ pub(crate) fn decode_reasoning_content(blob: &str) -> Option<String> {
     String::from_utf8(BASE64_STANDARD.decode(payload).ok()?).ok()
 }
 
+/// Whether `name` is `namespace` and `member` joined by a dot, read at the
+/// dot without building the joined text.
+fn is_namespaced(name: &str, namespace: &str, member: &str) -> bool {
+    name.strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| rest == member)
+}
+
 /// Recover structured identity only for a declared namespace member.
 /// Literal top-level names (including dots) take precedence over namespace matches.
 pub(crate) fn resolve_function_identity(
@@ -339,7 +349,7 @@ pub(crate) fn resolve_function_identity(
             if let ResponseTool::Namespace(namespace) = tool {
                 for member in &namespace.tools {
                     if let NamespaceTool::Function(ft) = member {
-                        if name == format!("{}.{}", namespace.name, ft.function.name) {
+                        if is_namespaced(name, &namespace.name, &ft.function.name) {
                             return (ft.function.name.clone(), Some(namespace.name.clone()));
                         }
                     }
@@ -1177,6 +1187,20 @@ mod tests {
             resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
             ("weather.lookup".into(), None)
         );
+    }
+
+    #[test]
+    fn a_namespaced_name_is_read_at_the_dot() {
+        assert!(is_namespaced("weather.lookup", "weather", "lookup"));
+        for (name, namespace, member) in [
+            ("weatherx.lookup", "weather", "lookup"),
+            ("weather.lookups", "weather", "lookup"),
+            ("weather.lookup.now", "weather", "lookup"),
+            ("weather", "weather", ""),
+            ("lookup", "", "lookup"),
+        ] {
+            assert!(!is_namespaced(name, namespace, member), "{name}");
+        }
     }
 
     #[test]

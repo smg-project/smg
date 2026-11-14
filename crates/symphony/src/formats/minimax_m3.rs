@@ -1,7 +1,9 @@
 //! MiniMax M3: reasoning between `<mm:think>` and `</mm:think>`, the calls of one turn between
 //! `<tool_call>` and `</tool_call>`, each call between `<invoke name="…">` and `</invoke>` as an
 //! XML tree of arguments, everything else content, and the separator token `]<]minimax[>[` before
-//! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`.
+//! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`;
+//! `MiniMax-M3.1-Flash` reads with it (the same tokenizer and wire; its template differs only
+//! outside the wire, as `docs/tables.md` notes).
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 

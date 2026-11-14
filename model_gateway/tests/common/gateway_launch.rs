@@ -337,7 +337,7 @@ pub enum Reply {
 
 /// One keep-alive `GET path` on `stream` (no `Connection: close`), and what
 /// it got back.
-pub fn keep_alive_get(stream: &mut TcpStream, path: &str) -> Reply {
+pub fn keep_alive_get<S: Read + Write>(stream: &mut S, path: &str) -> Reply {
     let _ = stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes());
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];

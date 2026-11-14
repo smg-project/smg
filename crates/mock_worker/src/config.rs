@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel};
+use crate::{
+    engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel},
+    kv_zmq::{KvZmqConfig, Wire},
+};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -110,7 +113,7 @@ pub struct Config {
     /// Batches each publisher keeps for replay.
     pub kv_events_buffer_steps: usize,
     /// Which engine's wire the publishers speak.
-    pub kv_events_wire: crate::kv_zmq::Wire,
+    pub kv_events_wire: Wire,
     /// Which backend's load report the workers imitate (`GetLoads`, `/v1/loads`).
     pub loads_like: LoadsLike,
     /// What the load record says of the mock's wire: `true` imitates an
@@ -375,7 +378,7 @@ impl Default for Config {
             kv_events_replay: true,
             kv_events_topic: String::new(),
             kv_events_buffer_steps: 10_000,
-            kv_events_wire: crate::kv_zmq::Wire::Vllm,
+            kv_events_wire: Wire::Vllm,
             loads_like: LoadsLike::Mock,
             step_reports: false,
             role: None,
@@ -420,11 +423,11 @@ impl Config {
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-step-ms" => cfg.zmq_step_ms = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
-                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--zmq-lockstep" => cfg.zmq_lockstep = true,
                 "--zmq-add-delay-ms" => {
-                    cfg.zmq_add_delay_ms = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.zmq_add_delay_ms = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--model" => cfg.model_id = value(&mut args, &flag)?,
                 "--tokenizer" => cfg.tokenizer_path = value(&mut args, &flag)?,
@@ -454,7 +457,7 @@ impl Config {
                     timing.decode_poly = Some(parse_poly(value(&mut args, &flag)?, &flag)?);
                 }
                 "--prefill-tps" => {
-                    timing.prefill_tps = Some(parse(value(&mut args, &flag)?, &flag)?)
+                    timing.prefill_tps = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
                 "--decode-base-ms" => {
                     timing.decode_base_ms = Some(parse(value(&mut args, &flag)?, &flag)?);
@@ -530,7 +533,7 @@ impl Config {
                         Duration::try_from_secs_f64(secs).map_err(|e| format!("{flag}: {e}"))?;
                 }
                 "--prefix-cache" => {
-                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
@@ -538,7 +541,7 @@ impl Config {
         }
 
         if cfg.tokenizer_path.is_empty() {
-            cfg.tokenizer_path = cfg.model_id.clone();
+            cfg.tokenizer_path.clone_from(&cfg.model_id);
         }
         cfg.default_sampling_params_json = sampling_defaults_json(Path::new(&cfg.model_id));
         let (model, calibration) = timing.resolve()?;
@@ -580,8 +583,7 @@ impl Config {
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
         }
-        if cfg.kv_events_wire == crate::kv_zmq::Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1
-        {
+        if cfg.kv_events_wire == Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1 {
             return Err(
                 "--kv-cache-groups names several groups, but the SGLang wire (--kv-events-wire \
                  sglang) publishes one cache group"
@@ -619,9 +621,9 @@ impl Config {
         }
         if cfg.role.is_some() && cfg.http_count > 0 && (cfg.grpc_count > 0 || cfg.zmq_count > 0) {
             return Err(
-                "--worker-type gives one wire's workers the role: pass --http-count or \
-                 --grpc-count/--zmq-count, not both (worker i of either wire would bind the \
-                 same bootstrap port)"
+                "--worker-type gives the role to the HTTP workers alone or to the gRPC workers \
+                 and ZMQ ranks together: pass --http-count or --grpc-count/--zmq-count, not \
+                 both (an HTTP worker i and a gRPC worker i would bind the same bootstrap port)"
                     .to_string(),
             );
         }
@@ -683,17 +685,13 @@ impl Config {
     /// then ZMQ ranks), when publishing is on and the engine is realistic.
     /// `dp_rank` is the rank the publisher stamps on the vLLM wire: 0 for a
     /// gRPC worker, the engine index a ZMQ rank advertises.
-    pub(crate) fn kv_zmq_for(
-        &self,
-        index: u16,
-        dp_rank: i32,
-    ) -> Option<crate::kv_zmq::KvZmqConfig> {
+    pub(crate) fn kv_zmq_for(&self, index: u16, dp_rank: i32) -> Option<KvZmqConfig> {
         if !self.realistic {
             return None;
         }
         let base = self.kv_events_zmq_base_port?;
         let port = base.checked_add(index.checked_mul(2)?)?;
-        Some(crate::kv_zmq::KvZmqConfig {
+        Some(KvZmqConfig {
             host: self.host.clone(),
             port,
             replay: self.kv_events_replay,
@@ -1338,7 +1336,7 @@ mod tests {
     /// numbered after the gRPC workers (a ZMQ prefill rank needs the base
     /// port); the encode role is the gRPC wire's alone.
     #[test]
-    fn the_prefill_and_decode_roles_are_one_wires_workers() {
+    fn the_prefill_and_decode_roles_are_the_http_side_or_the_grpc_and_zmq_side() {
         let grpc = ["--grpc-base-port", "19000", "--grpc-count", "2"];
         let cfg = parse(&grpc).expect("gRPC flags parse");
         assert_eq!((cfg.role, cfg.bootstrap_base_port), (None, None));
@@ -1399,7 +1397,7 @@ mod tests {
             .contains("HTTP workers have no encode role"));
         assert!(
             parse(&[&grpc[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
-                .expect_err("one wire's workers take the role")
+                .expect_err("the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role")
                 .contains("not both")
         );
         let zmq = [
@@ -1447,7 +1445,7 @@ mod tests {
             .contains("not encode"));
         assert!(
             parse(&[&zmq[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
-                .expect_err("one wire's workers take the role")
+                .expect_err("the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role")
                 .contains("not both")
         );
         assert!(parse(

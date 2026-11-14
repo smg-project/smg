@@ -629,7 +629,8 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 
         debug!(
             "Discovering metadata for {} ({:?})",
-            config.url, connection_mode
+            Endpoint::redacted_str(&config.url),
+            connection_mode
         );
 
         let (discovered_labels, detected_runtime) = match connection_mode {
@@ -641,7 +642,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .unwrap_or_else(|| {
                         warn!(
                             "No detected_runtime_type for {}, defaulting to sglang",
-                            config.url
+                            Endpoint::redacted_str(&config.url)
                         );
                         "sglang"
                     });
@@ -688,14 +689,18 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             }
         }
         .unwrap_or_else(|e| {
-            warn!("Failed to fetch metadata for {}: {}", config.url, e);
+            warn!(
+                "Failed to fetch metadata for {}: {}",
+                Endpoint::redacted_str(&config.url),
+                e
+            );
             (HashMap::new(), None)
         });
 
         debug!(
             "Discovered {} labels for {}",
             discovered_labels.len(),
-            config.url
+            Endpoint::redacted_str(&config.url)
         );
         context.data.discovered_labels = discovered_labels;
         if let Some(runtime) = detected_runtime {
@@ -771,7 +776,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::workflow::steps::local::test_support::labels_of;
+    use crate::{server::http_client, workflow::steps::local::test_support::labels_of};
 
     /// A ZMQ worker's labels say its grammars start at the first generated
     /// token (the gateway's own link holds them there), with or without the
@@ -871,7 +876,7 @@ mod tests {
         ])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&http_client(), &base, None).await;
         assert_eq!(
             label(&labels, "model_path"),
             Some("org/model-a"),
@@ -915,7 +920,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::server::http_client();
+        let client = http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-b"));
@@ -960,7 +965,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::server::http_client();
+        let client = http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-c"));
@@ -987,7 +992,7 @@ mod tests {
         let models = serde_json::json!({"data": [
             {"id": "served-d", "root": "org/model-d", "max_model_len": 8192}
         ]});
-        let client = crate::server::http_client();
+        let client = http_client();
 
         let base = serve_json_routes(vec![
             ("/v1/models", StatusCode::OK, models.clone()),
@@ -1021,7 +1026,7 @@ mod tests {
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
-        let client = crate::server::http_client();
+        let client = http_client();
 
         assert!(fetch_vllm_http_metadata(&client, &base, None)
             .await
@@ -1331,7 +1336,7 @@ mod tests {
         )])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&http_client(), &base, None).await;
 
         assert_eq!(
             labels.get("served_model_name").map(String::as_str),
@@ -1372,7 +1377,7 @@ mod tests {
         });
 
         let err = get_server_info(
-            &crate::server::http_client(),
+            &http_client(),
             &format!("http://user:secret@127.0.0.1:{port}"),
             None,
         )

@@ -117,23 +117,38 @@ fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
 /// (`Worker::max_running_requests`) prefers them.
 pub(crate) const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
+/// The labels that name a model's context window (one spelling per engine
+/// family's model info), in the order the card's read
+/// (`create_worker::card_from_labels`) prefers them.
+pub(crate) const CONTEXT_WINDOW_LABELS: [&str; 5] = [
+    "context_length",
+    "max_context_length",
+    "max_model_len",
+    "max_total_tokens",
+    "max_seq_len",
+];
+
 /// A worker's labels after a merge: `current` (the discovered labels at
 /// registration, the worker's own on a label update) with `by_hand` (the
 /// spec's own labels, the request's) on top. A window the operator set by
-/// hand is the worker's only window: a window under the other name is
-/// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
-/// and would otherwise take the engine's figure over the operator's, on
-/// every worker, expanded per rank or not. Registration, the admin label
-/// update and its early cap check all merge through here.
+/// hand is the worker's only window of its kind: the running window
+/// (`WINDOW_LABELS`) and the context window (`CONTEXT_WINDOW_LABELS`) each
+/// have a spelling per engine family and a reader that prefers one spelling
+/// to another, so the engine's figure under another spelling, which the
+/// reader would take over the operator's, on every worker, expanded per rank
+/// or not, is dropped. Registration, the admin label update, its early cap
+/// check and a refresh (`refreshed_labels`) all merge through here.
 pub(crate) fn merge_labels(
     current: &HashMap<String, String>,
     by_hand: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut labels = current.clone();
-    if WINDOW_LABELS.iter().any(|key| by_hand.contains_key(*key)) {
-        for key in WINDOW_LABELS {
-            if !by_hand.contains_key(key) {
-                labels.remove(key);
+    for family in [&WINDOW_LABELS[..], &CONTEXT_WINDOW_LABELS[..]] {
+        if family.iter().any(|key| by_hand.contains_key(*key)) {
+            for key in family {
+                if !by_hand.contains_key(*key) {
+                    labels.remove(*key);
+                }
             }
         }
     }
@@ -187,10 +202,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// its peers hold for the key, so the claim's publication outranks it.
     fn raise_revision_to(&self, _floor: u64) {}
 
-    /// Epochs reported during metadata discovery, invalidated after a health
-    /// failure. These are observations, not proof against an undetected restart.
-    fn cache_trace_epochs(&self) -> Vec<String> {
+    /// Epochs reported during metadata discovery, as the registration
+    /// advertises them: current only while
+    /// [`Self::cache_trace_epochs_valid`] holds. These are observations, not
+    /// proof against an undetected restart.
+    fn advertised_cache_trace_epochs(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Whether the advertised epochs are current: a health failure withdraws
+    /// them. The epochs' one live read: a routing-evidence row keeps this
+    /// bit where its pick runs and reads the advertised list when the
+    /// evidence is written.
+    fn cache_trace_epochs_valid(&self) -> bool {
+        false
     }
 
     /// Set the worker's lifecycle status.
@@ -202,6 +227,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// attached to a single shared runtime across the old and new objects.
     fn inherit_shared_state_from(&self, _other: &dyn Worker) -> bool {
         false
+    }
+
+    /// The runtime a stream of this worker notes its progress on, captured
+    /// once at the stream's start (see `TrackedStream`): the shared
+    /// [`WorkerRuntime`] every handle of the worker reaches, so the runtime's
+    /// own millisecond rule decides every note. `None` for a worker without
+    /// one, whose streams note through [`Self::note_token_progress_at`].
+    ///
+    /// A stream keeps noting the runtime it captured, so a worker's runtime
+    /// is not swapped once the worker can take a stream: the one swap,
+    /// [`Self::inherit_shared_state_from`], runs on a replacement before the
+    /// registry publishes it.
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        None
     }
 
     /// Check if the worker is currently healthy (status == Ready).
@@ -720,6 +759,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// its runs.
     fn prefill_unanswered_run(&self) -> Option<Duration> {
         None
+    }
+
+    /// How long the worker's prompts have gone unanswered since its latest
+    /// first response: [`Self::prefill_unanswered_run`] with the idle spells
+    /// still left out but read whether or not a prompt is pending, so a
+    /// worker that was given up on and holds nothing still reports the
+    /// silence it owes. Zero after an answer, for a worker never dispatched
+    /// to, or for one that does not track its runs.
+    fn prefill_unanswered_total(&self) -> Duration {
+        Duration::ZERO
     }
 
     /// Whether the engine behind the worker is on a prompt shape it has not
@@ -1537,16 +1586,17 @@ impl Worker for BasicWorker {
         self.runtime.load().raise_revision_to(floor);
     }
 
-    fn cache_trace_epochs(&self) -> Vec<String> {
-        if !self.runtime.load().cache_trace_epochs_valid() {
-            return Vec::new();
-        }
+    fn advertised_cache_trace_epochs(&self) -> Vec<String> {
         self.metadata
             .spec
             .labels
             .get("cache_trace_epochs")
             .and_then(|epochs| serde_json::from_str(epochs).ok())
             .unwrap_or_default()
+    }
+
+    fn cache_trace_epochs_valid(&self) -> bool {
+        self.runtime.load().cache_trace_epochs_valid()
     }
 
     fn set_status(&self, status: WorkerStatus) {
@@ -1731,6 +1781,10 @@ impl Worker for BasicWorker {
         changed
     }
 
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        Some(self.runtime.load_full())
+    }
+
     fn note_contact(&self) {
         self.runtime.load().note_contact();
     }
@@ -1878,6 +1932,10 @@ impl Worker for BasicWorker {
 
     fn prefill_unanswered_run(&self) -> Option<Duration> {
         self.runtime.load().prefill_unanswered_run()
+    }
+
+    fn prefill_unanswered_total(&self) -> Duration {
+        self.runtime.load().prefill_unanswered_total()
     }
 
     fn prefill_cold_shape(&self, tokens: u64) -> bool {

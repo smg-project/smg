@@ -2,7 +2,6 @@
 
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
-use tool_parser::ParserFactory;
 
 /// Global tokio runtime for all async FFI operations
 #[expect(
@@ -11,6 +10,3 @@ use tool_parser::ParserFactory;
 )]
 pub static RUNTIME: Lazy<Runtime> =
     Lazy::new(|| Runtime::new().expect("Failed to create tokio runtime for FFI"));
-
-/// Global parser factory (initialized once)
-pub static PARSER_FACTORY: Lazy<ParserFactory> = Lazy::new(ParserFactory::new);

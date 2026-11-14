@@ -104,3 +104,25 @@ fn a_window_the_operator_set_stays_the_only_window_when_the_engine_names_the_oth
         labels_of(&[("max_num_seqs", "8")]),
     );
 }
+
+/// The context window follows the same rule as the running window: a limit
+/// the operator set under one of its names stays the worker's only context
+/// window when the engine's report (a ZMQ handshake's, a model-info
+/// endpoint's) names a wider one under the name the reader prefers.
+#[test]
+fn a_context_window_the_operator_set_stays_the_only_window_when_the_engine_names_the_other() {
+    let discovered = labels_of(&[("constrained_decoding_start", "first_token")]);
+    let current = labels_of(&[
+        ("constrained_decoding_start", "first_token"),
+        ("max_model_len", "2048"),
+    ]);
+    let fresh = labels_of(&[
+        ("constrained_decoding_start", "first_token"),
+        ("max_context_length", "4096"),
+    ]);
+    assert_eq!(
+        refreshed_labels(&current, &discovered, &fresh),
+        current,
+        "the engine's window under the preferred name is not added beside the operator's limit"
+    );
+}

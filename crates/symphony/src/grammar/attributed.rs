@@ -19,6 +19,8 @@
 //!
 //! [`shape`]: crate::shape
 
+use std::sync::Arc;
+
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
@@ -118,7 +120,7 @@ fn string_attribute_calls(
                 Grammar::Sequence(vec![
                     Grammar::ConstString("false\">".to_string()),
                     Grammar::JsonSchema {
-                        schema: Value::Bool(true),
+                        schema: Arc::new(Value::Bool(true)),
                         style: None,
                         excludes: Vec::new(),
                         whitespace: Whitespace::Free,

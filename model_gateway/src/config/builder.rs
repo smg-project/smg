@@ -6,8 +6,8 @@ use smg_mcp::McpConfig;
 
 use super::{
     AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
-    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PolicyEngineMode,
+    GroupedDpSticky, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
+    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
     PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
@@ -736,8 +736,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn policy_engine(mut self, mode: PolicyEngineMode) -> Self {
-        self.config.policy_engine = mode;
+    pub fn grouped_dp_sticky(mut self, mode: GroupedDpSticky) -> Self {
+        self.config.grouped_dp_sticky = mode;
         self
     }
 

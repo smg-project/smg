@@ -46,7 +46,7 @@ fn check_batch(
                 if registry.get_by_url(worker.url()).is_some() {
                     return Err(step_failed(format!(
                         "Worker {} already exists",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
                 // The registry is keyed by URL, so a batch that repeats one
@@ -54,7 +54,7 @@ fn check_batch(
                 if !batch_urls.insert(worker.url()) {
                     return Err(step_failed(format!(
                         "Worker {} appears twice in the same registration",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
             }
@@ -89,14 +89,14 @@ fn register_worker(
             expected_revision,
         } => {
             let worker_id = WorkerId::from_string(worker_id.clone());
-            let url = worker.url().to_string();
+            let address = worker.redacted_url().to_string();
             // Fails when the ID is gone or the worker moved on, which covers
             // the concurrent DELETE, DELETE + POST, and second-PUT cases.
             if registry.replace_claiming_local(&worker_id, worker, *expected_revision) {
                 Ok(worker_id)
             } else {
                 Err(step_failed(format!(
-                    "Worker {} at {url} is no longer at revision {expected_revision}, \
+                    "Worker {} at {address} is no longer at revision {expected_revision}, \
                      so the replacement was dropped",
                     worker_id.as_str()
                 )))
@@ -158,21 +158,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         let left_models = models_left(&app_context.worker_registry, workers);
 
         for worker in workers {
-            // The handle this URL had before the write: a registration that
-            // replaces it tells the policy registry, as a removal would, so
-            // the engine's rows of the retired handle do not outlive it (the
-            // policies' URL-keyed state carries over to the replacement).
-            let previous = app_context.worker_registry.get_by_url(worker.url());
             let worker_id = register_worker(
                 &app_context.worker_registry,
                 Arc::clone(worker),
                 &registration_mode,
             )?;
-            if let Some(previous) = previous.filter(|previous| !Arc::ptr_eq(previous, worker)) {
-                app_context
-                    .policy_registry
-                    .on_worker_replaced(previous.as_ref(), worker.as_ref());
-            }
             debug!(
                 "Registered worker {} (model: {}) with ID {:?}",
                 worker.redacted_url(),

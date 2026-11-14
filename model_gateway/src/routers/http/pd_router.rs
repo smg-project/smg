@@ -38,10 +38,11 @@ use tracing::{debug, error, warn};
 use super::{
     request_body::RawBody,
     stream_failure::{cause, head_success_recorded, RelaySource},
-    stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
+    stream_relay::{relay_streaming_body, ChunkHook, ChunkMode, ChunkStep, Relay},
     tenant_rate_limit::{self, TenantCharge},
 };
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::{
@@ -71,6 +72,7 @@ use crate::{
             },
             serialize_json_sized,
             sse::SseEncoder,
+            sse_rechunk::{find_frame_end, MAX_FRAME_BYTES},
             trim_serialization_slack,
         },
         error,
@@ -374,7 +376,7 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{}/{endpoint}", worker.url());
+        let url = format!("{}/{endpoint}", worker.base_url());
         let mut request_builder = worker.http_client().get(&url);
 
         // A public route outside the auth middleware: the caller's headers go
@@ -461,7 +463,7 @@ impl PDRouter {
         clippy::unused_async,
         reason = "async for API consistency with other router constructors"
     )]
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -585,10 +587,10 @@ impl PDRouter {
         body.insert(Self::BOOTSTRAP_ROOM_KEY, fields.room);
     }
 
-    fn inject_dp_rank(
-        body: &mut RawBody<'_>,
+    fn inject_dp_rank<'a>(
+        body: &mut RawBody<'a>,
         rank: isize,
-        rank_key: &str,
+        rank_key: &'a str,
     ) -> serde_json::Result<()> {
         body.insert(rank_key, to_raw_value(&rank)?);
         Ok(())
@@ -2188,26 +2190,19 @@ impl PDRouter {
         Ok(((prefill, decode), guards))
     }
 
-    fn select_pd_pair(
-        &self,
-        model_id: &str,
-        inputs: PlacementInputs<'_>,
-        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
-        debug!("Selecting PD pair: model_id={:?}", model_id);
-
-        // Shared HTTP-transport projections: this router proxies plain HTTP
-        // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both pools derive from ONE snapshot's pair index:
-        // separate lookups could straddle a concurrent membership change and
-        // pair workers that never coexisted.
+    /// The pair index `model_id` routes within. Shared HTTP-transport
+    /// projections: this router proxies plain HTTP to the selected worker's
+    /// URL, so a gRPC or ZMQ worker must never be selectable. Both pools
+    /// derive from ONE snapshot's pair index: separate lookups could straddle
+    /// a concurrent membership change and pair workers that never coexisted.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
         let mode = self.policy_registry.pd_pairing_mode();
         let by_model = self
             .worker_registry
             .model_routing_snapshot(model_id)
             .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
-        let pairs = match by_model {
+        match by_model {
             // A named model routes within its own entry. The wildcard's
             // literal "unknown" entry wins while it can pair at all; when it
             // cannot (a pool empty, or no compatible pair) both pools widen
@@ -2220,8 +2215,17 @@ impl PDRouter {
                 .get_routing_snapshot(UNKNOWN_MODEL_ID)
                 .pd_pairs(PdWire::Http, mode),
             _ => Arc::new(PdPairIndex::empty()),
-        };
+        }
+    }
 
+    fn select_pd_pair(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdPair, Box<PairFailure>> {
+        debug!("Selecting PD pair: model_id={:?}", model_id);
+        let pairs = self.pd_pairs(model_id);
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -2303,28 +2307,7 @@ impl PDRouter {
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-        // Each decode chunk is read for the `[DONE]` sentinel, which ends the
-        // relay, and re-encoded with the prefill log-probabilities when the
-        // request asked for them; the sentinel is anchored at a line start
-        // when the previous chunk ended with an end of line.
-        let mut encoder = SseEncoder::new();
-        let mut at_line_start = true;
-        let per_chunk: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(move |chunk: Bytes| {
-            let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-            if let Some(&last) = chunk.last() {
-                at_line_start = last == b'\n' || last == b'\r';
-            }
-            let bytes = if return_logprob && prefill_logprobs.is_some() {
-                Self::merge_streaming_logprobs(prefill_logprobs.as_ref(), &chunk, &mut encoder)
-                    .unwrap_or(chunk)
-            } else {
-                chunk
-            };
-            ChunkStep {
-                bytes,
-                last: is_done,
-            }
-        });
+        let hook = Self::decode_chunk_hook(prefill_logprobs, return_logprob);
         relay_streaming_body(
             stream,
             Relay {
@@ -2333,7 +2316,7 @@ impl PDRouter {
                 source,
                 guard: decode_guard,
                 headers: response_headers,
-                mode: ChunkMode::Hook(per_chunk),
+                mode: ChunkMode::Hook(hook),
             },
         )
     }
@@ -2611,6 +2594,128 @@ impl PDRouter {
     }
 }
 
+impl PDRouter {
+    /// The decode side's reading of its stream. With the prefill's
+    /// log-probabilities to merge, each decode chunk is split into its frames
+    /// (a frame cut across chunks waits for its delimiter) and every data
+    /// frame is re-encoded with them merged in; without them, or when the
+    /// request did not ask for log-probabilities, each chunk is read for the
+    /// `[DONE]` sentinel alone, anchored at a line start when the previous
+    /// chunk ended with an end of line. Either reading ends the relay at the
+    /// sentinel.
+    fn decode_chunk_hook(
+        prefill_logprobs: Option<Value>,
+        return_logprob: bool,
+    ) -> Box<dyn ChunkHook> {
+        match prefill_logprobs.filter(|_| return_logprob) {
+            Some(prefill_logprobs) => Box::new(LogprobMerge::new(prefill_logprobs)),
+            None => {
+                let mut at_line_start = true;
+                Box::new(move |chunk: Bytes| {
+                    let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+                    if let Some(&last) = chunk.last() {
+                        at_line_start = last == b'\n' || last == b'\r';
+                    }
+                    ChunkStep {
+                        bytes: chunk,
+                        last: is_done,
+                    }
+                })
+            }
+        }
+    }
+}
+
+/// The decode side's reading of its stream when the request asked for
+/// log-probabilities: each chunk split into frames, every data frame
+/// re-encoded with the prefill's log-probabilities merged in, a frame cut
+/// across chunks held until its delimiter arrives, and the relay ended at the
+/// `[DONE]` sentinel. A frame that is not one data event passes as it came,
+/// and so does a frame past the re-chunker's bound, with the rest of it.
+struct LogprobMerge {
+    prefill_logprobs: Value,
+    encoder: SseEncoder,
+    /// The bytes after the last frame delimiter: a frame still arriving.
+    partial: Vec<u8>,
+    /// The rest of a frame past the bound is still arriving: it passes as it
+    /// came, and a sentinel in it counts only after a line break of its own.
+    overflowed: bool,
+}
+
+impl LogprobMerge {
+    fn new(prefill_logprobs: Value) -> Self {
+        Self {
+            prefill_logprobs,
+            encoder: SseEncoder::new(),
+            partial: Vec::new(),
+            overflowed: false,
+        }
+    }
+}
+
+impl ChunkHook for LogprobMerge {
+    fn step(&mut self, chunk: Bytes) -> ChunkStep {
+        let mut out = Vec::with_capacity(chunk.len());
+        // A delimiter is up to four bytes long and may straddle the boundary.
+        let mut from = self.partial.len().saturating_sub(3);
+        self.partial.extend_from_slice(&chunk);
+        let mut start = 0;
+        let mut last = false;
+        while let Some((end, delimiter)) = find_frame_end(&self.partial[start..], from) {
+            let frame_end = start + end + delimiter;
+            let frame = &self.partial[start..frame_end];
+            start = frame_end;
+            from = 0;
+            if self.overflowed {
+                // The rest of a frame past the bound continues a line already
+                // begun: it passes as it came, and a sentinel in it counts
+                // only after a line break of its own.
+                self.overflowed = false;
+                out.extend_from_slice(frame);
+                if PDRouter::chunk_contains_done_event(frame, false) {
+                    last = true;
+                    break;
+                }
+                continue;
+            }
+            if PDRouter::chunk_contains_done_event(frame, true) {
+                out.extend_from_slice(frame);
+                last = true;
+                break;
+            }
+            match PDRouter::merge_streaming_logprobs(
+                Some(&self.prefill_logprobs),
+                frame,
+                &mut self.encoder,
+            ) {
+                Ok(merged) => out.extend_from_slice(&merged),
+                Err(()) => out.extend_from_slice(frame),
+            }
+        }
+        if last {
+            // The sentinel ends the relay: nothing after it is read.
+            self.partial.clear();
+        } else {
+            self.partial.drain(..start);
+            if self.partial.len() > MAX_FRAME_BYTES {
+                // Past the bound a frame is no longer waited for: it passes as
+                // it came, and so will its rest.
+                out.append(&mut self.partial);
+                self.overflowed = true;
+            }
+        }
+        ChunkStep {
+            bytes: Bytes::from(out),
+            last,
+        }
+    }
+
+    /// A last frame cut short of its delimiter goes out as it came.
+    fn finish(&mut self) -> Bytes {
+        Bytes::from(std::mem::take(&mut self.partial))
+    }
+}
+
 #[async_trait]
 impl RouterTrait for PDRouter {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2646,12 +2751,12 @@ impl RouterTrait for PDRouter {
                 },
             };
 
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        let prefill_url = prefill.endpoint_url("/health_generate");
         let (prefill_result, decode_result) = tokio::join!(
             prefill.http_client().get(&prefill_url).send(),
             decode
                 .http_client()
-                .get(format!("{}/health_generate", decode.url()))
+                .get(decode.endpoint_url("/health_generate"))
                 .send()
         );
 
@@ -2783,29 +2888,35 @@ impl RouterTrait for PDRouter {
         // The request is never borrowed here: a borrowed local keeps its slot
         // in the task across the awaits that follow, a second copy of the
         // request per count. It is moved out for its routing text, moved back,
-        // and serialized once a worker is selected and admitted.
-        let (request_text, body) =
-            Self::count_tokens_routing_text(body, self.policies_need_request_text());
-        let Some(worker) = placement::select_single(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            RoutingPool::HttpPrefill,
-            None,
-            PlacementInputs {
-                text: request_text.as_deref(),
-                tokens: None,
-                headers,
-                rid_key: None,
-                cache_namespace: None,
-                candidate_filter: None,
-                tried: &[],
-            },
-        ) else {
-            return error::service_unavailable(
-                "no_prefill_servers",
-                "No available prefill servers to count tokens",
-            );
+        // and serialized once a worker is selected and admitted. The routing
+        // text, when a policy reads any, is owned by the selection's block and
+        // dropped at its end, before the first await: neither its slot nor
+        // its buffer rides in the task across the round trip.
+        let (worker, body) = {
+            let (request_text, body) =
+                Self::count_tokens_routing_text(body, self.policies_need_request_text());
+            let Some(worker) = placement::select_single(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                RoutingPool::HttpPrefill,
+                None,
+                PlacementInputs {
+                    text: request_text.as_deref(),
+                    tokens: None,
+                    headers,
+                    rid_key: None,
+                    cache_namespace: None,
+                    candidate_filter: None,
+                    tried: &[],
+                },
+            ) else {
+                return error::service_unavailable(
+                    "no_prefill_servers",
+                    "No available prefill servers to count tokens",
+                );
+            };
+            (worker, body)
         };
 
         if let Some(response) = overload::shed_if_worker_overloaded(
@@ -2969,17 +3080,19 @@ mod tests {
         middleware::{test_support::json_of, ReportedRefusal},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::{common::sse::SSE_CHANNEL_BUFFER, http::test_support},
+        server::http_client_builder,
         tenant::TenantKey,
         worker::{
             circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
-            WorkerType,
+            CircuitBreakerConfig, WorkerType,
         },
     };
 
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
-        crate::server::http_client_builder()
+        http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -3036,7 +3149,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
-        let error = crate::server::http_client_builder()
+        let error = http_client_builder()
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .unwrap()
@@ -3314,6 +3427,224 @@ mod tests {
         }
     }
 
+    /// The rest of a frame past the bound continues a line already begun: a
+    /// sentinel at its start is text of that line, not an event, and the
+    /// frames after the rest are read as before.
+    #[test]
+    fn the_rest_of_a_frame_past_the_bound_is_not_read_as_a_fresh_frame() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let comment = Bytes::from(format!(": {}", "x".repeat(MAX_FRAME_BYTES)));
+        let flushed = merge.step(comment.clone());
+        assert_eq!(
+            flushed.bytes, comment,
+            "past the bound it passes as it came"
+        );
+        assert!(!flushed.last);
+        let rest = Bytes::from_static(b"data: [DONE]\n\n");
+        let step = merge.step(rest.clone());
+        assert_eq!(step.bytes, rest, "the rest passes as it came");
+        assert!(!step.last, "the rest of a line is not the sentinel");
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n";
+        let merged = merge.step(Bytes::from(frame));
+        assert!(!merged.last);
+        let body = std::str::from_utf8(&merged.bytes).unwrap();
+        let event: Value =
+            serde_json::from_str(body.trim_end().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            event["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "the frame after the rest is merged: {body}"
+        );
+        let done = merge.step(Bytes::from_static(b"data: [DONE]\n\n"));
+        assert!(
+            done.last,
+            "the sentinel on a line of its own ends the relay"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the sentinel");
+    }
+
+    /// A sentinel after the rest's own line break is an event: it ends the
+    /// relay as before.
+    #[test]
+    fn a_sentinel_after_the_rest_of_a_frame_past_the_bound_ends_the_relay() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let comment = Bytes::from(format!(": {}", "x".repeat(MAX_FRAME_BYTES)));
+        assert!(!merge.step(comment).last);
+        let rest = Bytes::from_static(b"tail\ndata: [DONE]\n\n");
+        let step = merge.step(rest.clone());
+        assert_eq!(
+            step.bytes, rest,
+            "the rest and the sentinel pass as they came"
+        );
+        assert!(
+            step.last,
+            "the sentinel after the rest's line break ends the relay"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the sentinel");
+    }
+
+    /// Two frames in one chunk: each is merged. Before the split, the chunk
+    /// failed to parse as one frame and passed unmerged.
+    #[test]
+    fn two_decode_frames_in_one_chunk_are_each_merged() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let frame = |id: u32| {
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{id}\"}}}}],\"meta_info\":{{\"input_token_logprobs\":[[-0.5,{id},null]]}}}}\n\n"
+            )
+        };
+        let step = merge.step(Bytes::from(format!("{}{}", frame(2), frame(3))));
+        assert!(!step.last);
+        let body = std::str::from_utf8(&step.bytes).unwrap();
+        let events: Vec<Value> = body
+            .split("\n\n")
+            .filter(|event| !event.is_empty())
+            .map(|event| serde_json::from_str(event.strip_prefix("data: ").unwrap()).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "{body}");
+        assert_eq!(
+            events[0]["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+        assert_eq!(
+            events[1]["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 3, null]]),
+            "{body}"
+        );
+    }
+
+    /// A frame cut across two chunks waits for its delimiter and is merged
+    /// whole; the sentinel in the same chunk ends the relay.
+    #[test]
+    fn a_decode_frame_split_across_chunks_is_merged_whole() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n";
+        let (head, tail) = frame.split_at(40);
+        let first = merge.step(Bytes::from(head.to_owned()));
+        assert!(first.bytes.is_empty() && !first.last, "{:?}", first.bytes);
+        let second = merge.step(Bytes::from(format!("{tail}data: [DONE]\n\n")));
+        assert!(second.last);
+        let body = std::str::from_utf8(&second.bytes).unwrap();
+        let (merged, done) = body.split_once("\n\n").expect("two frames: {body}");
+        let merged: Value = serde_json::from_str(merged.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            merged["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+        assert_eq!(done, "data: [DONE]\n\n");
+        assert!(merge.finish().is_empty(), "nothing held past the sentinel");
+    }
+
+    /// A last frame cut short of its delimiter leaves at the end as it came.
+    #[test]
+    fn a_decode_frame_cut_short_at_the_end_leaves_as_it_came() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let step = merge.step(Bytes::from_static(b"data: {\"choices\":[{\"delta"));
+        assert!(step.bytes.is_empty() && !step.last);
+        assert_eq!(
+            merge.finish(),
+            Bytes::from_static(b"data: {\"choices\":[{\"delta")
+        );
+        assert!(merge.finish().is_empty(), "the tail leaves once");
+    }
+
+    /// The prefill's log-probabilities stay out of a stream the request did
+    /// not ask them for: the sentinel reading relays each chunk byte for byte
+    /// and ends at `[DONE]`; asked for, the same frame comes back merged.
+    #[test]
+    fn a_request_without_logprobs_keeps_the_sentinel_reading() {
+        let prefill = json!([[-0.1, 1, null]]);
+        let frame = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n",
+        );
+        let mut plain = PDRouter::decode_chunk_hook(Some(prefill.clone()), false);
+        let step = plain.step(frame.clone());
+        assert_eq!(step.bytes, frame, "relayed as it came");
+        assert!(!step.last);
+        assert!(plain.step(Bytes::from_static(b"data: [DONE]\n\n")).last);
+        let mut merging = PDRouter::decode_chunk_hook(Some(prefill), true);
+        let step = merging.step(frame);
+        let body = std::str::from_utf8(&step.bytes).unwrap();
+        let merged: Value =
+            serde_json::from_str(body.trim_end().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            merged["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+    }
+
+    /// A frame delimiter cut across two chunks (`\n\n` and `\r\r` after
+    /// their first byte, `\r\n\r\n` after any of its first three bytes): the
+    /// look-back over the held bytes finds it on the second chunk and the
+    /// frame is merged whole. The cut after the third byte needs all three
+    /// held bytes, so a shorter look-back is red here.
+    #[test]
+    fn a_delimiter_cut_across_chunks_completes_its_frame_on_the_second() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}";
+        for (delimiter, cut) in [
+            ("\n\n", 1),
+            ("\r\r", 1),
+            ("\r\n\r\n", 1),
+            ("\r\n\r\n", 2),
+            ("\r\n\r\n", 3),
+        ] {
+            let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+            let (head, tail) = delimiter.split_at(cut);
+            let first = merge.step(Bytes::from(format!("{body}{head}")));
+            assert!(
+                first.bytes.is_empty() && !first.last,
+                "{delimiter:?}: {:?}",
+                first.bytes
+            );
+            let second = merge.step(Bytes::from(tail.to_owned()));
+            assert!(!second.last, "{delimiter:?}");
+            let out = std::str::from_utf8(&second.bytes).unwrap();
+            let (event, rest) = out.split_once("\n\n").expect("one frame");
+            let merged: Value =
+                serde_json::from_str(event.strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(
+                merged["meta_info"]["input_token_logprobs"],
+                json!([[-0.1, 1, null], [-0.5, 2, null]]),
+                "{delimiter:?}: {out}"
+            );
+            assert!(rest.is_empty(), "{delimiter:?}: {out}");
+            assert!(merge.finish().is_empty(), "{delimiter:?}: nothing held");
+        }
+    }
+
+    /// A partial past the re-chunker's bound is no longer waited for: the
+    /// held bytes leave as they came on the chunk that crosses the bound,
+    /// and the frame's rest follows unmerged.
+    #[test]
+    fn a_partial_past_the_bound_passes_as_it_came() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let head = Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}",
+            "x".repeat(MAX_FRAME_BYTES / 2)
+        ));
+        let first = merge.step(head.clone());
+        assert!(
+            first.bytes.is_empty() && !first.last,
+            "held under the bound"
+        );
+        let more = Bytes::from("y".repeat(MAX_FRAME_BYTES / 2 + 1));
+        let second = merge.step(more.clone());
+        assert!(!second.last);
+        assert_eq!(second.bytes.len(), head.len() + more.len());
+        assert_eq!(&second.bytes[..head.len()], &head[..]);
+        assert_eq!(&second.bytes[head.len()..], &more[..]);
+        let rest = Bytes::from_static(b"\"}}]}\n\n");
+        assert_eq!(
+            merge.step(rest.clone()).bytes,
+            rest,
+            "the rest passes unmerged"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the bound");
+    }
+
     #[test]
     fn test_merge_streaming_logprobs_sentinel_exact_match() {
         let mut encoder = SseEncoder::new();
@@ -3511,7 +3842,7 @@ mod tests {
     async fn a_worker_body_the_request_timeout_cuts_is_proxied_as_the_timeout() {
         let url = spawn_stalled_body_stub().await;
         let client = Arc::new(
-            crate::server::http_client_builder()
+            http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -3642,6 +3973,21 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
+    /// A Prefill admission refusal (the queue full, or a queued request that
+    /// waited out its admission timeout) is this process's own backpressure:
+    /// the retry layer does not replay it on another pair, where a plain
+    /// retryable answer is replayed, a worker's 503 and its own 429 under
+    /// another code alike: the error code decides, not the status.
+    #[test]
+    fn a_prefill_admission_refusal_is_not_retried() {
+        assert!(!PDRouter::should_retry_pd_response(&prefill_queue_full()));
+        assert!(!PDRouter::should_retry_pd_response(&prefill_queue_timeout()));
+        let worker_refusal = error::service_unavailable("worker_unavailable", "a worker is down");
+        assert!(PDRouter::should_retry_pd_response(&worker_refusal));
+        let worker_busy = error::too_many_requests("worker_busy", "a worker is saturated");
+        assert!(PDRouter::should_retry_pd_response(&worker_busy));
+    }
+
     /// A side that does not answer within the request's timeout ends the
     /// request, on the concurrent dispatch shape and on the sequential one:
     /// one attempt on the pair, the 504 `call_upstream_timeout` to the client
@@ -3664,7 +4010,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(
-                crate::server::http_client_builder()
+                http_client_builder()
                     .timeout(std::time::Duration::from_secs(1))
                     .build()
                     .unwrap(),
@@ -3677,7 +4023,7 @@ mod tests {
                     .worker_type(worker_type)
                     .runtime_type(runtime)
                     .http_client(Arc::clone(&client))
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         success_threshold: 1,
                         timeout_duration: std::time::Duration::from_secs(60),
@@ -3768,7 +4114,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(
-            crate::server::http_client_builder()
+            http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -3985,7 +4331,7 @@ mod tests {
                 BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
                     .worker_type(WorkerType::Prefill)
                     .api_key("worker-key".to_string())
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         ..Default::default()
                     })
@@ -4066,7 +4412,7 @@ mod tests {
         for head_sent in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Arc::new(
-                crate::server::http_client_builder()
+                http_client_builder()
                     .timeout(std::time::Duration::from_millis(100))
                     .build()
                     .unwrap(),
@@ -4077,7 +4423,7 @@ mod tests {
                 BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
                     .worker_type(WorkerType::Prefill)
                     .http_client(client)
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         ..Default::default()
                     })
@@ -4343,7 +4689,7 @@ mod tests {
     /// breaker with a threshold above one.
     #[test]
     fn a_drained_prefill_outcome_is_not_overwritten_by_the_attempt_status() {
-        let breaker = crate::worker::CircuitBreakerConfig {
+        let breaker = CircuitBreakerConfig {
             failure_threshold: 2,
             ..Default::default()
         };
@@ -4528,7 +4874,7 @@ mod tests {
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(spawn_stub(prefill).await)
                 .worker_type(WorkerType::Prefill)
-                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold: 1,
                     ..Default::default()
                 })
@@ -6429,8 +6775,8 @@ mod tests {
 
     /// A breaker that opens on two failures, whose timeout is over at once
     /// and which closes again after `successes` successes.
-    fn breaker_closing_after(successes: u32) -> crate::worker::CircuitBreakerConfig {
-        crate::worker::CircuitBreakerConfig {
+    fn breaker_closing_after(successes: u32) -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
             failure_threshold: 2,
             success_threshold: successes,
             timeout_duration: std::time::Duration::ZERO,
@@ -6877,7 +7223,7 @@ mod tests {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(worker_type)
-                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold: 1,
                     ..Default::default()
                 })

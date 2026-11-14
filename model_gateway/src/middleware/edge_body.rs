@@ -16,13 +16,15 @@
 //!
 //! The hand-over rides on the response's extensions, so it holds across the
 //! layers that keep them. A layer between a producer and the edge that
-//! builds the response again from scratch (the WASM middleware's reject and
-//! modify phases do, with `Response::builder()`) drops the duties handed so
-//! far with the old response: the permit and the keep-alive end there, as
-//! their in-body wrappers did when such a layer drained the old body, and
-//! the span closes with the head (`BodyDuties`' drop). A layer that
-//! replaces the body but keeps the parts (the Messages error envelope) keeps
-//! them.
+//! built the response again from scratch (the WASM middleware's reject and
+//! modify phases did, with `Response::builder()`) dropped the duties handed
+//! so far with the old response: the permit and the keep-alive ended there,
+//! as their in-body wrappers did when such a layer drained the old body, and
+//! the span closed with the head (`BodyDuties`' drop). A layer that replaces
+//! the body but keeps the parts (the Messages error envelope, the WASM hooks
+//! now) keeps them. A layer that drops the parts but keeps a body whose
+//! producer carried the cell (`BodyFailure::carry`) leaves the duties in
+//! that cell until the body goes.
 //!
 //! The duties end as they did. At the body's end (its last frame, the length
 //! the response declared, or an error of the body) the response is counted,
@@ -84,9 +86,21 @@ pub(crate) struct BodyDuties {
     pub(crate) span: Option<SpanDuty>,
     /// The response's cell, when the body's producer holds it for its word
     /// on a streamed body that tells the client of a failure and then ends
-    /// as planned (see [`BodyFailure`]): set by [`take`](Self::take), read
-    /// at the body's end, so the response counts as what the client read.
-    pub(crate) failure: Option<BodyFailure>,
+    /// as planned (see [`BodyFailure`]): set by [`take`](Self::take) alone,
+    /// read at the body's end, so the response counts as what the client
+    /// read. Private: a word a layer handed through [`hand`](Self::hand)
+    /// would be overwritten by `take`'s shared-cell arm, and a carried cell
+    /// handed as well would sit inside its own mutex, a cycle only `take`
+    /// breaks. [`carry`](BodyFailure::carry) is the one way in.
+    failure: Option<BodyFailure>,
+}
+
+#[cfg(test)]
+impl BodyDuties {
+    /// The cell taken out, for the tests that read the word through it.
+    pub(crate) fn take_failure(&mut self) -> Option<BodyFailure> {
+        self.failure.take()
+    }
 }
 
 /// The one shared cell of a response: the [`BodyDuties`] on their way out to

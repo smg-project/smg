@@ -42,6 +42,24 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
+        // The route declares media fields, and the paths that forward the
+        // body as given carry them to the engine; this pipeline sends text
+        // and token ids only. A request that names media is refused as the
+        // chat route refuses media no worker takes, instead of being served
+        // without it.
+        let media = request.media_fields();
+        if !media.is_empty() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                format!(
+                    "media input ({}) is not supported on the generate route over the gateway's \
+                     gRPC path: the route carries text and token ids to the engine, no media; send \
+                     media through the chat route",
+                    media.join(", ")
+                ),
+            ));
+        }
+
         // Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
             .map_err(|e| *e)?;
@@ -91,14 +109,10 @@ impl GeneratePreparationStage {
         worker_registry: &WorkerRegistry,
         model_id: &str,
     ) -> Result<(Option<String>, Vec<u32>), String> {
-        if let Some(text) = &request.text {
-            return self
-                .tokenize_single_text(tokenizer, text)
-                .await
-                .map(|(original, ids)| (Some(original), ids));
-        }
-
-        // Handle input_ids - validate and convert
+        // The engine's order: the ids before the text, so a body that carries
+        // both is served from the ids as the engine serves it (the text rode
+        // along for the client's own reading); a text-first read dropped the
+        // ids without a word.
         if let Some(input_ids) = &request.input_ids {
             return match input_ids {
                 InputIds::Single(ids) => {
@@ -116,6 +130,13 @@ impl GeneratePreparationStage {
                     Err("Batch input_ids are not supported over gRPC generate yet".to_string())
                 }
             };
+        }
+
+        if let Some(text) = &request.text {
+            return self
+                .tokenize_single_text(tokenizer, text)
+                .await
+                .map(|(original, ids)| (Some(original), ids));
         }
 
         Err("Either `text` or `input_ids` must be provided".to_string())

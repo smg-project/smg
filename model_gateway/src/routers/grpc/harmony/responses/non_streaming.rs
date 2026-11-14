@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session,
+        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session, owned_request,
         strip_image_generation_from_request_tools, McpCallTracking,
     },
     execution::{execute_mcp_tools, ToolResult},
@@ -152,6 +152,10 @@ async fn execute_with_mcp_loop(
         &ctx.mcp_format_registry,
     );
 
+    // Shared with each iteration's pipeline context by reference count; the
+    // loop takes it back (`owned_request`) when it appends the tool outputs.
+    let mut current_request = Arc::new(current_request);
+
     loop {
         iteration_count += 1;
 
@@ -235,7 +239,7 @@ async fn execute_with_mcp_loop(
 
                     // Build response with incomplete status - no tools executed due to limit
                     // Use original_tools for response (hide internal MCP tools)
-                    let mut response_request = current_request.clone();
+                    let mut response_request = owned_request(current_request);
                     response_request.tools.clone_from(&original_tools);
                     let mut response = build_tool_response(
                         vec![],         // No MCP tools executed
@@ -309,7 +313,7 @@ async fn execute_with_mcp_loop(
                     // 2. MCP tools as completed (with output) - these were executed
                     // 3. Function tools as completed (without output) - need caller execution
                     // Use original_tools for response (hide internal MCP tools)
-                    let mut response_request = current_request.clone();
+                    let mut response_request = owned_request(current_request);
                     response_request.tools.clone_from(&original_tools);
                     let mut response = build_tool_response(
                         mcp_tool_calls,
@@ -340,13 +344,13 @@ async fn execute_with_mcp_loop(
                 debug!("Only MCP tools - continuing loop with results");
 
                 // Build next request with appended history
-                current_request = build_next_request_with_tools(
-                    current_request,
+                current_request = Arc::new(build_next_request_with_tools(
+                    owned_request(current_request),
                     mcp_tool_calls,
                     mcp_results,
                     analysis,
                     partial_text,
-                );
+                ));
 
                 // Continue loop - next iteration will select workers and execute
             }
@@ -390,7 +394,9 @@ async fn execute_without_mcp_loop(
 ) -> Result<ResponsesResponse, Response> {
     debug!("Executing Harmony Responses without MCP loop");
 
-    // Execute pipeline once
+    // Execute pipeline once; the response built from a tool call below reads
+    // the same request, so it is shared, not copied.
+    let current_request = Arc::new(current_request);
     let iteration_result = ctx
         .pipeline
         .execute_harmony_responses(&current_request, ctx, Some(tenant_request_meta))
@@ -420,7 +426,7 @@ async fn execute_without_mcp_loop(
                 partial_text,
                 usage,
                 request_id,
-                Arc::new(current_request),
+                current_request,
             ))
         }
         ResponsesIterationResult::Completed { response, usage: _ } => {

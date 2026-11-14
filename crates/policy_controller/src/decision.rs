@@ -160,7 +160,7 @@ pub struct Shed {
 /// A queue ticket: the request waits for capacity in the binding's admission
 /// order and is decided again when a signal frees some. Specified in v1; no
 /// built-in issues one until the admission step, and a host that meets one
-/// refuses the request as the status table says.
+/// refuses the request.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Queue {
     pub ticket: u64,

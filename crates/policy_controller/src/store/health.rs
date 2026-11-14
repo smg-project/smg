@@ -42,14 +42,17 @@ pub trait HealthSink: Send + Sync {
     /// A gateway's standing veto on a worker until `until`; `None` clears
     /// it. The breaker's open window and the liveness veto travel this way,
     /// and a veto standing across a reconnect is re-asserted in the gateway's
-    /// `Hello` pages.
+    /// `Hello` pages. A veto for a worker without a row (never registered,
+    /// or removed) writes nothing; the clear needs no such guard.
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>);
 
     /// Whether `gateway` vetoes the worker at `now`.
     fn vetoed(&self, gateway: GatewayId, id: WorkerId, now: Instant) -> bool;
 
     /// A gateway's completed dispatch on the worker with its transport
-    /// class: the precedence rule's second input beside the prober.
+    /// class: the precedence rule's second input beside the prober. A
+    /// completion for a worker without a row (never registered, or removed)
+    /// writes nothing.
     fn completed(&self, gateway: GatewayId, id: WorkerId, class: TransportClass, at: Instant);
 
     /// Whether `gateway` completed a dispatch of class `Ok` on the worker at

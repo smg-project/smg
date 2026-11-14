@@ -64,6 +64,8 @@ pub struct TableConfig {
     /// Logical column names to omit from DDL, INSERT, and SELECT.
     /// Use when the physical schema lacks a standard column
     /// (e.g. a team's RESPONSES table has no `safety_identifier`).
+    /// The links table takes none: its statements name all three of its
+    /// columns, so a skip there is refused at start-up.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub skip_columns: HashSet<String>,
 }
@@ -267,14 +269,30 @@ impl SchemaConfig {
                      (known: {core:?})"
                 ));
             }
+            // The links table's statements name all three of its columns
+            // unconditionally (the DDL, the insert, the index and the listing
+            // order), so a skip there would pass validation and change nothing.
+            if label == "conversation_item_links" {
+                return Err(format!(
+                    "{label}.skip_columns: cannot skip '{name}' — the links table \
+                     keeps every column"
+                ));
+            }
         }
 
         Ok(())
     }
 }
 
-fn primary_key_columns_for(_label: &str) -> &'static [&'static str] {
-    &["id"]
+/// The primary key of each table, by logical column name: the columns a
+/// configuration may not skip. The links table has no `id`; its key is the
+/// pair that names the link.
+fn primary_key_columns_for(label: &str) -> &'static [&'static str] {
+    match label {
+        "conversations" | "responses" | "conversation_items" => &["id"],
+        "conversation_item_links" => &["conversation_id", "item_id"],
+        _ => &[],
+    }
 }
 
 /// Core logical column names for each table, used by validation to reject
@@ -695,6 +713,69 @@ mod tests {
             err.contains("cannot skip 'id'") && err.contains("primary key"),
             "unexpected: {err}"
         );
+    }
+
+    /// Each table's own key is refused, not `id` everywhere: the links table
+    /// has no `id`, its key is (`conversation_id`, `item_id`), and a skip of
+    /// either is a configuration error at start-up instead of passing
+    /// validation and being ignored by every backend, which build the links
+    /// statements from those columns unconditionally.
+    #[test]
+    fn validate_rejects_skip_of_each_tables_own_key_columns() {
+        for (table, key) in [
+            ("conversations", "id"),
+            ("conversation_items", "id"),
+            ("conversation_item_links", "conversation_id"),
+            ("conversation_item_links", "item_id"),
+        ] {
+            let mut cfg = SchemaConfig::default();
+            let tc = match table {
+                "conversations" => &mut cfg.conversations,
+                "conversation_items" => &mut cfg.conversation_items,
+                _ => &mut cfg.conversation_item_links,
+            };
+            tc.skip_columns.insert(key.to_string());
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.contains(&format!("{table}.skip_columns: cannot skip '{key}'"))
+                    && err.contains("primary key"),
+                "unexpected: {err}"
+            );
+        }
+
+        // `id` is not a column of the links table at all: unknown, not a key.
+        let mut cfg = SchemaConfig::default();
+        cfg.conversation_item_links
+            .skip_columns
+            .insert("id".to_string());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("not a recognized column"), "unexpected: {err}");
+    }
+
+    /// The links table has no skippable column: `added_at` is in its DDL,
+    /// its insert, its index and its listing order on every backend, so a
+    /// skip of it passed validation and changed nothing; it is refused at
+    /// start-up now, while a skip of a column the other tables' statements
+    /// consult still passes.
+    #[test]
+    fn validate_rejects_every_skip_on_the_links_table() {
+        let mut cfg = SchemaConfig::default();
+        cfg.conversation_item_links
+            .skip_columns
+            .insert("added_at".to_string());
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("conversation_item_links.skip_columns: cannot skip 'added_at'")
+                && err.contains("keeps every column"),
+            "unexpected: {err}"
+        );
+
+        let mut cfg = SchemaConfig::default();
+        cfg.conversation_items
+            .skip_columns
+            .insert("created_at".to_string());
+        cfg.validate()
+            .expect("a skip the items statements consult still passes");
     }
 
     // ── validate_sql_type ─────────────────────────────────────────────────

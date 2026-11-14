@@ -204,3 +204,135 @@ async fn test_inkling_text_mode_is_safely_suppressed() {
     assert_eq!(normal_text, "Before");
     assert!(calls.is_empty());
 }
+
+/// A JSON answer whose strings spell every kind of protocol token, an escaped
+/// quote before one of them, and non-ASCII text.
+const QUOTED_PROTOCOL_ANSWER: &str = concat!(
+    "{\"call\":\"<|content_invoke_tool_json|>{\\\"name\\\":\\\"search\\\"}<|end_message|>\",",
+    "\"<|message_model|>key\":\"\\\"<|content_thinking|>é<|content_text|>\",",
+    "\"text\":\"<|content_invoke_tool_text|>日本<|content_model_end_sampling|>\"}"
+);
+
+#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
+async fn stream_json_mode(chunks: &[&str]) -> (String, Vec<String>, String) {
+    let tools = create_test_tools();
+    let mut parser = InklingParser::new();
+    parser.set_json_mode(true);
+    let mut normal_text = String::new();
+    let mut names = Vec::new();
+    let mut arguments = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        normal_text.push_str(&result.normal_text);
+        for call in result.calls {
+            names.extend(call.name);
+            arguments.push_str(&call.parameters);
+        }
+    }
+    (normal_text, names, arguments)
+}
+
+#[tokio::test]
+async fn test_inkling_json_mode_keeps_quoted_protocol_text_complete() {
+    let tools = create_test_tools();
+    let mut parser = InklingParser::new();
+    parser.set_json_mode(true);
+
+    let (normal_text, calls) = parser
+        .parse_complete_with_tools(QUOTED_PROTOCOL_ANSWER, &tools)
+        .await
+        .unwrap();
+
+    assert!(calls.is_empty());
+    assert_eq!(normal_text, QUOTED_PROTOCOL_ANSWER);
+    serde_json::from_str::<serde_json::Value>(&normal_text).unwrap();
+}
+
+#[tokio::test]
+async fn test_inkling_json_mode_keeps_quoted_protocol_text_streaming() {
+    let characters = QUOTED_PROTOCOL_ANSWER
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain([QUOTED_PROTOCOL_ANSWER.len()])
+        .collect::<Vec<_>>();
+
+    // Every split into two chunks, then one chunk per character.
+    for split in &characters {
+        let (head, tail) = QUOTED_PROTOCOL_ANSWER.split_at(*split);
+        let (normal_text, names, _) = stream_json_mode(&[head, tail]).await;
+        assert_eq!(normal_text, QUOTED_PROTOCOL_ANSWER, "split at byte {split}");
+        assert!(names.is_empty(), "split at byte {split}");
+    }
+    let chunks = characters
+        .windows(2)
+        .map(|bounds| &QUOTED_PROTOCOL_ANSWER[bounds[0]..bounds[1]])
+        .collect::<Vec<_>>();
+    let (normal_text, names, _) = stream_json_mode(&chunks).await;
+    assert_eq!(normal_text, QUOTED_PROTOCOL_ANSWER);
+    assert!(names.is_empty());
+}
+
+#[tokio::test]
+async fn test_inkling_json_mode_still_parses_tool_frames_outside_strings() {
+    let tools = create_test_tools();
+    let input = concat!(
+        "{\"note\":\"<|end_message|>\"}",
+        "<|message_model|>search<|content_invoke_tool_json|>",
+        "{\"name\":\"search\",\"args\":{\"query\":\"\\\"<|end_message|>\"}}",
+        "<|end_message|><|content_model_end_sampling|>"
+    );
+    let mut parser = InklingParser::new();
+    parser.set_json_mode(true);
+
+    let (normal_text, calls) = parser
+        .parse_complete_with_tools(input, &tools)
+        .await
+        .unwrap();
+    assert_eq!(normal_text, "{\"note\":\"<|end_message|>\"}");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "search");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+        json!({"query": "\"<|end_message|>"})
+    );
+
+    let split = input.find("<|message_model|>").unwrap() + 3;
+    let (head, tail) = input.split_at(split);
+    let (normal_text, names, arguments) = stream_json_mode(&[head, tail]).await;
+    assert_eq!(normal_text, "{\"note\":\"<|end_message|>\"}");
+    assert_eq!(names, vec!["search".to_string()]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+        json!({"query": "\"<|end_message|>"})
+    );
+}
+
+#[tokio::test]
+async fn test_inkling_reset_clears_json_quote_state() {
+    let tools = create_test_tools();
+    let mut parser = InklingParser::new();
+    parser.set_json_mode(true);
+    parser
+        .parse_incremental("{\"open\":\"unterminated", &tools)
+        .await
+        .unwrap();
+
+    parser.reset();
+    let result = parser
+        .parse_incremental("<|content_text|>{\"a\":1}<|end_message|>", &tools)
+        .await
+        .unwrap();
+    assert_eq!(result.normal_text, "{\"a\":1}");
+}
+
+#[tokio::test]
+async fn test_inkling_without_json_mode_still_strips_framing() {
+    let tools = create_test_tools();
+    let parser = InklingParser::new();
+    let (normal_text, calls) = parser
+        .parse_complete_with_tools("{\"v\":\"a<|end_message|>b\"}", &tools)
+        .await
+        .unwrap();
+    assert!(calls.is_empty());
+    assert_eq!(normal_text, "{\"v\":\"ab\"}");
+}

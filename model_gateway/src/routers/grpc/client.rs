@@ -214,11 +214,8 @@ impl GrpcClient {
     /// Get the full load response from the backend.
     /// Returns `Unimplemented` for backends without scheduler load metrics.
     pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        // Optional sections beyond `core` (disagg/queues/memory) are dropped by
-        // engines that do not report them, so requesting them is always safe and
-        // leaves routing consumers, which only read `core`, unaffected.
         let include = || {
-            ["core", "disagg", "queues", "memory"]
+            smg_grpc_client::engine_load::LOAD_SECTIONS
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()
@@ -393,12 +390,12 @@ impl GrpcClient {
     ) -> Result<ProtoStream, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoGenerateRequest::Sglang(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
+                let stream = client.generate_framed(*boxed_req).await?;
                 Ok(ProtoStream::Sglang(stream))
             }
             (Self::Vllm(client), ProtoGenerateRequest::Vllm(boxed_req)) => {
                 let shm_handles = collect_vllm_generate_request_shm_handles(&boxed_req);
-                match client.generate(*boxed_req).await {
+                match client.generate_framed(*boxed_req).await {
                     Ok(stream) => Ok(ProtoStream::Vllm(stream)),
                     Err(error) => {
                         cleanup_mm_shm_handles(&shm_handles);
@@ -416,7 +413,7 @@ impl GrpcClient {
             }
             (Self::TokenSpeed(client), ProtoGenerateRequest::TokenSpeed(boxed_req)) => {
                 let shm_handles = collect_tokenspeed_generate_request_shm_handles(&boxed_req);
-                match client.generate(*boxed_req).await {
+                match client.generate_framed(*boxed_req).await {
                     Ok(stream) => Ok(ProtoStream::TokenSpeed(stream)),
                     Err(error) => {
                         cleanup_mm_shm_handles(&shm_handles);
@@ -432,10 +429,7 @@ impl GrpcClient {
         }
     }
 
-    pub async fn embed(
-        &mut self,
-        req: ProtoEmbedRequest,
-    ) -> Result<ProtoEmbedComplete, tonic::Status> {
+    pub async fn embed(&self, req: ProtoEmbedRequest) -> Result<ProtoEmbedComplete, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
                 let resp = client.embed(*boxed_req).await?;

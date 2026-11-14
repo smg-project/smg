@@ -92,7 +92,9 @@ pub(crate) async fn prepare_chat_like(
     request: &ChatCompletionRequest,
     wire_pools: &'static [RoutingPool],
 ) -> Result<(Vec<u32>, ProcessedMessages, symphony::PreparedConstraint), Response> {
-    utils::validate_chat_content_parts(&request.messages)
+    // Validate against the rendered tool set, which allowed_tools may narrow.
+    let body_ref = utils::request_as_rendered(request);
+    utils::validate_chat_template_content_parts(&body_ref)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
@@ -109,12 +111,6 @@ pub(crate) async fn prepare_chat_like(
             },
         )
         .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
-
-        // Step 1: the request whose tools the template renders (every tool
-        // for a named tool_choice; the constraint built below forces the call;
-        // under `none` the tools stay declared, as the engine's own server
-        // renders them, and the reader delivers no call)
-        let body_ref = utils::request_as_rendered(request);
 
         // The media-part order and, for a request with media, the plan and
         // the placeholder tokens, resolved from the registries as the
@@ -138,7 +134,7 @@ pub(crate) async fn prepare_chat_like(
         let provider = ProviderProfile::for_model(&request.model);
         ctx.state.provider = Some(provider);
 
-        // Step 2: Process messages and apply chat template
+        // Step 1: Process messages and apply chat template
         let (processed_messages, prompt_encoding) =
             match utils::process_chat_messages_with_placeholders(
                 &body_ref,
@@ -154,7 +150,7 @@ pub(crate) async fn prepare_chat_like(
                 }
             };
 
-        // Steps 3 and 4: the prompt tokenized the way its renderer said to,
+        // Steps 2 and 3: the prompt tokenized the way its renderer said to,
         // the media anchors checked, the media processed or kept as
         // references (shared with the Messages stage).
         let RenderedPrompt {

@@ -282,7 +282,7 @@ async fn collect_stream_responses<S: FanoutChild>(
                         worker = %worker_name,
                         grpc_code = ?status.code(),
                         error = ?status,
-                        prefill = prefill.map_or("none", |prefill| prefill.url()),
+                        prefill = prefill.map_or("none", |prefill| prefill.redacted_url()),
                         bootstrap_host = port.host.as_str(),
                         bootstrap_port = port.port,
                         bootstrap_port_source = port.source.label(),
@@ -330,6 +330,7 @@ mod tests {
 
     use axum::http::StatusCode;
     use smg_grpc_client::sglang_proto as sglang;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
@@ -687,6 +688,49 @@ mod tests {
         );
     }
 
+    /// The dead-rendezvous error line names the prefill side by the address
+    /// a log may carry: a side registered with userinfo and a query is
+    /// written with the userinfo masked and the query cut, never as
+    /// registered.
+    #[traced_test]
+    #[tokio::test]
+    async fn the_dead_rendezvous_line_masks_the_prefill_sides_userinfo_and_query() {
+        let refused = RefusedAddress::reserve();
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://engine:hunter2@127.0.0.1:30000?token=t0ken")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .bootstrap_port(Some(refused.port()))
+                .build(),
+        );
+        assert!(
+            prefill.url().contains("hunter2") && prefill.url().contains("t0ken"),
+            "the registered address keeps both"
+        );
+        collect_stream_responses(
+            &mut FailingStream(Some(tonic::Status::internal(ENGINE_ERROR_MESSAGE))),
+            "Decode",
+            Some(PdSide::Decode),
+            Some(&prefill),
+        )
+        .await
+        .err()
+        .expect("the failure becomes the answer");
+        assert!(
+            logs_contain("the sides could not rendezvous"),
+            "the dead-rendezvous line is the one written"
+        );
+        assert!(
+            !logs_contain("hunter2"),
+            "the userinfo stays out of the log"
+        );
+        assert!(!logs_contain("t0ken"), "the query stays out of the log");
+        assert!(
+            logs_contain("127.0.0.1:30000"),
+            "the line still names the prefill side by host and port"
+        );
+    }
+
     /// A side's stream failure read into a non-streamed answer is counted
     /// under the side's own labels, and only when it is the worker's failure.
     #[test]
@@ -750,5 +794,64 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert_eq!(completions.load(Ordering::SeqCst), 0);
+    }
+
+    /// A prefill answer's prompt logprobs, scored once for the whole
+    /// request, land on every collected decode answer; a prefill that
+    /// scored nothing leaves the decode answers as the engine sent them.
+    #[test]
+    fn prefill_prompt_logprobs_land_on_every_decode_answer() {
+        let prompt_logprobs = sglang::InputLogProbs {
+            token_ids: vec![11, 12, 13],
+            token_logprobs: vec![
+                sglang::InputTokenLogProb { value: None },
+                sglang::InputTokenLogProb { value: Some(-0.25) },
+                sglang::InputTokenLogProb { value: Some(-1.5) },
+            ],
+            ..Default::default()
+        };
+        let prefill = [ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+            input_logprobs: Some(prompt_logprobs.clone()),
+            ..Default::default()
+        })];
+        let mut decodes: Vec<ProtoGenerateComplete> = (0..3)
+            .map(|_| ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default()))
+            .collect();
+
+        merge_prefill_logprobs(&prefill, &mut decodes);
+
+        for (position, decode) in decodes.iter().enumerate() {
+            assert_eq!(
+                decode.as_sglang().input_logprobs.as_ref(),
+                Some(&prompt_logprobs),
+                "decode answer {position}"
+            );
+        }
+
+        let unscored = [ProtoGenerateComplete::Sglang(
+            sglang::GenerateComplete::default(),
+        )];
+        let engine_sent = sglang::InputLogProbs {
+            token_ids: vec![11],
+            ..Default::default()
+        };
+        let mut untouched: Vec<ProtoGenerateComplete> = (0..2)
+            .map(|_| {
+                ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                    input_logprobs: Some(engine_sent.clone()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        merge_prefill_logprobs(&unscored, &mut untouched);
+
+        for (position, decode) in untouched.iter().enumerate() {
+            assert_eq!(
+                decode.as_sglang().input_logprobs.as_ref(),
+                Some(&engine_sent),
+                "untouched decode answer {position}"
+            );
+        }
     }
 }

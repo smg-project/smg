@@ -5,7 +5,7 @@
 //! its per-runtime enums, so the variant dispatch lives here, next to the
 //! other transport glue, and nowhere else.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 pub use engine_zmq_adapter::{
     connect_for_worker, zmq_handshake_address, EncodeRendezvous, EngineCount, EosTokenIds,
@@ -14,9 +14,12 @@ pub use engine_zmq_adapter::{
 };
 use llm_tokenizer::traits::Tokenizer;
 
-use crate::routers::grpc::{
-    client::{ModelInfo, ServerInfo},
-    proto_wrapper::ProtoGenerateRequest,
+use crate::{
+    routers::grpc::{
+        client::{ModelInfo, ServerInfo},
+        proto_wrapper::ProtoGenerateRequest,
+    },
+    worker::basic::CONTEXT_WINDOW_LABELS,
 };
 
 /// Submit the wrapper's request to the engine it was built for.
@@ -45,6 +48,17 @@ pub(crate) fn model_info(client: &ZmqEngineClient) -> ModelInfo {
         ZmqModelInfo::Sglang(info) => ModelInfo::Sglang(info),
         ZmqModelInfo::Trtllm(info) => ModelInfo::Trtllm(*info),
     }
+}
+
+/// The label a ZMQ worker's own link learned at the handshake: the engine's
+/// context window, under the key its dialect's model info carries it as
+/// (one of the card's window labels), so a refresh after the handshake gives
+/// the card the window the gateway's admission reads. The rest of the
+/// handshake's report stays the link's own.
+pub(crate) fn link_labels(client: &ZmqEngineClient) -> HashMap<String, String> {
+    let mut labels = model_info(client).to_labels();
+    labels.retain(|key, _| CONTEXT_WINDOW_LABELS.contains(&key.as_str()));
+    labels
 }
 
 /// Server metadata as the gateway's per-runtime variant.

@@ -19,19 +19,17 @@ use axum::{
     response::Response,
 };
 use rand::RngExt;
-use smg_policy_controller::{Decision, Phase, Side, Target, WorkerId, MAX_TARGETS};
 use tracing::{debug, warn};
 
 use crate::{
     middleware::ReportedRefusal,
     observability::{
-        cache_trace,
         log_throttle::KeyedLogThrottle,
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        as_consistent_hashing, engine_host::HostRequest, policy_filters_unavailable_workers,
-        CacheNamespace, Decider, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        as_consistent_hashing, policy_filters_unavailable_workers, CacheNamespace,
+        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
@@ -279,12 +277,8 @@ pub(crate) fn select_from(
         routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
-        // Cached hash ring for consistent hashing (O(log n) lookup), when a
-        // policy of this registry may read one (`hash_ring_wanted`).
-        hash_ring: policies
-            .hash_ring_wanted()
-            .then(|| registry.get_hash_ring(model_id))
-            .flatten(),
+        // Cached hash ring for consistent hashing (O(log n) lookup).
+        hash_ring: registry.get_hash_ring(model_id),
         role: WorkerRole::Single,
         overload_lifted: false,
     };
@@ -300,32 +294,6 @@ pub(crate) fn select_from(
         worker.is_available()
             || (info.overload_lifted && overload::vetoed_by_overload_alone(worker.as_ref()))
     };
-
-    // Under `--policy-engine engine` the engine decides over the bounded view
-    // of the pool and the commit re-validates each target under this host's
-    // eligibility; a model on another policy than the default keeps the
-    // legacy selection below. A keyed request is a session of the engine's
-    // binding (the sticky override's rule, or the manual policy's own), and
-    // the lift travels with it as the legacy keyed path lifts the veto.
-    if let Some(decider) = policies.engine_for(policy.as_ref()) {
-        return select_from_decided(RegularDecision {
-            decider,
-            registry,
-            model_id,
-            candidates,
-            request: HostRequest {
-                model: model_id,
-                prompt_tokens: decider.prompt_tokens(inputs.tokens),
-                session_key: info.routing_key.or(inputs.rid_key),
-                tried: inputs.tried,
-                overload_lifted: info.overload_lifted,
-                phase: Phase::Single,
-                has_capacity: None,
-            },
-            eligible: &eligible,
-            policy: policy.name(),
-        });
-    }
 
     // Most policies already apply the complete availability predicate. Give
     // them the shared snapshot directly instead of cloning every available
@@ -399,78 +367,6 @@ pub(crate) fn select_from(
     );
 
     Some(selected)
-}
-
-/// What [`select_from`] hands the engine seam: the pool after the host's
-/// per-request narrowing, the request as the host reads it, and the
-/// eligibility the commit re-validates each target under.
-struct RegularDecision<'a> {
-    decider: &'a Decider,
-    registry: &'a WorkerRegistry,
-    model_id: &'a str,
-    candidates: &'a [Arc<dyn Worker>],
-    request: HostRequest<'a>,
-    eligible: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
-    /// The configured policy's name: the selection metric's label, as under
-    /// the legacy path, until the observability step relabels it.
-    policy: &'static str,
-}
-
-/// [`select_from`] through the policy engine: one decision over the view of
-/// the candidates, outside any lock of this host; the commit walks the
-/// ordered targets and takes the first one the eligibility re-validates.
-/// When every target misses, one re-decision with the misses excluded, then
-/// the host's own all-vetoed fallback, as the legacy path falls back.
-fn select_from_decided(rd: RegularDecision<'_>) -> Option<Arc<dyn Worker>> {
-    let RegularDecision {
-        decider,
-        registry,
-        model_id,
-        candidates,
-        request,
-        eligible,
-        policy,
-    } = rd;
-    cache_trace::begin_selection(candidates);
-    let accept = |target: &Target| eligible(&candidates[target.position as usize]);
-    let (decision, lease) = decider.decide(&request, candidates, &[]);
-    let committed = decider
-        .commit(&lease, &decision, Side::Single, accept)
-        .or_else(|| {
-            let (missed, count) = target_ids(&decision);
-            if count == 0 {
-                return None;
-            }
-            let (again, lease) = decider.decide(&request, candidates, &missed[..count]);
-            decider.commit(&lease, &again, Side::Single, accept)
-        });
-    let Some(target) = committed else {
-        cache_trace::selection(policy, "policy", candidates, None);
-        return overload_fallback(registry, policy, model_id, candidates);
-    };
-    let position = target.position as usize;
-    cache_trace::selection(policy, "policy", candidates, Some(position));
-    let selected = Arc::clone(&candidates[position]);
-    Metrics::record_worker_selection(
-        metrics_labels::WORKER_REGULAR,
-        selected.connection_mode().as_metric_label(),
-        model_id,
-        policy,
-    );
-    Some(selected)
-}
-
-/// The ids of a decision's targets, for the one re-decision after every one
-/// of them missed its commit; none for a shed.
-pub(crate) fn target_ids(decision: &Decision) -> ([WorkerId; MAX_TARGETS], usize) {
-    let targets = decision
-        .pick()
-        .map_or(&[][..], |pick| pick.targets.as_slice());
-    let mut ids = [WorkerId::default(); MAX_TARGETS];
-    for (id, target) in ids.iter_mut().zip(targets) {
-        *id = target.id;
-    }
-    (ids, targets.len().min(MAX_TARGETS))
 }
 
 /// The steering default for a pool whose every worker is vetoed, by the
@@ -1142,7 +1038,7 @@ pub(crate) fn select_pair(
         ) {
             return pair;
         }
-        debug!("No available prefill workers");
+        debug!(role = ?WorkerRole::Prefill, "No available PD pair");
         return Err(fail(
             WorkerRole::Prefill,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
@@ -1205,7 +1101,7 @@ pub(crate) fn select_pair(
         ) {
             return pair;
         }
-        debug!(?pair_runtime, "No available PD pair");
+        debug!(?role, "No available PD pair");
         return Err(fail(
             role,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
@@ -1230,10 +1126,7 @@ pub(crate) fn select_pair(
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
-    let hash_ring = policies
-        .hash_ring_wanted()
-        .then(|| registry.get_hash_ring(model_id))
-        .flatten();
+    let hash_ring = registry.get_hash_ring(model_id);
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
         tokens: inputs.tokens,
@@ -1407,8 +1300,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::{
-            ManualAssignmentMode, PdPairingMode, PolicyConfig, PolicyEngineMode,
-            RoutingKeyOverrideConfig,
+            ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig,
         },
         observability::logging::test_support::test_subscriber,
         policies::{
@@ -1899,6 +1791,23 @@ mod tests {
         let off =
             PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(PdPairingMode::Off);
         assert!(pair_from(&registry, &off).is_ok());
+    }
+
+    /// A pair over a pool whose only decode is not ready is the decode
+    /// role's unavailability.
+    #[test]
+    fn a_pair_whose_only_decode_is_not_ready_is_the_decode_roles_unavailability() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        decode.set_status(WorkerStatus::NotReady);
+        let failure = pair_from(&registry, &cohort_policies())
+            .err()
+            .expect("no partner is open");
+        assert_eq!(failure.role, WorkerRole::Decode);
+        assert!(matches!(failure.verdict, PlacementFailure::Unavailable));
     }
 
     #[test]
@@ -2510,6 +2419,66 @@ mod tests {
             },
         )
         .is_some());
+    }
+
+    /// The holder of a prompt's prefix keeps it over repeated placements, and
+    /// a retry leaves the holder.
+    #[test]
+    fn a_cache_aware_prefix_keeps_its_holder() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(cache_aware_policy());
+        let text = "a prompt long enough to fill a few blocks of the tree on its first request";
+        let inputs = PlacementInputs {
+            text: Some(text),
+            ..Default::default()
+        };
+        let holder = pick(&registry, &policies, inputs);
+        for _ in 0..8 {
+            assert_eq!(
+                pick(&registry, &policies, inputs).url(),
+                holder.url(),
+                "the prefix pins the prompt to its holder"
+            );
+        }
+        let tried = vec![holder.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(moved.url(), holder.url(), "the retry leaves the holder");
+    }
+
+    /// `select_from` under round robin rotates the pool it is given: three
+    /// candidates, nine picks, three each.
+    #[test]
+    fn select_from_rotates_the_pool_it_is_given() {
+        let registry = registry_with(&[
+            ("grpc://r:1", ConnectionMode::Grpc, RuntimeType::Vllm),
+            ("grpc://r:2", ConnectionMode::Grpc, RuntimeType::Vllm),
+            ("grpc://r:3", ConnectionMode::Grpc, RuntimeType::Vllm),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let candidates: Vec<Arc<dyn Worker>> = ["grpc://r:1", "grpc://r:2", "grpc://r:3"]
+            .iter()
+            .map(|url| registry.get_by_url(url).expect("registered"))
+            .collect();
+        let mut picks = BTreeMap::new();
+        for _ in 0..9 {
+            let worker = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                &candidates,
+                PlacementInputs::default(),
+            )
+            .expect("a worker is picked");
+            *picks.entry(worker.url().to_string()).or_insert(0) += 1;
+        }
+        assert_eq!(picks.into_values().collect::<Vec<usize>>(), [3, 3, 3]);
     }
 
     /// An explicit target under consistent hashing indexes the unfiltered
@@ -3468,6 +3437,151 @@ mod tests {
         );
     }
 
+    /// Under the override a round-robin default keeps every turn of a
+    /// conversation on the owner of its key.
+    #[test]
+    fn a_round_robin_defaults_turns_share_one_owner_under_the_override() {
+        let keyed = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            headers
+        };
+        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
+        let policies = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let base = keyed("conv");
+        let owner = pick(&registry, &policies, with_headers(&base));
+        // A vacant key would go to a lighter worker.
+        owner.increment_load();
+        for turn in turns {
+            let headers = keyed(turn);
+            assert_eq!(
+                pick(&registry, &policies, with_headers(&headers)).url(),
+                owner.url(),
+                "{turn} left the owner of conv"
+            );
+        }
+    }
+
+    /// The manual policy reads the `x-smg-routing-key` hint under an
+    /// override whose configured list names other headers: a conversation
+    /// keyed by the hint alone keeps its owner across turns with fresh
+    /// request ids, and across a turn with none.
+    #[test]
+    fn the_manual_policy_reads_the_hint_under_a_configured_list() {
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let hinted = keyed_headers();
+        let policies = PolicyRegistry::with_override(
+            manual,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                headers: vec!["x-session-id".into()],
+                ..Default::default()
+            },
+        );
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let turn = |rid_key: Option<&'static str>| PlacementInputs {
+            headers: Some(&hinted),
+            rid_key,
+            ..Default::default()
+        };
+        let owner = pick(&registry, &policies, turn(Some("request-1")));
+        // A vacant key would go to a lighter worker.
+        owner.increment_load();
+        for rid_key in [Some("request-2"), Some("request-3"), None] {
+            assert_eq!(
+                pick(&registry, &policies, turn(rid_key)).url(),
+                owner.url(),
+                "the turn keyed {rid_key:?} left the owner of the hint"
+            );
+        }
+    }
+
+    /// The hint keys nothing for a default the override places: with the
+    /// override's configured list naming other headers, a round-robin
+    /// request carrying the hint alone rotates.
+    #[test]
+    fn the_hint_keys_nothing_under_the_override() {
+        let hinted = keyed_headers();
+        let policies = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                headers: vec!["x-session-id".into()],
+                ..Default::default()
+            },
+        );
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            seen.insert(
+                pick(&registry, &policies, with_headers(&hinted))
+                    .url()
+                    .to_string(),
+            );
+        }
+        assert_eq!(seen.len(), 3, "the hint alone rotates: {seen:?}");
+    }
+
+    /// A key whose owner is not ready takes a failover. Once that worker is
+    /// back the key returns to it under the manual policy; under the
+    /// override it stays on the failover, as the override pins the newest
+    /// worker first.
+    #[test]
+    fn a_key_recovers_under_manual_and_stays_on_the_failover_under_the_override() {
+        let headers = keyed_headers();
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let cases = [
+            (manual, false, true),
+            (PolicyConfig::RoundRobin, true, false),
+        ];
+        for (config, override_on, returns) in cases {
+            let policies = PolicyRegistry::with_override(
+                config.clone(),
+                RoutingKeyOverrideConfig {
+                    enabled: override_on,
+                    ..Default::default()
+                },
+            );
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let owner = pick(&registry, &policies, with_headers(&headers));
+            owner.set_status(WorkerStatus::NotReady);
+            let failover = pick(&registry, &policies, with_headers(&headers));
+            assert_ne!(failover.url(), owner.url(), "{}", config.name());
+            for _ in 0..3 {
+                assert_eq!(
+                    pick(&registry, &policies, with_headers(&headers)).url(),
+                    failover.url(),
+                    "{}: the failover holds the key",
+                    config.name()
+                );
+            }
+            owner.set_status(WorkerStatus::Ready);
+            let back = pick(&registry, &policies, with_headers(&headers));
+            assert_eq!(
+                back.url() == owner.url(),
+                returns,
+                "{}: the key went to {}",
+                config.name(),
+                back.url()
+            );
+        }
+    }
+
     /// Every worker over the thresholds, the owner the busier: the session
     /// stays on its owner instead of going to the least-loaded worker, and
     /// the placement counts as the overload fallback it replaces.
@@ -3620,402 +3734,5 @@ mod tests {
         let owner = place();
         registry.set_worker_overloaded(&owner, true);
         assert_ne!(place().url(), owner.url());
-    }
-
-    /// Round robin under `--policy-engine engine`, the shape every test of the
-    /// switch starts from.
-    fn engine_round_robin() -> PolicyRegistry {
-        let round_robin = PolicyConfig::RoundRobin;
-        let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &round_robin,
-            &round_robin,
-        );
-        assert!(
-            policies.decider().is_some(),
-            "the engine serves round robin"
-        );
-        policies
-    }
-
-    /// Under `--policy-engine engine` a preset the engine serves decides over
-    /// the engine's view and commits under the host's eligibility: round robin
-    /// rotates the pool it is given, and a worker that is not ready is never
-    /// placed. Under `legacy`, the default, the engine is not built.
-    #[test]
-    fn with_the_engine_switch_select_from_rotates_the_pool_it_is_given() {
-        let registry = registry_with(&[
-            ("grpc://r:1", ConnectionMode::Grpc, RuntimeType::Vllm),
-            ("grpc://r:2", ConnectionMode::Grpc, RuntimeType::Vllm),
-            ("grpc://r:3", ConnectionMode::Grpc, RuntimeType::Vllm),
-        ]);
-        let round_robin = PolicyConfig::RoundRobin;
-        let legacy = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Legacy,
-            &round_robin,
-            &round_robin,
-        );
-        assert!(
-            legacy.decider().is_none(),
-            "the default leaves the engine out"
-        );
-        let policies = engine_round_robin();
-        let candidates: Vec<Arc<dyn Worker>> = ["grpc://r:1", "grpc://r:2", "grpc://r:3"]
-            .iter()
-            .map(|url| registry.get_by_url(url).expect("registered"))
-            .collect();
-        let picks = |policies: &PolicyRegistry| {
-            let mut picks = BTreeMap::new();
-            for _ in 0..9 {
-                let worker = select_from(
-                    &registry,
-                    policies,
-                    MODEL,
-                    &candidates,
-                    PlacementInputs::default(),
-                )
-                .expect("a worker is picked");
-                *picks.entry(worker.url().to_string()).or_insert(0) += 1;
-            }
-            picks
-        };
-        let counts = |picks: BTreeMap<String, usize>| picks.into_values().collect::<Vec<_>>();
-        assert_eq!(counts(picks(&policies)), [3, 3, 3]);
-        assert_eq!(
-            policies.decider().expect("the engine").decisions(),
-            9,
-            "every placement was decided through the engine"
-        );
-        assert_eq!(counts(picks(&legacy)), [3, 3, 3]);
-
-        candidates[1].set_status(WorkerStatus::NotReady);
-        let picks = picks(&policies);
-        assert_eq!(picks.get("grpc://r:2"), None, "{picks:?}");
-        assert!(
-            picks["grpc://r:1"] > 0 && picks["grpc://r:3"] > 0,
-            "{picks:?}"
-        );
-    }
-
-    /// Under the switch the engines a retry already tried step aside while
-    /// another candidate remains, and a lone tried worker takes the retry, as
-    /// the legacy narrowing does; the HTTP entry decides through the engine
-    /// too.
-    #[test]
-    fn with_the_engine_switch_a_tried_worker_steps_aside_while_another_remains() {
-        let policies = engine_round_robin();
-        let registry = http_registry(&["http://h:1", "http://h:2"]);
-        let tried = vec!["http://h:1".to_string()];
-        for _ in 0..4 {
-            let selected = pick(
-                &registry,
-                &policies,
-                PlacementInputs {
-                    tried: &tried,
-                    ..Default::default()
-                },
-            );
-            assert_eq!(selected.url(), "http://h:2");
-        }
-
-        let lone = http_registry(&["http://h:9"]);
-        let tried = vec!["http://h:9".to_string()];
-        let selected = pick(
-            &lone,
-            &policies,
-            PlacementInputs {
-                tried: &tried,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            selected.url(),
-            "http://h:9",
-            "nothing else is left: the one worker takes the retry"
-        );
-    }
-
-    /// Under the switch a keyed request is a session of the engine's default
-    /// binding, pinned to its owner by the sticky routing-key override's
-    /// rule, while an unkeyed one rotates through the engine.
-    #[test]
-    fn with_the_engine_switch_the_sticky_override_keeps_its_owner() {
-        let round_robin = PolicyConfig::RoundRobin;
-        let policies = PolicyRegistry::with_override(
-            round_robin.clone(),
-            RoutingKeyOverrideConfig {
-                enabled: true,
-                ..Default::default()
-            },
-        )
-        .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
-        assert!(policies.decider().is_some());
-        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
-        let headers = keyed_headers();
-        let owner = pick(&registry, &policies, with_headers(&headers));
-        // A vacant sticky key would go to a lighter worker.
-        owner.increment_load();
-        for _ in 0..4 {
-            assert_eq!(
-                pick(&registry, &policies, with_headers(&headers)).url(),
-                owner.url(),
-                "the key left its owner"
-            );
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..3 {
-            seen.insert(
-                pick(&registry, &policies, PlacementInputs::default())
-                    .url()
-                    .to_string(),
-            );
-        }
-        assert_eq!(seen.len(), 3, "an unkeyed request rotates: {seen:?}");
-        assert_eq!(
-            policies.decider().expect("the engine").decisions(),
-            8,
-            "the keyed placements were decided through the engine too"
-        );
-    }
-
-    /// Under the switch the manual policy and the sticky override decide
-    /// through the engine with the legacy outcomes, under the same inputs: a
-    /// key pins its first worker, every turn of a conversation shares that
-    /// owner under the override, and a new turn is a new key without it.
-    #[test]
-    fn with_the_engine_switch_the_manual_policy_and_the_override_pin_like_legacy() {
-        let keyed = |key: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-smg-routing-key", key.parse().unwrap());
-            headers
-        };
-        let manual = || PolicyConfig::Manual {
-            eviction_interval_secs: 0,
-            max_idle_secs: 0,
-            assignment_mode: ManualAssignmentMode::MinLoad,
-        };
-        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
-        let modes = [PolicyEngineMode::Legacy, PolicyEngineMode::Engine];
-        for (config, mode) in [PolicyConfig::RoundRobin, manual()]
-            .iter()
-            .flat_map(|config| modes.iter().map(move |mode| (config, *mode)))
-        {
-            let policies = PolicyRegistry::with_override(
-                config.clone(),
-                RoutingKeyOverrideConfig {
-                    enabled: true,
-                    ..Default::default()
-                },
-            )
-            .with_policy_engine(mode, config, config);
-            assert_eq!(
-                policies.decider().is_some(),
-                mode == PolicyEngineMode::Engine
-            );
-            let name = policies.get_default_policy().name();
-            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
-            let base = keyed("conv");
-            let owner = pick(&registry, &policies, with_headers(&base));
-            // A vacant key would go to a lighter worker.
-            owner.increment_load();
-            for turn in turns {
-                let headers = keyed(turn);
-                assert_eq!(
-                    pick(&registry, &policies, with_headers(&headers)).url(),
-                    owner.url(),
-                    "{name} under {mode:?}: {turn} left the owner of conv"
-                );
-            }
-            if let Some(decider) = policies.decider() {
-                assert_eq!(
-                    decider.decisions(),
-                    1 + turns.len() as u64,
-                    "{name}: every keyed placement was decided through the engine"
-                );
-            }
-        }
-
-        // Override off: the manual policy pins each raw key on its own.
-        for mode in modes {
-            let policies =
-                PolicyRegistry::new(manual()).with_policy_engine(mode, &manual(), &manual());
-            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
-            let first = keyed("conv_t1");
-            let owner = pick(&registry, &policies, with_headers(&first));
-            owner.increment_load();
-            let second = keyed("conv_t2");
-            assert_ne!(
-                pick(&registry, &policies, with_headers(&second)).url(),
-                owner.url(),
-                "{mode:?}: without the override a new turn is a new key"
-            );
-        }
-    }
-
-    /// Under the switch a key whose owner is not ready takes a failover and
-    /// returns to its first owner once that worker is back under the manual
-    /// policy, as under legacy; under the override it stays on the failover,
-    /// as the legacy override pins the newest worker first.
-    #[test]
-    fn with_the_engine_switch_a_key_recovers_as_the_legacy_paths_do() {
-        let headers = keyed_headers();
-        let manual = PolicyConfig::Manual {
-            eviction_interval_secs: 0,
-            max_idle_secs: 0,
-            assignment_mode: ManualAssignmentMode::Random,
-        };
-        let cases = [
-            (manual, false, true),
-            (PolicyConfig::RoundRobin, true, false),
-        ];
-        for (config, override_on, returns) in cases {
-            for mode in [PolicyEngineMode::Legacy, PolicyEngineMode::Engine] {
-                let policies = PolicyRegistry::with_override(
-                    config.clone(),
-                    RoutingKeyOverrideConfig {
-                        enabled: override_on,
-                        ..Default::default()
-                    },
-                )
-                .with_policy_engine(mode, &config, &config);
-                let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
-                let owner = pick(&registry, &policies, with_headers(&headers));
-                owner.set_status(WorkerStatus::NotReady);
-                let failover = pick(&registry, &policies, with_headers(&headers));
-                assert_ne!(failover.url(), owner.url(), "{mode:?}");
-                for _ in 0..3 {
-                    assert_eq!(
-                        pick(&registry, &policies, with_headers(&headers)).url(),
-                        failover.url(),
-                        "{mode:?}: the failover holds the key"
-                    );
-                }
-                owner.set_status(WorkerStatus::Ready);
-                let back = pick(&registry, &policies, with_headers(&headers));
-                assert_eq!(
-                    back.url() == owner.url(),
-                    returns,
-                    "{} under {mode:?}: the key went to {}",
-                    config.name(),
-                    back.url()
-                );
-            }
-        }
-    }
-
-    /// Under the switch a pool whose every worker is over the overload
-    /// thresholds is steered to its least-loaded worker by the host's fallback
-    /// and counted as such, as the legacy path does once its pre-filter
-    /// empties; a placement that commits keeps the configured policy's name
-    /// as the selection metric's label.
-    #[test]
-    fn with_the_engine_switch_an_all_overloaded_pool_keeps_the_least_loaded_fallback() {
-        let policies = engine_round_robin();
-        let registry = http_registry(&["http://h:1", "http://h:2"]);
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, || {
-            pick(&registry, &policies, PlacementInputs::default())
-        });
-        assert!(
-            handle.render().lines().any(|line| {
-                line.starts_with("smg_worker_selection_total{")
-                    && line.contains("policy=\"round_robin\"")
-                    && line.ends_with(" 1")
-            }),
-            "the selection keeps the policy label:\n{}",
-            handle.render()
-        );
-
-        let busier = registry.get_by_url("http://h:1").expect("registered");
-        for _ in 0..10 {
-            busier.increment_load();
-        }
-        for worker in registry.get_all() {
-            registry.set_worker_overloaded(&worker, true);
-        }
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let selected = metrics::with_local_recorder(&recorder, || {
-            pick(&registry, &policies, PlacementInputs::default())
-        });
-        assert_eq!(
-            selected.url(),
-            "http://h:2",
-            "the least-loaded worker of the vetoed pool"
-        );
-        assert_one_overload_fallback(&handle.render());
-    }
-    /// The engine's view already leaves out a worker the host vetoes, so a
-    /// commit miss needs the eligibility to turn between the view and the
-    /// commit. Handed one that refuses targets the view kept, the seam takes
-    /// the next target of the same decision; when every target misses, one
-    /// re-decision runs with the misses excluded; when that misses too, the
-    /// host's own fallback answers, nothing here since the host vetoed no
-    /// one, and no third decision runs.
-    #[test]
-    fn with_the_engine_switch_a_commit_miss_walks_the_targets_then_re_decides_once() {
-        let passthrough = PolicyConfig::Passthrough;
-        let policies = PolicyRegistry::new(passthrough.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &passthrough,
-            &passthrough,
-        );
-        let decider = policies.decider().expect("the engine serves passthrough");
-        let urls = [
-            "grpc://p:1",
-            "grpc://p:2",
-            "grpc://p:3",
-            "grpc://p:4",
-            "grpc://p:5",
-        ];
-        let registry = registry_with(
-            &urls
-                .iter()
-                .map(|url| (*url, ConnectionMode::Grpc, RuntimeType::Vllm))
-                .collect::<Vec<_>>(),
-        );
-        let candidates: Vec<Arc<dyn Worker>> = urls
-            .iter()
-            .map(|url| registry.get_by_url(url).expect("registered"))
-            .collect();
-        let place = |refused: &[&str]| {
-            let eligible = |worker: &Arc<dyn Worker>| !refused.contains(&worker.url());
-            select_from_decided(RegularDecision {
-                decider,
-                registry: &registry,
-                model_id: MODEL,
-                candidates: &candidates,
-                request: HostRequest {
-                    model: MODEL,
-                    phase: Phase::Single,
-                    ..HostRequest::default()
-                },
-                eligible: &eligible,
-                policy: "passthrough",
-            })
-        };
-
-        // Passthrough lists the pool in order: the first target misses, the
-        // second one of the same decision is taken.
-        assert_eq!(
-            place(&["grpc://p:1"]).expect("a worker").url(),
-            "grpc://p:2"
-        );
-        assert_eq!(decider.decisions(), 1, "the walk needs no second decision");
-
-        // Four misses exhaust the decision's targets: one re-decision with the
-        // misses excluded reaches the fifth worker.
-        let four = ["grpc://p:1", "grpc://p:2", "grpc://p:3", "grpc://p:4"];
-        assert_eq!(place(&four).expect("a worker").url(), "grpc://p:5");
-        assert_eq!(decider.decisions(), 3, "one decision and one re-decision");
-
-        // Every target refused: the re-decision misses too, the host's
-        // fallback has nothing vetoed to steer to, and no third decision runs.
-        assert!(
-            place(&urls).is_none(),
-            "no fallback outside the host's veto"
-        );
-        assert_eq!(decider.decisions(), 5, "one re-decision, never a second");
     }
 }

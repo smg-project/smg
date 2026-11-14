@@ -186,7 +186,7 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = HttpMetricsFuture<S::Future>;
+    type Future = HttpMetricsFuture<TaskLocalFuture<RequestStarted, S::Future>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -230,9 +230,9 @@ where
     }
 }
 
-/// The metrics layer's future: the route's future with the request's start
-/// in its task local, with the edge's bookkeeping as its duty.
-pub type HttpMetricsFuture<F> = DutyFuture<TaskLocalFuture<RequestStarted, F>, EdgeDuty>;
+/// The metrics layer's future: `F`, the route's future under the request's
+/// start in its task local, with the edge's bookkeeping as its duty.
+pub type HttpMetricsFuture<F> = DutyFuture<F, EdgeDuty>;
 
 /// What the metrics layer holds for a request between its arrival and the
 /// route's answer: the edge's bookkeeping of the answer (the duration, the

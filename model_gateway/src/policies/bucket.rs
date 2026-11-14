@@ -8,7 +8,6 @@ use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use rand::RngExt;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, BucketConfig,
@@ -121,27 +120,20 @@ impl LoadBalancingPolicy for BucketPolicy {
             // The bucket chooses among the workers it lists; the caller offers
             // the ones available now (on a retry, the ones not yet tried).
             let is_offered = |url: &str| healthy_indices.iter().any(|&i| workers[i].url() == url);
-            let (choiced_url, chars_per_url_snapshot) = {
-                let buc = bucket.read();
-                let chars_per_url_snapshot = buc.chars_per_url.lock().clone();
-                let choiced_url = buc.find_offered_boundary(char_count, is_offered);
-                (choiced_url, chars_per_url_snapshot)
-            };
             // The imbalance test and the spill weigh the offered healthy
             // workers alone: a listed worker nobody offers drains to zero and
             // would otherwise drag the minimum down and draw every spill to a
             // worker that cannot serve.
-            let offered: Vec<(&String, usize)> = chars_per_url_snapshot
-                .iter()
-                .filter(|(url, _)| is_offered(url))
-                .map(|(url, &chars)| (url, chars))
-                .collect();
-            let max_load = offered.iter().map(|&(_, chars)| chars).max().unwrap_or(0);
-            let min_load = offered.iter().map(|&(_, chars)| chars).min().unwrap_or(0);
-            let abs_diff = max_load.saturating_sub(min_load);
-            let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
+            let (choiced_url, loads) = {
+                let buc = bucket.read();
+                let choiced_url = buc.find_offered_boundary(char_count, is_offered);
+                let loads = buc.offered_loads(healthy_indices.iter().map(|&i| workers[i].url()));
+                (choiced_url, loads)
+            };
+            let abs_diff = loads.max.saturating_sub(loads.min);
+            let rel_threshold = self.config.balance_rel_threshold * loads.min as f32;
             let is_imbalanced =
-                abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
+                abs_diff > self.config.balance_abs_threshold && loads.max as f32 > rel_threshold;
             debug!(
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
@@ -150,20 +142,15 @@ impl LoadBalancingPolicy for BucketPolicy {
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
                 debug!("select prefill instance by Load Balance policy");
-                let min_url = offered
-                    .iter()
-                    .min_by_key(|&&(_, chars)| chars)
-                    .map(|&(url, _)| url.clone())
-                    .unwrap_or_else(|| {
-                        let idx = rng.random_range(0..healthy_indices.len());
-                        let url = workers[healthy_indices[idx]].url();
-                        warn!(
-                            "No URL found, randomly selecting: {}",
-                            Endpoint::redacted_str(url)
-                        );
-                        url.to_string()
-                    });
-                min_url
+                loads.least_loaded.map(str::to_string).unwrap_or_else(|| {
+                    let idx = rng.random_range(0..healthy_indices.len());
+                    let url = workers[healthy_indices[idx]].url();
+                    warn!(
+                        "No URL found, randomly selecting: {}",
+                        Endpoint::redacted_str(url)
+                    );
+                    url.to_string()
+                })
             } else {
                 debug!("select prefill instance by Bucket policy");
                 match choiced_url {
@@ -261,13 +248,11 @@ pub struct Bucket {
     bucket_load: usize,
     boundary: Vec<Boundary>,
     request_list: VecDeque<SequencerRequest>,
-    t_req_loads: HashMap<String, usize>,
     pub chars_per_url: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SequencerRequest {
-    pub id: String,
     pub char_cnt: usize,
     pub timestamp: SystemTime,
     pub prefill_worker_url: String,
@@ -285,6 +270,15 @@ impl Boundary {
     }
 }
 
+/// The loads of the offered workers the bucket counts, at a selection: the
+/// highest, the lowest and the least loaded worker; `None` with both loads at
+/// zero when the bucket counts none of them.
+struct OfferedLoads<'a> {
+    max: usize,
+    min: usize,
+    least_loaded: Option<&'a str>,
+}
+
 impl Bucket {
     pub fn new(period: usize) -> Self {
         let bucket_cnt = 0;
@@ -292,7 +286,6 @@ impl Bucket {
         let load_total = 0;
         let bucket_load = 0;
 
-        let t_req_loads = HashMap::new();
         let request_list = VecDeque::new();
 
         let initial_map = HashMap::new();
@@ -309,7 +302,6 @@ impl Bucket {
             bucket_load,
             boundary,
             request_list,
-            t_req_loads,
             chars_per_url: Arc::new(Mutex::new(initial_map)),
         }
     }
@@ -393,7 +385,6 @@ impl Bucket {
             }
 
             if let Some(removed_req) = self.request_list.pop_front() {
-                self.t_req_loads.remove(&removed_req.id);
                 removed_load += removed_req.char_cnt;
 
                 let mut map = self.chars_per_url.lock();
@@ -405,12 +396,7 @@ impl Bucket {
 
         self.load_total = self.load_total.saturating_sub(removed_load);
 
-        let id = Uuid::now_v7().to_string();
-
-        self.t_req_loads.insert(id.clone(), char_cnt);
-
         self.request_list.push_back(SequencerRequest {
-            id,
             char_cnt,
             timestamp: now,
             prefill_worker_url: prefill_url,
@@ -509,6 +495,28 @@ impl Bucket {
             .map(|b| b.url.clone())
     }
 
+    /// The loads of the workers of `offered` the bucket counts, read in one
+    /// pass: the highest, the lowest and the first least loaded one met.
+    fn offered_loads<'a>(&self, offered: impl Iterator<Item = &'a str>) -> OfferedLoads<'a> {
+        let counted = self.chars_per_url.lock();
+        let mut loads = OfferedLoads {
+            max: 0,
+            min: 0,
+            least_loaded: None,
+        };
+        for url in offered {
+            let Some(&chars) = counted.get(url) else {
+                continue;
+            };
+            loads.max = loads.max.max(chars);
+            if loads.least_loaded.is_none() || chars < loads.min {
+                loads.min = chars;
+                loads.least_loaded = Some(url);
+            }
+        }
+        loads
+    }
+
     pub fn get_total_load(&self) -> usize {
         self.load_total
     }
@@ -547,7 +555,7 @@ impl Bucket {
     /// no range until the next adjustment; the load spill of
     /// [`BucketPolicy::select_worker`] evens the load out meanwhile.
     pub fn adjust_boundary(&mut self) {
-        if self.t_req_loads.is_empty() {
+        if self.request_list.is_empty() {
             return;
         }
 
@@ -571,8 +579,8 @@ impl Bucket {
         // The size histogram of the window: each distinct size with the load
         // its requests add up to.
         let mut histogram: BTreeMap<usize, usize> = BTreeMap::new();
-        for &size in self.t_req_loads.values() {
-            *histogram.entry(size).or_default() += size;
+        for req in &self.request_list {
+            *histogram.entry(req.char_cnt).or_default() += req.char_cnt;
         }
         let worker_urls = self.prefill_worker_urls.lock().clone();
         let mut classes = histogram.iter();

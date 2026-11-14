@@ -105,7 +105,6 @@ pub unsafe extern "C" fn sgl_stream_read_next(
                     &mut converter_guard,
                     &tokenizer,
                 )
-                .await
             });
 
             match conversion_result {

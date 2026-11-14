@@ -46,8 +46,18 @@ use crate::{
 };
 
 const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Three files' split pattern: a letter run with its marks, words joined by
+/// single spaces, as one piece.
+const JOINED_LETTER_RUNS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
 const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const DIGITS: &str = r"\p{N}{1,3}";
+/// A parse family's punctuation stage: a bracket, or a capturing group of one
+/// punctuation character read back at once (a run of it).
+const PUNCTUATION_RUNS: &str = r#"[\(\)\[\]\{\}]|([!"\#\$%\&'\*\+,\-\./:;<=>\?\\\^_`\|\~])\1*"#;
+
+/// A line-break stage: runs of `\n` or `\r\n`, each taken whole with the text
+/// after it under `MergedWithNext`.
+const LINE_BREAK_RUNS: &str = r"(?:\r?\n)+(?!\r?\n)";
 const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
 const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -63,6 +73,25 @@ const JOINED_LETTERS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?
 /// The cased template without the clitic group and with one digit at a
 /// time.
 const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// The cased template whose number rule cuts a run of the numbers (the
+/// decimal digits and the other numerals) into groups of three from its
+/// end, the lookahead closed by a negative lookahead over the numbers,
+/// and a run of one or two beside it.
+const NUMBER_GROUPS: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// The digit-grouping split before the cased template: a digit run is cut
+/// into groups of three from its end, the first group taking the
+/// remainder.
+const DIGIT_GROUPS: &str = r"\d{1,3}(?=(?:\d{3})*\b)";
+/// The digit stages of a 200k byte-level family, between its `Digits` split
+/// and its letter template: a digit run cut into pieces of at most 510 from
+/// its end, a piece's first one or two digits cut off when groups of three
+/// fill the rest, then groups of three from the piece's start. `\A`, `\z`
+/// and `\G` read the bounds of the piece a stage runs over and where the
+/// search in it began. Then the family's runs of several scripts.
+const WIDE_DIGIT_GROUPS: &str = r"\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}";
+const DIGIT_GROUP_HEAD: &str = r"\A\p{Nd}{1,2}(?=\p{Nd}{3}+\z)";
+const DIGIT_GROUPS_FROM_THE_START: &str = r"\A\p{Nd}{3}|\G\p{Nd}{3}";
+const SCRIPT_RUNS: &str = r"(?:[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\uf900-\uFAFF\uFF65-\uFF9F\u2F00-\u2FDF]+|[\u0E00-\u0E7F]+|[\u0E80-\u0EFF]+|[\u1780-\u17FF]+|[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]+|[\uAC00-\uD7AF\u1100-\u11FF]+)";
 
 const POOL: &[char] = &[
     'a',
@@ -280,6 +309,10 @@ struct Shape {
     ignore_merges: bool,
     special: &'static [&'static str],
     added: &'static [(&'static str, bool)],
+    /// Added tokens with `lstrip` / `rstrip`: content, lstrip, rstrip, and
+    /// whether the token is special (matched on the raw text; a plain one
+    /// is matched after normalization).
+    stripped: &'static [(&'static str, bool, bool, bool)],
 }
 
 fn shapes() -> Vec<Shape> {
@@ -300,6 +333,7 @@ fn shapes() -> Vec<Shape> {
                 "</think>",
             ],
             added: &[("<tool_call>", false), ("</tool_call>", false)],
+            stripped: &[],
         },
         Shape {
             name: "cl100k-ignore-merges",
@@ -311,6 +345,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: true,
             special: &["<|endoftext|>", "[gMASK]", "<sop>"],
             added: &[],
+            stripped: &[],
         },
         Shape {
             name: "three-splits",
@@ -328,6 +363,7 @@ fn shapes() -> Vec<Shape> {
                 "<｜User｜>",
             ],
             added: &[("<｜tool▁call▁begin｜>", true), ("<｜fim▁hole｜>", true)],
+            stripped: &[],
         },
         Shape {
             name: "inverted-removed",
@@ -339,6 +375,32 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|im_start|>", "<|im_end|>", "[e~[", "]~b]"],
             added: &[],
+            stripped: &[],
+        },
+        // A lone `Removed` split before a `ByteLevel` without its regex: the
+        // gaps alone, under the generic walk (the single-stage loop takes a
+        // stage whose pieces are its matches). The literal is the space: the
+        // stage matches at every space, so the chunking sweeps find their
+        // cuts there (a lone stage that never matches at a space leaves a
+        // long text one unit).
+        Shape {
+            name: "removed-literal",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Split(
+                    Split::new(
+                        SplitPattern::String(" ".to_owned()),
+                        SplitDelimiterBehavior::Removed,
+                        false,
+                    )
+                    .expect("split"),
+                ),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
         },
         Shape {
             name: "byte-level-regex",
@@ -347,6 +409,63 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
+        },
+        // The NFC normalizer, the split whose second alternative is the joined
+        // letter run (words joined by single spaces as one piece), and the
+        // `ByteLevel` without its regex: the chain of a family's files.
+        Shape {
+            name: "nfc-then-joined-letter-runs",
+            normalizer: Normalizer::Nfc,
+            pre_tokenizers: vec![
+                split(JOINED_LETTER_RUNS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["[|endofturn|]", "[|tool|]"],
+            added: &[],
+            stripped: &[],
+        },
+        // A line-break stage with `MergedWithNext` (each run of line breaks
+        // glued to the text after it), the cl100k-style regex, and the
+        // `ByteLevel` without its regex: the chain of a code family's files.
+        Shape {
+            name: "merged-line-breaks-then-cl100k",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(
+                    LINE_BREAK_RUNS,
+                    SplitDelimiterBehavior::MergedWithNext,
+                    false,
+                ),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|fim_prefix|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // The same chain with a `Digits` split after the map: the
+        // merged-with-next stage walks the raw text, the digit stage the
+        // byte-level image of each piece.
+        Shape {
+            name: "merged-line-breaks-then-cl100k-then-digits-over-the-image",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(
+                    LINE_BREAK_RUNS,
+                    SplitDelimiterBehavior::MergedWithNext,
+                    false,
+                ),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|fim_prefix|>"],
+            added: &[],
+            stripped: &[],
         },
         Shape {
             name: "possessive-clitic-class",
@@ -367,6 +486,7 @@ fn shapes() -> Vec<Shape> {
                 "<|role_end|>",
             ],
             added: &[("<tool_call>", false), ("<think>", false)],
+            stripped: &[],
         },
         Shape {
             name: "clitic-class",
@@ -383,6 +503,7 @@ fn shapes() -> Vec<Shape> {
                 "<|im_end|>",
             ],
             added: &[("<think>", false), ("<|tool_call_start|>", false)],
+            stripped: &[],
         },
         // `Digits` before the `ByteLevel` with its own regex: every numeric
         // character its own piece, the rest cut by the byte-level pattern.
@@ -396,6 +517,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
+            stripped: &[],
         },
         // NFKC before the `Digits` stage and the `ByteLevel`: compatibility
         // characters spell out first (a circled digit becomes a digit the
@@ -410,6 +532,31 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[("\u{FB01}le", true), ("<tool_call>", false)],
+            stripped: &[],
+        },
+        // `Digits` runs, the three anchored digit stages over them, the runs
+        // of several scripts, the letter template with its own symbols, and
+        // the `ByteLevel` map without its regex.
+        Shape {
+            name: "digit-runs-then-anchored-digit-stages",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split(WIDE_DIGIT_GROUPS, SplitDelimiterBehavior::Isolated, false),
+                split(DIGIT_GROUP_HEAD, SplitDelimiterBehavior::Isolated, false),
+                split(
+                    DIGIT_GROUPS_FROM_THE_START,
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                ),
+                split(SCRIPT_RUNS, SplitDelimiterBehavior::Isolated, false),
+                split(DEEPSEEK, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[("<think>", false)],
+            stripped: &[],
         },
         // `Punctuation` runs, the cased template, the `ByteLevel` map, and a
         // split on ASCII digits after the map (the reference cuts the mapped
@@ -428,6 +575,103 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
             added: &[],
+            stripped: &[],
+        },
+        // Five `Split` stages before `Digits` and a `ByteLevel` without its
+        // regex, the fourth anchored at the end (`\s+$`, a whitespace run
+        // that ends its piece): the pieces are cut stage by stage and the
+        // anchor reads each piece's end.
+        Shape {
+            name: "end-anchored-splits",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(r"[\r\n]", SplitDelimiterBehavior::Isolated, false),
+                split(r"\s?[A-Za-z]+", SplitDelimiterBehavior::Isolated, false),
+                split(r"\s?[!-/:-~]+", SplitDelimiterBehavior::Isolated, false),
+                split(r"\s+$", SplitDelimiterBehavior::Isolated, false),
+                split(CJK, SplitDelimiterBehavior::Isolated, false),
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // The cased template with the number rule that cuts a run of the
+        // numbers into groups of three from its end, and a `ByteLevel`
+        // without its regex: a numeral beyond the decimal digits (a
+        // superscript, a fraction, a Roman numeral) counts in the run.
+        Shape {
+            name: "number-groups-in-the-cased-template",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(NUMBER_GROUPS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[("<think>", false)],
+            stripped: &[],
+        },
+        // The digit-grouping split before the cased template and a
+        // `ByteLevel` without its regex: a digit run is cut into groups of
+        // three from its end, the first group taking the remainder, and a
+        // run that meets a word character stays whole for the template.
+        Shape {
+            name: "digit-groups-then-cased-template",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(DIGIT_GROUPS, SplitDelimiterBehavior::Isolated, false),
+                split(CASED, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // A literal split with `Removed` first (the first stage of a parse
+        // family's chain): its matches are dropped, the pieces on either
+        // side of one stay apart through the later stages and the model,
+        // and two adjacent matches leave no piece between them. The dash is
+        // in the random texts' pool, so the sweeps cut at it.
+        Shape {
+            name: "removed-literal-then-digits-then-byte-level-regex",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Split(
+                    Split::new(
+                        SplitPattern::String("-".to_owned()),
+                        SplitDelimiterBehavior::Removed,
+                        false,
+                    )
+                    .expect("split"),
+                ),
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[("<tool_call>", false)],
+            stripped: &[],
+        },
+        // A punctuation stage written as a capturing group read back at once
+        // (a run of one repeated character), before `Digits` and the
+        // `ByteLevel` with its regex: each run is one piece, as the engine
+        // cuts it.
+        Shape {
+            name: "repeated-punctuation-then-digits-then-byte-level-regex",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(PUNCTUATION_RUNS, SplitDelimiterBehavior::Isolated, false),
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
         },
         // `Digits` in runs before a split and the `ByteLevel`.
         Shape {
@@ -441,6 +685,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         Shape {
             name: "joined-letters",
@@ -452,6 +697,7 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|begin_of_text|>", "<|endoftext|>"],
             added: &[],
+            stripped: &[],
         },
         // `Punctuation` one character at a time, then the `ByteLevel` with
         // its own regex.
@@ -467,6 +713,43 @@ fn shapes() -> Vec<Shape> {
             ignore_merges: false,
             special: &["<|endoftext|>"],
             added: &[],
+            stripped: &[],
+        },
+        // A `Digits` after the `ByteLevel` map (a `Punctuation` before it):
+        // the digits stage runs over the byte-level image, where the map's
+        // Latin-1 numerics (six bytes beyond ASCII, inside multi-byte
+        // characters too) are numeric, each a piece of its own.
+        Shape {
+            name: "punctuation-then-byte-level-regex-then-digits",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Contiguous,
+                )),
+                byte_level(true),
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // The same with digit runs, and a split of three digits after them.
+        Shape {
+            name: "punctuation-then-byte-level-regex-then-digit-runs-then-threes",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Punctuation(Punctuation::new(
+                    SplitDelimiterBehavior::Contiguous,
+                )),
+                byte_level(true),
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split("[0-9][0-9][0-9]", SplitDelimiterBehavior::Isolated, false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
         },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
@@ -484,6 +767,25 @@ fn shapes() -> Vec<Shape> {
                 ("foo bar", true),
                 ("### Instruction", true),
                 ("<tool_call>", false),
+            ],
+            stripped: &[],
+        },
+        // Added tokens that take the whitespace beside them (`rstrip`, and
+        // `lstrip` with `rstrip`), as the reference's matcher widens them.
+        Shape {
+            name: "stripped-sentinels",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[("<think>", false)],
+            stripped: &[
+                ("<|end|>", false, true, true),
+                ("<|user|>", false, true, false),
+                ("<|dummy_0|>", true, true, false),
             ],
         },
     ]
@@ -513,7 +815,12 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
             shape
                 .added
                 .iter()
-                .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized)),
+                .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized))
+                .chain(shape.stripped.iter().map(|(s, lstrip, rstrip, special)| {
+                    AddedToken::from(*s, *special)
+                        .lstrip(*lstrip)
+                        .rstrip(*rstrip)
+                })),
         )
         .expect("added tokens");
     tokenizer
@@ -637,13 +944,13 @@ fn shapes_outside_the_path_are_declined() {
     // A split behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        split(QWEN35, SplitDelimiterBehavior::MergedWithNext, false),
+        split(QWEN35, SplitDelimiterBehavior::MergedWithPrevious, false),
         byte_level(false),
     ]))));
     assert_eq!(
         declined(&tokenizer),
-        "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, or \
-             Removed inverted)"
+        "Split behavior Some(\"MergedWithPrevious\") with invert Some(false) (only Isolated, \
+             Removed, Removed inverted, or MergedWithNext)"
     );
     // A punctuation behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -655,37 +962,20 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "Punctuation behavior Some(\"Removed\") (only Isolated or Contiguous)"
     );
-    // A split after the ByteLevel that would read the mapped text otherwise
-    // than the raw text.
-    let mut tokenizer = tokenizer_of(base, &mut state);
-    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        byte_level(false),
-        split(r"\p{N}", SplitDelimiterBehavior::Isolated, false),
-    ]))));
-    assert_eq!(
-        declined(&tokenizer),
-        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
-    );
-    // A `Digits` after the ByteLevel: on the mapped text it would also cut
-    // at the numeric characters the map makes of six bytes beyond ASCII.
-    let mut tokenizer = tokenizer_of(base, &mut state);
-    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        byte_level(false),
-        PreTokenizerWrapper::Digits(Digits::new(true)),
-    ]))));
-    assert_eq!(
-        declined(&tokenizer),
-        "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII"
-    );
-    // An added token with lstrip.
+    // An added token with single_word; one with lstrip and rstrip is taken.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer
-        .add_special_tokens([AddedToken::from("<pad>", true).lstrip(true)])
+        .add_special_tokens([AddedToken::from("<pad>", true).single_word(true)])
         .expect("special token");
     assert_eq!(
         declined(&tokenizer),
-        "added token \"<pad>\" with single_word, lstrip or rstrip, or without content"
+        "added token \"<pad>\" with single_word, or without content"
     );
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer
+        .add_special_tokens([AddedToken::from("<pad>", true).lstrip(true).rstrip(true)])
+        .expect("special token");
+    assert!(NativeEncoder::from_tokenizer(&tokenizer).is_ok());
     // A regex outside the subset.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
@@ -695,6 +985,80 @@ fn shapes_outside_the_path_are_declined() {
     assert_eq!(
         declined(&tokenizer),
         r"a split pattern outside the supported regex subset: \w+|\s+"
+    );
+    // A pattern anchored to its text in the first stage (a unit of the pool
+    // would be its text), and one over more than digits after a stage (the
+    // pool's cut check runs it over a window, not over pieces).
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(
+            DIGIT_GROUPS_FROM_THE_START,
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a first split pattern anchored to its text (\A, \z or \G)"
+    );
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        PreTokenizerWrapper::Digits(Digits::new(false)),
+        split(
+            r"\A[a-z]+|\G\p{Nd}{3}",
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a split pattern anchored to its text (\A, \z or \G) over more than decimal digits"
+    );
+    // The `\z` that ends a digit-grouping lookahead is an anchor as the bare
+    // one is; and an anchored stage after a stage other than `Digits` (a gap
+    // of that stage holding digits can end at a unit's end, where the text
+    // goes on).
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(
+            r"\p{Nd}{1,2}(?=\p{Nd}{3}+\z)",
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        split(DEEPSEEK, SplitDelimiterBehavior::Isolated, false),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a first split pattern anchored to its text (\A, \z or \G)"
+    );
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(r"[a-z]+", SplitDelimiterBehavior::Isolated, false),
+        split(DIGIT_GROUP_HEAD, SplitDelimiterBehavior::Isolated, false),
+        split(DEEPSEEK, SplitDelimiterBehavior::Isolated, false),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a split pattern anchored to its text (\A, \z or \G) without a Digits split before it"
+    );
+    // A two-character lookahead after a class run: it would read past the
+    // end of a pool unit where the whole text reads on.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(
+            r"[a]+(?![ ][b])| [a-z]+",
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a split pattern outside the supported regex subset: [a]+(?![ ][b])| [a-z]+"
     );
     // A post-processor of another kind, and a model that is not BPE.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -715,6 +1079,21 @@ fn shapes_outside_the_path_are_declined() {
         declined(&tokenizer),
         "no pre-tokenizer (the path needs a ByteLevel without a prefix space)"
     );
+}
+
+/// `NativeEncoder::check_anchors` accepts an anchored digit stage after a
+/// `Digits` split because every decimal digit of the engine (`\p{Nd}`,
+/// `unicode::DIGIT`, the engine's tables) is numeric to the split
+/// (`unicode::STD_NUMERIC`, the toolchain's); the two tables regenerate on
+/// different triggers, so the inclusion is pinned here.
+#[test]
+fn every_engine_decimal_digit_is_numeric() {
+    for &(lo, hi) in unicode::DIGIT {
+        for code in lo..=hi {
+            let c = char::from_u32(code).expect("a scalar value");
+            assert!(c.is_numeric(), "U+{code:04X}");
+        }
+    }
 }
 
 /// The `Digits` stage holds exactly what `char::is_numeric` accepts, the
@@ -826,6 +1205,126 @@ fn the_punctuation_stage_holds_what_the_reference_cuts_on() {
     }
 }
 
+/// Added tokens with `lstrip` / `rstrip` take the whitespace beside them, as
+/// the reference's matcher widens them: the whitespace is in no id, the
+/// whitespace between an `rstrip` token and an `lstrip` token goes to the
+/// first, a token at the text's start or end takes what is there, and an
+/// unflagged token beside whitespace leaves it to the text.
+#[test]
+fn stripped_added_tokens_take_their_whitespace_as_tokenizers_does() {
+    let mut state = 0x57A1_57A1_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "stripped-sentinels")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let id = |s: &str| tokenizer.token_to_id(s).expect("an added token");
+    let ids = |s: &str| {
+        tokenizer
+            .encode(s, false)
+            .expect("tokenizers encodes")
+            .get_ids()
+            .to_vec()
+    };
+    let cases: [(&str, Vec<u32>); 7] = [
+        (
+            "a <|end|> b",
+            [ids("a "), vec![id("<|end|>")], ids("b")].concat(),
+        ),
+        (
+            "a \u{3000}<|dummy_0|>\t\n b",
+            [ids("a"), vec![id("<|dummy_0|>")], ids("b")].concat(),
+        ),
+        (
+            "<|end|> \u{A0}<|dummy_0|> x",
+            [vec![id("<|end|>"), id("<|dummy_0|>")], ids("x")].concat(),
+        ),
+        (" <|dummy_0|> ", vec![id("<|dummy_0|>")]),
+        ("<|end|>", vec![id("<|end|>")]),
+        (
+            "a <think> b",
+            [ids("a "), vec![id("<think>")], ids(" b")].concat(),
+        ),
+        (
+            "x <|user|><|end|>  <|user|>",
+            [
+                ids("x "),
+                vec![id("<|user|>"), id("<|end|>"), id("<|user|>")],
+            ]
+            .concat(),
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(ids(text), expected, "the reference on {text:?}");
+        assert_eq!(
+            native.encode(Some(model), text, false),
+            Ok(expected),
+            "{text:?}"
+        );
+    }
+}
+
+/// A whitespace token under `lstrip` whose match a stripped neighbour's
+/// widening took whole emits no id, as the library drops the empty split it
+/// makes of it, where the same token standing on its own is one id. Its
+/// shape stands apart from the shape set: the random texts hold that
+/// character, and the library's own matcher panics on a text where a
+/// neighbour's whitespace runs past such a token (a split whose start passes
+/// its end), so there is nothing to compare against there; the native path
+/// answers, the empty range leaving the matcher's clamp where it was, so a
+/// later token's widening reaches into no earlier range.
+#[test]
+fn a_whitespace_token_inside_a_neighbours_whitespace_emits_no_id() {
+    let mut state = 0x57A1_57A1_0000_0002u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "stripped-sentinels")
+        .expect("the shape");
+    let shape = Shape {
+        name: "stripped-sentinels-with-a-space",
+        stripped: &[
+            ("<|user|>", false, true, false),
+            ("\u{2003}", true, false, false),
+        ],
+        ..shape
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let id = |s: &str| tokenizer.token_to_id(s).expect("an added token");
+    let ids = |s: &str| {
+        tokenizer
+            .encode(s, false)
+            .expect("tokenizers encodes")
+            .get_ids()
+            .to_vec()
+    };
+    let cases: [(&str, Vec<u32>); 2] = [
+        ("<|user|>\u{2003}", vec![id("<|user|>")]),
+        (
+            "x\u{2003}y",
+            [ids("x"), vec![id("\u{2003}")], ids("y")].concat(),
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(ids(text), expected, "the reference on {text:?}");
+        assert_eq!(
+            native.encode(Some(model), text, false),
+            Ok(expected),
+            "{text:?}"
+        );
+    }
+    // The first token's `rstrip` takes all the whitespace, past both em
+    // spaces; the library's matcher panics on this text, the native path
+    // emits the token and the text after the whitespace.
+    assert_eq!(
+        native.encode(Some(model), "<|user|>\u{2003} \u{2003}x", false),
+        Ok([vec![id("<|user|>")], ids("x")].concat())
+    );
+}
+
 #[test]
 fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
     // The NFKC shape on texts NFC leaves as they are: a ligature, fullwidth
@@ -858,6 +1357,964 @@ fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
             Ok(reference.get_ids().to_vec()),
             "{text:?}"
         );
+    }
+}
+
+#[test]
+fn an_end_anchored_chain_keeps_a_long_text_whole() {
+    // `\s+$` reads the end of the text it runs over: a cut for the thread
+    // pool would put a false end inside the text, so an end-anchored chain
+    // takes no stable cut and a long text is one unit, with the ids of the
+    // whole however the caller asks for it.
+    let mut state = 0xE4DA_4C40_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "end-anchored-splits")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    assert!(native.end_anchored);
+    let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES) + "the end   ";
+    assert_eq!(native.stable_cut(&text, PARALLEL_CHUNK_BYTES), None);
+    let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+    for parallel in [false, true] {
+        assert_eq!(
+            native.encode_with(Some(tokenizer.get_model()), &text, parallel, false),
+            Ok(reference.get_ids().to_vec()),
+            "parallel {parallel}"
+        );
+    }
+}
+
+/// A stage after the `ByteLevel` map whose pattern reads beyond printable
+/// ASCII (a `Digits`, each digit or each run a piece, with a split of three
+/// digits after it in one shape) runs over each piece's byte-level image, as
+/// the reference runs it: the Latin-1 numerics the map makes of six bytes
+/// beyond ASCII are pieces of their own, inside a multi-byte character too,
+/// so a piece is not always a whole character; the native path's ids are
+/// the reference's on such texts, serial and pooled, and a long text stays
+/// one unit (the cut check reads the raw text).
+#[test]
+fn a_stage_after_the_byte_level_reads_the_image() {
+    let mut state = 0x1A6E_0000_0000_0001u64;
+    for name in [
+        "punctuation-then-byte-level-regex-then-digits",
+        "punctuation-then-byte-level-regex-then-digit-runs-then-threes",
+    ] {
+        let shape = shapes()
+            .into_iter()
+            .find(|shape| shape.name == name)
+            .expect("the shape");
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        assert_eq!(native.mapped_from, Some(2), "{name}");
+        for text in [
+            "x\u{BC}y",
+            "a\u{B2}b\u{B3}c",
+            "\u{B9}\u{B2}\u{B3}",
+            "1\u{BD}2",
+            "\u{4E32}",
+            "\u{4E39}\u{4E3C}",
+            "price 1234 units",
+            "abc12345678def",
+            "a\u{B2} 123 \u{BC}",
+            "\u{E52}\u{E53}",
+            "tab\there",
+            "x, y; 1,234.5 (\u{BE})!",
+            "<|endoftext|>\u{BC}<|endoftext|>",
+        ] {
+            let reference = tokenizer.encode(text, false).expect("encode");
+            for parallel in [false, true] {
+                assert_eq!(
+                    native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                    Ok(reference.get_ids().to_vec()),
+                    "{name}: {text:?} parallel {parallel}"
+                );
+            }
+        }
+        let text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
+        assert_eq!(
+            native.stable_cut(&text, PARALLEL_CHUNK_BYTES),
+            None,
+            "{name}"
+        );
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), &text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{name}: parallel {parallel}"
+            );
+        }
+    }
+    // The two configurations whose decline rows went with this change, on
+    // the direct path now: a regex `Split` after the `ByteLevel` that reads
+    // beyond ASCII through the engine's `\p{N}`, and one with the end
+    // anchor, where `end_anchored` and `mapped_from` both hold (over the
+    // image `$` holds only at an image piece's end: a `\n` is `Ċ` there);
+    // then the first again with its pieces dropped (`Removed`) and with its
+    // gaps dropped (`Removed` inverted): the image walk skips the dropped
+    // span and its raw cursor still advances over it, which in the CJK
+    // texts is a byte inside a character.
+    let base = &shapes()[0];
+    for (pattern, behavior, invert, anchored) in [
+        (r"\p{N}", SplitDelimiterBehavior::Isolated, false, false),
+        (r"[a-z]+$", SplitDelimiterBehavior::Isolated, false, true),
+        (r"\p{N}", SplitDelimiterBehavior::Removed, false, false),
+        (r"\p{N}", SplitDelimiterBehavior::Removed, true, false),
+    ] {
+        let mut tokenizer = tokenizer_of(base, &mut state);
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+            byte_level(false),
+            split(pattern, behavior, invert),
+        ]))));
+        let native = seeded(&tokenizer);
+        assert_eq!(
+            native.mapped_from,
+            Some(0),
+            "{pattern} {behavior:?} {invert}"
+        );
+        assert_eq!(
+            native.end_anchored, anchored,
+            "{pattern} {behavior:?} {invert}"
+        );
+        for text in [
+            "abc\ndef",
+            "x\u{B2}\n",
+            "abc",
+            "ab1c2 d\u{BD}e",
+            "x\u{BC}y\n\n",
+            "\u{4E32}\n\u{4E39}",
+            "12 ab\nAB cd",
+            "tab\there\n",
+            "\n",
+            "",
+        ] {
+            let reference = tokenizer.encode(text, false).expect("encode");
+            for parallel in [false, true] {
+                assert_eq!(
+                    native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                    Ok(reference.get_ids().to_vec()),
+                    "{pattern} {behavior:?} {invert}: {text:?} parallel {parallel}"
+                );
+            }
+        }
+    }
+
+    // A `Digits` after the map with the anchored digit stages after it:
+    // `\A`, `\z` and `\G` read the bounds of each image piece (a piece can
+    // start with an image numeric outside `Nd`, the `\u{B2}` of `\u{4E32}`).
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        byte_level(false),
+        PreTokenizerWrapper::Digits(Digits::new(false)),
+        split(DIGIT_GROUP_HEAD, SplitDelimiterBehavior::Isolated, false),
+        split(
+            DIGIT_GROUPS_FROM_THE_START,
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+    ]))));
+    let native = seeded(&tokenizer);
+    assert_eq!(native.mapped_from, Some(0));
+    // The ids alone would not tell a skipped anchored stage from a run one
+    // (the pool's merges join no two of the digits `2` to `8`), so the
+    // pieces are compared too, as the reference cuts them, in the image's
+    // alphabet (a cut inside a three-byte character is no `str`).
+    let from = native.mapped_from.expect("the map");
+    let table = bytes_char();
+    let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+    let mut image = String::new();
+    for text in [
+        "12345\u{4E32}678901",
+        "1234567\u{B2}890",
+        "\u{B9}2345",
+        "1234567",
+        "12 345\n6789",
+    ] {
+        let mut split = PreTokenizedString::from(text);
+        pre_tokenizer
+            .pre_tokenize(&mut split)
+            .expect("the reference");
+        let theirs: Vec<String> = split
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(piece, _, _)| piece.to_owned())
+            .collect();
+        let mut ours = Vec::new();
+        native.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+            ours.push(
+                raw.iter()
+                    .map(|&b| table[usize::from(b)])
+                    .collect::<String>(),
+            );
+        });
+        assert!(theirs.len() >= 2, "{text:?} is cut");
+        assert_eq!(
+            ours, theirs,
+            "anchored digit stages: the pieces of {text:?}"
+        );
+        let reference = tokenizer.encode(text, false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "anchored digit stages: {text:?} parallel {parallel}"
+            );
+        }
+    }
+}
+
+#[test]
+fn digit_groups_are_cut_from_the_end_of_a_run_as_the_library_does() {
+    // The digit-grouping shape on runs of every length up to twelve beside
+    // spaces, letters, punctuation, a mark, an underscore, a joiner and
+    // digits of another script, and on a long text of such runs, whole and
+    // through the pool.
+    let mut state = 0xD161_7C40_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digit-groups-then-cased-template")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let mut texts: Vec<String> = [
+        "1234 ",
+        "123456",
+        "1234abc",
+        "12,345,678.90",
+        "1 000 000",
+        "\u{663}\u{664}\u{665}\u{666} ",
+        "1\u{2460}",
+        "x1_",
+        "99\n",
+        "7",
+        "2026-11-12",
+        "abc1234",
+        "123\u{200D}x",
+        "123_456",
+        "a 1000000 b",
+        "\u{663}\u{664}\u{665}\u{666}\u{667}\u{668}\u{669} \u{661}\u{662}\u{663}",
+        "3.14159265358979",
+    ]
+    .iter()
+    .map(|text| (*text).to_owned())
+    .collect();
+    let runs: String = (1..=12)
+        .map(|n| format!("{} {}a {}_ ", "9".repeat(n), "8".repeat(n), "7".repeat(n)))
+        .collect();
+    texts.push(runs.clone());
+    texts.push(runs.repeat(1 + 2 * PARALLEL_MIN_BYTES / runs.len()));
+    for text in &texts {
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{text:?} parallel {parallel}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_removed_split_drops_its_matches_as_the_library_does() {
+    // The removed-literal shape on texts with the literal between words,
+    // twice in a row, at both ends, alone, next to a digit, a line break
+    // and an added token, and absent.
+    let mut state = 0x5245_4D4F_5645_4401u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "removed-literal-then-digits-then-byte-level-regex")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "the-final--countdown",
+        "-lead and trail-",
+        "---",
+        "a-1-b 22-33\n-<tool_call>-x",
+        "<|endoftext|>-",
+        "no match at all",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_joined_letter_run_encodes_as_the_library_does() {
+    // The joined-letter-run shape on texts with words joined by single
+    // spaces, two spaces, marks after letters and after a space, digits and
+    // punctuation between words, a line break, and an added token.
+    let mut state = 0x4A4F_494E_4544_5201u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "nfc-then-joined-letter-runs")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "hello world",
+        "hello  world",
+        "h\u{e9}llo w\u{f6}rld, c\u{327}a va",
+        "ab\u{301} c\u{301}d a \u{301}b",
+        "x1 y2 z 33 words",
+        "one two\nthree four",
+        "[|endofturn|] a b [|tool|]c d",
+        "it's a dog's life",
+        "no",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+/// A letter run joined by spaces can span the pool's cut candidates, and a
+/// window started at one of its joins would read the space by another
+/// alternative (` \p{L}` at once; ` ?\p{L}+` after a comma, where the run
+/// does not restart), part from the whole text's pieces and approve a cut
+/// inside the run; so would a window begun at a space a whitespace run took
+/// (the text lands on the letter after it, where the run begins, the window
+/// reads ` b` instead), or at a space some other alternative reads after
+/// the character before it inside one match (`\p{N}+ ?` takes `1 `,
+/// `[^\s\p{L}\p{N}]+ ?` takes `, `, a literal prefix takes `x `, an optional
+/// digit or prefix before the space the same; the text lands on the letter
+/// after the space the same way): the check starts its
+/// window at a space after a character that is neither whitespace, nor one
+/// a run reaches the space from, nor one such an alternative reads before a
+/// space, and refuses a candidate without one in reach; a pattern without
+/// a joined run whose letter run reads an optional space takes the same
+/// guarded start. The patterns, the family's, five with such an alternative
+/// and the one without a run, on a text that is one run, on prose with a
+/// comma, on runs after two spaces and after a line break with a space, on
+/// prose joined by a period and two spaces, on lines indented by four
+/// spaces, on runs after `1 `, after `, `, after a literal prefix and after
+/// an optional one, and on single-spaced words: the pool's units hold the
+/// whole text's pieces, and the pool's ids are the serial encode's and the
+/// library's.
+#[test]
+fn a_space_joined_run_is_never_cut_by_the_pool() {
+    let mut state = 0x4A4F_494E_4544_5203u64;
+    let one_run = format!("a{}", " b".repeat(40_000));
+    let prose = {
+        let words = "lorem ipsum dolor sit amet ".repeat(4_000);
+        format!("{words}word, then more {words}end")
+    };
+    let double_space = format!("{}  b{}", "c".repeat(31_767), " b".repeat(20_000));
+    let newline_space = format!("{}\n b{}", "c".repeat(32_000), " b".repeat(20_000));
+    let period_prose = "lorem ipsum dolor sit amet consectetur.  ".repeat(3_000);
+    let indented = "    lorem ipsum dolor sit amet\n".repeat(4_000);
+    let digit_space = format!("{}1 b{}", "c".repeat(31_000), " b".repeat(20_000));
+    let comma_space = format!("{}, b{}", "c".repeat(31_000), " b".repeat(20_000));
+    let prefix_run = format!("{}x {}", "z".repeat(31_767), "a ".repeat(20_000));
+    let prefix_opt = format!(
+        "{}x {}c {}",
+        "z".repeat(31_767),
+        "a".repeat(230),
+        "a ".repeat(20_000)
+    );
+    let letter_space = "abc ".repeat(20_000);
+    let long_alternative = format!("{}{}", "z".repeat(31_768), " a".repeat(20_000));
+    let lookahead_at_the_end = format!("! {} ", "a".repeat(1_000)).repeat(120);
+    for (index, pattern) in [
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\s+",
+        JOINED_LETTER_RUNS,
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}+ ?| ?\p{L}+|\s+",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|[^\s\p{L}\p{N}]+ ?| ?\p{L}+|\s+",
+        r"x (?:ab*(?: ab*)*)+| a[ a]{998}| (?:ab*(?: ab*)*)+",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\p{N}? |\s+",
+        r" [ ac]{999}|x? a+|(?:ab*(?: ab*)*)+",
+        r"\p{L}+ ?| ?\p{L}+|\s+",
+        r" [ a]{1999}| [ a]{999}| a",
+        r" a{1000}(?!\s)|a+",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shape = Shape {
+            name: "space-joined-run",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(pattern, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &[],
+            added: &[],
+            stripped: &[],
+        };
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        for text in [
+            one_run.as_str(),
+            prose.as_str(),
+            double_space.as_str(),
+            newline_space.as_str(),
+            period_prose.as_str(),
+            indented.as_str(),
+            digit_space.as_str(),
+            comma_space.as_str(),
+            prefix_run.as_str(),
+            prefix_opt.as_str(),
+            letter_space.as_str(),
+            long_alternative.as_str(),
+            lookahead_at_the_end.as_str(),
+        ] {
+            let whole: Vec<String> = {
+                let mut out = Vec::new();
+                native.pieces(0, text, &mut |piece| out.push(piece.to_owned()));
+                out
+            };
+            let mut chunked = Vec::new();
+            let units = native.units(text, true, true);
+            for unit in units.as_slice() {
+                let Segment::Text(chunk) = unit else {
+                    panic!("no added tokens in this text");
+                };
+                native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+            }
+            assert_eq!(chunked, whole, "pattern {index}: a cut split a piece");
+            let pooled = native
+                .encode_with(Some(tokenizer.get_model()), text, true, false)
+                .expect("pooled");
+            let serial = native
+                .encode_with(Some(tokenizer.get_model()), text, false, false)
+                .expect("serial");
+            assert_eq!(pooled, serial, "pattern {index}: the pool changed the ids");
+            let reference = tokenizer
+                .encode(text, false)
+                .expect("encode")
+                .get_ids()
+                .to_vec();
+            assert_eq!(pooled, reference, "pattern {index}: against the reference");
+        }
+    }
+}
+
+/// A whitespace run of odd length under a fixed-count whitespace alternative
+/// (`\s{2}`): the text leaves one space before the letters after the run,
+/// which a window begun inside the run at the other parity would not, and a
+/// space-led alternative with a lookahead at its end (` a{100}(?!\s)`) reads
+/// that space one way inside the text and another at a unit's end. The cut
+/// check's window begins where the run begins, as the text's match loop
+/// does, so the pool's units hold the text's pieces and the pool's ids are
+/// the serial encode's and the library's, under a split that removes its
+/// matches as under one that keeps them.
+#[test]
+fn a_cut_window_begins_where_a_whitespace_run_begins_under_a_fixed_count_alternative() {
+    let text = format!(
+        "{}{}{} b{}",
+        "z".repeat(32_067),
+        " ".repeat(601),
+        "a".repeat(100),
+        "z".repeat(40_000)
+    );
+    for (index, (pattern, behavior)) in [
+        (r"\s{2}| a{100}(?!\s)| b", SplitDelimiterBehavior::Removed),
+        (
+            r"\s{2}| a{100}(?!\s)| b|\s+",
+            SplitDelimiterBehavior::Isolated,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut state = 0x4649_5845_4432_5553u64;
+        let shape = Shape {
+            name: "fixed-count-whitespace",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![split(pattern, behavior, false), byte_level(false)],
+            ignore_merges: false,
+            special: &[],
+            added: &[],
+            stripped: &[],
+        };
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let whole: Vec<String> = {
+            let mut out = Vec::new();
+            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            out
+        };
+        let mut chunked = Vec::new();
+        let units = native.units(&text, true, true);
+        for unit in units.as_slice() {
+            let Segment::Text(chunk) = unit else {
+                panic!("no added tokens in this text");
+            };
+            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+        }
+        assert_eq!(chunked, whole, "case {index}: a cut split a piece");
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), &text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), &text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "case {index}: the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "case {index}: against the reference");
+    }
+}
+
+/// A whitespace run longer than a chunk before a candidate: the window
+/// would begin at the run's start, however far back, and under a
+/// whitespace split the check would collect one span per space over it, so
+/// the candidate has no window and the search skips it instead; the text,
+/// with no other candidate, stays one unit, its pool ids the serial
+/// encode's and the library's; a run within a chunk keeps its cut, the
+/// window begun at the run's start.
+#[test]
+fn a_whitespace_run_past_a_chunk_before_a_candidate_refuses_the_cut() {
+    let mut state = 0x5245_4143_4852_554Eu64;
+    let shape = Shape {
+        name: "long-whitespace",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let spaces = PARALLEL_CHUNK_BYTES + CUT_CHECK_REACH;
+    let text = format!("{}a b{}", " ".repeat(spaces), "z".repeat(40_000));
+    assert_eq!(
+        native.window_start(&text, spaces + 1),
+        None,
+        "a window begun at the text's start, the whole run inside it"
+    );
+    let units = native.units(&text, true, true);
+    assert_eq!(units.as_slice().len(), 1, "the text stays one unit");
+    let pooled = native
+        .encode_with(Some(tokenizer.get_model()), &text, true, false)
+        .expect("pooled");
+    let serial = native
+        .encode_with(Some(tokenizer.get_model()), &text, false, false)
+        .expect("serial");
+    assert_eq!(pooled, serial, "the pool changed the ids");
+    let reference = tokenizer
+        .encode(text.as_str(), false)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(pooled, reference, "against the reference");
+    let run = CUT_CHECK_REACH / 2;
+    let within = format!(
+        "{}{}a b{}",
+        "z".repeat(40_000),
+        " ".repeat(run),
+        "z".repeat(40_000)
+    );
+    assert_eq!(
+        native.window_start(&within, 40_000 + run + 1),
+        Some(40_000),
+        "a run within a chunk: the window begins at its start"
+    );
+}
+
+/// A stretch without a space longer than a chunk before or after a
+/// candidate (line breaks under a whitespace split, digits under a digit
+/// split: one piece per byte, one span each in the check): the window
+/// would begin at the stretch's start or end at its end, however far, so
+/// the candidate has no window and the search skips it instead; the text,
+/// with no other candidate, stays one unit, its pool ids the serial
+/// encode's and the library's; a stretch within a chunk keeps its cut, the
+/// window begun at the space before it.
+#[test]
+fn a_space_free_stretch_past_a_chunk_around_a_candidate_refuses_the_cut() {
+    let mut state = 0x5354_5245_5443_4821u64;
+    let line_breaks = Shape {
+        name: "long-line-breaks",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&line_breaks, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let stretch = PARALLEL_CHUNK_BYTES + CUT_CHECK_REACH;
+    let before = format!("{}a b{}", "\n".repeat(stretch), "z".repeat(40_000));
+    assert_eq!(
+        native.window_start(&before, stretch + 1),
+        None,
+        "a window begun at the text's start, the stretch inside it"
+    );
+    let after = format!("{}a b{}", "z".repeat(40_000), "\n".repeat(stretch));
+    assert_eq!(
+        native.window_end(&after, 40_001),
+        None,
+        "a window ended at the text's end, the stretch inside it"
+    );
+    for text in [&before, &after] {
+        let units = native.units(text, true, true);
+        assert_eq!(units.as_slice().len(), 1, "the text stays one unit");
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "against the reference");
+    }
+    let digits = Shape {
+        name: "long-digits",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\p{N}", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&digits, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let text = format!("{}a b{}", "1".repeat(stretch), "z".repeat(40_000));
+    assert_eq!(
+        native.window_start(&text, stretch + 1),
+        None,
+        "digits: a window begun at the text's start"
+    );
+    let run = PARALLEL_CHUNK_BYTES / 2;
+    let within = format!(
+        "{} {}a b{}",
+        "z".repeat(40_000),
+        "\n".repeat(run),
+        "z".repeat(40_000)
+    );
+    assert_eq!(
+        native.window_start(&within, 40_000 + run + 2),
+        Some(40_000),
+        "a stretch within a chunk: the window begins at the space before it"
+    );
+}
+
+/// A stretch without a space longer than a chunk, followed by prose: the
+/// candidates in the first window of prose after it have no window within
+/// the reach (their walks back meet the stretch) and would end the search
+/// if they counted as rejections, the whole tail one unit; skipped, the
+/// search cuts at the first candidate past that window, so the prose keeps
+/// its pool cuts, before such a stretch and after it, with the pooled ids
+/// the serial encode's and the library's.
+#[test]
+fn a_space_free_stretch_longer_than_a_chunk_keeps_the_cuts_of_the_prose_after_it() {
+    let mut state = 0x5441_494C_4355_5453u64;
+    let shape = Shape {
+        name: "stretch-then-prose",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let stretch = "\n".repeat(PARALLEL_CHUNK_BYTES + CUT_CHECK_REACH);
+    let prose = "the pool cuts a long text at a space before a letter ".repeat(2_000);
+    for text in [
+        format!("{stretch}{prose}"),
+        format!("{}{stretch}{prose}", &prose[..40_000]),
+    ] {
+        let units = native.units(&text, true, true);
+        let longest = units
+            .as_slice()
+            .iter()
+            .map(|unit| match unit {
+                Segment::Text(text) => text.len(),
+                Segment::Added(_) => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            units.as_slice().len() > 1 && longest <= 3 * PARALLEL_CHUNK_BYTES,
+            "{} units, the longest {longest} bytes: the stretch ended the cutting",
+            units.as_slice().len()
+        );
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), &text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), &text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "against the reference");
+    }
+}
+
+#[test]
+fn a_later_stage_runs_over_the_earlier_stage_pieces_of_the_cut_window() {
+    // Stacked stages around a cut candidate, each case a chain of splits
+    // (the byte level after them) and a text: two isolated stages whose
+    // later one begins its match where the earlier one's piece ends (the
+    // cut check ran it from the window's start instead); two whose later
+    // one splits the earlier one's match on the candidate, where the next
+    // unit's first stage begins inside that match (the check read the text
+    // before the candidate on its own and nothing from it on); and a
+    // dropped match the next unit begins inside the same way.
+    let mut state = 0x5354_4147_4544_0001u64;
+    let cases: [(Vec<PreTokenizerWrapper>, String); 4] = [
+        (
+            vec![
+                split("aa", SplitDelimiterBehavior::Isolated, false),
+                split(r" [ a]{999}", SplitDelimiterBehavior::Isolated, false),
+            ],
+            format!(
+                "{}{}  aa{}z {}",
+                "z".repeat(31_768),
+                " a".repeat(115),
+                " a".repeat(883),
+                "z".repeat(40_000)
+            ),
+        ),
+        (
+            vec![
+                split(r"[ a]{999}", SplitDelimiterBehavior::Isolated, false),
+                split(" a", SplitDelimiterBehavior::Isolated, false),
+            ],
+            format!(
+                "{}{}z {}",
+                "z".repeat(31_968),
+                " a".repeat(1_000),
+                "z".repeat(40_000)
+            ),
+        ),
+        (
+            vec![
+                split(
+                    r"[a-z]+ [a-z]+|[0-9]+",
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                ),
+                split(r" ?[a-z]+", SplitDelimiterBehavior::Isolated, false),
+            ],
+            "12ab cd ef. ".repeat(8_000),
+        ),
+        (
+            vec![split(
+                r"[a-z]+ ?[a-z]*",
+                SplitDelimiterBehavior::Removed,
+                false,
+            )],
+            "12ab cd. ".repeat(10_000),
+        ),
+    ];
+    for (index, (splits, text)) in cases.into_iter().enumerate() {
+        let mut pre_tokenizers = splits;
+        pre_tokenizers.push(byte_level(false));
+        let shape = Shape {
+            name: "stacked-stages",
+            normalizer: Normalizer::None,
+            pre_tokenizers,
+            ignore_merges: false,
+            special: &[],
+            added: &[],
+            stripped: &[],
+        };
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let whole: Vec<String> = {
+            let mut out = Vec::new();
+            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            out
+        };
+        let mut chunked = Vec::new();
+        for unit in native.units(&text, true, true).as_slice() {
+            let Segment::Text(chunk) = unit else {
+                panic!("no added tokens in this text");
+            };
+            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+        }
+        assert_eq!(chunked, whole, "case {index}: a cut split a piece");
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), &text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), &text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "case {index}: the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "case {index}: against the reference");
+    }
+}
+
+/// When no stage reads a space after a non-whitespace character inside one
+/// match (the shape's before-space classes are whitespace alone), the cut
+/// check's window starts at the nearest space back that begins a whitespace
+/// run, within a chunk of the candidate: a text whose spaces stand further
+/// apart than the check's reach keeps its pool cuts, and the pool's ids are
+/// the serial encode's and the library's.
+#[test]
+fn sparse_spaces_keep_the_pool_cuts_without_a_joined_run() {
+    let mut state = 0x5350_4152_5345_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "cl100k-ignore-merges")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let text = format!("{} ", "x".repeat(2_099)).repeat(48);
+    let units = native.units(&text, true, true);
+    assert!(
+        units.as_slice().len() > 1,
+        "{} unit: the sparse spaces lost the cuts",
+        units.as_slice().len()
+    );
+    let pooled = native
+        .encode_with(Some(tokenizer.get_model()), &text, true, false)
+        .expect("pooled");
+    let serial = native
+        .encode_with(Some(tokenizer.get_model()), &text, false, false)
+        .expect("serial");
+    assert_eq!(pooled, serial, "the pool changed the ids");
+    let reference = tokenizer
+        .encode(text.as_str(), false)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(pooled, reference, "against the reference");
+}
+
+#[test]
+fn a_merged_with_next_split_glues_each_match_to_the_text_after_it() {
+    // The merged-line-breaks shape on texts with line breaks between words,
+    // runs of them, a lone `\r` (no match), breaks at both ends, alone,
+    // next to digits, indentation and an added token, and absent.
+    let mut state = 0x4D45_5247_4544_4E01u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "merged-line-breaks-then-cl100k")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "one\ntwo\r\nthree\rfour",
+        "\n\nlead and trail\n",
+        "\r\n\r\n\n",
+        "\r",
+        "a\n1\r\nb 22\n\n33 <|fim_prefix|>\nx",
+        "<|endoftext|>\r\n",
+        "    indented\n\tcode\n\n",
+        "no break at all",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn number_groups_are_cut_from_the_end_of_a_run_as_the_library_does() {
+    // The number-grouping rule inside the cased template on runs of the
+    // decimal digits of two scripts and of the other numerals, alone and
+    // mixed, of every length up to twelve, beside spaces, letters,
+    // punctuation, a mark, an underscore and a joiner, whole and through
+    // the pool.
+    let mut state = 0x9E5F_0A2B_0000_0003u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "number-groups-in-the-cased-template")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let mut texts: Vec<String> = [
+        "1234 ",
+        "123456",
+        "1234abc",
+        "12,345,678.90",
+        "1 000 000",
+        "x\u{B2}\u{B3}\u{B9}\u{2070}",
+        "\u{2160}\u{2161}\u{2162}\u{2163}\u{2164} ",
+        "1\u{B2}3\u{BD}",
+        "\u{2460}\u{2461}",
+        "\u{663}\u{664}\u{665}\u{666} ",
+        "\u{663}\u{664}\u{665}\u{666}\u{667}\u{668}\u{669} \u{661}\u{662}\u{663}",
+        "1\u{2460}",
+        "x1_",
+        "99\n",
+        "7",
+        "007",
+        "2026-11-12",
+        "v1.2.3",
+        "abc1234",
+        "Hello2World 3rdPlace",
+        "123\u{200D}x",
+        "123_456",
+        "a 1000000 b",
+        "3.14159265358979",
+        "\u{BD}\u{BD}\u{BD}\u{BD} \u{2167}\u{2168}",
+    ]
+    .iter()
+    .map(|text| (*text).to_owned())
+    .collect();
+    let runs: String = (1..=12)
+        .map(|n| {
+            format!(
+                "{} {}a {}_ {}\u{B2} ",
+                "9".repeat(n),
+                "8".repeat(n),
+                "7".repeat(n),
+                "\u{2461}".repeat(n)
+            )
+        })
+        .collect();
+    texts.push(runs.clone());
+    texts.push(runs.repeat(1 + 2 * PARALLEL_MIN_BYTES / runs.len()));
+    for text in &texts {
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{text:?} parallel {parallel}"
+            );
+        }
     }
 }
 
@@ -916,6 +2373,75 @@ fn long_text(state: &mut u64, added: &[&str], bytes: usize) -> String {
     text
 }
 
+/// The anchored digit stages cut digit runs as the library does: runs of
+/// every length around the stages' group sizes, in the digits of two scripts
+/// and beside the other numbers the `Digits` split takes with them, in one
+/// piece; and a long text of such runs on the thread pool, whose units are
+/// cut between the first stage's pieces, so a later stage sees the same piece
+/// bounds (`\A`, `\z`) and search starts (`\G`) in a unit as in the whole.
+#[test]
+fn anchored_digit_stages_cut_digit_runs_as_the_library_does() {
+    let mut state = 0xA11C_0DE5_0000_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "digit-runs-then-anchored-digit-stages")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let model = tokenizer.get_model();
+    let reference = |text: &str| {
+        tokenizer
+            .encode(text, false)
+            .expect("encode")
+            .get_ids()
+            .to_vec()
+    };
+    let digits = "0123456789".repeat(160);
+    let mut long = String::new();
+    for len in [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 509, 510, 511, 512, 513, 1019, 1020, 1021, 1022,
+        1531,
+    ] {
+        let run = &digits[..len];
+        let arabic = "\u{663}".repeat(len);
+        for text in [
+            run.to_owned(),
+            format!("total {run} units"),
+            format!("{run}\n{run}"),
+            format!("x{run}, {run}."),
+            format!("{run}\u{B2} {arabic}"),
+            format!("{arabic}\u{2460}{run}"),
+        ] {
+            assert_eq!(
+                native.encode(Some(model), &text, false),
+                Ok(reference(&text)),
+                "{len} digits in {:?}",
+                &text[..text.len().min(32)]
+            );
+            long.push_str(&text);
+            long.push_str(" word ");
+        }
+    }
+    while long.len() < 4 * PARALLEL_CHUNK_BYTES {
+        long.push_str(&long_text(&mut state, &[], PARALLEL_CHUNK_BYTES));
+        long.push_str(&digits[..1 + (pseudo_random(&mut state) % 1100) as usize]);
+    }
+    let units = native.units(&long, true, true);
+    assert!(
+        units.as_slice().len() > 2,
+        "{} units",
+        units.as_slice().len()
+    );
+    let pooled = native
+        .encode_with(Some(model), &long, true, false)
+        .expect("pooled");
+    let serial = native
+        .encode_with(Some(model), &long, false, false)
+        .expect("serial");
+    assert_eq!(pooled, serial, "the pool changed the ids");
+    assert_eq!(pooled, reference(&long), "against the reference");
+}
+
 #[test]
 fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     let mut state = 0x5A5A_1234_5678_9ABCu64;
@@ -927,6 +2453,7 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
             .iter()
             .copied()
             .chain(shape.added.iter().map(|(s, _)| *s))
+            .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
             .collect();
         let mut compared = 0;
         for _ in 0..3 {
@@ -1092,10 +2619,10 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     all.push((declined, true));
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for (tokens, by_prefixes) in &all {
-        let list: Vec<(String, u32)> = tokens
+        let list: Vec<Added> = tokens
             .iter()
             .enumerate()
-            .map(|(i, token)| ((*token).to_owned(), 1000 + i as u32))
+            .map(|(i, token)| Added::plain((*token).to_owned(), 1000 + i as u32))
             .collect();
         let added = AddedTokens::build(&list)
             .expect("the tokens form an automaton")
@@ -1225,6 +2752,19 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         let mut chunked = Vec::new();
         let units = native.units(&text, true, true);
         let units = units.as_slice();
+        // An end-anchored chain takes no cut, nor does one with a stage over
+        // the byte-level image: the text stays one unit (see
+        // `an_end_anchored_chain_keeps_a_long_text_whole` and
+        // `a_stage_after_the_byte_level_reads_the_image`).
+        if native.end_anchored || native.mapped_from.is_some() {
+            assert_eq!(
+                units.len(),
+                1,
+                "{}: a cut under the end anchor or the image",
+                shape.name
+            );
+            continue;
+        }
         assert!(
             units.len() >= 2,
             "{}: no cut in {} bytes",
@@ -1252,6 +2792,7 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
             .iter()
             .copied()
             .chain(shape.added.iter().map(|(s, _)| *s))
+            .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
             .collect();
         for round in 0..2000 {
             let text = random_text(&mut state, 1 + round % 40, &added);
@@ -2503,8 +4044,8 @@ fn a_thread_whose_packed_table_outgrew_its_share_cuts_it_back_at_its_next_encode
 }
 
 /// A thread's map of the 16-to-64-byte pieces grown for an earlier share
-/// keeps its buckets through a clear at the bound (the map's own clear
-/// keeps the allocation); once the share fell below half its capacity
+/// keeps its slots and slabs through a clear at the bound (the map's own
+/// clear keeps them); once the share fell below half its capacity
 /// (threads joined) the thread's next encode call makes the map anew for
 /// the share, entries within it or not.
 #[test]
@@ -2543,7 +4084,7 @@ fn a_thread_whose_map_outgrew_its_share_remakes_it_at_its_next_encode() {
     let grown = capacity(&mut native);
     assert!(grown >= 20_000, "{grown}");
     // Threads join: the share falls below the entries; the clear at the
-    // start of the next call keeps the buckets, which still serve the share.
+    // start of the next call keeps the slots, which still serve the share.
     native.threads.store(256, Ordering::Relaxed);
     let share = native.piece_cache_share();
     assert!(grown <= 2 * share, "{grown} for a share of {share}");
@@ -2555,7 +4096,7 @@ fn a_thread_whose_map_outgrew_its_share_remakes_it_at_its_next_encode() {
     );
     assert!(entries(&mut native) <= share);
     assert_eq!(capacity(&mut native), grown);
-    // More threads join: the entries are within the new share, the buckets
+    // More threads join: the entries are within the new share, the slots
     // are more than twice it; the next call makes the map anew for the share.
     native.threads.store(1_024, Ordering::Relaxed);
     let share = native.piece_cache_share();
@@ -2609,19 +4150,19 @@ fn long_pieces_are_cached_by_their_bytes() {
             .get()
             .expect("this thread's cache")
             .borrow();
-        assert!(cache.short.contains_key(short.as_bytes()));
-        assert!(!cache.long.contains_key(short.as_bytes()));
-        assert!(cache.long.contains_key(long.as_bytes()));
-        assert!(cache.long.contains_key(longest.as_bytes()));
-        assert!(!cache.long.contains_key(beyond.as_bytes()));
-        assert!(!cache.short.contains_key(beyond.as_bytes()));
+        assert!(cache.short.get(short.as_bytes()).is_some());
+        assert!(cache.long.get(short.as_bytes()).is_none());
+        assert!(cache.long.get(long.as_bytes()).is_some());
+        assert!(cache.long.get(longest.as_bytes()).is_some());
+        assert!(cache.long.get(beyond.as_bytes()).is_none());
+        assert!(cache.short.get(beyond.as_bytes()).is_none());
         assert_eq!(cache.long.len(), 2);
         let accounted: usize = cache
             .long
-            .iter()
+            .entries()
             .map(|(piece, ids)| long_entry_bytes(piece, ids))
             .sum();
-        assert_eq!(cache.long_bytes, accounted);
+        assert_eq!(cache.long.bytes(), accounted);
     }
     // The second encode is answered from the cache: the same ids, and
     // the cache as it was.
@@ -2634,9 +4175,14 @@ fn long_pieces_are_cached_by_their_bytes() {
         .borrow();
     assert_eq!(cache.long.len(), 2);
     assert_eq!(
-        cache.long_bytes,
-        long_entry_bytes(long.as_bytes(), &cache.long[long.as_bytes()])
-            + long_entry_bytes(longest.as_bytes(), &cache.long[longest.as_bytes()])
+        cache.long.bytes(),
+        long_entry_bytes(
+            long.as_bytes(),
+            cache.long.get(long.as_bytes()).expect("cached")
+        ) + long_entry_bytes(
+            longest.as_bytes(),
+            cache.long.get(longest.as_bytes()).expect("cached")
+        )
     );
 }
 
@@ -2663,13 +4209,63 @@ fn long_pieces_stay_within_their_byte_share() {
         .borrow();
     let accounted: usize = cache
         .long
-        .iter()
+        .entries()
         .map(|(piece, ids)| long_entry_bytes(piece, ids))
         .sum();
-    assert_eq!(cache.long_bytes, accounted);
-    assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
+    assert_eq!(cache.long.bytes(), accounted);
+    assert!(
+        cache.long.bytes() <= share,
+        "{} > {share}",
+        cache.long.bytes()
+    );
     assert!(cache.long.len() < words as usize, "{}", cache.long.len());
     assert!(!cache.long.is_empty());
+}
+
+/// A thread's long tier grown under an earlier share keeps its arrays
+/// through an eviction at the bound (four times the share at most); once
+/// the share fell below a quarter of them (threads joined) the thread's
+/// next encode call makes the tier anew.
+#[test]
+fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode() {
+    let mut state = 0x1D1D_3C3C_5B5B_7A7Au64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let held = |native: &NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow()
+            .long
+            .held_bytes()
+    };
+    let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
+    let text: String = (0..16_000)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect();
+    let before = native.encode(Some(model), &head, false).expect("ids");
+    native.encode(Some(model), &text, false).expect("ids");
+    let share = native.long_piece_bytes_share();
+    let grown = held(&native);
+    assert!(grown > share / 2, "{grown} for a share of {share}");
+    assert!(grown <= 4 * share, "{grown} for a share of {share}");
+    // Threads join: the share falls to a thirty-second of the arrays; the
+    // next call makes the tier anew, the ids as before.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.long_piece_bytes_share();
+    assert!(grown > 4 * share, "{grown} for a share of {share}");
+    // A call that meets no long piece: only the check at the call's start
+    // can make the tier anew (a miss would, through the eviction).
+    native.encode(Some(model), &word(1), false).expect("ids");
+    let kept = held(&native);
+    assert!(kept <= 4 * share, "{kept} for a share of {share}");
+    assert_eq!(
+        native.encode(Some(model), &head, false).expect("ids"),
+        before
+    );
 }
 
 #[test]
@@ -2780,6 +4376,7 @@ fn a_template_post_processor_frames_the_ids_on_request() {
         .iter()
         .copied()
         .chain(shape.added.iter().map(|(s, _)| *s))
+        .chain(shape.stripped.iter().map(|(s, _, _, _)| *s))
         .collect();
     for (name, post_processor) in forms {
         let mut tokenizer = tokenizer_of(shape, &mut state);
@@ -3248,6 +4845,12 @@ const SENTENCEPIECE_ADDED: &[(&str, bool)] = &[("<think>", false), ("[note]", tr
 /// one merge joins a word to the marker after it, so a token spans a word
 /// boundary.
 fn sentencepiece_model(state: &mut u64) -> BPE {
+    sentencepiece_model_with(state, true)
+}
+
+/// [`sentencepiece_model`] with or without the tab's byte token (`<0x09>`;
+/// the tab itself stays a token, as every other pool character is).
+fn sentencepiece_model_with(state: &mut u64, tab_byte_token: bool) -> BPE {
     let mut vocab = Vocab::default();
     let add = |vocab: &mut Vocab, token: String| {
         if !vocab.contains_key(&token) {
@@ -3258,7 +4861,7 @@ fn sentencepiece_model(state: &mut u64) -> BPE {
     for token in ["<unk>", "<s>", "</s>"] {
         add(&mut vocab, token.to_owned());
     }
-    for byte in 0..=255u8 {
+    for byte in (0..=255u8).filter(|&byte| tab_byte_token || byte != b'\t') {
         add(&mut vocab, format!("<0x{byte:02X}>"));
     }
     add(&mut vocab, WORD_MARKER.to_string());
@@ -3324,8 +4927,14 @@ struct SentencepieceShape {
     sequence: bool,
     split: bool,
     metaspace: Option<PrependScheme>,
+    /// A `Prepend` of the marker before the `Replace`, in a `Sequence`: the
+    /// legacy conversion's shape.
+    prepend: bool,
     /// The post-processor frames the ids with `<s>`.
     bos: bool,
+    /// The vocabulary holds the tab's byte token (`<0x09>`); without it
+    /// the tab, a token of its own, never falls back to the byte.
+    tab_byte_token: bool,
 }
 
 fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
@@ -3336,7 +4945,9 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: true,
             metaspace: None,
+            prepend: false,
             bos: true,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "replace",
@@ -3344,7 +4955,9 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: None,
+            prepend: false,
             bos: false,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "metaspace-first",
@@ -3352,7 +4965,9 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: Some(PrependScheme::First),
+            prepend: false,
             bos: true,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "metaspace-always",
@@ -3360,7 +4975,9 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Always),
+            prepend: false,
             bos: false,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "metaspace-never",
@@ -3368,7 +4985,9 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: false,
             split: false,
             metaspace: Some(PrependScheme::Never),
+            prepend: false,
             bos: false,
+            tab_byte_token: true,
         },
         SentencepieceShape {
             name: "replace-in-sequence",
@@ -3376,16 +4995,47 @@ fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
             sequence: true,
             split: false,
             metaspace: None,
+            prepend: false,
             bos: true,
+            tab_byte_token: true,
+        },
+        SentencepieceShape {
+            name: "prepend-replace",
+            replace: true,
+            sequence: true,
+            split: false,
+            metaspace: None,
+            prepend: true,
+            bos: true,
+            tab_byte_token: true,
+        },
+        // The `Replace` shape over a vocabulary without the tab's byte
+        // token: the tab is a token of its own, so the fallback never
+        // spells its byte.
+        SentencepieceShape {
+            name: "replace-without-the-tab-byte-token",
+            replace: true,
+            sequence: false,
+            split: false,
+            metaspace: None,
+            prepend: false,
+            bos: false,
+            tab_byte_token: false,
         },
     ]
 }
 
 fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTokenizer {
-    let mut tokenizer = HfTokenizer::new(sentencepiece_model(state));
+    let mut tokenizer = HfTokenizer::new(sentencepiece_model_with(state, shape.tab_byte_token));
     if shape.replace {
         let replace = Replace::new(" ", "\u{2581}").expect("a Replace normalizer");
-        let normalizer: NormalizerWrapper = if shape.sequence {
+        let normalizer: NormalizerWrapper = if shape.prepend {
+            NormalizerSequence::new(vec![
+                Prepend::new("\u{2581}".to_owned()).into(),
+                replace.into(),
+            ])
+            .into()
+        } else if shape.sequence {
             NormalizerSequence::new(vec![replace.into()]).into()
         } else {
             replace.into()
@@ -3414,9 +5064,10 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
         ByteFallback::new().into(),
         Fuse::new().into(),
     ];
-    if shape
-        .metaspace
-        .is_some_and(|scheme| scheme != PrependScheme::Never)
+    if shape.prepend
+        || shape
+            .metaspace
+            .is_some_and(|scheme| scheme != PrependScheme::Never)
     {
         decoder.push(Strip::new(' ', 1, 0).into());
     }
@@ -3429,12 +5080,21 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
         .add_special_tokens([
             AddedToken::from("<s>", true),
             AddedToken::from("</s>", true),
+            // A sentinel that takes the whitespace on both sides, raw (so
+            // it stays native on every shape): the sweeps match it after a
+            // space and before one, and place the marker after it.
+            AddedToken::from("<|strip|>", true)
+                .lstrip(true)
+                .rstrip(true),
         ])
         .expect("special tokens");
+    // Under the `Prepend` an added token matched after normalization is
+    // declined: that shape takes the raw ones alone.
     tokenizer
         .add_tokens(
             SENTENCEPIECE_ADDED
                 .iter()
+                .filter(|(_, normalized)| !(shape.prepend && *normalized))
                 .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized)),
         )
         .expect("added tokens");
@@ -3443,7 +5103,7 @@ fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTok
 
 /// The spellings [`random_text`] drops into a text of a sentencepiece shape.
 fn sentencepiece_added() -> Vec<&'static str> {
-    ["<s>", "</s>"]
+    ["<s>", "</s>", "<|strip|>"]
         .into_iter()
         .chain(SENTENCEPIECE_ADDED.iter().map(|(s, _)| *s))
         .collect()
@@ -3681,6 +5341,41 @@ fn a_tiktoken_vocabulary_outside_the_path_declines() {
         declined(&ranks, r"\w+|\s+", &[]),
         r"a split pattern outside the supported regex subset: \w+|\s+"
     );
+    // The end anchor parses, but the file's own encoder reads it as the end
+    // of the text only, where the subset reads it before a newline too.
+    assert_eq!(
+        declined(&ranks, r"[a-z]+|\s+$|\s", &[]),
+        r"a split pattern with the end anchor, which the file's own encoder reads as the end of the text only: [a-z]+|\s+$|\s"
+    );
+    assert!(NativeEncoder::from_ranks(&ranks, r"[a-z]+|\s", &[]).is_ok());
+    // The digit-grouping lookahead parses, but its word boundary reads the
+    // Hugging Face engine's word class, not the one the file's own encoder
+    // reads (`1234²` would cut apart).
+    assert_eq!(
+        declined(&ranks, r"\d{1,3}(?=(?:\d{3})*\b)|[a-z]+|\s", &[]),
+        r"a split pattern with the digit-grouping lookahead, whose word boundary the file's own encoder reads with another word class: \d{1,3}(?=(?:\d{3})*\b)|[a-z]+|\s"
+    );
+    // The anchors parse, but this path's one stage runs over a unit of the
+    // pool as over the text between two specials.
+    assert_eq!(
+        declined(&ranks, r"\A[a-z]+|\G\d{3}|\s", &[]),
+        r"a split pattern anchored to its text (\A, \z or \G): \A[a-z]+|\G\d{3}|\s"
+    );
+    assert_eq!(
+        declined(&ranks, r"\d(?=\d{3}+\z)|[a-z]+|\s", &[]),
+        r"a split pattern anchored to its text (\A, \z or \G): \d(?=\d{3}+\z)|[a-z]+|\s"
+    );
+    // A `+` after a bare interval inside the lookahead: a repeat of the
+    // interval to the tokenizers engine, a possessive mark to this file's
+    // own; the grouped repeat means the same to both and stays.
+    assert_eq!(
+        declined(&ranks, r"\p{N}(?=\p{N}{3}+(?!\p{N}))|[a-z]+|\s", &[]),
+        r"a split pattern with a `+` after a bare interval, which the file's own encoder reads as a possessive mark: \p{N}(?=\p{N}{3}+(?!\p{N}))|[a-z]+|\s"
+    );
+    assert!(
+        NativeEncoder::from_ranks(&ranks, r"\p{N}(?=(?:\p{N}{3})+(?!\p{N}))|[a-z]+|\s", &[])
+            .is_ok()
+    );
     assert_eq!(
         declined(&ranks, KIMI_K2_PATTERN, &[(String::new(), 9)]),
         "special token \"\" without content"
@@ -3825,15 +5520,34 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
             out.push((offset, offset + text.len()));
             return;
         };
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(from) => walk(rest, &text[from..start], offset + from, out),
+                        None if start > 0 => walk(rest, &text[..start], offset, out),
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                let from = merged.unwrap_or(0);
+                walk(rest, &text[from..], offset + from, out);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.keep_gaps && cursor < start {
+            if gaps && cursor < start {
                 walk(rest, &text[cursor..start], offset + cursor, out);
             }
-            walk(rest, &text[start..end], offset + start, out);
+            if matches {
+                walk(rest, &text[start..end], offset + start, out);
+            }
             cursor = end;
         }
-        if stage.keep_gaps && cursor < text.len() {
+        if gaps && cursor < text.len() {
             walk(rest, &text[cursor..], offset + cursor, out);
         }
     }
@@ -3893,7 +5607,8 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
         .iter()
         .map(|pattern| Stage {
             pattern: Pattern::parse(pattern).expect("parses"),
-            keep_gaps: true,
+            pieces: Pieces::MatchesAndGaps,
+            digits: false,
         })
         .collect();
     let scanner = chain::Scanner::recognize(&stages).expect("the chain takes the scanner");
@@ -3901,22 +5616,76 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
         .iter()
         .map(|stage| Stage {
             pattern: stage.pattern.program_only(),
-            keep_gaps: stage.keep_gaps,
+            pieces: stage.pieces,
+            digits: stage.digits,
         })
         .collect();
     let fixtures = fixture_texts();
     let rounds = fuzz_rounds();
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let check = |text: &str| {
-        let mut ours = Vec::new();
-        scanner.pieces(text, &mut |start, end| ours.push((start, end)));
-        assert_eq!(ours, staged(&programs, text), "text {text:?}");
+        let expected = staged(&programs, text);
+        for words in [false, true] {
+            let mut ours = Vec::new();
+            scanner.pieces(text, words, &mut |start, end| ours.push((start, end)));
+            assert_eq!(ours, expected, "words {words} text {text:?}");
+        }
     };
     for text in &fixtures {
         check(text);
     }
     for _ in 0..rounds {
         check(&fuzz_text(&mut state, &fixtures));
+    }
+}
+
+#[test]
+fn a_tab_without_its_byte_token_encodes_as_the_library_does() {
+    // The byte-fallback shape whose vocabulary lacks the tab's byte token:
+    // the tab is a token of its own, so a tab anywhere (alone, in runs,
+    // beside words, spaces, characters that fall back to their bytes and
+    // added tokens) encodes to the same ids, serial and pooled, and a long
+    // text as one unit.
+    let mut state = 0x7AB0_09B1_0000_0007u64;
+    let shape = sentencepiece_shapes()
+        .into_iter()
+        .find(|shape| shape.name == "replace-without-the-tab-byte-token")
+        .expect("the shape");
+    let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+    assert!(
+        tokenizer.get_model().token_to_id("<0x09>").is_none()
+            && tokenizer.get_model().token_to_id("\t").is_some(),
+        "the vocabulary lacks the tab's byte token and holds the tab"
+    );
+    let native = seeded(&tokenizer);
+    let mut texts: Vec<String> = [
+        "\t",
+        "a\tb",
+        "\t\t\t",
+        "the\tend",
+        " \t ",
+        "the the\tthe",
+        "\u{E9}\t\u{4E2D}",
+        "\u{1F600}\t\u{1F44D}",
+        "x\t\n",
+        "<think>\tnote",
+        "[note]\t",
+        "\u{7F}\t\u{0}",
+    ]
+    .iter()
+    .map(|text| (*text).to_owned())
+    .collect();
+    let long: String = texts.concat().repeat(1 + PARALLEL_MIN_BYTES / 40);
+    texts.push(long);
+    for text in &texts {
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        for parallel in [false, true] {
+            assert_eq!(
+                native.encode_with(Some(tokenizer.get_model()), text, parallel, false),
+                Ok(reference.get_ids().to_vec()),
+                "{text:?} parallel {parallel}"
+            );
+        }
     }
 }
 
@@ -3936,16 +5705,20 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         .expect("normalizer");
     assert_eq!(
         declined(&tokenizer),
-        "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+        "a byte-fallback vocabulary with a normalizer other than Replace(space, marker), alone \
+         or after Prepend(marker), or none"
     );
-    // The Replace in a Sequence with another step: the one-step sequence is
-    // the only sequence the path takes (a Prepend before the Replace is the
-    // legacy conversion's shape, which this path would read without the
-    // prepended marker).
+    // The Replace in a Sequence with another step: the one-step sequence and
+    // the Prepend of the marker before the Replace are the sequences the
+    // path takes; another step, another prepended text or the two steps in
+    // the other order are not.
     let replace =
         || NormalizerWrapper::from(Replace::new(" ", "\u{2581}").expect("a Replace normalizer"));
+    let prepend = |text: &str| NormalizerWrapper::from(Prepend::new(text.to_owned()));
     for steps in [
-        vec![Prepend::new("\u{2581}".to_owned()).into(), replace()],
+        vec![prepend("\u{2581}"), replace(), NormalizerWrapper::NFC(NFC)],
+        vec![prepend(" "), replace()],
+        vec![replace(), prepend("\u{2581}")],
         vec![replace(), NormalizerWrapper::NFC(NFC)],
     ] {
         let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
@@ -3954,9 +5727,37 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
             .expect("normalizer");
         assert_eq!(
             declined(&tokenizer),
-            "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+            "a byte-fallback vocabulary with a normalizer other than Replace(space, marker), \
+             alone or after Prepend(marker), or none"
         );
     }
+    // A pre-tokenizer under the Prepend, and an added token matched after it.
+    let prepended = shapes
+        .iter()
+        .position(|shape| shape.prepend)
+        .expect("the prepend shape");
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[prepended], &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Split(
+        Split::new(
+            SplitPattern::String(" ".to_owned()),
+            SplitDelimiterBehavior::MergedWithPrevious,
+            false,
+        )
+        .expect("split"),
+    )));
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with the pre-tokenizer Split under the Prepend normalizer \
+         (the path takes that normalizer with none)"
+    );
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[prepended], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("[note]", false).normalized(true)])
+        .expect("added token");
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with an added token matched after the Prepend normalizer"
+    );
     // Neither the Replace nor a Metaspace.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
     tokenizer
@@ -4004,12 +5805,33 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
     assert_eq!(
         declined(&tokenizer),
         "a byte-fallback vocabulary with an added token matched after the Replace normalizer \
-         that holds a space or the word marker"
+         that holds a space or the word marker, or takes the whitespace beside it"
     );
-    // The same token under Metaspace is matched on the same text either way.
+    // A token that takes the whitespace beside it, matched after the Replace:
+    // its strip would take a raw space the reference sees as the marker.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("<x>", false).normalized(true).rstrip(true)])
+        .expect("added token");
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with an added token matched after the Replace normalizer \
+         that holds a space or the word marker, or takes the whitespace beside it"
+    );
+    // The same tokens under Metaspace are matched on the same text either
+    // way, the normalized `<x>` with its strip among them.
     let mut tokenizer = sentencepiece_tokenizer(&shapes[2], &mut state);
     tokenizer
-        .add_tokens([AddedToken::from("end of text", false).normalized(true)])
+        .add_tokens([
+            AddedToken::from("end of text", false).normalized(true),
+            AddedToken::from("<x>", false).normalized(true).rstrip(true),
+        ])
+        .expect("added tokens");
+    assert!(NativeEncoder::from_tokenizer(&tokenizer).is_ok());
+    // A raw token that strips is matched on the raw text on both sides.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("<x>", true).rstrip(true)])
         .expect("added token");
     assert!(NativeEncoder::from_tokenizer(&tokenizer).is_ok());
     // ignore_merges.
@@ -4055,6 +5877,15 @@ fn sentencepiece_shapes_outside_the_path_are_declined() {
         tokenizer
     };
     assert_eq!(declined(&small(&[], "<0x7F>")), "byte 0x7f has no token");
+    // The tab's byte token missing: the tab as a token of its own never
+    // falls back, so the path stays; without the tab token, or for a byte
+    // beyond ASCII (inside any character that is no token), it declines.
+    assert!(NativeEncoder::from_tokenizer(&small(&["\t"], "<0x09>")).is_ok());
+    assert_eq!(declined(&small(&[], "<0x09>")), "byte 0x09 has no token");
+    assert_eq!(
+        declined(&small(&["\t"], "<0xE2>")),
+        "byte 0xe2 has no token"
+    );
     assert_eq!(
         declined(&small(&["a<0x41>"], "")),
         "the token \"a<0x41>\" spells a byte token inside it"
@@ -4126,4 +5957,311 @@ fn a_long_uncut_piece_leaves_the_thread_a_bounded_scratch() {
         scratch <= MERGE_SCRATCH_SYMBOLS,
         "the thread kept a scratch of {scratch} symbols"
     );
+}
+
+/// A greedy class run before a character that never comes used to cost half
+/// the square of the run's length: each start inside the run scanned to its
+/// end and failed, and the search moved on by one character. Over the
+/// byte-level image a space maps to a letter, so an ordinary text is one run
+/// of letters to `\p{L}+!`, and 128 KiB took minutes where the reference
+/// takes milliseconds. The search now leaves a failed run behind.
+#[test]
+fn a_failed_run_before_a_character_that_never_comes_is_left_behind() {
+    use std::time::{Duration, Instant};
+    let mut state = 0x4641_494C_4544_5255u64;
+    let shape = Shape {
+        name: "byte-level-then-letter-run-before-a-bang",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            byte_level(false),
+            split(r"\p{L}+!", SplitDelimiterBehavior::Isolated, false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    let from = native.mapped_from.expect("the map");
+    let table = bytes_char();
+    let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+    let mut image = String::new();
+    for n in [8192usize, 32768, 131072] {
+        for text in [
+            "a".repeat(n),
+            format!("{}!", "a".repeat(n - 1)),
+            "ab cd ".repeat(n / 6),
+            format!("{}!{}", "ab cd ".repeat(n / 12), "ab cd ".repeat(n / 12)),
+        ] {
+            let mut split = PreTokenizedString::from(text.as_str());
+            pre_tokenizer
+                .pre_tokenize(&mut split)
+                .expect("the reference");
+            let theirs: Vec<String> = split
+                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(piece, _, _)| piece.to_owned())
+                .collect();
+            let mut ours = Vec::new();
+            let started = Instant::now();
+            native.pieces_mapping(0, from, &text, &mut image, &mut |raw: &[u8]| {
+                ours.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            let took = started.elapsed();
+            assert_eq!(
+                ours,
+                theirs,
+                "the pieces of {} bytes of {:?}",
+                text.len(),
+                &text[..8]
+            );
+            let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+            assert_eq!(
+                native.encode(Some(tokenizer.get_model()), &text, false),
+                Ok(reference.get_ids().to_vec()),
+                "{} bytes of {:?}",
+                text.len(),
+                &text[..8]
+            );
+            // Minutes before the skip at this size; milliseconds with it. The
+            // bound leaves room for a loaded machine and a debug build.
+            assert!(
+                took < Duration::from_secs(2),
+                "{} bytes of {:?} took {took:?} to cut",
+                text.len(),
+                &text[..8]
+            );
+        }
+    }
+}
+
+/// The skip changes no result: class-run patterns before a character the run
+/// may or may not reach, bounded and unbounded, as the first stage over the
+/// raw text and as a stage after the map over the image, on fixed and random
+/// short texts, pieces and ids against the reference. The table says where
+/// each pattern loads and every row asserts it, so a row that stops loading
+/// fails instead of running nothing; after the map an optional prefix before
+/// the run would rescan the run from every start and is declined at load.
+#[test]
+fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
+    // (pattern, loads as a first stage, loads after the map)
+    let patterns = [
+        (r"\p{L}+!", true, true),
+        (r"\p{L}+a", true, true),
+        (r"\p{L}{1,3}!", true, true),
+        (r"[a-z]+b", true, true),
+        (r"\p{N}+\.", true, true),
+        (r"\p{L}++!", true, true),
+        (r" ?\p{L}+", true, false),
+        (r"[\p{L}.]+!", true, true),
+    ];
+    let alphabet: Vec<char> = "ab c!a.1\n\u{E9}".chars().collect();
+    // A start outside the run (a `!`, a digit, a stop before the letters)
+    // must not skip the letters after it, so a few texts are fixed.
+    let fixed = ["!ab!", "1a!", ".aa!a!", "ab!", "a!!b!", "\u{E9}!a"];
+    let mut state = 0x5345_4152_4348_0001u64;
+    let random = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    };
+    let table = bytes_char();
+    let mut ran = 0;
+    for (pattern, loads_first, loads_after) in patterns {
+        for mapped in [false, true] {
+            let loads = if mapped { loads_after } else { loads_first };
+            let pre_tokenizers = if mapped {
+                vec![
+                    byte_level(false),
+                    split(pattern, SplitDelimiterBehavior::Isolated, false),
+                ]
+            } else {
+                vec![
+                    split(pattern, SplitDelimiterBehavior::Isolated, false),
+                    byte_level(false),
+                ]
+            };
+            let shape = Shape {
+                name: "class-run-before-a-character",
+                normalizer: Normalizer::None,
+                pre_tokenizers,
+                ignore_merges: false,
+                special: &[],
+                added: &[],
+                stripped: &[],
+            };
+            let tokenizer = tokenizer_of(&shape, &mut state);
+            let mut native = match NativeEncoder::from_tokenizer(&tokenizer) {
+                Ok(native) => {
+                    assert!(
+                        loads,
+                        "{pattern} mapped {mapped} loads where the table says it declines"
+                    );
+                    native
+                }
+                Err(declined) => {
+                    assert!(!loads, "{pattern} mapped {mapped} declined: {declined}");
+                    continue;
+                }
+            };
+            ran += 1;
+            native.seed_vocabulary(tokenizer.get_model(), None);
+            let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+            let mut image = String::new();
+            for i in 0..300 {
+                let text: String = if let Some(fixed) = fixed.get(i) {
+                    (*fixed).to_owned()
+                } else {
+                    let len = (random(&mut state) % 25) as usize;
+                    (0..len)
+                        .map(|_| alphabet[(random(&mut state) % alphabet.len() as u64) as usize])
+                        .collect()
+                };
+                let mut split = PreTokenizedString::from(text.as_str());
+                pre_tokenizer
+                    .pre_tokenize(&mut split)
+                    .expect("the reference");
+                let theirs: Vec<String> = split
+                    .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                    .into_iter()
+                    .map(|(piece, _, _)| piece.to_owned())
+                    .collect();
+                if let Some(from) = native.mapped_from {
+                    let mut ours = Vec::new();
+                    native.pieces_mapping(0, from, &text, &mut image, &mut |raw: &[u8]| {
+                        ours.push(
+                            raw.iter()
+                                .map(|&b| table[usize::from(b)])
+                                .collect::<String>(),
+                        );
+                    });
+                    assert_eq!(
+                        ours, theirs,
+                        "{pattern} after the map: the pieces of {text:?}"
+                    );
+                }
+                let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+                for parallel in [false, true] {
+                    assert_eq!(
+                        native.encode_with(Some(tokenizer.get_model()), &text, parallel, false),
+                        Ok(reference.get_ids().to_vec()),
+                        "{pattern} mapped {mapped}: {text:?} parallel {parallel}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(ran, 15, "the rows that ran");
+}
+
+/// A stage over the image whose program holds an unbounded run anywhere but
+/// first would rescan an ordinary text's run of letters from every start
+/// (the search passes over a failed run only when the program opens with
+/// it), so it is declined at load; the same shapes before the map load, as
+/// does a leading run after it.
+#[test]
+fn image_stages_whose_pattern_rescans_a_run_are_declined() {
+    let mut state = 0x5245_5343_414E_0001u64;
+    let shape_of = |pre_tokenizers: Vec<PreTokenizerWrapper>| Shape {
+        name: "a-run-anywhere-but-first",
+        normalizer: Normalizer::None,
+        pre_tokenizers,
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    // The last two open with a unit run, which no start skip covers: one
+    // that falls short of its minimum is rescanned from every start.
+    for pattern in [
+        r" ?\p{L}+!",
+        r"\p{L}+!|\p{N}+",
+        r"\p{L}\p{L}*!",
+        r"[a-z]\p{L}+!",
+        r"\p{L}*\p{N}+!",
+        r"(?:[!]?\p{L}){3,}",
+        r"(?:[!]?\p{L}){100000,}",
+    ] {
+        let stage = || split(pattern, SplitDelimiterBehavior::Isolated, false);
+        let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
+        assert_eq!(
+            NativeEncoder::from_tokenizer(&after)
+                .expect_err("declined")
+                .to_string(),
+            "a pre-tokenizer stage over the byte-level image whose pattern rescans a run from every start",
+            "{pattern} after the map"
+        );
+        let before = tokenizer_of(&shape_of(vec![stage(), byte_level(false)]), &mut state);
+        assert!(
+            NativeEncoder::from_tokenizer(&before).is_ok(),
+            "{pattern} before the map"
+        );
+    }
+    let leading = tokenizer_of(
+        &shape_of(vec![
+            byte_level(false),
+            split(r"\p{L}+!", SplitDelimiterBehavior::Isolated, false),
+        ]),
+        &mut state,
+    );
+    assert!(
+        NativeEncoder::from_tokenizer(&leading).is_ok(),
+        "a leading run after the map"
+    );
+}
+
+#[test]
+fn a_merged_with_next_stage_over_the_image_is_declined() {
+    let mut state = 0x4D45_5247_4544_0001u64;
+    let shape_of = |pre_tokenizers: Vec<PreTokenizerWrapper>| Shape {
+        name: "merged-with-next-over-the-image",
+        normalizer: Normalizer::None,
+        pre_tokenizers,
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let stage = || split(r"\p{N}+", SplitDelimiterBehavior::MergedWithNext, false);
+    let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
+    assert_eq!(
+        NativeEncoder::from_tokenizer(&after)
+            .expect_err("declined")
+            .to_string(),
+        "a merged-with-next pre-tokenizer stage over the byte-level image"
+    );
+    let before = tokenizer_of(&shape_of(vec![stage(), byte_level(false)]), &mut state);
+    assert!(
+        NativeEncoder::from_tokenizer(&before).is_ok(),
+        "a merged-with-next stage before the map"
+    );
+    // Within printable ASCII after the map the stage loads: no stage reads
+    // outside the image's alphabet, so the stages run over the raw text,
+    // where the merged pieces are the reference's.
+    let loads = tokenizer_of(
+        &shape_of(vec![
+            byte_level(false),
+            split("[!]+", SplitDelimiterBehavior::MergedWithNext, false),
+        ]),
+        &mut state,
+    );
+    let native = NativeEncoder::from_tokenizer(&loads)
+        .expect("a merged-with-next stage within printable ASCII after the map");
+    for text in ["a! b!!c", "!a!", "ab", "! !"] {
+        assert_eq!(
+            native.encode(Some(loads.get_model()), text, false),
+            Ok(loads
+                .encode(text, false)
+                .expect("encode")
+                .get_ids()
+                .to_vec()),
+            "{text:?} through the merged pieces over the raw text"
+        );
+    }
 }

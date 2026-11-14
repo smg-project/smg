@@ -1,6 +1,7 @@
 mod alias_pipeline;
 mod build_parity;
 mod chat_logit_bias;
+mod embeddings;
 mod generate_body;
 mod glm53;
 mod model_label;
@@ -903,10 +904,12 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
         let components = components_with_multimodal(worker_registry, true).await;
         let request: Arc<CreateMessageRequest> =
             Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
+        let tools = MessagesTools::from(&*request);
         let response = tokio::time::timeout(
             Duration::from_secs(10),
             pipeline.execute_messages(
                 request,
+                tools,
                 None,
                 MODEL.to_string(),
                 components,
@@ -2709,6 +2712,83 @@ async fn a_harmony_responses_request_s_stop_sequences_reach_the_engine() {
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     assert_eq!(seen, vec![vec!["STOP".to_string(), "\n\n".to_string()]]);
+}
+
+/// The tool loop's saving rests on one fact: when an iteration's run
+/// returns, nothing else holds the loop's request, so the loop takes it
+/// back by a move (`owned_request`). This pins that fact for the
+/// non-streamed iteration: the iteration runs to its result over the stub,
+/// so the build stage's spec did hold a share of the request, and a later
+/// holder of the request past the run fails here instead of silently
+/// restoring the per-turn deep copy.
+#[tokio::test]
+async fn a_harmony_responses_iteration_releases_its_share_of_the_request_when_it_returns() {
+    let scheduler = GatedScheduler::default();
+    let port = spawn_stub(scheduler.clone()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+    let request: Arc<ResponsesRequest> = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "input": "hi",
+            "stream": false,
+        }))
+        .expect("responses request"),
+    );
+    // The iteration must have been built and dispatched: only then did the
+    // build stage's spec hold a share of the request for this test to see
+    // released. The result stays alive through the count, as the loop's
+    // does when it takes the request back.
+    let _result = ctx
+        .pipeline
+        .execute_harmony_responses(&request, &ctx, None)
+        .await
+        .expect("the non-streamed iteration runs to its result");
+    assert_eq!(
+        scheduler
+            .seen_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1,
+        "the iteration reached the engine"
+    );
+    assert_eq!(
+        Arc::strong_count(&request),
+        1,
+        "the iteration's context released its share when the run returned"
+    );
+}
+
+/// The streamed twin: the iteration's context let go of the request when
+/// the run returned, and nothing the result carries past it (the engine
+/// stream, the load guards, the reservation, the stop obligations) holds a
+/// share either, so once the stream is read to its end the loop moves the
+/// request as the non-streamed loop does.
+#[tokio::test]
+async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_stream_is_drained() {
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+    let request = responses_request(false);
+    let (execution_result, _load_guards, _reservation, _router_stops) = ctx
+        .pipeline
+        .execute_harmony_responses_streaming(&request, &ctx, None, None)
+        .await
+        .expect("the iteration dispatches");
+    match execution_result {
+        ExecutionResult::Single { mut stream, .. } => while stream.next().await.is_some() {},
+        _ => panic!("a regular worker answers with one stream"),
+    }
+    assert_eq!(
+        Arc::strong_count(&request),
+        1,
+        "the iteration's context released its share once its stream was drained"
+    );
 }
 
 /// Harmony Responses over the gRPC PD path: the same client leaves while

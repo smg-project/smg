@@ -62,18 +62,29 @@ engine does in that role; its `Generate` is refused as the wrong pool, and a
 prefill worker on that wire refuses a request whose `encode_bootstrap_info`
 does not name a rendezvous for each media item once.
 The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
-request's media items are checked against the shape the engine requires before
-the canned answer: a known modality, the TokenSpeed item's content hash and,
-on the prefill and regular roles, its encoder input (or the encode room that
-hands the item over; a decode worker takes the gateway's pixel-free clone,
-metadata alone), the SGLang batch's pixel tensor (or its feature hash) and a
-video's placeholder token id, placeholder spans inside the prompt and disjoint
-across the request's items, and, when the item names its placeholder token id,
-spans that cover exactly the prompt's tokens of that id; a wrong item is
-refused with `InvalidArgument` naming the item and the field, so a gateway
-regression in a wire's items reads as a red row on the mock. A reference batch
-on the SGLang wire (media URLs without a pixel tensor, the form the gateway
-hands a worker that processes media itself) is accepted as it stands: the
+request's media items are checked against the shape the engine's adapter
+requires before the canned answer: a known modality, the TokenSpeed item's
+content hash and, on the prefill and regular roles, its encoder input (or the
+encode room that hands the item over; a decode worker takes the gateway's
+pixel-free clone, metadata alone), the SGLang batch's pixel tensor (or its
+feature hash) and a video's placeholder token id, every tensor read as the
+engine reads it (bytes matching the shape at the dtype's width; the SGLang
+reader refuses a dtype outside its six, the TokenSpeed reader passes one it
+does not know; on the TokenSpeed wire an inline payload through the adapter's
+reader, an SHM handle with the servicer's checks: that byte length, a bare
+name and, for the scheduler's feature, a dtype of bfloat16, float16 or float32,
+the encoder reading its feature generically, a remote handle on a feature as
+it came, pulled by the servicer, and a remote handle on a side tensor refused
+as the servicer's generic reader refuses it), one SGLang batch per modality
+(image or
+video, an empty list reading as image) beside a primary batch, placeholder spans
+inside the prompt and disjoint across the request's items, and, when the item
+names its placeholder token id, spans that cover exactly the prompt's tokens of
+that id; a wrong item is refused with `InvalidArgument` naming the item and the
+field, so a gateway regression in a wire's items reads as a red row on the mock.
+A reference batch on the SGLang wire (media URLs without a pixel tensor, the
+form the gateway hands a worker that processes media itself) is the primary
+batch's alone, travels with no extra batch, and is accepted as it stands: the
 worker's processor or an encoder would resolve it, and the mock has neither.
 `--capture` records the TokenSpeed wire's requests only. Beside the scheduler
 service the server hosts the standard `grpc.health.v1` service (`Check`,
@@ -661,6 +672,20 @@ run.
 The mock fleet it is meant for is `mock-worker --engine realistic --admin-port`
 (the [Realistic engine](#realistic-engine) above; note the caveat that its timing
 polynomials were validated against hardware only with prefix caching off).
+
+`scripts/multiturn_trace.py` writes a synthetic trace in this format, shaped like
+multi-turn chat or agent sessions: Poisson session arrivals, tenant system
+prompts drawn by Zipf, and every turn of a session re-sending the conversation so
+far with the previous answer and a new message appended (`--help` lists the
+knobs). Its blocks are 64 tokens, not 512: replay it with `--words-per-block 64`
+(about one token a word), and to calibrate against a real tokenizer as above,
+count `blocks = trace_input_length / 64` and set `--words-per-block` to
+`64 * 64 / b`.
+
+```bash
+python3 scripts/multiturn_trace.py --out trace.jsonl --duration-s 480 --sessions-per-s 10
+replay --trace trace.jsonl --words-per-block 64 --max-output 200 --speedup 1 --limit 0 ...
+```
 
 ### Long runs
 

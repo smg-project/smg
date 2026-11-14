@@ -115,7 +115,10 @@ fn text_only_function_output_projection_preserves_order_and_rejects_media() {
     let value = json!([{"type":"input_image", "image_url":"data:image/png;base64,AA=="}]);
     let output: StringOrContentParts = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(&output).unwrap(), value);
-    assert!(output.to_text_only().is_err());
+    assert!(output
+        .to_text_only()
+        .unwrap_err()
+        .contains("\"input_image\""));
 }
 
 #[test]

@@ -56,6 +56,8 @@
 //!
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
+use std::sync::Arc;
+
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
@@ -297,7 +299,7 @@ impl<'l> Writing<'l> {
                 parameters.of_tool(shape, layout, values, tool, limited)
             }
             Self::Json => Some(Grammar::JsonSchema {
-                schema: tool.function.parameters_schema().clone(),
+                schema: Arc::new(tool.function.parameters_schema().clone()),
                 style: None,
                 excludes: Vec::new(),
                 whitespace: Whitespace::Free,
@@ -1248,7 +1250,7 @@ mod tests {
             value!({"content": null, "calls": [call, call]})
         );
         let answer = named
-            .answer_grammar(&value!({"type": "object"}), false)
+            .answer_grammar(&Arc::new(value!({"type": "object"})), false)
             .expect("an answer");
         assert_eq!(
             answer.payload(),
