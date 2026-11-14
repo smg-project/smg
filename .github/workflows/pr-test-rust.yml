@@ -2513,7 +2513,13 @@ jobs:
   finish:
     needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    # A hosted runner, never a self-hosted pool: this job runs on a cancelled
+    # run too, and a cancelled run is complete only once it has run. Until
+    # then the concurrency group holds the next push's run with no job
+    # created, so a wait for a runner here is a wait for every later head.
+    # The job reads this file and the results of the jobs above, nothing of
+    # a pool.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -2611,7 +2617,9 @@ jobs:
 
   summarize-benchmarks:
     needs: [benchmarks]
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    # A hosted runner, for the reason `finish` has one: once the benchmarks
+    # ended, this job runs on a cancelled run too.
+    runs-on: ubuntu-latest
     if: always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)
     permissions:
       contents: read
