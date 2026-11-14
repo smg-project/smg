@@ -7,5 +7,5 @@ pub mod adapters;
 pub mod discovery;
 pub mod wiring;
 
-pub use adapters::{RateLimitSyncAdapter, TreeDelta, TreeSyncAdapter, WorkerSyncAdapter};
+pub use adapters::{TreeDelta, TreeSyncAdapter, WorkerSyncAdapter};
 pub use wiring::MeshAdapters;

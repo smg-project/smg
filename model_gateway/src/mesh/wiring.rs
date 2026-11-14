@@ -19,7 +19,7 @@ use super::adapters::{
         PeerList, RepairEntry, TreeRepairPage, TreeSyncAdapter, REPAIR_PAGE_PREFIX,
         REPAIR_REQUEST_PREFIX, TENANT_DELTA_PREFIX,
     },
-    RateLimitSyncAdapter, WorkerSyncAdapter,
+    WorkerSyncAdapter,
 };
 use crate::{
     policies::{as_cache_aware, CacheAwarePolicy, PolicyRegistry, TreeHandle, TreeKind},
@@ -49,16 +49,15 @@ const REPAIR_PAGE_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Debug)]
 pub struct MeshAdapters {
     worker: Arc<WorkerSyncAdapter>,
-    rate_limit: Arc<RateLimitSyncAdapter>,
     tree: Arc<TreeSyncAdapter>,
 }
 
 impl MeshAdapters {
-    /// Register the `worker:` (last-writer-wins) and `rl:` (epoch-max-wins)
-    /// CRDT namespaces plus the `td:` / `tree:req:` / `tree:page:` stream
-    /// namespaces, construct the adapters, and start their inbound sync
-    /// loops. One call because the adapters' `start` methods are not
-    /// idempotent (each call spawns another subscription task).
+    /// Register the `worker:` (last-writer-wins) CRDT namespace plus the
+    /// `td:` / `tree:req:` / `tree:page:` stream namespaces, construct the
+    /// adapters, and start their inbound sync loops. One call because the
+    /// adapters' `start` methods are not idempotent (each call spawns another
+    /// subscription task).
     ///
     /// MUST be called before `MeshServer::start` spawns gossip: a remote op
     /// arriving for an unregistered prefix would merge through the default
@@ -74,9 +73,7 @@ impl MeshAdapters {
     /// Panics if any adapter's `start` invariants are violated — the
     /// concrete sources are a double `start` call on the same [`MeshKV`]
     /// (each adapter registers exactly one drain per prefix) and an
-    /// empty `node_name` (asserted by every adapter); the rate-limit
-    /// adapter additionally rejects a `node_name` containing `':'`
-    /// because it is the shard-key separator.
+    /// empty `node_name` (asserted by every adapter).
     pub fn start(
         mesh_kv: &MeshKV,
         node_name: String,
@@ -85,7 +82,6 @@ impl MeshAdapters {
         policy_registry: Arc<PolicyRegistry>,
     ) -> Arc<Self> {
         let worker_ns = mesh_kv.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
-        let rl_ns = mesh_kv.configure_crdt_prefix("rl:", MergeStrategy::EpochMaxWins);
         let td_ns = mesh_kv.configure_stream_prefix(
             TENANT_DELTA_PREFIX,
             StreamConfig {
@@ -113,7 +109,6 @@ impl MeshAdapters {
             node_name.clone(),
             cluster_state.clone(),
         );
-        let rate_limit = RateLimitSyncAdapter::new(rl_ns, node_name.clone());
         let peers: Arc<dyn PeerList> =
             Arc::new(ClusterStatePeerList::new(cluster_state, node_name.clone()));
         let tree_handle: Arc<dyn TreeHandle> =
@@ -127,27 +122,17 @@ impl MeshAdapters {
             node_name,
         );
         worker.start();
-        rate_limit.start();
         tree.start();
         // Only after the adapter is subscribed to the `td:` stream do we
         // let policies start writing to it — otherwise the very first
         // hot-path delta races the subscription setup and is dropped.
         policy_registry.set_mesh_tree_sync(Some(tree.clone()));
-        Arc::new(Self {
-            worker,
-            rate_limit,
-            tree,
-        })
+        Arc::new(Self { worker, tree })
     }
 
     /// Worker sync adapter.
     pub fn worker(&self) -> &Arc<WorkerSyncAdapter> {
         &self.worker
-    }
-
-    /// Rate-limit sync adapter.
-    pub fn rate_limit(&self) -> &Arc<RateLimitSyncAdapter> {
-        &self.rate_limit
     }
 
     /// Tree sync adapter (cache-aware tenant deltas + repair).
@@ -364,19 +349,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rl_namespace_uses_epoch_max_wins() {
-        let mesh = MeshKV::new("node-a".into());
-        let adapters = started(&mesh);
-
-        // Under EpochMaxWins a lower-epoch write cannot rewind the shard;
-        // under a mis-registered LWW engine the later write would win and
-        // the aggregate would read 100.
-        adapters.rate_limit().sync_counter("global", 2, 5);
-        adapters.rate_limit().sync_counter("global", 1, 100);
-        assert_eq!(adapters.rate_limit().get_aggregate("global"), 5);
-    }
-
-    #[tokio::test]
     async fn tree_adapter_registers_and_flips_populate_flag() {
         let mesh = MeshKV::new("node-a".into());
         let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
@@ -442,19 +414,6 @@ mod tests {
         let mesh = MeshKV::new("node-a".into());
         let _adapters = started(&mesh);
         let _again = started(&mesh);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "must not contain ':'")]
-    async fn start_panics_on_colon_node_name() {
-        let mesh = MeshKV::new("node-a".into());
-        let _ = MeshAdapters::start(
-            &mesh,
-            "node:a".into(),
-            Arc::new(WorkerRegistry::new()),
-            empty_cluster_state(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-        );
     }
 
     fn cache_aware_policy_config() -> PolicyConfig {
