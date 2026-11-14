@@ -13,7 +13,10 @@ if TYPE_CHECKING:
 
 
 def _input_items_params(
-    limit: int | None, order: str | None, after: str | None, include: list[str] | None
+    limit: int | None,
+    order: Literal["asc", "desc"] | None,
+    after: str | None,
+    include: list[str] | None,
 ) -> dict[str, Any] | None:
     """The list's query: the parameters the caller set, in the public API's order."""
     params: dict[str, Any] = {}
@@ -44,7 +47,7 @@ class SyncInputItems:
         *,
         response_id: str,
         limit: int | None = None,
-        order: str | None = None,
+        order: Literal["asc", "desc"] | None = None,
         after: str | None = None,
         include: list[str] | None = None,
     ) -> EventObject:
@@ -87,7 +90,7 @@ class AsyncInputItems:
         *,
         response_id: str,
         limit: int | None = None,
-        order: str | None = None,
+        order: Literal["asc", "desc"] | None = None,
         after: str | None = None,
         include: list[str] | None = None,
     ) -> EventObject:
