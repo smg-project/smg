@@ -911,7 +911,9 @@ async fn execute_tool_loop_streaming_internal(
         };
 
         // Prepare tool_choice for this iteration (same logic as non-streaming)
-        prepare_tool_choice(&mut chat_request, state.iteration);
+        prepare_tool_choice(&mut chat_request, &state, |name| {
+            session.has_exposed_tool(name)
+        });
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
@@ -988,7 +990,9 @@ async fn execute_tool_loop_streaming_internal(
             break Turns::Done;
         }
 
-        if !tool_calls.is_empty() {
+        // The final turn's answer ends the stream whatever it holds: a server
+        // call made anyway was hidden by the converter and does not run.
+        if !tool_calls.is_empty() && !state.final_turn {
             let (mcp_tool_calls, function_tool_calls, tool_call_limit) =
                 partition_tool_calls(tool_calls, &session, &state, max_tool_calls, true);
 
@@ -1007,14 +1011,11 @@ async fn execute_tool_loop_streaming_internal(
                 }
             }
 
-            if let Some(limit) = tool_call_limit {
-                break match limit {
-                    McpToolCallLimit::User => Turns::Done,
-                    McpToolCallLimit::Safety => Turns::Failed(json!({
-                        "code": "max_tool_calls_exceeded",
-                        "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
-                    })),
-                };
+            if tool_call_limit == Some(McpToolCallLimit::Safety) {
+                break Turns::Failed(json!({
+                    "code": "max_tool_calls_exceeded",
+                    "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
+                }));
             }
 
             // process_chunk already emitted these function-call items.
@@ -1022,6 +1023,8 @@ async fn execute_tool_loop_streaming_internal(
             if !function_tool_calls.is_empty() {
                 break Turns::Done;
             }
+
+            state.final_turn = tool_call_limit == Some(McpToolCallLimit::User);
 
             // Build next request with conversation history
             current_request = build_next_request(&mut state, current_request);
