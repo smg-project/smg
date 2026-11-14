@@ -11,6 +11,13 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use openai_protocol::{
+    common::json_type_name,
+    responses::{
+        validate_input_message_role, validate_metadata_pair_count, validate_metadata_pairs,
+        ResponseContentPart,
+    },
+};
 use serde_json::{json, Value};
 use smg_data_connector::{
     AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
@@ -28,12 +35,15 @@ use crate::routers::{
 // Constants
 // ============================================================================
 
-pub const MAX_METADATA_PROPERTIES: usize = 16;
 const MAX_ITEMS_PER_REQUEST: usize = 20;
 /// The longest item id a client may supply, in bytes: the id columns of the
 /// SQL stores are 64 wide, and every backend gives the same refusal before any
 /// store is asked, where one of them used to fail the insert instead.
 pub const MAX_ITEM_ID_LENGTH: usize = 64;
+/// The `status` values a message item may carry (the public API's set for a
+/// message; the other item types have sets of their own and keep the status
+/// they are sent).
+const MESSAGE_STATUSES: [&str; 3] = ["in_progress", "completed", "incomplete"];
 
 const SUPPORTED_ITEM_TYPES: &[&str] = &[
     "message",
@@ -116,6 +126,40 @@ fn item_id_above_max_length(id: &str) -> Response {
     }))
 }
 
+/// A refusal in the public API's words: `code` and `message` as a validator
+/// of the protocols crate gives them, under `param` (none for the body as a
+/// whole).
+fn refused(param: Option<&str>, code: &str, message: &str) -> Response {
+    bad_request_structured(json!({
+        "message": message,
+        "type": "invalid_request_error",
+        "param": param,
+        "code": code
+    }))
+}
+
+/// The refusal of a `metadata` object outside the public API's bounds, as
+/// `validate_metadata_pairs` words it.
+fn metadata_refused(code: &str, message: Option<&str>) -> Response {
+    refused(Some("metadata"), code, message.unwrap_or_default())
+}
+
+/// A request body that is not a JSON object is refused as the typed
+/// extractors refuse one (`invalid_type`), before any field is read.
+fn object_body(body: &Value) -> Result<(), Response> {
+    if body.is_object() {
+        return Ok(());
+    }
+    Err(refused(
+        None,
+        "invalid_type",
+        &format!(
+            "Invalid type for the request body: expected an object, but got {} instead.",
+            json_type_name(body)
+        ),
+    ))
+}
+
 // ============================================================================
 // Storage Helpers
 // ============================================================================
@@ -139,32 +183,44 @@ async fn ensure_conversation_exists(
 // Metadata Operations
 // ============================================================================
 
-fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Value>>, String> {
+/// The `metadata` of a create body: none when absent, the object once the
+/// public API's bounds hold (`validate_metadata_pairs`: 16 pairs, 64-character
+/// keys, 512-character string values, strings only); a bound crossed and a
+/// value of another type are refused under the public API's codes.
+fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Value>>, Response> {
     match value.get("metadata") {
         Some(Value::Object(map)) => {
-            if map.len() > MAX_METADATA_PROPERTIES {
-                Err(format!(
-                    "metadata cannot have more than {MAX_METADATA_PROPERTIES} properties"
-                ))
-            } else {
-                Ok(Some(map.clone()))
-            }
+            validate_metadata_pairs(map.iter())
+                .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
+            Ok(Some(map.clone()))
         }
-        Some(_) => Err("metadata must be an object".to_string()),
+        Some(other) => Err(metadata_not_an_object(other)),
         None => Ok(None),
     }
 }
 
+/// `current` with the `metadata` patch of an update body applied (a null
+/// value removes its key). The key and value rules are read on the patch's
+/// own pairs, so a pair stored before these rules held does not block an
+/// unrelated patch; the 16-pair bound is the stored object's and is read on
+/// the merged result. A patch that crosses either changes nothing.
 fn apply_metadata_patches(
     current: Option<serde_json::Map<String, Value>>,
     body: &Value,
-) -> Result<Option<serde_json::Map<String, Value>>, String> {
+) -> Result<Option<serde_json::Map<String, Value>>, Response> {
     let patch_map = match body.get("metadata") {
         Some(Value::Object(map)) => map,
-        Some(_) => return Err("metadata must be an object".to_string()),
+        Some(other) => return Err(metadata_not_an_object(other)),
         None => return Ok(current),
     };
 
+    // A null value removes its key and is not a value under the rules.
+    let patched: Vec<(&String, &Value)> = patch_map
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .collect();
+    validate_metadata_pairs(patched.iter().copied())
+        .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
     let mut result = current.unwrap_or_default();
     for (k, v) in patch_map {
         if v.is_null() {
@@ -173,18 +229,25 @@ fn apply_metadata_patches(
             result.insert(k.clone(), v.clone());
         }
     }
-
-    if result.len() > MAX_METADATA_PROPERTIES {
-        return Err(format!(
-            "metadata cannot have more than {MAX_METADATA_PROPERTIES} properties"
-        ));
-    }
+    validate_metadata_pair_count(result.len())
+        .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
 
     Ok(if result.is_empty() {
         None
     } else {
         Some(result)
     })
+}
+
+/// The refusal of a `metadata` field that is not an object.
+fn metadata_not_an_object(value: &Value) -> Response {
+    metadata_refused(
+        "invalid_type",
+        Some(&format!(
+            "Invalid type for 'metadata': expected an object, but got {} instead.",
+            json_type_name(value)
+        )),
+    )
 }
 
 // ============================================================================
@@ -209,9 +272,12 @@ pub async fn create_conversation(
     tenant: Option<&str>,
     body: Value,
 ) -> Response {
+    if let Err(response) = object_body(&body) {
+        return response;
+    }
     let metadata = match validate_metadata(&body) {
         Ok(m) => m,
-        Err(msg) => return bad_request(msg),
+        Err(response) => return response,
     };
     let items = match items_of(&body, false) {
         Ok(items) => items,
@@ -285,6 +351,9 @@ pub async fn update_conversation(
     conv_id: &str,
     body: Value,
 ) -> Response {
+    if let Err(response) = object_body(&body) {
+        return response;
+    }
     let conversation_id = ConversationId::from(conv_id);
 
     let current = match ensure_conversation_exists(storage, &conversation_id, tenant).await {
@@ -294,7 +363,7 @@ pub async fn update_conversation(
 
     let final_metadata = match apply_metadata_patches(current.metadata.clone(), &body) {
         Ok(m) => m,
-        Err(msg) => return bad_request(msg),
+        Err(response) => return response,
     };
 
     match storage
@@ -405,6 +474,9 @@ pub async fn create_conversation_items(
     conv_id: &str,
     body: Value,
 ) -> Response {
+    if let Err(response) = object_body(&body) {
+        return response;
+    }
     let conversation_id = ConversationId::from(conv_id);
 
     if let Err(response) =
@@ -533,8 +605,7 @@ async fn prepare_items(
         } else if let Some(id_str) = id {
             prepare_item_with_id(item_storage, conversation_id, item_val, id_str, tenant).await?
         } else {
-            let (new_item, warning) =
-                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
+            let (new_item, warning) = parse_item_from_value(item_val, tenant)?;
             PreparedItem::New(new_item, warning)
         };
         if let (Some(id_str), PreparedItem::New(..)) = (id, &item) {
@@ -599,8 +670,7 @@ async fn prepare_item_with_id(
         }
         Ok(Some(_)) => Err(bad_request(format!("Item id '{id_str}' cannot be used"))),
         Ok(None) => {
-            let (mut new_item, warning) =
-                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
+            let (mut new_item, warning) = parse_item_from_value(item_val, tenant)?;
             new_item.id = Some(item_id);
             Ok(PreparedItem::New(new_item, warning))
         }
@@ -899,21 +969,25 @@ pub async fn delete_conversation_item(
 // Parsing and Serialization
 // ============================================================================
 
+/// A request item as the stores take it, with the warning of a type accepted
+/// but not implemented; a refusal is the response the caller answers. A
+/// message item's `role`, `status` and content parts are checked against the
+/// public API's sets (`validate_message_fields`) before any store is asked.
 fn parse_item_from_value(
     item_val: &Value,
     tenant: Option<&str>,
-) -> Result<(NewConversationItem, Option<String>), String> {
+) -> Result<(NewConversationItem, Option<String>), Response> {
     let item_type = item_val
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("message");
 
     if !SUPPORTED_ITEM_TYPES.contains(&item_type) {
-        return Err(format!(
+        return Err(bad_request(format!(
             "Unsupported item type '{}'. Supported types: {}",
             item_type,
             SUPPORTED_ITEM_TYPES.join(", ")
-        ));
+        )));
     }
 
     let warning = if IMPLEMENTED_ITEM_TYPES.contains(&item_type) {
@@ -930,8 +1004,11 @@ fn parse_item_from_value(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    if item_type == "message" && role.is_none() {
-        return Err("Message items require 'role' field".to_string());
+    if item_type == "message" {
+        if role.is_none() {
+            return Err(bad_request("Message items require 'role' field"));
+        }
+        validate_message_fields(item_val)?;
     }
 
     let status = item_val
@@ -965,6 +1042,117 @@ fn parse_item_from_value(
         },
         warning,
     ))
+}
+
+/// A message item's `role`, `status` and `content` under the public API's
+/// sets, refused in its words before any store is asked: the role through the
+/// rule the Responses request validates with, the status in the message set,
+/// the content a string or an array of the content parts the Responses
+/// request takes (each part read with the typed part, so an unknown type, a
+/// missing field and a wrong shape are refused as the typed extractors refuse
+/// them). An item of another type keeps its fields as sent.
+fn validate_message_fields(item_val: &Value) -> Result<(), Response> {
+    if let Some(role) = item_val.get("role").and_then(Value::as_str) {
+        validate_input_message_role(role).map_err(|error| {
+            refused(
+                Some("items[].role"),
+                &error.code,
+                error.message.as_deref().unwrap_or_default(),
+            )
+        })?;
+    }
+    if let Some(status) = item_val.get("status").filter(|status| !status.is_null()) {
+        if !status
+            .as_str()
+            .is_some_and(|status| MESSAGE_STATUSES.contains(&status))
+        {
+            let shown = status
+                .as_str()
+                .map_or_else(|| status.to_string(), str::to_owned);
+            return Err(refused(
+                Some("items[].status"),
+                "invalid_value",
+                &format!(
+                    "Invalid value: '{shown}'. Supported values are: 'in_progress', 'completed', and 'incomplete'."
+                ),
+            ));
+        }
+    }
+    match item_val.get("content") {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(parts)) => {
+            for (index, part) in parts.iter().enumerate() {
+                if let Err(error) = serde_json::from_value::<ResponseContentPart>(part.clone()) {
+                    return Err(part_refused(index, part, &error.to_string()));
+                }
+            }
+            Ok(())
+        }
+        Some(other) => Err(refused(
+            Some("items[].content"),
+            "invalid_type",
+            &format!(
+                "Invalid type for 'items[].content': expected a string or an array of content parts, but got {} instead.",
+                json_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// The refusal of a message content part the typed part does not read, under
+/// the public API's code for serde's reason, on the field the reason names
+/// without a guess: a part that is not an object is `invalid_type`; one
+/// without a `type` is `missing_required_parameter` on its type, one whose
+/// `type` is not a string `invalid_type` on it, one whose `type` is outside
+/// the part set `invalid_value` on it; a missing field of a part that holds
+/// nothing nested is `missing_required_parameter` on that field. serde names
+/// a missing field or an unknown variant without its path, so an error that
+/// may come from inside a nested value (an annotation's field, a `detail`
+/// outside its set) names the part itself, under the code of its kind.
+fn part_refused(index: usize, part: &Value, reason: &str) -> Response {
+    let part_param = format!("items[].content[{index}]");
+    let missing_field = reason
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(field, _)| field);
+    let (param, code) = match part.get("type") {
+        _ if !part.is_object() => (part_param.clone(), "invalid_type"),
+        None | Some(Value::Null) => (format!("{part_param}.type"), "missing_required_parameter"),
+        Some(Value::String(own)) if unknown_variant_is(reason, own) => {
+            (format!("{part_param}.type"), "invalid_value")
+        }
+        Some(Value::String(_)) => {
+            let nested = part
+                .as_object()
+                .is_some_and(|fields| fields.values().any(|v| v.is_object() || v.is_array()));
+            match missing_field {
+                Some(field) if !nested => (
+                    format!("{part_param}.{field}"),
+                    "missing_required_parameter",
+                ),
+                Some(_) => (part_param.clone(), "missing_required_parameter"),
+                None if reason.starts_with("unknown variant") => {
+                    (part_param.clone(), "invalid_value")
+                }
+                None => (part_param.clone(), "invalid_type"),
+            }
+        }
+        Some(_) => (format!("{part_param}.type"), "invalid_type"),
+    };
+    refused(
+        Some(&param),
+        code,
+        &format!("Invalid '{part_param}': {reason}"),
+    )
+}
+
+/// Whether serde's reason is the unknown-variant refusal of `name` itself
+/// (``unknown variant `name`, expected ...``), not of a value nested in it.
+fn unknown_variant_is(reason: &str, name: &str) -> bool {
+    reason
+        .strip_prefix("unknown variant `")
+        .and_then(|rest| rest.strip_prefix(name))
+        .is_some_and(|rest| rest.starts_with('`'))
 }
 
 /// The content of a message item as it is stored and listed: a plain string
@@ -1344,6 +1532,338 @@ mod tests {
         )
         .await;
         assert_eq!(listed["data"][0]["content"][0]["text"], "B", "{listed}");
+    }
+
+    /// A conversation's `metadata` is bounded as the public API bounds it, on
+    /// create and on update: 16 pairs, 64-character keys, 512-character
+    /// values, strings only; every refusal carries the public code under
+    /// `metadata` and stores nothing; metadata at the bounds is kept; a body
+    /// that is not an object is refused before any field is read.
+    #[tokio::test]
+    async fn metadata_is_bounded_as_the_public_api_bounds_it_on_create_and_update() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let error_of = |response: Response| async move { json_of(response).await["error"].clone() };
+        let one = |key: String, value: Value| {
+            let mut map = serde_json::Map::new();
+            map.insert(key, value);
+            Value::Object(map)
+        };
+
+        let before = conversations.stored_record_count();
+        let seventeen: serde_json::Map<String, Value> =
+            (0..17).map(|i| (format!("k{i}"), json!("v"))).collect();
+        for (metadata, code) in [
+            (json!({"k": "v".repeat(513)}), "string_above_max_length"),
+            (one("k".repeat(65), json!("v")), "string_above_max_length"),
+            (Value::Object(seventeen), "object_above_max_properties"),
+            (json!({"k": {"nested": 1}}), "invalid_type"),
+            (json!({"n": 5}), "invalid_type"),
+            (json!("text"), "invalid_type"),
+        ] {
+            let response =
+                create_conversation(&conversations, &items, None, json!({"metadata": metadata}))
+                    .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{metadata}");
+            let error = error_of(response).await;
+            assert_eq!(error["code"], code, "{error}");
+            assert_eq!(error["param"], "metadata", "{error}");
+            assert_eq!(
+                conversations.stored_record_count(),
+                before,
+                "a refused create creates nothing: {metadata}"
+            );
+        }
+        let response = create_conversation(&conversations, &items, None, json!([])).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = error_of(response).await;
+        assert_eq!(error["code"], "invalid_type", "{error}");
+        assert!(error["param"].is_null(), "{error}");
+        assert_eq!(conversations.stored_record_count(), before);
+
+        let at_the_bounds: serde_json::Map<String, Value> = (0..16)
+            .map(|i| (format!("{i:0>64}"), json!("v".repeat(512))))
+            .collect();
+        let response = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"metadata": Value::Object(at_the_bounds.clone())}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_of(response).await;
+        assert_eq!(
+            created["metadata"],
+            Value::Object(at_the_bounds.clone()),
+            "{created}"
+        );
+        let conv_id = created["id"].as_str().unwrap().to_string();
+
+        let key0 = format!("{:0>64}", 0);
+        for (body, code) in [
+            (
+                json!({"metadata": one(key0.clone(), json!("v".repeat(513)))}),
+                "string_above_max_length",
+            ),
+            (
+                json!({"metadata": one(key0.clone(), json!(1))}),
+                "invalid_type",
+            ),
+            (
+                json!({"metadata": {"seventeenth": "v"}}),
+                "object_above_max_properties",
+            ),
+            (json!({"metadata": "text"}), "invalid_type"),
+            (json!([]), "invalid_type"),
+        ] {
+            let response = update_conversation(&conversations, None, &conv_id, body.clone()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(error_of(response).await["code"], code, "{body}");
+        }
+        let kept = json_of(get_conversation(&conversations, None, &conv_id).await).await;
+        assert_eq!(
+            kept["metadata"],
+            Value::Object(at_the_bounds),
+            "a refused update changes nothing: {kept}"
+        );
+        let response = update_conversation(
+            &conversations,
+            None,
+            &conv_id,
+            json!({"metadata": one(key0, Value::Null)}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = json_of(response).await;
+        assert_eq!(
+            updated["metadata"].as_object().map(serde_json::Map::len),
+            Some(15),
+            "{updated}"
+        );
+
+        // A pair stored before these rules held (a number) does not block an
+        // unrelated patch: the key and value rules are read on the patch's own
+        // pairs, the pair count on the merged object.
+        let stored = conversations
+            .create_conversation(NewConversation {
+                id: None,
+                metadata: json!({"n": 5}).as_object().cloned(),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let response = update_conversation(
+            &conversations,
+            None,
+            &stored.id.0,
+            json!({"metadata": {"a": "b"}}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let patched = json_of(response).await;
+        assert_eq!(patched["metadata"], json!({"n": 5, "a": "b"}), "{patched}");
+        let sixteen_more: serde_json::Map<String, Value> =
+            (0..16).map(|i| (format!("k{i}"), json!("v"))).collect();
+        let response = update_conversation(
+            &conversations,
+            None,
+            &stored.id.0,
+            json!({"metadata": Value::Object(sixteen_more)}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_of(response).await["error"]["code"],
+            "object_above_max_properties",
+            "the pair count is the merged object's"
+        );
+    }
+
+    /// A message item's `role`, `status` and content parts are refused outside
+    /// the public API's sets, in its words and under the field named, before
+    /// any store is asked, on the add-items route and on create alike; an item
+    /// inside the sets (a developer message, an incomplete status, the typed
+    /// parts) is stored and listed as sent, and an item of another type keeps
+    /// its status.
+    #[tokio::test]
+    async fn a_message_items_role_status_and_parts_are_refused_outside_the_public_sets() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conv_id = created["id"].as_str().unwrap().to_string();
+        let message = |fields: Value| {
+            let mut item = json!({"type": "message", "role": "user", "content": "x"});
+            item.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            json!({"items": [item]})
+        };
+
+        let before = conversations.stored_record_count();
+        for (body, code, param) in [
+            (
+                message(json!({"role": "bogus"})),
+                "invalid_value",
+                "items[].role",
+            ),
+            (
+                message(json!({"status": "flying"})),
+                "invalid_value",
+                "items[].status",
+            ),
+            (
+                message(json!({"status": 3})),
+                "invalid_value",
+                "items[].status",
+            ),
+            (
+                message(json!({"content": [{"type": "bogus_part", "x": 1}]})),
+                "invalid_value",
+                "items[].content[0].type",
+            ),
+            (
+                message(
+                    json!({"content": [{"type": "input_text", "text": "ok"}, {"text": "no type"}]}),
+                ),
+                "missing_required_parameter",
+                "items[].content[1].type",
+            ),
+            (
+                message(json!({"content": [{"type": "input_text"}]})),
+                "missing_required_parameter",
+                "items[].content[0].text",
+            ),
+            (
+                message(json!({"content": [{"type": "refusal", "refusal": 7}]})),
+                "invalid_type",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [{"type": 7}]})),
+                "invalid_type",
+                "items[].content[0].type",
+            ),
+            (
+                message(json!({"content": ["a bare string"]})),
+                "invalid_type",
+                "items[].content[0]",
+            ),
+            // An error inside a nested value names the part, never a field of it
+            // that is fine or that it does not have.
+            (
+                message(json!({"content": [
+                    {"type": "input_image", "image_url": "https://example.com/a.png", "detail": "ultra"}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "url_citation", "url": "u"}]}
+                ]})),
+                "missing_required_parameter",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "bogus"}]}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": {"text": "x"}})),
+                "invalid_type",
+                "items[].content",
+            ),
+            (
+                message(json!({"content": null})),
+                "invalid_type",
+                "items[].content",
+            ),
+        ] {
+            let response =
+                create_conversation_items(&conversations, &items, None, &conv_id, body.clone())
+                    .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error = json_of(response).await["error"].clone();
+            assert_eq!(error["code"], code, "{body}: {error}");
+            assert_eq!(error["param"], param, "{body}: {error}");
+            assert_eq!(error["type"], "invalid_request_error", "{body}: {error}");
+            let response = create_conversation(&conversations, &items, None, body.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "on create: {body}"
+            );
+            assert_eq!(
+                conversations.stored_record_count(),
+                before,
+                "a refused create creates nothing: {body}"
+            );
+        }
+        let response =
+            create_conversation_items(&conversations, &items, None, &conv_id, json!([])).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_of(response).await["error"]["code"], "invalid_type");
+
+        // A batch refused at its second item under these rules stores nothing
+        // of its first: the whole batch is prepared before any write.
+        let items_before = items.stored_record_count();
+        let mixed = json!({"items": [
+            {"id": "msg_first", "type": "message", "role": "user", "content": "ok"},
+            {"type": "message", "role": "user", "content": "x", "status": "flying"}
+        ]});
+        let response =
+            create_conversation_items(&conversations, &items, None, &conv_id, mixed).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            items.stored_record_count(),
+            items_before,
+            "nothing of a refused batch is stored"
+        );
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, None, &conv_id, None, None, None).await,
+        )
+        .await;
+        assert!(
+            listed["data"].as_array().unwrap().is_empty(),
+            "nothing is stored for a refused batch: {listed}"
+        );
+
+        let accepted = json!({"items": [
+            {"type": "message", "role": "developer", "content": "rules", "status": "incomplete"},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"},
+                {"type": "input_image", "image_url": "https://example.com/a.png"}
+            ]},
+            {"type": "message", "role": "assistant", "status": "in_progress", "content": [
+                {"type": "output_text", "text": "hello"},
+                {"type": "refusal", "refusal": "no"}
+            ]},
+            {"type": "web_search_call", "id": "ws_1", "status": "searching"}
+        ]});
+        let response =
+            create_conversation_items(&conversations, &items, None, &conv_id, accepted).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let added = json_of(response).await;
+        assert_eq!(added["data"].as_array().map(Vec::len), Some(4), "{added}");
+        assert_eq!(added["data"][0]["status"], "incomplete", "{added}");
+        assert_eq!(
+            added["data"][1]["content"][1]["type"], "input_image",
+            "{added}"
+        );
+        assert_eq!(added["data"][2]["content"][1]["refusal"], "no", "{added}");
+        assert_eq!(
+            added["data"][3]["status"], "searching",
+            "an item of another type keeps its status: {added}"
+        );
     }
 
     const A: Option<&str> = Some("header:tenant-a");
