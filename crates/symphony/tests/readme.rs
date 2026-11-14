@@ -2871,6 +2871,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "spark-x2.6-4b",
+        model: "XHToken/Spark-X2.6-4B",
+        also: &["Spark-X2.6-1.7B"],
+        released: "2026-10-19",
+        smg: (None, None),
+        table: Some(Table::Glm),
+        set: Some(27),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "step-3.5-flash",
         model: "stepfun-ai/Step-3.5-Flash",
         also: &[],
