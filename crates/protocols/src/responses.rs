@@ -1578,6 +1578,36 @@ pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
+    /// The reasoning execution mode (`ReasoningModeEnum`: `standard`, `pro`,
+    /// or another string the upstream takes), forwarded as given.
+    pub mode: Option<String>,
+    /// Which reasoning items are rendered back to the model on later turns.
+    pub context: Option<ReasoningContext>,
+    /// The deprecated spelling of `summary`, forwarded as given. It is a field
+    /// of its own rather than an alias, so a body that sends both spellings
+    /// still parses.
+    pub generate_summary: Option<ReasoningSummary>,
+}
+
+/// Which reasoning items are rendered back to the model on later turns
+/// (`Reasoning.context` in the spec); `auto` lets the model decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContext {
+    Auto,
+    CurrentTurn,
+    AllTurns,
+}
+
+impl ReasoningContext {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CurrentTurn => "current_turn",
+            Self::AllTurns => "all_turns",
+        }
+    }
 }
 
 #[expect(
@@ -2880,12 +2910,20 @@ pub struct IncompleteDetails {
 }
 
 /// The `reasoning` block of a Response object. The public API returns it on
-/// every response, both keys present (`null` when the request set none), so
-/// neither key is skipped here.
+/// every response with `effort` and `summary` present (`null` when the request
+/// set none), so neither is skipped here. `mode`, `context` and
+/// `generate_summary` echo the request's when it set them, and are left out
+/// otherwise.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReasoningInfo {
     pub effort: Option<String>,
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
 }
 
 impl From<&ResponseReasoningParam> for ReasoningInfo {
@@ -2893,6 +2931,11 @@ impl From<&ResponseReasoningParam> for ReasoningInfo {
         Self {
             effort: param.effort.map(|effort| effort.as_str().to_string()),
             summary: param.summary.map(|summary| summary.as_str().to_string()),
+            mode: param.mode.clone(),
+            context: param.context.map(|context| context.as_str().to_string()),
+            generate_summary: param
+                .generate_summary
+                .map(|summary| summary.as_str().to_string()),
         }
     }
 }

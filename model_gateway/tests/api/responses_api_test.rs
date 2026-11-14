@@ -1219,6 +1219,9 @@ fn test_responses_request_creation() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::Medium),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Auto),
         store: Some(true),
@@ -1380,6 +1383,9 @@ fn test_reasoning_param_default() {
     let param = ResponseReasoningParam {
         effort: Some(ReasoningEffort::Medium),
         summary: None,
+        mode: None,
+        context: None,
+        generate_summary: None,
     };
 
     let json = serde_json::to_string(&param).unwrap();
@@ -1419,6 +1425,9 @@ fn test_json_serialization() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::High),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Priority),
         store: Some(false),

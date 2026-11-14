@@ -90,6 +90,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses request's reasoning config keeps `mode`, `context` and the deprecated
+  `generate_summary`, as the public API's `Reasoning` takes them, when the request is written back
+  for an upstream, and a Response's `reasoning` echoes the ones the request set. The crate dropped
+  all three, so a `pro`-mode request reached the upstream in its default mode. Breaking:
+  `ResponseReasoningParam` gains `mode: Option<String>`, `context: Option<ReasoningContext>` and
+  `generate_summary: Option<ReasoningSummary>`, `ReasoningInfo` gains the three as
+  `Option<String>`, and the crate gains `ReasoningContext`.
 - `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
   `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
   "input_image" in a function output for text-only backends: only text parts are carried as a tool

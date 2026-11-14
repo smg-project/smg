@@ -256,6 +256,29 @@ fn legacy_vec_string_summary_fails_to_deserialize() {
     );
 }
 
+/// The public API's reasoning config takes `mode`, `context` and the
+/// deprecated `generate_summary` beside `effort` and `summary`: a request
+/// carrying them writes them back for the upstream as sent, a mode the spec
+/// does not list included, since its `mode` is an open string.
+#[test]
+fn a_responses_reasoning_config_keeps_its_mode_context_and_generate_summary() {
+    for mode in ["pro", "a-mode-the-spec-does-not-list"] {
+        let reasoning = json!({
+            "effort": "high",
+            "summary": "auto",
+            "mode": mode,
+            "context": "all_turns",
+            "generate_summary": "concise"
+        });
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6", "input": "think it through", "reasoning": reasoning.clone()
+        }))
+        .unwrap_or_else(|e| panic!("mode {mode}: {e}"));
+        let written = serde_json::to_value(&request).expect("serialize the request");
+        assert_eq!(written["reasoning"], reasoning, "mode {mode}");
+    }
+}
+
 #[test]
 fn test_responses_request_omitted_top_p_deserializes_to_none() {
     let request: ResponsesRequest = serde_json::from_value(json!({
