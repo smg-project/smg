@@ -2521,11 +2521,11 @@ mod validated_body_tests {
     }
 
     /// `/generate` serves a body with `text` and `input_ids` (the engine takes
-    /// the ids first) and passes an empty `text` beside a media item through
-    /// the door (the gRPC path then refuses the media as before, not the
-    /// text); an empty `text` alone is refused under `text` and a body with no
-    /// prompt at all as a rule over the request, in the envelope before the
-    /// worker sees it.
+    /// the ids first), an empty `text` beside ids among them, and passes an
+    /// empty `text` beside a media item through the door (the gRPC path then
+    /// refuses the media as before, not the text); an empty `text` alone is
+    /// refused under `text` and a body with no prompt at all as a rule over
+    /// the request, in the envelope before the worker sees it.
     #[tokio::test]
     async fn generate_takes_the_ids_over_the_text_and_an_empty_text_only_with_media() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -2542,6 +2542,7 @@ mod validated_body_tests {
         for served in [
             r#"{"model":"mock-model","text":"hi","sampling_params":{"max_new_tokens":2}}"#,
             r#"{"model":"mock-model","text":"hi","input_ids":[1,2],"sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"","input_ids":[1,2],"sampling_params":{"max_new_tokens":2}}"#,
             r#"{"model":"mock-model","text":"","audio_data":"a.wav","sampling_params":{"max_new_tokens":2}}"#,
         ] {
             let (status, _, body) = post(&app, "/generate", "application/json", served).await;

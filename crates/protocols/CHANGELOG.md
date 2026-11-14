@@ -100,8 +100,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   The message reaches a client on both routes that read it: the chat-family Responses conversion
   (`400 unsupported_content_part`) and the Harmony builder's tool message
   (`400 harmony_build_failed`).
-- The generate route's request rule refuses an empty `text` under `prompt_empty` only when no media
-  field carries an item (a media-only prompt is sent with an empty `text`, as the engine reads it);
+- The generate route's request rule refuses an empty `text` under `prompt_empty` only when the body
+  has no `input_ids` and no media field carries an item (beside ids the engine serves the ids without
+  reading the text; a media-only prompt is sent with an empty `text`, as the engine reads it);
   a body with two prompts (two of `text`, `input_ids` and `input_embeds`) is served, the engine
   taking the ids over the text (and the embeds only without a text), and the gateway's gRPC
   generate path now reads the ids before the text too, where it read the text first and dropped

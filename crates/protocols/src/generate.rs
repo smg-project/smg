@@ -223,12 +223,13 @@ impl Normalizable for GenerateRequest {
 }
 
 /// Validation function for GenerateRequest: a body with no prompt at all is
-/// refused, an empty `text` with no media item is refused (a media-only prompt
-/// is sent with an empty `text`, as the engine reads it; a body with two of
-/// `text`, `input_ids` and `input_embeds` is served, the engine takes the
-/// embeds, then the ids, then the text), an empty `input_ids` is refused as
-/// the chat route refuses an empty `messages`, and a negative id in
-/// `input_ids` is refused.
+/// refused, an empty `text` with no ids and no media item is refused (beside
+/// ids the engine serves the ids without reading the text; a media-only
+/// prompt is sent with an empty `text`, as the engine reads it; a body with
+/// two of `text`, `input_ids` and `input_embeds` is served, the engine taking
+/// the ids over the text and the embeds only without a text), an empty
+/// `input_ids` is refused as the chat route refuses an empty `messages`, and
+/// a negative id in `input_ids` is refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
     // A body with no prompt at all is refused. `input_embeds` is a prompt on
     // the paths that forward the body as-is.
@@ -238,10 +239,12 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
             "One of 'text', 'input_ids' or 'input_embeds' is required.",
         ));
     }
-    // An empty text with no media is no prompt, as the completions route
-    // reads an empty prompt: the same refusal. With a media item it is the
-    // media-only prompt, sent with an empty text as the engine reads it.
-    if req.text.as_deref() == Some("") && !req.carries_media() {
+    // An empty text with no ids and no media is no prompt, as the completions
+    // route reads an empty prompt: the same refusal. Beside ids the engine
+    // serves the ids without reading the text; beside a media item it is the
+    // media-only prompt, sent with an empty text as the engine reads it. The
+    // embeds rescue nothing: with a text present the engine drops them.
+    if req.text.as_deref() == Some("") && req.input_ids.is_none() && !req.carries_media() {
         return Err(invalid_at(
             "text",
             "prompt_empty",
@@ -628,12 +631,14 @@ mod tests {
         assert_eq!(found[0].params["field"], "input_ids");
     }
 
-    /// One prompt per request: a body with `text`, `input_ids` or
-    /// `input_embeds` alone passes, as does a body with two prompts (the
-    /// engine takes the embeds, then the ids, then the text) and an empty
-    /// `text` beside a media item (the media-only prompt); an empty `text`
-    /// alone is refused under `text`, a body with no prompt at all as a rule
-    /// over the request, and a cross-field sampling rule names its field.
+    /// A body with `text`, `input_ids` or `input_embeds` alone passes, as does
+    /// a body with two prompts (the engine taking the ids over the text and
+    /// the embeds only without a text), an empty `text` beside ids (served
+    /// from the ids) and an empty `text` beside a media item (the media-only
+    /// prompt); an empty `text` alone or beside embeds alone is refused under
+    /// `text`, an empty `input_ids` beside an empty `text` under `input_ids`,
+    /// a body with no prompt at all as a rule over the request, and a
+    /// cross-field sampling rule names its field.
     #[test]
     fn a_generate_request_is_refused_without_a_prompt_or_with_an_empty_text() {
         use validator::ValidationErrorsKind;
@@ -646,6 +651,7 @@ mod tests {
             serde_json::json!({"model": "m", "input_ids": [1, 2]}),
             serde_json::json!({"model": "m", "input_embeds": [[0.1, 0.2]]}),
             serde_json::json!({"model": "m", "text": "hi", "input_ids": [1, 2]}),
+            serde_json::json!({"model": "m", "text": "", "input_ids": [1, 2]}),
             serde_json::json!({"model": "m", "text": "", "audio_data": "a.wav"}),
             serde_json::json!({"model": "m", "text": "", "image_data": [[null, "a.png"]]}),
         ] {
@@ -661,6 +667,16 @@ mod tests {
                 serde_json::json!({"model": "m", "text": "", "audio_data": [null, []]}),
                 "text",
                 "prompt_empty",
+            ),
+            (
+                serde_json::json!({"model": "m", "text": "", "input_embeds": [[0.1, 0.2]]}),
+                "text",
+                "prompt_empty",
+            ),
+            (
+                serde_json::json!({"model": "m", "text": "", "input_ids": []}),
+                "input_ids",
+                "empty_array",
             ),
         ] {
             let errors = request(body.clone()).validate().expect_err("refused");
