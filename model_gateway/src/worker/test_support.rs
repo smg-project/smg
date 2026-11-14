@@ -18,9 +18,9 @@ use openai_protocol::{
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
 use tokio::net::TcpSocket;
 
-use crate::worker::{
-    prefill_admission::{PrefillAdmissionAttempt, PrefillSelectionContext},
-    BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry,
+use crate::{
+    routers::common::prefill_admission::{PrefillAdmissionAttempt, PrefillSelectionContext},
+    worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry},
 };
 
 /// The health checker disabled, everything else default: a test's worker
