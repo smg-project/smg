@@ -23,6 +23,7 @@ use openai_protocol::{
     },
     responses::{ResponseTool, ResponsesRequest},
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use smg_mcp::{McpOrchestrator, McpServerBinding, McpToolSession};
 use tokio_stream::wrappers::ReceiverStream;
@@ -53,8 +54,8 @@ use crate::{
     openai::{
         context::{RequestContext, StreamingEventContext, StreamingRequest},
         mcp::{
-            build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-            mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions, retained_output_items,
+            execute_streaming_tool_calls, inject_mcp_metadata_last, inject_mcp_metadata_streaming,
+            prepare_mcp_tools_as_functions, resume_payload_in_place, retained_output_items,
             send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
             StreamingToolHandler, ToolLoopState, TOOL_CALL_LIMIT_REASON,
         },
@@ -553,7 +554,7 @@ pub(super) async fn send_final_response_event(
     tx: &SseSender,
     enc: &mut SseEncoder,
     sequence_number: &mut u64,
-    state: &ToolLoopState,
+    state: &mut ToolLoopState,
     ctx: &StreamingEventContext<'_>,
     end: ToolLoopEnd,
 ) -> bool {
@@ -593,12 +594,13 @@ pub(super) async fn send_final_response_event(
         end_at_tool_call_limit(&mut final_response, ctx.original_request);
     }
 
-    let completed_payload = json!({
-        "type": ResponseEvent::COMPLETED,
-        "sequence_number": *sequence_number,
-        "response": final_response
-    });
+    let sequence = *sequence_number;
     *sequence_number += 1;
+    let completed_payload = CompletedEventPayload {
+        event_type: ResponseEvent::COMPLETED,
+        sequence_number: sequence,
+        response: &final_response,
+    };
 
     match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
         Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
@@ -607,11 +609,26 @@ pub(super) async fn send_final_response_event(
             let completed_event = format!(
                 "event: {}\ndata: {}\n\n",
                 ResponseEvent::COMPLETED,
-                completed_payload
+                json!({
+                    "type": ResponseEvent::COMPLETED,
+                    "sequence_number": sequence,
+                    "response": final_response
+                })
             );
             tx.send(Ok(Bytes::from(completed_event))).await.is_ok()
         }
     }
+}
+
+/// The `response.completed` event's payload, serialised onto the wire from
+/// the final response where it stands; `json!` would copy the whole response,
+/// its `mcp_list_tools` schemas included, into the event first.
+#[derive(Serialize)]
+struct CompletedEventPayload<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    sequence_number: u64,
+    response: &'a Value,
 }
 
 /// Simple pass-through streaming without MCP interception
@@ -791,9 +808,9 @@ struct RelayFlags {
 
 /// Relays one upstream event stream to the client: every block goes through
 /// the handler and is forwarded, buffered or dropped as it says; the MCP
-/// list-tools items go out at the first `in_progress` of the first stream
-/// (the bindings exist only with a session, [`StreamingEventContext::session`]);
-/// a tool-call trigger ends the relay with the calls pending in the handler.
+/// list-tools items (the loop's, built once with its session; none without
+/// one) go out at the first `in_progress` of the first stream; a tool-call
+/// trigger ends the relay with the calls pending in the handler.
 #[expect(
     clippy::too_many_arguments,
     reason = "The relay reads the loop's client side as the loop's own text did (the sender, the encoder, the sequence number) beside the handler and its two flags; a struct for one call would be a type the loop's other phases do not share."
@@ -802,7 +819,7 @@ async fn relay_upstream_stream(
     upstream_stream: &mut (impl Stream<Item = reqwest::Result<Bytes>> + Unpin),
     handler: &mut StreamingToolHandler,
     flags: &mut RelayFlags,
-    list_tools_bindings: &[(String, String)],
+    list_tools_items: &[Value],
     tx: &SseSender,
     sse_encoder: &mut SseEncoder,
     streaming_ctx: &StreamingEventContext<'_>,
@@ -878,23 +895,20 @@ async fn relay_upstream_stream(
                             if is_in_progress {
                                 seen_in_progress = true;
                                 if !flags.mcp_list_tools_sent {
-                                    if let Some(session) = streaming_ctx.session {
-                                        for (server_label, server_key) in list_tools_bindings {
-                                            let list_tools_index =
-                                                handler.allocate_synthetic_output_index();
-                                            if !send_mcp_list_tools_events(
-                                                tx,
-                                                session,
-                                                server_label,
-                                                list_tools_index,
-                                                sequence_number,
-                                                server_key,
-                                            )
-                                            .await
-                                            {
-                                                // Client disconnected
-                                                return RelayEnd::Stopped;
-                                            }
+                                    for item in list_tools_items {
+                                        let list_tools_index =
+                                            handler.allocate_synthetic_output_index();
+                                        if !send_mcp_list_tools_events(
+                                            tx,
+                                            sse_encoder,
+                                            item,
+                                            list_tools_index,
+                                            sequence_number,
+                                        )
+                                        .await
+                                        {
+                                            // Client disconnected
+                                            return RelayEnd::Stopped;
                                         }
                                     }
                                     flags.mcp_list_tools_sent = true;
@@ -1010,8 +1024,6 @@ pub(super) fn handle_streaming_with_tool_interception(
         );
         let mut current_payload = payload_clone;
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
-        let tools_json = current_payload.get("tools").cloned().unwrap_or(json!([]));
-        let base_payload = current_payload.clone();
         let mut flags = RelayFlags {
             first_iteration: true,
             mcp_list_tools_sent: false,
@@ -1020,10 +1032,6 @@ pub(super) fn handle_streaming_with_tool_interception(
         let mut sse_encoder = SseEncoder::new();
         let mut next_output_index: usize = 0;
         let mut preserved_response_id: Option<String> = None;
-        let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-            &state.existing_mcp_list_tools_labels,
-            session.mcp_servers(),
-        );
 
         let streaming_ctx = StreamingEventContext {
             original_request: &original_request,
@@ -1076,7 +1084,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 &mut upstream_stream,
                 &mut handler,
                 &mut flags,
-                &list_tools_bindings,
+                state.mcp_list_tools_items(&session),
                 &tx,
                 &mut sse_encoder,
                 &streaming_ctx,
@@ -1159,15 +1167,10 @@ pub(super) fn handle_streaming_with_tool_interception(
                 break (handler, ToolLoopEnd::ToolCallLimit);
             }
 
-            // Build resume payload
-            match build_resume_payload(
-                &base_payload,
-                &state.conversation_history,
-                &tools_json,
-                true, // is_streaming = true
-            ) {
-                Ok(resume_payload) => {
-                    current_payload = resume_payload;
+            // The next turn's payload: this one, the calls just executed
+            // appended
+            match resume_payload_in_place(&mut current_payload, state.history_to_append(), true) {
+                Ok(()) => {
                     flags.first_iteration = false;
                 }
                 Err(e) => {
@@ -1192,7 +1195,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             &tx,
             &mut sse_encoder,
             &mut sequence_number,
-            &state,
+            &mut state,
             &streaming_ctx,
             end,
         )
@@ -1213,7 +1216,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                     obj.insert("id".to_string(), Value::String(id.clone()));
                 }
             }
-            inject_mcp_metadata_streaming(&mut response_json, &state, &session);
+            inject_mcp_metadata_last(&mut response_json, &mut state, &session);
 
             restore_original_tools(&mut response_json, &original_request, Some(&session));
             patch_response_with_request_metadata(
@@ -1346,7 +1349,7 @@ mod tests {
             session: None,
             mcp_format_registry: None,
         };
-        let state = ToolLoopState::new(Vec::new());
+        let mut state = ToolLoopState::new(Vec::new());
         let mut handler = StreamingToolHandler::with_starting_index(0);
         handler.accumulator.ingest_block(
             "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\
@@ -1365,7 +1368,7 @@ mod tests {
                     &tx,
                     &mut enc,
                     &mut sequence_number,
-                    &state,
+                    &mut state,
                     &ctx,
                     end,
                 )
