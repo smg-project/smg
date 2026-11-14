@@ -390,12 +390,15 @@ impl PolicyRegistry {
     /// stage that reads an input this host does not feed a document on this
     /// base (the prefix index, a ring), refused by its profile, stage and
     /// input instead of applied to score nothing (the decider's
-    /// `fed_as_a_document`). From the apply on nothing but the document
-    /// chooses a policy: no worker's `policy` label is read
-    /// ([`Self::on_worker_added`]).
+    /// `fed_as_a_document`), and one with a binding's overload block that
+    /// asks for anything, refused by its field: the overload veto stays the
+    /// host's flags (`overload_blocks_ask_nothing`). From the apply on
+    /// nothing but the document chooses a policy: no worker's `policy` label
+    /// is read ([`Self::on_worker_added`]).
     pub fn with_policy_spec(mut self, spec: &PolicySpec) -> Result<Self, EngineHostError> {
         let decider = Decider::from_spec(spec)?;
         decider.fed_as_a_document()?;
+        overload_blocks_ask_nothing(spec)?;
         let headers = session_headers_of(spec)?;
         if !headers.is_empty() {
             self.routing_key_headers = Arc::new(headers);
@@ -1511,6 +1514,41 @@ impl std::fmt::Debug for PolicyRegistry {
             )
             .finish()
     }
+}
+
+/// A binding's overload block is not read on this release: the overload
+/// veto, its two thresholds and the shed are the host's own flags, under a
+/// document as without one. A block that asks for anything is refused by its
+/// first such field (the veto off, a threshold written, the shed on) instead
+/// of accepted and never obeyed. A threshold is refused whatever its number,
+/// its default too: the host's flag may hold another. A switch at its
+/// default states nothing, the host's flag decides it, so a block with no
+/// threshold and both switches at their defaults reads as absent. The block
+/// is taken apart by field, so a field the crate adds stops the build here.
+fn overload_blocks_ask_nothing(spec: &PolicySpec) -> Result<(), EngineHostError> {
+    use smg_policy_controller::spec::OverloadSpec;
+
+    for (binding, bound) in spec.bindings.iter().enumerate() {
+        let Some(OverloadSpec {
+            enabled,
+            waiting_requests,
+            token_usage,
+            shed_when_all_vetoed,
+        }) = &bound.overload
+        else {
+            continue;
+        };
+        let asked = [
+            (!*enabled, "enabled"),
+            (waiting_requests.is_some(), "waiting_requests"),
+            (token_usage.is_some(), "token_usage"),
+            (*shed_when_all_vetoed, "shed_when_all_vetoed"),
+        ];
+        if let Some((_, field)) = asked.into_iter().find(|(asks, _)| *asks) {
+            return Err(EngineHostError::Overload { binding, field });
+        }
+    }
+    Ok(())
 }
 
 /// The headers a document's bindings read a session key from, in their
@@ -3786,6 +3824,49 @@ mod tests {
             registry.engine_for(policy.as_ref()).is_some(),
             "the document decides the labelled model"
         );
+    }
+
+    /// A binding's overload block is not read on this release, so one that
+    /// asks for anything is refused by its field: the veto off, a threshold
+    /// written (at the default number too: the host's flag may hold another),
+    /// the shed on, on whichever binding it stands. A block with every field
+    /// at its default asks for nothing and the document is applied.
+    #[test]
+    fn with_policy_spec_refuses_an_overload_block_that_asks_for_anything() {
+        let apply = |binding: usize, block: &str| {
+            let mut spec = PolicySpec::preset("round_robin").expect("a preset document");
+            let mut named = spec.bindings[0].clone();
+            named.matcher.model = "model-a".to_string();
+            spec.bindings.insert(0, named);
+            spec.bindings[binding].overload =
+                Some(serde_json::from_str(block).expect("an overload block"));
+            PolicyRegistry::new(PolicyConfig::Random)
+                .with_policy_spec(&spec)
+                .map(drop)
+                .map_err(|error| error.to_string())
+        };
+        for (binding, block, field) in [
+            (0, r#"{"enabled":false}"#, "enabled"),
+            (0, r#"{"waiting_requests":64}"#, "waiting_requests"),
+            (0, r#"{"waiting_requests":8}"#, "waiting_requests"),
+            (0, r#"{"token_usage":0.95}"#, "token_usage"),
+            (0, r#"{"token_usage":0.8}"#, "token_usage"),
+            (
+                0,
+                r#"{"shed_when_all_vetoed":true}"#,
+                "shed_when_all_vetoed",
+            ),
+            (1, r#"{"enabled":false,"waiting_requests":64}"#, "enabled"),
+        ] {
+            assert_eq!(
+                apply(binding, block).expect_err("a block that asks is refused"),
+                format!("bindings[{binding}].overload.{field}: a binding's overload block is not read on this release; the overload veto is taken from the gateway's worker-overload flags"),
+                "{block}"
+            );
+        }
+        for block in ["{}", r#"{"enabled":true,"shed_when_all_vetoed":false}"#] {
+            assert_eq!(apply(0, block), Ok(()), "{block}");
+        }
     }
 
     /// Under a document whose binding keeps sessions, the registry resolves

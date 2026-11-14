@@ -128,6 +128,11 @@ pub enum EngineHostError {
         second: String,
         second_mean: u32,
     },
+    /// A binding's overload block that asks for anything: the overload veto,
+    /// its thresholds and the shed are the host's own flags on this release,
+    /// and no line reads a block.
+    #[error("bindings[{binding}].overload.{field}: a binding's overload block is not read on this release; the overload veto is taken from the gateway's worker-overload flags")]
+    Overload { binding: usize, field: &'static str },
     #[error(transparent)]
     Spec(#[from] SpecError),
 }
