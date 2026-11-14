@@ -7,7 +7,7 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 
-use crate::app_context::AppContext;
+use crate::{app_context::AppContext, server::http_client, worker::WorkerRegistry};
 
 /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
 /// accepted and queued but never processed, so tests observe what discovery
@@ -22,11 +22,7 @@ pub(crate) fn create_test_app_context() -> Arc<AppContext> {
 
     // Note: Using uninitialized queue for tests to avoid spawning background workers
     // Jobs submitted during tests will queue but not be processed
-    app_context_for_tests(
-        router_config,
-        Arc::new(crate::worker::WorkerRegistry::new()),
-        None,
-    )
+    app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
 }
 
 /// An `AppContext` whose jobs run: a live job queue and workflow engines, so
@@ -45,7 +41,6 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
     use crate::{
         config::{HealthCheckConfig, PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
-        worker::WorkerRegistry,
         workflow::{JobQueue, JobQueueConfig, WorkflowEngines},
     };
 
@@ -64,7 +59,7 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
     let context = Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::server::http_client())
+            .client(http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))

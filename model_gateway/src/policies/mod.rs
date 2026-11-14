@@ -9,7 +9,7 @@ use rand::RngExt as _;
 
 use crate::{
     config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
+    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker, UNKNOWN_MODEL_ID},
 };
 
 mod bucket;
@@ -18,9 +18,7 @@ mod cache_namespace;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
-pub mod engine_host;
 mod factory;
-pub mod host_stores;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -38,7 +36,6 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
-pub use engine_host::Decider;
 pub use factory::PolicyFactory;
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
@@ -405,7 +402,7 @@ pub(crate) fn draw_eligible(
 #[inline]
 pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     if model_id.is_empty() {
-        crate::worker::UNKNOWN_MODEL_ID
+        UNKNOWN_MODEL_ID
     } else {
         model_id
     }
@@ -500,7 +497,8 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerType,
+        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerLoadGuard,
+        WorkerType,
     };
 
     #[test]
@@ -598,7 +596,7 @@ mod tests {
         );
 
         // A busy worker is still eligible: load alone is not the veto.
-        let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        let _guard = WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
         assert_eq!(
             get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
             vec![0, 1, 2]

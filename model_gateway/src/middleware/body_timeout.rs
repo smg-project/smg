@@ -348,7 +348,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{super::request_start::RequestStarted, *};
-    use crate::middleware::test_support::{echo_request, echo_route, json_of, ECHO_PATH};
+    use crate::middleware::{
+        test_support::{echo_request, echo_route, json_of, ECHO_PATH},
+        RequestBodyLimitLayer,
+    };
 
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()
@@ -528,7 +531,7 @@ mod tests {
     /// more, past where the extractors look for it.
     #[tokio::test(start_paused = true)]
     async fn a_body_over_the_payload_limit_is_413_request_body_too_large() {
-        let app = app(timeouts(5, 60)).layer(crate::middleware::RequestBodyLimitLayer::new(8));
+        let app = app(timeouts(5, 60)).layer(RequestBodyLimitLayer::new(8));
         let response = app
             .oneshot(echo_request(Body::from("more than eight bytes")))
             .await
