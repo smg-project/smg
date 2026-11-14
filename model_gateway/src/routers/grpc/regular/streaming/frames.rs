@@ -408,8 +408,9 @@ impl EscapedText {
 /// `model` and `system_fingerprint`; only its choice differs, and it sits
 /// between them. The head up to and including `"choices":[` and the tail
 /// from `]` to the end of the event are serialized once per stream and
-/// copied around each chunk's choice, so a chunk costs the serialization of
-/// its choice only. The bytes are exactly those of a serialized
+/// copied around each chunk's choice, which is written in one pass
+/// ([`Self::write_chunk`]), so a chunk costs its own bytes only. The bytes
+/// are exactly those of a serialized
 /// [`openai_protocol::completion::CompletionStreamResponse`] whose `usage` is
 /// `None` (a per-token chunk never carries the counts), except that a stream
 /// that asks for usage writes `"usage":null` last, where serde writes
@@ -448,11 +449,13 @@ impl CompletionChunkFrame {
         Self { head, tail }
     }
 
-    /// Append `data: {...}\n\n` for `choice` to `buffer`.
+    /// Append `data: {...}\n\n` for `choice` to `buffer`: the choice through
+    /// [`Self::write_choice`] between the head and the tail; a choice that
+    /// failed to serialize leaves an error event in its place.
     pub(super) fn write_chunk(&self, buffer: &mut BytesMut, choice: &CompletionStreamChoice) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
-        match serde_json::to_writer(FrameSink(buffer), choice) {
+        match Self::write_choice(buffer, choice) {
             Ok(()) => buffer.extend_from_slice(&self.tail),
             Err(e) => {
                 error!("Failed to serialize completion SSE chunk: {}", e);
@@ -469,6 +472,46 @@ impl CompletionChunkFrame {
                 buffer.extend_from_slice(b"\n\n");
             }
         }
+    }
+
+    /// Append the choice's JSON object to `buffer`: the bytes serde writes
+    /// for the struct, its keys and brackets as literals and its values
+    /// through the calls serde makes for them (the text escaped, the index in
+    /// decimal, the logprobs and the finish reason where the derive writes
+    /// them and `null` where they are absent). Walked as a struct, the choice
+    /// cost an escape scan and three writes per key on every chunk, four keys
+    /// a token around the text and the index. Pinned against the serialized
+    /// struct by `tests::chunk_frames_write_the_bytes_of_the_whole_structs`.
+    fn write_choice(
+        buffer: &mut BytesMut,
+        choice: &CompletionStreamChoice,
+    ) -> serde_json::Result<()> {
+        // Matched field by field with no rest pattern, so a field added to the
+        // choice is a compile error here until this write says where it goes.
+        let CompletionStreamChoice {
+            text,
+            index,
+            logprobs,
+            finish_reason,
+        } = choice;
+        buffer.extend_from_slice(b"{\"text\":");
+        push_json(FrameSink(buffer), text);
+        buffer.extend_from_slice(b",\"index\":");
+        push_json(FrameSink(buffer), index);
+        buffer.extend_from_slice(b",\"logprobs\":");
+        match logprobs {
+            // The logprobs' `Serialize` lives in another crate, so their write
+            // keeps the fallible path rather than the infallible one.
+            Some(logprobs) => serde_json::to_writer(FrameSink(buffer), logprobs)?,
+            None => buffer.extend_from_slice(b"null"),
+        }
+        buffer.extend_from_slice(b",\"finish_reason\":");
+        match finish_reason {
+            Some(finish_reason) => push_json(FrameSink(buffer), finish_reason),
+            None => buffer.extend_from_slice(b"null"),
+        }
+        buffer.extend_from_slice(b"}");
+        Ok(())
     }
 }
 
