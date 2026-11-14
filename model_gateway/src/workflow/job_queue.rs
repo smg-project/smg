@@ -266,11 +266,11 @@ impl std::fmt::Debug for JobQueue {
 /// ([`JobQueue::submit_or_defer`]): at most one removal and one job of any
 /// other kind, the latest of the other kind and one removal for all the
 /// removals kept (`place` merges their pins). The removal runs first: a
-/// refresh kept
-/// beside it would refresh what the removal takes out, and when the removal
-/// leaves its worker standing (a guarded removal that skipped a worker
-/// registered since its `DELETE`) the refresh runs after it, so neither a
-/// `DELETE` nor a worker's one refresh is lost to the other.
+/// refresh kept beside it would refresh what the removal takes out, and
+/// when the removal leaves its worker standing (a guarded removal that
+/// skipped a worker registered since its `DELETE`) the refresh runs after
+/// it, so neither a `DELETE` nor a worker's one refresh is lost to the
+/// other.
 #[derive(Default)]
 struct Kept {
     removal: Option<Job>,
@@ -549,16 +549,17 @@ impl JobQueue {
 
     /// `submit_unless_in_flight` for a submission that must not be lost: a
     /// job that finds another of any type in flight under its URL is kept
-    /// (one of each kind per URL, the latest removal and the latest of any
-    /// other kind, `keep`) and run by that job's completion (`run_kept`),
-    /// after it and never beside it, the removal first. Returns `Ok(false)`
-    /// for a kept job. A job still kept once nothing is in flight (the holder
-    /// ended between the claim and the keeping, its completion finding
-    /// nothing) is this call's to submit, in the run order: the type is read
-    /// per iteration, as the job taken back may be of the other kind, a job
-    /// taken back and refused again goes back behind a newer one of its kind
-    /// (`put_back`, as the runner does), and `Ok(true)` says this call's own
-    /// job was submitted.
+    /// (one of each kind per URL: one removal carrying the merged pins of
+    /// every removal kept, and the latest of any other kind, `keep`) and run
+    /// by that job's completion (`run_kept`), after it and never beside it,
+    /// the removal first. Returns `Ok(false)` for a kept job. A job still
+    /// kept once nothing is in flight (the holder ended between the claim and
+    /// the keeping, its completion finding nothing) is this call's to submit,
+    /// in the run order: the type is read per iteration, as the job taken
+    /// back may be of the other kind, a job taken back and refused again goes
+    /// back to its slot (`put_back`, as the runner does: a removal merging
+    /// with one kept since, another kind yielding to a newer one), and
+    /// `Ok(true)` says this call's own job was submitted.
     pub async fn submit_or_defer(&self, mut job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
         let own_kind_is_removal = matches!(job, Job::RemoveWorker { .. });
@@ -626,8 +627,9 @@ impl JobQueue {
     /// heels of the job that held the URL (the removal first), on its task
     /// and under their own status; a job queued for the URL in the meantime
     /// holds it first, and its completion runs the kept ones, a job whose
-    /// claim is refused going back to its slot behind any job of its kind
-    /// kept since (`put_back`). Nothing waits on a kept job's outcome.
+    /// claim is refused going back to its slot (`put_back`: a removal merges
+    /// with one kept since, another kind yields to a newer one). Nothing
+    /// waits on a kept job's outcome.
     async fn run_kept(
         worker_url: &str,
         context: &Arc<AppContext>,
@@ -2715,7 +2717,14 @@ mod tests {
             "an empty slot takes the job back"
         );
 
-        JobQueue::put_back(&kept, url, removal());
+        JobQueue::put_back(
+            &kept,
+            url,
+            Job::RemoveWorker {
+                url: url.to_string(),
+                expected_revisions: Some(HashMap::new()),
+            },
+        );
         assert_eq!(
             kinds(&kept),
             (Some("RemoveWorker"), Some("RefreshWorkerLabels")),
