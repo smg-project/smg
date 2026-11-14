@@ -761,7 +761,10 @@ async fn the_manifest_format_exports_the_registered_fleet() {
 mod pending_registration_tests {
     use std::{sync::Arc, time::Duration};
 
-    use smg::{config::RouterConfig, routers::http::router::Router as HttpRouter};
+    use smg::{
+        config::RouterConfig, routers::http::router::Router as HttpRouter,
+        worker::test_support::RefusedAddress,
+    };
     use wfaas::{StateStore, StepId, StepStatus};
 
     use super::*;
@@ -770,14 +773,6 @@ mod pending_registration_tests {
         mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
         test_app::create_test_app_with_context,
     };
-
-    /// A loopback port nothing listens on: bound once to learn it, then closed.
-    fn closed_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("a loopback port")
-            .port()
-    }
 
     /// `GET /workers/{id}` until `settled` holds of its answer or `wait` runs
     /// out: the last answer.
@@ -816,7 +811,10 @@ mod pending_registration_tests {
             .get()
             .expect("the harness starts the engines")
             .worker_registration;
-        let url = format!("http://127.0.0.1:{}", closed_port());
+        // The engine's address, refused for the whole case: no other test of
+        // the binary can be handed the port and answer in its place.
+        let closed = RefusedAddress::reserve();
+        let url = closed.http_url();
 
         let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -958,7 +956,10 @@ mod pending_registration_tests {
             .get()
             .expect("the harness starts the engines")
             .worker_registration;
-        let url = format!("http://127.0.0.1:{}", closed_port());
+        // The engine's address, refused for the whole case: no other test of
+        // the binary can be handed the port and answer in its place.
+        let closed = RefusedAddress::reserve();
+        let url = closed.http_url();
 
         let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -1026,8 +1027,12 @@ mod pending_registration_tests {
             .get()
             .expect("the harness starts the engines")
             .worker_registration;
-        let port = closed_port();
-        let url = format!("http://127.0.0.1:{port}");
+        // The engine's address, refused until the engine comes up on it: the
+        // port is held from here on, so no other test of the binary can be
+        // handed it.
+        let closed = RefusedAddress::reserve();
+        let port = closed.port();
+        let url = closed.http_url();
 
         let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -1060,7 +1065,8 @@ mod pending_registration_tests {
         }
         assert!(retrying, "the registration's probe waits out its interval");
 
-        // The engine comes up on that port, in time for the next attempt.
+        // The engine comes up on that port, on the held socket itself, in
+        // time for the next attempt.
         let mut mock = MockWorker::new(MockWorkerConfig {
             port,
             worker_type: WorkerType::Regular,
@@ -1068,7 +1074,10 @@ mod pending_registration_tests {
             response_delay_ms: 0,
             fail_rate: 0.0,
         });
-        let served = mock.start().await.expect("the mock engine starts");
+        let served = mock
+            .start_on(closed.listen())
+            .await
+            .expect("the mock engine starts");
         assert_eq!(served, url, "the mock engine took the registration's port");
 
         let (status, body) = send(&app, "DELETE", &format!("/workers/{id}"), None).await;
