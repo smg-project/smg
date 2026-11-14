@@ -15,6 +15,7 @@
 //! - `get_by_name(name)`: Exact name match only
 //! - `remove(name)`: Removes by name
 //! - `remove_by_id(id)`: Removes by ID
+//! - `remove_if_id(name, id)`: Removes by name while the name maps to that ID
 
 use std::sync::Arc;
 
@@ -96,7 +97,20 @@ pub struct TokenizerRegistry {
 }
 
 /// RAII guard that removes the loading lock entry on drop.
-/// Ensures cleanup happens on normal completion, early return, or panic.
+/// Ensures cleanup happens on normal completion, early return, cancellation
+/// or panic.
+///
+/// The entry stays while another load holds a reference to the lock (a
+/// waiter, or a holder whose own reference is not yet gone): the waiter
+/// takes the mutex next, a load that arrives meanwhile (a failed load's
+/// retry) joins the same lock instead of making a second one, so two loads
+/// of one name never run together and publish two entries under it, and
+/// the last load out removes the entry. Declared before the mutex guard in
+/// [`TokenizerRegistry::load`] and so dropped after it (and after the
+/// pending lock future of a load cancelled while it waits), the guard
+/// counts once this load's own reference is gone and removes the entry when
+/// the map's reference is the last; `remove_if` and `entry` take the same
+/// shard lock, so no clone slips in between the count and the removal.
 struct LoadingLockGuard<'a> {
     locks: &'a DashMap<String, Arc<Mutex<()>>>,
     key: String,
@@ -104,7 +118,8 @@ struct LoadingLockGuard<'a> {
 
 impl Drop for LoadingLockGuard<'_> {
     fn drop(&mut self) {
-        self.locks.remove(&self.key);
+        self.locks
+            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
     }
 }
 
@@ -174,11 +189,16 @@ impl TokenizerRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
-        let _mutex_guard = lock.lock().await;
+        // Declared before the mutex guard and so dropped after it (and after
+        // the pending lock future of a load cancelled while it waits): each
+        // load counts once its own reference is gone, and the last one out
+        // removes the entry.
         let _lock_cleanup = LoadingLockGuard {
             locks: &self.loading_locks,
             key: name.to_string(),
         };
+        // The mutex guard owns this load's reference to the lock.
+        let _mutex_guard = lock.lock_owned().await;
 
         // Double-check after acquiring lock (another thread may have loaded it)
         if let Some(existing_id) = self.name_to_id.get(name) {
@@ -315,14 +335,44 @@ impl TokenizerRegistry {
 
     /// Remove a tokenizer by ID
     ///
-    /// Returns the entry if it was present.
+    /// Through the name's publication, as [`Self::remove_if_id`], while the
+    /// name maps to this ID: the name goes first, then the entry. An entry
+    /// whose name is published under another ID is no name's (a removal by
+    /// name between its two steps, or two loads of the name that once ran
+    /// together) and goes by its ID alone, the name staying that other
+    /// entry's: that publication is held read-locked through the removal,
+    /// so a removal of the other entry by name or a put-back of this one
+    /// under its ID waits on it and no name is left mapping to a removed
+    /// entry. An entry `load` has stored and not yet published is not
+    /// taken, so a name never outlives its entry. Returns the entry if it
+    /// was taken.
     pub fn remove_by_id(&self, id: &str) -> Option<TokenizerEntry> {
-        if let Some((_, entry)) = self.tokenizers.remove(id) {
-            self.name_to_id.remove(&entry.name);
-            Some(entry)
-        } else {
-            None
+        let name = self.tokenizers.get(id)?.name.clone();
+        if let Some(entry) = self.remove_if_id(&name, id) {
+            return Some(entry);
         }
+        // The publication stays held (the name's shard read-locked) until
+        // the removal below is done: the name first, then the entry, the
+        // order `get` and `register` nest in too.
+        let published = self.name_to_id.get(&name)?;
+        if published.as_str() == id {
+            return None;
+        }
+        self.tokenizers.remove(id).map(|(_, entry)| entry)
+    }
+
+    /// Remove the tokenizer under `name` when it is the entry with `id`
+    ///
+    /// For a removal that read the entry under its name and acts later: the
+    /// name is taken first, and only while it maps to `id`, then the entry
+    /// under `id`. An entry `load` has stored and not yet published (no name
+    /// yet) is left alone, so is one that replaced the inspected entry under
+    /// the name (another ID), and a name never outlives the entry it maps to.
+    /// Returns the entry if it was taken.
+    pub fn remove_if_id(&self, name: &str, id: &str) -> Option<TokenizerEntry> {
+        self.name_to_id
+            .remove_if(name, |_, published| published == id)?;
+        self.tokenizers.remove(id).map(|(_, entry)| entry)
     }
 
     /// Remove a tokenizer by name
@@ -357,14 +407,17 @@ impl Default for TokenizerRegistry {
 )]
 mod tests {
     use std::{
+        future::Future,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
+        task::{Context, Waker},
         time::Duration,
     };
 
-    use tokio::time::sleep;
+    use dashmap::try_result::TryResult;
+    use tokio::{sync::oneshot, time::sleep};
 
     use crate::{mock::MockTokenizer, traits::Tokenizer, LoadError, TokenizerRegistry};
 
@@ -692,5 +745,337 @@ mod tests {
 
         assert!(!outcome.is_newly_loaded());
         assert_eq!(outcome.id(), id1); // Returns original ID
+    }
+
+    /// The removal by name and ID together, for a removal that read the
+    /// entry under its name and acts later: another ID under the name takes
+    /// nothing; the ID read goes with its name, and nothing of it stays.
+    #[tokio::test]
+    async fn test_remove_if_id() {
+        let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
+        registry
+            .load(&id, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+
+        let other = TokenizerRegistry::generate_id();
+        assert!(registry.remove_if_id("model1", &other).is_none());
+        assert_eq!(registry.get_by_name("model1").unwrap().id, id);
+
+        let removed = registry.remove_if_id("model1", &id).unwrap();
+        assert_eq!(removed.id, id);
+        assert!(!registry.contains("model1"));
+        assert!(!registry.contains_id(&id));
+        assert!(registry.is_empty());
+        assert!(registry.remove_if_id("model1", &id).is_none());
+    }
+
+    /// `load` stores the entry, then publishes its name: a removal by ID
+    /// between the two writes would take the stored entry and leave the
+    /// name, once published, mapping to nothing. The removal by name and ID
+    /// reads the publication and takes nothing until it is there.
+    #[tokio::test]
+    async fn test_remove_if_id_leaves_an_entry_not_yet_published() {
+        let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
+        registry
+            .load(&id, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        // The registry as `load` leaves it between its two writes.
+        let (_, published) = registry.name_to_id.remove("model1").unwrap();
+
+        assert!(registry.remove_if_id("model1", &id).is_none());
+        assert!(registry.contains_id(&id), "the stored entry is not taken");
+
+        // The publish lands whole.
+        registry.name_to_id.insert("model1".to_string(), published);
+        assert_eq!(registry.get_by_name("model1").unwrap().id, id);
+        assert_eq!(registry.remove_if_id("model1", &id).unwrap().id, id);
+        assert!(registry.is_empty());
+    }
+
+    /// A removal by ID (the operator's DELETE, the removal job) of an entry
+    /// whose name is published under another ID (a removal by name between
+    /// its two steps, or two loads of the name that once ran together): the
+    /// entry goes by its ID alone and the name keeps mapping to the
+    /// replacement.
+    #[tokio::test]
+    async fn test_remove_by_id_leaves_a_replacements_name() {
+        let registry = TokenizerRegistry::new();
+        let old = TokenizerRegistry::generate_id();
+        registry
+            .load(&old, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        // The registry as a release leaves it between its two steps (the
+        // name taken, the entry still stored) once a load has published a
+        // replacement under the name.
+        registry.name_to_id.remove("model1").unwrap();
+        let replacement = TokenizerRegistry::generate_id();
+        registry
+            .load(&replacement, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        assert!(registry.contains_id(&old));
+
+        // The removal by the old id takes the old entry alone: the name is
+        // the replacement's and stays so.
+        assert_eq!(registry.remove_by_id(&old).unwrap().id, old);
+        assert!(!registry.contains_id(&old));
+        assert_eq!(
+            registry.get_by_name("model1").unwrap().id,
+            replacement,
+            "the replacement keeps its name"
+        );
+        assert_eq!(registry.remove_by_id(&replacement).unwrap().id, replacement);
+        assert!(registry.is_empty());
+    }
+
+    /// `load` stores the entry, then publishes its name: a removal by ID
+    /// between the two writes takes nothing (the publication is not there),
+    /// so the publish lands whole and the next removal takes the entry.
+    #[tokio::test]
+    async fn test_remove_by_id_leaves_an_entry_not_yet_published() {
+        let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
+        registry
+            .load(&id, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        // The registry as `load` leaves it between its two writes.
+        let (_, published) = registry.name_to_id.remove("model1").unwrap();
+
+        assert!(registry.remove_by_id(&id).is_none());
+        assert!(registry.contains_id(&id), "the stored entry is not taken");
+
+        // The publish lands whole, and the removal takes the entry then.
+        registry.name_to_id.insert("model1".to_string(), published);
+        assert_eq!(registry.remove_by_id(&id).unwrap().id, id);
+        assert!(registry.is_empty());
+    }
+
+    /// Yields until the per-name lock under `name` has `clones` strong
+    /// references (the map's counted): the count the guard reads on drop.
+    async fn wait_for_lock_clones(registry: &TokenizerRegistry, name: &str, clones: usize) {
+        for _ in 0..10_000 {
+            let count = registry
+                .loading_locks
+                .get(name)
+                .map(|lock| Arc::strong_count(lock.value()));
+            if count == Some(clones) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the lock under {name} never reached {clones} references");
+    }
+
+    /// A load that fails while another waits on its per-name lock: the lock
+    /// stays for the waiter, the failed load's retry joins it behind the
+    /// waiter, and the name ends with one entry (the waiter's), the retry
+    /// answering with it, and no lock. A guard that removed the lock with a
+    /// waiter on it let the retry make a second lock and load beside the
+    /// waiter: both published, and the loser's entry stayed stored under an
+    /// ID its name no longer mapped to.
+    #[tokio::test]
+    async fn test_a_failed_loads_lock_stays_for_its_waiter() {
+        let registry = Arc::new(TokenizerRegistry::new());
+
+        // A holds the lock inside its loader until told to fail.
+        let (a_started_tx, a_started_rx) = oneshot::channel();
+        let (a_fail_tx, a_fail_rx) = oneshot::channel();
+        let a = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let id = TokenizerRegistry::generate_id();
+                registry
+                    .load(&id, "model1", "source1", || async move {
+                        a_started_tx.send(()).unwrap();
+                        a_fail_rx.await.unwrap();
+                        Err::<Arc<dyn Tokenizer>, String>("the source is down".to_string())
+                    })
+                    .await
+            })
+        };
+        a_started_rx.await.unwrap();
+
+        // B waits on A's lock.
+        let (b_started_tx, b_started_rx) = oneshot::channel();
+        let (b_finish_tx, b_finish_rx) = oneshot::channel();
+        let id_b = TokenizerRegistry::generate_id();
+        let b = {
+            let registry = registry.clone();
+            let id_b = id_b.clone();
+            tokio::spawn(async move {
+                registry
+                    .load(&id_b, "model1", "source1", || async move {
+                        b_started_tx.send(()).unwrap();
+                        b_finish_rx.await.unwrap();
+                        Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+                    })
+                    .await
+            })
+        };
+        wait_for_lock_clones(&registry, "model1", 3).await;
+
+        // A fails: the lock stays for B, which loads next.
+        a_fail_tx.send(()).unwrap();
+        assert!(matches!(a.await.unwrap(), Err(LoadError::LoadFailed(_))));
+        b_started_rx.await.unwrap();
+        assert!(
+            registry.loading_locks.contains_key("model1"),
+            "the lock stays for the waiter"
+        );
+
+        // C, A's retry, arrives while B loads: it joins B's lock and answers
+        // with B's entry once B has published.
+        let id_c = TokenizerRegistry::generate_id();
+        let c = {
+            let registry = registry.clone();
+            let id_c = id_c.clone();
+            tokio::spawn(async move {
+                registry
+                    .load(&id_c, "model1", "source1", || async {
+                        panic!("the retry loads nothing: the waiter's load publishes first");
+                    })
+                    .await
+            })
+        };
+        wait_for_lock_clones(&registry, "model1", 3).await;
+        b_finish_tx.send(()).unwrap();
+        assert!(b.await.unwrap().unwrap().is_newly_loaded());
+        let outcome = c.await.unwrap().unwrap();
+        assert!(!outcome.is_newly_loaded());
+        assert_eq!(outcome.id(), id_b);
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.get_by_name("model1").unwrap().id, id_b);
+        assert!(!registry.contains_id(&id_c));
+        assert!(
+            registry.loading_locks.is_empty(),
+            "the last load out removes the lock"
+        );
+    }
+
+    /// A removal by ID of an entry whose name is published under another ID
+    /// holds that publication read-locked through the removal: a removal of
+    /// the other entry by name and a put-back of this one under its ID wait
+    /// on it, so the entry removed is the one the publication was read
+    /// beside and no name is left mapping to a removed entry. Pinned by the
+    /// lock itself: with the old entry's shard held read, the removal parks
+    /// at its write, and while it is parked a write to the name's
+    /// publication is refused.
+    #[tokio::test]
+    async fn test_remove_by_id_holds_the_names_publication_through_the_removal() {
+        let registry = Arc::new(TokenizerRegistry::new());
+        let old = TokenizerRegistry::generate_id();
+        registry
+            .load(&old, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        // A release between its two steps, then a replacement published.
+        registry.name_to_id.remove("model1").unwrap();
+        let replacement = TokenizerRegistry::generate_id();
+        registry
+            .load(&replacement, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+
+        // The old entry's shard held read: the removal parks at its write.
+        let parked = registry.tokenizers.get(&old).unwrap();
+        let removal = {
+            let registry = registry.clone();
+            let old = old.clone();
+            tokio::task::spawn_blocking(move || registry.remove_by_id(&old))
+        };
+        // While it is parked, the name's publication is held: a write to it
+        // is refused, and stays refused (two reads a millisecond apart, so a
+        // passing write lock of the name-first step is not mistaken for it).
+        let mut refused = 0;
+        for _ in 0..5_000 {
+            if matches!(registry.name_to_id.try_get_mut("model1"), TryResult::Locked) {
+                refused += 1;
+                if refused == 2 {
+                    break;
+                }
+            } else {
+                refused = 0;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            refused, 2,
+            "the name's publication is not held through the removal"
+        );
+        drop(parked);
+        assert_eq!(removal.await.unwrap().unwrap().id, old);
+        assert!(!registry.contains_id(&old));
+        assert_eq!(registry.get_by_name("model1").unwrap().id, replacement);
+    }
+
+    /// A waiter cancelled before it takes the mutex (a registration step
+    /// that times out) leaves no lock behind: its reference goes with its
+    /// pending lock future, its guard counts after that, and the last load
+    /// out, whichever it is, removes the entry.
+    #[tokio::test]
+    async fn test_a_waiter_cancelled_before_the_mutex_leaves_no_lock() {
+        let registry = Arc::new(TokenizerRegistry::new());
+        let (a_started_tx, a_started_rx) = oneshot::channel();
+        let (a_finish_tx, a_finish_rx) = oneshot::channel();
+        let a = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let id = TokenizerRegistry::generate_id();
+                registry
+                    .load(&id, "model1", "source1", || async move {
+                        a_started_tx.send(()).unwrap();
+                        a_finish_rx.await.unwrap();
+                        Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+                    })
+                    .await
+            })
+        };
+        a_started_rx.await.unwrap();
+
+        // B, polled once by hand: it clones the lock and waits on the mutex.
+        let id_b = TokenizerRegistry::generate_id();
+        let mut b = Box::pin(registry.load(&id_b, "model1", "source1", || async {
+            panic!("the cancelled waiter loads nothing");
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        wait_for_lock_clones(&registry, "model1", 3).await;
+
+        // A publishes and leaves: the entry stays for the waiter.
+        a_finish_tx.send(()).unwrap();
+        assert!(a.await.unwrap().unwrap().is_newly_loaded());
+        assert!(
+            registry.loading_locks.contains_key("model1"),
+            "the lock stays for the waiter"
+        );
+
+        // B is dropped before it is polled again: the last load out.
+        drop(b);
+        assert!(
+            registry.loading_locks.is_empty(),
+            "the cancelled waiter removes the entry"
+        );
+        assert_eq!(registry.len(), 1);
     }
 }

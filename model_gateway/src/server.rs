@@ -1858,6 +1858,7 @@ async fn start_workflow_engines(
             chat_template_path: config.router_config.chat_template.clone(),
             cache_config: config.router_config.tokenizer_cache.to_option(),
             fail_on_duplicate: false,
+            for_worker: false,
         };
 
         let job = Job::AddTokenizer {

@@ -1405,6 +1405,7 @@ impl JobQueue {
                 // Tokenizer removal is synchronous and fast
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     context.multimodal_config_registry.remove(&entry.id);
+                    context.worker_loaded_tokenizers.remove(&entry.id);
                     note_tokenizer_removed(
                         &context.tokenizer_load_failures,
                         &context.worker_registry,
