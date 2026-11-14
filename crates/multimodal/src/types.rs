@@ -15,6 +15,7 @@ use crate::{
     buffer_pool,
     error::MediaConnectorError,
     media::{apply_transparency, decode_image_bytes},
+    minimax_resize::resize_image,
     vision::{execution, transforms::resize_bicubic_pil},
 };
 
@@ -558,7 +559,7 @@ impl ImageFrame {
             Ok(if self.minimax_sglang_resize {
                 resize_bicubic_pil(&image, self.size.width, self.size.height)
             } else if self.minimax_resize {
-                crate::minimax_resize::resize_image(image, self.size.width, self.size.height)
+                resize_image(image, self.size.width, self.size.height)
             } else {
                 image
             })

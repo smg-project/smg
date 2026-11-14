@@ -27,7 +27,7 @@ use formula::{Bf16Formula, F32Formula};
 use self::avx2 as vector;
 #[cfg(target_arch = "aarch64")]
 use self::neon as vector;
-use crate::encoder_inputs::{EncoderDtype, PixelNorm};
+use crate::encoder_inputs::{f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, PixelNorm};
 
 /// Writes `tables[channel][byte]` as a little-endian `u16` for every byte of
 /// `src` (`dst` holds two bytes per source byte). Consecutive runs of `block`
@@ -127,7 +127,7 @@ impl WireWriter {
             EncoderDtype::BFloat16 => {
                 let tables = Box::new(
                     norm.table_f32()
-                        .map(|channel| channel.map(crate::encoder_inputs::f32_to_bf16_bits)),
+                        .map(|channel| channel.map(f32_to_bf16_bits)),
                 );
                 Some(Self::Half {
                     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -136,10 +136,7 @@ impl WireWriter {
                 })
             }
             EncoderDtype::Float16 => Some(Self::Half {
-                tables: Box::new(
-                    norm.table_f32()
-                        .map(|channel| channel.map(crate::encoder_inputs::f32_to_f16_bits)),
-                ),
+                tables: Box::new(norm.table_f32().map(|channel| channel.map(f32_to_f16_bits))),
                 // The half-up rounding of the vector formula is the
                 // bfloat16's; float16 takes the tables.
                 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -722,8 +719,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn the_vector_formula_reproduces_the_tables_of_the_pipelines_normalizations() {
-        use crate::encoder_inputs::f32_to_bf16_bits;
-
         if !vector::detected() {
             return;
         }
@@ -774,8 +769,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn every_run_length_takes_the_tables_values_on_the_vector_path() {
-        use crate::encoder_inputs::f32_to_bf16_bits;
-
         if !vector::detected() {
             return;
         }

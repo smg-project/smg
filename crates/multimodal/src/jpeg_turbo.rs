@@ -36,6 +36,8 @@ use image::{DynamicImage, RgbImage};
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 
+use crate::buffer_pool;
+
 type TjHandle = *mut c_void;
 /// TurboJPEG pixel formats (`enum TJPF`).
 const TJPF_RGB: c_int = 0;
@@ -893,7 +895,7 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
                 return None;
             }
         };
-        let mut buf = crate::buffer_pool::take(nbytes);
+        let mut buf = buffer_pool::take(nbytes);
         // The frame's last row carries a sentinel into the call: the library
         // writes the frame top to bottom, so the row is overwritten only when
         // the write reached the end of the frame (`kept` below).
@@ -925,7 +927,7 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
             || (tj.warned(handle) && end_is_served(bytes) && !holds_sentinel(&buf[last_row..]));
         (tj.destroy)(handle);
         if !kept {
-            crate::buffer_pool::recycle(buf);
+            buffer_pool::recycle(buf);
             return None;
         }
         let rgb = if cmyk { cmyk_to_rgb_like_pil(buf) } else { buf };
@@ -944,6 +946,7 @@ pub(crate) fn turbojpeg_reads_warnings() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{turbojpeg_or_skip, warned_decode_or_skip};
 
     #[test]
     fn decoded_buffer_len_caps_decoded_size() {
@@ -1066,7 +1069,7 @@ mod tests {
     /// fails where `SMG_REQUIRE_TURBOJPEG` says the library must be there.
     #[test]
     fn cmyk_and_ycck_jpegs_decode_to_pils_pixels() {
-        if !crate::test_support::turbojpeg_or_skip("the CMYK parity test") {
+        if !turbojpeg_or_skip("the CMYK parity test") {
             return;
         }
         type Pixel = (u32, u32, [u8; 3]);
@@ -1281,7 +1284,7 @@ mod tests {
     /// (the pure-Rust fallback differs from it by a few levels per pixel).
     #[test]
     fn a_four_component_jpeg_with_unequal_sampling_decodes_through_turbojpeg() {
-        if !crate::test_support::turbojpeg_or_skip("the unequal-sampling test") {
+        if !turbojpeg_or_skip("the unequal-sampling test") {
             return;
         }
         let image = decode_jpeg_rgb(&unequal_sampling_cmyk_jpeg())
@@ -1342,7 +1345,7 @@ mod tests {
     /// reached by the library's 16-column rows and its tail never written.
     #[test]
     fn a_two_frame_file_decodes_the_frame_the_library_reads() {
-        if !crate::test_support::warned_decode_or_skip("the two-frame test") {
+        if !warned_decode_or_skip("the two-frame test") {
             return;
         }
         let plain = decode_jpeg_rgb(&unequal_sampling_cmyk_jpeg())
@@ -1383,7 +1386,7 @@ mod tests {
     /// 128 on every pixel (the decoder takes any whole-number sampling ratio).
     #[test]
     fn a_three_component_jpeg_with_unequal_sampling_decodes_through_turbojpeg() {
-        if !crate::test_support::turbojpeg_or_skip("the three-component test") {
+        if !turbojpeg_or_skip("the three-component test") {
             return;
         }
         let jpeg = unequal_sampling_jpeg(&[0x11, 0x21, 0x11]);
@@ -1414,7 +1417,7 @@ mod tests {
     #[test]
     fn a_header_the_library_cannot_read_takes_no_buffer() {
         use crate::buffer_pool::{self, BufferPool};
-        if !crate::test_support::turbojpeg_or_skip("the unreadable-header test") {
+        if !turbojpeg_or_skip("the unreadable-header test") {
             return;
         }
         let mut jpeg = unequal_sampling_cmyk_jpeg();
@@ -1444,7 +1447,7 @@ mod tests {
     /// decoder's, pinned by the parity test).
     #[test]
     fn a_header_with_a_warning_decodes_through_the_library() {
-        if !crate::test_support::warned_decode_or_skip("the warned-header test") {
+        if !warned_decode_or_skip("the warned-header test") {
             return;
         }
         let mut jpeg = fixture("ycck_adobe_16x16_420.jpg");
@@ -1471,7 +1474,7 @@ mod tests {
     /// where it fell back to the pure-Rust decoder before.
     #[test]
     fn a_frame_the_library_finished_with_a_warning_is_kept() {
-        if !crate::test_support::warned_decode_or_skip("the warned-decode test") {
+        if !warned_decode_or_skip("the warned-decode test") {
             return;
         }
         let clean = fixture("small.jpg");
@@ -1502,7 +1505,7 @@ mod tests {
     /// decode by PIL 12.3 on libjpeg-turbo hashes as pinned.
     #[test]
     fn a_corrupt_scan_decodes_to_the_reference_decoders_pixels() {
-        if !crate::test_support::warned_decode_or_skip("the corrupt-scan test") {
+        if !warned_decode_or_skip("the corrupt-scan test") {
             return;
         }
         let mut jpeg = fixture("small.jpg");
@@ -1523,7 +1526,7 @@ mod tests {
     #[test]
     fn a_frame_cut_before_its_end_marker_is_not_kept() {
         use crate::buffer_pool::{self, BufferPool};
-        if !crate::test_support::turbojpeg_or_skip("the cut-file test") {
+        if !turbojpeg_or_skip("the cut-file test") {
             return;
         }
         let jpeg = fixture("large.jpg");
@@ -1541,7 +1544,7 @@ mod tests {
     /// warned frame is kept.
     #[test]
     fn a_single_scan_file_ending_in_a_comment_is_kept() {
-        if !crate::test_support::warned_decode_or_skip("the comment-tail test") {
+        if !warned_decode_or_skip("the comment-tail test") {
             return;
         }
         let clean = fixture("small.jpg");
@@ -1851,7 +1854,7 @@ mod tests {
     #[test]
     fn a_two_component_frame_takes_no_buffer() {
         use crate::buffer_pool::{self, BufferPool};
-        if !crate::test_support::turbojpeg_or_skip("the two-component test") {
+        if !turbojpeg_or_skip("the two-component test") {
             return;
         }
         let jpeg = two_component_jpeg();
@@ -1883,7 +1886,7 @@ mod tests {
     #[test]
     fn a_fatal_error_after_a_warning_in_the_decode_is_not_kept() {
         use crate::buffer_pool::{self, BufferPool};
-        if !crate::test_support::warned_decode_or_skip("the warned-then-fatal decode test") {
+        if !warned_decode_or_skip("the warned-then-fatal decode test") {
             return;
         }
         let mut jpeg = fixture("large.jpg");
@@ -1913,7 +1916,7 @@ mod tests {
     #[test]
     fn a_warned_header_with_the_sampling_refused_takes_no_buffer() {
         use crate::buffer_pool::{self, BufferPool};
-        if !crate::test_support::turbojpeg_or_skip("the warned-then-refused header test") {
+        if !turbojpeg_or_skip("the warned-then-refused header test") {
             return;
         }
         let mut jpeg = two_component_jpeg();
@@ -1934,7 +1937,7 @@ mod tests {
     /// bytes on its way to the scan, behind which the marker is found.
     #[test]
     fn a_warned_file_with_an_appendage_is_kept() {
-        if !crate::test_support::warned_decode_or_skip("the warned-appendage test") {
+        if !warned_decode_or_skip("the warned-appendage test") {
             return;
         }
         let clean = fixture("small.jpg");
@@ -2008,14 +2011,17 @@ mod tests {
 #[cfg(test)]
 mod buffer_pool_tests {
     use super::*;
-    use crate::buffer_pool::{self, BufferPool};
+    use crate::{
+        buffer_pool::{self, BufferPool},
+        test_support::turbojpeg_or_skip,
+    };
 
     /// The decoded frame is a pooled buffer: the second decode of a frame
     /// takes the buffer the first one returned and writes the same pixels
     /// into it (the library writes every pixel of the frame it reports).
     #[test]
     fn a_decode_reuses_the_returned_buffer_and_writes_the_same_pixels() {
-        if !crate::test_support::turbojpeg_or_skip("the pooled decode test") {
+        if !turbojpeg_or_skip("the pooled decode test") {
             return;
         }
         static MINE: BufferPool = BufferPool::new();
@@ -2050,7 +2056,7 @@ mod buffer_pool_tests {
     /// class is warm.
     #[test]
     fn a_failed_decode_returns_its_buffer_to_the_pool() {
-        if !crate::test_support::turbojpeg_or_skip("the failed-decode pool test") {
+        if !turbojpeg_or_skip("the failed-decode pool test") {
             return;
         }
         static MINE: BufferPool = BufferPool::new();
