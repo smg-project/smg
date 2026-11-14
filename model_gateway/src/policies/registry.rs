@@ -672,7 +672,6 @@ impl PolicyRegistry {
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
             cache_trace::selection(policy.name(), branch.as_str(), workers, result);
             Metrics::record_worker_manual_policy_branch(branch.as_str());
-            Metrics::set_manual_policy_cache_entries(sticky.map_len());
             debug!(
                 source,
                 key,
@@ -1786,7 +1785,7 @@ mod tests {
                 );
             }
             if let Some(manual) = policy.as_any().downcast_ref::<ManualPolicy>() {
-                assert_eq!(manual.map_len(), 1);
+                assert_eq!(manual.entry_count(), 1);
             }
         }
     }
@@ -2279,7 +2278,7 @@ mod tests {
             );
         }
 
-        assert_eq!(reg.routing_key_sticky.as_ref().unwrap().map_len(), 1);
+        assert_eq!(reg.routing_key_sticky.as_ref().unwrap().entry_count(), 1);
 
         // No header: request-ID lineage still gets its own stable pin.
         let rid_info = SelectWorkerInfo {
