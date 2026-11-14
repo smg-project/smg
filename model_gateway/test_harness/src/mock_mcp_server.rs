@@ -117,6 +117,9 @@ pub struct MockSearchResponseMCPServer {
 #[derive(Clone)]
 pub struct MockSearchServer {
     calls: Arc<AtomicUsize>,
+    /// How long a search takes before it answers (zero unless a test asks):
+    /// the window in which a client leaves during a tool's execution.
+    latency: Duration,
     tool_router: ToolRouter<MockSearchServer>,
 }
 
@@ -174,16 +177,20 @@ impl MockSearchServer {
     pub fn new() -> Self {
         Self {
             calls: Arc::default(),
+            latency: Duration::ZERO,
             tool_router: Self::tool_router(),
         }
     }
 
     #[tool(description = "Mock web search tool")]
-    fn brave_web_search(
+    async fn brave_web_search(
         &self,
         Parameters(params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.latency.is_zero() {
+            tokio::time::sleep(self.latency).await;
+        }
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -287,11 +294,12 @@ impl ServerHandler for MockSearchServer {
 }
 
 impl MockMCPServer {
-    fn router(calls: Arc<AtomicUsize>) -> axum::Router {
+    fn router(calls: Arc<AtomicUsize>, latency: Duration) -> axum::Router {
         let service = StreamableHttpService::new(
             move || {
                 Ok(MockSearchServer {
                     calls: calls.clone(),
+                    latency,
                     ..MockSearchServer::new()
                 })
             },
@@ -304,9 +312,16 @@ impl MockMCPServer {
 
     /// Start a mock MCP server on an available port
     pub async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::start_with_latency(Duration::ZERO).await
+    }
+
+    /// Start a mock MCP server whose searches answer after `latency`.
+    pub async fn start_with_latency(
+        latency: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let calls = Arc::default();
         Ok(Self {
-            harness: MockServerHarness::start(Self::router(Arc::clone(&calls))).await?,
+            harness: MockServerHarness::start(Self::router(Arc::clone(&calls), latency)).await?,
             calls,
         })
     }

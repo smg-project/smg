@@ -1,6 +1,7 @@
 //! Worker selection stage: Select appropriate worker(s) based on routing mode
 
 use std::{
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,6 +11,8 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
+use futures::{future::Either, FutureExt};
+use openai_protocol::common::CachePartition;
 use smg_policy_controller::{fingerprint, Side, Target};
 use tracing::{debug, error, warn};
 
@@ -226,49 +229,64 @@ impl WorkerSelectionStage {
     /// the bound: when the budget runs out the waiter is dropped (its queue
     /// ticket goes with it) and the request is refused as one held past the
     /// queue timeout; without a bound the wait is the prefill queue's own.
-    async fn admit_within_budget<T, F>(
-        &self,
-        ctx: &RequestContext,
+    ///
+    /// Returned as a future rather than awaited in an `async fn`: an async
+    /// body keeps the slot of a parameter it has moved on, so the admission
+    /// (over a kilobyte of selection state) sat in this frame and again in
+    /// the timeout it was moved into, and the stage's boxed future, one
+    /// allocation per request, paid for both.
+    fn admit_within_budget<'a, T, F>(
+        &'a self,
+        ctx: &'a RequestContext,
         accepted: Option<Instant>,
         admission: F,
-    ) -> Result<T, Response>
+    ) -> impl Future<Output = Result<T, Response>> + 'a
     where
-        F: std::future::Future<Output = Result<T, Response>>,
+        T: 'a,
+        F: Future<Output = Result<T, Response>> + 'a,
     {
         let (Some(timeout), Some(accepted)) = (self.queue_timeout, accepted) else {
-            return admission.await;
+            return Either::Left(admission);
         };
         let budget =
             timeout.saturating_sub(AcceptedAt::clock_now().saturating_duration_since(accepted));
-        match tokio::time::timeout(budget, admission).await {
-            Ok(result) => result,
-            Err(_) => Err(Self::queue_timeout_refusal(
-                ctx,
-                AcceptedAt::clock_now().saturating_duration_since(accepted),
-                timeout,
-            )),
-        }
+        Either::Right(
+            tokio::time::timeout(budget, admission).map(move |held| match held {
+                Ok(result) => result,
+                Err(_) => Err(Self::queue_timeout_refusal(
+                    ctx,
+                    AcceptedAt::clock_now().saturating_duration_since(accepted),
+                    timeout,
+                )),
+            }),
+        )
     }
 
     /// A disaggregated selection admitted within the budget
     /// ([`Self::admit_within_budget`]) and still within it afterwards: an
     /// admission that lands right at the bound gives its claim back instead
     /// of taking a worker.
-    async fn admit_selection_within_budget<T, F>(
-        &self,
-        ctx: &RequestContext,
+    fn admit_selection_within_budget<'a, T, F>(
+        &'a self,
+        ctx: &'a RequestContext,
         accepted: Option<Instant>,
         admission: F,
-    ) -> Result<(T, PrefillLoadGuard), Response>
+    ) -> impl Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a
     where
-        F: std::future::Future<Output = Result<(T, PrefillLoadGuard), Response>>,
+        T: 'a,
+        F: Future<Output = Result<(T, PrefillLoadGuard), Response>> + 'a,
     {
-        let (selected, guard) = self.admit_within_budget(ctx, accepted, admission).await?;
-        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
-            drop(guard);
-            return Err(refused);
-        }
-        Ok((selected, guard))
+        self.admit_within_budget(ctx, accepted, admission)
+            .map(move |admitted| {
+                let (selected, guard) = admitted?;
+                if let Some(refused) =
+                    accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted))
+                {
+                    drop(guard);
+                    return Err(refused);
+                }
+                Ok((selected, guard))
+            })
     }
 }
 
@@ -389,14 +407,16 @@ impl<'a> SelectionInputs<'a> {
             || stage
                 .policy_registry
                 .any_policy_needs_request_text_with_tokens(headers);
-        // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
-        // request's cache-partition fields yet, so the engine's prefix cache
-        // is unpartitioned on this path and the router must not split
-        // affinity for it: a namespace here would cost cache hits for every
-        // request that sets a salt today. The snapshot carries the field so
-        // the forwarding change can derive it (as the HTTP proxy path does via
-        // `GenerationRequest::cache_partition`) without touching selection.
-        let cache_namespace: Option<CacheNamespace> = None;
+        // Only LoRA selection is forwarded; salts and extra_key still are
+        // not, so they must not split affinity on the tokenized wire. Names
+        // match the engine's KV-event namespace. Internal IDs stay isolated
+        // too, but cannot match name-keyed events without a name mapping.
+        let lora_adapter = input.request_type.lora_adapter();
+        let cache_namespace = CacheNamespace::derive(&CachePartition {
+            cache_salt: None,
+            extra_key: None,
+            lora_path: lora_adapter,
+        });
         let media = MediaDemands {
             media_refs,
             vision: needs_vision,
@@ -408,15 +428,17 @@ impl<'a> SelectionInputs<'a> {
         };
 
         let model_id = input.model_id.as_str();
-        // Decisions needs selected-token scoring, currently supported only by
-        // SGLang gRPC. Retries retain the selected wire via DispatchContext.
-        let wire =
-            matches!(input.request_type, RequestType::Decisions(_)).then_some(WireConstraint {
-                runtime: RuntimeType::Sglang,
-                connection: ConnectionMode::Grpc,
-                requires_media_refs: false,
-                pipeline: PipelinePin::Any,
-            });
+        // Selected-token scoring and LoRA selection are currently supported
+        // only by SGLang gRPC. Pin initial selection as well as retries so a
+        // mixed-runtime pool cannot silently run a LoRA request on the base model.
+        let wire = (matches!(input.request_type, RequestType::Decisions(_))
+            || lora_adapter.is_some())
+        .then_some(WireConstraint {
+            runtime: RuntimeType::Sglang,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+            pipeline: PipelinePin::Any,
+        });
         Self {
             intermediate,
             media_refs,
@@ -608,7 +630,7 @@ impl WorkerSelectionStage {
                             model_id,
                             placement,
                             sticky_key,
-                            None,
+                            wire,
                             media,
                             inputs.demand,
                         ),
@@ -618,7 +640,7 @@ impl WorkerSelectionStage {
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-                    let refs = multimodal::assemble_media_refs(plan.clone())
+                    let refs = multimodal::assemble_media_refs(plan)
                         .map_err(multimodal::MmRefsError::into_response)?;
                     Ok(refs
                         .items
@@ -657,6 +679,7 @@ impl WorkerSelectionStage {
                             sticky_key,
                             &encode_item_hashes,
                             EpdDemands {
+                                wire,
                                 encode: media,
                                 decode_vision: inputs.demand.decode,
                                 image_fanout: ctx.state.image_anchor.is_some(),
@@ -859,7 +882,9 @@ impl WorkerSelectionStage {
 
     /// Select a PD pair and take its Prefill admission slot. With admission
     /// enabled the selection runs at the head of the admission queue, so a
-    /// queued request commits to a worker only once it is admitted.
+    /// queued request commits to a worker only once it is admitted, under
+    /// the lock on both paths: the legacy policies, or the engine's decision
+    /// and commit ([`Self::place_pd_pair_through_engine`]).
     async fn admit_pd_pair(
         &self,
         model_id: &str,
@@ -869,11 +894,17 @@ impl WorkerSelectionStage {
         media: MediaDemands,
         demand: PairDemands,
     ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
+        let decider = placement::pair_decider(&self.policy_registry, &inputs);
         acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _, _): &PdWorkerPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, wire, capacity, demand),
+            |capacity| match decider {
+                Some(decider) => self.place_pd_pair_through_engine(
+                    decider, model_id, inputs, wire, capacity, demand,
+                ),
+                None => self.select_pd_pair(model_id, inputs, wire, capacity, demand),
+            },
         )
         .await
         .map_err(|error| {
@@ -1852,16 +1883,87 @@ impl WorkerSelectionStage {
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
         demand: PairDemands,
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
-        // Both pools derive from ONE membership snapshot: separate pool
-        // lookups could straddle a concurrent replacement and pair workers
-        // that never coexisted. The pools hold the workers whose wire carries
-        // the PD bootstrap info (gRPC, and TokenSpeed's direct ZMQ, see
-        // `RoutingPool::GrpcPrefill`; the wildcard model maps to the global
-        // snapshot). The pools must
-        // share a runtime, the rendezvous being runtime-specific, and a retry
-        // pins both to the retained plan's runtime.
+        let pairs = self.pd_pairs(model_id);
+        let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, demand, &pairs, |inputs| {
+            placement::select_pair(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                &pairs,
+                wire,
+                true,
+                prefill_capacity,
+                inputs,
+            )
+        })?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// [`Self::select_pd_pair`] through the policy engine under
+    /// `--policy-engine engine`, inside the admission callback as the legacy
+    /// selection runs: the pair decided over the window as the lock reads it
+    /// and committed under the same hold, by the request the queue lets
+    /// select; a commit every target of which missed re-decides once with
+    /// the misses excluded, then the request waits for a slot. The snapshot
+    /// is read and the inputs narrowed afresh on every run, as the legacy
+    /// callback does.
+    fn place_pd_pair_through_engine(
+        &self,
+        decider: &Decider,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        wire: Option<WireConstraint>,
+        capacity: Option<&PrefillSelectionContext<'_>>,
+        demand: PairDemands,
+    ) -> Result<PdWorkerPair, PdSelectionFailure> {
+        let pairs = self.pd_pairs(model_id);
+        let has_capacity = |worker: &Arc<dyn Worker>| {
+            capacity.is_none_or(|capacity| capacity.has_capacity(worker))
+        };
+        let pair = Self::with_pd_pair_inputs(model_id, inputs, wire, demand, &pairs, |inputs| {
+            placement::place_pair_through_engine(
+                &self.worker_registry,
+                &self.policy_registry,
+                decider,
+                model_id,
+                &pairs,
+                wire,
+                true,
+                &has_capacity,
+                inputs,
+            )
+        })?;
+        Ok((pair.prefill, pair.decode, pair.runtime))
+    }
+
+    /// The pair index of `model_id`'s snapshot. Both pools derive from ONE
+    /// membership snapshot: separate pool lookups could straddle a concurrent
+    /// replacement and pair workers that never coexisted. The pools hold the
+    /// workers whose wire carries the PD bootstrap info (gRPC, and
+    /// TokenSpeed's direct ZMQ, see `RoutingPool::GrpcPrefill`; the wildcard
+    /// model maps to the global snapshot). The pools must share a runtime,
+    /// the rendezvous being runtime-specific, and a retry pins both to the
+    /// retained plan's runtime.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode())
+    }
+
+    /// The per-request narrowing of a pair placement over `pairs`, then
+    /// `select` with the inputs narrowed: the shapes membership can never
+    /// serve are refused first (a request needing a vision encoder no
+    /// prefill worker has, a prompt no pair's context takes), and the
+    /// candidate filter composes the caller's predicate with the request's
+    /// media demands. Run by the legacy selection and by each closure of
+    /// the decided path.
+    fn with_pd_pair_inputs<R>(
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        wire: Option<WireConstraint>,
+        demand: PairDemands,
+        pairs: &PdPairIndex,
+        select: impl FnOnce(PlacementInputs<'_>) -> Result<R, Box<PairFailure>>,
+    ) -> Result<R, PdSelectionFailure> {
         // A side that needs a vision encoder (see `PairDemands`) is kept off
         // the workers without one. The prefill side must find one: a request
         // carrying pixel media is refused when the index pairs no prefill
@@ -1887,8 +1989,8 @@ impl WorkerSelectionStage {
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
             && pairs.refusal.is_none()
-            && pair_admitted_by(&pairs, wire, &takes_refs)
-            && !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+            && pair_admitted_by(pairs, wire, &takes_refs)
+            && !pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
                 prefill_vision_capable(worker) && takes_refs(worker)
             })
         {
@@ -1901,7 +2003,7 @@ impl WorkerSelectionStage {
         };
         let prefill_with_vision =
             move |worker: &dyn Worker| prefill_vision_capable(worker) && admitted(worker);
-        let require_decode_vision = demand.decode && pair_admitted_by(&pairs, wire, &with_vision);
+        let require_decode_vision = demand.decode && pair_admitted_by(pairs, wire, &with_vision);
         let candidate_filter: Option<CandidateFilter<'_>> = if require_decode_vision {
             Some(&with_vision)
         } else if demand.prefill {
@@ -1922,7 +2024,7 @@ impl WorkerSelectionStage {
         };
         // Membership, not health, decides whether a request can ever fit.
         // Inspect actual partners: independently large pools need not pair.
-        if !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+        if !pair_admitted_by(pairs, wire, &|worker: &dyn Worker| {
             takes_media(worker) && demand.context.admits(worker, model_id)
         }) {
             let mut largest = None;
@@ -1963,17 +2065,7 @@ impl WorkerSelectionStage {
             candidate_filter: Some(&fits),
             ..inputs
         };
-        let pair = placement::select_pair(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            &pairs,
-            wire,
-            true,
-            prefill_capacity,
-            inputs,
-        )?;
-        Ok((pair.prefill, pair.decode, pair.runtime))
+        select(inputs).map_err(PdSelectionFailure::from)
     }
 
     /// Select per-item encode workers + a prefill/decode pair for EPD routing.
@@ -2001,7 +2093,8 @@ impl WorkerSelectionStage {
         // may take references (it processes the media itself); a rendezvous
         // encoder takes router-processed items only.
         let capable_for = |worker: &Arc<dyn Worker>, media: MediaDemands| {
-            media.accepts(worker.as_ref())
+            WireConstraint::admits(demand.wire, worker.as_ref())
+                && media.accepts(worker.as_ref())
                 && match PdProtocol::encode_handoff(worker.metadata().spec.runtime_type) {
                     Some(EncodeHandoff::Push) => ec_role(worker.as_ref(), "ec_producer"),
                     Some(EncodeHandoff::Rendezvous) => !media.media_refs,
@@ -2060,11 +2153,11 @@ impl WorkerSelectionStage {
                 || vision_capable(worker)
         };
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-        let ec_pair_exists = pair_admitted_by(&pairs, None, &registered_ec);
-        if !ec_pair_exists && pair_admitted_by(&pairs, None, &|_| true) {
+        let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
+        if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
             return Err(EpdSelectionFailure::EcIncompatible);
         }
-        let vision_pair_exists = pair_admitted_by(&pairs, None, &|worker| {
+        let vision_pair_exists = pair_admitted_by(&pairs, demand.wire, &|worker| {
             registered_ec(worker) && decode_vision(worker)
         });
         if demand.decode_vision && ec_pair_exists && !vision_pair_exists {
@@ -2084,7 +2177,7 @@ impl WorkerSelectionStage {
             &self.policy_registry,
             model_id,
             &pairs,
-            None,
+            demand.wire,
             true,
             prefill_capacity,
             PlacementInputs {
@@ -2152,6 +2245,7 @@ impl WorkerSelectionStage {
 /// E consumes the media; D may still need grids for positional embeddings.
 #[derive(Clone, Copy)]
 struct EpdDemands {
+    wire: Option<WireConstraint>,
     encode: MediaDemands,
     decode_vision: bool,
     image_fanout: bool,
@@ -2337,6 +2431,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod lora;
+
     use std::{
         collections::HashMap,
         sync::atomic::{AtomicUsize, Ordering},
@@ -2701,6 +2797,59 @@ mod tests {
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
         }
         (prefill_hits, decode_hits)
+    }
+
+    /// Under `--policy-engine engine` the stage admits its pair through the
+    /// engine's decision: round robin on both roles covers every worker of
+    /// both pools evenly over 40 admissions, every one a decision of the
+    /// engine.
+    #[tokio::test]
+    async fn the_engine_decides_the_pair_through_the_stage() {
+        use crate::config::PolicyEngineMode;
+
+        let model_id = "test-model-engine-pair";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
+        let round_robin = PolicyConfig::RoundRobin;
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+                PolicyEngineMode::Engine,
+                &round_robin,
+                &round_robin,
+            )),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+        let mut prefill_hits = HashMap::new();
+        let mut decode_hits = HashMap::new();
+        for _ in 0..40 {
+            let ((prefill, decode, _), guard) = stage
+                .admit_pd_pair(
+                    model_id,
+                    PlacementInputs::default(),
+                    None,
+                    None,
+                    MediaDemands::NONE,
+                    PairDemands::default(),
+                )
+                .await
+                .unwrap_or_else(|response| panic!("a pair is admitted: {response:?}"));
+            *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
+            *decode_hits.entry(decode.url().to_string()).or_default() += 1;
+            drop(guard);
+        }
+        assert_even_pd_round_robin_coverage(
+            &prefill_urls,
+            &decode_urls,
+            &prefill_hits,
+            &decode_hits,
+        );
+        assert_eq!(
+            stage.policy_registry.decider().expect("hosted").decisions(),
+            40,
+            "every admission was decided through the engine"
+        );
     }
 
     /// A saturated prefill pool is a pressure condition, not model absence.
@@ -4178,6 +4327,7 @@ mod tests {
                     PlacementInputs::default(),
                     &[vec![1], vec![2]],
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: false,
                             vision: true,
@@ -4305,6 +4455,7 @@ mod tests {
                         },
                         &[vec![1], vec![2]],
                         EpdDemands {
+                            wire: None,
                             encode: MediaDemands {
                                 media_refs,
                                 vision: true,
@@ -4353,6 +4504,7 @@ mod tests {
                     },
                     &[vec![1]],
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs,
                             vision: true,
@@ -4558,6 +4710,7 @@ mod tests {
                     PlacementInputs::default(),
                     &[vec![1]],
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: false,
                             vision: needs_vision,
@@ -4597,6 +4750,7 @@ mod tests {
                             PlacementInputs::default(),
                             &[vec![1]],
                             EpdDemands {
+                                wire: None,
                                 encode: MediaDemands {
                                     media_refs: false,
                                     vision: true,
@@ -4612,6 +4766,7 @@ mod tests {
                 }
                 if runtime == RuntimeType::Vllm && allowed && !d_vision {
                     let refs = EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: true,
                             vision: needs_vision,
@@ -4705,6 +4860,7 @@ mod tests {
                     PlacementInputs::default(),
                     hashes,
                     EpdDemands {
+                        wire: None,
                         encode: MediaDemands {
                             media_refs: false,
                             vision: true,
@@ -5430,7 +5586,7 @@ mod tests {
         }
         let stage = regular_stage(Arc::clone(&registry));
         let image = multimodal::MediaPlan::new([MediaContentPart::ImageUrl {
-            url: "data:image/png;base64,AAAA".to_string(),
+            url: "data:image/png;base64,AAAA".to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
@@ -5923,7 +6079,7 @@ mod tests {
             "a processed image"
         );
         let image_refs = multimodal::MediaPlan::new([MediaContentPart::ImageUrl {
-            url: "data:image/png;base64,AAAA".to_string(),
+            url: "data:image/png;base64,AAAA".to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
@@ -7513,6 +7669,30 @@ mod tests {
             body["error"]["message"],
             "All workers for model 'test-model' are unavailable (unhealthy or circuit breaker open)",
             "the client's message is unchanged"
+        );
+    }
+
+    /// The stage's `execute` future is boxed once per request (`async_trait`)
+    /// and fits the allocator's 2,048-byte class on 64-bit targets: 1,744
+    /// bytes. It read 4,112 when the admission budget's two async wrappers
+    /// each kept the admission they had moved on (three copies of a 1.1 KB
+    /// future, and a 16-byte field took the box from the 4,096 class to
+    /// 5,120); returned as futures they hold it once. A field that grows the
+    /// future past the class needs its own read.
+    #[test]
+    fn the_selection_stage_future_fits_its_class() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let mut ctx = prepared_ctx(registry, None);
+        let future = size_of_val(&*stage.execute(&mut ctx));
+        assert!(
+            future <= 2048,
+            "the stage's execute future is {future} bytes"
         );
     }
 }

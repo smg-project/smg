@@ -6,7 +6,9 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
+    common::{
+        AudioUrl, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, ResponseFormat, VideoUrl,
+    },
     profile::ProviderProfile,
 };
 use serde_json::json;
@@ -213,7 +215,7 @@ fn test_transform_messages_string_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -251,7 +253,7 @@ fn test_transform_messages_string_format_without_placeholders_omits_media() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
+                    url: "https://example.com/image.png".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -276,7 +278,7 @@ fn test_transform_messages_string_format_with_video_placeholder() {
             },
             ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "https://example.com/video.mp4".to_string(),
+                    url: "https://example.com/video.mp4".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
@@ -307,14 +309,14 @@ fn test_transform_messages_string_format_uses_per_modality_placeholders() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
             },
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "audio".to_string(),
+                    url: "audio".to_string().into(),
                 },
             },
         ]),
@@ -354,7 +356,7 @@ fn test_transform_messages_input_audio_uses_audio_placeholder() {
             },
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             },
@@ -386,7 +388,7 @@ fn test_transform_messages_string_format_rejects_missing_modality_placeholder() 
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::AudioUrl {
             audio_url: AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
             },
         }]),
         name: None,
@@ -409,7 +411,7 @@ fn test_transform_messages_openai_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: Some("high".to_string()),
                     max_long_side_pixel: None,
                 },
@@ -472,7 +474,7 @@ fn test_transform_messages_multiple_messages() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -507,7 +509,7 @@ fn test_transform_messages_empty_text_parts() {
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
-                url: "https://example.com/image.jpg".to_string(),
+                url: "https://example.com/image.jpg".to_string().into(),
                 detail: None,
                 max_long_side_pixel: None,
             },
@@ -542,7 +544,7 @@ fn test_transform_messages_mixed_content_types() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: Some("low".to_string()),
                         max_long_side_pixel: None,
                     },
@@ -590,7 +592,7 @@ fn parts_reach_a_parts_template_in_the_requests_order_whatever_the_media_order()
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -617,7 +619,7 @@ fn test_media_hoisted_before_text_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -649,7 +651,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i1".to_string(),
+                    url: "i1".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -659,7 +661,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i2".to_string(),
+                    url: "i2".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -779,7 +781,7 @@ fn test_tml_preserves_authored_multipart_order_openai() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1003,7 +1005,7 @@ fn test_tml_preserves_authored_multipart_order_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1119,7 +1121,12 @@ fn tool_choice_none_renders_the_tools_as_auto_does() {
 /// `build_chat_template_kwargs` with the profile the request's model
 /// derives, as the preparation stage carries it.
 fn kwargs_for(request: &ChatCompletionRequest) -> HashMap<String, Value> {
-    build_chat_template_kwargs(request, ProviderProfile::for_model(&request.model), None)
+    build_chat_template_kwargs(
+        request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    )
 }
 
 /// `kwargs_for` under a template that reads the `thinking_mode` switch.
@@ -1128,6 +1135,7 @@ fn kwargs_for_switch(request: &ChatCompletionRequest) -> HashMap<String, Value> 
         request,
         ProviderProfile::for_model(&request.model),
         Some(ThinkingKeyName::ThinkingMode),
+        |_| true,
     )
 }
 
@@ -1178,6 +1186,73 @@ fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
     )]));
     let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+}
+
+/// A control the template never reads is not handed to it: a `response_format`
+/// (its schema copied node by node into the kwarg) or a `tool_choice` the
+/// template has no name for could not reach the prompt. The client's own
+/// entries and the effort pass as before, and a request whose controls are
+/// all unread renders with no kwargs at all.
+#[test]
+fn a_control_the_template_never_reads_is_not_handed_to_it() {
+    let mut request = effort_request(None);
+    request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        json_schema: Box::new(JsonSchemaFormat {
+            name: "answer".to_string(),
+            schema: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            strict: Some(true),
+            description: None,
+        }),
+    });
+    let read_all = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    );
+    assert_eq!(read_all[TOOL_CHOICE_KEY], json!("auto"));
+    assert_eq!(
+        read_all[RESPONSE_FORMAT_KEY],
+        serde_json::to_value(request.response_format.as_ref().unwrap()).unwrap()
+    );
+
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert!(unread.is_empty(), "{unread:?}");
+    assert_eq!(
+        unread.capacity(),
+        0,
+        "no map for controls the template never reads"
+    );
+    let only_format = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |name| name == RESPONSE_FORMAT_KEY,
+    );
+    assert!(!only_format.contains_key(TOOL_CHOICE_KEY));
+    assert_eq!(
+        only_format[RESPONSE_FORMAT_KEY],
+        read_all[RESPONSE_FORMAT_KEY]
+    );
+
+    request.reasoning_effort = Some("high".to_string());
+    request.chat_template_kwargs = Some(HashMap::from([("custom".to_string(), json!(true))]));
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert_eq!(unread.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+    assert_eq!(unread.get("custom"), Some(&json!(true)));
+    assert!(!unread.contains_key(TOOL_CHOICE_KEY));
+    assert!(!unread.contains_key(RESPONSE_FORMAT_KEY));
 }
 
 fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1410,7 +1485,7 @@ fn test_render_image_before_question_real_template() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1556,6 +1631,98 @@ fn flat_renderer_joins_the_prefill_and_reports_from_text() {
 
 // --- renderer-capability gates on the render path ------------------------
 
+fn json_renderer() -> llm_tokenizer::MockTokenizer {
+    llm_tokenizer::MockTokenizer::new()
+        .with_renderer_capabilities(RendererCapabilities {
+            native_assistant_continuation: true,
+            json_requires_separate_reasoning: true,
+            json_requires_empty_assistant_prefix: true,
+            ..Default::default()
+        })
+        .with_json_chat_template()
+}
+
+#[test]
+fn json_reasoning_separation_follows_the_renderer_contract() {
+    for format in [
+        json!({"type":"json_object"}),
+        json!({"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}),
+    ] {
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"user","content":"Hi"}],
+            "response_format":format, "separate_reasoning":false
+        }))
+        .unwrap();
+        let render = |request: &ChatCompletionRequest, tokenizer: &dyn Tokenizer| {
+            process_with_derived_profile(request, tokenizer, None, MediaPartOrder::MediaFirst)
+        };
+        assert!(render(&request, &json_renderer())
+            .unwrap_err()
+            .contains("separate_reasoning=true"));
+        assert!(render(&request, &llm_tokenizer::MockTokenizer::new()).is_ok());
+        request.separate_reasoning = true;
+        assert!(render(&request, &json_renderer()).is_ok());
+    }
+}
+
+#[test]
+fn json_continuation_checks_the_effective_flag_and_actual_response_format() {
+    for top_level in [false, true] {
+        for prefix in ["", "{\"answer\":"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"m", "messages":[{"role":"assistant","content":prefix}],
+                "response_format":{"type":"json_object"},
+                "continue_final_message":top_level,
+                "chat_template_kwargs":{
+                    "continue_final_message":true,
+                    "response_format":{"type":"text"}
+                }
+            }))
+            .unwrap();
+            let result = process_with_derived_profile(
+                &request,
+                &json_renderer(),
+                None,
+                MediaPartOrder::MediaFirst,
+            );
+            if prefix.is_empty() {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().contains("nonempty assistant"));
+            }
+        }
+    }
+}
+
+#[test]
+fn json_contract_does_not_restrict_text_responses_or_closed_history() {
+    for format in [Value::Null, json!({"type":"text"})] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"assistant","content":"Partial"}],
+            "response_format":format, "continue_final_message":true,
+            "separate_reasoning":false
+        }))
+        .unwrap();
+        assert!(process_with_derived_profile(
+            &request,
+            &json_renderer(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .is_ok());
+    }
+    let mut request = prefill_request();
+    request.continue_final_message = false;
+    request.response_format = Some(ResponseFormat::JsonObject);
+    assert!(process_with_derived_profile(
+        &request,
+        &json_renderer(),
+        None,
+        MediaPartOrder::MediaFirst,
+    )
+    .is_ok());
+}
+
 /// Render `request` through a mock that declares `capabilities` and
 /// hands back the message list it received as JSON, so both gates are
 /// observable without a checkpoint: which messages reach the template,
@@ -1584,6 +1751,8 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
@@ -1591,6 +1760,8 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 
 /// Without the capability the trailing assistant message is popped and its
@@ -2491,7 +2662,7 @@ fn resolved_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
 #[test]
 fn the_render_reads_the_carried_profile_not_the_model() {
     let effort_kwarg = |request: &ChatCompletionRequest, provider: ProviderProfile| {
-        build_chat_template_kwargs(request, provider, None)
+        build_chat_template_kwargs(request, provider, None, |_| true)
             .get(REASONING_EFFORT_KEY)
             .cloned()
     };

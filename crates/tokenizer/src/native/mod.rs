@@ -52,7 +52,7 @@
 //! (another normalizer, a pre-tokenizer or regex construct outside the
 //! supported subset, a post-processor other than `ByteLevel` or a template
 //! of that shape, truncation or padding, added tokens with
-//! `single_word`/`lstrip`/`rstrip`) simply has no native path.
+//! `single_word`) simply has no native path.
 //!
 //! A tiktoken vocabulary is a byte-level BPE of this shape with no
 //! normalizer, one pattern, special tokens cut out of the raw text and no
@@ -153,8 +153,9 @@ const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// is tokenized every time.
 const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 
-/// Bytes of an input from which the single-stage scanners walk a letter or
-/// white-space run eight bytes at a time (`Roles::run_end_as`): the scanner
+/// Bytes of an input from which the scanners walk a letter or white-space
+/// run eight bytes at a time (`Roles::run_end_as`, and `run_end_as_in` for
+/// the chain scanner's runs, which also end at a stage class): the scanner
 /// loop is compiled with the word scans and without, and the choice is made
 /// once per encode call on the input's length; a shorter input walks every
 /// run byte by byte through the loop as it was before the scans, and no run
@@ -606,6 +607,10 @@ struct Stage {
     pattern: Pattern,
     /// The spans of the stage's text that go on as pieces.
     pieces: Pieces,
+    /// A `Digits` split: from it on, every piece that holds a decimal digit
+    /// lies inside a run of numeric characters, which holds no whitespace
+    /// (`NativeEncoder::check_anchors` reads it).
+    digits: bool,
 }
 
 /// The spans of a stage's text that go on as its pieces: the reference's
@@ -619,22 +624,72 @@ enum Pieces {
     /// `Removed`: the text between the matches alone; a match is dropped
     /// and the pieces on either side of it stay apart.
     Gaps,
+    /// `MergedWithNext`: each match with the text after it up to the next
+    /// match or the end, as one piece; the text before the first match
+    /// stands alone.
+    MatchesWithNextGap,
 }
 
 impl Pieces {
-    /// Whether the text between and around the matches goes on.
-    fn gaps(self) -> bool {
-        self != Self::Matches
-    }
-
-    /// Whether the matches go on.
-    fn matches(self) -> bool {
-        self != Self::Gaps
+    /// How a walk cuts a text under this kind: the cursor loop over the
+    /// matches with its two switches, or the merged loop. Every walker asks
+    /// this first, so a kind the cursor loop does not know never falls
+    /// through its switches silently.
+    fn walk(self) -> Walk {
+        match self {
+            Self::MatchesAndGaps => Walk::Apart {
+                gaps: true,
+                matches: true,
+            },
+            Self::Matches => Walk::Apart {
+                gaps: false,
+                matches: true,
+            },
+            Self::Gaps => Walk::Apart {
+                gaps: true,
+                matches: false,
+            },
+            Self::MatchesWithNextGap => Walk::Merged,
+        }
     }
 }
 
-/// Added tokens by content and id, the list a matcher is built from.
-type AddedTokenList = Vec<(String, u32)>;
+/// The loop a walk runs under a [`Pieces`] kind (see [`Pieces::walk`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Walk {
+    /// Each match and each gap on its own: `gaps` says the text between and
+    /// around the matches goes on as pieces, `matches` says the matches do.
+    Apart { gaps: bool, matches: bool },
+    /// Each match with the text after it up to the next match or the end.
+    Merged,
+}
+
+/// An added token the path cuts out: its content and id, and whether the
+/// whitespace before or after a match is the token's (`lstrip`, `rstrip`,
+/// as `AddedVocabulary` reads them). Ordered by content, so a list sorts
+/// into a stable order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Added {
+    content: String,
+    id: u32,
+    lstrip: bool,
+    rstrip: bool,
+}
+
+impl Added {
+    /// A token that takes no whitespace: its content and id.
+    pub(crate) fn plain(content: String, id: u32) -> Self {
+        Self {
+            content,
+            id,
+            lstrip: false,
+            rstrip: false,
+        }
+    }
+}
+
+/// Added tokens, the list a matcher is built from.
+type AddedTokenList = Vec<Added>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
 /// matches them. The automaton's own search scans a text for the tokens'
@@ -651,6 +706,9 @@ type AddedTokenList = Vec<(String, u32)>;
 pub(crate) struct AddedTokens {
     automaton: AhoCorasick,
     ids: Vec<u32>,
+    /// Per token, whether the whitespace before / after a match is the
+    /// token's; none when no token of the set takes any.
+    strips: Option<Vec<(bool, bool)>>,
     prefixes: Option<Prefixes>,
 }
 
@@ -679,10 +737,10 @@ impl Prefixes {
 
     /// Whether the automaton's start-byte scan declines `tokens`: a first
     /// byte beyond ASCII, or more than three distinct first bytes.
-    fn wanted(tokens: &[(String, u32)]) -> bool {
+    fn wanted(tokens: &[Added]) -> bool {
         let mut firsts: Vec<u8> = tokens
             .iter()
-            .filter_map(|(content, _)| content.bytes().next())
+            .filter_map(|token| token.content.bytes().next())
             .collect();
         firsts.sort_unstable();
         firsts.dedup();
@@ -695,11 +753,11 @@ impl Prefixes {
     /// byte of ordinary text, where the automaton's own walk is cheaper),
     /// when even the one-byte prefixes exceed [`Self::MAX_COUNT`], or when
     /// the library declines the set.
-    fn of(tokens: &[(String, u32)]) -> Option<Self> {
+    fn of(tokens: &[Added]) -> Option<Self> {
         let distinct = |len: usize| {
             let mut prefixes: Vec<&[u8]> = tokens
                 .iter()
-                .map(|(content, _)| &content.as_bytes()[..content.len().min(len)])
+                .map(|token| &token.content.as_bytes()[..token.content.len().min(len)])
                 .collect();
             prefixes.sort_unstable();
             prefixes.dedup();
@@ -711,7 +769,7 @@ impl Prefixes {
             len -= 1;
             prefixes = distinct(len);
         }
-        let cut_short = tokens.iter().any(|(content, _)| content.len() > len);
+        let cut_short = tokens.iter().any(|token| token.content.len() > len);
         if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
             return None;
         }
@@ -744,7 +802,7 @@ impl Prefixes {
 
 impl AddedTokens {
     /// The matcher over `tokens`, none for no tokens.
-    pub(crate) fn build(tokens: &[(String, u32)]) -> Result<Option<Self>, Declined> {
+    pub(crate) fn build(tokens: &[Added]) -> Result<Option<Self>, Declined> {
         if tokens.is_empty() {
             return Ok(None);
         }
@@ -758,37 +816,102 @@ impl AddedTokens {
             } else {
                 StartKind::Unanchored
             })
-            .build(tokens.iter().map(|(content, _)| content.as_bytes()))
+            .build(tokens.iter().map(|token| token.content.as_bytes()))
             .map_err(|e| Declined::from(format!("the added tokens form no automaton: {e}")))?;
         Ok(Some(Self {
             automaton,
-            ids: tokens.iter().map(|(_, id)| *id).collect(),
+            ids: tokens.iter().map(|token| token.id).collect(),
+            strips: tokens
+                .iter()
+                .any(|token| token.lstrip || token.rstrip)
+                .then(|| {
+                    tokens
+                        .iter()
+                        .map(|token| (token.lstrip, token.rstrip))
+                        .collect()
+                }),
             prefixes,
         }))
     }
 
     /// The added tokens in `text`, in order, each as its byte range and its
     /// index in the list: the leftmost-longest matches, each continuing after
-    /// the last. With prefixes, a token starts only where a prefix stands, so
+    /// the last (after the token's own end: a range widened over whitespace,
+    /// [`Self::stripped`], does not move the search, as the reference's loop
+    /// does not). With prefixes, a token starts only where a prefix stands, so
     /// the first prefix at or after the last match that begins a token begins
-    /// the next one, and the longest token there is the match.
+    /// the next one, and the longest token there is the match. A match the
+    /// widening before it leaves empty (a whitespace token inside the
+    /// whitespace a stripped neighbour took) is no match: the reference drops
+    /// the empty split it makes of it; it leaves the end of the last match
+    /// where it was, so that no later widening reaches into an earlier range
+    /// (the reference's own loop fails on such a text).
     fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         let mut at = 0;
+        let mut taken = 0;
         std::iter::from_fn(move || loop {
             let Some(prefixes) = &self.prefixes else {
                 let input = Input::new(text).range(at..);
                 let found = self.automaton.find(input)?;
                 at = found.end();
-                return Some((found.range(), found.pattern().as_usize()));
+                let index = found.pattern().as_usize();
+                let range = self.stripped(text, found.range(), index, taken);
+                if range.is_empty() {
+                    continue;
+                }
+                taken = range.end;
+                return Some((range, index));
             };
             let start = prefixes.next(text, at)?;
             let input = Input::new(text).range(start..).anchored(Anchored::Yes);
             if let Some(found) = self.automaton.find(input) {
                 at = found.end();
-                return Some((found.range(), found.pattern().as_usize()));
+                let index = found.pattern().as_usize();
+                let range = self.stripped(text, found.range(), index, taken);
+                if range.is_empty() {
+                    continue;
+                }
+                taken = range.end;
+                return Some((range, index));
             }
             at = start + 1;
         })
+    }
+
+    /// The match `found` of the token at `index`, widened over the whitespace
+    /// the token takes: with `rstrip` the whitespace characters after it, with
+    /// `lstrip` those before it, not past `taken`, the end of the previous
+    /// match (`AddedVocabulary::find_matches`; its whitespace is Unicode
+    /// `White_Space`, which is `char::is_whitespace`).
+    fn stripped(
+        &self,
+        text: &str,
+        mut found: Range<usize>,
+        index: usize,
+        taken: usize,
+    ) -> Range<usize> {
+        let Some(strips) = &self.strips else {
+            return found;
+        };
+        let (lstrip, rstrip) = strips[index];
+        if lstrip {
+            let before: usize = text[..found.start]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            found.start = (found.start - before).max(taken);
+        }
+        if rstrip {
+            let after: usize = text[found.end..]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            found.end += after;
+        }
+        found
     }
 
     /// The byte ranges of the added tokens in `text`, in order.
@@ -902,6 +1025,15 @@ pub(crate) struct NativeEncoder {
     /// Whether a stage holds the end anchor `$`: such a text is never cut
     /// into units for the thread pool (see [`Self::stable_cut`]).
     end_anchored: bool,
+    /// The stages from this index on run over each piece's byte-level
+    /// image, the alphabet character of each of its bytes, rather than
+    /// over the raw text: a stage after the `ByteLevel` whose pattern can
+    /// read beyond printable ASCII cuts the image where the reference does,
+    /// which is not where it would cut the raw text (see
+    /// [`Self::pieces_in_alphabet`]). `None` when every stage runs over the
+    /// raw text. Such a text is never cut into units for the thread pool
+    /// either (see [`Self::stable_cut`]).
+    mapped_from: Option<usize>,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
@@ -1005,7 +1137,7 @@ impl NativeEncoder {
         }
         let normalizer =
             Self::normalizer_from(&serialized("normalizer", tokenizer.get_normalizer())?)?;
-        let stages = Self::stages_from(&pre_tokenizer)?;
+        let (stages, mapped_from) = Self::stages_from(&pre_tokenizer)?;
         let frame = Self::frame_from(&serialized(
             "post-processor",
             tokenizer.get_post_processor(),
@@ -1034,9 +1166,15 @@ impl NativeEncoder {
                 None
             }
         };
-        let chain = chain::Scanner::recognize(&stages);
+        // The one-pass chain scanner reads the raw text: not for stages
+        // over the image.
+        let chain = match mapped_from {
+            None => chain::Scanner::recognize(&stages),
+            Some(_) => None,
+        };
         Ok(Self {
             end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
+            mapped_from,
             nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
@@ -1063,11 +1201,11 @@ impl NativeEncoder {
     /// prepend scheme places the marker, or by a `Prepend` of the marker
     /// before the `Replace` (the legacy conversion's shape), which places it
     /// before every text; anything else declines, as does an added token
-    /// matched after the `Replace` with a space or a marker in it (matched
-    /// on the raw text here, its spelling would not be the one `tokenizers`
-    /// matches after the normalizer), and any added token matched after the
-    /// `Prepend` (a text after it gets no marker there; one after a raw
-    /// added token does).
+    /// matched after the `Replace` with a space or a marker in it, or with
+    /// `lstrip` / `rstrip` (matched on the raw text here, its spelling and
+    /// the whitespace it takes would not be the ones `tokenizers` sees after
+    /// the normalizer), and any added token matched after the `Prepend` (a
+    /// text after it gets no marker there; one after a raw added token does).
     fn sentencepiece_from<M: Model + ModelView>(
         tokenizer: &TokenizerOf<M>,
         pre_tokenizer: &Value,
@@ -1085,14 +1223,19 @@ impl NativeEncoder {
                  normalizer",
             ));
         }
+        // The tokens matched after the Replace are matched on the raw text
+        // here; one whose strip takes whitespace would take a raw space,
+        // which the reference, matching the normalized piece, sees as the
+        // word marker and leaves to the text.
         if replaces
-            && normalized
-                .iter()
-                .any(|(content, _)| content.contains([' ', WORD_MARKER]))
+            && normalized.iter().any(|token| {
+                token.content.contains([' ', WORD_MARKER]) || token.lstrip || token.rstrip
+            })
         {
             return Err(Declined::from(
                 "a byte-fallback vocabulary with an added token matched after the Replace \
-                 normalizer that holds a space or the word marker",
+                 normalizer that holds a space or the word marker, or takes the whitespace \
+                 beside it",
             ));
         }
         let chars = CharSymbols::from_model(
@@ -1109,6 +1252,7 @@ impl NativeEncoder {
         );
         Ok(Self {
             end_anchored: false,
+            mapped_from: None,
             normalizer: Normalizer::None,
             nfc_quick: None,
             raw_added: AddedTokens::build(&raw)?,
@@ -1382,7 +1526,8 @@ impl NativeEncoder {
 
     /// The added tokens the path cuts out itself, those matched on the raw
     /// text and those matched after normalization (normalized here, once),
-    /// each in a stable order so leftmost-longest ties stay deterministic.
+    /// each in a stable order so leftmost-longest ties stay deterministic;
+    /// a token's `lstrip` / `rstrip` ride along, `single_word` declines.
     fn added_tokens_of<M: Model>(
         tokenizer: &TokenizerOf<M>,
         normalizer: Normalizer,
@@ -1394,20 +1539,25 @@ impl NativeEncoder {
         let mut raw = Vec::new();
         let mut normalized = Vec::new();
         for (&id, token) in added.get_added_tokens_decoder() {
-            if token.single_word || token.lstrip || token.rstrip || token.content.is_empty() {
+            if token.single_word || token.content.is_empty() {
                 return Err(Declined::from(format!(
-                    "added token {:?} with single_word, lstrip or rstrip, or without content",
+                    "added token {:?} with single_word, or without content",
                     token.content
                 )));
             }
+            let added = |content: String| Added {
+                content,
+                id,
+                lstrip: token.lstrip,
+                rstrip: token.rstrip,
+            };
             if token.normalized {
-                let content = match normalizer {
+                normalized.push(added(match normalizer {
                     Normalizer::None => token.content.clone(),
                     form => normalize(&token.content, form, None).into_owned(),
-                };
-                normalized.push((content, id));
+                }));
             } else {
-                raw.push((token.content.clone(), id));
+                raw.push(added(token.content.clone()));
             }
         }
         raw.sort();
@@ -1656,6 +1806,26 @@ impl NativeEncoder {
                  own encoder reads with another word class: {pattern}"
             )));
         }
+        // The one stage of this path runs over a unit of the thread pool as
+        // over the text between two specials, and would read the unit's
+        // bounds as the text's: a pattern anchored to its text is declined
+        // on this path (see `Self::check_anchors`).
+        if parsed.anchored() {
+            return Err(Declined::from(format!(
+                "a split pattern anchored to its text (\\A, \\z or \\G): {pattern}"
+            )));
+        }
+        // The file's own encoder reads a `+` after a bare interval as a
+        // possessive mark (one interval, nothing given back), where the
+        // subset reads it as the Hugging Face engine does (a repeat of the
+        // interval): a pattern with one inside the lookahead is declined on
+        // this path.
+        if parsed.repeats_bare_interval() {
+            return Err(Declined::from(format!(
+                "a split pattern with a `+` after a bare interval, which the file's own encoder \
+                 reads as a possessive mark: {pattern}"
+            )));
+        }
         if let Some((content, _)) = specials.iter().find(|(content, _)| content.is_empty()) {
             return Err(Declined::from(format!(
                 "special token {content:?} without content"
@@ -1690,14 +1860,20 @@ impl NativeEncoder {
         let stages = vec![Stage {
             pattern: parsed,
             pieces: Pieces::Matches,
+            digits: false,
         }];
         let chain = chain::Scanner::recognize(&stages);
+        let specials: Vec<Added> = specials
+            .iter()
+            .map(|(content, id)| Added::plain(content.clone(), *id))
+            .collect();
         Ok(Self {
             normalizer: Normalizer::None,
-            raw_added: AddedTokens::build(specials)?,
+            raw_added: AddedTokens::build(&specials)?,
             normalized_added: None,
             nfc_quick: None,
             end_anchored: false,
+            mapped_from: None,
             stages,
             chain,
             frame: Frame::default(),
@@ -1727,9 +1903,10 @@ impl NativeEncoder {
     /// The stages of a pre-tokenizer that is zero or more `Split`s (or
     /// `Digits`, a split on numeric characters, or `Punctuation`s) around
     /// one `ByteLevel` without prefix space: those before it as they are,
-    /// those after it when they cut the text where they cut its byte-level
-    /// image.
-    fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
+    /// those after it over the raw text when they cut it where they cut its
+    /// byte-level image, else over the image itself (the index of the first
+    /// of them is the second half of the answer, see `mapped_from`).
+    fn stages_from(pre_tokenizer: &Value) -> Result<(Vec<Stage>, Option<usize>), Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
                 "no pre-tokenizer (the path needs a ByteLevel without a prefix space)",
@@ -1753,36 +1930,115 @@ impl NativeEncoder {
             })?;
         let mut stages = Vec::with_capacity(items.len());
         for split in &items[..at] {
-            stages.push(Self::split_stage(split)?);
+            let stage = Self::split_stage(split)?;
+            Self::check_anchors(&stage, &stages)?;
+            stages.push(stage);
         }
         if items[at].get("use_regex").and_then(Value::as_bool) == Some(true) {
             stages.push(Stage {
                 pattern: Pattern::parse(BYTE_LEVEL_PATTERN)
                     .ok_or_else(|| Declined::from("the ByteLevel split pattern"))?,
                 pieces: Pieces::MatchesAndGaps,
+                digits: false,
             });
         }
-        // A stage after the `ByteLevel` cuts the mapped text. It cuts the
-        // raw text at the same places when its pattern can only ever match
-        // or reject printable ASCII characters: the map leaves those in
-        // place and takes every other byte beyond ASCII. Such a stage moves
-        // before the map; any other declines.
+        // A stage after the `ByteLevel` cuts the mapped text. When every
+        // such stage's pattern can only ever match or reject printable
+        // ASCII characters, it cuts the raw text at the same places (the
+        // map leaves those in place and takes every other byte beyond
+        // ASCII), so the stages run over the raw text as the ones before
+        // the map do. Otherwise the stages after the map run over each
+        // piece's byte-level image, from the first of them on.
+        let after = stages.len();
         for split in &items[at + 1..] {
             let stage = Self::split_stage(split)?;
-            if !stage.pattern.within_printable_ascii() {
-                return Err(Declined::from(
-                    "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII",
-                ));
-            }
+            Self::check_anchors(&stage, &stages)?;
             stages.push(stage);
         }
-        Ok(stages)
+        let mapped_from = stages[after..]
+            .iter()
+            .any(|stage| !stage.pattern.within_printable_ascii())
+            .then_some(after);
+        // Over the image an ordinary text is one run of letters (a space
+        // maps to one), and the search passes over a failed run only when
+        // the program opens with it (see `Matches::next`): a stage whose
+        // program holds an unbounded run anywhere else would rescan that
+        // run from every start, so it is declined.
+        if let Some(from) = mapped_from {
+            if stages[from..]
+                .iter()
+                .any(|stage| stage.pattern.rescans_a_run())
+            {
+                return Err(Declined::from(
+                    "a pre-tokenizer stage over the byte-level image whose pattern rescans a run from every start",
+                ));
+            }
+        }
+        // A merged-with-next stage joins each match with the text after it
+        // (see `Pieces::walk`); the walk over the image takes matches and
+        // gaps apart, so such a stage among those over the image is declined
+        // (no covered vocabulary has one there). One after the `ByteLevel`
+        // still loads when every stage after the map stays within printable
+        // ASCII: those stages run over the raw text, where `pieces` glues it.
+        if let Some(from) = mapped_from {
+            if stages[from..]
+                .iter()
+                .any(|stage| stage.pieces == Pieces::MatchesWithNextGap)
+            {
+                return Err(Declined::from(
+                    "a merged-with-next pre-tokenizer stage over the byte-level image",
+                ));
+            }
+        }
+        Ok((stages, mapped_from))
+    }
+
+    /// A stage anchored to its text (`\A`, `\z` or `\G`) reads the bounds of
+    /// the piece the stage before it cut, and where its search in that piece
+    /// began, as the reference runs it ([`Self::pieces`] runs every stage
+    /// over the pieces of the one before). Three things keep it honest: the
+    /// first stage runs over a unit of the thread pool as over the text, and
+    /// would read the unit's bounds as the text's; the pool's cut check runs
+    /// every stage over a window of the text instead of over pieces
+    /// ([`Self::piece_starts_at`]), which stays right only when the stage's
+    /// matches are runs of decimal digits, which neither span nor start at a
+    /// cut candidate (a space); and the stage's own input pieces must meet
+    /// the same bounds in a unit as in the text, which a gap of an earlier
+    /// stage that holds digits and spans a cut would not (it ends at the
+    /// unit's end, where the text goes on): after a `Digits` split every
+    /// piece that holds a decimal digit lies inside a run of numeric
+    /// characters, which holds no whitespace and so spans no cut candidate,
+    /// and the stages after it only cut pieces finer. An anchored first
+    /// stage, an anchored stage over anything but decimal digits and an
+    /// anchored stage without a `Digits` split before it decline.
+    fn check_anchors(stage: &Stage, earlier: &[Stage]) -> Result<(), Declined> {
+        if !stage.pattern.anchored() {
+            return Ok(());
+        }
+        if earlier.is_empty() {
+            return Err(Declined::from(
+                "a first split pattern anchored to its text (\\A, \\z or \\G)",
+            ));
+        }
+        if !stage.pattern.decimal_digits_only() {
+            return Err(Declined::from(
+                "a split pattern anchored to its text (\\A, \\z or \\G) over more than decimal \
+                 digits",
+            ));
+        }
+        if !earlier.iter().any(|stage| stage.digits) {
+            return Err(Declined::from(
+                "a split pattern anchored to its text (\\A, \\z or \\G) without a Digits split \
+                 before it",
+            ));
+        }
+        Ok(())
     }
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
-    /// `Isolated`, `Removed`, or `Removed` inverted. A `Digits` is the
-    /// `Isolated` split on numeric characters, each one a piece under
-    /// `individual_digits`, else each run: the reference splits on
+    /// `Isolated`, `Removed`, `Removed` inverted, or `MergedWithNext`. A
+    /// `Digits` is the `Isolated` split on numeric characters, each one a
+    /// piece under `individual_digits`, else each run: the reference splits on
     /// `char::is_numeric`, the toolchain's numeric set
     /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
     /// regex engine's Unicode version). A `Punctuation` is the `Isolated`
@@ -1805,6 +2061,7 @@ impl NativeEncoder {
                     .map(|pattern| Stage {
                         pattern,
                         pieces: Pieces::MatchesAndGaps,
+                        digits: true,
                     })
                     .ok_or_else(|| Declined::from("the Digits split pattern"));
             }
@@ -1823,6 +2080,7 @@ impl NativeEncoder {
                     .map(|pattern| Stage {
                         pattern,
                         pieces: Pieces::MatchesAndGaps,
+                        digits: false,
                     })
                     .ok_or_else(|| Declined::from("the Punctuation split pattern"));
             }
@@ -1854,10 +2112,11 @@ impl NativeEncoder {
             (Some("Isolated"), Some(false)) => Pieces::MatchesAndGaps,
             (Some("Removed"), Some(false)) => Pieces::Gaps,
             (Some("Removed"), Some(true)) => Pieces::Matches,
+            (Some("MergedWithNext"), Some(false)) => Pieces::MatchesWithNextGap,
             (behavior, invert) => {
                 return Err(Declined::from(format!(
                     "Split behavior {behavior:?} with invert {invert:?} (only Isolated, Removed, \
-                     or Removed inverted)"
+                     Removed inverted, or MergedWithNext)"
                 )))
             }
         };
@@ -1866,7 +2125,11 @@ impl NativeEncoder {
                 "a split pattern outside the supported regex subset: {regex}"
             ))
         })?;
-        Ok(Stage { pattern, pieces })
+        Ok(Stage {
+            pattern,
+            pieces,
+            digits: false,
+        })
     }
 
     /// The ids of `text`, framed by the post-processor's special tokens when
@@ -2169,8 +2432,10 @@ impl NativeEncoder {
             return (from.max(1)..text.len()).find(|&p| chars.cuts_at(bytes, p));
         }
         // A stage that reads the end of the text (`$`) would read the
-        // window's end as one: no cut, the text stays one unit.
-        if self.stages.is_empty() || self.end_anchored {
+        // window's end as one, and the cut check's window is read in the
+        // raw text while a stage over the byte-level image cuts elsewhere:
+        // no cut, the text stays one unit.
+        if self.stages.is_empty() || self.end_anchored || self.mapped_from.is_some() {
             return None;
         }
         let bytes = text.as_bytes();
@@ -2284,9 +2549,21 @@ impl NativeEncoder {
         // its static callback; any other shape walks, a lone `Removed`
         // stage among them (its matches are no pieces: the scanner loop
         // stays the loop of a stage whose matches are).
-        match (&self.chain, self.stages.as_slice()) {
-            (Some(chain), _) => {
-                chain.pieces(text, &mut |start, end| {
+        match (&self.chain, self.stages.as_slice(), self.mapped_from) {
+            (_, _, Some(from)) => {
+                // The stages from `mapped_from` on run over each piece's
+                // byte-level image; a final piece is a byte range of the
+                // unit, not always a `str`.
+                let mut image = String::new();
+                let mut per_piece = |piece: &[u8]| {
+                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                        fallback = Some(declined);
+                    }
+                };
+                self.pieces_mapping(0, from, text, &mut image, &mut per_piece);
+            }
+            (Some(chain), _, None) => {
+                chain.pieces(text, words, &mut |start, end| {
                     if let Err(declined) =
                         self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
                     {
@@ -2294,16 +2571,20 @@ impl NativeEncoder {
                     }
                 });
             }
-            (None, [stage]) if stage.pieces.matches() => {
+            (None, [stage], None)
+                if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
+            {
                 if let Err(declined) =
                     self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
                 {
                     fallback = Some(declined);
                 }
             }
-            (None, _) => {
+            (None, _, None) => {
                 let mut per_piece = |piece: &str| {
-                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                    if let Err(declined) =
+                        self.tokenize_piece(model, piece.as_bytes(), mapped, ids, cache)
+                    {
                         fallback = Some(declined);
                     }
                 };
@@ -2324,18 +2605,151 @@ impl NativeEncoder {
             f(text);
             return;
         };
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                // Each match takes the text after it up to the next match or
+                // the end; the text before the first match stands alone, and
+                // a text without a match is one piece.
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(from) => self.pieces(depth + 1, &text[from..start], f),
+                        None if start > 0 => self.pieces(depth + 1, &text[..start], f),
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                self.pieces(depth + 1, &text[merged.unwrap_or(0)..], f);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.pieces.gaps() && cursor < start {
+            if gaps && cursor < start {
                 self.pieces(depth + 1, &text[cursor..start], f);
             }
-            if stage.pieces.matches() {
+            if matches {
                 self.pieces(depth + 1, &text[start..end], f);
             }
             cursor = end;
         }
-        if stage.pieces.gaps() && cursor < text.len() {
+        if gaps && cursor < text.len() {
             self.pieces(depth + 1, &text[cursor..], f);
+        }
+    }
+
+    /// [`Self::pieces`] for a chain with stages over the byte-level image
+    /// from the stage `from` on ([`Self::mapped_from`]): the stages before
+    /// it run over the raw text as there; at it each piece is mapped into
+    /// `image` once and the rest run over the image
+    /// ([`Self::pieces_in_alphabet`]). `f` takes each final piece's raw
+    /// bytes: a cut inside a multi-byte character is one the reference
+    /// makes too, so a piece is not always a `str`.
+    fn pieces_mapping<F: FnMut(&[u8])>(
+        &self,
+        depth: usize,
+        from: usize,
+        text: &str,
+        image: &mut String,
+        f: &mut F,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if depth >= from {
+            image.clear();
+            image.extend(text.bytes().map(|b| self.alphabet[usize::from(b)]));
+            self.pieces_in_alphabet(depth, image, text.as_bytes(), f);
+            return;
+        }
+        let stage = &self.stages[depth];
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                // As in `pieces`: each match takes the text after it up to
+                // the next match or the end; the text before the first
+                // match stands alone, and a text without a match is one
+                // piece.
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(at) => {
+                            self.pieces_mapping(depth + 1, from, &text[at..start], image, f);
+                        }
+                        None if start > 0 => {
+                            self.pieces_mapping(depth + 1, from, &text[..start], image, f);
+                        }
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                self.pieces_mapping(depth + 1, from, &text[merged.unwrap_or(0)..], image, f);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
+        let mut cursor = 0;
+        for (start, end) in stage.pattern.find_iter(text) {
+            if gaps && cursor < start {
+                self.pieces_mapping(depth + 1, from, &text[cursor..start], image, f);
+            }
+            if matches {
+                self.pieces_mapping(depth + 1, from, &text[start..end], image, f);
+            }
+            cursor = end;
+        }
+        if gaps && cursor < text.len() {
+            self.pieces_mapping(depth + 1, from, &text[cursor..], image, f);
+        }
+    }
+
+    /// Applies the stages from `depth` on to `image`, the byte-level image
+    /// of `raw` (one alphabet character per byte, in order), calling `f`
+    /// with each final piece's raw bytes: a match's bounds in characters of
+    /// the image are its bounds in bytes of the raw text.
+    fn pieces_in_alphabet<F: FnMut(&[u8])>(
+        &self,
+        depth: usize,
+        image: &str,
+        raw: &[u8],
+        f: &mut F,
+    ) {
+        debug_assert_eq!(image.chars().count(), raw.len());
+        if raw.is_empty() {
+            return;
+        }
+        let Some(stage) = self.stages.get(depth) else {
+            f(raw);
+            return;
+        };
+        // `stages_from` declines a merged-with-next stage among those over
+        // the image, so the walk over the image takes the pieces apart.
+        let Walk::Apart { gaps, matches } = stage.pieces.walk() else {
+            debug_assert!(false, "a merged-with-next stage over the byte-level image");
+            f(raw);
+            return;
+        };
+        let mut cursor = 0;
+        let mut raw_cursor = 0;
+        for (start, end) in stage.pattern.find_iter(image) {
+            let raw_start = raw_cursor + image[cursor..start].chars().count();
+            let raw_end = raw_start + image[start..end].chars().count();
+            if gaps && cursor < start {
+                self.pieces_in_alphabet(
+                    depth + 1,
+                    &image[cursor..start],
+                    &raw[raw_cursor..raw_start],
+                    f,
+                );
+            }
+            if matches {
+                self.pieces_in_alphabet(depth + 1, &image[start..end], &raw[raw_start..raw_end], f);
+            }
+            cursor = end;
+            raw_cursor = raw_end;
+        }
+        if gaps && cursor < image.len() {
+            self.pieces_in_alphabet(depth + 1, &image[cursor..], &raw[raw_cursor..], f);
         }
     }
 
@@ -2362,14 +2776,14 @@ impl NativeEncoder {
     fn tokenize_piece(
         &self,
         model: Option<&ModelWrapper>,
-        piece: &str,
+        piece: &[u8],
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         // The hot path of a warm encode, and nothing else in this function:
         // the key of a short piece and the packed table's probe.
-        let vacancy = match ShortPieceKey::of(piece.as_bytes()) {
+        let vacancy = match ShortPieceKey::of(piece) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return Ok(()),
                 vacancy => vacancy,
@@ -2399,7 +2813,7 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let gaps = stage.pieces.gaps();
+        let gaps = matches!(stage.pieces.walk(), Walk::Apart { gaps: true, .. });
         let mut cursor = 0;
         let mut fallback = None;
         // The probe compiles into the scanner's loop. As a closure of its
@@ -2458,7 +2872,7 @@ impl NativeEncoder {
             },
             None => None,
         };
-        self.tokenize_piece_slow(model, &text[piece], vacancy, mapped, ids, cache)
+        self.tokenize_piece_slow(model, &text.as_bytes()[piece], vacancy, mapped, ids, cache)
     }
 
     /// [`Self::tokenize_piece_at`] for a gap between two matches of a
@@ -2485,13 +2899,12 @@ impl NativeEncoder {
     fn tokenize_piece_slow(
         &self,
         model: Option<&ModelWrapper>,
-        piece: &str,
+        bytes: &[u8],
         vacancy: Option<Vacancy>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let bytes = piece.as_bytes();
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
         if vacancy.is_none() && cacheable {
             if let Some(found) = cache.get(bytes) {

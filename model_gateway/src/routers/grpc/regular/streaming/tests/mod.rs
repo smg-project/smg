@@ -20,7 +20,7 @@ mod thinking_display;
 mod usage;
 mod usage_chunk;
 
-use super::*;
+use super::{frames::TextDelta, *};
 
 /// The frames write exactly the bytes of the serialized whole chunk
 /// structs, so a field added to a struct turns up here, not on the wire
@@ -41,23 +41,37 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
             logprobs: None,
             finish_reason: Some("stop".to_string()),
         };
-        let frame = CompletionChunkFrame::new("cmpl-1", "model-x", 1_700_000_000, fingerprint);
-        let mut buffer = BytesMut::new();
-        frame.write_chunk(&mut buffer, &choice);
         let whole = CompletionStreamResponse {
             id: "cmpl-1".to_string(),
             object: "text_completion".to_string(),
             created: 1_700_000_000,
-            choices: vec![choice],
+            choices: vec![choice.clone()],
             model: "model-x".to_string(),
             system_fingerprint: fingerprint.map(str::to_string),
             usage: None,
         };
-        assert_eq!(
-            event(&buffer),
-            serde_json::to_vec(&whole).unwrap(),
-            "completion, fingerprint {fingerprint:?}"
-        );
+        for usage_null_placeholder in [false, true] {
+            let frame = CompletionChunkFrame::new(
+                "cmpl-1",
+                "model-x",
+                1_700_000_000,
+                fingerprint,
+                usage_null_placeholder,
+            );
+            let mut buffer = BytesMut::new();
+            frame.write_chunk(&mut buffer, &choice);
+            // The placeholder goes where a serialized `usage` would: last.
+            let mut expected = serde_json::to_vec(&whole).unwrap();
+            if usage_null_placeholder {
+                expected.pop();
+                expected.extend_from_slice(b",\"usage\":null}");
+            }
+            assert_eq!(
+                event(&buffer),
+                expected,
+                "completion, fingerprint {fingerprint:?}, placeholder {usage_null_placeholder}"
+            );
+        }
 
         let choice = assistant_choice(0, Some("tok".to_string()), None, None);
         let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, fingerprint);
@@ -290,7 +304,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
             },
         ));
     }
-    let usage = serde_json::to_value(tracker.snapshot(0)).unwrap();
+    let usage = serde_json::to_value(tracker.snapshot(0, None)).unwrap();
     assert_eq!(usage["prompt_tokens"], 10);
     assert_eq!(usage["completion_tokens"], 9);
     assert_eq!(usage["total_tokens"], 19);
@@ -307,7 +321,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 3,
         ..Default::default()
     }));
-    let usage = tracker.snapshot(0);
+    let usage = tracker.snapshot(0, None);
     assert_eq!(usage.completion_tokens, 10);
     let details = usage.completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(2));
@@ -321,7 +335,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 1,
         ..Default::default()
     }));
-    let details = tracker.snapshot(0).completion_tokens_details.unwrap();
+    let details = tracker.snapshot(0, None).completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(3));
     assert_eq!(details.rejected_prediction_tokens, Some(1));
 }
@@ -340,7 +354,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             },
         ));
     }
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
     tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
         proto::GenerateComplete {
             prompt_tokens: 10,
@@ -348,7 +362,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             ..Default::default()
         },
     )));
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
 }
 
 /// Wire contract: cache counters serialize as integer zeros, never null,
@@ -614,5 +628,77 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
     assert_eq!(
         formatted(&stop),
         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"
+    );
+}
+
+/// The chat writer stops at the flush bound and resumes: a step of many
+/// events (content and reasoning in turns, since consecutive content events
+/// merge on push) is written by calls that each return at the bound, the
+/// caller splitting the frame off between them, and the frames hold every
+/// event's text in order, each frame at most the bound plus the event that
+/// crossed it.
+#[test]
+fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
+    const EVENTS: usize = 600;
+    const ONE_EVENT: usize = 1024;
+    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
+    let texts: Vec<String> = (0..EVENTS)
+        .map(|i| {
+            format!(
+                "{}{i:04}-{}",
+                if i % 2 == 0 { 'c' } else { 'r' },
+                "x".repeat(40)
+            )
+        })
+        .collect();
+    let mut events = Events::new();
+    for (i, text) in texts.iter().enumerate() {
+        let text = symphony::event::Text::new(text.as_str(), 1);
+        if i % 2 == 0 {
+            events.push(Event::Content(text));
+        } else {
+            events.push(Event::Reasoning(text));
+        }
+    }
+    let mut buffer = BytesMut::new();
+    let mut logprobs = None;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut pending = events.consume();
+    while StreamingProcessor::write_events(
+        &mut buffer,
+        &frame,
+        0,
+        &mut pending,
+        &mut logprobs,
+        None,
+        false,
+    ) {
+        assert!(
+            buffer.len() >= CHUNK_FLUSH_BYTES && buffer.len() < CHUNK_FLUSH_BYTES + ONE_EVENT,
+            "the writer returned at the bound: {} bytes",
+            buffer.len()
+        );
+        frames.push(buffer.split().to_vec());
+    }
+    drop(pending);
+    frames.push(buffer.split().to_vec());
+    assert!(
+        frames.len() > 2,
+        "the step left in more than two frames: {}",
+        frames.len()
+    );
+    let all: Vec<u8> = frames.concat();
+    let mut at = 0;
+    for text in &texts {
+        let found = all[at..]
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .unwrap_or_else(|| panic!("{text} missing or out of order"));
+        at += found + text.len();
+    }
+    assert_eq!(
+        all.windows(6).filter(|&window| window == b"data: ").count(),
+        EVENTS,
+        "every event left exactly once across the flushes"
     );
 }
