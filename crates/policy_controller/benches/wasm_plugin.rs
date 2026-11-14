@@ -1,9 +1,11 @@
 //! The WebAssembly plugin host's cost per decision: a profile whose filter,
 //! scorer and picker are one plugin, over the record and the packed world,
-//! at 8, 64 and 512 candidates, on a kept instance and without one (every
-//! decision instantiates); the fuel-exhaustion latency of a guest that
-//! spins; one lifecycle event; and the same profile out of built-in stages
-//! as the floor. Ids: `policy_wasm/decide/<world>/<n>`,
+//! at 8, 64 and 512 candidates, on a kept instance, on a kept instance with
+//! the affinity column fed (both worlds' fills then read each row's entry
+//! of it) and without an instance (every decision instantiates); the
+//! fuel-exhaustion latency of a guest that spins; one lifecycle event; and
+//! the same profile out of built-in stages as the floor. Ids:
+//! `policy_wasm/decide/<world>/<n>`, `policy_wasm/decide_held/<world>/<n>`,
 //! `policy_wasm/decide_fresh/<world>/<n>`, `policy_wasm/fuel_exhausted/<n>`,
 //! `policy_wasm/observe/<world>` and `policy_wasm/native/<n>`. The guests
 //! are the test guests, assembled at bench start.
@@ -12,6 +14,8 @@
     reason = "a bench's setup has no caller to answer; a guest that fails to load is a bug the tests catch"
 )]
 
+#[path = "common/column.rs"]
+mod column;
 #[expect(
     dead_code,
     reason = "the native floor is the guest's own shape out of built-ins, not a preset"
@@ -26,6 +30,7 @@ mod guest;
 
 use std::{hint::black_box, sync::Arc};
 
+use column::build_column;
 use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use smg_policy_controller::{
@@ -164,6 +169,71 @@ fn decide(c: &mut Criterion) {
             ),
             (0, 0, 0, 0, 0),
             "{world}: the honest guest answered every call of every decision: {stats:?}"
+        );
+    }
+    group.finish();
+}
+
+/// The kept-instance decision with the affinity column fed: each world's
+/// fill reads a row and the row's entry of the column.
+fn decide_held(c: &mut Criterion) {
+    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let mut group = c.benchmark_group("policy_wasm/decide_held");
+    for (world, component) in worlds() {
+        let plugin = plugin(
+            &runtime,
+            world,
+            component,
+            vec![guest::mode::LEAST_IN_FLIGHT],
+        );
+        let engine = plugin_engine(&plugin);
+        for &n in &SIZES {
+            let fleet = fleet(n);
+            let mut view = Vec::with_capacity(n);
+            build_view(&fleet, &mut view);
+            let mut held = Vec::with_capacity(n);
+            build_column(&fleet, &mut held);
+            let mut scratch = Scratch::new();
+            let pool = PoolFacts {
+                pool_size: n as u32,
+                generation: 1,
+                ..PoolFacts::default()
+            };
+            let cx = Constraints::default();
+            // A column of another length is refused before the plugin is
+            // called: the cell would time the refusal.
+            let first = RequestFacts {
+                affinity: &held,
+                ..facts(0)
+            };
+            let first = engine.decide(&first, &pool, &view, &cx, &mut scratch);
+            assert!(
+                first.pick().is_some(),
+                "{world}/{n}: the decision picks a worker"
+            );
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(BenchmarkId::new(world, n), &n, |b, _| {
+                let mut seed = 0u64;
+                b.iter(|| {
+                    seed += 1;
+                    let facts = RequestFacts {
+                        affinity: black_box(&held),
+                        ..facts(seed)
+                    };
+                    engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+                });
+            });
+        }
+        let stats = plugin.stats();
+        assert_eq!(
+            (
+                stats.traps,
+                stats.fuel_exhausted,
+                stats.invalid,
+                stats.declined
+            ),
+            (0, 0, 0, 0),
+            "{world}: the honest guest answered every call: {stats:?}"
         );
     }
     group.finish();
@@ -316,6 +386,7 @@ fn native(c: &mut Criterion) {
 criterion_group!(
     benches,
     decide,
+    decide_held,
     decide_fresh,
     fuel_exhausted,
     observe,

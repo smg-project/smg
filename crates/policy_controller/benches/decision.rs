@@ -2,15 +2,18 @@
 //! build cost over several layouts of the candidate row, side by side in one
 //! binary, read on the pull-request gate's runner.
 //!
-//! The gate builds both of its sides from this file over the crate as it
-//! stands, so the real row cannot differ a side. The layouts are therefore
-//! MODELS: row types local to this file, their offsets pinned, walked by a
-//! copy of the engine's filter stage (one call a filter a decision, the test
-//! inlined, the survivors kept by position), of its passthrough pick and of
-//! its trace pass, and written field by field in place with what the bench's
-//! view build writes. The model of the row as it stands is checked against
-//! the real row at start, and the engine's own ids for it are kept beside the
-//! model as its test: `policy_engine/view_build/<n>` and
+//! The gate builds both of its sides from this file, so one binary holds one
+//! real row: the row as it stands (128 bytes) on the base side, the row
+//! without its five affinity words (104 bytes) on this branch. The other
+//! layouts are therefore MODELS: row types local to this file, their offsets
+//! pinned, walked by a copy of the engine's filter stage (one call a filter a
+//! decision, the test inlined, the survivors kept by position), of its
+//! passthrough pick and of its trace pass, and written field by field in
+//! place with what the bench's view build writes. At start the model of the
+//! binary's own real row is checked against that row, and the engine's own
+//! ids are kept beside the models as their test: by them one run reads the
+//! real 128 against the real 104 beside the model's 128 against its 104.
+//! They are `policy_engine/view_build/<n>` and
 //! `policy_engine/decide/<preset>/<n>` for three presets.
 //!
 //! Probe ids, every row buffer on a page's start:
@@ -33,6 +36,8 @@
 )]
 
 mod common;
+#[path = "common/placed.rs"]
+mod placed;
 
 use std::{
     hint::black_box,
@@ -45,6 +50,7 @@ use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
     Throughput,
 };
+use placed::page_start_buffer;
 use smg_policy_controller::{
     Candidate, Constraints, Health, LoadRow, PoolFacts, RequestFacts, Scratch, SignalSource,
     WorkerId,
@@ -61,7 +67,10 @@ fn view_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/view_build");
     for &n in &SIZES {
         let fleet = fleet(n);
-        let mut out = Vec::with_capacity(n);
+        // Where a page boundary falls in the rows' buffer is an input of
+        // the build's time (`placed`): the timed buffer stands on a page's
+        // start, on both sides of the gate.
+        let mut out = page_start_buffer(n);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
@@ -499,33 +508,44 @@ row_layout!(
     }
 );
 
-/// The model of the row as it stands is the real row: the same size, and the
-/// same place for every field a walk reads. A change of the real row stops
+/// Where the real row holds what a walk reads, in the order of
+/// [`Row::OFFSETS`].
+const REAL: [usize; 6] = [
+    offset_of!(Candidate, health),
+    offset_of!(Candidate, id),
+    offset_of!(Candidate, load_sampled_at_micros),
+    offset_of!(Candidate, in_flight),
+    offset_of!(Candidate, load),
+    offset_of!(Candidate, position),
+];
+
+/// The binary's own real row is one of the two the probe models, and its
+/// model has the same size and the same place for every field a walk reads:
+/// `m128` on the base side, `h104` on this branch. Another real row stops
 /// the probe here.
+#[expect(
+    clippy::print_stderr,
+    reason = "the probe's log is where its cells are read from"
+)]
 fn the_model_is_the_real_row() {
-    assert_eq!(size_of::<M128>(), size_of::<Candidate>());
+    let real = size_of::<Candidate>();
+    eprintln!(
+        "PROBE real row: {real} bytes, flags at {}: the engine's own ids of this binary read it",
+        REAL[0]
+    );
+    let model = if real == size_of::<M128>() {
+        M128::OFFSETS
+    } else {
+        assert_eq!(
+            real,
+            size_of::<H104>(),
+            "the real row is neither of the two the probe models"
+        );
+        H104::OFFSETS
+    };
     assert_eq!(
-        [
-            offset_of!(M128, health),
-            offset_of!(M128, id),
-            offset_of!(M128, load_sampled_at_micros),
-            offset_of!(M128, in_flight),
-            offset_of!(M128, load),
-            offset_of!(M128, position),
-            offset_of!(M128, dp_rank),
-            offset_of!(M128, key),
-        ],
-        [
-            offset_of!(Candidate, health),
-            offset_of!(Candidate, id),
-            offset_of!(Candidate, load_sampled_at_micros),
-            offset_of!(Candidate, in_flight),
-            offset_of!(Candidate, load),
-            offset_of!(Candidate, position),
-            offset_of!(Candidate, dp_rank),
-            offset_of!(Candidate, key),
-        ],
-        "the model of the row as it stands has the real row's offsets"
+        model, REAL,
+        "the model of this binary's real row has the real row's offsets"
     );
 }
 
@@ -536,15 +556,16 @@ const PAGE: usize = 4096;
 
 /// How often the allocator is asked: it hands out every 16th byte of a page
 /// in turn, and a later placement of one size is handed the earlier one's
-/// rejects first, so a size placed four times needs a thousand asks.
+/// rejects first, so a size placed four times needs a thousand asks. The
+/// bench's own helper (`placed`) stops at that; the probe places one size
+/// more often.
 const ASKS: usize = 4_096;
 
-/// A buffer of capacity `n` that starts on a page's start. The allocator is
-/// asked until it hands such an address; a reject stays allocated until the
-/// end, so each ask gets another address. Nothing is timed in a buffer that
-/// is not placed: when no ask of the bound lands on a page's start the probe
-/// stops here.
-fn page_start_buffer<T>(n: usize) -> Vec<T> {
+/// A buffer of capacity `n` that starts on a page's start, as the bench's
+/// `placed` helper hands one, under the wider bound. Nothing is timed in a
+/// buffer that is not placed: when no ask of the bound lands on a page's
+/// start the probe stops here.
+fn probe_buffer<T>(n: usize) -> Vec<T> {
     let mut rejects = Vec::new();
     let mut buffer = Vec::<T>::with_capacity(n);
     for _ in 1..ASKS {
@@ -961,7 +982,7 @@ fn typed<R: Row>(c: &mut Criterion) {
         let fleet = fleet(n);
         let healthy = fleet.iter().filter(|w| w.healthy).count() as u32;
         let first = fleet.iter().position(|w| w.healthy).map(|i| i as u32);
-        let mut rows: Vec<R> = page_start_buffer(n);
+        let mut rows: Vec<R> = probe_buffer(n);
         for (i, w) in fleet.iter().enumerate() {
             rows.push(R::fill(i as u32, w));
         }
@@ -1083,7 +1104,7 @@ fn raw(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/probe_raw");
     short(&mut group);
     for stride in [128usize, 112, 104, 96, 8] {
-        let mut rows: Vec<u8> = page_start_buffer(stride * n);
+        let mut rows: Vec<u8> = probe_buffer(stride * n);
         for &(_, at, second) in RAW.iter().filter(|(s, _, _)| *s == stride) {
             let place = Place {
                 stride,
