@@ -499,7 +499,7 @@
       "additionalProperties": false
     },
     "KvPressureParams": {
-      "description": "The KV-pressure scorer: the fleet's KV-usage spread past which affinity\nyields to load, and the per-candidate ceiling above which the hottest\ncandidate is de-ranked.",
+      "description": "The KV-pressure gate: the fleet's KV-usage spread, or the usage the\nhottest candidate crosses, past which the profile's affinity stages\nyield to load. The stage orders nothing itself.",
       "type": "object",
       "properties": {
         "weight": {
@@ -519,7 +519,7 @@
           "exclusiveMinimum": 0
         },
         "ceiling": {
-          "description": "The usage ceiling above which a candidate is de-ranked; above zero,\n1 and above switches the rule off (default 1).",
+          "description": "The usage the hottest candidate crosses for affinity to yield to\nload; above zero, 1 and above switches the rule off (default 1).",
           "type": [
             "number",
             "null"
@@ -587,6 +587,16 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "miss_share": {
+          "description": "The index overlap share at or under which a hit counts as a miss\nfor the slice; between 0 and 1 (default 0.3, the affinity\nthreshold's).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
         }
       },
       "additionalProperties": false

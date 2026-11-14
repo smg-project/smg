@@ -30,6 +30,7 @@ use crate::{
     config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
     routers::grpc::context::WorkerSelection,
+    server::http_client,
     worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
 };
 
@@ -96,7 +97,7 @@ pub(crate) fn grpc_ctx_from(
     Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::server::http_client())
+            .client(http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
             .tool_parser_factory(Some(ToolParserFactory::new()))
@@ -230,4 +231,20 @@ impl Tokenizer for ThreadRecordingTokenizer {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Bytes the current thread allocated while `f` ran: the allocator's own
+/// per-thread counter, read before and after (frees do not subtract). The
+/// lib's test binary runs under that allocator (`lib.rs`) wherever the
+/// executable does.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+pub(crate) fn bytes_allocated_during(f: impl FnOnce()) -> u64 {
+    let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().expect("thread.allocatedp");
+    let before = allocated.get();
+    f();
+    allocated.get() - before
 }

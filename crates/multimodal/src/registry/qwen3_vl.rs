@@ -432,7 +432,10 @@ mod tests {
     use crate::{
         encoder_inputs::ModelSpecificValue,
         media::FrameSampling,
-        registry::{test_helpers::*, MediaItemInfo, ModelMetadata, ModelRegistry},
+        registry::{
+            test_helpers::*, MediaItemInfo, ModelMetadata, ModelRegistry, ModelRegistryError,
+            Tokenizer,
+        },
         types::{FieldLayout, ImageSize, Modality, TokenId, VideoSamplingInfo},
         vision::PreProcessorConfig,
     };
@@ -695,7 +698,7 @@ mod tests {
     fn qwen3_vl_declares_images_without_a_count_of_its_own() {
         use std::collections::HashMap;
 
-        use crate::registry::{ModelProcessorSpec, ModelRegistryError};
+        use crate::registry::ModelProcessorSpec;
 
         let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
         let config = video_config("qwen3_vl");
@@ -744,7 +747,7 @@ mod tests {
     fn qwen3_vl_declares_video_without_a_count_of_its_own() {
         use std::collections::HashMap;
 
-        use crate::registry::{ModelProcessorSpec, ModelRegistryError};
+        use crate::registry::ModelProcessorSpec;
 
         let tokenizer = TestTokenizer::new(&[("<|video_pad|>", 151656)]);
         let config = video_config("qwen3_vl");
@@ -885,7 +888,7 @@ mod tests {
     /// Knows the family's markers but cannot encode plain text.
     struct NoTextTokenizer(TestTokenizer);
 
-    impl crate::registry::Tokenizer for NoTextTokenizer {
+    impl Tokenizer for NoTextTokenizer {
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.0.token_to_id(token)
         }
@@ -924,7 +927,7 @@ mod tests {
 
         assert_eq!(
             err,
-            crate::registry::ModelRegistryError::TextEncodingFailed {
+            ModelRegistryError::TextEncodingFailed {
                 spec: "qwen3_vl",
                 text: "<0.2 seconds>".to_string(),
             }

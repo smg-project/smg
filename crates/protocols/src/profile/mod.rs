@@ -179,6 +179,13 @@ impl ProviderProfile {
         registered.unwrap_or_else(|| Self::from_model_segments(model))
     }
 
+    /// Whether a model id selects the GLM-5.3-Flash Chat Completions
+    /// tool-reference syntax. Opaque model names can inherit the Flash contract
+    /// through the registered aliases.
+    pub fn supports_chat_tool_references(self, model: &str) -> bool {
+        self == Self::Zai && zai::is_glm53_flash(model)
+    }
+
     /// The thinking on/off preference the profile reads from a request's
     /// effective `reasoning_effort` (`thinking.effort`, else the top-level
     /// field) when the request states no `thinking.type`. The OpenAI reading
@@ -355,8 +362,13 @@ impl ProviderProfile {
         )
     }
 
-    /// The vendor a model id names in one of its `/`-separated segments.
+    /// The vendor a model id names in one of its `/`-separated segments,
+    /// read in one walk: the first segment naming a vendor decides; with
+    /// none, the id is OpenAI's own when a segment is OpenAI's and no
+    /// segment is `gpt-oss` (the rule of [`is_openai_vendor_model`]).
     fn from_model_segments(model: &str) -> Self {
+        let mut openai = false;
+        let mut gpt_oss = false;
         for segment in model.split('/') {
             if deepseek::matches_model(segment) {
                 return ProviderProfile::DeepSeek;
@@ -377,8 +389,10 @@ impl ProviderProfile {
             {
                 return ProviderProfile::Zai;
             }
+            gpt_oss = gpt_oss || starts_with_ignore_ascii_case(segment, "gpt-oss");
+            openai = openai || is_openai_segment(segment);
         }
-        if is_openai_vendor_model(model) {
+        if openai && !gpt_oss {
             return ProviderProfile::OpenAi;
         }
         ProviderProfile::Generic
@@ -563,6 +577,24 @@ fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut S
 /// requests through to the engine, whose grammar compiler decides what it can
 /// constrain, so the gateway does not refuse ahead of it.
 pub fn is_openai_vendor_model(model: &str) -> bool {
+    let mut openai = false;
+    for segment in model.split('/') {
+        // The open-weight gpt-oss models are served locally whatever route
+        // segment precedes or follows them: never the vendor's hosted
+        // contract.
+        if starts_with_ignore_ascii_case(segment, "gpt-oss") {
+            return false;
+        }
+        openai = openai || is_openai_segment(segment);
+    }
+    openai
+}
+
+/// One `/`-separated segment of a model id that is OpenAI's: the `openai`
+/// route segment, one of the hosted families' prefixes, or the reasoning
+/// series. The `gpt-oss` exception is the callers' to apply over the whole
+/// id, so the readers walk it once.
+fn is_openai_segment(segment: &str) -> bool {
     const PREFIXES: [&str; 6] = [
         "gpt-",
         "chatgpt-",
@@ -571,21 +603,11 @@ pub fn is_openai_vendor_model(model: &str) -> bool {
         "text-embedding-",
         "omni-moderation",
     ];
-    // The open-weight gpt-oss models are served locally whatever route
-    // segment precedes them: never the vendor's hosted contract.
-    if model
-        .split('/')
-        .any(|segment| starts_with_ignore_ascii_case(segment, "gpt-oss"))
-    {
-        return false;
-    }
-    model.split('/').any(|segment| {
-        segment.eq_ignore_ascii_case("openai")
-            || PREFIXES
-                .iter()
-                .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
-            || is_openai_reasoning_series(segment)
-    })
+    segment.eq_ignore_ascii_case("openai")
+        || PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
+        || is_openai_reasoning_series(segment)
 }
 
 /// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then
@@ -805,6 +827,7 @@ mod tests {
             "meta-llama/Llama-3.3-70B-Instruct",
             "openai/gpt-oss-120b",
             "gpt-oss-20b",
+            "gpt-4.1/gpt-oss-20b",
             "olmo-2",
             "o5",
             "m1",
@@ -874,6 +897,7 @@ mod tests {
         for model in [
             "",
             "/models/llama-3",
+            "gpt-4.1/gpt-oss-20b",
             "qwen3-8b",
             "Qwen/Qwen3-VL-8B-Instruct",
             "gpt-oss-20b",

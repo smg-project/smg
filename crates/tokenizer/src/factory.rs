@@ -4,6 +4,7 @@ use anyhow::{Error, Result};
 use tracing::debug;
 
 use crate::{
+    chat_template::{load_chat_template_from_file, ConfigChatTemplates},
     hub::download_tokenizer_from_hf,
     huggingface::HuggingFaceTokenizer,
     tekken,
@@ -330,15 +331,13 @@ pub(crate) fn processor_chat_template(
     });
     dir.filter(|_| checkpoints_own_template)
         .and_then(discover_processor_chat_template_in_dir)
-        .and_then(
-            |path| match crate::chat_template::load_chat_template_from_file(&path) {
-                Ok(template) => template,
-                Err(e) => {
-                    debug!("the processor's chat template at {path} does not load: {e}");
-                    None
-                }
-            },
-        )
+        .and_then(|path| match load_chat_template_from_file(&path) {
+            Ok(template) => template,
+            Err(e) => {
+                debug!("the processor's chat template at {path} does not load: {e}");
+                None
+            }
+        })
 }
 
 /// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
@@ -348,9 +347,7 @@ fn config_has_chat_template(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join("tokenizer_config.json"))
         .ok()
         .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .is_some_and(|config| {
-            crate::chat_template::ConfigChatTemplates::read(config.get("chat_template")).is_some()
-        })
+        .is_some_and(|config| ConfigChatTemplates::read(config.get("chat_template")).is_some())
 }
 
 /// Helper function to resolve and log chat template selection
@@ -636,6 +633,7 @@ mod tests {
         create_tokenizer_from_file, get_tokenizer_info, is_likely_json, is_likely_openai_model,
         TokenizerType,
     };
+    use crate::huggingface::QWEN2_PRETOKENIZE_REGEX;
 
     /// A checkpoint that ships `tekken.json` loads it ahead of the
     /// `tokenizer.json` conversion beside it, from a directory, from a Hub
@@ -857,7 +855,7 @@ mod tests {
                 "normalizer": {"type": "NFC"},
                 "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
                     {"type": "Split",
-                     "pattern": {"Regex": crate::huggingface::QWEN2_PRETOKENIZE_REGEX},
+                     "pattern": {"Regex": QWEN2_PRETOKENIZE_REGEX},
                      "behavior": "Isolated", "invert": false},
                     {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false,
                      "use_regex": false}

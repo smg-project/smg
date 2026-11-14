@@ -41,7 +41,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    worker::{registry::WorkerId, Worker},
+    worker::{registry::WorkerId, ConnectionMode, Worker},
 };
 
 // ============================================================================
@@ -140,7 +140,7 @@ pub struct WorkerWorkflowData {
     /// Determined by ClassifyWorkerTypeStep (Local or External).
     pub worker_kind: Option<WorkerKind>,
     // -- Local-only fields --
-    pub connection_mode: Option<crate::worker::ConnectionMode>,
+    pub connection_mode: Option<ConnectionMode>,
     /// HTTP workers: whether the router speaks HTTP/2 prior knowledge,
     /// resolved by DetectConnectionModeStep.
     #[serde(default)]

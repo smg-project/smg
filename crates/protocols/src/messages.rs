@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     marker::PhantomData,
+    sync::Arc,
 };
 
 use serde::{
@@ -16,6 +17,9 @@ use serde::{
 use serde_json::{Map, Value};
 use validator::Validate;
 
+/// The request rules that read the betas of the request beside its body
+/// ([`MessagesBetas`]), applied by the gateway's Messages handler.
+pub use crate::messages_validation::validate_with_betas;
 use crate::{
     chat::deserialize_reasoning_effort,
     common::{self, invalid, CachePartition, GenerationRequest},
@@ -127,6 +131,82 @@ impl Normalizable for CreateMessageRequest {
 pub enum MessageThread {
     Create,
     Continue { previous_message_id: String },
+}
+
+/// The betas a Messages request names in its `anthropic-beta` header, read
+/// once per request. The public API names a beta in its dated form,
+/// `name-YYYY-MM-DD`; the header may repeat, and each value may list several
+/// betas, comma separated. The set keeps the names: the rules that read it
+/// ([`validate_with_betas`]) ask whether a beta is named, and the request's
+/// raw headers reach the backend unchanged, dates and all. A token without
+/// the dated suffix names no beta, and a longer name that begins with a
+/// known one is another beta, not that one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessagesBetas {
+    names: Vec<String>,
+}
+
+impl MessagesBetas {
+    /// The beta under which `thinking.budget_tokens` may reach `max_tokens`.
+    pub const INTERLEAVED_THINKING: &'static str = "interleaved-thinking";
+    /// The beta a `thread` field needs.
+    pub const MESSAGE_THREADS: &'static str = "message-threads";
+
+    /// The set named by the header's values, each a comma-separated list.
+    pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            names: dated_beta_names(values).map(str::to_owned).collect(),
+        }
+    }
+
+    /// Whether the header's values name `name` in its dated form, read
+    /// without building the set.
+    pub fn values_name<'a>(values: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+        dated_beta_names(values).any(|named| named == name)
+    }
+
+    /// Whether the request names the beta `name`.
+    pub fn names(&self, name: &str) -> bool {
+        self.names.iter().any(|named| named == name)
+    }
+
+    /// Whether the interleaved-thinking beta is named.
+    pub fn interleaved_thinking(&self) -> bool {
+        self.names(Self::INTERLEAVED_THINKING)
+    }
+
+    /// Whether the message-threads beta is named.
+    pub fn message_threads(&self) -> bool {
+        self.names(Self::MESSAGE_THREADS)
+    }
+}
+
+/// `-YYYY-MM-DD`, the suffix a public beta's name ends with.
+const DATED_SUFFIX_LEN: usize = 11;
+
+/// The names of the dated betas in `values`, in their order.
+fn dated_beta_names<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> impl Iterator<Item = &'a str> {
+    values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| dated_beta_name(token.trim()))
+}
+
+/// `token` as `name-YYYY-MM-DD`: its name, or `None` when the token does not
+/// end with the dated suffix (the shape alone, not the calendar).
+fn dated_beta_name(token: &str) -> Option<&str> {
+    let bytes = token.as_bytes();
+    let at = bytes.len().checked_sub(DATED_SUFFIX_LEN)?;
+    let dated = bytes[at..].iter().enumerate().all(|(i, b)| {
+        if i == 0 || i == 5 || i == 8 {
+            *b == b'-'
+        } else {
+            b.is_ascii_digit()
+        }
+    });
+    (dated && at > 0 && token.is_char_boundary(at)).then(|| &token[..at])
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
@@ -675,8 +755,14 @@ pub struct ImageBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 { media_type: String, data: String },
-    Url { url: String },
+    /// Base64 text with its media type; the text is shared with the readers
+    /// that decode it, never re-encoded into a data URL.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
+    /// A URL or `data:` URL, shared with its readers.
+    Url { url: Arc<String> },
 }
 
 /// Document content block
@@ -1004,7 +1090,9 @@ pub enum Tool {
     /// it and falls through, while CustomTool JSON with "type" would incorrectly
     /// match ToolSearchTool's less-restrictive shape if tried first)
     Custom(CustomTool),
-    /// Tool search tool
+    /// Tool search tool, and every other Anthropic-defined tool: a tool with a
+    /// `type` and a `name` and no `input_schema` that reads as one reads here,
+    /// its configuration kept in [`ToolSearchTool::extra`].
     ToolSearch(ToolSearchTool),
     /// Bash tool (computer use)
     Bash(BashTool),
@@ -1665,6 +1753,34 @@ pub enum MessageStreamEvent {
     Ping,
     /// Error event
     Error { error: ErrorResponse },
+}
+
+impl MessageStreamEvent {
+    /// The events that close a streamed `thinking` block at `index` as the
+    /// public API closes one: a `signature_delta` just before the
+    /// `content_block_stop`, preceded by one empty `thinking_delta` when the
+    /// block's text was withheld (`thinking.display: omitted`). The gateway
+    /// has no signature to give, so the delta carries the empty string the
+    /// whole answer reports too.
+    pub fn thinking_block_close(index: u32, text_withheld: bool) -> impl Iterator<Item = Self> {
+        text_withheld
+            .then(|| Self::ContentBlockDelta {
+                index,
+                delta: ContentBlockDelta::ThinkingDelta {
+                    thinking: String::new(),
+                },
+            })
+            .into_iter()
+            .chain([
+                Self::ContentBlockDelta {
+                    index,
+                    delta: ContentBlockDelta::SignatureDelta {
+                        signature: String::new(),
+                    },
+                },
+                Self::ContentBlockStop { index },
+            ])
+    }
 }
 
 /// Message delta for streaming updates: the public API writes all four
@@ -2630,7 +2746,10 @@ pub enum WebFetchToolResultErrorCode {
 // Beta Features - Tool Search Types
 // ============================================================================
 
-/// Tool search tool (beta)
+/// Tool search tool (beta). The untagged [`Tool`] reads every
+/// Anthropic-defined tool (web search, web fetch, computer use, bash, the text
+/// editor, ...) as this one, so the keys those tools take beyond `type` and
+/// `name` ride in [`Self::extra`].
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolSearchTool {
@@ -2644,6 +2763,12 @@ pub struct ToolSearchTool {
 
     /// Cache control for this tool
     pub cache_control: Option<CacheControl>,
+
+    /// The tool's other keys (a web search tool's domain filters and use cap,
+    /// a computer tool's display size, `defer_loading`, `strict`, ...),
+    /// forwarded as written.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Tool reference block (beta) - returned by tool search
@@ -3590,6 +3715,44 @@ mod tests {
                 "Expected McpToolset, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    /// An Anthropic-defined tool reads as `ToolSearch` and is written back as
+    /// the client sent it, its configuration included: a web search tool's
+    /// domain filters, use cap and location, a web fetch tool's, a computer
+    /// tool's display size, a text editor's `max_characters`, and a bash
+    /// tool's `defer_loading`, `strict` and `input_examples`.
+    #[test]
+    fn an_anthropic_defined_tool_keeps_its_configuration() {
+        for tool in [
+            json!({
+                "type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["example.com"], "max_uses": 3,
+                "user_location": {"type": "approximate", "city": "Paris", "country": "FR"}
+            }),
+            json!({
+                "type": "web_fetch_20250910", "name": "web_fetch",
+                "blocked_domains": ["example.org"], "max_uses": 2,
+                "max_content_tokens": 1000, "citations": {"enabled": true}
+            }),
+            json!({
+                "type": "computer_20250124", "name": "computer",
+                "display_width_px": 1024, "display_height_px": 768, "display_number": 1
+            }),
+            json!({
+                "type": "text_editor_20250728", "name": "str_replace_based_edit_tool",
+                "max_characters": 10000
+            }),
+            json!({
+                "type": "bash_20250124", "name": "bash", "defer_loading": true,
+                "strict": true, "input_examples": [{"command": "ls"}]
+            }),
+        ] {
+            let parsed: Tool =
+                serde_json::from_value(tool.clone()).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(matches!(parsed, Tool::ToolSearch(_)), "{tool}");
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), tool);
         }
     }
 

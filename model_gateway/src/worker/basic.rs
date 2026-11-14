@@ -202,10 +202,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// its peers hold for the key, so the claim's publication outranks it.
     fn raise_revision_to(&self, _floor: u64) {}
 
-    /// Epochs reported during metadata discovery, invalidated after a health
-    /// failure. These are observations, not proof against an undetected restart.
-    fn cache_trace_epochs(&self) -> Vec<String> {
+    /// Epochs reported during metadata discovery, as the registration
+    /// advertises them: current only while
+    /// [`Self::cache_trace_epochs_valid`] holds. These are observations, not
+    /// proof against an undetected restart.
+    fn advertised_cache_trace_epochs(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Whether the advertised epochs are current: a health failure withdraws
+    /// them. The epochs' one live read: a routing-evidence row keeps this
+    /// bit where its pick runs and reads the advertised list when the
+    /// evidence is written.
+    fn cache_trace_epochs_valid(&self) -> bool {
+        false
     }
 
     /// Set the worker's lifecycle status.
@@ -217,6 +227,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// attached to a single shared runtime across the old and new objects.
     fn inherit_shared_state_from(&self, _other: &dyn Worker) -> bool {
         false
+    }
+
+    /// The runtime a stream of this worker notes its progress on, captured
+    /// once at the stream's start (see `TrackedStream`): the shared
+    /// [`WorkerRuntime`] every handle of the worker reaches, so the runtime's
+    /// own millisecond rule decides every note. `None` for a worker without
+    /// one, whose streams note through [`Self::note_token_progress_at`].
+    ///
+    /// A stream keeps noting the runtime it captured, so a worker's runtime
+    /// is not swapped once the worker can take a stream: the one swap,
+    /// [`Self::inherit_shared_state_from`], runs on a replacement before the
+    /// registry publishes it.
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        None
     }
 
     /// Check if the worker is currently healthy (status == Ready).
@@ -1562,16 +1586,17 @@ impl Worker for BasicWorker {
         self.runtime.load().raise_revision_to(floor);
     }
 
-    fn cache_trace_epochs(&self) -> Vec<String> {
-        if !self.runtime.load().cache_trace_epochs_valid() {
-            return Vec::new();
-        }
+    fn advertised_cache_trace_epochs(&self) -> Vec<String> {
         self.metadata
             .spec
             .labels
             .get("cache_trace_epochs")
             .and_then(|epochs| serde_json::from_str(epochs).ok())
             .unwrap_or_default()
+    }
+
+    fn cache_trace_epochs_valid(&self) -> bool {
+        self.runtime.load().cache_trace_epochs_valid()
     }
 
     fn set_status(&self, status: WorkerStatus) {
@@ -1754,6 +1779,10 @@ impl Worker for BasicWorker {
             self.publish_state();
         }
         changed
+    }
+
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        Some(self.runtime.load_full())
     }
 
     fn note_contact(&self) {

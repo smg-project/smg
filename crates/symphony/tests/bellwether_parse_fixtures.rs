@@ -282,6 +282,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // an older template without a thought; the recorded outputs follow the former.
     ("qwen-agentworld-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
+    // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
+    // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
+    // off.
+    ("mage-vl-cowork", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
@@ -360,11 +364,20 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("webworld-32b", GenerationPrompt::ModelWritesTheThought),
     ("webworld-14b", GenerationPrompt::ModelWritesTheThought),
     ("k-exaone-236b-a23b", GenerationPrompt::OpensTheThought),
+    // Youtu-Parsing-Omni writes Qwen3's thinking switch under turn headers of its own
+    // (`<|begin_of_text|>assistant\n`, the group's opener) and declares no tools; bellwether
+    // recorded one content case of it (the rest refused), and a thought the model writes is
+    // reasoning, as the switch says.
+    (
+        "youtu-parsing-omni",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
     ("nanbeige4.2-3b", GenerationPrompt::OpensTheThought),
+    ("nanbeige4.3-33b", GenerationPrompt::OpensTheThought),
     // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     ("mimo-v2.5", GenerationPrompt::ModelWritesTheThought),
     // The V2.6 line writes the same tags with no newline between them; the generation prompt
@@ -391,6 +404,21 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Keyed arguments, each family under its own markers; the prompt opens the thought, Hy4's
     // whatever the request says.
     ("hy4-preview", GenerationPrompt::AlwaysOpensTheThought),
+    // Hy V3 (Hy-Memory) writes Hy4's grammar under the plain markers, with K2-Horizon's newlines
+    // and `<tool_sep>` after the name; its prompt closes the thought unless the request's
+    // `reasoning_effort` asks for one.
+    (
+        "hy-memory-30b-a3b",
+        GenerationPrompt::OpensTheThoughtByEffort,
+    ),
+    // LongCat writes GLM 4.5 and 4.6's keyed spelling under `longcat_`-prefixed tags, each call
+    // bare after the content; its template writes the thinking switch into the user turn
+    // (`/think_on` under `enable_thinking`, `/think_off` otherwise, the default) and opens the
+    // thought in the prompt only when it is on (`<longcat_think>` alone), closing an empty one
+    // otherwise (the tail's newlines are not read, its markers are); bellwether's reference
+    // refused the thought-bearing probes, so the common set holds eleven of the sixteen cases
+    // and the turns set eight of the twelve.
+    ("longcat-2.5", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("ling-3.0-flash", GenerationPrompt::OpensTheThought),
     // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
     // whatever the request says (the template has no thinking switch).
@@ -456,6 +484,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
     // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    // OTel-2.0-LLM-31B-IT (a Gemma 4 stack) writes Gemma 4's template with a comment block added at
+    // the generation prompt and nothing else: the prompt is the turn's opener alone; the model
+    // writes `<|channel>thought` or not.
+    ("otel-2.0-llm-31b-it", GenerationPrompt::ModelDecides),
     // Nemotron 3.5 Bolt-E4B writes a Nemotron-modified Gemma 4 template: the prompt is the turn's opener
     // alone, and a request that turns thinking on puts `<|think|>` in a system turn instead.
     (
@@ -716,6 +748,7 @@ impl Recorded for Table {
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
+            Self::LongCat => ("<longcat_think>", "</longcat_think>"),
             Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
@@ -756,9 +789,9 @@ impl Recorded for Table {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::Qwen3TaggedDirect => KNOWN_TAGGED_DIFFERENCES,
             // Seed-OSS, Hy4, Olmo 3, Llama 4, xLAM, the json table, Kimi K3, Muse Spark, K2-Horizon,
-            // Inkling, Gemma 4 and the plain table read neither of the probes' Qwen markers:
-            // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content,
-            // as the reference says.
+            // Inkling, Gemma 4, LongCat and the plain table read neither of the probes' Qwen
+            // markers: `</think>` stays reasoning text and the fenced `<tool_call>` block stays
+            // content, as the reference says.
             Self::SeedOss
             | Self::Hy4
             | Self::Olmo3
@@ -773,13 +806,16 @@ impl Recorded for Table {
             | Self::FunctionGemma
             | Self::Mistral
             | Self::MistralV13
+            | Self::LongCat
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, the DSML tables, Kimi K2, LFM2.5,
+            // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a
+            // call inside its block alone), the DSML tables, Kimi K2, LFM2.5,
             // MiniMax M2, MiniCPM5, dots3 and Llama Nemotron read `</think>` but not
             // `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
+            | Self::HyV3
             | Self::DeepSeekV3_2
             | Self::DeepSeekV3
             | Self::DeepSeekV3_1
@@ -821,9 +857,11 @@ impl Recorded for Table {
                 | Self::Qwen3TaggedDirect
                 | Self::SeedOss
                 | Self::Hy4
+                | Self::HyV3
                 | Self::Ling
                 | Self::IQuest
                 | Self::Glm
+                | Self::LongCat
         ) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
@@ -873,6 +911,11 @@ enum GenerationPrompt {
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
     OpensTheThoughtWhenAsked,
+    /// Hy V3 (Hy-Memory): `<think>` (the thought opened, no newline) when the request's
+    /// `reasoning_effort` is `low` or `high`, so the output starts inside the thought; otherwise
+    /// (`no_think`, the template's default) `<think></think>`, and the output starts in content.
+    /// `enable_thinking` moves nothing in this template.
+    OpensTheThoughtByEffort,
     /// Qwen3: nothing, and the model writes its own `<think>`; thinking off closes it in the
     /// prompt as above.
     ModelWritesTheThought,
@@ -928,6 +971,10 @@ impl GenerationPrompt {
             }
             (Self::OpensTheThoughtOrClosesIt, _) => opened,
             (Self::OpensTheThoughtOrTheAnswer, false) => opened,
+            (Self::OpensTheThoughtByEffort, _) if request.effort_asks_for_a_thought() => {
+                open.to_string()
+            }
+            (Self::OpensTheThoughtByEffort, _) => format!("{open}{close}"),
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
             (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
@@ -941,7 +988,10 @@ impl GenerationPrompt {
     fn writes_no_thought_unasked(self) -> bool {
         matches!(
             self,
-            Self::Plain | Self::OpensTheThoughtWhenAsked | Self::MarkerAlone
+            Self::Plain
+                | Self::OpensTheThoughtWhenAsked
+                | Self::OpensTheThoughtByEffort
+                | Self::MarkerAlone
         )
     }
 }
@@ -1019,6 +1069,7 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "llama-3.3-nemotron-70b-reward-principle",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
+    ("youtu-parsing-omni", "<|begin_of_text|>assistant\n"),
 ];
 
 /// What a recorded model's own chat template writes after the thought's close before a call,
@@ -1171,12 +1222,20 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
             );
             continue;
         }
-        let Some((source, rendered, at)) = texts
-            .iter()
-            .find_map(|(source, text)| text.find(close).map(|at| (*source, text, at)))
-        else {
+        // A close counts only when a call follows it: a template whose history call turn writes
+        // no thought (d1-Omni-2B's `<|im_start|>assistant\n<tool_call>`) leaves the generation
+        // prompt's own closed thought as the text's only close, with nothing after it, and that
+        // says nothing about the call; the next source is read instead. The first close decides:
+        // every later close's rest is a suffix of the first one's, so a tag after a later close
+        // is a tag after the first.
+        let Some((source, rendered, at)) = texts.iter().find_map(|(source, text)| {
+            text.find(close)
+                .filter(|at| text[at + close.len()..].contains('<'))
+                .map(|at| (*source, text, at))
+        }) else {
             unread(format!(
-                "no {close:?} in the rendered call turn or the recorded thinking-on call"
+                "no {close:?} followed by a call in the rendered call turn or the recorded \
+                 thinking-on call"
             ));
             continue;
         };
@@ -1547,6 +1606,14 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     // sixteen, and no fence probe.
     ("d1-2b", "parse/content-with-marker-in-code-fence"),
     ("lfm2.5-24b-a2b", "parse/content-with-marker-in-code-fence"),
+    // Youtu-Parsing-Omni: the set is the one content case bellwether could record (the template
+    // renders no thought in history), so the qwen3 table's two listed probes are not among its
+    // fixtures.
+    ("youtu-parsing-omni", "parse/reasoning-with-marker-text"),
+    (
+        "youtu-parsing-omni",
+        "parse/content-with-marker-in-code-fence",
+    ),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
@@ -1663,6 +1730,17 @@ impl Request {
             == Some(false)
     }
 
+    /// Whether the request's `reasoning_effort`, the switch Hy V3's template reads, asks for a
+    /// thought: `low` or `high`; `no_think`, the default, and anything else leave it closed.
+    fn effort_asks_for_a_thought(&self) -> bool {
+        matches!(
+            self.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.reasoning_effort.as_deref()),
+            Some("low" | "high")
+        )
+    }
+
     fn enable_thinking(&self) -> Option<bool> {
         self.chat_template_kwargs
             .as_ref()
@@ -1674,6 +1752,7 @@ impl Request {
 struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
     thinking: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]

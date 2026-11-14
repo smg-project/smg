@@ -41,28 +41,54 @@
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`elector::Fence`] a shard thread reads before every decision it sends.
 //!
-//! What this step does not hold: the plugin hosts, the operator calls, the
-//! ingestion drivers and the gRPC API; they arrive in later
+//! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
+//!   feature): user policies as components of the committed `smg:policy`
+//!   package, one kept instance per deciding thread, every call under fuel,
+//!   bound to a profile as the framework's own stages.
+//! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
+//!   path (the `GetLoads` poll per engine under the store's poll
+//!   arbitration, the metrics scrape of an engine without a servicer) and
+//!   the load helpers the gateway shares with the controller (the row
+//!   conversion, the scrape parser). The KV subscription, the prober and
+//!   discovery arrive in the step's later PRs.
+//!
+//! - Behind the `controller` feature, the standalone controller
+//!   (`controller`): the listeners with their credentialed scopes, the
+//!   health service on each, the admin endpoints, readiness and the drain,
+//!   the load driver over the store, and the binary of the package's name
+//!   over them. The scopes' calls and the election arrive in the step's
+//!   later PRs.
+//!
+//! What this step does not hold: the gRPC plugin service, the operator calls,
+//! the other ingestion drivers and the gRPC API; they arrive in later
 //! steps and build on these types. The
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
+pub mod affinity;
 pub mod builtins;
+#[cfg(feature = "controller")]
+pub mod controller;
 pub mod decision;
 pub mod elector;
 pub mod framework;
+#[cfg(feature = "ingest")]
+pub mod ingest;
 pub mod lease;
 pub mod ring;
 pub mod sessions;
 pub mod spec;
 pub mod store;
 pub mod view;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch, TieBand, Weighted,
+    Binding, DecisionScope, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch,
+    TieBand, Weighted,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,

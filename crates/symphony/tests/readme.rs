@@ -1211,6 +1211,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "hy-memory-30b-a3b",
+        model: "tencent/Hy-Memory-30B-A3B",
+        also: &["Hy-Memory-30B-A3B-FP8"],
+        released: "2026-10-15",
+        smg: (None, None),
+        table: Some(Table::HyV3),
+        set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "hy4-preview",
         model: "tencent/Hy4-preview",
         also: &[],
@@ -1353,7 +1363,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "lfm2.5-24b-a2b",
         model: "LiquidAI/LFM2.5-24B-A2B",
-        also: &[],
+        also: &["LFM2.5-24B-A2B-FP8"],
         released: "2026-10-12",
         smg: (None, None),
         table: Some(Table::Lfm2_5),
@@ -1620,6 +1630,26 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "longcat-2.5",
+        model: "meituan-longcat/LongCat-2.5",
+        also: &[],
+        released: "2026-11-04",
+        smg: (None, None),
+        table: Some(Table::LongCat),
+        set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "mage-vl-cowork",
+        model: "microsoft/Mage-VL-Cowork",
+        also: &[],
+        released: "2026-10-30",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "mimo-v2.5",
         model: "XiaomiMiMo/MiMo-V2.5",
         also: &["MiMo-V2.5-Base"],
@@ -1775,7 +1805,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "mistral-large-4-1t-a52b",
         model: "mistralai/Mistral-Large-4-1T-A52B",
-        also: &[],
+        also: &["Mistral-Large-4-1T-A52B-NVFP4"],
         released: "2026-09-30",
         smg: (Some("mistral"), None),
         table: Some(Table::MistralV13),
@@ -1840,6 +1870,16 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
         set: Some(589_298),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "nanbeige4.3-33b",
+        model: "Nanbeige/Nanbeige4.3-33B",
+        also: &[],
+        released: "2026-10-24",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
         status: Status::Replaying,
     },
     Group {
@@ -1978,7 +2018,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-3.5-super-vl-120b-a12b-bf16",
         model: "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16",
-        also: &[],
+        also: &["NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"],
         released: "2026-10-12",
         smg: (Some("qwen_xml"), Some("nano_v3")),
         table: Some(Table::Qwen3Tagged),
@@ -2008,7 +2048,10 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-labs-dory1.0-4b-bf16",
         model: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
-        also: &[],
+        also: &[
+            "NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8",
+            "NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+        ],
         released: "2026-10-16",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
@@ -2095,6 +2138,16 @@ const GROUPS: &[Group] = &[
         table: None,
         set: Some(328_662),
         status: Status::Pending,
+    },
+    Group {
+        slug: "otel-2.0-llm-31b-it",
+        model: "RedHatAI/OTel-2.0-LLM-31B-IT",
+        also: &[],
+        released: "2026-10-26",
+        smg: (None, None),
+        table: Some(Table::Gemma4),
+        set: Some(28),
+        status: Status::Replaying,
     },
     Group {
         slug: "phi-4-mini-instruct",
@@ -2587,6 +2640,16 @@ const GROUPS: &[Group] = &[
         set: Some(19),
         status: Status::Replaying,
     },
+    Group {
+        slug: "youtu-parsing-omni",
+        model: "tencent/Youtu-Parsing-Omni",
+        also: &[],
+        released: "2026-10-09",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: Some(1),
+        status: Status::Replaying,
+    },
 ];
 
 /// `n` with thousands separators, as the README writes counts.
@@ -2606,19 +2669,18 @@ fn count(n: u32) -> String {
 fn render() -> String {
     let mut groups: Vec<&Group> = GROUPS.iter().collect();
     groups.sort_by_key(|group| (std::cmp::Reverse(group.released), group.slug));
-    let tally = |status: fn(&Status) -> bool| groups.iter().filter(|g| status(&g.status)).count();
-    let checkpoints: usize = groups.iter().map(|group| 1 + group.also.len()).sum();
     let mut out = String::new();
+    let legend = [
+        Status::Ready,
+        Status::Replaying,
+        Status::AwaitingFixtures,
+        Status::Pending,
+    ]
+    .map(Status::cell);
     let _ = writeln!(
         out,
-        "{} groups, {} checkpoints, newest first.\n{} ready, {} replaying a recorded \
-         set, {} on main awaiting fixtures, {} pending.",
-        groups.len(),
-        checkpoints,
-        tally(|s| *s == Status::Ready),
-        tally(|s| *s == Status::Replaying),
-        tally(|s| *s == Status::AwaitingFixtures),
-        tally(|s| *s == Status::Pending),
+        "Newest first; the status column reads {}, {}, {}, or {}.",
+        legend[0], legend[1], legend[2], legend[3]
     );
     out.push('\n');
     out.push_str(

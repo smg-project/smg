@@ -96,7 +96,10 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
                 message: format!(
                     "worker {} targets the {} provider, but this build carries no {} router; \
                      rebuild with the `{}` Cargo feature to admit it",
-                    config.url, missing.label, missing.label, missing.feature
+                    Endpoint::redacted_str(&config.url),
+                    missing.label,
+                    missing.label,
+                    missing.feature
                 ),
             });
         }
@@ -196,6 +199,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::probe_models_owned_by;
+    use crate::server::http_client;
 
     #[tokio::test]
     async fn probe_models_owned_by_accepts_nvidia_as_local() {
@@ -222,14 +226,9 @@ mod tests {
                 .unwrap();
         });
 
-        let owned_by = probe_models_owned_by(
-            &format!("http://{addr}"),
-            5,
-            &crate::server::http_client(),
-            None,
-        )
-        .await
-        .unwrap();
+        let owned_by = probe_models_owned_by(&format!("http://{addr}"), 5, &http_client(), None)
+            .await
+            .unwrap();
         server.abort();
 
         assert_eq!(owned_by, "nvidia");

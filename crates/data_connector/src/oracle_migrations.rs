@@ -129,7 +129,7 @@ fn oracle_v3_up(schema: &SchemaConfig) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::TableConfig;
+    use crate::schema::{ColumnDef, TableConfig};
 
     #[test]
     fn oracle_history_migrations_cover_only_core_history_schema() {
@@ -232,7 +232,7 @@ mod tests {
         let mut schema = SchemaConfig::default();
         schema.responses.extra_columns.insert(
             "USER_ID".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "VARCHAR2(128)".to_string(),
                 default_value: None,
             },

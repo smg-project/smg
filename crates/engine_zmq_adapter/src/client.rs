@@ -39,6 +39,7 @@ use tokio::time::Instant;
 #[cfg(unix)]
 use crate::sockets::unlink_stale_socket;
 use crate::{
+    abort_status::engine_abort_status,
     eos::EosTokenIds,
     pin_yield::PinYieldNote,
     sglang::{
@@ -1522,10 +1523,7 @@ impl ZmqEngineClient {
                         .as_deref()
                         .unwrap_or("no reason reported")
                 );
-                return Err(crate::abort_status::engine_abort_status(
-                    output.finish_status,
-                    message,
-                ));
+                return Err(engine_abort_status(output.finish_status, message));
             }
             let embedding = output.embedding.unwrap_or_default();
             return Ok(sglang_proto::EmbedResponse {

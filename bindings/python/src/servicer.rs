@@ -480,7 +480,7 @@ impl MediaProcessor for SmgMediaProcessor {
         Box::pin(async move {
             let items = request
                 .items
-                .iter()
+                .into_iter()
                 .enumerate()
                 .map(|(index, item)| {
                     let modality = match item.modality.as_str() {
@@ -494,12 +494,12 @@ impl MediaProcessor for SmgMediaProcessor {
                     };
                     Ok(WorkerMediaItem {
                         modality,
-                        url: item.url.clone(),
+                        url: item.url,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let output = pipeline
-                .process(request.prompt_token_ids, &items, request.want_identity)
+                .process(request.prompt_token_ids, items, request.want_identity)
                 .await
                 .map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
@@ -612,7 +612,7 @@ impl PyManagedEncoderProcessor {
                 .collect();
             let (_, inputs, extras) = self
                 .runtime
-                .block_on(self.pipeline.process_sglang(tokens, &items))
+                .block_on(self.pipeline.process_sglang(tokens, items))
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
                 mm_inputs: Some(Box::new(inputs)),
@@ -674,7 +674,7 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                 let tokenized = request.tokenized.as_mut()
                     .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
                 let (tokens, inputs, extras) = pipeline.process_sglang(
-                    std::mem::take(&mut tokenized.input_ids), &items,
+                    std::mem::take(&mut tokenized.input_ids), items,
                 ).await.map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
                     WorkerMediaError::Internal(message) => tonic::Status::internal(message),

@@ -245,10 +245,20 @@ async fn non_streamed_chat_usage(scripted: Scripted, request: &ChatCompletionReq
 }
 
 async fn streamed_completion_usage(
-    (stream, server): Scripted,
+    scripted: Scripted,
     request: &CompletionRequest,
     reservation: Option<Arc<SharedReservationHandle>>,
 ) -> Value {
+    usage_chunk(&streamed_completion_events(scripted, request, reservation).await)
+}
+
+/// The `data:` events of one streamed completion, in order, `[DONE]` left
+/// out.
+async fn streamed_completion_events(
+    (stream, server): Scripted,
+    request: &CompletionRequest,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> Vec<Value> {
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
     let response = Arc::new(processor(false))
@@ -269,14 +279,13 @@ async fn streamed_completion_usage(
         .await
         .expect("the stream's body");
     server.abort();
-    let events: Vec<Value> = std::str::from_utf8(&body)
+    std::str::from_utf8(&body)
         .expect("UTF-8 SSE")
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).expect("SSE JSON"))
-        .collect();
-    usage_chunk(&events)
+        .collect()
 }
 
 async fn non_streamed_completion(
@@ -505,6 +514,86 @@ async fn chat_usage_is_the_same_streamed_and_not() {
     }
 }
 
+/// The image tokens the gateway's expansion wrote are reported on the usage
+/// chunk and on the non-streamed answer alike, beside the engine's counts; a
+/// request without them reports no image count, the shape every chat answer
+/// had.
+#[tokio::test]
+async fn chat_usage_reports_the_image_tokens_streamed_and_not() {
+    let counters = Counters {
+        prompt: 535,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let request = |stream: bool| -> ChatCompletionRequest {
+        let mut request = json!({"model": "eof-test", "messages": [], "stream": stream});
+        if stream {
+            request["stream_options"] = json!({"include_usage": true});
+        }
+        serde_json::from_value(request).expect("chat request")
+    };
+    for image_tokens in [Some(324), None] {
+        let streaming_request = request(true);
+        let mut spec = ChatResponseSpec::from(&streaming_request);
+        spec.image_tokens = image_tokens;
+        let (stream, server) = engine_stream(frames(&["hi"], 1, counters)).await;
+        let (tx, rx) = sse_channel();
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                tokenizer(),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        let streamed = usage_chunk(&events);
+
+        let whole_request = request(false);
+        let mut spec = ChatResponseSpec::from(&whole_request);
+        spec.image_tokens = image_tokens;
+        let (stream, server) = engine_stream(frames(&["hi"], 1, counters)).await;
+        let tokenizer = tokenizer();
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let (response, _) = response_processor()
+            .process_non_streaming_chat_response(
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
+                spec,
+                dispatch(),
+                tokenizer,
+                &mut decoder,
+                false,
+            )
+            .await
+            .unwrap_or_else(|response| panic!("{}", response.status()));
+        server.abort();
+        let whole = serde_json::to_value(response).expect("a JSON response")["usage"].clone();
+
+        assert_eq!(
+            streamed, whole,
+            "image tokens {image_tokens:?}: the streamed usage chunk vs the non-streamed usage"
+        );
+        assert_eq!(streamed["prompt_tokens"], 535);
+        assert_eq!(
+            streamed["prompt_tokens_details"]
+                .get("image_tokens")
+                .and_then(Value::as_u64),
+            image_tokens.map(u64::from),
+            "{streamed}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn completion_usage_is_the_same_streamed_and_not() {
     let plain = Counters {
@@ -552,6 +641,57 @@ async fn completion_usage_is_the_same_streamed_and_not() {
             whole["prompt_tokens_details"]["cached_tokens"], counters.cached,
             "{name}: {whole}"
         );
+    }
+}
+
+/// Under `stream_options.include_usage` every chunk before the usage chunk
+/// carries `"usage": null`, as the public API writes it and a chat stream
+/// does; without the option no chunk carries the key.
+#[tokio::test]
+async fn a_completion_stream_that_asks_for_usage_writes_the_placeholder_before_the_usage_chunk() {
+    let counters = Counters {
+        prompt: 3,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    for stream_options in [
+        Some(json!({"include_usage": true})),
+        Some(json!({"include_usage": false})),
+        None,
+    ] {
+        let asks = stream_options
+            .as_ref()
+            .is_some_and(|options| options["include_usage"] == true);
+        let mut request = json!({"model": "eof-test", "prompt": "hi", "stream": true});
+        if let Some(options) = stream_options {
+            request["stream_options"] = options;
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(request).expect("completion request");
+        let events = streamed_completion_events(
+            engine_stream(frames(&["o", "k"], 1, counters)).await,
+            &request,
+            None,
+        )
+        .await;
+        if asks {
+            let (closing, chunks) = events.split_last().expect("the usage chunk");
+            assert!(closing["usage"].is_object(), "{events:?}");
+            assert!(!chunks.is_empty(), "{events:?}");
+            assert!(
+                chunks
+                    .iter()
+                    .all(|chunk| chunk.get("usage") == Some(&Value::Null)),
+                "every chunk before the usage chunk writes the placeholder: {events:?}"
+            );
+        } else {
+            assert!(!events.is_empty(), "{events:?}");
+            assert!(
+                events.iter().all(|chunk| chunk.get("usage").is_none()),
+                "no chunk carries usage without the option: {events:?}"
+            );
+        }
     }
 }
 
@@ -1475,7 +1615,7 @@ fn mixed_stream_snapshot_preserves_unknown_rejected() {
             ..Default::default()
         },
     );
-    let json = serde_json::to_value(usage.snapshot(0)).unwrap();
+    let json = serde_json::to_value(usage.snapshot(0, None)).unwrap();
     assert_eq!(
         json["completion_tokens_details"]["accepted_prediction_tokens"],
         3
@@ -1576,7 +1716,7 @@ fn continuous_spec_usage_terminal_coverage_controls() {
             }))
         };
         let snapshot =
-            |tracker: &ChatStreamUsage| serde_json::to_value(tracker.snapshot(3)).unwrap();
+            |tracker: &ChatStreamUsage| serde_json::to_value(tracker.snapshot(3, None)).unwrap();
         let mut tracker = ChatStreamUsage::new(2);
         tracker.reasoning_parsed = true;
         tracker.record_reasoning(0, 3);

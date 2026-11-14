@@ -119,6 +119,7 @@ fn candidate_record() -> &'static [&'static str] {
             host_local,
             active_sessions,
             key,
+            indexed_blocks,
         }
     )
 }
@@ -144,6 +145,7 @@ fn request_record() -> &'static [&'static str] {
             headers,
             media,
             seed,
+            block_size,
             now_micros,
         }
     )
@@ -590,6 +592,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("host_local", Type::Bool),
                 ("active_sessions", Type::Uint32),
                 ("key", Type::Uint32),
+                ("indexed_blocks", Type::Uint32),
             ],
             repeated: &[],
             optional: &[],
@@ -618,6 +621,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("media", Type::Message),
                 ("seed", Type::Fixed64),
                 ("prompt_text", Type::Bytes),
+                ("block_size", Type::Uint32),
             ],
             repeated: &["block_hashes", "tried", "headers"],
             optional: &[],
@@ -1646,11 +1650,11 @@ fn the_watch_workers_resume_fields_are_pinned() {
     }
 }
 
-/// The packed request block's layout as the world's comment states it: a
-/// 72-byte header, the model bytes, zero bytes to the next multiple of 8,
+/// The packed request block's layout as the world's comment states it: an
+/// 80-byte header, the model bytes, zero bytes to the next multiple of 8,
 /// then the u64 sections. The arithmetic is mirrored here so the alignment
 /// rule is pinned beside the sentence that states it.
-const PACKED_REQUEST_HEADER: usize = 72;
+const PACKED_REQUEST_HEADER: usize = 80;
 
 fn packed_hashes_offset(model_len: usize) -> usize {
     (PACKED_REQUEST_HEADER + model_len).div_ceil(8) * 8
@@ -1658,7 +1662,7 @@ fn packed_hashes_offset(model_len: usize) -> usize {
 
 #[test]
 fn the_packed_request_block_keeps_its_u64_sections_aligned() {
-    assert_eq!(packed_hashes_offset(12), 88, "a 12-byte model name");
+    assert_eq!(packed_hashes_offset(12), 96, "a 12-byte model name");
     for model_len in 0..=255usize {
         let hashes = packed_hashes_offset(model_len);
         assert_eq!(hashes % 8, 0, "block hashes at a {model_len}-byte name");
@@ -1672,9 +1676,9 @@ fn the_packed_request_block_keeps_its_u64_sections_aligned() {
     let wit =
         std::fs::read_to_string(contracts_dir().join(WORLD_WIT)).expect("the world file reads");
     for sentence in [
-        "Request block: a 72-byte header",
+        "Request block: an 80-byte header",
         "zero bytes to the next multiple of 8",
-        "puts the hashes at 88",
+        "puts the hashes at 96",
         "returns 8-aligned memory for these lists",
     ] {
         assert!(
@@ -1864,5 +1868,67 @@ fn the_decide_budget_fields_are_pinned() {
             .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
             .collect();
         assert_eq!(found, expected, "{message_name}: a budget field moved");
+    }
+}
+
+/// The replication rejoin: `ReplicaHello` names its last applied position and
+/// the term it was written under, every batch names the write term of its
+/// events, a snapshot names the write term of the position it is consistent
+/// with. The pin holds names, numbers and types; the mismatch answer is the
+/// conformance suite's to check.
+type ReplicaField = (&'static str, i32, Type);
+
+const REPLICA_FIELDS: &[(&str, &[ReplicaField])] = &[
+    (
+        "ReplicaHello",
+        &[
+            ("replica_id", 1, Type::String),
+            ("last_applied_seq", 2, Type::Uint64),
+            ("term_seen", 3, Type::Uint64),
+            ("max_backlog", 4, Type::Uint32),
+            ("last_applied_term", 5, Type::Uint64),
+        ],
+    ),
+    (
+        "ReplicationBatch",
+        &[
+            ("first_seq", 1, Type::Uint64),
+            ("term", 2, Type::Uint64),
+            ("events", 3, Type::Message),
+            ("resync_required", 4, Type::Bool),
+        ],
+    ),
+    (
+        "Snapshot",
+        &[
+            ("term", 1, Type::Uint64),
+            ("replication_seq", 15, Type::Uint64),
+            ("replication_term", 18, Type::Uint64),
+        ],
+    ),
+];
+
+#[test]
+fn the_replica_rejoin_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in REPLICA_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a rejoin field moved");
     }
 }

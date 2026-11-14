@@ -15,6 +15,7 @@ use smg::{
 use tower::ServiceExt;
 
 use crate::common::{
+    create_test_context_with_parsers,
     mock_worker::{MockWorker, MockWorkerConfig},
     test_app::create_test_app_with_context,
 };
@@ -87,7 +88,7 @@ impl ParserTestContext {
             .unwrap();
 
         // Create app context with parser factories initialized
-        let app_context = crate::common::create_test_context_with_parsers(config.clone()).await;
+        let app_context = create_test_context_with_parsers(config.clone()).await;
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();

@@ -260,7 +260,10 @@ pub struct HandshakeInitMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_msgpack, encode_msgpack};
+    use crate::{
+        codec::{decode_msgpack, encode_msgpack},
+        mock_engine::default_ready_response,
+    };
 
     #[test]
     fn ready_message_roundtrips_hello() {
@@ -441,7 +444,7 @@ mod tests {
     /// The optional declaration round-trips, while older handshakes remain silent.
     #[test]
     fn ready_response_preserves_optional_multimodal_encoder_dtype() {
-        let ready = crate::mock_engine::default_ready_response();
+        let ready = default_ready_response();
         let mut value = serde_json::to_value(ready).unwrap();
         value
             .as_object_mut()

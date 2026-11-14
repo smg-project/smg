@@ -294,11 +294,14 @@ mod tests {
         use metrics_labels::*;
         use smg_grpc_client::constraint_failed_status;
 
-        use crate::routers::{
-            common::{overload, placement},
-            error,
-            grpc::{common::responses::background, utils::tonic_ext::TonicStatusExt},
-            prefill_queue_full, prefill_queue_timeout,
+        use crate::{
+            rate_limit::rejection_response,
+            routers::{
+                common::{overload, placement},
+                error,
+                grpc::{common::responses::background, utils::tonic_ext::TonicStatusExt},
+                prefill_queue_full, prefill_queue_timeout,
+            },
         };
 
         // A worker's status, whatever code the answer is minted under.
@@ -369,10 +372,7 @@ mod tests {
             ),
             (background::limit_reached(4), REASON_OVERLOAD_SHED),
             (error::model_not_found("m"), REASON_MODEL_NOT_FOUND),
-            (
-                crate::rate_limit::rejection_response(3),
-                REASON_RATE_LIMITED,
-            ),
+            (rejection_response(3), REASON_RATE_LIMITED),
             (
                 placement::no_media_ref_capable_worker("no vision worker"),
                 REASON_NO_CAPABLE_WORKER,

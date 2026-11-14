@@ -18,6 +18,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use crate::{
     crdt_kv::{
         decode as decode_epoch_count, encode as encode_epoch_count, CrdtWatermark, EpochCount,
+        Operation,
     },
     kv::MeshKV,
     transport::{
@@ -38,7 +39,7 @@ fn deliver_crdt(sender: &MeshKV, receiver: &MeshKV) {
 
 /// Snapshot the ops the sender would send this round: the op-log filtered by
 /// the per-key send watermark. Mirrors the live sender's filter step.
-fn pending_ops(sender: &MeshKV, acked: &CrdtWatermark) -> Vec<crate::crdt_kv::Operation> {
+fn pending_ops(sender: &MeshKV, acked: &CrdtWatermark) -> Vec<Operation> {
     sender
         .collect_round_batch()
         .crdt_ops

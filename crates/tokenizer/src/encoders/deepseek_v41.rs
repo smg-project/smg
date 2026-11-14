@@ -93,7 +93,7 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // `thinking: false` (or the engine's `enable_thinking` alias, see the
     // capabilities) turns it off.
     thinking_toggle: ThinkingToggle::DefaultOn,
-    thinking_key_name: ThinkingKeyName::Thinking,
+    thinking_key_name: Some(ThinkingKeyName::Thinking),
     native_effort_values: NATIVE_EFFORT_VALUES,
     // Switches off on the protocol's `none` / `minimal`: no words of its own.
     native_effort_off_values: &[],
@@ -759,6 +759,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{super::deepseek_common::object_arguments_render_one_parameter_per_key_through, *};
+    use crate::chat_template::developer_messages_as_system;
 
     fn user(q: &str) -> Value {
         json!({ "role": "user", "content": q })
@@ -1233,7 +1234,7 @@ mod tests {
             // encoder drops the message or writes a user turn: the tests
             // above); the fold stays here so those recordings still describe
             // the system path they took.
-            if let Some(rewritten) = crate::chat_template::developer_messages_as_system(&messages) {
+            if let Some(rewritten) = developer_messages_as_system(&messages) {
                 messages = rewritten;
             }
 

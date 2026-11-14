@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -66,7 +66,10 @@ pub use tls::{blocking_http_client, http_client, http_client_builder, install_cr
 use crate::{
     app_context::AppContext,
     config::{redacted, ParserChoice, RouterConfig},
-    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
+    endpoints::{
+        conversations, messages::MessagesHeaders, models, parse, responses as response_handlers,
+        tokenize,
+    },
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
         MeshAdapters,
@@ -80,7 +83,7 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::{header_utils, realtime::ws::RealtimeQueryParams},
+        common::realtime::ws::RealtimeQueryParams,
         error as route_error,
         gateway::Gateway,
         grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
@@ -402,107 +405,19 @@ async fn v1_embeddings(
         .await
 }
 
-/// The public Messages API knows only its dated versions: a request whose
-/// `anthropic-version` is not a calendar date of 2023 or later is refused as
-/// the public API refuses it, before anything is routed. A request without
-/// the header is served as the current version: this gateway's own SDK
-/// clients send none, and the header selects nothing here.
-fn check_anthropic_version(headers: &HeaderMap) -> Result<(), Response> {
-    let Some(value) = headers.get("anthropic-version") else {
-        return Ok(());
-    };
-    let version = value.to_str().unwrap_or_default();
-    if is_anthropic_version(version) {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "invalid_anthropic_version",
-            format!("anthropic-version: \"{version}\" is not a valid version"),
-        ))
-    }
-}
-
-/// `YYYY-MM-DD`, a real calendar date, 2023 (the first public version) or
-/// later.
-fn is_anthropic_version(version: &str) -> bool {
-    let bytes = version.as_bytes();
-    let shaped = bytes.len() == 10
-        && bytes.iter().enumerate().all(|(i, b)| {
-            if i == 4 || i == 7 {
-                *b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }
-        });
-    if !shaped {
-        return false;
-    }
-    let field = |range: std::ops::Range<usize>| version[range].parse::<u32>().unwrap_or(0);
-    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    };
-    year >= 2023 && (1..=days).contains(&day)
-}
-
-/// `thinking.budget_tokens` must leave room under `max_tokens` for the
-/// answer, unless the interleaved-thinking beta is on: then the budget covers
-/// every thinking block of the turn and the public API takes a budget at or
-/// above `max_tokens`. The rule reads the `anthropic-beta` header, so it runs
-/// here rather than in the request's own validation.
-fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
-    let Some(openai_protocol::messages::ThinkingConfig::Enabled { budget_tokens, .. }) =
-        &body.thinking
-    else {
-        return Ok(());
-    };
-    let interleaved = header_utils::anthropic_beta_named(headers, "interleaved-thinking");
-    if interleaved || *budget_tokens < body.max_tokens {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "thinking_budget_exceeds_max_tokens",
-            "`max_tokens` must be greater than `thinking.budget_tokens`",
-        ))
-    }
-}
-
-/// A thread turn names the message-threads beta, as the public API requires
-/// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
-/// the body layer to parse the request before the route, so a `thread` field
-/// without it is refused here with the public API's own 400 on the parsed
-/// (buffered) path. A header-less turn on the raw pass-through path never
-/// reaches this handler: it is forwarded unparsed, `thread` and all.
-fn check_thread_beta(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
-    if body.thread.is_none() || header_utils::anthropic_beta_named(headers, "message-threads") {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "thread_beta_required",
-            "`thread` requires the `anthropic-beta: message-threads-2026-08-12` header",
-        ))
-    }
-}
-
+/// The Messages route: its typed headers ([`MessagesHeaders`]) are read
+/// before the body, so a malformed `anthropic-version` is refused before the
+/// body is buffered; the rules that read a beta beside the body run once the
+/// body is parsed. The raw headers are forwarded as they came.
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
+    parsed: MessagesHeaders,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
-    if let Err(refused) = check_anthropic_version(&headers) {
-        return refused;
-    }
-    if let Err(refused) = check_thinking_budget(&headers, &body) {
-        return refused;
-    }
-    if let Err(refused) = check_thread_beta(&headers, &body) {
+    if let Err(refused) = parsed.validate(&body) {
         return refused;
     }
     let model = body.model.clone();
@@ -515,16 +430,16 @@ async fn v1_messages(
         .await
 }
 
+/// The count-tokens route reads the typed headers for the version refusal
+/// alone: no rule of its body reads a beta.
 async fn v1_messages_count_tokens(
     State(state): State<Arc<AppState>>,
+    _parsed: MessagesHeaders,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
-    if let Err(refused) = check_anthropic_version(&headers) {
-        return refused;
-    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -578,12 +493,14 @@ async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedPath(response_id): ValidatedPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::get_response(
         &state.context.response_storage,
         tenant.as_deref(),
         &response_id,
+        query.as_deref(),
     )
     .await
 }
@@ -618,12 +535,14 @@ async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedPath(response_id): ValidatedPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::list_response_input_items(
         &state.context.response_storage,
         tenant.as_deref(),
         &response_id,
+        query.as_deref(),
     )
     .await
 }
@@ -1259,6 +1178,22 @@ pub fn build_app(
     .map(|apps| apps.data)
 }
 
+/// The control-plane auth state as the gateway attaches it: the admin-only
+/// reads named, and the in-flight tracker handed out as the hold a recorded
+/// mutation's task keeps until its outcome line is written. The shutdown's
+/// drain waits on that count and the exit waits for the drain before its
+/// teardown (see [`drain_before_teardown`]), so a mutation whose client left
+/// is waited for as one whose client is still connected.
+fn control_plane_state(
+    state: smg_auth::ControlPlaneAuthState,
+    tracker: &Arc<InFlightRequestTracker>,
+) -> smg_auth::ControlPlaneAuthState {
+    let tracker = Arc::clone(tracker);
+    state
+        .with_admin_only_reads(ADMIN_ONLY_READS)
+        .with_mutation_hold(move || Box::new(tracker.track()))
+}
+
 /// `serving_auth_config` covers inference-serving routes and may include
 /// per-tenant keys. `admin_auth_config` is the admin/worker-management
 /// fallback (used when `control_plane_auth_state` is `None`) and must
@@ -1280,10 +1215,11 @@ pub fn build_apps(
     cors_allowed_origins: Vec<String>,
     admin_listener: bool,
 ) -> Result<GatewayApps, InvalidHeaderName> {
-    // The admin-only reads join the state once, for every attachment of
-    // the control-plane layer below: the shared groups and the gated group.
-    let control_plane_auth_state =
-        control_plane_auth_state.map(|state| state.with_admin_only_reads(ADMIN_ONLY_READS));
+    // The admin-only reads and the in-flight hold join the state once, for
+    // every attachment of the control-plane layer below: the shared groups
+    // and the gated group.
+    let control_plane_auth_state = control_plane_auth_state
+        .map(|state| control_plane_state(state, &app_state.context.inflight_tracker));
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1454,9 +1390,9 @@ pub fn build_apps(
         );
     let protected_routes = typed_routes.merge(plain_protected_routes);
 
-    // WebSocket and WebRTC routes: auth + admission but NO WASM middleware.
-    // WASM OnResponse reconstructs the response from status/headers/body,
-    // dropping the response extensions that carry the WebSocket upgrade future.
+    // WebSocket and WebRTC routes: auth + admission but no WASM middleware.
+    // The hooks filter HTTP requests and responses; a realtime session is
+    // upgraded away from HTTP and its frames are not run through modules.
     let realtime_routes = Router::new()
         .route("/v1/realtime", get(v1_realtime_ws))
         .route("/v1/realtime/calls", post(v1_realtime_webrtc))
@@ -2758,16 +2694,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         clippy::disallowed_methods,
         reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
     )]
-    spawn(async move {
+    let shutdown = spawn(async move {
         shutdown_signal().await;
         // The mesh hears of the stop first: `Leaving` goes to the live
         // members during the settle window (the broadcast is bounded by 3 s,
         // then a second for propagation, then the gossip loop stops), so
         // they know as soon as this member stops serving, instead of finding
         // out from failed probes once it is gone. The leave gets the window
-        // and no more (with no window, what the grace allows); cut short, its
-        // broadcast tasks run on and the gossip loop is stopped by
-        // `stop_mesh`.
+        // and no more (with no window, what the grace allows); cut short, the
+        // pings it still had pending are dropped with it (no dial outlives
+        // the call) and the gossip loop is stopped by `stop_mesh`.
         let leave_mesh = async {
             if let Some(mesh) = &mesh_handler {
                 if let Err(e) = mesh.graceful_shutdown().await {
@@ -2777,7 +2713,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         };
         // The leave's own stop of the gossip loop did not run: stop it as a
         // finished leave would have, so both paths end the same way; the
-        // broadcast tasks the leave spawned run on.
+        // pings the leave still had pending went with it.
         let stop_mesh = || {
             if let Some(mesh) = &mesh_handler {
                 mesh.shutdown();
@@ -2793,7 +2729,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 admin_handle_clone.graceful_shutdown(Some(drain_timeout));
             },
         )
-        .await;
+        .await
     });
 
     let (data_serving, admin_serving) = serve_listeners(
@@ -2805,17 +2741,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         admin_handle,
     )?;
     // Until both listeners have stopped; one that fails stops the other
-    // (see `serve_together`), so the gateway is never half-served.
-    let (server_result, admin_result) = serve_together(
+    // (see `serve_together`), so the gateway is never half-served. The
+    // listeners end with their connections; work that holds none is still in
+    // flight, and the teardown waits for it within the shutdown's time.
+    let (server_result, admin_result) = serve_until_drained(
         data_serving,
         admin_serving,
         move || data_stop.graceful_shutdown(Some(drain_timeout)),
         move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+        &app_context.inflight_tracker,
+        shutdown,
+        drain_timeout,
     )
     .await;
-    if let Err(e) = &admin_result {
-        error!("Admin listener stopped with an error: {e}");
-    }
 
     // Graceful Shutdown
 
@@ -2876,14 +2814,16 @@ impl ShutdownBudget {
 /// then `stop_listeners` gates new connections with what is left of the
 /// grace. Phase 2: the in-flight requests drain within that, or the drain
 /// gives up and says so. Phase 3, the teardown, is the caller's once the
-/// listeners have stopped.
+/// listeners have stopped and this drain has ended (see
+/// [`drain_before_teardown`]). Returns the end of the grace, the deadline
+/// the phases share, for the caller's own wait to end by.
 async fn graceful_shutdown(
     inflight_tracker: &InFlightRequestTracker,
     budget: ShutdownBudget,
     leave_mesh: impl Future<Output = ()>,
     stop_mesh: impl FnOnce(),
     stop_listeners: impl FnOnce(Duration),
-) {
+) -> tokio::time::Instant {
     // Phase 1: Flip readiness to 503, hold the listener open through the
     // settle window so propagation-lagged requests still land, then gate
     // new connections.
@@ -2912,8 +2852,8 @@ async fn graceful_shutdown(
         stop_mesh();
         if !budget.grace.is_zero() {
             info!(
-                "Leaving the mesh was cut short by the settle window; its broadcast runs on \
-                 and the gossip loop is stopped now"
+                "Leaving the mesh was cut short by the settle window; its pending pings were \
+                 dropped and the gossip loop is stopped now"
             );
         }
     }
@@ -2935,7 +2875,119 @@ async fn graceful_shutdown(
             );
         }
     }
-    // Phase 3: Teardown proceeds after axum server stops (in the main task)
+    // Phase 3: the teardown is the main task's, once the listeners have
+    // stopped and this drain has ended (`drain_before_teardown`).
+    deadline
+}
+
+/// Serving to its end, the part of `startup` between its listeners and its
+/// teardown: both listeners until they have stopped (see
+/// [`serve_together`]), the admin listener's error reported, then the wait
+/// for the work that is still in flight (see [`drain_before_teardown`]). A
+/// listener's failure stops the other with `drain`, when another is still
+/// serving; that work shares the same `drain`, counted from the failure,
+/// and from the failure the probes read draining, whether or not another
+/// listener was there to stop: the gateway is on its way out. Both results
+/// come back for the caller to return.
+async fn serve_until_drained(
+    data: Serving,
+    admin: Serving,
+    stop_data: impl FnOnce(),
+    stop_admin: impl FnOnce(),
+    inflight_tracker: &InFlightRequestTracker,
+    shutdown: tokio::task::JoinHandle<tokio::time::Instant>,
+    drain: Duration,
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    // What a listener's failure found: the instant, and whether a shutdown
+    // was under way. The drain flag is read before it is set, so the
+    // failure's own mark never passes for a shutdown's. The note is taken
+    // at the failure whether or not another listener is there to stop: in
+    // the stop closures, or below when none ran. The first note stands.
+    let failure = OnceLock::new();
+    let note_failure = || {
+        let _ = failure.set((tokio::time::Instant::now(), inflight_tracker.is_draining()));
+        inflight_tracker.begin_drain();
+    };
+    let (data_result, admin_result) = serve_together(
+        data,
+        admin,
+        || {
+            note_failure();
+            stop_data();
+        },
+        || {
+            note_failure();
+            stop_admin();
+        },
+    )
+    .await;
+    // A failure that found the other serving ended had nothing to stop, so
+    // no stop closure ran: with no admin listener, the default, the admin
+    // serving ends at once. That failure ended the listeners, now.
+    if data_result.is_err() || admin_result.is_err() {
+        note_failure();
+    }
+    if let Err(e) = &admin_result {
+        error!("Admin listener stopped with an error: {e}");
+    }
+    drain_before_teardown(inflight_tracker, shutdown, failure.into_inner(), drain).await;
+    (data_result, admin_result)
+}
+
+/// The wait between the listeners' end and the teardown, for work that is in
+/// flight and holds no connection. A request holds its connection, so the
+/// listeners' own end waited for it; a recorded control-plane mutation whose
+/// client left holds none and is in the in-flight count alone (see
+/// [`control_plane_state`]). With nothing in flight there is nothing to wait
+/// for. Otherwise the count is waited for to the deadline the listeners'
+/// connections had, and no longer. With a shutdown under way that is the end
+/// of the grace: the `shutdown` task hands it back once its own drain has
+/// ended (the settle window first, when a listener failed inside it), and
+/// what was admitted after that drain, while the listeners still closed
+/// their connections, gets what is left of the grace. With none (a listener
+/// failed, and no shutdown was under way by then) it is one `drain` after
+/// the failure, the end of the `drain` a listener it stopped was given; a
+/// signal that comes after the failure does not move it. `failure` is what
+/// the failure found: its instant, and whether a shutdown was under way.
+async fn drain_before_teardown(
+    inflight_tracker: &InFlightRequestTracker,
+    shutdown: tokio::task::JoinHandle<tokio::time::Instant>,
+    failure: Option<(tokio::time::Instant, bool)>,
+    drain: Duration,
+) {
+    if inflight_tracker.is_empty() {
+        return;
+    }
+    // With no failure the listeners ended on their own, now, and the drain
+    // flag is a shutdown's alone.
+    let (stopped, shutdown_under_way) =
+        failure.unwrap_or_else(|| (tokio::time::Instant::now(), inflight_tracker.is_draining()));
+    if shutdown_under_way {
+        match shutdown.await {
+            Ok(deadline) => {
+                // With no time left there is nothing to wait for: the task's
+                // own drain ran to the deadline and said so.
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !left.is_zero() && !inflight_tracker.wait_for_drain(left).await {
+                    warn!(
+                        remaining = inflight_tracker.len(),
+                        "Drain timed out, forcing shutdown with requests still in-flight"
+                    );
+                }
+            }
+            Err(e) => error!("The shutdown task ended abnormally: {e}"),
+        }
+    } else {
+        // What is left of the drain since the failure; a listener it stopped
+        // closed its connections inside the same drain.
+        let left = drain.saturating_sub(stopped.elapsed());
+        if !inflight_tracker.wait_for_drain(left).await {
+            warn!(
+                remaining = inflight_tracker.len(),
+                "Drain timed out after a listener failed, tearing down with requests still in-flight"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3422,105 +3474,6 @@ mod tests {
     use super::*;
     use crate::config::TenantApiKeyEntry;
 
-    /// A request without `anthropic-version` is served (this gateway's own
-    /// SDK clients send none); a version that is not a real calendar date of
-    /// 2023 or later is refused, as the public API refuses it.
-    #[test]
-    fn messages_requests_take_a_missing_version_and_refuse_a_malformed_one() {
-        let with = |value: &'static str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("anthropic-version", http::HeaderValue::from_static(value));
-            headers
-        };
-        assert!(check_anthropic_version(&HeaderMap::new()).is_ok());
-        for ok in ["2023-06-01", "2023-01-01", "2024-02-29", "2026-12-31"] {
-            assert!(check_anthropic_version(&with(ok)).is_ok(), "{ok}");
-        }
-        for bad in [
-            "1999-01-01",
-            "latest",
-            "2023-6-1",
-            "2023-02-30",
-            "2023-13-01",
-            "2023-00-10",
-            "2023-02-29",
-        ] {
-            let refused = check_anthropic_version(&with(bad)).expect_err(bad);
-            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad}");
-            assert_eq!(
-                route_error::extract_error_code_from_response(&refused),
-                "invalid_anthropic_version",
-                "{bad}"
-            );
-        }
-    }
-
-    /// A thinking budget at or above `max_tokens` is refused as the public
-    /// API refuses it, except under the interleaved-thinking beta, where the
-    /// public API takes it.
-    #[test]
-    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
-        let request = |max_tokens: u32, budget: u32| -> CreateMessageRequest {
-            serde_json::from_value(serde_json::json!({
-                "model": "m", "max_tokens": max_tokens,
-                "thinking": {"type": "enabled", "budget_tokens": budget},
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .unwrap()
-        };
-        let plain = HeaderMap::new();
-        assert!(check_thinking_budget(&plain, &request(4096, 1024)).is_ok());
-        let refused = check_thinking_budget(&plain, &request(1024, 1024)).expect_err("refused");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            route_error::extract_error_code_from_response(&refused),
-            "thinking_budget_exceeds_max_tokens"
-        );
-
-        let mut interleaved = HeaderMap::new();
-        interleaved.insert(
-            "anthropic-beta",
-            http::HeaderValue::from_static(
-                "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
-            ),
-        );
-        assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
-        assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
-    }
-
-    /// A `thread` field needs the message-threads beta header, as the public
-    /// API requires; a request without `thread` needs no header.
-    #[test]
-    fn a_thread_field_needs_the_message_threads_beta_header() {
-        let request = |thread: bool| -> CreateMessageRequest {
-            let mut body = serde_json::json!({
-                "model": "m", "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}]
-            });
-            if thread {
-                body["thread"] = serde_json::json!({"type": "create"});
-            }
-            serde_json::from_value(body).unwrap()
-        };
-        let plain = HeaderMap::new();
-        assert!(check_thread_beta(&plain, &request(false)).is_ok());
-        let refused = check_thread_beta(&plain, &request(true)).expect_err("refused");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            route_error::extract_error_code_from_response(&refused),
-            "thread_beta_required"
-        );
-
-        let mut named = HeaderMap::new();
-        named.insert(
-            "anthropic-beta",
-            http::HeaderValue::from_static(
-                "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
-            ),
-        );
-        assert!(check_thread_beta(&named, &request(true)).is_ok());
-    }
-
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.
     #[tokio::test]
@@ -3553,6 +3506,467 @@ mod tests {
                 "{path} skipped the edge middleware"
             );
         }
+    }
+
+    /// A client's call into the edge stack; dropping it is the client
+    /// leaving.
+    type ClientCall = Pin<Box<dyn Future<Output = Result<Response, Infallible>>>>;
+
+    /// A recorded control-plane mutation whose handler waits at a gate, sent
+    /// through the real edge stack over the control-plane layer with the
+    /// state the gateway attaches. Returns the call, polled once (the
+    /// handler waits and the client is still there), and the gate that lets
+    /// the handler answer.
+    fn a_mutation_at_its_gate(
+        tracker: &Arc<InFlightRequestTracker>,
+    ) -> (ClientCall, Arc<tokio::sync::Notify>) {
+        use std::task::{Context, Waker};
+
+        use axum::{body::Body, extract::State, middleware::from_fn_with_state};
+        use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+
+        async fn wait_at_the_gate(State(gate): State<Arc<Notify>>) -> StatusCode {
+            gate.notified().await;
+            StatusCode::ACCEPTED
+        }
+
+        let gate = Arc::new(Notify::new());
+        let state = control_plane_state(
+            ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            ),
+            tracker,
+        );
+        let admin_routes = Router::new()
+            .route("/workers", post(wait_at_the_gate))
+            .route_layer(from_fn_with_state(
+                state,
+                smg_auth::control_plane_auth_middleware,
+            ))
+            .with_state(Arc::clone(&gate));
+        let app = attach_edge_layers(
+            admin_routes,
+            1024,
+            Arc::clone(tracker),
+            vec![],
+            vec![],
+            middleware::AccessLogFields::NONE,
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(http::header::AUTHORIZATION, "Bearer admin-key")
+            .body(Body::empty())
+            .unwrap();
+
+        let mut call: ClientCall = Box::pin(app.oneshot(request));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            call.as_mut().poll(&mut cx).is_pending(),
+            "the handler waits at its gate"
+        );
+        (call, gate)
+    }
+
+    /// A control-plane mutation whose client left stays in the in-flight
+    /// count until its handler answers. While the client waits, the mutation
+    /// counts twice: the edge's guard and the task's hold.
+    #[tokio::test]
+    async fn a_departed_clients_mutation_stays_in_flight_until_it_answers() {
+        let tracker = InFlightRequestTracker::new();
+        let (call, gate) = a_mutation_at_its_gate(&tracker);
+        assert_eq!(
+            tracker.len(),
+            2,
+            "the waiting client's request counts twice: the edge's guard and the task's hold"
+        );
+        // The client leaves: the edge's future goes, the mutation's task runs on.
+        drop(call);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            tracker.len(),
+            1,
+            "the departed client's mutation is in flight until it answers"
+        );
+        gate.notify_one();
+        for _ in 0..1_000 {
+            if tracker.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tracker.is_empty(),
+            "the mutation answered and left the count"
+        );
+    }
+
+    /// The ways out of serving: the shutdown signal; a listener that fails
+    /// with no signal; a listener that fails once the signal has come; a
+    /// listener that fails, and the signal three seconds later; the only
+    /// listener, with no admin listener beside it, failing with no signal.
+    #[derive(Clone, Copy, Debug)]
+    enum WayOut {
+        Signal,
+        ListenerFailure,
+        Both,
+        FailureThenSignal,
+        OnlyListenerFailure,
+    }
+
+    /// The exit as `startup` runs it, on a paused clock: the shutdown task,
+    /// then `serve_until_drained`, the function `startup` serves through,
+    /// over both listeners. A stopped listener takes `closing` to close its
+    /// connections: no time with none to close, the whole drain when one
+    /// holds out. The listeners are stopped when the settle window ends
+    /// under the signal; the data listener's failure stops the other at once
+    /// with no signal, and a second into the settle window with one; on the
+    /// fourth way the signal comes three seconds after the failure. On the
+    /// last there is no admin listener, as by default: the data listener
+    /// fails a second into serving, with no signal and nothing to stop.
+    /// Returns when the listeners ended and when the exit did.
+    async fn exit(
+        tracker: &Arc<InFlightRequestTracker>,
+        budget: ShutdownBudget,
+        way: WayOut,
+        closing: Duration,
+    ) -> (Duration, Duration) {
+        use tokio::sync::watch;
+
+        let start = tokio::time::Instant::now();
+        let (stop, stopped) = watch::channel(false);
+        let stop = Arc::new(stop);
+        let until_closed = |mut stopped: watch::Receiver<bool>| -> Serving {
+            Box::pin(async move {
+                let _ = stopped.wait_for(|stopped| *stopped).await;
+                tokio::time::sleep(closing).await;
+                Ok(())
+            })
+        };
+        let failing_after = |delay: Duration| -> Serving {
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Err(std::io::Error::other("accept failed"))
+            })
+        };
+        // The last listener to end notes when it does: the admin listener,
+        // or the data listener where it is the only one.
+        let (ended, listeners_ended) = watch::channel(Duration::ZERO);
+        let noting_its_end = move |serving: Serving| -> Serving {
+            Box::pin(async move {
+                let result = serving.await;
+                ended.send_replace(start.elapsed());
+                result
+            })
+        };
+        let data = match way {
+            WayOut::Signal => until_closed(stopped.clone()),
+            WayOut::ListenerFailure | WayOut::FailureThenSignal => failing_after(Duration::ZERO),
+            WayOut::Both | WayOut::OnlyListenerFailure => failing_after(Duration::from_secs(1)),
+        };
+        let (data, admin) = if matches!(way, WayOut::OnlyListenerFailure) {
+            // The admin serving `serve_listeners` builds with no admin
+            // listener: ended before it began.
+            let no_admin: Serving = Box::pin(std::future::ready(Ok(())));
+            (noting_its_end(data), no_admin)
+        } else {
+            (data, noting_its_end(until_closed(stopped)))
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the stand-in for the shutdown task `startup` spawns"
+        )]
+        let shutdown = spawn({
+            let tracker = Arc::clone(tracker);
+            let stop = Arc::clone(&stop);
+            async move {
+                match way {
+                    // The signal never comes.
+                    WayOut::ListenerFailure | WayOut::OnlyListenerFailure => {
+                        std::future::pending::<()>().await;
+                    }
+                    WayOut::FailureThenSignal => {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    WayOut::Signal | WayOut::Both => {}
+                }
+                graceful_shutdown(
+                    &tracker,
+                    budget,
+                    async {},
+                    || {},
+                    move |_| {
+                        stop.send_replace(true);
+                    },
+                )
+                .await
+            }
+        });
+        // The shutdown task is under way before the listeners are served on.
+        // An exit that never ends (it waits on a signal that never comes)
+        // fails its case here; it does not hang the run.
+        tokio::task::yield_now().await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3600),
+            serve_until_drained(
+                data,
+                admin,
+                || {},
+                move || {
+                    stop.send_replace(true);
+                },
+                tracker,
+                shutdown,
+                budget.drain,
+            ),
+        )
+        .await
+        .expect("the exit ends");
+        let listeners_ended = *listeners_ended.borrow();
+        (listeners_ended, start.elapsed())
+    }
+
+    /// With nothing in flight the exit ends when the listeners do, on every
+    /// way out: the wait before the teardown takes no time.
+    #[tokio::test(start_paused = true)]
+    async fn with_nothing_in_flight_the_exit_ends_with_the_listeners() {
+        let secs = Duration::from_secs;
+        for (way, ended) in [
+            (WayOut::Signal, 5),
+            (WayOut::ListenerFailure, 0),
+            (WayOut::Both, 1),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            assert_eq!(
+                exit(&tracker, budget, way, Duration::ZERO).await,
+                (secs(ended), secs(ended)),
+                "{way:?}"
+            );
+        }
+    }
+
+    /// A departed client's mutation holds the exit until it answers, on every
+    /// way out: the listeners end with no connection to wait for, and the
+    /// teardown still waits for the mutation's task, so its outcome line is
+    /// written before logging closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_departed_clients_mutation_holds_the_exit_until_it_answers() {
+        let secs = Duration::from_secs;
+        for (way, ended) in [
+            (WayOut::Signal, 5),
+            (WayOut::ListenerFailure, 0),
+            (WayOut::Both, 1),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            assert_eq!(tracker.len(), 1, "{way:?}: the mutation is in flight");
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            // The handler answers 8 s in.
+            let answer = async {
+                tokio::time::sleep(secs(8)).await;
+                gate.notify_one();
+            };
+            let (times, ()) = tokio::join!(exit(&tracker, budget, way, Duration::ZERO), answer);
+            assert_eq!(
+                times,
+                (secs(ended), secs(8)),
+                "{way:?}: the exit waited for the mutation, past the listeners' end"
+            );
+            assert!(
+                tracker.is_empty(),
+                "{way:?}: the mutation answered before the teardown"
+            );
+        }
+    }
+
+    /// A mutation that never answers holds the exit to the shutdown's
+    /// deadline and no longer: the end of the grace under the signal, the
+    /// drain's time when a listener failed with no signal.
+    #[tokio::test(start_paused = true)]
+    async fn a_mutation_that_never_answers_holds_the_exit_to_the_deadline_and_no_longer() {
+        let secs = Duration::from_secs;
+        for (way, ended, deadline) in [
+            (WayOut::Signal, 5, 30),
+            (WayOut::ListenerFailure, 0, 25),
+            (WayOut::Both, 1, 30),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, _gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            assert_eq!(
+                exit(&tracker, budget, way, Duration::ZERO).await,
+                (secs(ended), secs(deadline)),
+                "{way:?}"
+            );
+            assert_eq!(
+                tracker.len(),
+                1,
+                "{way:?}: the mutation is given up on, still in flight"
+            );
+        }
+    }
+
+    /// With no signal a listener's failure stops the other with the drain,
+    /// and a departed client's mutation shares that drain with the stopped
+    /// listener's connections: the exit ends one drain after the failure,
+    /// however much of it the connections took to close, never two.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_listener_and_a_departed_clients_mutation_share_one_drain() {
+        let secs = Duration::from_secs;
+        for closing in [25, 10, 0] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, _gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            assert_eq!(
+                exit(&tracker, budget, WayOut::ListenerFailure, secs(closing)).await,
+                (secs(closing), secs(25)),
+                "the stopped listener closed its connections in {closing} s"
+            );
+            assert_eq!(
+                tracker.len(),
+                1,
+                "the mutation is given up on, still in flight"
+            );
+        }
+    }
+
+    /// Under the signal the shutdown task's own drain ends as soon as nothing
+    /// is in flight. A mutation admitted after that, while the listeners
+    /// still close their connections, and whose client leaves, is waited for
+    /// until it answers, or to the end of the grace when it never does.
+    #[tokio::test(start_paused = true)]
+    async fn a_mutation_admitted_while_the_listeners_close_holds_the_exit() {
+        let secs = Duration::from_secs;
+        for (answers_at, exit_at) in [(Some(9), 9), (None, 30)] {
+            let tracker = InFlightRequestTracker::new();
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            // The listeners are stopped at 5 s, with nothing in flight, and
+            // take 2 s to close; the mutation is admitted in between.
+            let admitted = async {
+                tokio::time::sleep(secs(6)).await;
+                let (call, gate) = a_mutation_at_its_gate(&tracker);
+                drop(call);
+                if let Some(at) = answers_at {
+                    tokio::time::sleep(secs(at - 6)).await;
+                    gate.notify_one();
+                }
+            };
+            let (times, ()) =
+                tokio::join!(exit(&tracker, budget, WayOut::Signal, secs(2)), admitted);
+            assert_eq!(
+                times,
+                (secs(7), secs(exit_at)),
+                "the mutation answers at {answers_at:?} s"
+            );
+        }
+    }
+
+    /// Whether the probes read draining at each of `at`, the seconds since
+    /// the exit began.
+    async fn draining_at<const N: usize>(
+        tracker: &InFlightRequestTracker,
+        at: [u64; N],
+    ) -> [bool; N] {
+        let start = tokio::time::Instant::now();
+        let mut read = [false; N];
+        for (slot, at) in read.iter_mut().zip(at) {
+            tokio::time::sleep_until(start + Duration::from_secs(at)).await;
+            *slot = tracker.is_draining();
+        }
+        read
+    }
+
+    /// A listener's failure with no signal takes the gateway down. From the
+    /// instant it stops the other listener the probes read draining, for as
+    /// long as that listener takes to close its connections: a gateway that
+    /// no longer accepts connections is not ready.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_reports_not_ready_while_the_other_listener_closes() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(&tracker, budget, WayOut::ListenerFailure, secs(10)),
+            draining_at(&tracker, [1, 9]),
+        );
+        assert_eq!(times, (secs(10), secs(10)));
+        assert_eq!(draining, [true, true]);
+    }
+
+    /// The same while the exit waits for a departed client's mutation with
+    /// both listeners closed, and the wait still ends one drain after the
+    /// failure: the failure's own mark is not a shutdown's, so the exit does
+    /// not wait on a shutdown task whose signal never comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_reports_not_ready_while_the_exit_waits_for_a_mutation() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(&tracker, budget, WayOut::ListenerFailure, Duration::ZERO),
+            draining_at(&tracker, [1, 24]),
+        );
+        assert_eq!(times, (secs(0), secs(25)));
+        assert_eq!(draining, [true, true]);
+    }
+
+    /// The same with no admin listener, the default: the failure finds no
+    /// other listener to stop, and it takes the gateway down all the same.
+    /// The probes read ready until the failure, a second into serving, and
+    /// draining from it; the exit ends one drain after the failure.
+    #[tokio::test(start_paused = true)]
+    async fn the_only_listeners_failure_reports_not_ready_while_the_exit_waits_for_a_mutation() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(
+                &tracker,
+                budget,
+                WayOut::OnlyListenerFailure,
+                Duration::ZERO
+            ),
+            draining_at(&tracker, [0, 2, 25]),
+        );
+        assert_eq!(times, (secs(1), secs(26)));
+        assert_eq!(draining, [false, true, true]);
+    }
+
+    /// A signal that comes after a listener's failure does not move the
+    /// exit's deadline: the failure stopped the gateway with no shutdown
+    /// under way, and the exit ends one drain after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_after_a_listeners_failure_does_not_move_the_exits_deadline() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        assert_eq!(
+            exit(&tracker, budget, WayOut::FailureThenSignal, secs(10)).await,
+            (secs(10), secs(25))
+        );
     }
 
     /// An unknown URL and a wrong method answer a JSON envelope in the shape

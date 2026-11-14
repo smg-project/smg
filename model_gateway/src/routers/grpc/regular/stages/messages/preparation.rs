@@ -280,6 +280,7 @@ mod tests {
         use serde_json::{json, Value};
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -301,7 +302,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
@@ -347,6 +348,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -371,7 +373,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (model, profile, rendered) in [
             (
@@ -426,6 +428,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -449,7 +452,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         let schema = json!({
             "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]

@@ -47,9 +47,11 @@ use tokio::{
 };
 
 use crate::{
+    bootstrap::{accept_and_close, bind},
     config::{Config, Role},
     drain::InFlight,
     engine::{Engine, GenEvent, LoadSnapshot, NewRequest},
+    kv_zmq,
     script::{self, Answer, MatchedStop},
 };
 
@@ -459,7 +461,7 @@ pub async fn serve_until(
         .ok()
         .and_then(|index| cfg.grpc_count.checked_add(index))
         .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+    let bootstrap = match bind(&cfg.host, bootstrap_port).await {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!("zmq engine {engine_index}: {e}");
@@ -472,7 +474,7 @@ pub async fn serve_until(
             clippy::disallowed_methods,
             reason = "the acceptor ends with the rank: the guard's drop stops it"
         )]
-        tokio::spawn(crate::bootstrap::accept_and_close(listener, stopped));
+        tokio::spawn(accept_and_close(listener, stopped));
         StopOnDrop(stop)
     });
     if let Some(port) = bootstrap_port {
@@ -555,7 +557,7 @@ pub async fn serve_until(
         clippy::disallowed_methods,
         reason = "publisher self-terminates when the engine's event channel closes"
     )]
-    let _publisher = publisher.map(|(engine, kv)| tokio::spawn(crate::kv_zmq::serve(engine, kv)));
+    let _publisher = publisher.map(|(engine, kv)| tokio::spawn(kv_zmq::serve(engine, kv)));
 
     // A single writer owns the output PUSH socket; per-request forwarders funnel
     // their outputs here so concurrent requests serialize onto the one socket.

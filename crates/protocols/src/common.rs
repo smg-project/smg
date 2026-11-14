@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use serde::{
@@ -423,7 +423,7 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
 // Content Parts (for multimodal messages)
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
@@ -440,10 +440,86 @@ pub enum ContentPart {
     /// replays it in the history; the renderers read it as the turn's text.
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
-    /// Pass through unknown content objects to HTTP backends.
-    /// Also matches malformed known types; gRPC backends reject this variant.
+    /// Pass through unknown content objects to HTTP backends; gRPC backends
+    /// reject this variant. A known `type` whose body does not fit it is no
+    /// unknown part: it refuses with serde's reason for the field.
     #[serde(untagged)]
     Unknown(Map<String, Value>),
+}
+
+/// The parts the gateway knows, read by their `type` as serde reads a tagged
+/// enum, so a malformed one carries serde's reason for the field.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum KnownContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+}
+
+impl KnownContentPart {
+    /// The `type` names a kind the gateway knows.
+    fn names(kind: &str) -> bool {
+        matches!(
+            kind,
+            "text" | "image_url" | "audio_url" | "input_audio" | "video_url" | "refusal"
+        )
+    }
+}
+
+impl From<KnownContentPart> for ContentPart {
+    fn from(part: KnownContentPart) -> Self {
+        match part {
+            KnownContentPart::Text { text } => Self::Text { text },
+            KnownContentPart::ImageUrl { image_url } => Self::ImageUrl { image_url },
+            KnownContentPart::AudioUrl { audio_url } => Self::AudioUrl { audio_url },
+            KnownContentPart::InputAudio { input_audio } => Self::InputAudio { input_audio },
+            KnownContentPart::VideoUrl { video_url } => Self::VideoUrl { video_url },
+            KnownContentPart::Refusal { refusal } => Self::Refusal { refusal },
+        }
+    }
+}
+
+/// A part is an object; one whose `type` the gateway knows must fit that
+/// kind (its refusal is serde's, naming the field's reason), any other is
+/// kept whole for the backends that read it.
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = Map::<String, Value>::deserialize(deserializer)?;
+        let kind = match fields.get("type").and_then(Value::as_str) {
+            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
+            _ => return Ok(Self::Unknown(fields)),
+        };
+        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
+            .map(Self::from)
+            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+    }
+}
+
+/// Serde's reason for a known part's refusal, opening with serde's words so
+/// a reader keeps its code: a field missing from the kind's body is named
+/// under the kind (`missing field `image_url.url``), any other reason names
+/// the body after itself (`..., in `image_url``), since serde's own path
+/// stops at the message a tagged enum buffers.
+fn known_part_reason(kind: &str, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    let missing = reason
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'));
+    match missing {
+        Some(field) if field != kind => format!("missing field `{kind}.{field}`"),
+        Some(_) => reason,
+        None => format!("{reason}, in `{kind}`"),
+    }
 }
 
 impl ContentPart {
@@ -460,7 +536,9 @@ impl ContentPart {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct ImageUrl {
-    pub url: String,
+    /// The image's URL or `data:` URL, shared with every reader of the
+    /// request (the media plan among them) instead of copied.
+    pub url: Arc<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
     /// MiniMax-M3 extension: cap the image's long side before preprocessing.
@@ -478,20 +556,22 @@ pub struct ImageUrl {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct AudioUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct InputAudio {
-    /// Base64-encoded audio bytes.
-    pub data: String,
+    /// Base64-encoded audio bytes, shared with the readers that decode them.
+    pub data: Arc<String>,
     /// Encoded audio format. The OpenAI Chat API supports `wav` and `mp3`.
     pub format: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
     /// MiniMax-M3 extension: frames per second to sample the clip at.
     ///
     /// Valid range is 0.2 to 5.0 inclusive.
@@ -1667,6 +1747,27 @@ impl Usage {
         self
     }
 
+    /// Report the prompt's image tokens: the tokens the gateway's multimodal
+    /// expansion wrote into the prompt for the request's images, as
+    /// `prompt_tokens_details.image_tokens`. `None` leaves the details as they
+    /// are: a request without an image the gateway expanded reports no image
+    /// count, as before. The count is kept within `prompt_tokens`, the total
+    /// the details break down.
+    pub fn with_image_tokens(mut self, image_tokens: Option<u32>) -> Self {
+        if let Some(image_tokens) = image_tokens {
+            self.prompt_tokens_details
+                .get_or_insert(PromptTokenUsageInfo {
+                    cached_tokens: 0,
+                    audio_tokens: None,
+                    text_tokens: None,
+                    image_tokens: None,
+                    cache_write_tokens: None,
+                })
+                .image_tokens = Some(image_tokens.min(self.prompt_tokens));
+        }
+        self
+    }
+
     /// Default detail counters to zero, except unknown speculative rejections.
     /// With explicit accepted tokens, unavailable/inconsistent drafts leave rejected
     /// absent. Default zeros for non-speculative usage are schema defaults, not
@@ -1717,6 +1818,10 @@ pub struct CompletionTokensDetails {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
+    /// Generated tokens. The public API's embeddings usage has no such key
+    /// (only `prompt_tokens` and `total_tokens`), so a usage written without
+    /// it reads as none generated.
+    #[serde(default)]
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub reasoning_tokens: Option<u32>,
@@ -2278,6 +2383,55 @@ mod tests {
     }
 
     #[test]
+    fn image_tokens_are_reported_within_the_prompt_or_not_at_all() {
+        let none = Usage::from_counts(10, 4).with_image_tokens(None);
+        assert!(
+            none.prompt_tokens_details.is_none(),
+            "no image count opens no details"
+        );
+        let kept = Usage::from_counts(10, 4)
+            .with_cached_tokens(2)
+            .with_image_tokens(None);
+        assert_eq!(
+            kept.prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((2, None)),
+            "no image count leaves the cache details as they are"
+        );
+
+        let reported = Usage::from_counts(535, 4).with_image_tokens(Some(324));
+        assert_eq!(
+            reported
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((0, Some(324))),
+            "the details the count opens default the cache to zero"
+        );
+        let beside_cache = Usage::from_counts(535, 4)
+            .with_cached_tokens(100)
+            .with_image_tokens(Some(324));
+        assert_eq!(
+            beside_cache
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((100, Some(324)))
+        );
+
+        let clamped = Usage::from_counts(10, 4).with_image_tokens(Some(12));
+        assert_eq!(
+            clamped
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.image_tokens),
+            Some(10),
+            "the count stays within the prompt"
+        );
+    }
+
+    #[test]
     fn content_part_deserializes_audio_url() {
         let value = json!({
             "type": "audio_url",
@@ -2290,10 +2444,97 @@ mod tests {
             part,
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "https://example.com/audio.wav".to_string(),
+                    url: "https://example.com/audio.wav".to_string().into(),
                 },
             }
         );
+    }
+
+    /// A known `type` whose body does not fit it is refused with serde's
+    /// reason for the field, not read as an unknown part.
+    #[test]
+    fn content_part_refuses_a_malformed_known_type_with_the_fields_reason() {
+        for (value, reason) in [
+            (
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}),
+                "invalid value: integer `-1`, expected u32, in `image_url`",
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA==", "fps": "1"}}),
+                "invalid type: string \"1\", expected f64, in `video_url`",
+            ),
+            (
+                json!({"type": "image_url", "image_url": {"detail": "high"}}),
+                "missing field `image_url.url`",
+            ),
+            (json!({"type": "image_url"}), "missing field `image_url`"),
+            (
+                json!({"type": "text", "text": 5}),
+                "invalid type: integer `5`, expected a string, in `text`",
+            ),
+            (
+                json!({"type": "refusal", "refusal": null}),
+                "invalid type: null, expected a string, in `refusal`",
+            ),
+        ] {
+            let error = serde_json::from_value::<ContentPart>(value.clone()).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{value}");
+        }
+    }
+
+    /// Every typed kind reads back typed: the `ContentPart` variants, the
+    /// `KnownContentPart` mirror and `KnownContentPart::names` name the same
+    /// set, and the match below has no wildcard, so a new variant does not
+    /// compile until it has a sample here (a kind missing from the mirror or
+    /// the names would read back as an unknown part and fail the round trip).
+    #[test]
+    fn every_typed_content_part_reads_back_typed() {
+        let samples = [
+            ContentPart::Text {
+                text: "t".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "u".to_string().into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "u".to_string().into(),
+                },
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "d".to_string().into(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::VideoUrl {
+                video_url: VideoUrl {
+                    url: "u".to_string().into(),
+                    fps: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::Refusal {
+                refusal: "r".to_string(),
+            },
+        ];
+        for part in samples {
+            match &part {
+                ContentPart::Text { .. }
+                | ContentPart::ImageUrl { .. }
+                | ContentPart::AudioUrl { .. }
+                | ContentPart::InputAudio { .. }
+                | ContentPart::VideoUrl { .. }
+                | ContentPart::Refusal { .. } => {}
+                ContentPart::Unknown(_) => panic!("a typed sample"),
+            }
+            let value = serde_json::to_value(&part).unwrap();
+            assert_eq!(serde_json::from_value::<ContentPart>(value).unwrap(), part);
+        }
     }
 
     #[test]
@@ -2354,7 +2595,7 @@ mod tests {
             part,
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             }

@@ -41,9 +41,11 @@ use tokio::{
 
 use crate::{
     admin_ops::{AdminOps, ProfileOptions},
+    bootstrap::{accept_and_close, bind},
     config::{Config, Role},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
+    grpc::KV_TRANSPORT,
     script::{self, Answer, MatchedStop},
 };
 
@@ -136,7 +138,7 @@ pub async fn serve_with_listener_until(
     let bootstrap_port = port
         .checked_sub(cfg.http_base_port)
         .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+    let bootstrap = match bind(&cfg.host, bootstrap_port).await {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!("http worker {port} {e}");
@@ -176,7 +178,7 @@ pub async fn serve_with_listener_until(
     };
     let bootstrap = async {
         if let Some(listener) = bootstrap {
-            crate::bootstrap::accept_and_close(listener, stopped).await;
+            accept_and_close(listener, stopped).await;
         }
     };
     let server = async {
@@ -350,7 +352,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let mut info = json!({ "model_path": state.cfg.model_id });
     if let Some(role) = state.cfg.role {
         info["disaggregation_mode"] = json!(role.as_str());
-        info["disaggregation_transfer_backend"] = json!(crate::grpc::KV_TRANSPORT);
+        info["disaggregation_transfer_backend"] = json!(KV_TRANSPORT);
         if let Some(port) = state.bootstrap_port {
             info["disaggregation_bootstrap_port"] = json!(port);
         }
@@ -2509,10 +2511,7 @@ mod tests {
         .await;
         assert_eq!(prefill["disaggregation_mode"], "prefill");
         assert_eq!(prefill["disaggregation_bootstrap_port"], 8998);
-        assert_eq!(
-            prefill["disaggregation_transfer_backend"],
-            crate::grpc::KV_TRANSPORT
-        );
+        assert_eq!(prefill["disaggregation_transfer_backend"], KV_TRANSPORT);
         let decode = json_of(
             server_info(State(state_of(
                 Some(Role::Decode),
