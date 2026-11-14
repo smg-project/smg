@@ -1187,6 +1187,11 @@ async fn execute_embed(
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
+    // The file's own `join_all` import goes with the last other call that
+    // uses it; this one names the function here, so the call stands whether
+    // or not that import remains.
+    use futures::future::join_all;
+
     let client = &*clients.single_or_mismatch("execute_embed")?;
 
     let worker = workers.single();
