@@ -278,9 +278,12 @@ const CUT_CHECK_WINDOW: usize = 512;
 /// be looked for when a stage can read a space after a non-whitespace
 /// character inside one match (a letter run joined by spaces, a class read
 /// before a space), so that spaces lie inside pieces; a candidate without a
-/// start or an end within this reach is refused. Without such a stage the
-/// nearest space back is the start and the nearest space on the end,
-/// however far.
+/// start or an end within this reach has no window and the cut search
+/// skips it (a stretch without one is one piece under such a stage, so no
+/// cut is lost). Without such a stage
+/// the start and the end are looked for within a chunk instead (see
+/// `cut_check_reach`): such a stretch is many pieces there, and a text
+/// whose spaces stand further apart than this reach keeps its cuts.
 const CUT_CHECK_REACH: usize = 4 * CUT_CHECK_WINDOW;
 /// Candidates one cut search may reject before it gives up: the byte scan for
 /// a candidate is cheap, the window check on each one is not, so a text whose
@@ -2020,8 +2023,9 @@ impl NativeEncoder {
     /// first stage runs over a unit of the thread pool as over the text, and
     /// would read the unit's bounds as the text's; the pool's cut check runs
     /// the stages over a window of the text ([`Self::piece_starts_at`]), each
-    /// over the pieces of the one before, from a start that can sit inside a
-    /// whitespace run of the text ([`Self::window_start`]), which stays right
+    /// over the pieces of the one before, from a start an earlier stage's
+    /// gap can span ([`Self::window_start`]) to an end that can sit inside a
+    /// whitespace run of the text ([`Self::window_end`]), which stays right
     /// only when the stage's matches are runs of decimal digits, which begin
     /// at neither of the window's bounds nor at a cut candidate (all spaces)
     /// and span none of them; and the stage's own input pieces must meet
@@ -2443,7 +2447,13 @@ impl NativeEncoder {
     /// lookahead's word boundary reads the character before it, one its match
     /// consumed: the parser declines the lookahead where it could lead a
     /// match), so the pieces of the two halves are the pieces of the whole.
-    /// `None` when
+    /// A candidate without a window within the check's reach
+    /// ([`Self::window_start`], [`Self::window_end`]: a stretch without a
+    /// space longer than the reach on one side of it) is skipped, with the
+    /// window after it (the walks of the candidates there meet the same
+    /// stretch), and not counted: its own space begins a whitespace run,
+    /// where the next candidate's walk back can stop, so a blob followed by
+    /// prose keeps its cuts past the blob. `None` when
     /// the text has no such point past `from`, or when
     /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
     /// check: a stretch without candidates (a blob, a table of numbers) costs
@@ -2480,7 +2490,17 @@ impl NativeEncoder {
                     .next_back()
                     .is_some_and(|c| !c.is_whitespace())
             {
-                if self.piece_starts_at(text, p) {
+                let (Some(start), Some(end)) =
+                    (self.window_start(text, p), self.window_end(text, p))
+                else {
+                    // No window within the check's reach on one side: a stretch without a
+                    // space there, which the walks of every candidate within a window of
+                    // this one meet too. A skip, not a rejection: the rejections count the
+                    // candidates the check read.
+                    p += CUT_CHECK_WINDOW;
+                    continue;
+                };
+                if self.piece_starts_at(&text[start..end], p - start) {
                     return Some(p);
                 }
                 rejected += 1;
@@ -2493,36 +2513,29 @@ impl NativeEncoder {
         None
     }
 
-    /// Whether the stages, run over a window of text around `p`, cut cleanly
-    /// at `p`. The window starts where the whole text's match loop begins a
-    /// piece and ends just after such a space ([`Self::window_start`],
-    /// [`Self::window_end`]), so that its pieces around `p` are the text's; a
-    /// candidate without such a start or end is no cut. Over the window the
+    /// Whether the stages, run over the cut check's `window` of a candidate
+    /// at `at` inside it, cut cleanly there. The window starts where the
+    /// whole text's match loop begins a piece and ends just after such a
+    /// space ([`Self::window_start`], [`Self::window_end`]), so that its
+    /// pieces around the candidate are the text's. Over the window the
     /// stages run as the walk runs them over a piece ([`Self::pieces`]), each
     /// over the piece of the stage before it, never over the whole window
     /// (two isolated stages, `aa` then a space with 999 of the space-or-a
     /// class, over a run of ` a` with `aa` inside it: the second stage's match
     /// begins where `aa` ends, while a run from the window's start would end
     /// one match on the candidate and begin the next there). A piece that
-    /// holds `p` inside it would be split, so that is no cut. The text before
-    /// `p` on its own, as the unit before the cut reads it, must cut into the
-    /// same pieces as it does inside the window (a lookahead at `p` reads the
-    /// unit's end where the text reads on: ` a{1000}(?!\s)` holds at the one
-    /// and fails at the other); and the text from `p` on its own, as the unit
-    /// after the cut reads it, must cut into the same pieces too (an earlier
-    /// stage's match that a later stage splits at `p`, or that a dropped
-    /// stage drops, leaves no final piece over `p`, while the next unit's
-    /// first stage begins inside that match and may match otherwise:
-    /// `[ a]{999}` then ` a` over a run of ` a`); else that is no cut.
-    fn piece_starts_at(&self, text: &str, p: usize) -> bool {
-        let Some(start) = self.window_start(text, p) else {
-            return false;
-        };
-        let Some(end) = self.window_end(text, p) else {
-            return false;
-        };
-        let window = &text[start..end];
-        let at = p - start;
+    /// holds `at` inside it would be split, so that is no cut. The text
+    /// before `at` on its own, as the unit before the cut reads it, must cut
+    /// into the same pieces as it does inside the window (a lookahead at
+    /// `at` reads the unit's end where the text reads on: ` a{1000}(?!\s)`
+    /// holds at the one and fails at the other); and the text from `at` on
+    /// its own, as the unit after the cut reads it, must cut into the same
+    /// pieces too (an earlier stage's match that a later stage splits at
+    /// `at`, or that a dropped stage drops, leaves no final piece over `at`,
+    /// while the next unit's first stage begins inside that match and may
+    /// match otherwise: `[ a]{999}` then ` a` over a run of ` a`); else that
+    /// is no cut.
+    fn piece_starts_at(&self, window: &str, at: usize) -> bool {
         let mut whole = Vec::new();
         self.piece_spans(window, &mut whole);
         if whole.iter().any(|&(from, to)| from < at && at < to) {
@@ -2554,6 +2567,25 @@ impl NativeEncoder {
         });
     }
 
+    /// How far before and after a candidate the cut check's window may start
+    /// and end ([`Self::window_start`], [`Self::window_end`]): the reach
+    /// ([`CUT_CHECK_REACH`]) when a stage reads a space after a
+    /// non-whitespace character inside one match, where a stretch without a
+    /// piece-beginning space is one piece and the refusal loses no cut; a
+    /// chunk ([`PARALLEL_CHUNK_BYTES`]) otherwise, where such a stretch
+    /// (digits, letters, line breaks, a whitespace run) is many pieces and
+    /// its candidates are cuts the pool wants - a text whose spaces stand
+    /// thousands of bytes apart keeps them - while the chunk keeps the
+    /// window, and the spans the check collects over it (one per piece),
+    /// within two chunks whatever the text.
+    fn cut_check_reach(&self) -> usize {
+        if self.space_inside {
+            CUT_CHECK_REACH
+        } else {
+            PARALLEL_CHUNK_BYTES
+        }
+    }
+
     /// Where the cut check's window for a candidate at `p` starts: the first
     /// space at or before `p - CUT_CHECK_WINDOW`, or the text's start, where
     /// the whole text's match loop begins a piece, so that the window's
@@ -2573,24 +2605,33 @@ impl NativeEncoder {
     /// reads a space after a non-whitespace character inside one match
     /// ([`Pattern::reads_space_inside`]: no such run, and the before-space
     /// classes whitespace alone), a piece holds a space only at its start
-    /// or in a whitespace run, so the nearest space back is the start,
-    /// however far (a window begun inside a whitespace run rejoins the
-    /// text's pieces at the run's end). Otherwise `None` when no such space
-    /// lies within [`CUT_CHECK_REACH`] of `p`: a long text without one
-    /// stays one unit (under a letter run joined by spaces such a stretch
-    /// is one piece, so no cut is lost there).
+    /// or in a whitespace run, so the nearest space back that begins a
+    /// whitespace run is the start ([`Self::whitespace_run_begins_at`]: a
+    /// window begun inside the run would take a fixed-count whitespace
+    /// alternative, `\s{2}`, from another offset than the text and leave
+    /// another remainder at the run's end, one space before a letter run
+    /// that a space-led alternative with a lookahead at its end,
+    /// ` a{100}(?!\s)`, reads one way inside the text and another at a
+    /// unit's end), when it lies within a chunk of `p`
+    /// ([`Self::cut_check_reach`]); a stretch without one before a
+    /// candidate - a longer whitespace run, line breaks, digits, letters
+    /// without a space - leaves the candidate without a window (`None`; the
+    /// search skips it, [`Self::stable_cut`]), which keeps the window, and
+    /// the spans the check collects over it (one per piece: one per byte
+    /// under a whitespace or digit split), within a chunk. Otherwise
+    /// `None` when no such space lies within [`CUT_CHECK_REACH`] of `p`: a
+    /// long text without one stays one unit (under a letter run joined by
+    /// spaces such a stretch is one piece, so no cut is lost there).
     fn window_start(&self, text: &str, p: usize) -> Option<usize> {
-        let bytes = text.as_bytes();
         let mut start = p.saturating_sub(CUT_CHECK_WINDOW);
-        if !self.space_inside {
-            while start > 0 && !(text.is_char_boundary(start) && bytes[start] == b' ') {
-                start -= 1;
-            }
-            return Some(start);
-        }
-        let floor = p.saturating_sub(CUT_CHECK_REACH);
+        let floor = p.saturating_sub(self.cut_check_reach());
         while start > 0 {
-            if self.piece_begins_at_space(text, start) {
+            let begins = if self.space_inside {
+                self.piece_begins_at_space(text, start)
+            } else {
+                Self::whitespace_run_begins_at(text, start)
+            };
+            if begins {
                 return Some(start);
             }
             if start <= floor {
@@ -2617,22 +2658,25 @@ impl NativeEncoder {
     /// neighbour is no whitespace, so no whitespace run spans `p`). When no
     /// stage reads a space inside a match the first space on is the end: no
     /// piece spans `p` then, so an end inside a later piece (a whitespace
-    /// run) changes nothing up to `p`. Otherwise `None` when no such space
-    /// lies within [`CUT_CHECK_REACH`] of `p` and the text runs on: no cut
-    /// there (under a pattern that reads a space inside a match such a
-    /// stretch is one piece, so no cut is lost).
+    /// run) changes nothing up to `p`; `None` when no space lies within a
+    /// chunk of `p` ([`Self::cut_check_reach`]) and the text runs on (the
+    /// search skips the candidate, [`Self::stable_cut`]), which keeps the
+    /// window, and the spans the check collects over it, within a chunk.
+    /// Otherwise `None` when no such space lies within
+    /// [`CUT_CHECK_REACH`] of `p` and the text runs on: no cut there (under
+    /// a pattern that reads a space inside a match such a stretch is one
+    /// piece, so no cut is lost).
     fn window_end(&self, text: &str, p: usize) -> Option<usize> {
         let bytes = text.as_bytes();
         let mut end = (p + CUT_CHECK_WINDOW).min(text.len());
-        if !self.space_inside {
-            while end < text.len() && !(text.is_char_boundary(end) && bytes[end] == b' ') {
-                end += 1;
-            }
-            return Some((end + 1).min(text.len()));
-        }
-        let ceiling = (p + CUT_CHECK_REACH).min(text.len());
+        let ceiling = (p + self.cut_check_reach()).min(text.len());
         while end < text.len() {
-            if self.piece_begins_at_space(text, end) {
+            let ends = if self.space_inside {
+                self.piece_begins_at_space(text, end)
+            } else {
+                text.is_char_boundary(end) && bytes[end] == b' '
+            };
+            if ends {
                 return Some(end + 1);
             }
             if end >= ceiling {
@@ -2662,6 +2706,22 @@ impl NativeEncoder {
                         || stage.pattern.reads_space_after(before)
                 })
         })
+    }
+
+    /// Whether a whitespace run begins at `at` with a space: `at` holds a
+    /// space and no whitespace precedes it. Under a pattern that reads no
+    /// space inside a match the whole text's match loop attempts a match
+    /// there (nothing before the run takes the space), so the cut check's
+    /// window begins at such a space: a window begun inside the run would
+    /// take a fixed-count whitespace alternative (`\s{2}`) from another
+    /// offset than the text and leave another remainder at the run's end.
+    fn whitespace_run_begins_at(text: &str, at: usize) -> bool {
+        text.is_char_boundary(at)
+            && text.as_bytes()[at] == b' '
+            && !text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
     }
 
     /// Appends the ids of one unit: an added token's id, or a text's pieces
