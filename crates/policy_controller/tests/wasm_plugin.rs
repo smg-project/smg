@@ -568,6 +568,19 @@ fn a_declined_pick_takes_the_fallback_picker_or_sheds_when_closed() {
     );
     assert_eq!(plugin.stats().declined, 1);
 
+    // Without a fallback: open ranks by the combined scores, closed sheds.
+    let open = load(
+        &runtime,
+        "open-pick",
+        guest::record_guest(),
+        mode::DECLINE_PICK,
+    );
+    assert_eq!(
+        pick_ids(&decide(&plugin_engine(&open), &pool(4), 1)),
+        vec![103, 102, 101, 100],
+        "the plugin's own scores rank the rows"
+    );
+    assert_eq!(open.stats().declined, 1);
     let mut closed = spec("closed-pick", guest::record_guest(), mode::DECLINE_PICK);
     closed.failure = Failure::Closed;
     let plugin = Plugin::load(&runtime, closed).expect("loads");
@@ -577,6 +590,48 @@ fn a_declined_pick_takes_the_fallback_picker_or_sheds_when_closed() {
             assert_eq!(shed.emptied_by, "closed-pick");
         }
         other => panic!("a shed, not {other:?}"),
+    }
+}
+
+/// A score is a preference and has no veto: declined with no fallback it is
+/// a flat score under either failure mode, the plugin weighs nothing and
+/// nothing is shed (what must hold or shed is a filter). The plugin's own
+/// pick, which with its scores names the least loaded row, names the first.
+#[test]
+fn a_declined_score_has_no_veto_under_either_failure_mode() {
+    let runtime = runtime();
+    let scoring = load(
+        &runtime,
+        "scoring",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    assert_eq!(
+        pick_ids(&decide(&plugin_engine(&scoring), &pool(4), 1))
+            .first()
+            .copied(),
+        Some(103),
+        "with its scores the plugin picks the least loaded row"
+    );
+    for failure in [Failure::Open, Failure::Closed] {
+        let mut declining = spec("no-score", guest::record_guest(), mode::DECLINE_SCORE);
+        declining.failure = failure;
+        let plugin = Plugin::load(&runtime, declining).expect("loads");
+        let decision = decide(&plugin_engine(&plugin), &pool(4), 1);
+        let mut ids = pick_ids(&decision);
+        assert_eq!(
+            ids.first().copied(),
+            Some(100),
+            "{failure:?}: over flat scores the plugin's pick is the first row: {decision:?}"
+        );
+        ids.sort_unstable();
+        assert_eq!(ids, vec![100, 101, 102, 103], "{failure:?}: no row is shed");
+        let stats = plugin.stats();
+        assert_eq!(
+            (stats.declined, stats.answered),
+            (1, 3),
+            "{failure:?}: the score declined; the constructor, the filter and the pick answered"
+        );
     }
 }
 

@@ -426,6 +426,25 @@ jobs:
           source "$HOME/.cargo/env"
           bash crates/wasm/tests/fixtures/build_fixtures.sh
 
+      # The example policy plugin, built with the line a user runs (its
+      # build.sh: the bare wasm32 target of the pinned toolchain, then one
+      # wasm-tools command, here the pinned release). The policy crate's
+      # tests load the component that line wrote. The guest is a workspace
+      # of its own, which the repository's fmt and clippy do not reach, so
+      # the copy a user starts from is checked here: the repository's
+      # formatter (rustfmt runs on nightly) and the pinned toolchain's clippy.
+      - name: Build the example policy plugin
+        if: contains(matrix.needs, 'policy-guest')
+        run: |
+          source "$HOME/.cargo/env"
+          bash scripts/ci_install_wasm_tools.sh
+          export PATH="$HOME/.local/bin:$PATH"
+          bash examples/wasm/wasm-guest-policy/build.sh
+          cd examples/wasm/wasm-guest-policy
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          cargo +nightly fmt -- --check
+          cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings
+
       # --strict makes a fixture that fails to generate fail this step (the Rust
       # golden tests skip a missing fixture directory, so a silent skip here
       # would silently drop coverage). The step does not block the Rust tests,
@@ -483,6 +502,9 @@ jobs:
           # Where libjpeg-turbo is installed, the TurboJPEG decode tests must
           # run: a library that does not load fails them instead of skipping them.
           SMG_REQUIRE_TURBOJPEG: ${{ contains(matrix.needs, 'turbojpeg') && '1' || '' }}
+          # Where the example policy plugin is built, the tests that load it
+          # must run: a missing component fails them instead of skipping them.
+          SMG_REQUIRE_POLICY_GUEST: ${{ contains(matrix.needs, 'policy-guest') && '1' || '' }}
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
@@ -957,6 +979,8 @@ jobs:
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
               - 'crates/policy_controller/**'
+              - 'examples/wasm/wasm-guest-policy/**'
+              - 'scripts/ci_install_wasm_tools.sh'
               - 'crates/radix_tree/**'
               - 'crates/grpc_client/**'
               - 'crates/engine_zmq_client/**'
@@ -1173,6 +1197,7 @@ jobs:
               ("scripts/oracle_flyway/**",                       "agentic vendor"),
               ("scripts/ci_cargo_audit.sh",                      NONE),
               ("scripts/ci_rust_tests.sh",                       NONE),
+              ("scripts/ci_install_wasm_tools.sh",               NONE),
               ("scripts/ci_gpu_runner_image.py",                 NONE),
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
