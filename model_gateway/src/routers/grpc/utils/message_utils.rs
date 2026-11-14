@@ -1223,7 +1223,7 @@ mod tests {
                 InputContentBlock::Image(messages::ImageBlock {
                     source: messages::ImageSource::Base64 {
                         media_type: "image/png".to_string(),
-                        data: "AAAA".to_string(),
+                        data: "AAAA".to_string().into(),
                     },
                     cache_control: None,
                 }),
@@ -1535,7 +1535,7 @@ mod tests {
                         messages::ToolResultContentBlock::Image(messages::ImageBlock {
                             source: messages::ImageSource::Base64 {
                                 media_type: "image/png".to_string(),
-                                data: "AAAA".to_string(),
+                                data: "AAAA".to_string().into(),
                             },
                             cache_control: None,
                         }),
@@ -1689,7 +1689,7 @@ mod tests {
                 content: vec![InputContentBlock::Image(messages::ImageBlock {
                     source: messages::ImageSource::Base64 {
                         media_type: "image/png".to_string(),
-                        data: "AAAA".to_string(),
+                        data: "AAAA".to_string().into(),
                     },
                     cache_control: None,
                 })],

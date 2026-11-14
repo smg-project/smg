@@ -62,6 +62,7 @@ use openai_protocol::worker::{
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
 use smg_grpc_client::common_proto::EngineLoad;
+use smg_policy_controller::ingest::scrape;
 use tokio::{
     sync::{broadcast, Notify},
     task::JoinHandle,
@@ -80,72 +81,6 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Minimal Prometheus text-format scraper: metric name -> sample values
-/// (one per label-set). Only the flat `name{labels} value` / `name value`
-/// gauge lines that the engine load fetchers look up are collected;
-/// `#` comment lines and unparsable values are skipped, and histogram or
-/// summary buckets are simply never queried by name.
-struct PromScrape {
-    samples: HashMap<String, Vec<f64>>,
-}
-
-impl PromScrape {
-    fn parse(text: &str) -> Self {
-        let mut samples: HashMap<String, Vec<f64>> = HashMap::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            // Line shape: `name{labels} value [timestamp]`. Split the head
-            // (`name{labels}`) from the tail at the end of the label block so
-            // spaces inside quoted label values don't confuse the split; fall
-            // back to the first whitespace for unlabeled metrics. Then take
-            // the FIRST tail token as the value, ignoring any optional
-            // trailing timestamp.
-            let (head, tail) = match line.rfind('}') {
-                Some(close) => (&line[..=close], &line[close + 1..]),
-                None => match line.split_once(char::is_whitespace) {
-                    Some(split) => split,
-                    None => continue,
-                },
-            };
-            let Some(value) = tail.split_whitespace().next() else {
-                continue;
-            };
-            let Ok(value) = value.parse::<f64>() else {
-                continue;
-            };
-            let name = head.split('{').next().unwrap_or(head).trim();
-            samples.entry(name.to_string()).or_default().push(value);
-        }
-        Self { samples }
-    }
-
-    /// Sum across all label-set samples for `name` (0.0 if absent). Right for
-    /// additive counts like running/waiting requests across DP ranks.
-    fn sum(&self, name: &str) -> f64 {
-        self.samples
-            .get(name)
-            .map(|v| v.iter().sum())
-            .unwrap_or(0.0)
-    }
-
-    /// Mean across all label-set samples for `name` (0.0 if absent). Right for
-    /// ratios like KV-cache usage that must not be double-counted.
-    fn mean(&self, name: &str) -> f64 {
-        match self.samples.get(name) {
-            Some(v) if !v.is_empty() => v.iter().sum::<f64>() / v.len() as f64,
-            _ => 0.0,
-        }
-    }
-
-    /// True when at least one sample exists for `name`.
-    fn has(&self, name: &str) -> bool {
-        self.samples.get(name).is_some_and(|v| !v.is_empty())
-    }
-}
 
 /// DP rank load cache used by load-aware routing policies.
 ///
@@ -1604,57 +1539,21 @@ impl WorkerMonitor {
         }
     }
 
-    /// vLLM HTTP: derive load from the Prometheus `/metrics` endpoint.
-    /// The KV-cache usage ratio (0.0–1.0) maps onto `token_usage`; it is
-    /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
-    /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
+    /// vLLM HTTP: the load from the Prometheus `/metrics` endpoint, read by
+    /// the gauge table the controller crate holds (`ingest::scrape`), the
+    /// same one the controller's scrape driver reads.
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
-        let m = PromScrape::parse(&body);
-
-        // Require the KV-usage gauge: it is the signal load-aware routing acts
-        // on, and without it `token_usage` would default to `0.0` and make a
-        // worker of unknown pressure look idle. v0 and v1 name it differently.
-        let kv_usage = ["vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc"]
-            .into_iter()
-            .find(|name| m.has(name))?;
-
-        Some(Self::single_rank(SchedulerLoadSnapshot {
-            num_running_reqs: m.sum("vllm:num_requests_running") as i32,
-            num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
-            token_usage: m.mean(kv_usage),
-            cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
-            ..Default::default()
-        }))
+        scrape::vllm(&body).map(Self::single_rank)
     }
 
-    /// SGLang HTTP: try the custom `/v1/loads` endpoint first (some builds
-    /// serve it), then fall back to the Prometheus `/metrics` gauges. The
-    /// KV-usage ratio (0.0–1.0) is `<prefix>token_usage`, where SGLang used
-    /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
-    /// in v0.5.4+, so detect whichever is present and use it throughout.
+    /// SGLang HTTP: the load from the Prometheus `/metrics` gauges, read by
+    /// the controller crate's gauge table (either metric prefix).
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
-        let m = PromScrape::parse(&body);
-
-        // Require the KV-usage gauge — the load signal routing acts on.
-        // Without it `token_usage` would default to 0.0 and hide real KV
-        // pressure, so report unavailable instead. Pick the prefix off it.
-        let prefix = ["sglang:", "sglang_"]
-            .into_iter()
-            .find(|p| m.has(&format!("{p}token_usage")))?;
-
-        Some(Self::single_rank(SchedulerLoadSnapshot {
-            num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
-            num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
-            token_usage: m.mean(&format!("{prefix}token_usage")),
-            gen_throughput: m.mean(&format!("{prefix}gen_throughput")),
-            cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
-            utilization: m.mean(&format!("{prefix}utilization")),
-            ..Default::default()
-        }))
+        scrape::sglang(&body).map(Self::single_rank)
     }
 
     /// Shared authenticated GET builder with the standard timeout.
@@ -1675,20 +1574,10 @@ impl WorkerMonitor {
         }
     }
 
-    /// Wrap a single scheduler snapshot as a one-rank `WorkerLoadResponse`.
-    /// HTTP `/metrics` already aggregates across DP ranks, so a single
-    /// synthetic rank is the correct shape.
-    ///
-    /// Such a snapshot carries the KV-usage ratio (`token_usage`) but no
-    /// absolute token counts (`max_total_num_tokens`/`num_used_tokens` stay
-    /// `0`), so `WorkerLoadResponse::has_absolute_token_data` reports `false`
-    /// for it — keeping it out of the DP-rank cache.
+    /// A single scheduler snapshot as a one-rank report: the controller
+    /// crate's wrapper, kept under this name for the readers here.
     fn single_rank(snapshot: SchedulerLoadSnapshot) -> WorkerLoadResponse {
-        WorkerLoadResponse {
-            dp_rank_count: 1,
-            loads: vec![snapshot],
-            ..Default::default()
-        }
+        scrape::single_rank(snapshot)
     }
 
     /// Fetch load via the backend client's `GetLoads` (gRPC RPC or the ZMQ

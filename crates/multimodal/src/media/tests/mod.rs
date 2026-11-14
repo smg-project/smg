@@ -19,6 +19,7 @@ use std::{
     process::Command,
 };
 
+use super::ImageFetchConfig;
 use crate::test_support::{skip_for, video_tools_available};
 
 /// Whether this ffmpeg build carries `encoder`. `ffmpeg -h encoder=<name>`
@@ -326,6 +327,23 @@ const TINY_PNG: &[u8] = &[
     0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 96, 96, 0, 0, 0, 3, 0, 1, 43,
     9, 141, 84, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
+
+/// A base64 source decodes as the data URL it stands for: the same bytes,
+/// the same frame hash, the same size, through the one decode both share.
+#[test]
+fn a_base64_source_decodes_as_its_data_url() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let data = STANDARD.encode(TINY_PNG);
+    let data_url = format!("data:image/png;base64,{data}");
+    let from_data_url = MediaConnector::fetch_data_url(&data_url, ImageFetchConfig::default())
+        .expect("the data url decodes");
+    let from_base64 = MediaConnector::fetch_base64(&data, ImageFetchConfig::default())
+        .expect("the base64 text decodes");
+    assert_eq!(from_base64.raw_bytes, from_data_url.raw_bytes);
+    assert_eq!(from_base64.hash, from_data_url.hash);
+    assert_eq!(from_base64.size(), from_data_url.size());
+    assert!(matches!(from_base64.source, super::ImageSource::DataUrl));
+}
 
 #[test]
 fn splits_concatenated_png_stream() {
