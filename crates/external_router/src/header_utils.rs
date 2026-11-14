@@ -130,7 +130,9 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 
 /// Convert headers from reqwest Response to axum HeaderMap.
 ///
-/// Filters out hop-by-hop and SMG-owned headers that must not be forwarded.
+/// Filters out hop-by-hop and SMG-owned headers that must not be forwarded, and
+/// the upstream's `server` header: the upstream's software and version are not the
+/// client's to read, and the gateway's own answers carry no `server` header.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
@@ -169,9 +171,15 @@ pub fn is_smg_owned_error_code_header(name: &str) -> bool {
     name.eq_ignore_ascii_case(HEADER_X_SMG_ERROR_CODE)
 }
 
-/// Determine if a header should be forwarded without allocating (case-insensitive)
-fn should_forward_header_no_alloc(name: &str) -> bool {
-    // List of headers that should NOT be forwarded (hop-by-hop or SMG error-code).
+/// Whether an upstream response header crosses the relay (case-insensitive, no allocation).
+///
+/// Every HTTP relay reads this one list: `preserve_response_headers` for the buffered
+/// and the OpenAI-style streamed answers, `anthropic::sse::build_sse_response` for the
+/// Messages streamed ones.
+pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
+    // List of headers that should NOT be forwarded: hop-by-hop, the SMG error-code
+    // marker, and the upstream's `server` header, which names the upstream's software
+    // and version to every client while the gateway's own answers carry none.
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-authenticate")
@@ -182,6 +190,7 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("server")
         || is_smg_owned_error_code_header(name))
 }
 
@@ -498,6 +507,35 @@ mod tests {
         assert!(forwarded.get(HEADER_X_SMG_ERROR_CODE).is_none());
         assert_eq!(forwarded.get("x-upstream-id").unwrap(), "worker-a");
         assert!(is_smg_owned_error_code_header("X-SMG-Error-Code"));
+    }
+
+    #[test]
+    fn preserve_response_headers_drops_the_upstream_server_header() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert(
+            "Server",
+            HeaderValue::from_static("engine/1.2.3 Python/3.12"),
+        );
+        upstream.insert("connection", HeaderValue::from_static("keep-alive"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+        upstream.insert("x-request-id", HeaderValue::from_static("req-7"));
+        upstream.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("41"),
+        );
+        upstream.insert("retry-after", HeaderValue::from_static("3"));
+
+        let forwarded = preserve_response_headers(&upstream);
+
+        assert!(forwarded.get("server").is_none());
+        assert!(forwarded.get("connection").is_none());
+        assert_eq!(forwarded.get("content-type").unwrap(), "application/json");
+        assert_eq!(forwarded.get("x-request-id").unwrap(), "req-7");
+        assert_eq!(
+            forwarded.get("x-ratelimit-remaining-requests").unwrap(),
+            "41"
+        );
+        assert_eq!(forwarded.get("retry-after").unwrap(), "3");
     }
 
     /// The tests' HTTP client, the process-level TLS crypto provider

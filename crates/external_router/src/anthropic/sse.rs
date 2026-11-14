@@ -22,7 +22,7 @@ use tracing::{debug, error, warn};
 use super::mcp::{IterationResult, McpToolCall};
 use crate::{
     error::internal_error,
-    header_utils::is_smg_owned_error_code_header,
+    header_utils::should_forward_header_no_alloc,
     sse::{SseDecodeError, SseDecoder, SseEncodeError, SseEncoder, SseFrame},
 };
 
@@ -85,6 +85,10 @@ pub(crate) struct StreamConsumeResult {
 // ============================================================================
 
 /// Build an SSE response from a status, upstream headers, and body stream.
+///
+/// The upstream headers cross through the relay's shared block-list
+/// (`should_forward_header_no_alloc`); the three headers the builder sets itself
+/// and the upstream's `content-length` (the body here is a fresh stream) stay out.
 pub(crate) fn build_sse_response(
     status: StatusCode,
     upstream_headers: HeaderMap,
@@ -98,15 +102,8 @@ pub(crate) fn build_sse_response(
 
     for (key, value) in &upstream_headers {
         let key_str = key.as_str();
-        if !is_smg_owned_error_code_header(key_str)
-            && !matches!(
-                key_str,
-                "content-type"
-                    | "cache-control"
-                    | "connection"
-                    | "transfer-encoding"
-                    | "content-length"
-            )
+        if should_forward_header_no_alloc(key_str)
+            && !matches!(key_str, "content-type" | "cache-control" | "content-length")
         {
             builder = builder.header(key, value);
         }
@@ -751,6 +748,26 @@ mod tests {
 
         assert!(response.headers().get(HEADER_X_SMG_ERROR_CODE).is_none());
         assert_eq!(response.headers().get("x-upstream-id").unwrap(), "worker-a");
+    }
+
+    #[test]
+    fn build_sse_response_drops_the_upstream_server_header() {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert("server", "upstream/1.2.3".parse().unwrap());
+        upstream_headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        upstream_headers.insert("x-upstream-id", "worker-a".parse().unwrap());
+        upstream_headers.insert("x-request-id", "req-7".parse().unwrap());
+
+        let response = build_sse_response(StatusCode::OK, upstream_headers, Body::empty());
+
+        assert!(response.headers().get("server").is_none());
+        assert!(response.headers().get("keep-alive").is_none());
+        assert_eq!(response.headers().get("x-upstream-id").unwrap(), "worker-a");
+        assert_eq!(response.headers().get("x-request-id").unwrap(), "req-7");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
     }
 
     /// Decode `bytes` through the shared `SseDecoder` and resolve each frame
