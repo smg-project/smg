@@ -341,8 +341,10 @@ impl StreamBench {
     /// codec from the pre-encoded frames, owned against the peer and never
     /// dispatched to it, so dropping it aborts nothing.
     fn engine_stream(&self, script: &EngineScript) -> ProtoStream {
-        let mut codec =
-            tonic_prost::ProstCodec::<proto::GenerateResponse, proto::GenerateResponse>::default();
+        let mut codec = tonic_prost::ProstCodec::<
+            proto::GenerateResponse,
+            Box<proto::GenerateResponse>,
+        >::default();
         let decoded = tonic::Streaming::new_response(
             codec.decoder(),
             StreamBody::new(script.reading()),
