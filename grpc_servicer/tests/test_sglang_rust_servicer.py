@@ -987,10 +987,11 @@ def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp
     holds readiness for it; the plan's inputs carry the engine's stand-in
     bootstrap host, so the requests are bound for nobody and the side warms up
     before its peer is there."""
-    monkeypatch.setitem(
-        sys.modules,
+    _install(
+        monkeypatch,
         "sglang.srt.disaggregation.utils",
-        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
+        FAKE_BOOTSTRAP_HOST="2.2.2.2",
+        DisaggregationMode=object,
     )
     planned = {}
     plan_for = rust_lifecycle.plan_for
@@ -1353,10 +1354,11 @@ def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     # The warm-up planner reads the engine's stand-in bootstrap host on a
     # disaggregation role (the facts here carry no vocabulary: nothing planned).
-    monkeypatch.setitem(
-        sys.modules,
+    _install(
+        monkeypatch,
         "sglang.srt.disaggregation.utils",
-        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
+        FAKE_BOOTSTRAP_HOST="2.2.2.2",
+        DisaggregationMode=object,
     )
     for mode in ("prefill", "decode"):
         args = _server_args(disaggregation_mode=mode)
