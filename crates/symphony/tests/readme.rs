@@ -1650,6 +1650,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "midashenglm-spatial",
+        model: "mispeech/midashenglm-spatial",
+        also: &[],
+        released: "2026-09-23",
+        smg: (Some("json"), None),
+        table: Some(Table::Plain),
+        set: Some(5),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "mimo-v2.5",
         model: "XiaomiMiMo/MiMo-V2.5",
         also: &["MiMo-V2.5-Base"],
