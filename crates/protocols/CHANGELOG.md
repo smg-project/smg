@@ -94,6 +94,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A rerank score keeps the worker's double precision, as SGLang writes it: `RerankResult.score`
+  was an `f32`, so a worker's `0.123456789012345` was answered as `0.12345679`. Breaking: `score`
+  is an `f64`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
