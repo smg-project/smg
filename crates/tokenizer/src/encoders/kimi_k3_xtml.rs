@@ -44,7 +44,8 @@ use super::RendererProfile;
 pub(crate) use super::{join_segments, PromptSegment};
 use crate::{
     chat_template::{
-        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+        developer_messages_as_system, ChatTemplateContentFormat, ChatTemplateParams,
+        ThinkingKeyName, ThinkingToggle,
     },
     traits::RendererCapabilities,
 };
@@ -232,7 +233,7 @@ fn render_xtml(
     // (and merges the system messages when one is not first) before the
     // vendor encoding sees the conversation, whose loop has no branch for the
     // role and would skip it; the same rule here.
-    let developer = crate::chat_template::developer_messages_as_system(messages);
+    let developer = developer_messages_as_system(messages);
     let messages = developer.as_deref().unwrap_or(messages);
     // Re-sort tool results by tool_call_id, then normalize each message
     // (deep-sort tool schemas, coerce tool-call arguments) — both side-effect

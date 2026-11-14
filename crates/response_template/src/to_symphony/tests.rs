@@ -21,7 +21,11 @@ use super::lower::{
     anchor_literals, chars, lower, lower_tag, pattern, split_close, split_open, Branches, Captures,
     Chars, EndItems, Item, Tag,
 };
-use crate::{pyre::Regex, test_fixtures::patterns, to_symphony::refusal::Construct};
+use crate::{
+    pyre::{Node, Regex},
+    test_fixtures::patterns,
+    to_symphony::refusal::Construct,
+};
 
 /// A file of bellwether's shape recordings.
 fn shape_fixture(patterns: &Path, name: &str) -> String {
@@ -54,7 +58,7 @@ fn recorded_ranges(table: &[String]) -> Vec<(char, char)> {
 fn escape(source: &str) -> Chars {
     let regex = Regex::parse(source).unwrap();
     match &regex.node {
-        crate::pyre::Node::One(set) => chars(set).unwrap(),
+        Node::One(set) => chars(set).unwrap(),
         other => panic!("{source}: {other:?}"),
     }
 }

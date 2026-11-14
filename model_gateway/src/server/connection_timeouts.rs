@@ -679,7 +679,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::server::bind_http_server;
+    use crate::server::{bind_http_server, http_client_builder};
 
     /// The bound under test, in seconds; the other one sits out of reach.
     const SHORT: u64 = 1;
@@ -894,7 +894,7 @@ mod tests {
     /// An HTTP/2 client over the plain port, with prior knowledge; one
     /// connection, kept alive between requests.
     fn http2_client() -> reqwest::Client {
-        crate::server::http_client_builder()
+        http_client_builder()
             .http2_prior_knowledge()
             .build()
             .expect("the HTTP/2 client")
