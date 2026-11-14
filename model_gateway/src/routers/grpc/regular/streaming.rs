@@ -491,6 +491,7 @@ impl StreamingProcessor {
                 pd_timing,
                 // Chat streaming does not emit prompt logprobs.
                 prefill_input_logprobs: _,
+                ledger: _,
             } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
@@ -775,6 +776,7 @@ impl StreamingProcessor {
                 prefill_guards,
                 pd_timing,
                 prefill_input_logprobs,
+                ledger: _,
             } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
                 let tokenizer = tokenizer.clone();

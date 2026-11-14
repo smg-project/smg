@@ -26,10 +26,13 @@ use super::{
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
-    routers::grpc::{
-        common::responses::streaming::ResponseStreamEventEmitter,
-        context::ExecutionResult,
-        harmony::{try_harmony_encoding, HarmonyStreamingProcessor},
+    routers::{
+        common::attempt_ledger::AttemptLedger,
+        grpc::{
+            common::responses::streaming::ResponseStreamEventEmitter,
+            context::ExecutionResult,
+            harmony::{try_harmony_encoding, HarmonyStreamingProcessor},
+        },
     },
 };
 
@@ -75,6 +78,7 @@ async fn pd_result(
         prefill,
         decode: Box::new(decode),
         prefill_guards: vec![None],
+        ledger: AttemptLedger::default(),
         pd_timing: pd_timing(prefill_offset),
         prefill_input_logprobs: None,
     };

@@ -1699,6 +1699,10 @@ pub(crate) enum ExecutionResult {
         /// prefill stream before the streaming layer runs; parallel/fan-out PD
         /// leaves this `None` and the streaming layer drains the stream itself.
         prefill_input_logprobs: Option<ProtoInputLogProbs>,
+        /// The attempt's ledger (a handle to the request's record), for the
+        /// breaker sample of a prefill side that fails in the plain
+        /// collector, which runs inside the attempt.
+        ledger: AttemptLedger,
     },
     /// Embedding requests return a single response, not a stream
     Embedding { response: ProtoEmbedComplete },
@@ -1728,12 +1732,14 @@ impl ExecutionResult {
                 prefill_guards,
                 pd_timing,
                 prefill_input_logprobs,
+                ledger,
             } => Self::PrefillDecode {
                 prefill: prefill.until_client_gone(client, request_id),
                 decode: Box::new(decode.until_client_gone(client, request_id)),
                 prefill_guards,
                 pd_timing,
                 prefill_input_logprobs,
+                ledger,
             },
             Self::Embedding { .. } => self,
             Self::Batch { results } => Self::Batch {
