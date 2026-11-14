@@ -94,6 +94,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- Interactions content keeps the fields the public API added: an audio part's `channels` and
+  `sample_rate` (and an audio delta's), a video part's `processing` and `name`, and a text
+  annotation's `type` and that kind's fields (a URL citation's `url` and `title`, a file
+  citation's `file_name` and `page_number`, ...). Each was dropped on the way to the upstream.
+  Breaking: `Content::Audio`, `Delta::Audio` and `Content::Video` gain the fields, and
+  `Annotation` gains `other`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
