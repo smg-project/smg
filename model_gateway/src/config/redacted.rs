@@ -31,7 +31,6 @@ const PLAIN: &[&str] = &[
     "routing_key_override",
     "grouped_dp_sticky",
     "pd_pairing_mode",
-    "policy_engine",
     "host",
     "port",
     "health_check_port",
