@@ -62,7 +62,6 @@ use openai_protocol::worker::{
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
 use smg_grpc_client::common_proto::EngineLoad;
-use smg_policy_controller::ingest::scrape;
 use tokio::{
     sync::{broadcast, Notify},
     task::JoinHandle,
@@ -79,6 +78,8 @@ use crate::{
         ConnectionMode, Worker, WorkerRegistry,
     },
 };
+
+mod scrape;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1540,8 +1541,7 @@ impl WorkerMonitor {
     }
 
     /// vLLM HTTP: the load from the Prometheus `/metrics` endpoint, read by
-    /// the gauge table the controller crate holds (`ingest::scrape`), the
-    /// same one the controller's scrape driver reads.
+    /// the gauge table in [`scrape`].
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
@@ -1549,7 +1549,7 @@ impl WorkerMonitor {
     }
 
     /// SGLang HTTP: the load from the Prometheus `/metrics` gauges, read by
-    /// the controller crate's gauge table (either metric prefix).
+    /// the gauge table in [`scrape`] (either metric prefix).
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
@@ -1574,8 +1574,8 @@ impl WorkerMonitor {
         }
     }
 
-    /// A single scheduler snapshot as a one-rank report: the controller
-    /// crate's wrapper, kept under this name for the readers here.
+    /// A single scheduler snapshot as a one-rank report: the wrapper of
+    /// [`scrape`], kept under this name for the readers here.
     fn single_rank(snapshot: SchedulerLoadSnapshot) -> WorkerLoadResponse {
         scrape::single_rank(snapshot)
     }

@@ -58,7 +58,6 @@ use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::{Mutex, RwLock};
 use smg_policy_controller::{
     fingerprint,
-    ingest::rows,
     spec::{
         BindingSpec, KvPressureParams, LeastLoadParams, PlanName, PrefixAffinityParams,
         ProfileSpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER,
@@ -1413,30 +1412,92 @@ impl Retired {
     }
 }
 
-/// One worker's load row from its report: the controller crate's
-/// conversion (`ingest::rows::load_row`), the worker's type as the row's
-/// role; the source reads `poll` until the monitor's feed names which of
-/// the poll tick and the pushed records produced an entry.
+/// One worker's load row from its report, in one pass over the ranks: the
+/// request and token counts summed, the KV ratios averaged, the drain rate
+/// as the policies read it today. A prefill's drain is its measured input
+/// capacity, which only a complete report with every rank's rate states: a
+/// partial report or a rank without a rate leaves it unknown (zero), and
+/// the scorer prices the worker at the fleet's nominal rate. Any other
+/// role's drain is the generation rate of the ranks with a request running.
 pub(crate) fn load_row(
     report: &WorkerLoadResponse,
     worker_type: WorkerType,
     now: Instant,
     sampled_at: Instant,
 ) -> LoadRow {
-    let role = match worker_type {
-        WorkerType::Regular => Role::Single,
-        WorkerType::Prefill => Role::Prefill,
-        WorkerType::Decode => Role::Decode,
-        WorkerType::Encode => Role::Encode,
-    };
-    rows::load_row(report, role, now, sampled_at, SignalSource::Poll)
+    let mut running: i64 = 0;
+    let mut queued: i64 = 0;
+    let mut uncached: i64 = 0;
+    let mut max_running: i64 = 0;
+    let mut kv_usage = 0.0f64;
+    let mut active_kv = 0.0f64;
+    let mut live_rate = 0.0f64;
+    let complete = !report.loads.is_empty()
+        && report.loads.len() >= usize::try_from(report.dp_rank_count).unwrap_or(0);
+    let mut prefill_rate: Option<f64> = complete.then_some(0.0);
+    let mut resident: Option<i64> = Some(0);
+    for rank in &report.loads {
+        running += i64::from(rank.num_running_reqs);
+        queued += i64::from(rank.num_waiting_reqs);
+        uncached += i64::from(rank.num_waiting_uncached_tokens);
+        max_running += i64::from(rank.max_running_requests);
+        kv_usage += rank.token_usage;
+        active_kv += rank.active_token_usage.unwrap_or(rank.token_usage);
+        match worker_type {
+            WorkerType::Prefill => {
+                prefill_rate = prefill_rate
+                    .zip(
+                        rank.prefill_throughput
+                            .filter(|rate| rate.is_finite() && *rate > 0.0),
+                    )
+                    .map(|(sum, rate)| sum + rate);
+            }
+            _ if rank.num_running_reqs > 0 => live_rate += rank.gen_throughput,
+            _ => {}
+        }
+        resident = resident.zip(rank.num_resident_tokens).map(|(a, b)| a + b);
+    }
+    if matches!(worker_type, WorkerType::Prefill) {
+        live_rate = prefill_rate.unwrap_or(0.0);
+    }
+    let ranks = report.loads.len().max(1) as f64;
+    LoadRow {
+        running: narrow(running),
+        queued: narrow(queued),
+        waiting_uncached_tokens: narrow(uncached),
+        kv_usage_permille: permille(kv_usage / ranks),
+        active_kv_permille: permille(active_kv / ranks),
+        live_rate: if live_rate.is_finite() && live_rate > 0.0 {
+            live_rate.min(f64::from(u32::MAX)) as u32
+        } else {
+            0
+        },
+        resident_tokens: resident.map_or(0, narrow),
+        report_age_ms: u32::try_from(now.saturating_duration_since(sampled_at).as_millis())
+            .unwrap_or(u32::MAX),
+        // The monitor's feed merges the poll tick and the pushed records
+        // without naming which produced an entry; the row says poll until
+        // the feed carries its source.
+        source: SignalSource::Poll,
+        max_running: narrow(max_running),
+    }
 }
 
+/// A summed engine count as the row's field: negative reads as none.
+fn narrow(count: i64) -> u32 {
+    u32::try_from(count.max(0)).unwrap_or(u32::MAX)
+}
+
+/// A ratio as the row's permille field.
 /// A prompt's token count when the host has the tokens, else `mean`.
 fn counted_or(tokens: Option<&[u32]>, mean: u32) -> u32 {
     tokens.map_or(mean, |tokens| {
         u32::try_from(tokens.len()).unwrap_or(u32::MAX)
     })
+}
+
+fn permille(ratio: f64) -> u16 {
+    (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
 
 #[cfg(test)]
