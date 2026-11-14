@@ -286,6 +286,16 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
     ("mage-vl-cowork", GenerationPrompt::OpensTheThought),
+    // Flora-Rewarder and Flora-Captioner are Qwen3.5-27B fine-tunes with templates of their own.
+    // The Rewarder writes Qwen 3.5's tagged calls and opens the thought only when the request asks
+    // for it (closed otherwise, by default too); the Captioner's template declares no tools and
+    // never opens or renders a thought: content alone, read with the plain table.
+    ("flora-rewarder", GenerationPrompt::OpensTheThoughtWhenAsked),
+    ("flora-captioner", GenerationPrompt::Plain),
+    // MiniMax-H3-Image-PE is a Qwen3.8-27B fine-tune (the hub's base-model tag) that ships the
+    // base's chat template byte for byte: ChatML, Qwen 3.5's tagged calls, and the thought opened
+    // in the prompt (closed there when the request turns thinking off).
+    ("minimax-h3-image-pe", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as

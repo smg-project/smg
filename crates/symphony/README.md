@@ -240,6 +240,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
+| 2026-11-08 | [minimax-h3-image-pe](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-h3-image-pe) | MiniMaxAI/MiniMax-H3-Image-PE |  | `qwen3`, tagged calls | 28 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-11-06 | [arete-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/arete-27b) | NousResearch/Arete-27B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-11-06 | [cola2](https://github.com/smg-project/bellwether/tree/main/fixtures/cola2) | ByteDance-Seed/Cola2 |  | `qwen3` | — | awaiting fixtures | none |
 | 2026-11-04 | [longcat-2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/longcat-2.5) | meituan-longcat/LongCat-2.5 |  | `longcat` | 19 | replaying the set | none |
@@ -265,7 +266,9 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-05 | [nld-uni](https://github.com/smg-project/bellwether/tree/main/fixtures/nld-uni) | nvidia/NLD-Uni |  | `qwen3`, tagged calls | 27 | replaying the set | none |
 | 2026-10-05 | [nvidia-nemotron-3.5-bolt-e4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-bolt-e4b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 |  | `gemma4` | 28 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-10-03 | [colgrep-agent-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/colgrep-agent-2b) | lightonai/colgrep-agent-2B |  | `minicpm5` | 28 | replaying the set | none |
+| 2026-10-02 | [flora-rewarder](https://github.com/smg-project/bellwether/tree/main/fixtures/flora-rewarder) | nvidia/Flora-Rewarder |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-02 | [h2o-lightning-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/h2o-lightning-4b) | h2oai/h2o-lightning-4b |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
+| 2026-10-01 | [flora-captioner](https://github.com/smg-project/bellwether/tree/main/fixtures/flora-captioner) | nvidia/Flora-Captioner |  | `plain` | 2 | replaying the set | none |
 | 2026-10-01 | [userlm-2.0](https://github.com/smg-project/bellwether/tree/main/fixtures/userlm-2.0) | microsoft/UserLM-2.0 |  | `plain` | — | awaiting fixtures | none |
 | 2026-09-30 | [mistral-large-4-1t-a52b](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-large-4-1t-a52b) | mistralai/Mistral-Large-4-1T-A52B | Mistral-Large-4-1T-A52B-NVFP4 | `mistral_v13` | 28 | replaying the set | `mistral`, none |
 | 2026-09-29 | [arex-2](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-2) | BAAI/AREX-2 |  | `qwen3`, tagged calls | 474,563 | replaying the set | none |
