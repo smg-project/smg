@@ -97,7 +97,9 @@ pub use lease::{
 };
 pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
-pub use spec::{Needs, PolicySpec, SessionsSpec, SpecError, API_VERSION, PRESETS};
+pub use spec::{
+    Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
+};
 pub use view::{
     fingerprint, Candidate, Constraints, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
     OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,

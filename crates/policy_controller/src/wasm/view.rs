@@ -954,6 +954,7 @@ mod tests {
                 active_kv_permille: 12,
                 live_rate: 13,
                 resident_tokens: 14,
+                resident_counted: true,
                 report_age_ms: 15,
                 source: SignalSource::Relay,
                 max_running: 16,

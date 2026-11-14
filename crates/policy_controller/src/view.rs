@@ -165,8 +165,13 @@ pub struct LoadRow {
     pub active_kv_permille: u16,
     /// Tokens per second the worker drains; `0` when unknown.
     pub live_rate: u32,
-    /// Context tokens resident for the running requests.
+    /// Context tokens resident for the running requests; `0` too when the
+    /// engine does not count them.
     pub resident_tokens: u32,
+    /// Whether the report counts resident tokens: an engine that does not
+    /// count them sends none, which is not a count of zero. The host's own
+    /// reading of the report, in no plugin's view.
+    pub resident_counted: bool,
     /// Age of the report's sample at the decision, in milliseconds.
     pub report_age_ms: u32,
     /// Where the row came from.
@@ -478,6 +483,14 @@ mod tests {
             "a candidate row is {} bytes",
             size_of::<Candidate>()
         );
+    }
+
+    #[test]
+    fn the_load_row_holds_its_resident_count_flag_in_its_padding() {
+        // 34 bytes of fields in a row aligned to four: the flag adds no
+        // byte, and an optional row needs no tag beside it.
+        assert_eq!(size_of::<LoadRow>(), 36);
+        assert_eq!(size_of::<Option<LoadRow>>(), 36);
     }
 
     #[test]
