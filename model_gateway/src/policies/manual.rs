@@ -141,6 +141,20 @@ impl Default for ManualPolicy {
     }
 }
 
+impl Drop for ManualPolicy {
+    /// The map goes with the policy (the registry drops a model's policy
+    /// with its last worker), and its entries leave the size gauge with it:
+    /// the eviction task is stopped and joined first, so no pass sits
+    /// between its `retain` and its decrement when the count is read.
+    fn drop(&mut self) {
+        self._eviction_task.take();
+        let remaining = self.entries.swap(0, Ordering::Relaxed);
+        if remaining > 0 {
+            Metrics::manual_policy_cache_entries_evicted(remaining);
+        }
+    }
+}
+
 impl ManualPolicy {
     pub fn new() -> Self {
         Self::with_config(ManualConfig::default())
@@ -1267,5 +1281,45 @@ mod tests {
             selected_worker_0,
             "Random mode should sometimes select worker 0 despite higher load"
         );
+    }
+
+    /// A policy dropped with its map takes its entries out of the gauge: a
+    /// replacement's keys count from zero, not from the old map's worth.
+    #[test]
+    fn a_dropped_policy_takes_its_entries_out_of_the_gauge() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            let policy = ManualPolicy::new();
+            for key in ["conv-1", "conv-2", "conv-3"] {
+                let headers = headers_with_routing_key(key);
+                policy.select_worker(&workers, &with_headers(&headers));
+            }
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 3"),
+                "three new keys moved the gauge to 3"
+            );
+
+            drop(policy);
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 0"),
+                "the dropped policy's entries left the gauge"
+            );
+
+            let replacement = ManualPolicy::new();
+            let headers = headers_with_routing_key("conv-4");
+            replacement.select_worker(&workers, &with_headers(&headers));
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 1"),
+                "a replacement's keys count from zero"
+            );
+        });
     }
 }

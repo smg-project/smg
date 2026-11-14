@@ -2987,8 +2987,8 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").increment(1.0);
     }
 
-    /// `count` entries left the manual policy's map in one eviction pass:
-    /// the map's size gauge moves down by that many.
+    /// `count` entries left the manual policy's map (an eviction pass, or the
+    /// policy dropped with its map): the size gauge moves down by that many.
     pub fn manual_policy_cache_entries_evicted(count: usize) {
         gauge!("smg_manual_policy_cache_entries").decrement(count as f64);
     }
