@@ -146,7 +146,10 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::RangeInclusive,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -163,7 +166,7 @@ use zeromq::{
 
 use crate::{
     engine_link::EngineLink,
-    kv_history::{History, Window},
+    kv_history::{EncodedBatch, History, Window},
     kv_state::{LiveState, RankCut, Snapshot, SnapshotChunks},
     kv_wire::{low64_big_endian, Counts as WireCounts, Normalizer, WireBatch, WireEvent},
     BoxStream,
@@ -693,8 +696,55 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 /// What the live channel carries to subscribers.
 #[derive(Clone)]
 enum Live {
-    Batch(Arc<common::KvEventBatch>),
+    Batch(Arc<LiveBatch>),
     Restart { generation: u64 },
+}
+
+/// A relayed batch on its way to the receivers the channel had when it was
+/// sent. Each of them claims it once; the last to claim takes the batch as
+/// it is and the others copy it, so with one subscriber per relay (one
+/// gateway per engine) no batch is copied on its way out. The count is exact
+/// because [`Relaying::relay`] reads it and sends under the lock in which
+/// [`KvEventRelay::subscribe`] adds a receiver; a receiver that lags past
+/// the slot or drops leaves its claim unmade, and the batch stays in the
+/// slot until the channel drops it.
+struct LiveBatch {
+    rank: Option<i32>,
+    sequence: u64,
+    /// Receivers that have not claimed yet.
+    unclaimed: AtomicUsize,
+    batch: Mutex<Option<common::KvEventBatch>>,
+}
+
+impl LiveBatch {
+    fn new(batch: common::KvEventBatch, receivers: usize) -> Self {
+        Self {
+            rank: batch.dp_rank,
+            sequence: batch.sequence_number,
+            unclaimed: AtomicUsize::new(receivers),
+            batch: Mutex::new(Some(batch)),
+        }
+    }
+
+    /// The batch for this receiver: the batch itself for the last of the
+    /// counted receivers to claim, a copy for the others. `None` only for a
+    /// receiver the send did not count, which the lock rules out.
+    fn claim(&self) -> Option<common::KvEventBatch> {
+        let last = self.unclaimed.fetch_sub(1, Ordering::AcqRel) == 1;
+        let mut batch = self.batch.lock().unwrap_or_else(PoisonError::into_inner);
+        if last {
+            batch.take()
+        } else {
+            batch.clone()
+        }
+    }
+
+    /// A receiver that does not want the batch (a duplicate of what its
+    /// stream sent) still claims, so the last receiver that wants it finds
+    /// the slot its own.
+    fn pass(&self) {
+        self.unclaimed.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// One engine's KV-event relay: the publisher subscriptions (one per rank),
@@ -837,9 +887,8 @@ impl KvEventRelay {
                 .iter()
                 .position(|source| Some(source.rank) == batch.dp_rank)
                 .unwrap_or(0);
-            let batch = Arc::new(batch);
             let record = &mut shared.ranks[index];
-            record.history.push(sequence, Arc::clone(&batch));
+            record.history.push(sequence, &batch);
             if record.started_at.is_none() {
                 record.started_at = Some(sequence);
             }
@@ -916,20 +965,21 @@ impl KvEventRelay {
         request: common::SubscribeKvEventsRequest,
     ) -> Result<BoxStream<common::KvEventBatch>, Status> {
         self.start();
-        // Subscribed before the history is read, so nothing published between
-        // the two is missed; the subscriber skips what it already replayed.
-        let rx = self.live.subscribe();
         let cursor = request.start_sequence_number;
         let records_before_first_batch = request.load_records_before_first_batch;
         let label = self.config.label();
-        let serve = {
+        let (rx, serve) = {
             let mut shared = lock(&self.shared);
             if let Some(error) = &shared.failed {
                 return Err(Status::internal(format!(
                     "SubscribeKvEvents: the relay for {label} is down: {error}"
                 )));
             }
-            if cursor == 0 {
+            // Subscribed under the lock that relays: no batch lands between
+            // the history read below and the live stream, and every batch
+            // sent from here on counts this receiver ([`LiveBatch`]).
+            let rx = self.live.subscribe();
+            let serve = if cursor == 0 {
                 if shared.complete_from_start() {
                     shared.counts.served_from_history += 1;
                     Serve::History {
@@ -1050,7 +1100,8 @@ impl KvEventRelay {
                         return Err(Status::out_of_range(message));
                     }
                 }
-            }
+            };
+            (rx, serve)
         };
         let (replay, sent, snapshot) = match serve {
             Serve::History { batches, last_sent } => {
@@ -1135,7 +1186,7 @@ impl KvEventRelay {
 /// What a subscription begins with, decided under the relay's lock.
 enum Serve {
     History {
-        batches: Vec<Arc<common::KvEventBatch>>,
+        batches: Vec<EncodedBatch>,
         /// Per rank, the sequence the subscriber is known to hold.
         last_sent: BTreeMap<Option<i32>, u64>,
     },
@@ -1174,7 +1225,7 @@ type Item = Result<common::KvEventBatch, Status>;
 /// rank.
 struct Subscriber {
     snapshot: SnapshotPhase,
-    replay: VecDeque<Arc<common::KvEventBatch>>,
+    replay: VecDeque<EncodedBatch>,
     rx: broadcast::Receiver<Live>,
     /// Per rank, the last sequence sent (or the cursor the subscriber came
     /// with): what a live batch is a duplicate of.
@@ -1331,9 +1382,12 @@ impl Subscriber {
                 }
                 SnapshotPhase::None => {}
             }
-            if let Some(batch) = self.replay.pop_front() {
+            if let Some(encoded) = self.replay.pop_front() {
+                let Some(batch) = encoded.decode() else {
+                    continue;
+                };
                 self.sent.insert(batch.dp_rank, batch.sequence_number);
-                return Some(Ok(self.stamped((*batch).clone())));
+                return Some(Ok(self.stamped(batch)));
             }
             let waited = if self.source.is_some() {
                 let tick = self.load_tick;
@@ -1354,16 +1408,20 @@ impl Subscriber {
                 Waited::Live(received) => received,
             };
             match received {
-                Ok(Live::Batch(batch)) => {
+                Ok(Live::Batch(live)) => {
                     if self
                         .sent
-                        .get(&batch.dp_rank)
-                        .is_some_and(|&last| batch.sequence_number <= last)
+                        .get(&live.rank)
+                        .is_some_and(|&last| live.sequence <= last)
                     {
+                        live.pass();
                         continue;
                     }
-                    self.sent.insert(batch.dp_rank, batch.sequence_number);
-                    return Some(Ok(self.stamped((*batch).clone())));
+                    let Some(batch) = live.claim() else {
+                        continue;
+                    };
+                    self.sent.insert(live.rank, live.sequence);
+                    return Some(Ok(self.stamped(batch)));
                 }
                 Ok(Live::Restart { generation }) => {
                     self.done = true;
@@ -1668,11 +1726,10 @@ impl Relaying<'_> {
                 true,
             ),
         };
-        let batch = Arc::new(batch);
         {
             let mut shared = lock(self.shared);
             let record = &mut shared.ranks[self.index];
-            record.history.push(sequence, Arc::clone(&batch));
+            record.history.push(sequence, &batch);
             if record.started_at.is_none() {
                 record.started_at = Some(sequence);
             }
@@ -1701,8 +1758,17 @@ impl Relaying<'_> {
                     "KV event relay summary"
                 );
             }
+            // Sent under the lock in which subscribers join, so the receivers
+            // counted here are the ones this batch reaches: the last of them
+            // to claim it takes it uncopied ([`LiveBatch`]). With nobody to
+            // send to, the batch ends here.
+            let receivers = self.live.receiver_count();
+            if receivers > 0 {
+                let _ = self
+                    .live
+                    .send(Live::Batch(Arc::new(LiveBatch::new(batch, receivers))));
+            }
         }
-        let _ = self.live.send(Live::Batch(batch));
     }
 
     /// The publisher skipped `gap` on the socket: fill it from the engine's
