@@ -234,7 +234,7 @@ async fn tracker_deduplicates_without_confusing_effective_sizes() {
     for cap in [1000, 1000, 1009, 2016] {
         tracker
             .push_part(MediaContentPart::ImageUrl {
-                url: url.clone(),
+                url: url.clone().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: Some(cap),

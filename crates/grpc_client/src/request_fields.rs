@@ -255,6 +255,64 @@ impl Default for PlainSampling {
     }
 }
 
+/// An OpenAI-compatible `seed` (any int64) on a wire whose seed is an unsigned 64-bit word:
+/// the same bits, so every seed is a seed and distinct seeds stay distinct; a negative one
+/// lands in the upper half of the word.
+pub fn seed_bits(seed: i64) -> u64 {
+    seed as u64
+}
+
+/// A 64-bit seed on a wire whose seed is a signed 32-bit word: the two halves of its bits
+/// folded into one, so distinct seeds stay distinct as far as 32 bits allow (a saturating cast
+/// would send every seed past 2^31 to one value).
+pub fn seed_folded_i32(seed: u64) -> i32 {
+    ((seed ^ (seed >> 32)) as u32) as i32
+}
+
+/// An OpenAI-compatible `seed` (any int64) on a wire whose seed is a signed 32-bit word: itself
+/// when it fits, else its bits folded ([`seed_folded_i32`]); a refusal or a silent drop would make
+/// the public field narrower than the public API's.
+pub fn legacy_seed_i32(seed: i64) -> i32 {
+    i32::try_from(seed).unwrap_or_else(|_| seed_folded_i32(seed_bits(seed)))
+}
+
+/// A seed on a wire whose signed 32-bit field feeds an engine that seeds an unsigned word: the
+/// legacy form ([`legacy_seed_i32`]) with its sign bit cleared, so a seed that fits and is not
+/// negative stays itself and every other seed lands on a non-negative value (31 bits of identity)
+/// where a negative word would be refused by the engine.
+pub fn non_negative_seed_i32(seed: i64) -> i32 {
+    legacy_seed_i32(seed) & i32::MAX
+}
+
+/// A 64-bit seed on such a wire: the fold ([`seed_folded_i32`]) with its sign bit cleared.
+pub fn non_negative_folded_i32(seed: u64) -> i32 {
+    seed_folded_i32(seed) & i32::MAX
+}
+
+/// A seed on a wire whose engine reads `-1` as "no seed": the legacy form ([`legacy_seed_i32`])
+/// with that one value moved by [`seeded_word`], so a seeded request never runs unseeded.
+pub fn seeded_i32(seed: i64) -> i32 {
+    seeded_word(legacy_seed_i32(seed))
+}
+
+/// A 64-bit seed on such a wire: the fold ([`seed_folded_i32`]) with `-1` moved the same way.
+pub fn seeded_folded_i32(seed: u64) -> i32 {
+    seeded_word(seed_folded_i32(seed))
+}
+
+/// A seed word for the wire whose engine reads `-1` as "no seed": `-1` alone becomes the word's
+/// minimum, which the fold also reaches (the one shared value a 32-bit field costs); every other
+/// word is itself. The engine's in-repo servicers hand it the word's unsigned form, so a seed they
+/// derive per choice is never `-1` either; this rule covers the request seed for a servicer older
+/// than the gateway.
+fn seeded_word(seed: i32) -> i32 {
+    if seed == -1 {
+        i32::MIN
+    } else {
+        seed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +507,66 @@ mod tests {
             assert_eq!(completion_constraint(&completion), read, "{field}");
             assert_eq!(plain_constraint(&plain), read, "{field}");
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn a_seed_keeps_its_bits_on_an_unsigned_wire() {
+        assert_eq!(seed_bits(7), 7);
+        assert_eq!(seed_bits(-1), u64::MAX);
+        assert_eq!(seed_bits(i64::MIN), 1 << 63);
+    }
+
+    #[test]
+    fn a_seed_folds_onto_a_signed_32_bit_wire_only_past_its_range() {
+        assert_eq!(legacy_seed_i32(7), 7);
+        assert_eq!(legacy_seed_i32(-1), -1);
+        assert_eq!(legacy_seed_i32(i64::from(i32::MIN)), i32::MIN);
+        assert_eq!(legacy_seed_i32(1 << 32), 1);
+        assert_eq!(legacy_seed_i32(i64::MIN), i32::MIN);
+        assert_ne!(legacy_seed_i32(i64::MAX), legacy_seed_i32(i64::MAX - 1));
+        assert_eq!(seed_folded_i32(7), 7);
+        assert_eq!(seed_folded_i32(1 << 32), 1);
+        assert_eq!(seed_folded_i32(u64::MAX), 0);
+    }
+
+    #[test]
+    fn a_seed_for_an_unsigned_word_behind_a_signed_field_is_never_negative() {
+        assert_eq!(non_negative_seed_i32(7), 7);
+        assert_eq!(non_negative_seed_i32(i64::from(i32::MAX)), i32::MAX);
+        assert_eq!(non_negative_seed_i32(-1), i32::MAX);
+        assert_eq!(non_negative_seed_i32(i64::from(i32::MIN)), 0);
+        assert_eq!(non_negative_seed_i32(1 << 31), 0);
+        assert_eq!(non_negative_seed_i32(i64::MAX), 0);
+        assert_eq!(non_negative_folded_i32(7), 7);
+        assert_eq!(non_negative_folded_i32(1 << 31), 0);
+        assert_eq!(non_negative_folded_i32(u64::MAX), 0);
+        for seed in [-1, i64::MIN, i64::MAX, 1 << 31, 1 << 32] {
+            assert!(non_negative_seed_i32(seed) >= 0, "{seed}");
+        }
+    }
+
+    #[test]
+    fn a_seed_for_an_engine_that_reads_minus_one_as_unseeded_is_never_minus_one() {
+        assert_eq!(seeded_i32(7), 7);
+        assert_eq!(seeded_i32(-2), -2);
+        assert_eq!(seeded_i32(-1), i32::MIN);
+        assert_eq!(seeded_i32(i64::from(u32::MAX)), i32::MIN);
+        assert_eq!(seeded_i32(i64::MAX), i32::MIN);
+        assert_eq!(seeded_folded_i32(7), 7);
+        assert_eq!(seeded_folded_i32(u64::from(u32::MAX)), i32::MIN);
+        assert_eq!(seeded_folded_i32(u64::MAX), 0);
+        for seed in [-1, i64::from(u32::MAX), i64::MIN, i64::MAX] {
+            assert_ne!(seeded_i32(seed), -1, "{seed}");
+        }
+        // The rule on a bare word: `-1` alone moves to the minimum, every other word stays.
+        assert_eq!(seeded_word((-2i32).wrapping_add(1)), i32::MIN);
+        assert_eq!(seeded_word(-2), -2);
+        assert_eq!(seeded_word(i32::MAX.wrapping_add(1)), i32::MIN);
+        assert_eq!(seeded_word(0), 0);
     }
 }
