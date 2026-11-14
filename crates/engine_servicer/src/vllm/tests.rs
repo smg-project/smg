@@ -3028,8 +3028,6 @@ async fn loads_only_streams_each_ranks_record_without_a_relay() {
 /// rank past the connected ones.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
     rank1_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {

@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use smg::observability::metrics::Metrics;
 
+use crate::metrics::recorder;
+
 #[test]
 fn worker_retry_backoff_renders_histogram_buckets() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
 
     Metrics::record_worker_retry_backoff(1, Duration::from_millis(60));
     Metrics::record_worker_retry_backoff(4, Duration::from_secs(2));
