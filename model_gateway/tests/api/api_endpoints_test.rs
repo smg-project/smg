@@ -2537,9 +2537,12 @@ mod validated_body_tests {
         }])
         .await;
         let app = ctx.create_app();
+        // The media-only prompt passes the door and the relay forwards it as the
+        // engine takes it; the gRPC path's media refusal is that stage's own.
         for served in [
             r#"{"model":"mock-model","text":"hi","sampling_params":{"max_new_tokens":2}}"#,
             r#"{"model":"mock-model","text":"hi","input_ids":[1,2],"sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"","audio_data":"a.wav","sampling_params":{"max_new_tokens":2}}"#,
         ] {
             let (status, _, body) = post(&app, "/generate", "application/json", served).await;
             assert_eq!(status, StatusCode::OK, "{served}: served: {body}");
@@ -2549,11 +2552,6 @@ mod validated_body_tests {
                 r#"{"model":"mock-model","text":""}"#,
                 "prompt_empty",
                 Some("text"),
-            ),
-            (
-                r#"{"model":"mock-model","text":"","audio_data":"a.wav"}"#,
-                "multimodal_not_supported",
-                None,
             ),
             (
                 r#"{"model":"mock-model","sampling_params":{"max_new_tokens":2}}"#,
