@@ -14,7 +14,8 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use symphony::{
     grammar::{GrammarStart, Options},
-    Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
+    Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, OutputPosition, Spelling, Turn,
+    Unspelled,
 };
 use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
@@ -183,11 +184,12 @@ fn answer_tag(
     model: &str,
     schema: &Arc<Value>,
     reasoning_open: bool,
+    position: OutputPosition,
     start: GrammarStart,
     vocabulary: TagVocabulary,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
-    let grammar = format.answer_grammar_for(schema, reasoning_open, start);
+    let grammar = format.answer_grammar_at(schema, reasoning_open, start, position);
     if !compiled && (continues || matches!(grammar, Some(Grammar::JsonSchema { .. }))) {
         return Ok(None);
     }
@@ -550,6 +552,7 @@ pub(crate) fn constraint(
         &reading(parser, names, asks.model(), templates)?,
         asks,
         tools,
+        "",
         reasoning_open,
         thought_closed,
         start,
@@ -573,10 +576,15 @@ pub(crate) fn constraint(
 /// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
 /// the template's text after it, which the calls' tag then owes nothing of. The tests ask through
 /// `constraint`, which reads the decision first.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table, request, rendered prompt and the engines' constraint position"
+)]
 pub(crate) fn constraint_for(
     read: &Reading,
     asks: Asks<'_>,
     tools: &[Tool],
+    prompt: &str,
     reasoning_open: bool,
     thought_closed: bool,
     start: GrammarStart,
@@ -617,6 +625,7 @@ pub(crate) fn constraint_for(
     }
     Ok(match asks.answer_schema() {
         Some(schema) => Prepared::Answer(Arc::new(AnswerTag {
+            position: format.output_position(prompt, continues),
             format,
             compiled,
             model: asks.model().to_string(),
@@ -774,6 +783,8 @@ pub(crate) struct AnswerTag {
     schema: Arc<Value>,
     /// The prompt leaves the model inside its thought.
     reasoning_open: bool,
+    /// The rendered prompt's position, retained when a retry selects another worker.
+    position: OutputPosition,
     /// The prompt continues the assistant's message.
     continues: bool,
 }
@@ -794,6 +805,7 @@ impl AnswerTag {
             &self.model,
             &self.schema,
             self.reasoning_open,
+            self.position,
             start,
             vocabulary,
             self.continues,
@@ -824,6 +836,7 @@ impl fmt::Debug for AnswerTag {
             .field("compiled", &self.compiled)
             .field("model", &self.model)
             .field("reasoning_open", &self.reasoning_open)
+            .field("position", &self.position)
             .field("continues", &self.continues)
             .finish_non_exhaustive()
     }
@@ -1170,6 +1183,48 @@ mod tests {
             assert!(words.contains(backend.name()), "{words}");
             assert!(words.contains("model 'm'"), "{words}");
             assert!(words.contains("a forced call"), "{words}");
+        }
+    }
+
+    #[test]
+    fn a_prefilled_answer_position_survives_worker_selection_and_restamping() {
+        let prompt = "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>";
+        let format = Arc::new(symphony::formats::kimi_k3());
+        let read = Reading::Table(format, false);
+        let request = request(json!({
+            "model": "moonshotai/Kimi-K3",
+            "response_format": {"type": "json_object"},
+        }));
+        let Prepared::Answer(answer) = constraint_for(
+            &read,
+            Asks::Chat(&request),
+            &[],
+            prompt,
+            false,
+            false,
+            symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
+        )
+        .expect("the request has an answer tag") else {
+            panic!("an answer is prepared for the selected worker");
+        };
+        assert_eq!(answer.position, OutputPosition::InAnswer);
+        for start in [
+            GrammarStart::Unknown,
+            GrammarStart::AfterReasoning,
+            GrammarStart::FirstToken,
+        ] {
+            let tag = answer
+                .tag_for(start, TagVocabulary::Current)
+                .expect("the worker can constrain the answer")
+                .expect("a framed answer keeps its table tag");
+            let tag: Value = serde_json::from_str(&tag).expect("the wire tag");
+            assert_eq!(tag["format"]["begin"], "", "{start:?}");
+            assert_eq!(tag["format"]["content"]["type"], "json_schema");
+            assert_eq!(
+                tag["format"]["end"],
+                "<|close|>response<|sep|><|close|>message<|sep|>",
+            );
         }
     }
 

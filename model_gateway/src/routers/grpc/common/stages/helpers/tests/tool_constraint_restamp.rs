@@ -3,15 +3,23 @@
 
 use std::sync::Arc;
 
-use openai_protocol::common::ResponseFormat;
-use serde_json::Value;
+use llm_tokenizer::MockTokenizer;
+use openai_protocol::{chat::ChatCompletionRequest, common::ResponseFormat};
+use serde_json::{json, Value};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
 use super::*;
-use crate::routers::grpc::{
-    context::ExecutionPlanKind,
-    proto_wrapper::ProtoRequest,
-    testing::{forced_call_on_a_thinking_prompt, worker},
+use crate::{
+    config::ParserChoice,
+    routers::grpc::{
+        context::ExecutionPlanKind,
+        proto_wrapper::ProtoRequest,
+        regular::{
+            stages::{reading, testing::components},
+            symphony::Asks,
+        },
+        testing::{forced_call_on_a_thinking_prompt, worker},
+    },
 };
 
 /// A parser that registers a reasoning prefix, so a forced call on a
@@ -381,6 +389,105 @@ fn plan_constraint(plan: &ExecutionPlan) -> (Option<String>, Option<String>) {
             request.json_schema().map(str::to_string),
         ),
         _ => panic!("expected a single generate plan"),
+    }
+}
+
+/// The real preparation keeps the rendered answer position on the retained
+/// attempt stamp. After the request context is gone, changing workers must not
+/// make the model repeat the answer opener that the prompt already supplied.
+#[test]
+fn retry_keeps_the_prefilled_answer_from_production_preparation() {
+    const MODEL: &str = "moonshotai/Kimi-K3";
+    const PROMPT: &str = "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>";
+    let request: Arc<ChatCompletionRequest> = Arc::new(
+        serde_json::from_value(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Return a JSON object."}],
+            "response_format": {"type": "json_object"},
+        }))
+        .unwrap(),
+    );
+    let mut ctx = RequestContext::for_chat(Arc::clone(&request), None, MODEL.into(), components());
+    ctx.state.parser = Some(ParserChoice::Symphony);
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let prepared = reading::prepare(
+        &ctx,
+        Asks::Chat(&request),
+        &[],
+        PROMPT,
+        false,
+        &tokenizer,
+        "prefilled_answer_test",
+    )
+    .map_err(|response| response.status())
+    .expect("production preparation accepts the JSON request");
+    ctx.state.parser_names = Some(prepared.names);
+    ctx.state.prompt_thought = prepared.prompt_thought;
+    ctx.state.reading = prepared.reading;
+    ctx.state.workers = Some(worker(&[("constrained_decoding_start", "after_reasoning")]));
+    let decided = reading::decide(
+        &mut ctx,
+        Asks::Chat(&request),
+        &[],
+        PROMPT,
+        prepared.constraint,
+        |_| panic!("a requested JSON answer does not need an auto tool tag"),
+    )
+    .map_err(|response| response.status())
+    .expect("the selected worker accepts the prepared answer");
+    let (kind, built_tag) = decided.tool_constraints.expect("a constrained answer");
+    assert_eq!(kind, "structural_tag");
+    let retained = decided
+        .table_tag
+        .expect("the real answer derivation is retained");
+    drop(ctx);
+    drop(request);
+
+    let factory = ToolParserFactory::new();
+    for (backend, request) in requests_with_tag(&built_tag) {
+        let stamp = AttemptStamp {
+            id: IdStamp::Exact,
+            sampling_mask: None,
+            sampling_baseline: None,
+            inject_pd_metadata: false,
+            tool_constraint: ToolConstraintStamp::capture_table(Arc::clone(&retained), &request),
+        };
+        assert!(matches!(
+            stamp.tool_constraint,
+            Some(ToolConstraintStamp::Table(_))
+        ));
+        let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+        for start in [
+            Some("first_token"),
+            Some("after_reasoning"),
+            None,
+            Some("first_token"),
+        ] {
+            let labels: Vec<_> = start
+                .map(|start| ("constrained_decoding_start", start))
+                .into_iter()
+                .collect();
+            restamp_plan_for_attempt(&mut plan, &stamp, &worker(&labels), &factory).unwrap();
+            let tag: Value = serde_json::from_str(&plan_tag(&plan)).unwrap();
+            assert_eq!(
+                tag["format"]["begin"], "",
+                "{backend}, {start:?}: the prompt consumed the opener"
+            );
+            assert_eq!(tag["format"]["content"]["type"], "json_schema");
+            assert_eq!(
+                tag["format"]["content"]["json_schema"],
+                json!({"type": "object"})
+            );
+            assert_eq!(
+                tag["format"]["end"],
+                "<|close|>response<|sep|><|close|>message<|sep|>"
+            );
+            assert!(plan_request(&plan).json_schema().is_none());
+            assert_eq!(
+                plan_request(&plan).grammar_from_first_token(),
+                backend == "vllm" && start == Some("first_token")
+            );
+        }
     }
 }
 
