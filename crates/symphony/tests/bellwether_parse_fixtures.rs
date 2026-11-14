@@ -317,6 +317,12 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // MiniMax-M3.1-Flash ships a template of its own in M3's spelling (the thought closed with
     // `</mm:think>`, an XML tree of arguments); the generation prompt adds nothing.
     ("minimax-m3.1-flash", GenerationPrompt::ModelDecides),
+    // A quantized Qwen 3.8 27B with a template of its own: Qwen 3.5's tagged calls under ChatML,
+    // the thought opened in the prompt (`<think>\n`), closed as an empty block under thinking off.
+    (
+        "qwen3.8-27b-w4a16-autoround-rtx3090",
+        GenerationPrompt::OpensTheThought,
+    ),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
