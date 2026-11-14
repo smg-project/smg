@@ -144,6 +144,7 @@ use tracing::{info, warn};
 
 use super::{
     basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
+    runtime::WorkerRuntime,
     Worker,
 };
 use crate::{config::RouterConfig, observability::metrics::Metrics};
@@ -880,6 +881,18 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
 pub(crate) fn on_token_progress_at(worker: &Arc<dyn Worker>, now_ms: u64) {
     worker.note_token_progress_at(now_ms);
     if worker.stall_reason().is_some() {
+        set(worker, None, "progress");
+    }
+}
+
+/// [`on_token_progress_at`] for a stream that captured its worker's runtime
+/// at its start (see [`Worker::liveness_runtime`]): the note and the veto
+/// read go to the runtime directly, without the worker's runtime load and
+/// its dispatch for every token; a veto is cleared through the worker as
+/// before.
+pub(crate) fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, now_ms: u64) {
+    runtime.note_token_progress_at(now_ms);
+    if runtime.stall_reason().is_some() {
         set(worker, None, "progress");
     }
 }

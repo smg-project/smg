@@ -325,18 +325,22 @@ pub async fn list_conversation_items(
 
     match item_storage.list_items(&conversation_id, params).await {
         Ok(items) => {
+            let has_more = items.len() == limit;
+            let first_id = items.first().map(|item| item.id.0.clone());
+            let last_id = items.last().map(|item| item.id.0.clone());
             // The item objects as the public API lists them: each item's own
-            // fields, the same object the single-item GET answers.
-            let item_values: Vec<Value> = items.iter().map(item_to_json).collect();
+            // fields, the same object the single-item GET answers; the page is
+            // this answer's own, so each item moves into its object.
+            let item_values: Vec<Value> = items.into_iter().map(item_to_json).collect();
 
             (
                 StatusCode::OK,
                 Json(json!({
                     "object": "list",
                     "data": item_values,
-                    "has_more": items.len() == limit,
-                    "first_id": items.first().map(|item| &item.id.0),
-                    "last_id": items.last().map(|item| &item.id.0),
+                    "has_more": has_more,
+                    "first_id": first_id,
+                    "last_id": last_id,
                 })),
             )
                 .into_response()
@@ -458,7 +462,7 @@ async fn process_item(
     };
 
     let item_id = item.id.clone();
-    Ok((item_to_json(&item), item_id, warning))
+    Ok((item_to_json(item), item_id, warning))
 }
 
 /// Process an item_reference - resolve an existing item for linking.
@@ -496,7 +500,7 @@ async fn process_item_reference(
     };
 
     let item_id = existing_item.id.clone();
-    Ok((item_to_json(&existing_item), item_id, None))
+    Ok((item_to_json(existing_item), item_id, None))
 }
 
 /// Process an item with a user-provided ID
@@ -643,7 +647,7 @@ pub async fn get_conversation_item(
     }
 
     match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(&item))).into_response(),
+        Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(item))).into_response(),
         Ok(None) => not_found("Item not found"),
         Err(e) => store_error("Failed to get item", &e),
     }
