@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO, Any
 
 import yaml
@@ -64,6 +66,17 @@ from .process_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _moriio_read_image_verifier():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci_moriio_read_image.py"
+    spec = importlib.util.spec_from_file_location("_worker_moriio_read_image", path)
+    if spec is None or spec.loader is None:
+        raise OSError(f"Cannot load READ source verifier: {path}")
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    return verifier
+
 
 # How much of a log line the failure text of a dead worker quotes.
 LOG_EXCERPT_CHARS = 300
@@ -219,7 +232,29 @@ class Worker:
         )
         logger.debug("Command: %s", " ".join(cmd))
 
-        self._gpu_mem_baseline = gpu_memory_used_mib(self.gpu_ids)
+        strict_read = (
+            self.engine == "vllm"
+            and self.effective_kv_backend() == "moriio"
+            and os.environ.get("E2E_MORIIO_READ_QUALIFICATION")
+            and _moriio_read_image_verifier().qualification_attempt(dict(os.environ))
+        )
+        self._gpu_mem_baseline = (
+            gpu_memory_used_mib(self.gpu_ids, timeout=30.0)
+            if strict_read
+            else gpu_memory_used_mib(self.gpu_ids)
+        )
+        if strict_read and (
+            not self.gpu_ids
+            or any(type(gpu) is not int or gpu < 0 for gpu in self.gpu_ids)
+            or len(set(self.gpu_ids)) != len(self.gpu_ids)
+            or not isinstance(self._gpu_mem_baseline, dict)
+            or set(self._gpu_mem_baseline) != set(self.gpu_ids)
+            or any(type(gpu) is not int for gpu in self._gpu_mem_baseline)
+            or any(type(value) is not int or value < 0 for value in self._gpu_mem_baseline.values())
+        ):
+            raise ValueError(
+                "Strict READ requires a complete validated all-GPU baseline before spawn"
+            )
         self.process = self._spawn_process(cmd, env)
         # The launcher leads a session of its own (``start_new_session``), so
         # its pid is its group's id. Kept here: ``os.getpgid`` has no answer
@@ -573,9 +608,31 @@ class Worker:
 
     def _build_vllm_http_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build vLLM HTTP (OpenAI-compatible) server command."""
-        return self._build_vllm_base_cmd(
+        cmd = self._build_vllm_base_cmd(
             "vllm.entrypoints.openai.api_server", model_path, tp_size, spec
         )
+        # Match _build_env's final override order without invoking that method
+        # here (it also allocates backend ports). The module ships in the
+        # installed servicer package; vLLM imports it in the engine process.
+        protocol = (
+            (self.extra_env or {})
+            .get("SMG_PAIRING_PROTOCOL", os.environ.get("SMG_PAIRING_PROTOCOL", ""))
+            .strip()
+        )
+        middleware = "smg_grpc_servicer.http_metadata.PairingProtocolMiddleware"
+        extras = self.extra_engine_args or []
+        already_enabled = any(
+            arg == f"--middleware={middleware}"
+            or (
+                arg == "--middleware"
+                and index + 1 < len(extras)
+                and extras[index + 1] == middleware
+            )
+            for index, arg in enumerate(extras)
+        )
+        if protocol and not already_enabled:
+            cmd += ["--middleware", middleware]
+        return cmd
 
     def _build_vllm_base_cmd(
         self, entrypoint: str, model_path: str, tp_size: int, spec: dict
@@ -644,7 +701,7 @@ class Worker:
         else:
             for port in self._moriio_ports:
                 reserve_port(port)
-        return {
+        extra = {
             "host_ip": moriio_host(),
             "http_port": str(self.port),
             "handshake_port": str(self.moriio_handshake_port),
@@ -652,6 +709,10 @@ class Worker:
             "read_mode": vllm_moriio_mode() == "read",
             "backend": vllm_moriio_backend(),
         }
+        if extra["read_mode"] and self.worker_type == WorkerType.PREFILL:
+            # Opt in to ACK-fenced source ownership for sliced READ readers.
+            extra["read_ack_fenced_hold"] = True
+        return extra
 
     def moriio_registration(self) -> dict:
         """``POST /workers`` fields that let SMG's HTTP PD router hand KV to this worker.
@@ -1094,6 +1155,16 @@ class Worker:
 
         if self.extra_env:
             env.update(self.extra_env)
+        if (
+            self.engine == "vllm"
+            and self.effective_kv_backend() == "moriio"
+            and os.environ.get("E2E_MORIIO_READ_QUALIFICATION")
+            and _moriio_read_image_verifier().qualification_attempt(dict(os.environ))
+        ):
+            # Validate the original invocation, not an individual negative
+            # protocol worker's intentional WRITE override. Change only the
+            # native route knob after extra_env, preserving that error oracle.
+            env["MORI_DISABLE_AUTO_XGMI"] = "1"
         return env
 
     def read_log(self) -> str:

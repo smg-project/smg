@@ -1,0 +1,80 @@
+name: E2E MoRI READ host job
+
+# --network is not supported by jobs.container.options. Only the READ/RDMA
+# caller uses this host job; its one private CID is managed by the helper.
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      options_json:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  run:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download same-flow build artifacts
+        uses: ./.github/actions/download-build-artifacts
+        with:
+          wasm-fixtures: 'true'
+          client-types: 'true'
+
+      - name: Run original complete READ topology suite in owned CID
+        id: read
+        env:
+          READ_IMAGE: ${{ inputs.image }}
+          READ_OPTIONS_JSON: ${{ inputs.options_json }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci_moriio_read_host.py run \
+            --image "$READ_IMAGE" --options-json "$READ_OPTIONS_JSON"
+
+      # The helper's own finally runs first. Re-entry only reconciles a known
+      # closed CID or a never-issued cleanup; unknown mutations are not resent.
+      # Worker death is independently covered by the installed label guardian.
+      - name: Reconcile exact READ container cleanup
+        if: always() && steps.read.outputs.state_dir != ''
+        env:
+          STATE_DIR: ${{ steps.read.outputs.state_dir }}
+        run: python3 scripts/ci_moriio_read_host.py cleanup --state-dir "$STATE_DIR"
+
+      - name: Retain original READ JUnit and metadata
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: moriio-read-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.read.outputs.invocation || 'not-started' }}
+          path: |
+            e2e-logs/moriio-read-junit.xml
+            e2e-logs/read-host-summary.json
+            e2e-logs/read-device-preflight.json
+            e2e-logs/read-source-*.json
+            e2e-logs/read-host-failure.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Retain original READ failure evidence
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: moriio-read-failure-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.read.outputs.invocation || 'not-started' }}
+          path: |
+            e2e-logs/original-full-topology.stdout
+            e2e-logs/original-full-topology.stderr
+            e2e-logs/worker-*.log*
+            e2e-logs/read-*.log
+          retention-days: 7
+          if-no-files-found: ignore

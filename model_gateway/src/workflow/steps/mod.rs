@@ -149,7 +149,7 @@ pub fn create_worker_registration_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
+            .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&["detect_backend"]),
         )
         // Step 2b: Discover DP info (after metadata)
@@ -305,6 +305,8 @@ mod policy_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::config::RouterConfig;
 
@@ -382,5 +384,275 @@ mod tests {
         let config = config_with(1800, 30);
         assert_eq!(config.worker_startup_delay_secs, 0);
         assert_eq!(startup_delay(&config), None);
+    }
+
+    async fn register_http_worker_through_real_workflow(
+        status: http::StatusCode,
+        metadata: serde_json::Value,
+    ) -> (
+        wfaas::WorkflowState<WorkerWorkflowData>,
+        Arc<crate::worker::WorkerRegistry>,
+        String,
+    ) {
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let url = serve_json_routes(vec![
+            ("/health", http::StatusCode::OK, serde_json::json!({})),
+            ("/v1/models", status, metadata),
+        ])
+        .await;
+        execute_registration_workflow(url).await
+    }
+
+    async fn execute_registration_workflow(
+        url: String,
+    ) -> (
+        wfaas::WorkflowState<WorkerWorkflowData>,
+        Arc<crate::worker::WorkerRegistry>,
+        String,
+    ) {
+        use openai_protocol::{model_card::ModelCard, worker::WorkerModels};
+        use wfaas::{WorkflowEngine, WorkflowStatus};
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            worker::{RuntimeType, WorkerRegistry},
+        };
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![url.clone()])
+            .random_policy()
+            .worker_startup_delay_secs(0)
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
+        let registry = Arc::new(WorkerRegistry::new());
+        let app = app_context_for_tests(config.clone(), Arc::clone(&registry), None);
+        let mut spec = WorkerSpec::new(url.clone());
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("configured-model")));
+        spec.runtime_type = RuntimeType::Vllm;
+        spec.kv_connector = Some("moriio".into());
+        spec.http_pool.http2 = Some(false);
+        spec.health.timeout_secs = Some(1);
+        let data = create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, app);
+        let mut definition = create_worker_registration_workflow(&config);
+        // Keep the real DAG, executors, attempt budget and failure action. Only
+        // remove retry sleeping so the deterministic rejection test is fast.
+        let discovery = definition
+            .steps
+            .iter_mut()
+            .find(|step| step.id.to_string() == "discover_metadata")
+            .unwrap();
+        let retry = discovery.retry_policy.as_mut().unwrap();
+        assert_eq!(retry.max_attempts, 3);
+        retry.backoff = BackoffStrategy::Fixed(Duration::ZERO);
+        let id = definition.id.clone();
+        let engine = WorkflowEngine::new();
+        engine.register_workflow(definition).unwrap();
+        let instance = engine.start_workflow(id, data).await.unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let state = engine.get_status(instance).await.unwrap();
+                if matches!(
+                    state.status,
+                    WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+                ) {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        engine.shutdown();
+        assert!(engine.wait_for_shutdown(Duration::from_secs(1)).await);
+        (
+            terminal.expect("registration must terminate"),
+            registry,
+            url,
+        )
+    }
+
+    #[tokio::test]
+    async fn registration_workflow_blocks_malformed_protocol_from_registry_and_ready() {
+        let (state, registry, url) = register_http_worker_through_real_workflow(
+            http::StatusCode::OK,
+            serde_json::json!({"data": [{"id": "configured-model"}], "pairing_protocol": 4}),
+        )
+        .await;
+        assert_eq!(
+            state.status,
+            wfaas::WorkflowStatus::Failed,
+            "invalid metadata must fail the actual registration DAG; registered status: {:?}",
+            registry.get_by_url(&url).map(|worker| worker.status())
+        );
+        assert!(registry.get_by_url(&url).is_none());
+        assert!(state.context.data.actual_workers.is_none());
+        assert_eq!(
+            state.step_states[&wfaas::StepId::new("discover_metadata")].status,
+            wfaas::StepStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_workflow_blocks_middleware_rejection_from_registry_and_ready() {
+        let (state, registry, url) = register_http_worker_through_real_workflow(
+            http::StatusCode::BAD_GATEWAY,
+            serde_json::json!({"error": {"code": "smg_http_metadata_invalid"}}),
+        )
+        .await;
+        assert_eq!(
+            state.status,
+            wfaas::WorkflowStatus::Failed,
+            "explicit producer rejection must stop registration; registered status: {:?}",
+            registry.get_by_url(&url).map(|worker| worker.status())
+        );
+        assert!(registry.get_by_url(&url).is_none());
+        assert!(state.context.data.actual_workers.is_none());
+    }
+
+    #[tokio::test]
+    async fn registration_workflow_keeps_valid_legacy_and_optional_metadata_workers_ready() {
+        for (status, metadata, protocol) in [
+            (
+                http::StatusCode::OK,
+                serde_json::json!({"data": [{"id": "configured-model"}], "pairing_protocol": " kv-v1 "}),
+                Some("kv-v1"),
+            ),
+            (
+                http::StatusCode::OK,
+                serde_json::json!({"data": [{"id": "configured-model"}]}),
+                None,
+            ),
+            (http::StatusCode::NOT_FOUND, serde_json::json!({}), None),
+            (
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error": "optional metadata unavailable"}),
+                None,
+            ),
+        ] {
+            let (state, registry, url) =
+                register_http_worker_through_real_workflow(status, metadata).await;
+            assert_eq!(state.status, wfaas::WorkflowStatus::Completed);
+            let worker = registry
+                .get_by_url(&url)
+                .expect("valid or legacy worker registered");
+            assert_eq!(
+                worker.status(),
+                openai_protocol::worker::WorkerStatus::Ready
+            );
+            assert_eq!(worker.model_id(), "configured-model");
+            assert_eq!(
+                state
+                    .context
+                    .data
+                    .discovered_labels
+                    .get("pairing_protocol")
+                    .map(String::as_str),
+                protocol
+            );
+        }
+    }
+
+    async fn engine_with_slow_optional_version(
+        models: serde_json::Value,
+    ) -> (String, tokio::task::JoinSet<()>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let version_calls = Arc::clone(&calls);
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/v1/models",
+                axum::routing::get(move || {
+                    let models = models.clone();
+                    async move {
+                        // Make the per-request deadline later than the whole-step
+                        // deadline, so this reproduces the timeout compatibility gap.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        axum::Json(models)
+                    }
+                }),
+            )
+            .route(
+                "/version",
+                axum::routing::get(move || {
+                    let calls = Arc::clone(&version_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        axum::Json(serde_json::json!({"version": "slow"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, server, calls)
+    }
+
+    #[tokio::test]
+    async fn registration_workflow_optional_deadline_keeps_valid_models_and_ready() {
+        let (url, mut server, _) = engine_with_slow_optional_version(serde_json::json!({
+            "data": [{"id": "configured-model", "root": "local/configured-model"}],
+            "pairing_protocol": "kv-v1"
+        }))
+        .await;
+        let registration = execute_registration_workflow(url.clone()).await;
+        server.shutdown().await;
+        let (state, registry, _) = registration;
+        assert_eq!(
+            state.status,
+            wfaas::WorkflowStatus::Completed,
+            "optional slow version must not reject a healthy worker"
+        );
+        assert_eq!(
+            registry.get_by_url(&url).unwrap().status(),
+            openai_protocol::worker::WorkerStatus::Ready
+        );
+        let labels = &state.context.data.discovered_labels;
+        assert_eq!(
+            labels.get("pairing_protocol").map(String::as_str),
+            Some("kv-v1")
+        );
+        assert_eq!(
+            labels.get("model_path").map(String::as_str),
+            Some("local/configured-model")
+        );
+        assert_eq!(
+            labels.get("served_model_name").map(String::as_str),
+            Some("configured-model")
+        );
+        let worker = registry.get_by_url(&url).unwrap();
+        let labels = &worker.metadata().spec.labels;
+        assert_eq!(
+            labels.get("pairing_protocol").map(String::as_str),
+            Some("kv-v1")
+        );
+        assert_eq!(
+            labels.get("model_path").map(String::as_str),
+            Some("local/configured-model")
+        );
+        assert_eq!(
+            labels.get("served_model_name").map(String::as_str),
+            Some("configured-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_workflow_invalid_extension_fails_before_slow_optional_version() {
+        let (url, mut server, calls) = engine_with_slow_optional_version(serde_json::json!({
+            "data": [{"id": "configured-model"}], "pairing_protocol": 4
+        }))
+        .await;
+        let (state, registry, _) = execute_registration_workflow(url.clone()).await;
+        server.shutdown().await;
+        assert_eq!(state.status, wfaas::WorkflowStatus::Failed);
+        assert!(registry.get_by_url(&url).is_none());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "explicit invalid metadata must escape before awaiting optional version"
+        );
     }
 }

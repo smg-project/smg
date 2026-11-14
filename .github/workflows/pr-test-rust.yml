@@ -2542,7 +2542,8 @@ jobs:
     # created, so a wait for a runner here is a wait for every later head.
     # The job reads this file and the results of the jobs above, nothing of
     # a pool.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:

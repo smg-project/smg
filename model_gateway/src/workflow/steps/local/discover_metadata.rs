@@ -90,6 +90,15 @@ pub(super) struct ModelsResponse {
     pub data: Vec<ModelsResponseEntry>,
 }
 
+// Keep the optional SMG extension scoped to vLLM; SGLang's existing parser
+// continues to ignore unrelated model-list fields.
+#[derive(Debug, Deserialize)]
+struct VllmModelsResponse {
+    #[serde(flatten)]
+    models: ModelsResponse,
+    pairing_protocol: Option<String>,
+}
+
 /// vLLM `/version` response.
 #[derive(Debug, Deserialize)]
 struct VersionResponse {
@@ -103,19 +112,20 @@ struct VersionResponse {
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
 /// Why a metadata endpoint gave no answer: the engine does not offer it (a
 /// 404 on every spelling), or the read failed (transport, timeout, a non-2xx
-/// other than 404, an unparsable body). Registration tolerates both; a strict
-/// refresh tolerates only the first.
+/// other than 404, an unparsable body). Registration tolerates optional failures;
+/// an explicitly invalid SMG extension fails in both modes.
 #[derive(Debug)]
 enum MetadataError {
     NotOffered,
     Failed(String),
+    InvalidExtension(String),
 }
 
 impl std::fmt::Display for MetadataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotOffered => f.write_str("not offered (404)"),
-            Self::Failed(reason) => f.write_str(reason),
+            Self::Failed(reason) | Self::InvalidExtension(reason) => f.write_str(reason),
         }
     }
 }
@@ -193,11 +203,11 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
-async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
+async fn http_get_response_classified(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
-) -> Result<T, MetadataError> {
+) -> Result<reqwest::Response, MetadataError> {
     let shown = Endpoint::redacted_str(url);
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
@@ -210,6 +220,16 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
+    Ok(resp)
+}
+
+async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<T, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
+    let resp = http_get_response_classified(client, url, api_key).await?;
     if !resp.status().is_success() {
         return Err(MetadataError::Failed(format!(
             "status {} from {shown}",
@@ -219,6 +239,71 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     resp.json::<T>()
         .await
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
+}
+
+/// An explicitly invalid SMG extension must never become an absent protocol.
+async fn http_get_vllm_models_classified(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<VllmModelsResponse, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
+    let resp = http_get_response_classified(client, url, api_key).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        if status == reqwest::StatusCode::BAD_GATEWAY
+            && resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .is_some_and(|body| {
+                    body.pointer("/error/code")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("smg_http_metadata_invalid")
+                })
+        {
+            return Err(MetadataError::InvalidExtension(
+                "smg_http_metadata_invalid response".to_string(),
+            ));
+        }
+        return Err(MetadataError::Failed(format!(
+            "status {status} from {shown}"
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| MetadataError::Failed(format!("Failed to read {shown}: {e}")))?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))?;
+    #[derive(Deserialize)]
+    struct PairingExtension {
+        pairing_protocol: Option<String>,
+    }
+    // Parse the field from the original wire so duplicate declarations cannot
+    // be hidden by a JSON map's last-value-wins normalization.
+    let extension = if body.get("pairing_protocol").is_some() {
+        serde_json::from_slice::<PairingExtension>(&bytes).map_err(|e| {
+            MetadataError::InvalidExtension(format!("Invalid pairing_protocol: {e}"))
+        })?
+    } else {
+        PairingExtension {
+            pairing_protocol: None,
+        }
+    };
+    let declares_protocol = extension
+        .pairing_protocol
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    serde_json::from_slice(&bytes).map_err(|e| {
+        if declares_protocol {
+            MetadataError::InvalidExtension(format!(
+                "Invalid model list with pairing_protocol: {e}"
+            ))
+        } else {
+            MetadataError::Failed(format!("Failed to parse {shown}: {e}"))
+        }
+    })
 }
 
 pub async fn get_server_info(
@@ -236,7 +321,8 @@ pub async fn get_server_info(
 /// back into service or finishes loading. Returns the labels and, for a gRPC
 /// engine, the runtime the probe confirmed. Registration reads tolerantly
 /// (`strict == false`: a failed endpoint leaves a gap); a refresh reads
-/// strictly, because a gap would read as labels the engine dropped: a read
+/// strictly, because a gap would read as labels the engine dropped. An explicitly
+/// invalid SMG extension is an error in either mode. A read
 /// that fails (transport, timeout, a non-2xx other than 404, an unparsable
 /// body, an unknown gRPC error) is an error, while an endpoint the engine does
 /// not offer (404 on every spelling, gRPC `Unimplemented`) is tolerated in
@@ -340,7 +426,7 @@ async fn fetch_sglang_http_metadata_checked(
     Ok(labels)
 }
 
-/// The tolerant read as a plain map, kept for the tests of the registration shape.
+/// A plain map for the tests of legacy optional metadata responses.
 #[cfg(test)]
 async fn fetch_vllm_http_metadata(
     client: &Client,
@@ -359,15 +445,34 @@ async fn fetch_vllm_http_metadata_checked(
     api_key: Option<&str>,
     strict: bool,
 ) -> Result<HashMap<String, String>, String> {
-    let base = http_base_url(url);
     let mut labels = HashMap::new();
+    fetch_vllm_http_metadata_into(client, url, api_key, strict, &mut labels).await?;
+    Ok(labels)
+}
+
+// Retain validated model/protocol facts if registration's optional version
+// request exhausts its budget. Refresh still requires the whole checked read.
+async fn fetch_vllm_http_metadata_into(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+    labels: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let base = http_base_url(url);
 
     // /v1/models — vLLM uses `root` as model_path, `id` as served_model_name
-    match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
-        .await
-    {
+    match http_get_vllm_models_classified(client, &format!("{base}/v1/models"), api_key).await {
         Ok(models) => {
-            if let Some(m) = models.data.first() {
+            if let Some(protocol) = models
+                .pairing_protocol
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                labels.insert("pairing_protocol".to_string(), protocol.to_string());
+            }
+            if let Some(m) = models.models.data.first() {
                 if let Some(ref root) = m.root {
                     labels.insert("model_path".to_string(), root.clone());
                 }
@@ -379,6 +484,7 @@ async fn fetch_vllm_http_metadata_checked(
                 }
             }
         }
+        Err(MetadataError::InvalidExtension(e)) => return Err(format!("/v1/models: {e}")),
         Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
         Err(_) => {}
     }
@@ -396,7 +502,7 @@ async fn fetch_vllm_http_metadata_checked(
         Err(_) => {}
     }
 
-    Ok(labels)
+    Ok(())
 }
 
 /// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
@@ -633,69 +739,104 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
-            ConnectionMode::Http => {
-                let runtime = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "No detected_runtime_type for {}, defaulting to sglang",
-                            Endpoint::redacted_str(&config.url)
-                        );
-                        "sglang"
-                    });
-                let client = context.data.http_client("discover_metadata")?;
-                discover_engine_labels(
-                    &client,
-                    &config.url,
-                    ConnectionMode::Http,
-                    runtime,
-                    config.api_key.as_deref(),
-                    false,
-                )
-                .await
+        // Optional discovery must finish inside the workflow's 10s step timeout.
+        // Keep validated facts outside the cancelled future so a slow optional
+        // endpoint cannot erase an already validated pairing contract.
+        let mut partial_labels = HashMap::new();
+        let discovery = async {
+            let metadata = match connection_mode {
+                ConnectionMode::Http => {
+                    let runtime = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "No detected_runtime_type for {}, defaulting to sglang",
+                                Endpoint::redacted_str(&config.url)
+                            );
+                            "sglang"
+                        });
+                    let client = context.data.http_client("discover_metadata")?;
+                    if runtime == "vllm" {
+                        fetch_vllm_http_metadata_into(
+                            &client,
+                            &config.url,
+                            config.api_key.as_deref(),
+                            false,
+                            &mut partial_labels,
+                        )
+                        .await
+                        .map_err(|message| WorkflowError::StepFailed {
+                            step_id: wfaas::StepId::new("discover_metadata"),
+                            message,
+                        })?;
+                        Ok((partial_labels.clone(), None))
+                    } else {
+                        discover_engine_labels(
+                            &client,
+                            &config.url,
+                            ConnectionMode::Http,
+                            runtime,
+                            config.api_key.as_deref(),
+                            false,
+                        )
+                        .await
+                    }
+                }
+                ConnectionMode::Grpc => {
+                    let config_runtime = config.runtime_type.to_string();
+                    let runtime_type = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or(&config_runtime);
+                    fetch_grpc_metadata(&config.url, runtime_type, false)
+                        .await
+                        .map(|(labels, rt)| (labels, Some(rt)))
+                }
+                // A ZMQ engine reports its geometry at the handshake, which runs
+                // after this step; the facts worth having earlier are the
+                // model's own sampling defaults, read from the model the gateway
+                // was started with (a local directory, or a Hub id through the
+                // HF cache), for a worker that serves that model (one registered
+                // for another model, by spec or label, must not inherit them),
+                // and where the gateway's own link starts a grammar, which is
+                // the link's rule and needs no engine. The runtime stays `None`:
+                // the handshake is shared across engines, so it cannot be probed
+                // here and the configured or detected runtime is preserved.
+                ConnectionMode::Zmq => {
+                    let router_model = context
+                        .data
+                        .app_context
+                        .as_ref()
+                        .and_then(|app| app.router_config.model_path.clone());
+                    let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
+                    Ok((zmq_worker_labels(model.as_deref()).await, None))
+                }
             }
-            ConnectionMode::Grpc => {
-                let config_runtime = config.runtime_type.to_string();
-                let runtime_type = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or(&config_runtime);
-                fetch_grpc_metadata(&config.url, runtime_type, false)
-                    .await
-                    .map(|(labels, rt)| (labels, Some(rt)))
-            }
-            // A ZMQ engine reports its geometry at the handshake, which runs
-            // after this step; the facts worth having earlier are the
-            // model's own sampling defaults, read from the model the gateway
-            // was started with (a local directory, or a Hub id through the
-            // HF cache), for a worker that serves that model (one registered
-            // for another model, by spec or label, must not inherit them),
-            // and where the gateway's own link starts a grammar, which is
-            // the link's rule and needs no engine. The runtime stays `None`:
-            // the handshake is shared across engines, so it cannot be probed
-            // here and the configured or detected runtime is preserved.
-            ConnectionMode::Zmq => {
-                let router_model = context
-                    .data
-                    .app_context
-                    .as_ref()
-                    .and_then(|app| app.router_config.model_path.clone());
-                let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
-                Ok((zmq_worker_labels(model.as_deref()).await, None))
-            }
-        }
-        .unwrap_or_else(|e| {
-            warn!(
-                "Failed to fetch metadata for {}: {}",
-                Endpoint::redacted_str(&config.url),
-                e
-            );
-            (HashMap::new(), None)
-        });
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Failed to fetch metadata for {}: {}",
+                    Endpoint::redacted_str(&config.url),
+                    e
+                );
+                (HashMap::new(), None)
+            });
+
+            Ok::<_, WorkflowError>(metadata)
+        };
+        let (discovered_labels, detected_runtime) =
+            match tokio::time::timeout(Duration::from_secs(9), discovery).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    warn!(
+                        "Optional registration metadata budget expired for {}",
+                        Endpoint::redacted_str(&config.url)
+                    );
+                    (partial_labels, None)
+                }
+            };
 
         debug!(
             "Discovered {} labels for {}",
@@ -980,6 +1121,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn strict_vllm_refresh_still_rejects_optional_version_failure() {
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/v1/models",
+                http::StatusCode::OK,
+                serde_json::json!({"data": [{"id": "model"}], "pairing_protocol": "kv-v1"}),
+            ),
+            (
+                "/version",
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({}),
+            ),
+        ])
+        .await;
+        let client = http_client();
+        let (labels, _) =
+            discover_engine_labels(&client, &base, ConnectionMode::Http, "vllm", None, false)
+                .await
+                .unwrap();
+        assert_eq!(
+            labels.get("pairing_protocol").map(String::as_str),
+            Some("kv-v1")
+        );
+        let error =
+            discover_engine_labels(&client, &base, ConnectionMode::Http, "vllm", None, true)
+                .await
+                .unwrap_err();
+        assert!(error.starts_with("/version: status 503"), "{error}");
+    }
+
     /// The vLLM HTTP read takes the model's identity and window from
     /// `/v1/models` and the build from `/version`; a `/version` the engine
     /// does not offer leaves no label and fails no read.
@@ -1015,6 +1189,263 @@ mod tests {
             .expect("a version endpoint the engine does not offer fails no read");
         assert_eq!(label(&labels, "model_path"), Some("org/model-d"));
         assert_eq!(label(&labels, "version"), None, "{labels:?}");
+    }
+
+    #[tokio::test]
+    async fn vllm_smg_http_extension_reaches_pairing_and_preserves_explicit_priority() {
+        use http::StatusCode;
+        use openai_protocol::worker::WorkerSpec;
+
+        use crate::{
+            worker::pd_pairing::PdPairing, workflow::steps::local::test_support::serve_json_routes,
+        };
+
+        for (value, expected) in [
+            (None, None),
+            (Some(serde_json::Value::Null), None),
+            (Some(serde_json::json!("   ")), None),
+            (Some(serde_json::json!(" kv-v1 ")), Some("kv-v1")),
+            (Some(serde_json::json!("kv-v2")), Some("kv-v2")),
+        ] {
+            let mut models = serde_json::json!({"object": "list", "data": [{"id": "m"}]});
+            if let Some(value) = value {
+                models["pairing_protocol"] = value;
+            }
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+            let (labels, _) = discover_engine_labels(
+                &http_client(),
+                &base,
+                ConnectionMode::Http,
+                "vllm",
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(label(&labels, "pairing_protocol"), expected);
+            assert_eq!(label(&labels, "served_model_name"), Some("m"));
+            let mut spec = WorkerSpec::new(base);
+            spec.labels = labels;
+            assert_eq!(PdPairing::derive(&spec).explicit(), expected);
+            spec.labels
+                .insert("pairing_protocol".into(), "operator".into());
+            assert_eq!(PdPairing::derive(&spec).explicit(), Some("operator"));
+            spec.pairing_protocol = Some("spec-override".into());
+            assert_eq!(PdPairing::derive(&spec).explicit(), Some("spec-override"));
+        }
+    }
+
+    fn vllm_registration_context(url: String) -> WorkflowContext<WorkerWorkflowData> {
+        use std::sync::Arc;
+
+        use openai_protocol::{
+            model_card::ModelCard,
+            worker::{WorkerModels, WorkerSpec},
+        };
+        use wfaas::WorkflowInstanceId;
+
+        let mut config = WorkerSpec::new(url);
+        // Configured model/connector must not make invalid discovery optional.
+        config.models = WorkerModels::Single(Box::new(ModelCard::new("configured-model")));
+        config.labels.insert("kv_connector".into(), "moriio".into());
+        WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            WorkerWorkflowData {
+                config,
+                registration_mode: Default::default(),
+                worker_kind: Some(WorkerKind::Local),
+                connection_mode: Some(ConnectionMode::Http),
+                http2: Some(false),
+                http_client_handle: Some(Arc::new(http_client())),
+                detected_runtime_type: Some("vllm".into()),
+                discovered_labels: HashMap::new(),
+                dp_info: None,
+                symphony_table: None,
+                model_cards: vec![],
+                workers: None,
+                final_labels: HashMap::new(),
+                app_context: None,
+                actual_workers: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_malformed_pairing_protocol_before_worker_creation() {
+        use http::StatusCode;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let mut payloads: Vec<_> = [
+            serde_json::json!(4),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(false),
+        ]
+        .into_iter()
+        .map(|value| serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": value}))
+        .collect();
+        // A declared protocol cannot disappear because another field is invalid.
+        payloads.push(serde_json::json!({"data": "invalid", "pairing_protocol": "kv-v1"}));
+        for payload in payloads {
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, payload)]).await;
+            let mut context = vllm_registration_context(base);
+            let result = DiscoverMetadataStep.execute(&mut context).await;
+            match result {
+                Err(WorkflowError::StepFailed { step_id, message }) => {
+                    assert_eq!(step_id, wfaas::StepId::new("discover_metadata"));
+                    assert!(message.contains("pairing_protocol"), "{message}");
+                }
+                other => panic!("explicit invalid protocol cannot become absent: {other:?}"),
+            }
+            assert!(context.data.discovered_labels.is_empty());
+            assert!(context.data.actual_workers.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_smg_invalid_metadata_before_worker_creation() {
+        use http::StatusCode;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![("/v1/models", StatusCode::BAD_GATEWAY,
+            serde_json::json!({"error": {"code": "smg_http_metadata_invalid", "message": "invalid extension"}}))]).await;
+        let mut context = vllm_registration_context(base);
+        let result = DiscoverMetadataStep.execute(&mut context).await;
+        match result {
+            Err(WorkflowError::StepFailed { step_id, message }) => {
+                assert_eq!(step_id, wfaas::StepId::new("discover_metadata"));
+                assert!(message.contains("smg_http_metadata_invalid"), "{message}");
+            }
+            other => panic!("our middleware explicitly refused the metadata: {other:?}"),
+        }
+        assert!(context.data.discovered_labels.is_empty());
+        assert!(context.data.actual_workers.is_none());
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_duplicate_pairing_protocol_even_when_last_is_null() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                r#"{"data":[{"id":"m"}],"pairing_protocol":"kv-v1","pairing_protocol":null}"#
+            }),
+        );
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut context = vllm_registration_context(base);
+        let result = DiscoverMetadataStep.execute(&mut context).await;
+        servers.shutdown().await;
+        match result {
+            Err(WorkflowError::StepFailed { message, .. }) => {
+                assert!(message.contains("pairing_protocol"), "{message}");
+            }
+            other => panic!("duplicate protocol must not become an absent extension: {other:?}"),
+        }
+        assert!(context.data.actual_workers.is_none());
+    }
+
+    #[tokio::test]
+    async fn registration_preserves_legacy_absent_valid_and_optional_failures() {
+        use http::StatusCode;
+
+        use crate::{
+            worker::test_support::RefusedAddress,
+            workflow::steps::local::test_support::serve_json_routes,
+        };
+
+        for (status, body, expected) in [
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}]}),
+                None,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": null}),
+                None,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": "   "}),
+                None,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": " kv-v1 "}),
+                Some("kv-v1"),
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": "legacy malformed list"}),
+                None,
+            ),
+            (StatusCode::NOT_FOUND, serde_json::json!({}), None),
+            (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"code": "other_error"}}),
+                None,
+            ),
+        ] {
+            let base = serve_json_routes(vec![
+                ("/v1/models", status, body),
+                // The extension marker is interpreted only at its own endpoint.
+                (
+                    "/version",
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"error": {"code": "smg_http_metadata_invalid"}}),
+                ),
+            ])
+            .await;
+            let mut context = vllm_registration_context(base);
+            assert!(matches!(
+                DiscoverMetadataStep.execute(&mut context).await,
+                Ok(StepResult::Success)
+            ));
+            assert_eq!(
+                label(&context.data.discovered_labels, "pairing_protocol"),
+                expected
+            );
+        }
+        let refused = RefusedAddress::reserve();
+        let mut context = vllm_registration_context(refused.http_url());
+        assert!(matches!(
+            DiscoverMetadataStep.execute(&mut context).await,
+            Ok(StepResult::Success)
+        ));
+        assert!(context.data.discovered_labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_smg_http_extension_fails_both_modes_without_changing_sglang_schema() {
+        use http::StatusCode;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+        for invalid in [
+            serde_json::json!(4),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let models = serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": invalid});
+            // This field is interpreted only on the opted-in vLLM path.
+            assert!(serde_json::from_value::<ModelsResponse>(models.clone()).is_ok());
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+            let client = http_client();
+            let error = fetch_vllm_http_metadata_checked(&client, &base, None, true)
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("/v1/models: "), "{error}");
+            assert!(
+                fetch_vllm_http_metadata_checked(&client, &base, None, false)
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     /// An engine that refuses the connection leaves registration with no

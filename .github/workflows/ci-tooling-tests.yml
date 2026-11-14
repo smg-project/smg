@@ -6,6 +6,7 @@ on:
       - .github/workflows/ci-tooling-tests.yml
       - .github/workflows/pr-test-rust.yml
       - .github/workflows/e2e-gpu-job.yml
+      - .github/workflows/nightly-pd.yml
       - .github/workflows/nightly-bfcl.yml
       - .github/workflows/pr-naming-check.yml
       - .pre-commit-config.yaml
@@ -43,11 +44,19 @@ jobs:
       # Only the explicitly selected CPU fixtures run; no engine is installed.
       - name: Run available CI tooling contracts
         run: python scripts/ci_run_tooling_tests.py
+      - name: Run MoRI topology selection and producer command contracts
+        run: |
+          python -m pytest -q --confcutdir=e2e_test/infra \
+            e2e_test/infra/test_pd_topology_restart_skips.py \
+            e2e_test/infra/test_moriio_cmd_builders.py \
+            --junitxml=ci-moriio-topology-results.xml
       - name: Upload CPU test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ci-tooling-results
-          path: ci-tooling-results.xml
+          path: |
+            ci-tooling-results.xml
+            ci-moriio-topology-results.xml
           if-no-files-found: error
           retention-days: 7

@@ -70,3 +70,106 @@ def test_no_reading_without_a_working_tool(monkeypatch, amd_smi):
     monkeypatch.setattr(process_utils.subprocess, "run", _fake_run(amd_smi))
 
     assert gpu_memory_used_mib([0]) is None
+
+
+def test_total_readback_budget_decreases_across_both_tools(monkeypatch):
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(process_utils.time, "monotonic", lambda: clock[0])
+
+    def run(cmd, **kwargs):
+        calls.append((cmd[:2], kwargs["timeout"]))
+        if cmd[0] == "nvidia-smi":
+            clock[0] += 10
+            raise FileNotFoundError(cmd[0])
+        clock[0] += 15 if cmd[1] == "list" else 3
+        return _fake_run(_AMD_SMI)(cmd, **kwargs)
+
+    monkeypatch.setattr(process_utils.subprocess, "run", run)
+    assert gpu_memory_used_mib([0, 1], timeout=30) == {0: 261326, 1: 1000}
+    assert [timeout for _, timeout in calls] == [15, 15, 5]
+    assert [cmd[0] for cmd, _ in calls] == ["nvidia-smi", "amd-smi", "amd-smi"]
+
+
+def test_expired_total_budget_cannot_return_a_successful_read_or_start_fallback(monkeypatch):
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(process_utils.time, "monotonic", lambda: clock[0])
+
+    def run(cmd, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock[0] += 6
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(process_utils.subprocess, "run", run)
+    assert gpu_memory_used_mib([0], timeout=5) is None
+    assert calls == [5]
+
+
+@pytest.mark.parametrize("raw", [True, False, 12.5, -1, "01", "-1", "1.5", " 1", "1e2"])
+@pytest.mark.parametrize("field", ["node_id", "listed_gpu", "metric_gpu", "used_vram"])
+def test_strict_amd_parser_rejects_invalid_raw_identity_and_memory(monkeypatch, raw, field):
+    listed = [{"gpu": 0, "node_id": 2}]
+    metric = [{"gpu": 0, "mem_usage": {"used_vram": {"value": 12}}}]
+    if field == "node_id":
+        listed[0]["node_id"] = raw
+    elif field == "listed_gpu":
+        listed[0]["gpu"] = raw
+    elif field == "metric_gpu":
+        metric[0]["gpu"] = raw
+    else:
+        metric[0]["mem_usage"]["used_vram"]["value"] = raw
+    outputs = {"amd-smi list": json.dumps(listed), "amd-smi metric": json.dumps(metric)}
+    monkeypatch.setattr(process_utils.subprocess, "run", _fake_run(outputs))
+    assert gpu_memory_used_mib([0], timeout=30) is None
+
+
+@pytest.mark.parametrize("raw", [12, "12", 0, "0"])
+def test_strict_amd_parser_accepts_integer_and_canonical_decimal_memory(monkeypatch, raw):
+    outputs = {
+        "amd-smi list": json.dumps([{"gpu": "0", "node_id": "2"}]),
+        "amd-smi metric": json.dumps([{"gpu": "0", "mem_usage": {"used_vram": {"value": raw}}}]),
+    }
+    monkeypatch.setattr(process_utils.subprocess, "run", _fake_run(outputs))
+    assert gpu_memory_used_mib([0], timeout=30) == {0: int(raw)}
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "duplicate_node",
+        "duplicate_gpu",
+        "unknown_metric_gpu",
+        "duplicate_metric_gpu",
+        "negative_requested_gpu",
+        "negative_visibility",
+        "duplicate_visibility",
+        "visibility_out_of_range",
+    ],
+)
+def test_strict_amd_mapping_cannot_select_an_ambiguous_or_wrong_gpu(monkeypatch, defect):
+    listed = [{"gpu": 0, "node_id": 2}, {"gpu": 1, "node_id": 3}]
+    metrics = [{"gpu": g, "mem_usage": {"used_vram": 12}} for g in [0, 1]]
+    gpu_ids = [0]
+    if defect == "duplicate_node":
+        listed[1]["node_id"] = 2
+    elif defect == "duplicate_gpu":
+        listed[1]["gpu"] = 0
+    elif defect == "unknown_metric_gpu":
+        metrics[0]["gpu"] = 7
+    elif defect == "duplicate_metric_gpu":
+        metrics[1]["gpu"] = 0
+    elif defect == "negative_requested_gpu":
+        gpu_ids = [-1]
+    else:
+        monkeypatch.setenv(
+            "HIP_VISIBLE_DEVICES",
+            {
+                "negative_visibility": "-1",
+                "duplicate_visibility": "0,0",
+                "visibility_out_of_range": "2",
+            }[defect],
+        )
+    outputs = {"amd-smi list": json.dumps(listed), "amd-smi metric": json.dumps(metrics)}
+    monkeypatch.setattr(process_utils.subprocess, "run", _fake_run(outputs))
+    assert gpu_memory_used_mib(gpu_ids, timeout=30) is None
