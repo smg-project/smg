@@ -14,6 +14,8 @@ use std::{
 use tokio::time::{Instant, MissedTickBehavior};
 use tonic::Status;
 
+use crate::kv_events::env_usize;
+
 /// Seconds the probe waits with neither a push nor an answer before the
 /// RPC answers unhealthy, unless the wire's knob says otherwise.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -65,9 +67,7 @@ impl Verdict {
 /// when unset.
 pub(crate) fn timeout_from_env(knob: &str) -> Duration {
     let default = usize::try_from(DEFAULT_TIMEOUT.as_secs()).unwrap_or(usize::MAX);
-    Duration::from_secs(
-        u64::try_from(crate::kv_events::env_usize(knob, default)).unwrap_or(u64::MAX),
-    )
+    Duration::from_secs(u64::try_from(env_usize(knob, default)).unwrap_or(u64::MAX))
 }
 
 /// Whether the launch's server args name a disaggregation role (any

@@ -1,0 +1,27 @@
+# Router with the standalone policy controller beside it: a Deployment of its
+# own and the Service <fullname>-policy-controller (the gateways' gRPC port,
+# the operators' port and the metrics port). The controller runs on its own
+# today: nothing here points the router at it.
+# No controller image is published yet: build the smg-policy-controller
+# binary into an image of your own, push it to your registry and name it
+# below. The chart refuses to render the controller without a repository and
+# a tag.
+# Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-policy-controller.yaml
+router:
+  workerUrls:
+    - http://worker-1:8000
+policyController:
+  enabled: true
+  image:
+    registry: registry.example.com
+    repository: smg/policy-controller
+    tag: "0.1.0"
+  # The controller runs 2 runtime worker threads by default
+  # (runtimeWorkerThreads), the CPU limit here: raise the two together.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi

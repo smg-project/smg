@@ -13,6 +13,13 @@
 //! allocations; no asserts or allocation inside timed regions;
 //! quote the median of >=3 runs.
 
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    reason = "bench helpers: a failed store ends the run; the numbers are printed"
+)]
+
 mod common;
 
 use std::time::Instant;
@@ -178,7 +185,7 @@ fn build_families(rng: &mut Rng) -> Vec<Family> {
         .map(|&(h, pct)| (h, target_blocks() * pct / 100))
         .collect();
     let mut force_gate = true;
-    for (h, budget) in budgets.iter_mut() {
+    for (h, budget) in &mut budgets {
         let mut used = 0u64;
         while used < *budget {
             let shared_len = if force_gate && *h == 64 {
@@ -344,7 +351,6 @@ fn side() -> String {
     side
 }
 
-#[allow(clippy::large_enum_variant)] // bench-local, two instances ever
 enum Sider {
     Oracle(Oracle, Vec<Vec<u64>>),
     R1(
@@ -696,8 +702,7 @@ fn pinned_workload() {
         }
         let drift = rss_kib() as i64 - rss_soak_start as i64;
         println!(
-            "soak done: rss drift {:+} KiB over {soak_secs}s ({} ops, {} queries)",
-            drift, ops_applied, qps
+            "soak done: rss drift {drift:+} KiB over {soak_secs}s ({ops_applied} ops, {qps} queries)"
         );
     }
     std::hint::black_box(&sider as *const _);

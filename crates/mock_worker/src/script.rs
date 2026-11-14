@@ -1193,7 +1193,7 @@ mod tests {
             r#"{"output_ids": [1], "matched_stop": true}"#,
             r#"{"output_ids": [1], "delay": 5}"#,
             r#"{"output_ids": ["x"]}"#,
-            r#"[1]"#,
+            r"[1]",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
