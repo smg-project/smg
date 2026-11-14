@@ -1181,6 +1181,8 @@ pub(crate) fn start_failure_response(
 /// mid-way, so the worker's own account of the calls it admitted stays whole.
 /// The worker's request count takes one per call, as the batched completions
 /// route counts its sub-requests.
+/// The circuit breaker takes one sample for the request, the worst answer by
+/// the worker's reading ([`batch_breaker_status`]).
 async fn execute_embed(
     requests: Vec<ProtoEmbedRequest>,
     clients: &mut ClientSelection,
@@ -1202,10 +1204,12 @@ async fn execute_embed(
         client.embed(request)
     }))
     .await;
-    let result: Result<Vec<_>, _> = answers.into_iter().collect();
-    if let Some(status) = result.breaker_status() {
+    // One breaker sample for the request, read from every answer: a worker
+    // failure on any input counts whatever its place in the batch.
+    if let Some(status) = batch_breaker_status(&answers, worker.map(AsRef::as_ref)) {
         workers.record_outcome(ledger, status);
     }
+    let result: Result<Vec<_>, _> = answers.into_iter().collect();
 
     let responses = result.map_err(|e| {
         if let Some(worker) = workers.single() {
@@ -1224,6 +1228,34 @@ async fn execute_embed(
     })?;
 
     Ok(ExecutionResult::Embedding { responses })
+}
+
+/// The circuit breaker's one sample for a request the gateway dispatched as
+/// several calls, one per input: the worst answer by the worker's own
+/// reading, a failure it charges over its capacity pushback over the
+/// request's own fault (a rejection of one input) over the successes, so a
+/// worker failure counts whatever its place in the batch and a rejection
+/// ahead of it hides nothing; `None` when no answer says anything about the
+/// worker. Without the worker's reading the status class ranks the same way.
+fn batch_breaker_status<T>(
+    answers: &[Result<T, tonic::Status>],
+    worker: Option<&dyn Worker>,
+) -> Option<u16> {
+    let rank = |status: u16| match worker {
+        Some(worker) if worker.is_breaker_failure(status) => 3,
+        Some(worker) if worker.resilience().capacity_status_codes.contains(&status) => 2,
+        Some(_) => u8::from(status >= 400),
+        None => match status {
+            code if code >= 500 => 3,
+            429 => 2,
+            code if code >= 400 => 1,
+            _ => 0,
+        },
+    };
+    answers
+        .iter()
+        .filter_map(TonicResultExt::breaker_status)
+        .max_by_key(|status| rank(*status))
 }
 
 /// What addresses both sides of a disaggregated dispatch: the pair and the
