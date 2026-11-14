@@ -108,6 +108,8 @@ message ChoiceConstraint {
 }
 
 // Pre-tokenized input from Rust router
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   string original_text = 1;  // For reference/debugging
   repeated uint32 input_ids = 2;  // Actual token IDs to process

@@ -4065,11 +4065,13 @@ fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
 /// the centralized ID generation pattern with "msg_" prefix for consistency.
 ///
 /// # Arguments
-/// * `item` - The input item to normalize
+/// * `item` - The input item to normalize, taken by value: a SimpleInputMessage
+///   gives its content and role to the Message built from it, every other item
+///   comes back as it came, moved and not copied
 ///
 /// # Returns
 /// A normalized ResponseInputOutputItem (either Message if converted, or original if not SimpleInputMessage)
-pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutputItem {
+pub fn normalize_input_item(item: ResponseInputOutputItem) -> ResponseInputOutputItem {
     match item {
         ResponseInputOutputItem::SimpleInputMessage {
             content,
@@ -4079,20 +4081,20 @@ pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutp
         } => {
             let content_vec = match content {
                 StringOrContentParts::String(s) => {
-                    vec![ResponseContentPart::InputText { text: s.clone() }]
+                    vec![ResponseContentPart::InputText { text: s }]
                 }
-                StringOrContentParts::Array(parts) => parts.clone(),
+                StringOrContentParts::Array(parts) => parts,
             };
 
             ResponseInputOutputItem::Message {
                 id: generate_id("msg"),
-                role: role.clone(),
+                role,
                 content: content_vec,
                 status: Some("completed".to_string()),
-                phase: *phase,
+                phase,
             }
         }
-        _ => item.clone(),
+        other => other,
     }
 }
 
@@ -5065,5 +5067,59 @@ mod tests {
             },
         ]);
         assert_eq!(text.to_text_only().unwrap(), "ab");
+    }
+
+    /// The normaliser takes an item by value: a bare `{role, content}` message
+    /// becomes a message item carrying that content and role, and every other
+    /// item comes back as it came.
+    #[test]
+    fn normalize_input_item_reshapes_a_bare_message_and_keeps_every_other_item() {
+        let item = |body: Value| -> ResponseInputOutputItem {
+            serde_json::from_value(body).expect("the input item deserializes")
+        };
+        let wire = |item: &ResponseInputOutputItem| serde_json::to_value(item).unwrap();
+
+        let bare = normalize_input_item(item(
+            serde_json::json!({"role": "user", "content": "continue", "phase": "commentary"}),
+        ));
+        let ResponseInputOutputItem::Message {
+            id,
+            role,
+            content,
+            status,
+            phase,
+        } = &bare
+        else {
+            panic!("a bare message becomes a message item, got {bare:?}");
+        };
+        assert!(id.starts_with("msg_"), "a generated message id, got {id}");
+        assert_eq!(role, "user");
+        assert_eq!(
+            serde_json::to_value(content).unwrap(),
+            serde_json::json!([{"type": "input_text", "text": "continue"}])
+        );
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(*phase, Some(MessagePhase::Commentary));
+
+        let parts = normalize_input_item(item(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]
+        })));
+        assert_eq!(
+            wire(&parts)["content"],
+            serde_json::json!([{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]),
+            "the parts move over in order"
+        );
+
+        let call = item(serde_json::json!({
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "lookup", "arguments": "{\"key\": \"k\"}"
+        }));
+        let before = wire(&call);
+        assert_eq!(
+            wire(&normalize_input_item(call)),
+            before,
+            "an item that is not a bare message is returned as it came"
+        );
     }
 }

@@ -5,6 +5,8 @@
 //! set and one scrape configuration serve both processes; `/version` names
 //! the binary, its version and the protocol package it speaks.
 
+use std::sync::Arc;
+
 use axum::{
     extract::State as AxumState,
     http::{header, StatusCode},
@@ -12,11 +14,11 @@ use axum::{
     routing::get,
     Router,
 };
-use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use serde_json::json;
 
-use super::{readiness::Readiness, PROTOCOL_PACKAGE};
+use super::{metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
+use crate::ingest::loads::Stats;
 
 /// What `/version` answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -40,7 +42,9 @@ pub const VERSION: Version = Version {
 #[derive(Clone)]
 pub(crate) struct Admin {
     pub(crate) readiness: Readiness,
-    pub(crate) metrics: PrometheusHandle,
+    pub(crate) metrics: Arc<Metrics>,
+    /// The load driver's counts, rendered with the metrics.
+    pub(crate) loads: Arc<Stats>,
 }
 
 /// The admin routes over their state.
@@ -83,13 +87,15 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        admin.metrics.render(),
+        admin.metrics.render(&admin.loads),
     )
         .into_response()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -97,7 +103,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{router, Admin, VERSION};
-    use crate::controller::{metrics::Metrics, readiness, readiness::State};
+    use crate::{
+        controller::{metrics::Metrics, readiness, readiness::State},
+        ingest::loads::Stats,
+    };
 
     async fn get(app: axum::Router, path: &str) -> (StatusCode, String, String) {
         let response = app
@@ -127,7 +136,8 @@ mod tests {
         let metrics = Metrics::new();
         let app = router(Admin {
             readiness: reader,
-            metrics: metrics.handle(),
+            metrics: Arc::new(metrics),
+            loads: Arc::new(Stats::default()),
         });
 
         let (status, _, body) = get(app.clone(), "/readiness").await;
@@ -157,7 +167,8 @@ mod tests {
         let metrics = Metrics::new();
         let app = router(Admin {
             readiness: reader,
-            metrics: metrics.handle(),
+            metrics: Arc::new(metrics),
+            loads: Arc::new(Stats::default()),
         });
 
         let (status, content_type, body) = get(app.clone(), "/version").await;
@@ -173,6 +184,7 @@ mod tests {
         assert_eq!(content_type, "text/plain; version=0.0.4; charset=utf-8");
         assert!(body.contains("smg_policy_controller_state{state=\"starting\"} 1"));
         assert!(body.contains("smg_policy_controller_start_time_seconds "));
+        assert!(body.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 0"));
 
         let (status, _, _) = get(app, "/nowhere").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
