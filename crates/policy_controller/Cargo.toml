@@ -185,5 +185,9 @@ harness = false
 name = "store"
 harness = false
 
+[[bench]]
+name = "power_of_two"
+harness = false
+
 [lints]
 workspace = true

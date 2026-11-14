@@ -164,6 +164,7 @@ fn load_row_record() -> &'static [&'static str] {
             active_kv_permille,
             live_rate,
             resident_tokens,
+            resident_counted,
             report_age_ms,
             source,
             max_running,
@@ -511,7 +512,7 @@ struct ProtoMirror {
     record: &'static [&'static str],
     /// Record fields the wire does not carry: a host instant, a host-local
     /// position, the in-process length of a fixed array, the trace the wire
-    /// hoists into `Decision`.
+    /// hoists into `Decision`, whether a report counts resident tokens.
     host_only: &'static [&'static str],
     /// Wire fields outside the record: an event's key before it, controller
     /// facts, a wire-only input and the observability record's fields after
@@ -531,7 +532,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "LoadRow",
             record: load_row_record(),
-            host_only: &[],
+            host_only: &["resident_counted"],
             wire_only: &[],
             wire: &[
                 ("running", Type::Uint32),
@@ -803,7 +804,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "load",
             crate_record: load_row_record(),
-            host_only: &[],
+            host_only: &["resident_counted"],
             before: &[],
         },
         WitMirror {

@@ -702,7 +702,7 @@
       "additionalProperties": false
     },
     "ResidentWorkParams": {
-      "description": "The resident-work scorer: the tokens resident on a candidate, with the\nrequest's own token count added for the comparison.",
+      "description": "The resident-work scorer: the context tokens resident on a candidate,\nand a price in tokens for every request it holds.",
       "type": "object",
       "properties": {
         "weight": {
@@ -713,10 +713,10 @@
           "exclusiveMinimum": 0
         },
         "request_tokens": {
-          "description": "The request's token count added to each candidate's resident\ntokens; above zero.",
+          "description": "What one request a candidate holds adds to its resident tokens, in\ncontext tokens; zero compares the tokens alone.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 1
+          "minimum": 0
         }
       },
       "additionalProperties": false,

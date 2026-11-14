@@ -3,7 +3,8 @@
 //! a field fails to compile) and, per field, the WIT spelling of its Rust type
 //! against the descriptor in [`super::types`] (a retyped field fails the WIT
 //! test; the WIT order is the descriptor's, held by the byte-for-byte test,
-//! a struct's declaration order binding nothing). The host-only fields (a candidate's position and
+//! a struct's declaration order binding nothing). The host-only fields (a load row's
+//! resident-count flag, a candidate's position and
 //! sample instant, a request's host clock, a lease's issue instant and
 //! session verdict, a target's and a pair's positions) are named as such.
 //! `dispatched` has no struct of its own: the host composes it from a lease,
@@ -129,8 +130,8 @@ pub(crate) fn all() -> Vec<Probe> {
     vec![
         probe!("load", before [], LoadRow {
             running, queued, waiting_uncached_tokens, kv_usage_permille, active_kv_permille,
-            live_rate, resident_tokens, report_age_ms, source, max_running,
-        } host [], &load),
+            live_rate, resident_tokens, resident_counted, report_age_ms, source, max_running,
+        } host [resident_counted], &load),
         probe!("candidate", before [], Candidate {
             position, id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector,
             in_flight, load, load_sampled_at_micros, overlap_blocks, predicted_blocks,

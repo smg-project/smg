@@ -452,7 +452,9 @@ impl SinceReport {
 
     /// The held token-work and requests once the dispatches made at or
     /// before the report's sample are released. A sample that reaches none
-    /// of them reads the word alone.
+    /// of them reads the word alone. Inlined into each load scorer's row
+    /// loop: two loads and a compare a row, the release behind a call.
+    #[inline]
     fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
         if self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros {
             self.release_through(sampled_at_micros);
@@ -463,7 +465,12 @@ impl SinceReport {
 
     /// Releases every lane's dispatches made at or before the sample and
     /// recomputes the row's oldest, under every lane's lock in lane order,
-    /// so no dispatch lands between the lanes' reads and the store.
+    /// so no dispatch lands between the lanes' reads and the store. Out of
+    /// line: a decision reads a row far more often than a report releases
+    /// from it, and with this body inlined the read was too large to stay
+    /// in a second scorer's row loop.
+    #[cold]
+    #[inline(never)]
     fn release_through(&self, sampled_at_micros: u64) {
         let mut held_lanes = self.lock_lanes();
         for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
@@ -502,21 +509,126 @@ impl SinceReport {
 /// to 8 % at 64 and 512 rows.
 type RankKey = (WorkerId, u16);
 
+/// The since-report dispatch credit of a load scorer: per rank row, the
+/// dispatches no report reflects yet. A decision and a dispatch to a rank the
+/// tally knows load the map without a shared write (a read-write lock's
+/// reader count is one, and eight deciders queued on it); a rank's first
+/// dispatch and a membership change replace the map whole, which is rare.
+/// Within a row the dispatches take per-thread lanes: deciders that read the
+/// same minimum book the same rank, and one lock there queued them too.
+#[derive(Debug)]
+struct Credits {
+    tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
+}
+
+impl Default for Credits {
+    fn default() -> Self {
+        Self {
+            tally: ArcSwap::from_pointee(FxHashMap::default()),
+        }
+    }
+}
+
+impl Credits {
+    /// Dispatches no report reflects yet on `worker`, over every rank of it.
+    fn held(&self, worker: WorkerId) -> usize {
+        self.tally
+            .load()
+            .iter()
+            .filter(|((id, _), _)| *id == worker)
+            .map(|(_, since)| since.len())
+            .sum()
+    }
+
+    /// Dispatches no report reflects yet on one rank of `worker`.
+    fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
+        self.tally
+            .load()
+            .get(&(worker, dp_rank))
+            .map_or(0, |since| since.len())
+    }
+
+    /// The tally without the ranks `gone` names: the map replaced whole, as a
+    /// membership change is rare and a decision never waits on it.
+    fn forget(&self, gone: impl Fn(&RankKey) -> bool) {
+        self.tally.rcu(|tally| {
+            let mut next = FxHashMap::clone(tally);
+            next.retain(|rank, _| !gone(rank));
+            next
+        });
+    }
+
+    /// Credits the rank a dispatch landed on.
+    fn dispatched(&self, lease: &Lease, target: &Target, side: Side, since_decision_micros: u32) {
+        // The decode side of a pair target is the pair's decode rank; the
+        // target itself is the prefill. The credit dates from the dispatch,
+        // so a report sampled while a queue held the decision does not
+        // release it.
+        let rank: RankKey = match side {
+            Side::Decode => target.pair.map_or((target.id, target.dp_rank), |p| {
+                (p.decode_id, p.decode_dp_rank)
+            }),
+            Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
+        };
+        let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
+        // A rank the tally knows is credited on its own entry; the first
+        // dispatch to a rank enters it (another dispatch may have entered it
+        // meanwhile: the entry the map holds is the one credited).
+        if let Some(since) = self.tally.load().get(&rank) {
+            since.record(dispatched_micros, lease.tokens);
+            return;
+        }
+        self.tally.rcu(|tally| {
+            if tally.contains_key(&rank) {
+                return Arc::clone(tally);
+            }
+            let mut next = FxHashMap::clone(tally);
+            next.insert(rank, Arc::new(SinceReport::default()));
+            Arc::new(next)
+        });
+        if let Some(since) = self.tally.load().get(&rank) {
+            since.record(dispatched_micros, lease.tokens);
+        }
+    }
+
+    /// Drops the ranks a membership change takes away.
+    fn membership(&self, change: &Membership<'_>) {
+        match change {
+            // Every rank of the worker goes with it. A resized worker's ranks
+            // are a new set: what a vanished rank held would never release,
+            // and a kept rank's next report is one interval away. Rare, so a
+            // walk over the tally is cheaper than a second index per worker.
+            Membership::Removed(id)
+            | Membership::Replaced { old: id, .. }
+            | Membership::Resized(id) => {
+                self.forget(|(worker, _)| worker == id);
+            }
+            // A snapshot (every worker of every pool, after a resync) stands
+            // for removals that may never have arrived: only its ids keep a
+            // tally. Rare, so a sorted copy is cheaper than a scan per row.
+            Membership::Snapshot(ids) => {
+                let mut sorted: Vec<u64> = ids.iter().map(|w| w.0).collect();
+                sorted.sort_unstable();
+                self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
+            }
+            Membership::Added(_) | Membership::Relabelled(_) => {}
+        }
+    }
+}
+
+/// The mean prefill a load scorer prices a request of unknown size at when
+/// its profile names none.
+pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
+
 /// The expected wait: token-work over drain rate plus a convex KV-pressure
 /// barrier, the since-report dispatch credit water-filling arrivals between
-/// reports. The host's in-flight count floors the report. The credit tally is
-/// per rank row: a decision and a dispatch to a rank the tally knows load the
-/// map without a shared write (a read-write lock's reader count is one, and
-/// eight deciders queued on it); a rank's first dispatch and a membership
-/// change replace the map whole, which is rare. Within a row the dispatches
-/// take per-thread lanes: deciders that read the same minimum book the same
-/// rank, and one lock there queued them too.
+/// reports. The host's in-flight count floors the report.
 #[derive(Debug)]
 pub struct LeastLoad {
     pub kv_pressure_weight: f32,
     pub mean_prefill_tokens: u32,
     pub default_throughput: f32,
-    tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
+    credits: Credits,
 }
 
 impl LeastLoad {
@@ -529,33 +641,26 @@ impl LeastLoad {
             } else {
                 1.0
             },
-            tally: ArcSwap::from_pointee(FxHashMap::default()),
+            credits: Credits::default(),
         }
     }
 
     /// Dispatches no report reflects yet on `worker`, over every rank of it,
     /// for tests and dumps.
     pub fn held(&self, worker: WorkerId) -> usize {
-        self.tally
-            .load()
-            .iter()
-            .filter(|((id, _), _)| *id == worker)
-            .map(|(_, since)| since.len())
-            .sum()
+        self.credits.held(worker)
     }
 
     /// Dispatches no report reflects yet on one rank of `worker`.
     pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
-        self.tally
-            .load()
-            .get(&(worker, dp_rank))
-            .map_or(0, |since| since.len())
+        self.credits.held_at(worker, dp_rank)
     }
 
     /// One rank's held word as a decision reads it: token-work and requests.
     #[cfg(test)]
     fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
-        self.tally
+        self.credits
+            .tally
             .load()
             .get(&(worker, dp_rank))
             .map_or((0, 0), |since| {
@@ -568,7 +673,7 @@ impl LeastLoad {
     /// runs it.
     #[cfg(test)]
     fn retire_oldest_batch_of(&self, worker: WorkerId, dp_rank: u16) {
-        if let Some(since) = self.tally.load().get(&(worker, dp_rank)) {
+        if let Some(since) = self.credits.tally.load().get(&(worker, dp_rank)) {
             since.retire_oldest_batch();
         }
     }
@@ -576,21 +681,12 @@ impl LeastLoad {
     /// The rank row, for a test that holds its retire lock.
     #[cfg(test)]
     fn row(&self, worker: WorkerId, dp_rank: u16) -> Arc<SinceReport> {
-        self.tally
+        self.credits
+            .tally
             .load()
             .get(&(worker, dp_rank))
             .cloned()
             .expect("a rank row")
-    }
-
-    /// The tally without the ranks `gone` names: the map replaced whole, as a
-    /// membership change is rare and a decision never waits on it.
-    fn forget(&self, gone: impl Fn(&RankKey) -> bool) {
-        self.tally.rcu(|tally| {
-            let mut next = FxHashMap::clone(tally);
-            next.retain(|rank, _| !gone(rank));
-            next
-        });
     }
 
     /// A reporting candidate's dispatch credit as token-work: the since-report
@@ -658,58 +754,12 @@ impl Lifecycle for LeastLoad {
         side: Side,
         since_decision_micros: u32,
     ) {
-        // The decode side of a pair target is the pair's decode rank; the
-        // target itself is the prefill. The credit dates from the dispatch,
-        // so a report sampled while a queue held the decision does not
-        // release it.
-        let rank: RankKey = match side {
-            Side::Decode => target.pair.map_or((target.id, target.dp_rank), |p| {
-                (p.decode_id, p.decode_dp_rank)
-            }),
-            Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
-        };
-        let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
-        // A rank the tally knows is credited on its own entry; the first
-        // dispatch to a rank enters it (another dispatch may have entered it
-        // meanwhile: the entry the map holds is the one credited).
-        if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
-            return;
-        }
-        self.tally.rcu(|tally| {
-            if tally.contains_key(&rank) {
-                return Arc::clone(tally);
-            }
-            let mut next = FxHashMap::clone(tally);
-            next.insert(rank, Arc::new(SinceReport::default()));
-            Arc::new(next)
-        });
-        if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
-        }
+        self.credits
+            .dispatched(lease, target, side, since_decision_micros);
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
-        match change {
-            // Every rank of the worker goes with it. A resized worker's ranks
-            // are a new set: what a vanished rank held would never release,
-            // and a kept rank's next report is one interval away. Rare, so a
-            // walk over the tally is cheaper than a second index per worker.
-            Membership::Removed(id)
-            | Membership::Replaced { old: id, .. }
-            | Membership::Resized(id) => {
-                self.forget(|(worker, _)| worker == id);
-            }
-            // A snapshot (every worker of every pool, after a resync) stands
-            // for removals that may never have arrived: only its ids keep a
-            // tally. Rare, so a sorted copy is cheaper than a scan per row.
-            Membership::Snapshot(ids) => {
-                let mut sorted: Vec<u64> = ids.iter().map(|w| w.0).collect();
-                sorted.sort_unstable();
-                self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
-            }
-            Membership::Added(_) | Membership::Relabelled(_) => {}
-        }
+        self.credits.membership(change);
     }
 }
 
@@ -742,7 +792,7 @@ impl Scorer for LeastLoad {
         // the peer baseline is known. No allocation.
         let mut reporting = 0usize;
         {
-            let tally = self.tally.load();
+            let tally = self.credits.tally.load();
             for (slot, &i) in out.iter_mut().zip(kept) {
                 let c = &candidates[i as usize];
                 *slot = match c.load {
@@ -787,6 +837,151 @@ impl Scorer for LeastLoad {
         }
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
+        let span = normalize_costs(out);
+        if span > 0.0 {
+            TieBand((TIE_EPSILON_SECS / span).min(1.0))
+        } else {
+            TieBand::NORMALIZED
+        }
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
+/// The resident work, in context tokens, lower better: what a worker's
+/// report says its running requests hold, the prompts dispatched to it since
+/// that report (the credit the least-load scorer books too), and
+/// `request_tokens` for every request it holds: the reported ones, the
+/// credited ones, and the ones the host holds beyond both, those priced at
+/// the worker's mean context as well. Every survivor is scored. A worker
+/// whose report does not count resident tokens (the row's
+/// `resident_counted`), or that has no report, scores as the best reporting
+/// peer plus its in-flight requests, each at the mean prefill and
+/// `request_tokens`; with no survivor counting them, the in-flight count
+/// decides.
+#[derive(Debug)]
+pub struct ResidentWork {
+    pub request_tokens: u32,
+    pub mean_prefill_tokens: u32,
+    credits: Credits,
+}
+
+impl ResidentWork {
+    pub fn new(request_tokens: u32) -> Self {
+        Self {
+            request_tokens,
+            mean_prefill_tokens: DEFAULT_MEAN_PREFILL_TOKENS,
+            credits: Credits::default(),
+        }
+    }
+
+    /// Dispatches no report reflects yet on one rank of `worker`.
+    pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
+        self.credits.held_at(worker, dp_rank)
+    }
+
+    /// The resident work of a candidate whose report counts resident tokens,
+    /// with its since-report credit.
+    fn reported_cost(
+        &self,
+        c: &Candidate,
+        r: LoadRow,
+        credit_tokens: u64,
+        credit_requests: u64,
+    ) -> f32 {
+        let reported = u64::from(r.running) + u64::from(r.queued);
+        let unaccounted = u64::from(c.in_flight).saturating_sub(reported + credit_requests);
+        let resident = r.resident_tokens as f32;
+        let mean_context = if reported > 0 {
+            resident / reported as f32
+        } else {
+            self.mean_prefill_tokens as f32
+        };
+        let requests = reported + credit_requests + unaccounted;
+        resident
+            + credit_tokens as f32
+            + unaccounted as f32 * mean_context
+            + self.request_tokens as f32 * requests as f32
+    }
+}
+
+impl Lifecycle for ResidentWork {
+    fn on_dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        self.credits
+            .dispatched(lease, target, side, since_decision_micros);
+    }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        self.credits.membership(change);
+    }
+}
+
+impl Scorer for ResidentWork {
+    fn name(&self) -> &'static str {
+        "resident-work"
+    }
+
+    fn score(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        // One load of the tally, as the least-load scorer reads it: a row
+        // that counts resident tokens is costed with its credit, any other
+        // is marked and costed after the reporting peers' baseline is known.
+        let mut reporting = 0usize;
+        {
+            let tally = self.credits.tally.load();
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                let c = &candidates[i as usize];
+                *slot = match c.load.filter(|r| r.resident_counted) {
+                    Some(r) => {
+                        let (tokens, requests) =
+                            tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                                since.credit_through(c.load_sampled_at_micros)
+                            });
+                        reporting += 1;
+                        self.reported_cost(c, r, tokens, requests)
+                    }
+                    None => PENDING,
+                };
+            }
+        }
+        let fleet_reports = reporting > 0;
+        let peer_baseline = if fleet_reports && reporting < kept.len() {
+            out.iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            if *slot == PENDING {
+                let in_flight = candidates[i as usize].in_flight as f32;
+                *slot = if fleet_reports {
+                    peer_baseline + in_flight * in_flight_work
+                } else {
+                    in_flight
+                };
+            }
+        }
+        // The least-load scorer's band, on a score in tokens: equal work is
+        // a tie, drawn by the picker.
         let span = normalize_costs(out);
         if span > 0.0 {
             TieBand((TIE_EPSILON_SECS / span).min(1.0))
@@ -1861,6 +2056,286 @@ mod tests {
             "a cold worker took {} of a thousand",
             hits.iter().max().unwrap_or(&0)
         );
+    }
+
+    /// A report that counts resident tokens.
+    fn resident(running: u32, resident_tokens: u32) -> LoadRow {
+        LoadRow {
+            running,
+            resident_tokens,
+            resident_counted: true,
+            ..LoadRow::default()
+        }
+    }
+
+    /// A report of an engine that does not count them.
+    fn uncounted(running: u32) -> LoadRow {
+        LoadRow {
+            running,
+            ..LoadRow::default()
+        }
+    }
+
+    fn resident_scores<const N: usize>(scorer: &ResidentWork, pool: &[Candidate; N]) -> [f32; N] {
+        let mut scores = [0.0f32; N];
+        scorer.score(&RequestFacts::default(), pool, &kept(N as u32), &mut scores);
+        scores
+    }
+
+    /// The request's price is part of the comparison: a worker holding fewer
+    /// tokens over more requests loses once a request is priced high enough.
+    #[test]
+    fn resident_work_is_the_resident_tokens_plus_the_request_price_of_every_request_held() {
+        let mut pool = [candidate(0, 2), candidate(1, 1)];
+        pool[0].load = Some(resident(2, 6_000));
+        pool[1].load = Some(resident(1, 9_000));
+        let cheap = ResidentWork::new(1_000);
+        assert_eq!(
+            cheap.reported_cost(&pool[0], resident(2, 6_000), 0, 0),
+            8_000.0
+        );
+        assert_eq!(
+            cheap.reported_cost(&pool[1], resident(1, 9_000), 0, 0),
+            10_000.0
+        );
+        assert_eq!(resident_scores(&cheap, &pool), [1.0, 0.0]);
+        let dear = ResidentWork::new(4_000);
+        assert_eq!(
+            resident_scores(&dear, &pool),
+            [0.0, 1.0],
+            "14,000 against 13,000"
+        );
+        // A queued request is held as a running one is.
+        let queued = LoadRow {
+            queued: 1,
+            ..resident(1, 6_000)
+        };
+        assert_eq!(cheap.reported_cost(&pool[0], queued, 0, 0), 8_000.0);
+    }
+
+    /// A dispatch the report does not reflect yet adds its prompt and one
+    /// request's price; a report sampled after it releases both.
+    #[test]
+    fn resident_work_credits_a_dispatch_until_a_report_reflects_it() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 2_000));
+        pool[0].load_sampled_at_micros = 1_000;
+        pool[1].load = Some(resident(1, 4_000));
+        pool[1].load_sampled_at_micros = 1_000;
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0]);
+
+        let lease = Lease {
+            issued_micros: 2_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        assert_eq!(rw.held_at(pool[0].id, 0), 1);
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            [0.0, 1.0],
+            "2,000 + 1,500 + 1,000 for each of two requests, against 5,000"
+        );
+
+        pool[0].load_sampled_at_micros = 3_000;
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0]);
+        assert_eq!(rw.held_at(pool[0].id, 0), 0);
+
+        // A removed worker leaves no credit behind.
+        rw.on_dispatched(&lease, &target_of(&pool[1]), Side::Single, 0);
+        rw.on_membership(&Membership::Removed(pool[1].id));
+        assert_eq!(rw.held_at(pool[1].id, 0), 0);
+    }
+
+    /// A credit is its rank's: a dispatch to rank 1 of a worker prices that
+    /// rank's row and leaves rank 0's alone.
+    #[test]
+    fn a_dispatch_is_credited_to_the_rank_it_went_to() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[1].id = pool[0].id;
+        pool[1].dp_rank = 1;
+        for c in &mut pool {
+            c.load = Some(resident(1, 2_000));
+            c.load_sampled_at_micros = 1_000;
+        }
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 1.0]);
+
+        let lease = Lease {
+            issued_micros: 2_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&lease, &target_of(&pool[1]), Side::Single, 0);
+        assert_eq!(
+            (rw.held_at(pool[0].id, 0), rw.held_at(pool[0].id, 1)),
+            (0, 1)
+        );
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            [1.0, 0.0],
+            "3,000 on rank 0 against 2,000 + 1,500 + 1,000 for each of two requests on rank 1"
+        );
+    }
+
+    /// The mean context is the resident tokens over the requests the report
+    /// holds, the queued with the running: 8,000 tokens over two running and
+    /// two queued price the one request in transit at 2,000.
+    #[test]
+    fn the_mean_context_counts_the_queued_requests_with_the_running() {
+        let rw = ResidentWork::new(1_000);
+        let busy = candidate(0, 5);
+        let row = LoadRow {
+            queued: 2,
+            ..resident(2, 8_000)
+        };
+        assert_eq!(
+            rw.reported_cost(&busy, row, 0, 0),
+            8_000.0 + 2_000.0 + 5.0 * 1_000.0
+        );
+    }
+
+    /// The band is the scorer's own, on its score in tokens, and not the
+    /// plain band of a normalized score: with one worker two million tokens
+    /// behind, two workers a token apart are still not a tie.
+    #[test]
+    fn a_token_apart_is_not_a_tie_under_a_wide_spread() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 1), candidate(2, 1)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(resident(1, 5_001));
+        pool[2].load = Some(resident(1, 2_005_000));
+        let mut scores = [0.0f32; 3];
+        let band = rw.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert!(scores[0] - scores[1] > band.0, "{scores:?} {band:?}");
+        for seed in 0..300u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            Best.pick(&facts, &pool, &kept(3), &scores, band, &mut out);
+            assert_eq!(out.first().map(|t| t.position), Some(0), "seed {seed}");
+        }
+    }
+
+    /// The requests the host holds beyond the report and the credit are in
+    /// transit: each is priced at the worker's mean context and at the
+    /// request price; a worker that reports nothing held prices them at the
+    /// mean prefill.
+    #[test]
+    fn resident_work_prices_the_requests_in_transit_at_the_workers_mean_context() {
+        let rw = ResidentWork::new(1_000);
+        let busy = candidate(0, 5);
+        // Two reported requests hold 8,000 tokens, a mean context of 4,000;
+        // three more are in transit.
+        assert_eq!(
+            rw.reported_cost(&busy, resident(2, 8_000), 0, 0),
+            8_000.0 + 3.0 * 4_000.0 + 5.0 * 1_000.0
+        );
+        // One of the three is a credited dispatch of 1,500 tokens.
+        assert_eq!(
+            rw.reported_cost(&busy, resident(2, 8_000), 1_500, 1),
+            8_000.0 + 1_500.0 + 2.0 * 4_000.0 + 5.0 * 1_000.0
+        );
+        let idle = candidate(1, 2);
+        assert_eq!(
+            rw.reported_cost(&idle, resident(0, 0), 0, 0),
+            2.0 * DEFAULT_MEAN_PREFILL_TOKENS as f32 + 2.0 * 1_000.0
+        );
+    }
+
+    /// A worker whose report does not count resident tokens, or that has no
+    /// report, starts from the best reporting peer and adds its in-flight
+    /// requests, each at the mean prefill and the request price.
+    #[test]
+    fn a_worker_without_resident_tokens_scores_from_the_best_reporting_peer() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 2), candidate(2, 0)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(uncounted(2));
+        // 6,000; 6,000 + 2 * 2,024; and the unreported idle worker at 6,000.
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0, 1.0]);
+    }
+
+    /// The peer it starts from is the best one, not the worst, and each of
+    /// its requests in flight costs the mean prefill and the request price:
+    /// between a peer at 6,000 and a peer at 14,096, two requests in flight
+    /// put it at 6,000 + 2 * 2,024, the exact middle.
+    #[test]
+    fn a_worker_without_resident_tokens_is_priced_between_two_reporting_peers() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 2), candidate(2, 1)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(uncounted(2));
+        pool[2].load = Some(resident(1, 13_096));
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 3), candidate(1, 1), candidate(2, 2)];
+        pool[0].load = Some(uncounted(3));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0, 0.5]);
+    }
+
+    /// In a fleet whose engines do not count resident tokens, a report that
+    /// reads idle is no reporting peer: the in-flight count decides, and the
+    /// worker the host holds thirty requests on does not take the next one.
+    #[test]
+    fn an_idle_report_without_the_count_makes_no_reporting_peer() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 30), candidate(1, 1)];
+        pool[0].load = Some(uncounted(0));
+        pool[1].load = Some(uncounted(1));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0]);
+    }
+
+    /// A count of zero and no count are two reports. The idle worker of an
+    /// engine that counts resident tokens scores least, and so does one
+    /// whose running request has nothing resident yet; the idle worker of an
+    /// engine that does not count them ties with the best reporting peer.
+    #[test]
+    fn a_count_of_zero_is_not_a_report_without_the_count() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(resident(0, 0));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0]);
+        pool[1].load = Some(uncounted(0));
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 1.0]);
+        pool[1] = candidate(1, 1);
+        pool[1].load = Some(resident(1, 0));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0]);
+    }
+
+    /// Equal work is one tie, and a token apart is not: the band is the
+    /// least-load scorer's, on a score in tokens.
+    #[test]
+    fn equal_resident_work_ties_and_a_token_apart_does_not() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 1), candidate(2, 1)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(resident(1, 5_000));
+        pool[2].load = Some(resident(1, 5_001));
+        let mut scores = [0.0f32; 3];
+        let band = rw.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert_eq!(scores, [1.0, 1.0, 0.0]);
+        assert!(band.0 < 1.0, "{band:?}");
+        let mut picks = [0usize; 3];
+        for seed in 0..300u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            Best.pick(&facts, &pool, &kept(3), &scores, band, &mut out);
+            picks[out.first().map(|t| t.position).unwrap_or(0) as usize] += 1;
+        }
+        assert!(picks[0] > 100 && picks[1] > 100, "{picks:?}");
+        assert_eq!(picks[2], 0, "{picks:?}");
     }
 
     #[test]
