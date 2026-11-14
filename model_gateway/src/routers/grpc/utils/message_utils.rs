@@ -201,10 +201,14 @@ fn process_messages_prompt(
     // Step 6: Apply chat template. The template learns the tool choice the
     // way the chat path tells it (the chat value under the same kwarg): a
     // renderer that declares the tools under `none` writes its instruction
-    // not to call them from this key. The effort rides under the chat
-    // path's `reasoning_effort` kwarg as well.
+    // not to call them from this key; a renderer that never reads the key
+    // is not handed it. The effort rides under the chat path's
+    // `reasoning_effort` kwarg as well.
     let mut kwargs = HashMap::with_capacity(2);
-    if let Some(tool_choice) = request.tool_choice {
+    if let Some(tool_choice) = request
+        .tool_choice
+        .filter(|_| tokenizer.template_reads(chat_utils::TOOL_CHOICE_KEY))
+    {
         chat_utils::insert_tool_choice_kwarg(&mut kwargs, &ChatToolChoice::from(tool_choice));
     }
     if let Some(effort) = request.reasoning_effort {
@@ -1221,7 +1225,7 @@ mod tests {
                 InputContentBlock::Image(messages::ImageBlock {
                     source: messages::ImageSource::Base64 {
                         media_type: "image/png".to_string(),
-                        data: "AAAA".to_string(),
+                        data: "AAAA".to_string().into(),
                     },
                     cache_control: None,
                 }),
@@ -1533,7 +1537,7 @@ mod tests {
                         messages::ToolResultContentBlock::Image(messages::ImageBlock {
                             source: messages::ImageSource::Base64 {
                                 media_type: "image/png".to_string(),
-                                data: "AAAA".to_string(),
+                                data: "AAAA".to_string().into(),
                             },
                             cache_control: None,
                         }),
@@ -1687,7 +1691,7 @@ mod tests {
                 content: vec![InputContentBlock::Image(messages::ImageBlock {
                     source: messages::ImageSource::Base64 {
                         media_type: "image/png".to_string(),
-                        data: "AAAA".to_string(),
+                        data: "AAAA".to_string().into(),
                     },
                     cache_control: None,
                 })],

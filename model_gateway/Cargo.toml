@@ -105,7 +105,7 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
-smg-policy-controller.workspace = true
+smg-policy-controller = { workspace = true, features = ["ingest"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -306,3 +306,8 @@ workspace = true
 [target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }
+
+[[bench]]
+name = "policy_decider"
+harness = false
+path = "benches/policy_decider.rs"

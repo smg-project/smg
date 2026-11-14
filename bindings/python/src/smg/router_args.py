@@ -514,6 +514,9 @@ class RouterArgs:
     multimodal_tensor_transport: str | None = None
     oracle_connect_descriptor: str | None = None
     oracle_external_auth: bool = False
+    # The bound on one Oracle history-store call (pool wait, connect and the
+    # operation included), the same key as the Postgres and Redis ones
+    oracle_op_timeout_secs: int = 5
     oracle_password: str | None = None
     oracle_pool_max: int = 16
     oracle_pool_min: int = 1
@@ -2841,6 +2844,13 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
+        oracle_group.add_argument(
+            f"--{prefix}oracle-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("ATP_OP_TIMEOUT_SECS", RouterArgs.oracle_op_timeout_secs)),
+            help="Bound in seconds on each call to the Oracle store (pool wait, connect and the statement); "
+            "a call past it is answered 503 storage_unavailable (default: 5, env: ATP_OP_TIMEOUT_SECS)",
         )
 
         # Postgres configuration

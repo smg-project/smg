@@ -333,10 +333,13 @@ impl RerankResponse {
 /// `return_documents`. A body without `model` is routed as the unknown
 /// model, to any worker, the shape a single-model server's client sends;
 /// the native `/rerank` route takes [`RerankRequest`], whose `model` is
-/// required.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// required. `query` and `documents` are refused empty, by the rules of the
+/// native route; `top_n` has no bound, because 0 means all of them here.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 pub struct V1RerankReqInput {
+    #[validate(custom(function = "validate_query"))]
     pub query: String,
+    #[validate(custom(function = "validate_documents"))]
     pub documents: Vec<String>,
 
     /// The model to rerank with, which selects the worker.
@@ -361,6 +364,8 @@ pub struct V1RerankReqInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
+
+impl super::validated::Normalizable for V1RerankReqInput {}
 
 /// Convert V1RerankReqInput to RerankRequest
 impl From<V1RerankReqInput> for RerankRequest {

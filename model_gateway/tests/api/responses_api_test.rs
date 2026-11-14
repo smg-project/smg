@@ -3600,3 +3600,109 @@ async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
     assert!(event["param"].is_null(), "{body}");
     mcp.stop().await;
 }
+
+/// The Conversations routes refuse a body the way the typed routes do: in
+/// the gateway's envelope with a code, not with the framework's text/plain
+/// answer.
+mod conversation_body_refusals {
+    use axum::{
+        body::Body,
+        http::{header::CONTENT_TYPE, Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use crate::common::{
+        mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+        AppTestContext,
+    };
+
+    /// The status, the content type and the body of `body` posted to `path`
+    /// under `content_type` (no header when `None`); a body that is not JSON
+    /// is kept under `not_json`, so an assertion names it. A request that
+    /// cannot be built or a body that cannot be read is the caller's error.
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<(StatusCode, String, serde_json::Value), Box<dyn std::error::Error>> {
+        let mut req = Request::builder().method("POST").uri(path);
+        if let Some(content_type) = content_type {
+            req = req.header(CONTENT_TYPE, content_type);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_vec()))?)
+            .await?;
+        let status = resp.status();
+        let response_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let answer = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({"not_json": String::from_utf8_lossy(&bytes)}));
+        Ok((status, response_type, answer))
+    }
+
+    /// Create, update and create-items each refuse a truncated object, an
+    /// empty body, a body that is not UTF-8 and a body under another or no
+    /// content type with 400 in the envelope: `invalid_json` for a body that
+    /// does not parse, `json_parse_error` for the content type, the codes
+    /// the typed routes carry.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_malformed_body_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18131,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let cases: [(Option<&str>, &[u8], &str); 5] = [
+            (Some("application/json"), br#"{"metadata":"#, "invalid_json"),
+            (Some("application/json"), b"", "invalid_json"),
+            (
+                Some("application/json"),
+                b"{\"metadata\":\"\xff\"}",
+                "invalid_json",
+            ),
+            (None, br#"{"metadata":{}}"#, "json_parse_error"),
+            (
+                Some("text/plain"),
+                br#"{"metadata":{}}"#,
+                "json_parse_error",
+            ),
+        ];
+        for path in [
+            "/v1/conversations",
+            "/v1/conversations/conv_missing",
+            "/v1/conversations/conv_missing/items",
+        ] {
+            for (content_type, body, code) in cases.iter().copied() {
+                let case = format!(
+                    "{path} {content_type:?} {:?}",
+                    String::from_utf8_lossy(body)
+                );
+                let (status, response_type, answer) = post(&app, path, content_type, body)
+                    .await
+                    .expect("an answer from the route");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+                assert!(
+                    response_type.starts_with("application/json"),
+                    "{case}: {response_type} {answer}"
+                );
+                assert_eq!(
+                    answer["error"]["type"], "invalid_request_error",
+                    "{case}: {answer}"
+                );
+                assert_eq!(answer["error"]["code"], code, "{case}: {answer}");
+            }
+        }
+        ctx.shutdown().await;
+    }
+}

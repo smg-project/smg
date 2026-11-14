@@ -139,6 +139,8 @@ message GenerateRequest {
 }
 
 // Tokenized input from router
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   // Original text (for debugging/logging only, not used for generation)
   string original_text = 1;

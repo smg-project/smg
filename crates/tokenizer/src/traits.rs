@@ -82,6 +82,31 @@ pub struct RendererCapabilities {
     /// message is forwarded in place, for the templates that render a
     /// system turn anywhere.
     pub leading_system_only: bool,
+    /// JSON constraints require reasoning outside the response body.
+    pub json_requires_separate_reasoning: bool,
+    /// JSON constraints start at an empty assistant body, not a partial value.
+    pub json_requires_empty_assistant_prefix: bool,
+}
+
+impl RendererCapabilities {
+    /// Validate reasoning separation and the optional continued assistant text
+    /// for a JSON response. Return an error for an unsupported combination.
+    pub fn validate_json_response(
+        self,
+        separate_reasoning: bool,
+        assistant_prefix: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.json_requires_separate_reasoning || separate_reasoning,
+            "JSON response formats require separate_reasoning=true"
+        );
+        anyhow::ensure!(
+            !self.json_requires_empty_assistant_prefix
+                || assistant_prefix.is_none_or(str::is_empty),
+            "JSON response formats cannot continue a nonempty assistant message"
+        );
+        Ok(())
+    }
 }
 
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
@@ -543,6 +568,14 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()
+    }
+
+    /// Whether the renderer reads the template kwarg `name`. The gateway hands
+    /// a request's controls to the template as kwargs (`tool_choice`,
+    /// `response_format`) and leaves out one the renderer never reads: it
+    /// could not reach the prompt. `true` where the answer is not known.
+    fn template_reads(&self, _name: &str) -> bool {
+        true
     }
 
     /// The thinking mode this tokenizer's renderer renders for the template

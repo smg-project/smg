@@ -25,7 +25,8 @@ anyhow.workspace = true
 blake3.workspace = true
 dashmap.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+# Native tool arguments must preserve the reference's parsed f64 values.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
 tracing.workspace = true
