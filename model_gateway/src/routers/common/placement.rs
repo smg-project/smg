@@ -5572,6 +5572,89 @@ mod tests {
         );
     }
 
+    /// A request of unknown prompt size is booked at the mean of the pricing
+    /// profile the document's bindings resolve, whatever that profile is
+    /// called and whichever models it is bound to. Between two load reports
+    /// only the bookings tell equal workers apart, so forty such placements
+    /// split evenly under a load-pricing profile, as they do under the
+    /// flags; booked at nothing they leave the workers tied and the draw
+    /// splits them. The documents: the `least_load` preset (the best of four
+    /// workers, ten each); the `power_of_two` preset (two draws compared, so
+    /// its pool is the two workers every draw covers, twenty each);
+    /// `least_load` bound to the model's pattern with every model on
+    /// `round_robin`; the same with no every-model binding.
+    #[test]
+    fn a_document_books_an_unknown_prompt_size_at_its_bound_profiles_mean() {
+        use smg_policy_controller::spec::PolicySpec;
+
+        let four = ["http://h:1", "http://h:2", "http://h:3", "http://h:4"];
+        let preset = |name: &str| PolicySpec::preset(name).expect("a preset document");
+        let on_the_pattern = |every_model: Option<&str>| {
+            let mut spec = preset("least_load");
+            spec.bindings[0].matcher.model = format!("{MODEL}*");
+            if let Some(name) = every_model {
+                let rest = preset(name);
+                spec.profiles.extend(rest.profiles);
+                spec.bindings.extend(rest.bindings);
+            }
+            spec
+        };
+        let documents: [(&str, PolicySpec, &[&str]); 4] = [
+            ("the least_load preset", preset("least_load"), &four),
+            (
+                "the power_of_two preset",
+                preset("power_of_two"),
+                &four[..2],
+            ),
+            (
+                "a pattern on least_load, every model on round_robin",
+                on_the_pattern(Some("round_robin")),
+                &four,
+            ),
+            ("a pattern on least_load alone", on_the_pattern(None), &four),
+        ];
+        let seen: Vec<(&str, Vec<usize>, u32)> = documents
+            .iter()
+            .map(|(document, spec, urls)| {
+                let policies = PolicyRegistry::with_override(
+                    PolicyConfig::Random,
+                    RoutingKeyOverrideConfig::default(),
+                )
+                .with_policy_spec(spec)
+                .expect("the document is applied");
+                let decider = policies.decider().expect("the engine");
+                let registry = http_registry(urls);
+                let feed = TestFeed::attached_to(policies.get_policy_or_default(MODEL).as_ref());
+                decider.set_load_receiver(Some(feed.receiver()));
+                feed.publish(
+                    &urls
+                        .iter()
+                        .map(|url| ((*url).to_string(), one_rank_load(0, 0.1, 2000.0)))
+                        .collect::<HashMap<_, _>>(),
+                );
+                let mut placed: BTreeMap<String, usize> = BTreeMap::new();
+                for _ in 0..40 {
+                    let selected = pick(&registry, &policies, PlacementInputs::default());
+                    selected.increment_load();
+                    *placed.entry(selected.url().to_string()).or_default() += 1;
+                }
+                let shares: Vec<usize> = urls
+                    .iter()
+                    .map(|url| placed.get(*url).copied().unwrap_or(0))
+                    .collect();
+                (*document, shares, decider.prompt_tokens(None))
+            })
+            .collect();
+        let wanted: Vec<(&str, Vec<usize>, u32)> = documents
+            .iter()
+            .map(|(document, _, urls)| (*document, vec![40 / urls.len(); urls.len()], 1024))
+            .collect();
+        assert_eq!(
+            seen, wanted,
+            "forty placements of unknown size between two load reports, and the mean booked"
+        );
+    }
+
     /// Under the switch a keyed request is a session of the engine's default
     /// binding, pinned to its owner by the sticky routing-key override's
     /// rule, while an unkeyed one rotates through the engine.

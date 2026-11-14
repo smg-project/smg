@@ -119,6 +119,15 @@ pub enum EngineHostError {
         stage: &'static str,
         need: &'static str,
     },
+    /// Profiles of one document that price a request of unknown size at
+    /// different means; the host books one mean per side on this release.
+    #[error("the document's profiles {first:?} and {second:?} price a request of unknown size differently ({first_mean} and {second_mean} tokens); one mean per gateway on this release")]
+    Means {
+        first: String,
+        first_mean: u32,
+        second: String,
+        second_mean: u32,
+    },
     #[error(transparent)]
     Spec(#[from] SpecError),
 }
@@ -255,6 +264,51 @@ fn mean_prefill_of(profile: &ProfileSpec) -> u32 {
             ScoreSpec::Params(_) => None,
         })
         .unwrap_or(0)
+}
+
+/// What a model pattern's star stands for when the engine is asked which
+/// profile a binding's models resolve: a text no binding's exact id holds,
+/// so the model asked for matches the pattern and no id listed beside it.
+const SOME_TEXT: &str = "\u{0}";
+
+/// The mean prefill a request of unknown size is booked at for `phase`: the
+/// one mean of the profiles that price tokens among those the document's
+/// bindings resolve for the phase. Each binding is asked of the engine, for
+/// a model its pattern matches (and every model once, for a document
+/// without bindings), so the bindings' order and a plan's sides are the
+/// engine's own and a document is never read by a profile's name. One mean
+/// per side on this release: a profile that prices no tokens takes any, and
+/// two pricing profiles of different means refuse the document by both
+/// names, as bindings that disagree on their session headers do.
+fn bound_mean(engine: &Engine, spec: &PolicySpec, phase: Phase) -> Result<u32, EngineHostError> {
+    let mut agreed: Option<(&str, u32)> = None;
+    let patterns = spec
+        .bindings
+        .iter()
+        .map(|binding| binding.matcher.model.as_str());
+    for pattern in patterns.chain(["*"]) {
+        let model = pattern.replace('*', SOME_TEXT);
+        let Some((_, profile)) = engine.profile_for(&model, phase) else {
+            continue;
+        };
+        let mean = spec.profiles.get(&profile.name).map_or(0, mean_prefill_of);
+        if mean == 0 {
+            continue;
+        }
+        match agreed {
+            None => agreed = Some((profile.name.as_str(), mean)),
+            Some((_, first_mean)) if first_mean == mean => {}
+            Some((first, first_mean)) => {
+                return Err(EngineHostError::Means {
+                    first: first.to_string(),
+                    first_mean,
+                    second: profile.name.clone(),
+                    second_mean: mean,
+                });
+            }
+        }
+    }
+    Ok(agreed.map_or(0, |(_, mean)| mean))
 }
 
 /// Carry a configuration's tunables into its preset profile (see
@@ -674,9 +728,9 @@ pub struct Decider {
     origin: Instant,
     seq: AtomicU64,
     /// The token-work a request of unknown size is booked at: the mean
-    /// prefill of the default profile's least-load scorer when it has one
-    /// (`least_load`'s setting, the scorer's default under `power_of_two`),
-    /// nothing otherwise.
+    /// prefill of the least-load scorer of the profiles the regular bindings
+    /// resolve, when one has it (`least_load`'s setting, the scorer's
+    /// default under `power_of_two`), nothing otherwise ([`bound_mean`]).
     mean_prompt_tokens: u32,
     /// What the engine's stages read, from its needs at the build: the two
     /// per-key counts are map reads per row, so a row carries them only when
@@ -686,11 +740,11 @@ pub struct Decider {
     /// items of an encode-prefill-decode request.
     encode: bool,
     /// The token-work a pair's request of unknown size is booked at on the
-    /// prefill side: the prefill profile's mean, as the prefill policy
-    /// prices it.
+    /// prefill side: the mean of the profile the pair's binding names for
+    /// that side, as the prefill policy prices it.
     mean_prefill_prompt_tokens: u32,
-    /// The same on the decode side: the decode profile's mean, as the
-    /// decode policy prices it.
+    /// The same on the decode side: the mean of the profile the pair's
+    /// binding names for the decode, as the decode policy prices it.
     mean_decode_prompt_tokens: u32,
 }
 
@@ -795,12 +849,19 @@ impl Decider {
     }
 
     /// The engine for a document: `spec` validated and hosted. A request of
-    /// unknown prompt size is booked at the mean prefill of the profile
-    /// named `default` when it prices tokens, nothing otherwise.
+    /// unknown prompt size is booked at the mean prefill of the profiles its
+    /// side's bindings resolve that price tokens, nothing when none does:
+    /// the regular lease, a pair's prefill side and its decode side each
+    /// read theirs through the document's bindings, never by a profile's
+    /// name. One mean per side: a document whose pricing profiles of one
+    /// side differ in their means is refused by both names (`bound_mean`).
     pub fn from_spec(spec: &PolicySpec) -> Result<Self, EngineHostError> {
         let engine = spec.validate()?;
         Ok(Self {
             needs: engine.needs(),
+            mean_prompt_tokens: bound_mean(&engine, spec, Phase::Single)?,
+            mean_prefill_prompt_tokens: bound_mean(&engine, spec, Phase::Prefill)?,
+            mean_decode_prompt_tokens: bound_mean(&engine, spec, Phase::Decode)?,
             engine,
             loads: RwLock::new(None),
             retired: Mutex::new(Retired::default()),
@@ -809,10 +870,7 @@ impl Decider {
             stores: RwLock::new(None),
             origin: Instant::now(),
             seq: AtomicU64::new(1),
-            mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
             encode: spec.bindings.iter().any(|b| b.plan == Some(PlanName::Epd)),
-            mean_prefill_prompt_tokens: spec.profiles.get("prefill").map_or(0, mean_prefill_of),
-            mean_decode_prompt_tokens: spec.profiles.get("decode").map_or(0, mean_prefill_of),
         })
     }
 
@@ -2767,6 +2825,128 @@ mod tests {
         );
         assert_eq!(decider(&PolicyConfig::RoundRobin).prompt_tokens(None), 0);
     }
+
+    /// A document is read through its bindings, never by a profile's name: a
+    /// request of unknown size is booked at the mean of the pricing profile
+    /// its bindings resolve, whatever that profile is called and whichever
+    /// models it is bound to, and a profile named `default` that no binding
+    /// names prices nothing. One mean per side: one pricing profile bound
+    /// several times is one mean, a binding on a profile that prices nothing
+    /// takes it, and two pricing profiles of different means are refused by
+    /// both names.
+    #[test]
+    fn an_unknown_prompt_size_is_priced_by_the_bound_profile_whatever_its_name() {
+        let least_load = |mean_prefill_tokens| PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens,
+            default_throughput: 1000.0,
+        };
+        let named = |name: &str| {
+            let mut spec = PolicySpec::preset("least_load").expect("a preset document");
+            let mut profile = spec.profiles.remove("least_load").expect("its profile");
+            tune(&mut profile, &least_load(100));
+            spec.profiles.insert(name.to_string(), profile);
+            spec.bindings[0].profile = Some(name.to_string());
+            spec
+        };
+        for name in ["default", "least_load", "anything"] {
+            let decider = Decider::from_spec(&named(name)).expect("the document's engine");
+            assert_eq!(decider.prompt_tokens(None), 100, "{name}");
+            assert_eq!(decider.prompt_tokens(Some(&[1, 2, 3])), 3, "{name}");
+        }
+
+        let mut beside = named("bound");
+        beside.profiles.insert(
+            "default".to_string(),
+            profile_of(&least_load(7)).expect("a profile"),
+        );
+        let decider = Decider::from_spec(&beside).expect("the document's engine");
+        assert_eq!(
+            decider.prompt_tokens(None),
+            100,
+            "the binding's profile prices the request, not the one named default"
+        );
+
+        // Two bindings that name a model, one exact id and one glob prefix,
+        // stand before the every-model one: `models` is their profile,
+        // `every_model` the last binding's.
+        let bound_before = |models: &str, every_model: &str| {
+            let mut spec = named("bound");
+            spec.profiles.insert(
+                "other".to_string(),
+                profile_of(&least_load(7)).expect("a profile"),
+            );
+            spec.profiles.insert(
+                "rotation".to_string(),
+                profile_of(&PolicyConfig::RoundRobin).expect("a profile"),
+            );
+            let mut last = spec.bindings.remove(0);
+            for model in ["model-a", "model-*"] {
+                let mut named_model = last.clone();
+                named_model.matcher.model = model.to_string();
+                named_model.profile = Some(models.to_string());
+                spec.bindings.push(named_model);
+            }
+            last.profile = Some(every_model.to_string());
+            spec.bindings.push(last);
+            Decider::from_spec(&spec)
+        };
+        for (models, every_model, bound) in [
+            ("bound", "bound", "one pricing profile bound three times"),
+            (
+                "bound",
+                "rotation",
+                "every model on a profile that prices nothing",
+            ),
+            (
+                "rotation",
+                "bound",
+                "the named models on a profile that prices nothing",
+            ),
+        ] {
+            let decider = bound_before(models, every_model).expect("the document's engine");
+            assert_eq!(decider.prompt_tokens(None), 100, "{bound}");
+        }
+        let refused = bound_before("other", "bound")
+            .map(drop)
+            .expect_err("two pricing profiles of different means");
+        assert_eq!(
+            refused.to_string(),
+            "the document's profiles \"other\" and \"bound\" price a request of unknown size differently (7 and 100 tokens); one mean per gateway on this release"
+        );
+    }
+
+    /// A pair document's sides the same way: each side's request of unknown
+    /// size is booked at the mean of the profile the pair's binding names for
+    /// it, whatever the sides are called; the pair plan has no side for a
+    /// regular request, which books nothing.
+    #[test]
+    fn a_pairs_unknown_prompt_size_is_priced_by_each_bound_side_whatever_its_name() {
+        let mut spec =
+            PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
+        for (side, name, mean_prefill_tokens) in
+            [("prefill", "front", 100), ("decode", "back", 200)]
+        {
+            let mut profile = spec.profiles.remove(side).expect("the side's profile");
+            tune(
+                &mut profile,
+                &PolicyConfig::LeastLoad {
+                    kv_pressure_weight: 0.0,
+                    mean_prefill_tokens,
+                    default_throughput: 1000.0,
+                },
+            );
+            spec.profiles.insert(name.to_string(), profile);
+            spec.bindings[0]
+                .profiles
+                .insert(side.to_string(), name.to_string());
+        }
+        let decider = Decider::from_spec(&spec).expect("the document's engine");
+        assert_eq!(decider.prefill_prompt_tokens(None), 100);
+        assert_eq!(decider.decode_prompt_tokens(None), 200);
+        assert_eq!(decider.prompt_tokens(None), 0);
+    }
+
     /// A commit under a lease decided before the worker's retirement books
     /// nothing on it, whether the worker was removed or replaced at its URL:
     /// the rows the retirement pruned do not come back through the late
