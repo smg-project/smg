@@ -30,6 +30,8 @@
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - `test_support` (test builds only) — the fast retry policy the HTTP
 //!   and gRPC routers' tests retry under
+//! - `bench_support` (test builds and the `test-util` feature) — the pair
+//!   selection over a registered fleet, for a benchmark of the pair path
 //! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
@@ -200,6 +202,78 @@ pub(crate) fn attach_sized_body(
         )))
     } else {
         builder.body(body)
+    }
+}
+
+/// What a benchmark needs of the pair path: the default pair selection over
+/// one model's registered prefill-decode fleet, as a router runs it for a
+/// request.
+#[cfg(any(test, feature = "test-util"))]
+pub mod bench_support {
+    use std::sync::Arc;
+
+    use super::placement::{select_pair, PlacementInputs};
+    use crate::{
+        observability::cache_trace,
+        policies::PolicyRegistry,
+        worker::{PdPairIndex, PdWire, Worker, WorkerRegistry},
+    };
+
+    /// One model's fleet, its policies and its pair index over the gRPC wire.
+    pub struct PairPath {
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        model: String,
+        pairs: Arc<PdPairIndex>,
+    }
+
+    impl PairPath {
+        /// The pair index of `model` over the workers `registry` holds now.
+        pub fn new(
+            registry: Arc<WorkerRegistry>,
+            policies: Arc<PolicyRegistry>,
+            model: &str,
+        ) -> Self {
+            let pairs = registry
+                .get_routing_snapshot(model)
+                .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+            Self {
+                registry,
+                policies,
+                model: model.to_string(),
+                pairs,
+            }
+        }
+
+        /// One placement of a request carrying `tokens`, with no admission
+        /// window: the prefill and the decode paired with it. With `traced`
+        /// it runs inside a cache-trace capture, as a request that asked for
+        /// its decision record does.
+        pub async fn place(
+            &self,
+            tokens: Option<&[u32]>,
+            traced: bool,
+        ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+            cache_trace::scope(traced, async {
+                let inputs = PlacementInputs {
+                    tokens,
+                    ..Default::default()
+                };
+                select_pair(
+                    &self.registry,
+                    &self.policies,
+                    &self.model,
+                    &self.pairs,
+                    None,
+                    true,
+                    None,
+                    inputs,
+                )
+                .ok()
+                .map(|pair| (pair.prefill, pair.decode))
+            })
+            .await
+        }
     }
 }
 

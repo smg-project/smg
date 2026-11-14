@@ -95,7 +95,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Weak,
     },
     time::{Duration, Instant},
 };
@@ -163,8 +163,12 @@ const FLEET_SAMPLE: usize = 16;
 /// that entered the warm-up window is sliced to within this.
 const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 
-/// Pool tables kept at once: one per routing pool the policy sees (a model's
-/// regular pool, the PD roles' pools); past this the oldest goes.
+/// Pool tables kept at once: one per list of workers the policy is handed (a
+/// model's regular pool, a PD role's open pool, each partner list of a PD
+/// fleet) and index it reads; past this the oldest goes. Eight is room for the lists of a
+/// steady fleet while a lookup reads at most eight tables. A pool whose open
+/// set moves between more lists than that inside the refresh period builds a
+/// table for most decisions.
 const POOL_TABLES_KEPT: usize = 8;
 
 /// The floor of the swing-sized absolute margin of the spill gate: with a
@@ -1170,22 +1174,30 @@ struct OverlapCandidate {
     group_cap: Option<(u32, u32)>,
 }
 
-/// One routing pool's workers by their KV index ids, built once per pool
-/// snapshot and refreshed every [`POOL_TABLE_REFRESH_MS`]. The registry hands
-/// the policy the same slice until membership changes, so an overlap lookup's
-/// `index id -> blocks` result maps to slice positions through this table
-/// instead of a string lookup per healthy worker per request, and the warm-up
-/// slice reads the workers inside its window from it instead of scanning the
-/// pool on every thin miss.
+/// One list of workers by their ids in one KV index, built once for the pair
+/// and refreshed every [`POOL_TABLE_REFRESH_MS`]. A table answers for a slice
+/// that holds the workers it was built from, the same worker at every
+/// position, wherever the slice lives, and for the index it was built
+/// against, since an index numbers its workers in its own space: the registry
+/// hands the policy one slice until membership changes, a PD placement a
+/// `Vec` it collects per request, and both find the list's one table under
+/// the request's index. An overlap lookup's
+/// `index id -> blocks` result maps to slice positions through it instead of
+/// a string lookup per healthy worker per request, and the warm-up slice
+/// reads the workers inside its window from it instead of scanning the pool
+/// on every thin miss.
 #[derive(Debug)]
 struct PoolTable {
-    /// Address and length of the slice the table was built from.
-    slice: (usize, usize),
     /// Gateway clock at the build, for the refresh.
     built_ms: u64,
-    /// Address of the worker at each position at the build: a pool rebuilt
-    /// at the same address with other workers fails this check per holder.
-    worker_at: Vec<usize>,
+    /// The index the ids below are of, as a weak handle: it keeps no index
+    /// alive, and it keeps the index's allocation, so the address is never
+    /// another index's while the table lives.
+    index: Weak<KvIndex>,
+    /// The worker at each position at the build, as a weak handle: it keeps
+    /// no worker alive, and it keeps the worker's allocation, so an address
+    /// the table holds is never another worker's while the table lives.
+    worker_at: Vec<Weak<dyn Worker>>,
     /// The index id of the worker at each position; `None` while it is not
     /// interned.
     id_at: Vec<Option<u32>>,
@@ -1206,24 +1218,23 @@ struct PoolTable {
 }
 
 impl PoolTable {
-    fn slice_key(workers: &[Arc<dyn Worker>]) -> (usize, usize) {
-        (workers.as_ptr() as usize, workers.len())
-    }
-
-    fn worker_address(worker: &Arc<dyn Worker>) -> usize {
-        Arc::as_ptr(worker).cast::<()>() as usize
+    /// Whether `worker` is the worker the table was built from at `position`.
+    fn holds(&self, position: usize, worker: &Arc<dyn Worker>) -> bool {
+        self.worker_at
+            .get(position)
+            .is_some_and(|kept| std::ptr::addr_eq(kept.as_ptr(), Arc::as_ptr(worker)))
     }
 
     /// One pass over the pool: the string lookup per worker happens here,
     /// once per snapshot and refresh, not per request.
-    fn build(workers: &[Arc<dyn Worker>], indexer: &KvIndex, now_ms: u64) -> Self {
+    fn build(workers: &[Arc<dyn Worker>], indexer: &Arc<KvIndex>, now_ms: u64) -> Self {
         let warmup = liveness::warmup();
         let mut worker_at = Vec::with_capacity(workers.len());
         let mut id_at = Vec::with_capacity(workers.len());
         let mut position_of = HashMap::with_capacity(workers.len());
         let mut sized: Vec<Option<(usize, usize)>> = Vec::with_capacity(workers.len());
         for (position, worker) in workers.iter().enumerate() {
-            worker_at.push(Self::worker_address(worker));
+            worker_at.push(Arc::downgrade(worker));
             let id = indexer.worker_id(worker.url());
             id_at.push(id);
             if let Some(id) = id {
@@ -1274,8 +1285,8 @@ impl PoolTable {
             Vec::new()
         };
         Self {
-            slice: Self::slice_key(workers),
             built_ms: now_ms,
+            index: Arc::downgrade(indexer),
             worker_at,
             id_at,
             position_of,
@@ -1285,9 +1296,18 @@ impl PoolTable {
         }
     }
 
-    /// Whether the table was built from `workers` (the same slice).
-    fn describes(&self, workers: &[Arc<dyn Worker>]) -> bool {
-        self.slice == Self::slice_key(workers)
+    /// Whether the table was built from `workers` against `indexer`: the
+    /// same index, and the same worker at every position, in one pass that
+    /// stops at the first difference. The slice's address says nothing: a
+    /// `Vec` built per request repeats one with another list in it, and
+    /// never repeats across threads.
+    fn describes(&self, workers: &[Arc<dyn Worker>], indexer: &Arc<KvIndex>) -> bool {
+        std::ptr::eq(self.index.as_ptr(), Arc::as_ptr(indexer))
+            && self.worker_at.len() == workers.len()
+            && workers
+                .iter()
+                .enumerate()
+                .all(|(position, worker)| self.holds(position, worker))
     }
 
     /// Whether the table is within its refresh period.
@@ -1296,12 +1316,13 @@ impl PoolTable {
     }
 
     /// The position holding index worker `id`, when the worker there is
-    /// still the one the table was built from.
+    /// the one the table was built from: every position of a slice the
+    /// table describes.
     fn position(&self, id: u32, workers: &[Arc<dyn Worker>]) -> Option<usize> {
         let position = *self.position_of.get(&id)? as usize;
         let same_worker = workers
             .get(position)
-            .is_some_and(|worker| Self::worker_address(worker) == self.worker_at[position]);
+            .is_some_and(|worker| self.holds(position, worker));
         same_worker.then_some(position)
     }
 }
@@ -1622,27 +1643,35 @@ impl CacheAwarePolicy {
             || self.config.overload_token_usage_threshold < 1.0
     }
 
-    /// The pool table for `workers`: the one kept when it is fresh, a stale
-    /// one while another decision rebuilds, else built here and published.
+    /// The pool table for `workers` under `indexer`: the one kept when it is
+    /// fresh, a stale one while another decision rebuilds it, else built here
+    /// and published. Only the rebuild of a stale table takes the building
+    /// flag, and only it gives the flag back: a table built for a list that
+    /// had none leaves a rebuild running beside it its flag.
     fn pool_table(
         &self,
         workers: &[Arc<dyn Worker>],
-        indexer: &KvIndex,
+        indexer: &Arc<KvIndex>,
         now_ms: u64,
     ) -> Arc<PoolTable> {
+        let mut rebuilds = false;
         {
             let tables = self.pool_tables.load();
-            if let Some(table) = tables.iter().find(|table| table.describes(workers)) {
+            if let Some(table) = tables
+                .iter()
+                .find(|table| table.describes(workers, indexer))
+            {
                 if table.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel) {
                     return Arc::clone(table);
                 }
+                rebuilds = true;
             }
         }
         let table = Arc::new(PoolTable::build(workers, indexer, now_ms));
         self.pool_tables.rcu(|tables| {
             let mut next: Vec<Arc<PoolTable>> = tables
                 .iter()
-                .filter(|kept| kept.slice != table.slice)
+                .filter(|kept| !kept.describes(workers, indexer))
                 .cloned()
                 .collect();
             if next.len() >= POOL_TABLES_KEPT {
@@ -1658,7 +1687,9 @@ impl CacheAwarePolicy {
             next.push(Arc::clone(&table));
             next
         });
-        self.pool_table_building.store(false, Ordering::Release);
+        if rebuilds {
+            self.pool_table_building.store(false, Ordering::Release);
+        }
         table
     }
 
@@ -2659,7 +2690,7 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
-        indexer: &KvIndex,
+        indexer: &Arc<KvIndex>,
         block_size: usize,
         tuning: &OverlapTuning<'_>,
     ) -> Vec<OverlapCandidate> {
