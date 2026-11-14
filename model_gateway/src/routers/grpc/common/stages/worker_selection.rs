@@ -26,12 +26,19 @@ use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
-    policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole},
+    policies::{
+        hash_ring::HashRing, CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
+        WorkerRole,
+    },
     routers::{
         common::{
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
                 RefusalSite,
+            },
+            prefill_admission::{
+                acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
+                PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext,
             },
             retry::mark_non_retryable,
         },
@@ -47,9 +54,7 @@ use crate::{
         prefill_queue_full, prefill_queue_timeout,
     },
     worker::{
-        acquire_prefill, ConnectionMode, HashRing, ModelWorkerSnapshot, PdPairIndex, PdWire,
-        PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection, PrefillCandidateError,
-        PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType, Worker,
+        ConnectionMode, ModelWorkerSnapshot, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
         WorkerRegistry, WorkerType,
     },
 };
@@ -2286,6 +2291,7 @@ mod tests {
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
+                prefill_admission::PrefillReservation,
                 retry::is_retryable_response,
             },
             grpc::{
@@ -2299,7 +2305,7 @@ mod tests {
         tenant::TenantKey,
         worker::{
             test_support::{no_health_check, select_worker},
-            BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation, WorkerLoadGuard,
+            BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerLoadGuard,
         },
     };
 
