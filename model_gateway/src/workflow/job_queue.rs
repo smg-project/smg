@@ -176,9 +176,10 @@ pub struct JobQueue {
     /// The next waiter's id: what tells a caller's waiter from a later one
     /// under the same key.
     next_waiter_id: AtomicU64,
-    /// One job per URL, kept while another holds the URL
-    /// (`submit_or_defer`) and run by that job's completion (`run_kept`).
-    kept: Arc<DashMap<String, Job>>,
+    /// The jobs kept per URL while another job holds the URL (a removal
+    /// and one of any other kind, `submit_or_defer`), run in turn by that
+    /// job's completion (`run_kept`).
+    kept: Arc<DashMap<String, Kept>>,
     /// The ids (the ones their `POST /workers` reserved) whose registration a
     /// `DELETE` ended before the job had saved a workflow state
     /// (`cancel_registration`): the `POST`'s job reads its own id here before
@@ -261,6 +262,38 @@ impl std::fmt::Debug for JobQueue {
     }
 }
 
+/// The jobs kept for one URL while another job holds it
+/// ([`JobQueue::submit_or_defer`]): at most one removal and one job of any
+/// other kind, the latest of each. The removal runs first: a refresh kept
+/// beside it would refresh what the removal takes out, and when the removal
+/// leaves its worker standing (a guarded removal that skipped a worker
+/// registered since its `DELETE`) the refresh runs after it, so neither a
+/// `DELETE` nor a worker's one refresh is lost to the other.
+#[derive(Default)]
+struct Kept {
+    removal: Option<Job>,
+    other: Option<Job>,
+}
+
+impl Kept {
+    fn slot(&mut self, job: &Job) -> &mut Option<Job> {
+        if matches!(job, Job::RemoveWorker { .. }) {
+            &mut self.removal
+        } else {
+            &mut self.other
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.removal.is_none() && self.other.is_none()
+    }
+
+    /// The next job to run: the removal, then the other.
+    fn take_next(&mut self) -> Option<Job> {
+        self.removal.take().or_else(|| self.other.take())
+    }
+}
+
 /// A claimed submission's hold on its own status entry while it waits for a
 /// slot: dropped with its caller before the slot is held (a cancelled request
 /// on a full queue) or ended by a refused submission, it takes the claim back
@@ -296,7 +329,7 @@ impl JobQueue {
         let status_map = Arc::new(DashMap::new());
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let outcomes: Outcomes = Arc::new(DashMap::new());
-        let kept: Arc<DashMap<String, Job>> = Arc::new(DashMap::new());
+        let kept: Arc<DashMap<String, Kept>> = Arc::new(DashMap::new());
         let cancelled_before_start = Arc::new(DashSet::new());
 
         let queue = Arc::new(Self {
@@ -456,27 +489,39 @@ impl JobQueue {
 
     /// `submit_unless_in_flight` for a submission that must not be lost: a
     /// job that finds another of any type in flight under its URL is kept
-    /// (one per URL: the latest, a removal over anything else, `keep`) and
-    /// run by that job's completion (`run_kept`), after it and never beside
-    /// it. Returns `Ok(false)` for a kept job, and for one dropped because a
-    /// removal is kept for its URL. A job still kept once nothing is in
-    /// flight (the holder ended between the claim and the keeping, its
-    /// completion finding nothing) is this call's to submit.
+    /// (one of each kind per URL, the latest removal and the latest of any
+    /// other kind, `keep`) and run by that job's completion (`run_kept`),
+    /// after it and never beside it, the removal first. Returns `Ok(false)`
+    /// for a kept job. A job still kept once nothing is in flight (the holder
+    /// ended between the claim and the keeping, its completion finding
+    /// nothing) is this call's to submit, in the run order: the type is read
+    /// per iteration, as the job taken back may be of the other kind, a job
+    /// taken back and refused again goes back behind a newer one of its kind
+    /// (`put_back`, as the runner does), and `Ok(true)` says this call's own
+    /// job was submitted.
     pub async fn submit_or_defer(&self, mut job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
-        let job_type = job.job_type();
+        let own_kind_is_removal = matches!(job, Job::RemoveWorker { .. });
+        let mut taken_back = false;
         loop {
+            let job_type = job.job_type();
+            let own = matches!(job, Job::RemoveWorker { .. }) == own_kind_is_removal;
             if Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
-                return self.submit_inner(job, true, None).await.map(|()| true);
+                return self.submit_inner(job, true, None).await.map(|()| own);
             }
-            if !Self::keep(&self.kept, &worker_url, job) {
-                return Ok(false);
+            if taken_back {
+                Self::put_back(&self.kept, &worker_url, job);
+            } else {
+                Self::keep(&self.kept, &worker_url, job);
             }
             if Self::has_in_flight(&self.status_map, &worker_url) {
                 return Ok(false);
             }
-            match self.kept.remove(&worker_url) {
-                Some((_, taken_back)) => job = taken_back,
+            match Self::take_next(&self.kept, &worker_url) {
+                Some(next) => {
+                    job = next;
+                    taken_back = true;
+                }
                 None => return Ok(false),
             }
         }
@@ -489,63 +534,51 @@ impl JobQueue {
             .is_some_and(|entry| matches!(entry.status.as_str(), "pending" | "processing"))
     }
 
-    /// Keeps `job` for `url`: the latest job takes the slot, unless a removal
-    /// is kept there and `job` is not one, when `job` is dropped and `false`
-    /// returned (the worker it is for is leaving, and a label refresh of it
-    /// has nothing left to do). A removal displaces whatever is kept.
-    fn keep(kept: &DashMap<String, Job>, url: &str, job: Job) -> bool {
-        match kept.entry(url.to_string()) {
-            Entry::Occupied(slot) if Self::outranks(slot.get(), &job) => {
-                debug!(
-                    "Dropping the {} job for worker={}: a removal is kept for the URL",
-                    job.job_type(),
-                    Job::shown_worker(job.job_type(), url)
-                );
-                false
-            }
-            slot => {
-                slot.insert(job);
-                true
-            }
+    /// Keeps `job` for `url` in the slot of its kind: the latest of a kind
+    /// takes that slot, and the other kind's slot is left as it is.
+    fn keep(kept: &DashMap<String, Kept>, url: &str, job: Job) {
+        let mut entry = kept.entry(url.to_string()).or_default();
+        let slot = entry.slot(&job);
+        *slot = Some(job);
+    }
+
+    /// The next job kept for `url` in the run order (the removal, then the
+    /// other); the URL's entry goes once both slots are empty.
+    fn take_next(kept: &DashMap<String, Kept>, url: &str) -> Option<Job> {
+        let mut entry = kept.get_mut(url)?;
+        let job = entry.take_next();
+        let emptied = entry.is_empty();
+        drop(entry);
+        if emptied {
+            kept.remove_if(url, |_, slots| slots.is_empty());
+        }
+        job
+    }
+
+    /// `job` goes back to the slot of its kind (`run_kept`, its claim
+    /// refused): a job of that kind kept there since is the newer and stays.
+    fn put_back(kept: &DashMap<String, Kept>, url: &str, job: Job) {
+        let mut entry = kept.entry(url.to_string()).or_default();
+        let slot = entry.slot(&job);
+        if slot.is_none() {
+            *slot = Some(job);
         }
     }
 
-    /// `job` goes back to the slot it was taken from (`run_kept`, its claim
-    /// refused): a job kept there since is the newer and stays, unless `job`
-    /// is a removal and it is not.
-    fn put_back(kept: &DashMap<String, Job>, url: &str, job: Job) {
-        match kept.entry(url.to_string()) {
-            Entry::Occupied(mut slot) if Self::outranks(&job, slot.get()) => {
-                slot.insert(job);
-            }
-            Entry::Occupied(_) => {}
-            Entry::Vacant(slot) => {
-                slot.insert(job);
-            }
-        }
-    }
-
-    /// Whether `job` holds a kept slot against `other`: a removal against a
-    /// job of any other kind. A refresh kept over a removal dropped an
-    /// accepted `DELETE`; one kept under it would refresh what the removal
-    /// takes out.
-    fn outranks(job: &Job, other: &Job) -> bool {
-        matches!(job, Job::RemoveWorker { .. }) && !matches!(other, Job::RemoveWorker { .. })
-    }
-
-    /// The job kept for `worker_url` (`submit_or_defer`), run on the heels of
-    /// the job that held the URL, on its task and under its own status; a job
-    /// queued for the URL in the meantime holds it first, and its completion
-    /// runs the kept one, which goes back to its slot behind any job kept
-    /// since (`put_back`). Nothing waits on a kept job's outcome.
+    /// The jobs kept for `worker_url` (`submit_or_defer`), run in turn on the
+    /// heels of the job that held the URL (the removal first), on its task
+    /// and under their own status; a job queued for the URL in the meantime
+    /// holds it first, and its completion runs the kept ones, a job whose
+    /// claim is refused going back to its slot behind any job of its kind
+    /// kept since (`put_back`). Nothing waits on a kept job's outcome.
     async fn run_kept(
         worker_url: &str,
         context: &Arc<AppContext>,
         status_map: &Arc<DashMap<String, JobStatus>>,
-        kept: &DashMap<String, Job>,
+        kept: &DashMap<String, Kept>,
         cancelled_before_start: &DashSet<WorkerId>,
     ) {
-        while let Some((_, job)) = kept.remove(worker_url) {
+        while let Some(job) = Self::take_next(kept, worker_url) {
             let job_type = job.job_type();
             if !Self::claim_unless_in_flight(status_map, worker_url, job_type) {
                 Self::put_back(kept, worker_url, job);
@@ -602,7 +635,7 @@ impl JobQueue {
     /// Whether a job is kept for `url` (`submit_or_defer`).
     #[cfg(test)]
     pub(crate) fn kept_for(&self, url: &str) -> bool {
-        self.kept.contains_key(url)
+        self.kept.get(url).is_some_and(|slots| !slots.is_empty())
     }
 
     /// Any in-flight job under the key blocks the claim, whatever its type.
@@ -895,7 +928,7 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
-        kept: Arc<DashMap<String, Job>>,
+        kept: Arc<DashMap<String, Kept>>,
         cancelled_before_start: Arc<DashSet<WorkerId>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
@@ -2400,12 +2433,15 @@ mod tests {
         }
     }
 
-    /// A label refresh kept while a DELETE's removal is kept for the URL
-    /// leaves the removal in place and is dropped (the worker it would
-    /// refresh is leaving), where the latest job took the slot and the
-    /// accepted DELETE went with it.
+    /// A label refresh kept while a DELETE's removal is kept for the URL is
+    /// kept beside it (one slot per kind), and both run at the holder's end,
+    /// the removal first: the refresh's worker may be the one leaving, or
+    /// the one a guarded removal leaves standing. Each runs under its own
+    /// status, so the URL's last status is the refresh's. Before this the
+    /// one slot per URL held the latest job, and a refresh kept while the
+    /// DELETE waited dropped the accepted DELETE.
     #[tokio::test]
-    async fn a_refresh_kept_beside_a_kept_removal_leaves_the_removal_in_place() {
+    async fn a_refresh_kept_beside_a_kept_removal_runs_after_it() {
         use crate::service_discovery::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
@@ -2422,7 +2458,7 @@ mod tests {
         assert_eq!(
             queue.submit_or_defer(refresh).await,
             Ok(false),
-            "the refresh is neither submitted nor an error"
+            "the refresh is kept, neither submitted nor dropped"
         );
         assert!(queue.kept_for(url));
 
@@ -2441,22 +2477,23 @@ mod tests {
             &queue.cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url));
+        assert!(!queue.kept_for(url), "both kept jobs ran");
         assert_eq!(
             queue
                 .get_status(url)
-                .expect("the kept job's own status")
+                .expect("the last kept job's own status")
                 .job_type,
-            "RemoveWorker",
-            "the removal ran; the refresh did not take its slot"
+            "RefreshWorkerLabels",
+            "the refresh ran after the removal, under its own status"
         );
     }
 
     /// A DELETE's removal kept while a label refresh is kept for the URL
-    /// displaces the refresh, and the removal is what runs at the holder's
-    /// end.
+    /// takes the removal's slot beside it (the refresh stays), and the run
+    /// order is the removal first, then the refresh, whichever was kept
+    /// first.
     #[tokio::test]
-    async fn a_removal_kept_beside_a_kept_refresh_displaces_it() {
+    async fn a_removal_kept_beside_a_kept_refresh_runs_first() {
         use crate::service_discovery::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
@@ -2472,6 +2509,20 @@ mod tests {
         };
         assert_eq!(queue.submit_or_defer(removal).await, Ok(false));
         assert!(queue.kept_for(url));
+        // The run order, read off the slots and put back as it was.
+        let first = JobQueue::take_next(&queue.kept, url).expect("the removal is next");
+        let second = JobQueue::take_next(&queue.kept, url).expect("the refresh follows");
+        assert_eq!(
+            (first.job_type(), second.job_type()),
+            ("RemoveWorker", "RefreshWorkerLabels"),
+            "the removal runs first, the refresh after it"
+        );
+        assert!(
+            JobQueue::take_next(&queue.kept, url).is_none() && !queue.kept_for(url),
+            "two slots, nothing else"
+        );
+        JobQueue::put_back(&queue.kept, url, second);
+        JobQueue::put_back(&queue.kept, url, first);
 
         JobQueue::record_job_completion(
             "AddWorker",
@@ -2488,22 +2539,89 @@ mod tests {
             &queue.cancelled_before_start,
         )
         .await;
-        assert!(!queue.kept_for(url));
+        assert!(!queue.kept_for(url), "both kept jobs ran");
         assert_eq!(
             queue
                 .get_status(url)
-                .expect("the kept job's own status")
+                .expect("the last kept job's own status")
                 .job_type,
-            "RemoveWorker",
-            "the removal displaced the kept refresh and ran"
+            "RefreshWorkerLabels",
+            "the refresh ran last: the removal ran first and did not displace it"
         );
     }
 
-    /// A kept job whose claim the runner could not take goes back to its
-    /// slot behind a job kept meanwhile: the newer job stays, unless the
-    /// returning one is a removal and the newer one is not.
+    /// A repeated DELETE's removal, pinned to the id it saw, kept behind the
+    /// job that took the URL after the first removal, and the refresh of
+    /// the worker registered since under a fresh id, kept behind the same
+    /// job: both are kept, the removal first, and both run at the holder's
+    /// end. Before this the removal took the one slot and the refresh was
+    /// dropped, and the worker the removal's pin then skipped kept its
+    /// provisional labels until another transition into service.
+    #[tokio::test]
+    async fn a_fresh_workers_refresh_kept_beside_an_old_id_removal_runs_after_it() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let url = "http://w:8005";
+        queue.hold_url_for_tests(url, "UpdateWorker");
+        let old_id_removal = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: Some(HashMap::from([("old-id".to_string(), None)])),
+        };
+        assert_eq!(queue.submit_or_defer(old_id_removal).await, Ok(false));
+        let fresh_workers_refresh = Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        assert_eq!(
+            queue.submit_or_defer(fresh_workers_refresh).await,
+            Ok(false),
+            "the refresh is kept beside the removal, not dropped for it"
+        );
+        let next = JobQueue::take_next(&queue.kept, url).expect("the removal is next");
+        assert!(
+            matches!(
+                next,
+                Job::RemoveWorker {
+                    expected_revisions: Some(_),
+                    ..
+                }
+            ),
+            "the old-id removal runs first"
+        );
+        JobQueue::put_back(&queue.kept, url, next);
+
+        JobQueue::record_job_completion(
+            "UpdateWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "the removal and the refresh both ran");
+        assert_eq!(
+            queue
+                .get_status(url)
+                .expect("the last kept job's own status")
+                .job_type,
+            "RefreshWorkerLabels",
+            "the fresh worker's refresh ran after the removal"
+        );
+    }
+
+    /// A kept job whose claim the runner could not take goes back to the
+    /// slot of its kind: a job of that kind kept meanwhile is the newer and
+    /// stays; a job of the other kind kept meanwhile keeps its own slot. The
+    /// URL's entry goes with its last job.
     #[test]
-    fn a_kept_job_put_back_yields_to_a_newer_one_unless_it_is_a_removal() {
+    fn a_kept_job_put_back_yields_to_a_newer_one_of_its_kind() {
         let url = "http://w:8004";
         let removal = || Job::RemoveWorker {
             url: url.to_string(),
@@ -2512,33 +2630,33 @@ mod tests {
         let refresh = || Job::RefreshWorkerLabels {
             url: url.to_string(),
         };
-        let kept_type = |kept: &DashMap<String, Job>| kept.get(url).map(|job| job.job_type());
+        let kinds = |kept: &DashMap<String, Kept>| {
+            kept.get(url).map_or((None, None), |slots| {
+                (
+                    slots.removal.as_ref().map(Job::job_type),
+                    slots.other.as_ref().map(Job::job_type),
+                )
+            })
+        };
 
-        let kept: DashMap<String, Job> = DashMap::new();
+        let kept: DashMap<String, Kept> = DashMap::new();
         JobQueue::put_back(&kept, url, refresh());
         assert_eq!(
-            kept_type(&kept),
-            Some("RefreshWorkerLabels"),
+            kinds(&kept),
+            (None, Some("RefreshWorkerLabels")),
             "an empty slot takes the job back"
         );
 
-        kept.insert(url.to_string(), refresh());
         JobQueue::put_back(&kept, url, removal());
         assert_eq!(
-            kept_type(&kept),
-            Some("RemoveWorker"),
-            "a removal displaces the refresh kept meanwhile"
+            kinds(&kept),
+            (Some("RemoveWorker"), Some("RefreshWorkerLabels")),
+            "a removal put back beside a kept refresh keeps both"
         );
 
-        JobQueue::put_back(&kept, url, refresh());
-        assert_eq!(
-            kept_type(&kept),
-            Some("RemoveWorker"),
-            "a refresh yields to the removal kept meanwhile"
-        );
-
-        kept.insert(
-            url.to_string(),
+        JobQueue::keep(
+            &kept,
+            url,
             Job::RemoveWorker {
                 url: url.to_string(),
                 expected_revisions: Some(HashMap::new()),
@@ -2546,14 +2664,34 @@ mod tests {
         );
         JobQueue::put_back(&kept, url, removal());
         assert!(
-            matches!(
-                kept.get(url).as_deref(),
+            kept.get(url).is_some_and(|slots| matches!(
+                slots.removal,
                 Some(Job::RemoveWorker {
                     expected_revisions: Some(_),
                     ..
                 })
-            ),
+            )),
             "a removal yields to the removal kept meanwhile"
+        );
+        assert_eq!(
+            kinds(&kept).1,
+            Some("RefreshWorkerLabels"),
+            "the other kind's slot is untouched"
+        );
+
+        assert_eq!(
+            JobQueue::take_next(&kept, url).map(|job| job.job_type()),
+            Some("RemoveWorker"),
+            "the removal is taken first"
+        );
+        assert_eq!(
+            JobQueue::take_next(&kept, url).map(|job| job.job_type()),
+            Some("RefreshWorkerLabels"),
+            "the refresh follows"
+        );
+        assert!(
+            JobQueue::take_next(&kept, url).is_none() && !kept.contains_key(url),
+            "the URL's entry goes with its last job"
         );
     }
 

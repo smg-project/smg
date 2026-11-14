@@ -898,9 +898,11 @@ impl WorkerService {
         // A repeated DELETE's removal finds nothing left then; one behind a
         // guarded cleanup that skipped a worker replaced since the cleanup's
         // snapshot removes that worker, where a DELETE answered by the
-        // cleanup alone removed nothing. The queue keeps one job per URL; a
-        // label refresh is kept the same way (`submit_label_refresh`), and
-        // a kept removal outranks it: the worker it would refresh is leaving.
+        // cleanup alone removed nothing. The queue keeps one job of each
+        // kind per URL; a label refresh is kept the same way
+        // (`submit_label_refresh`) and runs after a kept removal: the worker
+        // it would refresh may be the one leaving, or the one a guarded
+        // removal leaves standing.
         job_queue
             .submit_or_defer(job)
             .await
