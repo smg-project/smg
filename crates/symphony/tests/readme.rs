@@ -2330,6 +2330,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "ornith-1.5-122b",
+        model: "ornith-ai/Ornith-1.5-122B",
+        also: &[],
+        released: "2026-10-16",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "otel-2.0-llm-31b-it",
         model: "RedHatAI/OTel-2.0-LLM-31B-IT",
         also: &[],

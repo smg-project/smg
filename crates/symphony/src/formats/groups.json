@@ -170,6 +170,7 @@
   {"model": "nvidia/NVIDIA-NemotronLabs-AI-for-Media-Sports-Basketball", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "allenai/Olmo-3-7B-Instruct", "also": [], "table": "olmo3", "opener": null, "after": null},
   {"model": "nvidia/OpenCodeReasoning-Nemotron-7B", "also": ["OpenCodeReasoning-Nemotron-1.1-14B", "OpenCodeReasoning-Nemotron-1.1-32B", "OpenCodeReasoning-Nemotron-1.1-7B", "OpenCodeReasoning-Nemotron-14B", "OpenCodeReasoning-Nemotron-32B", "OpenCodeReasoning-Nemotron-32B-IOI"], "table": "qwen2.5", "opener": null, "after": null},
+  {"model": "ornith-ai/Ornith-1.5-122B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "RedHatAI/OTel-2.0-LLM-31B-IT", "also": [], "table": "gemma4", "opener": null, "after": null},
   {"model": "microsoft/Phi-4-mini-instruct", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "microsoft/Phi-4-multimodal-instruct", "also": [], "table": "plain", "opener": null, "after": null},
