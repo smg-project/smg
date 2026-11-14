@@ -73,6 +73,7 @@
   {"model": "zai-org/GLM-5.3", "also": ["GLM-5.3-BF16"], "table": "glm", "opener": null, "after": null},
   {"model": "zai-org/GLM-5.3-Flash", "also": ["GLM-5.3-Flash-BF16"], "table": "glm", "opener": null, "after": null},
   {"model": "ibm-granite/granite-4.1-3b", "also": ["granite-4.1-30b"], "table": "qwen2.5", "opener": "<|start_of_role|>assistant<|end_of_role|>", "after": null},
+  {"model": "ibm-granite/granite-switch-4.1-8b", "also": ["granite-switch-4.1-30b"], "table": "qwen2.5", "opener": "<|start_of_role|>assistant<|end_of_role|>", "after": null},
   {"model": "h2oai/h2o-lightning-4b", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "NousResearch/Hermes-4-14B", "also": [], "table": "qwen2.5", "opener": null, "after": null},
   {"model": "FreedomIntelligence/HuatuoGPT-3-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
