@@ -16,11 +16,12 @@ use tracing::{debug, warn};
 
 use super::{
     inflight::MultimodalInflight,
+    media_client,
     pixel_cache::{pixel_cache_with_budget, PixelCache},
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
-use crate::{observability::metrics::Metrics, worker::http_client::build_with};
+use crate::observability::metrics::Metrics;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug)]
@@ -547,13 +548,7 @@ impl MultimodalComponents {
             allow_private_media_hosts_source = settings.allow_private_media_hosts.source.as_str(),
             "media fetch policy for router-side processing"
         );
-        let media_connector = build_with(
-            || crate::server::http_client_builder().timeout(std::time::Duration::from_secs(30)),
-            false,
-            "media HTTP client",
-            |client| MediaConnector::new(client, connector_config.clone()),
-        )
-        .map_err(anyhow::Error::msg)?;
+        let media_connector = media_client::media_connector(&connector_config)?;
 
         super::report_jpeg_decoder();
         super::enforce_jpeg_decoder_policy(settings.turbojpeg.value)?;
