@@ -448,30 +448,28 @@ pub(super) fn validate_constrained_decoding_label(
     }
 }
 
+/// A KV transfer value as given, an empty one being none: the spec's fields
+/// and the label values alike at registration, and the engine's report at a
+/// label refresh (`EngineKvMetadata::take`), so a value that says nothing is
+/// never a set field a later report cannot fill.
+pub(super) fn kv_transfer_value(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// The worker's KV transfer fields out of the spec and the labels (the
+/// three keys leave the labels): the spec's value when it says something,
+/// else the label's, read through [`kv_transfer_value`] on both sides.
 fn take_kv_transfer_metadata(
     config: &WorkerSpec,
     labels: &mut HashMap<String, String>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let connector_label = labels.remove("kv_connector");
-    let role_label = labels.remove("kv_role");
-    let engine_id_label = labels.remove("kv_engine_id");
+    let connector_label = kv_transfer_value(labels.remove("kv_connector"));
+    let role_label = kv_transfer_value(labels.remove("kv_role"));
+    let engine_id_label = kv_transfer_value(labels.remove("kv_engine_id"));
     (
-        config
-            .kv_connector
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or(connector_label),
-        config
-            .kv_role
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or(role_label),
-        config
-            .kv_engine_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or(engine_id_label)
-            .filter(|s| !s.is_empty()),
+        kv_transfer_value(config.kv_connector.clone()).or(connector_label),
+        kv_transfer_value(config.kv_role.clone()).or(role_label),
+        kv_transfer_value(config.kv_engine_id.clone()).or(engine_id_label),
     )
 }
 
@@ -1947,6 +1945,25 @@ mod tests {
             !text.contains("secret") && !text.contains("user:"),
             "{text}"
         );
+    }
+
+    /// An empty label value is no KV field, as an empty spec value is: a
+    /// registration carrying `kv_connector: ""` or `kv_role: ""` leaves the
+    /// field unset for a later report to fill, instead of holding `Some("")`
+    /// that nothing fills.
+    #[test]
+    fn an_empty_kv_label_value_is_no_field() {
+        let spec = WorkerSpec::new("http://worker:8080");
+        let mut labels = HashMap::from([
+            ("kv_connector".to_string(), String::new()),
+            ("kv_role".to_string(), String::new()),
+            ("kv_engine_id".to_string(), String::new()),
+        ]);
+        assert_eq!(
+            take_kv_transfer_metadata(&spec, &mut labels),
+            (None, None, None)
+        );
+        assert!(labels.is_empty(), "the keys leave the labels all the same");
     }
 
     #[test]

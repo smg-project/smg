@@ -135,6 +135,19 @@ struct OutputTextDelta<'a> {
     delta: &'a str,
 }
 
+/// The `response.output_item.added` and `response.output_item.done` events:
+/// the item an output index opens or closes with, borrowed into the frame
+/// rather than copied into an event map first; the fields in the events'
+/// order.
+#[derive(Serialize)]
+struct OutputItemFrame<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item: &'a serde_json::Value,
+}
+
 /// The `response.created` event: the response object as the stream opens,
 /// the fields in the event's order, the strings borrowed from the emitter.
 #[derive(Serialize)]
@@ -962,37 +975,124 @@ impl ResponseStreamEventEmitter {
         std::borrow::Cow::Borrowed(item)
     }
 
-    /// Emit response.output_item.added event
-    pub fn emit_output_item_added(
+    /// The `response.output_item.added` event of `item` under `output_index`,
+    /// sent as [`OutputItemFrame`]: the item goes into the frame borrowed,
+    /// not through a copy in an event map.
+    pub async fn send_output_item_added(
         &mut self,
         output_index: usize,
         item: &serde_json::Value,
-    ) -> serde_json::Value {
+        tx: &SseSender,
+    ) -> Result<(), String> {
         let item = self.normalize_function_item(item);
-        json!({
-            "type": OutputItemEvent::ADDED,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item": item
-        })
+        let event = OutputItemFrame {
+            kind: OutputItemEvent::ADDED,
+            sequence_number: self.next_sequence(),
+            output_index,
+            item: &item,
+        };
+        Self::send_frame(
+            &mut self.encoder,
+            self.abandoned,
+            OutputItemEvent::ADDED,
+            &event,
+            tx,
+        )
+        .await
     }
 
-    /// Emit response.output_item.done event
-    pub fn emit_output_item_done(
+    /// The `response.output_item.done` event of the item `output_index`
+    /// closes with, sent as [`OutputItemFrame`]. The emitter keeps the item
+    /// for the terminal event and the stored object, and the frame borrows
+    /// the kept item: a close costs the item once, not the event map's copy
+    /// and a kept clone besides - for every item but a namespaced function
+    /// call, whose restored copy is the one kept. An index the emitter does
+    /// not track gets its event all the same and keeps nothing, as before.
+    pub async fn send_output_item_done(
         &mut self,
         output_index: usize,
-        item: &serde_json::Value,
-    ) -> serde_json::Value {
-        let item = self.normalize_function_item(item).into_owned();
-        // Store the item data for later use in emit_completed
-        self.store_output_item_data(output_index, item.clone());
+        item: serde_json::Value,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let item = match self.normalize_function_item(&item) {
+            std::borrow::Cow::Owned(normalized) => normalized,
+            std::borrow::Cow::Borrowed(_) => item,
+        };
+        let sequence_number = self.next_sequence();
+        let kept: &serde_json::Value = match self
+            .output_items
+            .iter_mut()
+            .find(|tracked| tracked.output_index == output_index)
+        {
+            Some(tracked) => tracked.item_data.insert(item),
+            None => &item,
+        };
+        let event = OutputItemFrame {
+            kind: OutputItemEvent::DONE,
+            sequence_number,
+            output_index,
+            item: kept,
+        };
+        Self::send_frame(
+            &mut self.encoder,
+            self.abandoned,
+            OutputItemEvent::DONE,
+            &event,
+            tx,
+        )
+        .await
+    }
 
-        json!({
-            "type": OutputItemEvent::DONE,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item": item
-        })
+    /// Keeps the item `output_index` closes with, for a close whose
+    /// `response.output_item.done` event is sent later by
+    /// [`Self::send_kept_output_item_done`]: a hosted tool call keeps its
+    /// item before the completion sends that can fail on a closed channel, so
+    /// a client who leaves during the call still has the executed call in the
+    /// record. A namespaced function call is kept as its restored copy; an
+    /// index the emitter does not track keeps nothing.
+    pub fn keep_output_item(&mut self, output_index: usize, item: serde_json::Value) {
+        let item = match self.normalize_function_item(&item) {
+            std::borrow::Cow::Owned(normalized) => normalized,
+            std::borrow::Cow::Borrowed(_) => item,
+        };
+        if let Some(tracked) = self
+            .output_items
+            .iter_mut()
+            .find(|tracked| tracked.output_index == output_index)
+        {
+            tracked.item_data = Some(item);
+        }
+    }
+
+    /// The `response.output_item.done` event of an item kept by
+    /// [`Self::keep_output_item`], the frame borrowing the kept item; an
+    /// index with nothing kept is an error, not a silent omission.
+    pub async fn send_kept_output_item_done(
+        &mut self,
+        output_index: usize,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let sequence_number = self.next_sequence();
+        let kept = self
+            .output_items
+            .iter()
+            .find(|tracked| tracked.output_index == output_index)
+            .and_then(|tracked| tracked.item_data.as_ref())
+            .ok_or_else(|| format!("no kept item at output index {output_index}"))?;
+        let event = OutputItemFrame {
+            kind: OutputItemEvent::DONE,
+            sequence_number,
+            output_index,
+            item: kept,
+        };
+        Self::send_frame(
+            &mut self.encoder,
+            self.abandoned,
+            OutputItemEvent::DONE,
+            &event,
+            tx,
+        )
+        .await
     }
 
     /// Generate unique ID for item type
@@ -1044,17 +1144,6 @@ impl ResponseStreamEventEmitter {
             .find(|i| i.output_index == output_index)
         {
             item.status = ItemStatus::Completed;
-        }
-    }
-
-    /// Store output item data when emitting output_item.done
-    pub fn store_output_item_data(&mut self, output_index: usize, item_data: serde_json::Value) {
-        if let Some(item) = self
-            .output_items
-            .iter_mut()
-            .find(|i| i.output_index == output_index)
-        {
-            item.item_data = Some(item_data);
         }
     }
 
@@ -1156,12 +1245,10 @@ impl ResponseStreamEventEmitter {
         });
 
         // Emit output_item.added
-        let added_event = self.emit_output_item_added(output_index, &item);
-        self.send_event(&added_event, tx).await?;
+        self.send_output_item_added(output_index, &item, tx).await?;
 
         // Immediately emit output_item.done (no streaming for reasoning)
-        let done_event = self.emit_output_item_done(output_index, &item);
-        self.send_event(&done_event, tx).await?;
+        self.send_output_item_done(output_index, item, tx).await?;
 
         // Mark as completed
         self.complete_output_item(output_index);
@@ -1222,7 +1309,10 @@ impl ResponseStreamEventEmitter {
         let Some(reasoning) = self.reasoning_item.take() else {
             return Ok(());
         };
-        // Built and stored before any send, as the message item is.
+        // The done events go out in order; the item is kept by
+        // `send_output_item_done` before its frame goes out, so a send that
+        // failed because the client left has not lost it (as for the message
+        // item), and the first failure is reported once the item is kept.
         let text_done = self.emit_reasoning_text_done(
             reasoning.output_index,
             &reasoning.item_id,
@@ -1247,12 +1337,17 @@ impl ResponseStreamEventEmitter {
             item["encrypted_content"] =
                 json!(super::utils::encode_reasoning_content(&reasoning.text));
         }
-        let item_done = self.emit_output_item_done(reasoning.output_index, &item);
-        self.complete_output_item(reasoning.output_index);
-        for event in [&text_done, &part_done, &item_done] {
-            self.send_event(event, tx).await?;
+        let mut sent = Ok(());
+        for event in [&text_done, &part_done] {
+            if sent.is_ok() {
+                sent = self.send_event(event, tx).await;
+            }
         }
-        Ok(())
+        let item_sent = self
+            .send_output_item_done(reasoning.output_index, item, tx)
+            .await;
+        self.complete_output_item(reasoning.output_index);
+        sent.and(item_sent)
     }
 
     /// The status of the message or reasoning item a stream closes, under the turn's finish
@@ -1296,10 +1391,10 @@ impl ResponseStreamEventEmitter {
         };
         // The part's done events borrow the accumulated text, so they go out
         // before the item takes it; a send that fails because the client left
-        // is reported only once the item is stored and completed, so the
-        // record of the departure still reads an item the stream had
-        // generated from here. `output_item.done` is built after the part
-        // events, which keeps the sequence numbers in send order.
+        // does not stop the close: the item is still kept (by
+        // `send_output_item_done`, before its frame goes out) and completed,
+        // so the record of the departure reads it, and the first failure is
+        // reported last. The sequence numbers stay in send order.
         let mut sent = Ok(());
         if std::mem::take(&mut self.has_emitted_content_part_added) {
             sent = match self.send_text_done(output_index, &item_id, 0, tx).await {
@@ -1310,7 +1405,7 @@ impl ResponseStreamEventEmitter {
                 Err(e) => Err(e),
             };
         }
-        let done = if std::mem::take(&mut self.has_emitted_output_item_added) {
+        if std::mem::take(&mut self.has_emitted_output_item_added) {
             let item = json!({
                 "id": item_id,
                 "type": "message",
@@ -1318,16 +1413,11 @@ impl ResponseStreamEventEmitter {
                 "content": [{"type": "output_text", "text": std::mem::take(&mut self.accumulated_text)}],
                 "status": self.message_status(),
             });
-            Some(self.emit_output_item_done(output_index, &item))
-        } else {
-            None
-        };
-        self.complete_output_item(output_index);
-        sent?;
-        if let Some(event) = done {
-            self.send_event(&event, tx).await?;
+            let item_sent = self.send_output_item_done(output_index, item, tx).await;
+            sent = sent.and(item_sent);
         }
-        Ok(())
+        self.complete_output_item(output_index);
+        sent
     }
 
     /// Close every streamed tool-call item: arguments (or custom input) done,
@@ -1337,9 +1427,12 @@ impl ResponseStreamEventEmitter {
     /// turn, and those (possibly partial) calls still belong in the final
     /// output, so they must be closed and collected here.
     async fn close_tool_call_items(&mut self, tx: &SseSender) -> Result<(), String> {
-        // Every call's closing events are built, and the calls stored and
-        // completed, before any event is sent (as for the message item).
-        let mut events = Vec::new();
+        // Every call is kept and completed whether or not its events reach
+        // the client (as for the message item): a send that fails because
+        // the client left does not stop the loop, `send_output_item_done`
+        // keeps each call before its frame goes out, and the first failure
+        // is reported once every call is kept.
+        let mut sent = Ok(());
         for item in std::mem::take(&mut self.tool_call_items) {
             // The call's status as a function call, read before a custom
             // tool's call becomes its item.
@@ -1350,13 +1443,16 @@ impl ResponseStreamEventEmitter {
                     ("response.custom_tool_call_input.delta", "delta"),
                     ("response.custom_tool_call_input.done", "input"),
                 ] {
-                    events.push(json!({
+                    let event = json!({
                         "type": event_type,
                         "sequence_number": self.next_sequence(),
                         "output_index": item.output_index,
                         "item_id": item.item_id,
                         field: input,
-                    }));
+                    });
+                    if sent.is_ok() {
+                        sent = self.send_event(&event, tx).await;
+                    }
                 }
                 json!({
                     "id": item.item_id,
@@ -1366,11 +1462,14 @@ impl ResponseStreamEventEmitter {
                     "input": input,
                 })
             } else {
-                events.push(self.emit_function_call_arguments_done(
+                let event = self.emit_function_call_arguments_done(
                     item.output_index,
                     &item.item_id,
                     &item.arguments,
-                ));
+                );
+                if sent.is_ok() {
+                    sent = self.send_event(&event, tx).await;
+                }
                 json!({
                     "id": item.item_id,
                     "type": "function_call",
@@ -1380,13 +1479,13 @@ impl ResponseStreamEventEmitter {
                     "status": status,
                 })
             };
-            events.push(self.emit_output_item_done(item.output_index, &full));
+            let item_sent = self
+                .send_output_item_done(item.output_index, full, tx)
+                .await;
+            sent = sent.and(item_sent);
             self.complete_output_item(item.output_index);
         }
-        for event in &events {
-            self.send_event(event, tx).await?;
-        }
-        Ok(())
+        sent
     }
 
     /// Process a chunk and emit appropriate events: the reasoning delta, the
@@ -1441,8 +1540,7 @@ impl ResponseStreamEventEmitter {
                 "content": [],
                 "status": "in_progress"
             });
-            let event = self.emit_output_item_added(output_index, &item);
-            self.send_event(&event, tx).await?;
+            self.send_output_item_added(output_index, &item, tx).await?;
             let event = json!({
                 "type": "response.content_part.added",
                 "sequence_number": self.next_sequence(),
@@ -1484,8 +1582,7 @@ impl ResponseStreamEventEmitter {
             });
 
             // Emit output_item.added
-            let event = self.emit_output_item_added(output_index, &item);
-            self.send_event(&event, tx).await?;
+            self.send_output_item_added(output_index, &item, tx).await?;
             self.has_emitted_output_item_added = true;
 
             // Store for subsequent events
@@ -1628,8 +1725,7 @@ impl ResponseStreamEventEmitter {
                     "status": "in_progress",
                 })
             };
-            let event = self.emit_output_item_added(output_index, &item);
-            self.send_event(&event, tx).await?;
+            self.send_output_item_added(output_index, &item, tx).await?;
         }
         // Custom tool calls carry their payload as the raw `input`
         // string of the final item, not as streamed JSON arguments.
@@ -1815,8 +1911,8 @@ impl ResponseStreamEventEmitter {
         });
 
         // Emit output_item.added
-        let event = self.emit_output_item_added(output_index, &item_in_progress);
-        self.send_event(&event, tx).await?;
+        self.send_output_item_added(output_index, &item_in_progress, tx)
+            .await?;
 
         // Emit mcp_list_tools.in_progress
         let event = self.emit_mcp_list_tools_in_progress(output_index);
@@ -1835,9 +1931,9 @@ impl ResponseStreamEventEmitter {
             "tools": tool_items
         });
 
-        // Emit output_item.done (also stores item data internally)
-        let event = self.emit_output_item_done(output_index, &item_done);
-        self.send_event(&event, tx).await?;
+        // Emit output_item.done (the emitter keeps the item)
+        self.send_output_item_done(output_index, item_done, tx)
+            .await?;
 
         self.complete_output_item(output_index);
 
@@ -2118,6 +2214,65 @@ mod tests {
             .starts_with("event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_test\",\"object\":\"response\",\"created_at\":3,\"status\":\"in_progress\""));
     }
 
+    /// The two typed output item events write the frames the `json!` events
+    /// wrote, byte for byte (the same keys in the same order, the same
+    /// escaping, the same sequence numbers), and the item the done event
+    /// keeps is the one the terminal event carries.
+    #[tokio::test]
+    async fn the_output_item_frames_are_the_json_event_frames_byte_for_byte() {
+        let item = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "h\u{e9}llo \"there\"\n\u{1F600}"}],
+            "status": "completed"
+        });
+        let new =
+            |seq| ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), seq);
+        let frames_of = |mut rx: SseReceiver| async move {
+            let mut frames: Vec<Bytes> = Vec::new();
+            while let Some(Ok(bytes)) = rx.recv().await {
+                frames.push(bytes);
+            }
+            frames
+        };
+
+        let (tx, rx) = sse_channel();
+        let mut emitter = new(7);
+        let (index, _) = emitter.allocate_output_index(OutputItemKind::Message);
+        emitter
+            .send_output_item_added(index, &item, &tx)
+            .await
+            .unwrap();
+        emitter
+            .send_output_item_done(index, item.clone(), &tx)
+            .await
+            .unwrap();
+        emitter.complete_output_item(index);
+        drop(tx);
+        let typed_frames = frames_of(rx).await;
+
+        // The events as the `json!` maps wrote them before the typed forms.
+        let (tx, rx) = sse_channel();
+        let mut json_emitter = new(7);
+        for kind in [OutputItemEvent::ADDED, OutputItemEvent::DONE] {
+            let event = json!({
+                "type": kind,
+                "sequence_number": json_emitter.next_sequence(),
+                "output_index": index,
+                "item": &item
+            });
+            json_emitter.send_event(&event, &tx).await.unwrap();
+        }
+        drop(tx);
+        let json_frames = frames_of(rx).await;
+
+        assert_eq!(typed_frames.len(), 2);
+        assert_eq!(typed_frames, json_frames);
+        let terminal = emitter.emit_completed(None);
+        assert_eq!(terminal["response"]["output"][0], item);
+    }
+
     /// The frame of an event: its `type` on the `event:` line and the JSON on
     /// the `data:` line, the text escaped as JSON; an error frame has no
     /// `event:` line.
@@ -2157,14 +2312,21 @@ mod tests {
     /// A run that ends as failed before its terminal (the tool-call limit)
     /// stores what the stream carries: `failed`, the error, the items still
     /// held by the emitter, the usage; the terminal drains them afterwards.
-    #[test]
-    fn the_failed_final_object_keeps_the_items_the_error_and_the_usage() {
+    #[tokio::test]
+    async fn the_failed_final_object_keeps_the_items_the_error_and_the_usage() {
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
         let (index, id) = emitter.allocate_output_index(OutputItemKind::FunctionCall);
         let item = json!({"id": id, "type": "function_call", "call_id": "call_test", "name": "lookup", "arguments": "{}", "status": "completed"});
-        emitter.emit_output_item_added(index, &item);
-        emitter.emit_output_item_done(index, &item);
+        let (tx, _rx) = sse_channel();
+        emitter
+            .send_output_item_added(index, &item, &tx)
+            .await
+            .unwrap();
+        emitter
+            .send_output_item_done(index, item, &tx)
+            .await
+            .unwrap();
         emitter.complete_output_item(index);
         let error = json!({
             "code": "max_tool_calls_exceeded",
@@ -2297,20 +2459,34 @@ mod tests {
 mod namespace_tests {
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
-    #[test]
-    fn namespace_stream_events_and_completed_output_agree() {
+    #[tokio::test]
+    async fn namespace_stream_events_and_completed_output_agree() {
         let request: ResponsesRequest = namespace_test_request();
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
         emitter.set_original_request(request);
         let (index, id) = emitter.allocate_output_index(OutputItemKind::FunctionCall);
         let item = json!({"id":id,"type":"function_call","call_id":"call_test","name":"weather.lookup","arguments":"{}","status":"completed"});
-        for event in [
-            emitter.emit_output_item_added(index, &item),
-            emitter.emit_output_item_done(index, &item),
-        ] {
-            assert_eq!(event["item"]["name"], "lookup");
-            assert_eq!(event["item"]["namespace"], "weather");
+        let (tx, mut rx) = sse_channel();
+        emitter
+            .send_output_item_added(index, &item, &tx)
+            .await
+            .unwrap();
+        emitter
+            .send_output_item_done(index, item, &tx)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let frame = rx
+                .recv()
+                .await
+                .expect("a frame")
+                .expect("a frame, not an error");
+            let text = String::from_utf8(frame.to_vec()).unwrap();
+            let data = text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+            let event: serde_json::Value = serde_json::from_str(data).unwrap();
+            assert_eq!(event["item"]["name"], "lookup", "{text}");
+            assert_eq!(event["item"]["namespace"], "weather", "{text}");
         }
         emitter.complete_output_item(index);
         let event = emitter.emit_completed(None);
