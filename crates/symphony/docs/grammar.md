@@ -197,3 +197,13 @@ the last thing before its tag's end leaves out the excludes that end makes redun
 matcher cannot build the text otherwise). On the newer xgrammar the spelling compiles to the same
 token masks at every step; an engine whose grammar compiler predates the nodes no longer refuses the
 request at compile time. The gateway spells the tags it sends so where a worker's engine needs it.
+
+A grammar becomes the text a request carries in one place, `Grammar::spelled`, by the grammar
+backend the worker's engine runs (`GrammarBackend`): for xgrammar the structural tag above, byte
+for byte, in the vocabulary the compiler reads; a backend with no spelling of the tree refuses the
+grammar by name there (`Unspelled`), before the request leaves, rather than sending a text the
+engine's compiler would reject with its own words after the prompt ran. What the gateway does
+with that refusal follows what the request asked: a forced call, the response template's answer
+and the whole turn are refused by the backend's name; under `auto`, and for a registry table's
+answer, the grammar counts as a tag the table does not have, and the request goes out as it
+did before the table constrained it.
