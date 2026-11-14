@@ -307,8 +307,10 @@ fn first_violation(errors: &ValidationErrors) -> (Option<String>, String) {
 /// The refusal's message for a validation report: the violations each on a
 /// line of their own, in the order [`first_violation`] visits them (the
 /// first line is the violation whose `param` and `code` the envelope
-/// carries); `field: message` for a field's rule, a nested field by its path
-/// (`items[1].role: ...`), and the message alone for a rule over the whole
+/// carries); `field: message` for a field's rule with a message of its own,
+/// a nested field by its path (`items[1].role: ...`), the sentence alone for
+/// a built-in rule without one (it names the field itself, [`sentence_of`]),
+/// and the message alone for a rule over the whole
 /// request, whose key in the report is the validator crate's own
 /// (`WHOLE_REQUEST_KEY`) and no field of the public API.
 #[cfg(feature = "axum")]
@@ -321,15 +323,26 @@ fn message_of(errors: &ValidationErrors) -> String {
                     if !out.is_empty() {
                         out.push('\n');
                     }
-                    if !path.is_empty() {
+                    // A built-in rule's sentence names the field itself; a
+                    // message of a rule's own (or the library's rendering of
+                    // a rule the sentence cannot read) stands under the path.
+                    let sentences: Vec<Option<String>> = field_errors
+                        .iter()
+                        .map(|error| sentence_of(&path, error))
+                        .collect();
+                    if !path.is_empty() && sentences.iter().any(Option::is_none) {
                         out.push_str(&path);
                         out.push_str(": ");
                     }
-                    for (index, error) in field_errors.iter().enumerate() {
+                    for (index, (error, sentence)) in field_errors.iter().zip(sentences).enumerate()
+                    {
                         if index > 0 {
                             out.push_str(", ");
                         }
-                        out.push_str(&error.to_string());
+                        match sentence {
+                            Some(sentence) => out.push_str(&sentence),
+                            None => out.push_str(&error.to_string()),
+                        }
                     }
                 }
                 ValidationErrorsKind::Struct(inner) => walk(out, inner, &path),
@@ -344,6 +357,87 @@ fn message_of(errors: &ValidationErrors) -> String {
     let mut out = String::new();
     walk(&mut out, errors, "");
     out
+}
+
+/// The sentence for a built-in `range` or `length` rule that carries no
+/// message of its own, in the form the routes' own rules use (`Invalid
+/// 'top_p': decimal above maximum value. Expected a value <= 1, but got 2
+/// instead.`) instead of the validator crate's rendering of the rule's name
+/// and parameters (`Validation error: range [{"min": Number(1), "value":
+/// Number(0)}]`); `None` for a rule with a message of its own, or one whose
+/// value or bound the report does not carry, which print as before.
+#[cfg(feature = "axum")]
+fn sentence_of(path: &str, error: &ValidationError) -> Option<String> {
+    if error.message.is_some() {
+        return None;
+    }
+    let field = if path.is_empty() { "value" } else { path };
+    let value = error.params.get("value");
+    match error.code.as_ref() {
+        "range" => {
+            let code = range_code(error);
+            let (what, got) = match value {
+                Some(v) if v.is_i64() || v.is_u64() => ("an integer", v.to_string()),
+                Some(v) => match v.as_f64() {
+                    // A decimal field (an `f32` throughout the crate) reaches
+                    // the report widened to `f64` (`2.1` as
+                    // `2.0999999046325684`): a value that round-trips through
+                    // `f32` prints as one.
+                    Some(f) if f64::from(f as f32) == f => ("a value", (f as f32).to_string()),
+                    Some(f) => ("a value", f.to_string()),
+                    None => return None,
+                },
+                None => return None,
+            };
+            let (sign, limit) = if code.ends_with("_below_min_value") {
+                bound(error, "min")
+                    .map(|min| (">=", min))
+                    .or_else(|| bound(error, "exclusive_min").map(|min| (">", min)))
+            } else if code.ends_with("_above_max_value") {
+                bound(error, "max")
+                    .map(|max| ("<=", max))
+                    .or_else(|| bound(error, "exclusive_max").map(|max| ("<", max)))
+            } else {
+                None
+            }
+            .unzip();
+            let (Some(sign), Some(limit)) = (sign, limit) else {
+                return None;
+            };
+            let words = code
+                .replace("_min_", " minimum ")
+                .replace("_max_", " maximum ")
+                .replace('_', " ");
+            Some(format!("Invalid '{field}': {words}. Expected {what} {sign} {limit}, but got {got} instead."))
+        }
+        "length" => {
+            let code = length_code(error);
+            let (kind, what, len) = match value {
+                Some(Value::String(text)) => ("string", "a string", text.chars().count()),
+                Some(Value::Array(items)) => ("array", "an array", items.len()),
+                Some(Value::Object(members)) => ("object", "an object", members.len()),
+                _ => return None,
+            };
+            let below = code == "empty_array" || code.contains("_below_min_");
+            let limit = bound(error, if below { "min" } else { "max" })?;
+            let (bound_word, words) = if below {
+                ("minimum", "too short")
+            } else {
+                ("maximum", "too long")
+            };
+            Some(if kind == "object" {
+                // The routes' form for a property count.
+                let words = if below { "too few" } else { "too many" };
+                let noun = if len == 1 { "property" } else { "properties" };
+                format!("Invalid '{field}': {words} properties. The object has {len} {noun}, but the {bound_word} is {limit}.")
+            } else if below && len == 0 {
+                format!("Invalid '{field}': empty {kind}. Expected {what} with minimum length {limit}, but got an empty {kind} instead.")
+            } else {
+                format!("Invalid '{field}': {kind} {words}. Expected {what} with {bound_word} length {limit}, but got {what} with length {len} instead.")
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The public API's code for a validation error: a custom rule's own code
@@ -1462,8 +1556,10 @@ mod tests {
     /// A rule checked across fields names its field, which the envelope
     /// reports as `param`; a rule over the whole request that names none
     /// keeps `param` null; neither prints the key the validator crate files
-    /// them under. A field's rule prints `field: message` as before, a nested
-    /// one by its path, several violations each on a line in key order.
+    /// them under. A field's rule with a message of its own prints
+    /// `field: message` as before, a nested one by its path, a built-in rule's
+    /// sentence names the field itself; several violations each on a line in
+    /// key order.
     #[tokio::test]
     async fn request_level_refusals_name_their_field_and_print_no_internal_key() {
         let (status, json) = rejected::<CrossRequest>(r#"{"top": true}"#).await;
@@ -1486,22 +1582,23 @@ mod tests {
 
         let (_, json) = rejected::<CrossRequest>(r#"{"level": 9}"#).await;
         let message = json["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.starts_with("level: Validation error: range"),
+        assert_eq!(
+            message,
+            "Invalid 'level': integer above maximum value. Expected an integer <= 3, but got 9 instead.",
             "{json}"
         );
         assert_eq!(json["error"]["param"], "level", "{json}");
 
         let (_, json) = reject(r#"{"value": 0.5, "name": "x", "items": [{"role": ""}]}"#).await;
         let message = json["error"]["message"].as_str().unwrap_or_default();
-        assert!(message.starts_with("items[0].role: "), "{json}");
+        assert!(message.starts_with("Invalid 'items[0].role': "), "{json}");
 
         let (_, json) = reject(r#"{"value": 1.5, "name": ""}"#).await;
         let message = json["error"]["message"].as_str().unwrap_or_default();
         let lines: Vec<&str> = message.lines().collect();
         assert_eq!(lines.len(), 2, "{json}");
-        assert!(lines[0].starts_with("name: "), "{json}");
-        assert!(lines[1].starts_with("value: "), "{json}");
+        assert!(lines[0].starts_with("Invalid 'name': "), "{json}");
+        assert!(lines[1].starts_with("Invalid 'value': "), "{json}");
         assert_eq!(json["error"]["param"], "name", "{json}");
     }
 
@@ -2119,6 +2216,64 @@ mod tests {
                 .is_some_and(|m| m.contains("`reasoning_content` and `reasoning` disagree")),
             "{json}"
         );
+    }
+
+    /// A built-in `range` or `length` rule without a message of its own
+    /// answers a sentence in the routes' form, naming the field itself (no
+    /// `field: ` prefix), the code and param as before; a rule with its own
+    /// message keeps it under the field's path.
+    #[tokio::test]
+    async fn a_built_in_rule_without_a_message_answers_a_sentence() {
+        for (body, code, param, sentence) in [
+            (
+                r#"{"value": 1.5, "name": "x"}"#,
+                "decimal_above_max_value",
+                "value",
+                "Invalid 'value': decimal above maximum value. Expected a value <= 1, but got 1.5 instead.",
+            ),
+            (
+                r#"{"value": 1.1, "name": "x"}"#,
+                "decimal_above_max_value",
+                "value",
+                "Invalid 'value': decimal above maximum value. Expected a value <= 1, but got 1.1 instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "count": 0}"#,
+                "integer_below_min_value",
+                "count",
+                "Invalid 'count': integer below minimum value. Expected an integer >= 1, but got 0 instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "toolongname"}"#,
+                "string_above_max_length",
+                "name",
+                "Invalid 'name': string too long. Expected a string with maximum length 8, but got a string with length 11 instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": ""}"#,
+                "string_below_min_length",
+                "name",
+                "Invalid 'name': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "metadata": {"a": "1", "b": "2", "c": "3"}}"#,
+                "object_above_max_properties",
+                "metadata",
+                "Invalid 'metadata': too many properties. The object has 3 properties, but the maximum is 2.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "tags": []}"#,
+                "empty_array",
+                "tags",
+                "Invalid 'tags': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+            ),
+        ] {
+            let (status, json) = reject(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{body}: {json}");
+            assert_eq!(json["error"]["param"], param, "{body}: {json}");
+            assert_eq!(json["error"]["message"], sentence, "{body}: {json}");
+        }
     }
 }
 
