@@ -62,25 +62,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The pip download cache, restored on every ref and saved on main alone
-      # (the step after the installs): an entry a pull request saves is
-      # visible to that pull request only, and at about 0.2 GB each, beside
-      # about 1 GB each for the build cache below, those entries pushed
-      # main's larger ones out of the repository's 10 GB cache. A pull
-      # request restores the newest entry main saved and downloads the rest.
-      - name: Find the pip cache directory
-        id: pip-cache
-        run: echo "dir=$(pip cache dir)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore the pip cache
-        id: pip-restore
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ steps.pip-cache.outputs.dir }}
-          key: mlx-pr-test-pip-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/pyproject.toml') }}
-          restore-keys: |
-            mlx-pr-test-pip-${{ runner.os }}-${{ runner.arch }}-
-
+      # No pip cache: its 0.2 GB entry saved seconds of the installs below.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.0
 
@@ -133,15 +115,6 @@ jobs:
           python -c "import smg; print('smg OK')"
           python -c "from smg_client import SmgClient; print('smg_client OK')"
           python -c "import mlx_lm; print('mlx-lm OK')"
-
-      # After the installs and before the tests, so a failing test does not
-      # cost main the entry.
-      - name: Save the pip cache
-        if: github.ref == 'refs/heads/main' && steps.pip-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ steps.pip-cache.outputs.dir }}
-          key: ${{ steps.pip-restore.outputs.cache-primary-key }}
 
       - name: Run MLX E2E tests
         env:
