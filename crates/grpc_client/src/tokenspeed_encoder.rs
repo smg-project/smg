@@ -17,7 +17,10 @@ use std::{
 use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{channel::Channel, BoxedTraceInjector, NoopTraceInjector};
+use crate::{
+    channel::{connect_channel, Channel},
+    BoxedTraceInjector, NoopTraceInjector,
+};
 
 /// Process-global cache of connected channels, keyed by encode-worker endpoint.
 ///
@@ -88,7 +91,7 @@ impl TokenSpeedEncoderClient {
         );
         let mut built = Vec::with_capacity(ENCODE_CONNS_PER_ENDPOINT);
         for _ in 0..ENCODE_CONNS_PER_ENDPOINT {
-            built.push(crate::channel::connect_channel(endpoint).await?);
+            built.push(connect_channel(endpoint).await?);
         }
         {
             let mut cache = channel_cache()
