@@ -57,6 +57,7 @@ use super::{
 };
 use crate::{
     crdt_kv::CrdtWatermark,
+    kv::{MeshKV, RoundBatch},
     metrics,
     transport::{
         limits::{MAX_MESSAGE_SIZE, STREAM_HEARTBEAT_INTERVAL},
@@ -110,11 +111,11 @@ pub struct GossipController {
     /// Current stream round batch, drained once per round from MeshKV.
     /// Per-peer senders read this and filter targeted entries to their
     /// own peer; drain_entries are broadcast to every peer.
-    current_stream_batch: Arc<RwLock<Arc<crate::kv::RoundBatch>>>,
+    current_stream_batch: Arc<RwLock<Arc<RoundBatch>>>,
     /// Node-wide MeshKV handle. Owns the stream buffers, subscriber
     /// registry, and chunk assembler shared with the server-side
     /// SyncStream handlers.
-    mesh_kv: Option<Arc<crate::kv::MeshKV>>,
+    mesh_kv: Option<Arc<MeshKV>>,
 }
 
 impl GossipController {
@@ -132,7 +133,7 @@ impl GossipController {
             init_peers,
             dialer,
             sync_connections: Arc::new(Mutex::new(HashMap::new())),
-            current_stream_batch: Arc::new(RwLock::new(Arc::new(crate::kv::RoundBatch::default()))),
+            current_stream_batch: Arc::new(RwLock::new(Arc::new(RoundBatch::default()))),
             mesh_kv: None,
         }
     }
@@ -141,7 +142,7 @@ impl GossipController {
     /// builder so stream buffers, subscribers, and the chunk assembler
     /// are shared between client-side (outbound) and server-side
     /// (inbound) SyncStream handlers.
-    pub fn with_mesh_kv(mut self, mesh_kv: Arc<crate::kv::MeshKV>) -> Self {
+    pub fn with_mesh_kv(mut self, mesh_kv: Arc<MeshKV>) -> Self {
         self.mesh_kv = Some(mesh_kv);
         self
     }
@@ -149,7 +150,7 @@ impl GossipController {
     /// Get a handle to the shared stream RoundBatch. Used by GossipService
     /// so server-side sync_stream handlers see the same drained stream
     /// entries as client-side handlers.
-    pub fn current_stream_batch(&self) -> Arc<RwLock<Arc<crate::kv::RoundBatch>>> {
+    pub fn current_stream_batch(&self) -> Arc<RwLock<Arc<RoundBatch>>> {
         self.current_stream_batch.clone()
     }
 
