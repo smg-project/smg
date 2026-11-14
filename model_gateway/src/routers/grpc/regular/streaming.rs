@@ -46,6 +46,7 @@ use crate::{
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
         common::{
+            prefill_admission::PrefillLoadGuard,
             sse::{SseEncoder, SseSender},
             sse_rechunk,
         },
@@ -75,7 +76,6 @@ use crate::{
             wire::StreamShape,
         },
     },
-    worker::PrefillLoadGuard,
 };
 
 mod completion;
