@@ -136,6 +136,10 @@ struct Args {
     /// Prompt length in words (about one token each).
     #[arg(long, default_value_t = 64)]
     prompt_tokens: usize,
+    /// Maximum text content parts per chat user message (0: one string).
+    /// Splits on word boundaries without dropping text; other modes are unchanged.
+    #[arg(long, default_value_t = 0)]
+    text_parts: usize,
     /// Number of fixed shared heads the prompts cycle through.
     #[arg(long, default_value_t = 16)]
     prefix_pool: usize,
@@ -252,6 +256,23 @@ fn prompt(args: &Args, i: usize) -> String {
     let head = words(args.seed ^ 0x5EED_0000 ^ (i % pool) as u64, head_words);
     let tail = words(args.seed ^ 0x7A11_0000 ^ ((i as u64) << 20), tail_words);
     format!("{head} [session {i}] {tail}")
+}
+
+/// Builds a chat user message as a string (zero parts) or text content blocks.
+/// Splits after ASCII spaces, retaining every byte and emitting at most the
+/// requested number of parts; empty text produces an empty array. This controls
+/// request shape, not token equivalence across model chat templates.
+fn chat_user(text: String, text_parts: usize) -> Value {
+    if text_parts == 0 {
+        return user(text);
+    }
+    let words: Vec<_> = text.split_inclusive(' ').collect();
+    let per_part = words.len().div_ceil(text_parts).max(1);
+    let parts: Vec<_> = words
+        .chunks(per_part)
+        .map(|words| json!({"type": "text", "text": words.concat()}))
+        .collect();
+    json!({"role": "user", "content": parts})
 }
 
 fn user(text: impl Into<String>) -> Value {
@@ -411,7 +432,7 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
             Mode::Chat => {
                 let mut body = json!({
                     "model": args.model,
-                    "messages": [user(prompt(args, i))],
+                    "messages": [chat_user(prompt(args, i), args.text_parts)],
                     "max_tokens": args.max_tokens,
                     "stream": args.stream,
                     "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
@@ -1140,6 +1161,111 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text blocks preserve whitespace and Unicode, including boundary inputs.
+    #[test]
+    fn chat_text_parts_keep_every_byte_and_default_string_shape() {
+        for text in ["", "hello", "hello 世界  again ", "one two three four five"] {
+            assert_eq!(chat_user(text.to_owned(), 0), user(text));
+            for count in [1, 2, 16, usize::MAX] {
+                let body = chat_user(text.to_owned(), count);
+                let parts = body["content"].as_array().unwrap();
+                assert!(parts.len() <= count);
+                let joined: String = parts
+                    .iter()
+                    .map(|part| {
+                        assert_eq!(part["type"], "text");
+                        part["text"].as_str().unwrap()
+                    })
+                    .collect();
+                assert_eq!(joined, text);
+            }
+        }
+    }
+
+    /// Multiple parts are produced in order, with spaces retained at boundaries.
+    #[test]
+    fn chat_text_parts_split_at_word_boundaries() {
+        for (count, expected) in [
+            (1, vec!["one two three four five"]),
+            (2, vec!["one two three ", "four five"]),
+            (usize::MAX, vec!["one ", "two ", "three ", "four ", "five"]),
+        ] {
+            let actual = chat_user("one two three four five".to_owned(), count);
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|text| json!({"type": "text", "text": text}))
+                .collect();
+            assert_eq!(actual, json!({"role": "user", "content": expected}));
+        }
+        assert_eq!(chat_user(String::new(), 1)["content"], json!([]));
+    }
+
+    /// The CLI option reaches serialized chat bodies without changing other fields.
+    #[test]
+    fn chat_text_parts_are_wired_into_request_bodies() {
+        let mut options = Args::parse_from([
+            "stress_load",
+            "--mode",
+            "chat",
+            "--text-parts",
+            "4",
+            "--distinct",
+            "3",
+            "--stream",
+            "--json-schema",
+            "--logprobs",
+            "2",
+        ]);
+        let multipart = build_bodies(&options).unwrap();
+        options.text_parts = 0;
+        let strings = build_bodies(&options).unwrap();
+        assert_eq!(args(Mode::Chat).text_parts, 0);
+        assert_eq!(multipart.len(), strings.len());
+        for (parts, string) in multipart.iter().zip(&strings) {
+            let mut parts: Value = serde_json::from_slice(parts).unwrap();
+            let string: Value = serde_json::from_slice(string).unwrap();
+            let content = parts["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 4);
+            let joined: String = content
+                .iter()
+                .map(|part| {
+                    assert_eq!(part["type"], "text");
+                    part["text"].as_str().unwrap()
+                })
+                .collect();
+            assert_eq!(
+                Some(joined.as_str()),
+                string["messages"][0]["content"].as_str()
+            );
+            parts["messages"][0]["content"] = Value::String(joined);
+            assert_eq!(parts, string);
+        }
+    }
+
+    /// Text partitioning is limited to chat, leaving every other mode unchanged.
+    #[test]
+    fn chat_text_parts_leave_other_modes_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("image.png");
+        std::fs::write(&image, b"image fixture").unwrap();
+        for &mode in Mode::value_variants() {
+            if mode == Mode::Chat {
+                continue;
+            }
+            let mut options = args(mode);
+            if mode == Mode::Image {
+                options.image = vec![image.clone()];
+            }
+            let baseline = build_bodies(&options).unwrap();
+            let response = responses_body(&options, 3, Some("resp_1"));
+            options.text_parts = 4;
+            assert_eq!(build_bodies(&options).unwrap(), baseline, "{mode:?}");
+            if mode == Mode::Responses {
+                assert_eq!(responses_body(&options, 3, Some("resp_1")), response);
+            }
+        }
+    }
 
     fn args(mode: Mode) -> Args {
         Args::parse_from([
