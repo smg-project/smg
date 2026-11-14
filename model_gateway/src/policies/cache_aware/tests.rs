@@ -3304,7 +3304,7 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
     let thin = indexer.worker_id("http://w7:8000").unwrap();
     // The growth baselines date from the first table, built on the empty
     // fleet as on the run; the regrowth comes after.
-    policy.pool_table(&workers, &indexer, liveness::now_ms());
+    policy.pool_table(&workers, None, &indexer, liveness::now_ms());
     let regrown: Vec<u32> = (0..4_400).map(|i| 80_000_000 + i).collect();
     store_blocks(&indexer, thin, &regrown, 4, 8_000_000);
     assert_eq!(indexer.worker_block_count(thin), 1_100);
@@ -3322,6 +3322,7 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
             rebuilds += 1;
             policy.pool_table(
                 &workers,
+                None,
                 &indexer,
                 liveness::now_ms() + rebuilds * POOL_TABLE_REFRESH_MS,
             );
@@ -3380,10 +3381,12 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
     // counted.
     let table = policy.pool_table(
         &workers,
+        None,
         &indexer,
         liveness::now_ms() + (rebuilds + 1) * POOL_TABLE_REFRESH_MS,
     );
-    assert!(table.thin.is_empty(), "no longer thin: {:?}", table.thin);
+    let thin_rows = &table.rows().thin;
+    assert!(thin_rows.is_empty(), "no longer thin: {thin_rows:?}");
     let hits = policy.divert_hits.load(Ordering::Relaxed);
     for i in 0..32 {
         route_tokens(&policy, &workers, &request(20_000 + i));
@@ -5115,13 +5118,14 @@ fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
     let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
     let w3 = indexer.worker_id("http://w3:8000").unwrap();
-    let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
-    assert!(table.describes(&workers, &indexer));
-    assert!(table.fresh(liveness::now_ms()));
-    assert_eq!(table.position(w3, &workers), Some(2));
-    assert_eq!(table.id_at, vec![None, None, Some(w3)]);
+    let built = Arc::new(WorkersTable::build(&workers, &indexer, liveness::now_ms()));
+    assert!(built.describes(&workers, &indexer));
+    assert!(built.rows.fresh(liveness::now_ms()));
+    let table = PoolTable::Workers(Arc::clone(&built));
+    assert_eq!(table.candidate(w3, &workers), Some(2));
+    assert_eq!(built.rows.id_at, vec![None, None, Some(w3)]);
     assert_eq!(
-        table.position(w3 + 100, &workers),
+        table.candidate(w3 + 100, &workers),
         None,
         "an id never interned"
     );
@@ -5129,10 +5133,10 @@ fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     // table was built from the old one and says so.
     let mut swapped = workers.clone();
     swapped[2] = make_workers(&["http://w3:8000"]).remove(0);
-    assert_eq!(table.position(w3, &swapped), None);
+    assert_eq!(table.candidate(w3, &swapped), None);
     // Every worker was admitted just now: a young fleet lists nothing to slice.
-    assert!(table.warming.is_empty());
-    assert!(!table.fresh(liveness::now_ms() + POOL_TABLE_REFRESH_MS));
+    assert!(built.rows.warming.is_empty());
+    assert!(!built.rows.fresh(liveness::now_ms() + POOL_TABLE_REFRESH_MS));
 }
 
 /// Eight workers behind one policy and one event index, for the lists a
@@ -5270,7 +5274,7 @@ fn a_pool_table_describes_its_own_workers_at_any_address() {
     let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
     let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
     let weak_handles = Arc::weak_count(&workers[1]);
-    let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
+    let table = WorkersTable::build(&workers, &indexer, liveness::now_ms());
     let copy = workers.clone();
     assert!(
         table.describes(&copy, &indexer),
@@ -5370,9 +5374,11 @@ fn a_list_whose_first_worker_fails_reads_the_next_index() {
     );
 }
 
-/// The registry hands each model a slice of its own, and two models served
-/// by the same workers get two slices of the same handles. The second
-/// slice, coming under the second index, reads a table of that index.
+/// The regression test of a table keyed by its workers alone: the same
+/// handles in another slice come under the second index once the list's
+/// first admitted worker fails, and read a table of that index. A key of
+/// the slice's address passes it by the second slice's other address; the
+/// case above holds the same state on one slice.
 #[test]
 fn a_second_slice_of_the_same_workers_reads_its_own_index() {
     let (policy, workers, prompts) = mixed_primaries();
@@ -5389,26 +5395,34 @@ fn a_second_slice_of_the_same_workers_reads_its_own_index() {
 
 /// Only the rebuild of a stale table takes the building flag, and only it
 /// gives the flag back: a table built for a list that had none leaves a
-/// rebuild running beside it its flag.
+/// rebuild running beside it its flag, whether the list is named or not.
 #[test]
 fn a_build_for_a_new_list_leaves_a_running_rebuild_its_flag() {
     let policy = CacheAwarePolicy::with_config(test_config());
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.clone().into();
+    let name = NamedList {
+        list: &list,
+        positions: None,
+    };
     let indexer = Arc::new(KvIndex::chain());
     let now = liveness::now_ms();
-    // Another decision is rebuilding a stale table: it holds the flag.
-    policy.pool_table_building.store(true, Ordering::Release);
-    policy.pool_table(&workers, &indexer, now);
-    assert!(
-        policy.pool_table_building.load(Ordering::Acquire),
-        "a first build is no rebuild"
-    );
-    policy.pool_table_building.store(false, Ordering::Release);
-    // The same list past its refresh: this rebuild takes the flag and gives
-    // it back.
-    policy.pool_table(&workers, &indexer, now + POOL_TABLE_REFRESH_MS);
-    assert!(!policy.pool_table_building.load(Ordering::Acquire));
+    for named in [None, Some(&name)] {
+        // Another decision is rebuilding a stale table: it holds the flag.
+        policy.pool_table_building.store(true, Ordering::Release);
+        policy.pool_table(&workers, named, &indexer, now);
+        assert!(
+            policy.pool_table_building.load(Ordering::Acquire),
+            "a first build is no rebuild"
+        );
+        policy.pool_table_building.store(false, Ordering::Release);
+        // The same list past its refresh: this rebuild takes the flag and
+        // gives it back.
+        policy.pool_table(&workers, named, &indexer, now + POOL_TABLE_REFRESH_MS);
+        assert!(!policy.pool_table_building.load(Ordering::Acquire));
+    }
     assert_eq!(policy.pool_tables.load().len(), 1);
+    assert_eq!(policy.named_tables.load().len(), 1);
 }
 
 /// A list has one kept table wherever its slice lives: found inside the
@@ -5422,13 +5436,13 @@ fn a_list_has_one_kept_table_and_the_ninth_list_takes_the_oldest_place() {
     let workers = make_workers(&refs);
     let indexer = Arc::new(KvIndex::chain());
     let now = liveness::now_ms();
-    let first = policy.pool_table(&workers[..4], &indexer, now);
+    let first = policy.workers_table(&workers[..4], &indexer, now);
     let copy = workers[..4].to_vec();
     assert!(
-        Arc::ptr_eq(&first, &policy.pool_table(&copy, &indexer, now)),
+        Arc::ptr_eq(&first, &policy.workers_table(&copy, &indexer, now)),
         "the same list in another buffer reads the kept table"
     );
-    let rebuilt = policy.pool_table(&copy, &indexer, now + POOL_TABLE_REFRESH_MS);
+    let rebuilt = policy.workers_table(&copy, &indexer, now + POOL_TABLE_REFRESH_MS);
     assert!(!Arc::ptr_eq(&first, &rebuilt), "rebuilt past the period");
     assert_eq!(
         policy.pool_tables.load().len(),
@@ -5437,13 +5451,13 @@ fn a_list_has_one_kept_table_and_the_ninth_list_takes_the_oldest_place() {
     );
     // The same list under another index has a table of its own.
     let another = Arc::new(KvIndex::chain());
-    let under_another = policy.pool_table(&copy, &another, now + POOL_TABLE_REFRESH_MS);
+    let under_another = policy.workers_table(&copy, &another, now + POOL_TABLE_REFRESH_MS);
     assert!(!Arc::ptr_eq(&rebuilt, &under_another));
     assert_eq!(policy.pool_tables.load().len(), 2);
     // Eight younger lists, one worker each.
     for (i, worker) in workers.iter().enumerate() {
         let list = [Arc::clone(worker)];
-        policy.pool_table(&list, &indexer, now + POOL_TABLE_REFRESH_MS + 1 + i as u64);
+        policy.workers_table(&list, &indexer, now + POOL_TABLE_REFRESH_MS + 1 + i as u64);
     }
     let kept = policy.pool_tables.load();
     assert_eq!(kept.len(), POOL_TABLES_KEPT);
@@ -5451,6 +5465,298 @@ fn a_list_has_one_kept_table_and_the_ninth_list_takes_the_oldest_place() {
         kept.iter().all(|table| !table.describes(&copy, &indexer)),
         "the oldest table went"
     );
+}
+
+/// Route `tokens` over the workers of `list` at `positions`, the policy told
+/// which list they are cut from: the candidate picked.
+fn route_named(
+    policy: &CacheAwarePolicy,
+    list: &Arc<[Arc<dyn Worker>]>,
+    positions: &[usize],
+    tokens: &[u32],
+) -> usize {
+    let workers: Vec<Arc<dyn Worker>> = positions.iter().map(|&at| Arc::clone(&list[at])).collect();
+    policy
+        .select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                tokens: Some(tokens),
+                named: Some(NamedList {
+                    list,
+                    positions: Some(positions),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
+/// A list its caller names has ONE table whatever part of it a request may
+/// use: a prefill pool under its admission window hands the policy another
+/// open set with every request, and each finds the holder at its own place
+/// among the candidates without a table being built for it.
+#[test]
+fn a_named_list_has_one_table_whatever_part_of_it_is_open() {
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_with_holders(8);
+    // Worker 5 reports a queue: only its own prompt's affinity places a
+    // request on it.
+    update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 10_000, 0, 0]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    for positions in [&[0, 1, 2][..], &[0, 3, 5, 7], &[0]] {
+        assert_eq!(
+            route_named(&policy, &list, positions, &heads[0]),
+            0,
+            "the holder among {positions:?}"
+        );
+    }
+    assert_eq!(
+        route_named(&policy, &list, &[2, 5, 7], &heads[5]),
+        1,
+        "the holder's place among the candidates, not its row"
+    );
+    assert_eq!(
+        policy.named_tables.load().len(),
+        1,
+        "one table for the list"
+    );
+    assert!(
+        policy.pool_tables.load().is_empty(),
+        "and none by the workers of an open set"
+    );
+}
+
+/// A holder the request may not use is no candidate: its row is not among
+/// the positions, and the worker standing at that index among the
+/// candidates is never taken for it. The worker there reports a queue, so
+/// only a holder's affinity would place the request on it.
+#[test]
+fn a_holder_outside_the_open_set_is_skipped_not_misplaced() {
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_with_holders(8);
+    update_expected_wait_loads(&policy, &workers, &[0, 10_000, 0, 0, 0, 0, 0, 0]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    assert_eq!(
+        route_named(&policy, &list, &[0, 1, 2], &heads[1]),
+        1,
+        "the queued holder keeps its request while it is open"
+    );
+    let picked = route_named(&policy, &list, &[1, 2, 3], &heads[0]);
+    assert_ne!(
+        picked, 0,
+        "row 0 is closed: the worker at candidate 0 is not its holder"
+    );
+    assert_eq!(
+        policy.misplaced.load(Ordering::Relaxed),
+        0,
+        "a closed holder is no mismatch: nothing is counted"
+    );
+}
+
+/// The caller's word is checked where it is used. Positions that do not
+/// match the workers beside them (here shifted by one) lose the holder,
+/// counted on the policy and said at the next publish of a named table, and
+/// the request is placed by load: never on the neighbour the positions
+/// pointed at.
+#[test]
+fn positions_that_do_not_match_their_workers_lose_the_holder_and_are_counted() {
+    let HolderFleet {
+        policy,
+        workers,
+        indexer,
+        heads,
+    } = fleet_with_holders(8);
+    update_expected_wait_loads(&policy, &workers, &[0, 10_000, 0, 0, 0, 0, 0, 0]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    // The candidates are the list's workers 1, 2 and 3; the positions say
+    // 0, 1 and 2. The request's holder is the list's worker 0.
+    let candidates = list[1..4].to_vec();
+    let picked = policy
+        .select_worker(
+            &candidates,
+            &SelectWorkerInfo {
+                tokens: Some(&heads[0]),
+                named: Some(NamedList {
+                    list: &list,
+                    positions: Some(&[0, 1, 2]),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(
+        picked, 0,
+        "the queued worker at candidate 0 is not the holder"
+    );
+    assert_eq!(policy.named_tables.load().len(), 1);
+    assert!(
+        policy.misplaced.load(Ordering::Relaxed) >= 1,
+        "the lost holder is counted"
+    );
+    // The next publish says what was lost and starts the count again.
+    policy.named_table(&list, &indexer, liveness::now_ms() + POOL_TABLE_REFRESH_MS);
+    assert_eq!(policy.misplaced.load(Ordering::Relaxed), 0);
+}
+
+/// The warm-up reads the pool, not the workers open to one request. Four of
+/// eight workers are new and hold nothing; the level is the upper median of
+/// the whole list (1,100 blocks), so the four are thin whoever is open.
+/// Among one busy holder and three new workers the open set's own median is
+/// an empty index: read over it, nobody is thin and the holder keeps every
+/// hit. A named list diverts a hit to a new worker inside one window.
+#[test]
+fn the_warm_up_reads_the_level_of_the_pool_not_of_the_open_workers() {
+    let request = |heads: &[Vec<u32>], i: usize| -> Vec<u32> {
+        let mut tokens = heads[0].clone();
+        tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+        tokens
+    };
+    let open = [0usize, 4, 5, 6];
+
+    // The list nobody names: a table of the four open workers.
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_with_holders(4);
+    workers[0].increment_load();
+    let candidates: Vec<Arc<dyn Worker>> =
+        open.iter().map(|&at| Arc::clone(&workers[at])).collect();
+    for i in 0..32 {
+        assert_eq!(
+            route_tokens(&policy, &candidates, &request(&heads, i)),
+            0,
+            "no thin worker against a level of nothing"
+        );
+    }
+
+    // The same pool, named: the level and the thin workers are the pool's.
+    let HolderFleet {
+        policy,
+        workers,
+        indexer,
+        heads,
+    } = fleet_with_holders(4);
+    workers[0].increment_load();
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    let diverted = (0..32)
+        .map(|i| route_named(&policy, &list, &open, &request(&heads, i)))
+        .filter(|&candidate| candidate != 0)
+        .count();
+    assert!(diverted >= 1, "a hit goes to a new worker: {diverted}");
+    let table = policy.named_table(&list, &indexer, liveness::now_ms());
+    assert_eq!(table.rows.fleet_level, 1_100);
+    assert_eq!(
+        table.rows.thin,
+        vec![4, 5, 6, 7],
+        "the pool's thin workers, open or not"
+    );
+    // A miss goes through the slice, which reads each open worker's block
+    // count at its row in the list: read at its place among the candidates,
+    // the three new workers would show the settled workers 1 to 3 and none
+    // would be warming.
+    let miss: Vec<u32> = (0..64).map(|t| 95_000_000 + t).collect();
+    assert_eq!(policy.warmup_misses.load(Ordering::Relaxed), 0);
+    assert_ne!(
+        route_named(&policy, &list, &open, &miss),
+        0,
+        "a miss goes to a new worker"
+    );
+    assert_eq!(
+        policy.warmup_misses.load(Ordering::Relaxed),
+        1,
+        "through the warm-up slice"
+    );
+}
+
+/// Nine named lists keep nine tables: the bound of eight is the unnamed
+/// lists'. A named table is found by its list and its index, keeps neither
+/// alive, and leaves at the first publish after its list died.
+#[test]
+fn a_named_table_lives_as_long_as_its_list() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    let named = |list: &Arc<[Arc<dyn Worker>]>, indexer: &Arc<KvIndex>| {
+        policy.named_table(list, indexer, now)
+    };
+    let mut lists: Vec<Arc<[Arc<dyn Worker>]>> = (0..9)
+        .map(|i| make_workers(&[format!("http://w{i}:8000").as_str()]).into())
+        .collect();
+    let tables: Vec<Arc<NamedTable>> = lists.iter().map(|list| named(list, &indexer)).collect();
+    assert_eq!(policy.named_tables.load().len(), 9);
+    assert!(policy.pool_tables.load().is_empty());
+    for (list, table) in lists.iter().zip(&tables) {
+        assert!(
+            Arc::ptr_eq(table, &named(list, &indexer)),
+            "each list reads its own table"
+        );
+    }
+    // The same list under another index has a table of its own.
+    let another = Arc::new(KvIndex::chain());
+    assert!(!Arc::ptr_eq(&tables[0], &named(&lists[0], &another)));
+    assert_eq!(policy.named_tables.load().len(), 10);
+    // Neither the list nor the index is kept alive.
+    assert_eq!(Arc::strong_count(&lists[8]), 1);
+    assert_eq!(Arc::strong_count(&another), 1);
+    drop(tables);
+    // A list and an index die; the next publish drops their tables.
+    drop(lists.pop());
+    drop(another);
+    let fresh: Arc<[Arc<dyn Worker>]> = make_workers(&["http://w9:8000"]).into();
+    named(&fresh, &indexer);
+    assert_eq!(
+        policy.named_tables.load().len(),
+        9,
+        "eight live lists and the new one"
+    );
+}
+
+/// One decision rebuilds a stale table while the others read it: a named
+/// list's and an unnamed one's alike. The flag is taken by the rebuild and
+/// given back by it.
+#[test]
+fn a_stale_table_is_rebuilt_by_one_decision_while_the_others_read_it() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.clone().into();
+    let name = NamedList {
+        list: &list,
+        positions: None,
+    };
+    for named in [None, Some(&name)] {
+        let first = policy.pool_table(&workers, named, &indexer, now);
+        // Another decision holds the flag: this one reads the stale table.
+        policy.pool_table_building.store(true, Ordering::Release);
+        let read = policy.pool_table(&workers, named, &indexer, now + POOL_TABLE_REFRESH_MS);
+        assert!(
+            std::ptr::eq(first.rows(), read.rows()),
+            "the stale table serves while it is rebuilt"
+        );
+        policy.pool_table_building.store(false, Ordering::Release);
+        let rebuilt = policy.pool_table(&workers, named, &indexer, now + POOL_TABLE_REFRESH_MS);
+        assert!(
+            !std::ptr::eq(first.rows(), rebuilt.rows()),
+            "the next one rebuilds it"
+        );
+        assert!(
+            !policy.pool_table_building.load(Ordering::Acquire),
+            "and gives the flag back"
+        );
+    }
+    assert_eq!(policy.pool_tables.load().len(), 1);
+    assert_eq!(policy.named_tables.load().len(), 1);
 }
 
 /// `count` workers that all hold the shared block `[1, 2, 3, 4]` (a chat

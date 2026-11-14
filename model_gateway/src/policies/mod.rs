@@ -476,6 +476,44 @@ pub struct SelectWorkerInfo<'a> {
     /// placement over regular workers also sets it for a request its policy
     /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
     pub overload_lifted: bool,
+    /// The list of the routing snapshot the candidates are cut from, when
+    /// the caller names it ([`NamedList`]). A policy that keeps state per
+    /// list finds it by the list's own address, whatever part of the list
+    /// this request may use; without a name the policy reads which workers
+    /// it was handed.
+    pub named: Option<NamedList<'a>>,
+}
+
+/// The candidates of a selection as a part of a list the routing snapshot
+/// owns. The list never changes while it lives (a membership change makes a
+/// new one), so its address names it, and a candidate is a position in it.
+#[derive(Clone, Copy)]
+pub struct NamedList<'a> {
+    /// The snapshot's own list.
+    pub list: &'a Arc<[Arc<dyn Worker>]>,
+    /// Candidate `k` is `list[positions[k]]`, ascending; `None` when the
+    /// candidates are the whole list in its order.
+    pub positions: Option<&'a [usize]>,
+}
+
+impl NamedList<'_> {
+    /// The candidate that is the list's worker at `row`, when the request
+    /// may use that worker.
+    pub(crate) fn candidate(&self, row: usize) -> Option<usize> {
+        match self.positions {
+            None => Some(row),
+            Some(positions) => positions.binary_search(&row).ok(),
+        }
+    }
+}
+
+impl Debug for NamedList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamedList")
+            .field("list", &self.list.len())
+            .field("positions", &self.positions.map(<[usize]>::len))
+            .finish()
+    }
 }
 
 impl SelectWorkerInfo<'_> {

@@ -30,8 +30,9 @@
 //!   by every routing path (regular, PD, fallback, external provider)
 //! - `test_support` (test builds only) — the fast retry policy the HTTP
 //!   and gRPC routers' tests retry under
-//! - `bench_support` (test builds and the `test-util` feature) — the pair
-//!   selection over a registered fleet, for a benchmark of the pair path
+//! - `bench_support` (test builds and the `test-util` feature) — the
+//!   regular and the pair selection over a registered fleet, for a
+//!   benchmark of each path
 //! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
@@ -205,19 +206,84 @@ pub(crate) fn attach_sized_body(
     }
 }
 
-/// What a benchmark needs of the pair path: the default pair selection over
-/// one model's registered prefill-decode fleet, as a router runs it for a
-/// request.
+/// What a benchmark needs of the routers' selection: the regular placement
+/// over one model's registered pool and the default pair selection over its
+/// registered prefill-decode fleet, each as a router runs it for a request,
+/// and whether the process captures every request's cache trace.
 #[cfg(any(test, feature = "test-util"))]
 pub mod bench_support {
     use std::sync::Arc;
 
-    use super::placement::{select_pair, PlacementInputs};
+    use super::placement::{select_pair, select_single, PlacementInputs};
     use crate::{
         observability::cache_trace,
         policies::PolicyRegistry,
-        worker::{PdPairIndex, PdWire, Worker, WorkerRegistry},
+        worker::{PdPairIndex, PdWire, RoutingPool, Worker, WorkerRegistry},
     };
+
+    /// Whether a process switch captures every request's cache trace
+    /// (`SMG_CACHE_TRACE=1` or `SMG_CACHE_TRACE_HEADER=1`). A benchmark cell
+    /// labelled untraced is not untraced in such a process.
+    pub fn process_trace_configured() -> bool {
+        cache_trace::configured()
+    }
+
+    /// One model's regular pool over the gRPC pipeline and its policies.
+    pub struct RegularPath {
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        model: String,
+    }
+
+    impl RegularPath {
+        /// The regular pool of `model` as `registry` holds it at each
+        /// placement.
+        pub fn new(
+            registry: Arc<WorkerRegistry>,
+            policies: Arc<PolicyRegistry>,
+            model: &str,
+        ) -> Self {
+            Self {
+                registry,
+                policies,
+                model: model.to_string(),
+            }
+        }
+
+        /// One placement of a request carrying `tokens`, with no filter, no
+        /// wire pin and no tried engine: the pool drawn from the registry
+        /// and one policy pick over it.
+        pub fn place(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            self.select(PlacementInputs {
+                tokens,
+                ..Default::default()
+            })
+        }
+
+        /// [`Self::place`] under a candidate filter that refuses nobody, the
+        /// sequence both routers run on a request's first attempt: the HTTP
+        /// router hands its attempt ledger as the filter, the gRPC pipeline
+        /// the request's media and context demands.
+        pub fn place_filtered(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            let everyone = |_: &dyn Worker| true;
+            self.select(PlacementInputs {
+                tokens,
+                candidate_filter: Some(&everyone),
+                ..Default::default()
+            })
+        }
+
+        fn select(&self, inputs: PlacementInputs<'_>) -> Option<Arc<dyn Worker>> {
+            select_single(
+                &self.registry,
+                &self.policies,
+                &self.model,
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+            )
+        }
+    }
 
     /// One model's fleet, its policies and its pair index over the gRPC wire.
     pub struct PairPath {
