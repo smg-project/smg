@@ -65,6 +65,16 @@ tonic-health = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
+# The plugin host measures a call's bound on the CPU its thread had: the
+# thread CPU clock, read only at a tick a call is still in flight. Already in
+# the tree under the WebAssembly runtime. Where no such clock exists the
+# bound stays on the wall clock. `use-libc-auxv`: the clock's first read
+# looks for the kernel's fast path through the process's auxiliary vector,
+# and the library's own read of it faults where a tool hides that page from
+# the process (a run under valgrind); libc's read is the one such tools serve.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "time", "use-libc-auxv"], optional = true }
+
 [features]
 # The ingestion drivers over the store: the load path (the `GetLoads` poll
 # per engine under the store's poll arbitration, the metrics scrape of an
@@ -102,7 +112,7 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
-wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing"]
+wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 
 [dev-dependencies]
 criterion = "0.8"
