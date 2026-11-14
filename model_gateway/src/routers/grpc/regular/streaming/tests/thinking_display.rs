@@ -46,6 +46,8 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         });

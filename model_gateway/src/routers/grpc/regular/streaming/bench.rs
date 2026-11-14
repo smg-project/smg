@@ -3,9 +3,9 @@
 //! over an engine stream of pre-encoded gRPC frames decoded by the client's
 //! own codec (no socket under it), writing to the bounded SSE channel a
 //! client reads from, with the bytes written as the result. The gRPC router
-//! module re-exports `EngineScript` and `StreamBench`, the face
-//! `benches/stream_state_machines.rs` sees; the module is compiled for the
-//! crate's test targets only.
+//! module re-exports `EngineScript`, `StreamBench` and `ForcedChat`, the face
+//! `benches/stream_state_machines.rs` and `benches/forced_call_stream.rs`
+//! see; the module is compiled for the crate's test targets only.
 
 #![expect(
     clippy::expect_used,
@@ -20,7 +20,9 @@ use futures::{stream, Stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::{chat::ChatCompletionRequest, completion::CompletionRequest};
+use openai_protocol::{
+    chat::ChatCompletionRequest, completion::CompletionRequest, profile::ProviderProfile,
+};
 use prost::Message as ProstMessage;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
@@ -28,7 +30,10 @@ use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
     VllmEngineClient,
 };
-use symphony::{formats::qwen3, CallSyntax};
+use symphony::{
+    formats::{qwen3, Table},
+    CallSyntax,
+};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tonic::{
     codec::Codec,
@@ -44,7 +49,7 @@ use crate::{
         grpc::{
             context::DispatchMetadata,
             proto_wrapper::ProtoStream,
-            regular::symphony::Assignment,
+            regular::symphony::{assign_for, Asks, Assignment, Reading},
             spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
             utils::ParserResolver,
         },
@@ -134,6 +139,83 @@ fn trailers_frame() -> Frame<Bytes> {
     Frame::trailers(trailers)
 }
 
+/// A chat request whose `tool_choice` forces a call, read as the gateway reads
+/// it under the JSON schema the older registry writes for such a call: the
+/// request, its model's table and the prompt's tail, and the response's spec
+/// with the reader the gateway assigns ([`assign_for`]).
+pub struct ForcedChat {
+    request: ChatCompletionRequest,
+    table: Table,
+    prompt: &'static str,
+    schema: (String, String),
+    spec: ChatResponseSpec,
+}
+
+impl ForcedChat {
+    /// The request on a model whose table reads a thought (Qwen3), the
+    /// reasoning separated: `tool_choice` names the declared function when
+    /// `named` and requires a call otherwise.
+    pub fn on_a_thought_table(named: bool) -> Self {
+        Self::new(Table::Qwen3, "<|im_start|>assistant\n", named, true)
+    }
+
+    /// The same request on a model whose table reads no thought (Llama 4),
+    /// which separates none.
+    pub fn on_a_plain_table(named: bool) -> Self {
+        Self::new(
+            Table::Llama4,
+            "<|header_start|>assistant<|header_end|>",
+            named,
+            false,
+        )
+    }
+
+    fn new(table: Table, prompt: &'static str, named: bool, separate_reasoning: bool) -> Self {
+        let tool_choice = if named {
+            json!({"type": "function", "function": {"name": "lookup"}})
+        } else {
+            json!("required")
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true,
+            "separate_reasoning": separate_reasoning,
+            "tool_choice": tool_choice,
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }}]
+        }))
+        .expect("a chat request");
+        let mut forced = Self {
+            spec: ChatResponseSpec::from(&request),
+            request,
+            table,
+            prompt,
+            schema: ("json_schema".to_string(), "{}".to_string()),
+        };
+        forced.spec.symphony = forced.assignment();
+        forced
+    }
+
+    /// The gateway's assignment of the response's reader, which request
+    /// building asks once per request: whether a table reads the response.
+    pub fn assign(&self) -> bool {
+        self.assignment().is_some()
+    }
+
+    fn assignment(&self) -> Option<Assignment> {
+        assign_for(
+            Reading::Table(self.table.shared(), false),
+            Asks::Chat(&self.request),
+            Some(&self.schema),
+            self.prompt,
+            ProviderProfile::for_model(MODEL),
+        )
+    }
+}
+
 /// The stream drivers, ready to run a script: one streaming processor over
 /// the legacy parser factories (the tool parser `json`, the reasoning parser
 /// `qwen3`), the character tokenizer, the chat request's spec under the
@@ -175,6 +257,8 @@ impl StreamBench {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: tracing::Span::none(),
             marked: Arc::default(),
         });
@@ -230,6 +314,12 @@ impl StreamBench {
     /// A chat stream under Symphony's Qwen3 table: the bytes written.
     pub async fn chat_symphony(&self, script: &EngineScript) -> usize {
         self.chat_under(&self.chat_symphony, script).await
+    }
+
+    /// The response stream of a chat request that forces a call, under the
+    /// reader the gateway assigns it: the bytes written.
+    pub async fn chat_forced(&self, forced: &ForcedChat, script: &EngineScript) -> usize {
+        self.chat_under(&forced.spec, script).await
     }
 
     async fn chat_under(&self, spec: &ChatResponseSpec, script: &EngineScript) -> usize {

@@ -125,8 +125,17 @@ impl crate::engine::CallAssembler for Assembler {
         self.feed(text, declared, out)
     }
 
+    /// A terminal with a row out of the state leaves it only before the value's first byte, where
+    /// a table that reads a thought before the call has the thought's opener
+    /// ([`Format::with_forced_call`](crate::Format::with_forced_call)). Once the value began,
+    /// every terminal is its text, as a JSON string may hold any, or text after it.
+    fn closes(&mut self, _terminal: &str) -> bool {
+        !self.started && !self.unnamed
+    }
+
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
-        // The table has no terminal that closes the region; the end of the stream does.
+        // No terminal closes the call; the end of the stream does. A terminal that leaves the
+        // state before the value began ([`Self::closes`]) finds nothing to end.
         (*self).finish(out);
         false
     }

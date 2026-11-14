@@ -41,8 +41,8 @@ pub(crate) struct Prepared {
     /// cannot constrain the request. Request building decides on the selected
     /// worker (`regular::symphony::worker_constraint`).
     pub constraint: PreparedConstraint,
-    /// The constraint is a JSON schema: the older path's forced call, under
-    /// which no table reads.
+    /// The constraint is a JSON schema: the older registry's forced call,
+    /// whose JSON has none of the table's markers.
     pub json_schema: bool,
     /// The decoder keeps the special tokens the reader of the response needs:
     /// a table's markers, or a legacy reasoning parser's.
@@ -86,11 +86,11 @@ pub(crate) struct Prepared {
 /// logged under `stage`). A table whose markers the decoder would drop as
 /// special tokens needs them kept whatever the request asks of the channels:
 /// without them the table reads neither the thought nor the calls
-/// (`regular::symphony::keeps_special_tokens_for`); under a JSON-schema constraint
-/// no table reads (request building makes no assignment), so the legacy
-/// parsers answer for themselves, as they do where no table reads at all: a
-/// reasoning parser that needs its control tokens, for a request that
-/// separates the reasoning.
+/// (`regular::symphony::keeps_special_tokens_for`), under a JSON-schema
+/// constraint too, where the table still reads the thought ahead of the
+/// forced call's JSON (`regular::symphony::assign_for`). Where no table reads
+/// at all the legacy parsers answer for themselves: a reasoning parser that
+/// needs its control tokens, for a request that separates the reasoning.
 pub(crate) fn prepare(
     ctx: &RequestContext,
     asks: Asks<'_>,
@@ -187,8 +187,8 @@ pub(crate) fn prepare(
     let keeps_special_tokens = match reading.as_ref().ok().and_then(|read| {
         symphony::keeps_special_tokens_for(read, model, &ctx.components.templates, tokenizer)
     }) {
-        Some(kept) if !json_schema => kept,
-        _ => {
+        Some(kept) => kept,
+        None => {
             !asks.no_reasoning()
                 && utils::reasoning_parser_requires_special_tokens(
                     &ctx.components.reasoning_parser_factory,
@@ -372,8 +372,8 @@ pub(crate) fn decide(
         ctx.state.constraint_decided_on = Some(decoding);
     }
     // The table's constraint, as Symphony's assignment reads it below: a
-    // `json_schema` pair there is the older path's forced call, which the
-    // legacy parsers read.
+    // `json_schema` pair there is the older registry's forced call, which the
+    // table reads with its forced call.
     let tabled = decided.constraint.map(|constraint| constraint.to_tuple());
     let provider = ctx
         .state

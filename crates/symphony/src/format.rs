@@ -274,6 +274,18 @@ pub enum Whitespace {
     Bounded(u32),
 }
 
+/// How the JSON of a forced call is written under the gateway's JSON-schema constraint
+/// ([`Format::with_forced_call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForcedCall {
+    /// The arguments object alone, of the function the request names
+    /// ([`CallSyntax::ForcedArguments`]).
+    Arguments,
+    /// A list of `{"name": …, "parameters": …}` objects, as a required call writes them
+    /// ([`CallSyntax::JsonAlone`]).
+    List,
+}
+
 /// Where a call's id comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CallId {
@@ -971,6 +983,104 @@ impl Format {
             }
         }
         self.calls = None;
+        self.layout = None;
+        self
+    }
+
+    /// The table for a request whose call the gateway's JSON-schema constraint forces, where the
+    /// engine holds the output to the schema only once the model's thought is over: the output
+    /// is the thought, as the table reads it, and then the JSON alone, with no call marker, no
+    /// name outside the JSON and no answer. The thought's states stay, with every row into, out
+    /// of and between them; every other state is one arguments state, the first, which reads
+    /// the JSON as `written` says: the arguments of the function the request names
+    /// ([`Declared::forcing`](crate::Declared::forcing)), or the list a required call writes.
+    /// So the output starts in the call unless the prompt's replay, an anchor or the unopened
+    /// row leaves it inside the thought, and the thought's close, wherever the table's own row
+    /// led, opens the call.
+    ///
+    /// A row out of the arguments state is taken only before the JSON's first byte, where a
+    /// marker is the template's framing: the thought's opener enters the thought, and any other
+    /// marker with a row from a state that is now this one (an answer's opener) is dropped as
+    /// wrapping. From the first byte on every marker is the call's text, which a JSON string
+    /// may hold: the assemblers of the two syntaxes close at no terminal once their value began.
+    /// The rows the parser alone reads (the leading and the recovery rows) are rows like the
+    /// others here; where two states that are now one read a marker differently, the row the
+    /// table lists first stands. An anchor that named a state other than a thought's names the
+    /// arguments state. An unopened row that named one goes, since the row cannot name a state
+    /// that holds a call ([`Self::validate`]), and so does a start row, the turn's first byte
+    /// being the call's. The layout goes, and the call's id is the engine's. The table keeps
+    /// its name: the model's table reads the output.
+    ///
+    /// A table without a thought becomes the arguments state alone, its markers dropped before
+    /// the JSON: what [`forced`](crate::formats::forced()) and [`json`](crate::formats::json())
+    /// read, for an output that is the JSON from its first byte. The variant
+    /// [`Self::without_reasoning`] makes of this one reads the thought as content and keeps its
+    /// markers dropped, which here are the rows into and out of the call.
+    #[must_use]
+    pub fn with_forced_call(mut self, written: ForcedCall) -> Self {
+        let mut states = vec![State {
+            name: "forced".to_string(),
+            emits: Emits::Arguments,
+            framing: false,
+            trimmed: false,
+            kept: false,
+            closes_at_stop: false,
+            remade: false,
+        }];
+        // Where each state of the table stands in the variant: a thought's state after the
+        // arguments state, in the table's order, every other state at the arguments state.
+        let moved: Vec<usize> = self
+            .states
+            .iter()
+            .map(|state| {
+                if state.emits == Emits::Reasoning {
+                    states.push(state.clone());
+                    states.len() - 1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut rows: Vec<Transition> = Vec::with_capacity(self.transitions.len());
+        for row in self
+            .transitions
+            .iter()
+            .chain(&self.leading_transitions)
+            .chain(&self.recovery_transitions)
+        {
+            let row = Transition {
+                from: moved[row.from],
+                on: row.on,
+                to: moved[row.to],
+            };
+            if !rows
+                .iter()
+                .any(|kept| kept.from == row.from && kept.on == row.on)
+            {
+                rows.push(row);
+            }
+        }
+        for anchor in &mut self.anchors {
+            anchor.state = moved[anchor.state];
+        }
+        self.unopened = self
+            .unopened
+            .take()
+            .map(|row| Unopened {
+                state: moved[row.state],
+                end: row.end,
+            })
+            .filter(|row| row.state != 0);
+        self.start = None;
+        self.states = states;
+        self.transitions = rows;
+        self.leading_transitions = Vec::new();
+        self.recovery_transitions = Vec::new();
+        self.calls = Some(match written {
+            ForcedCall::Arguments => CallSyntax::ForcedArguments,
+            ForcedCall::List => CallSyntax::JsonAlone(None),
+        });
+        self.call_id = CallId::Minted;
         self.layout = None;
         self
     }

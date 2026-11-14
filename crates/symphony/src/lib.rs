@@ -50,7 +50,7 @@ mod tokens;
 pub use declared::Declared;
 pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
-pub use format::{CallId, CallSyntax, Emits, Format, Whitespace};
+pub use format::{CallId, CallSyntax, Emits, ForcedCall, Format, Whitespace};
 pub use grammar::{
     Bound, Grammar, GrammarBackend, GrammarStart, Output, OutputAnswer, OutputChoice,
     OutputPosition, OutputSpelling, Spelling, Tag, Turn, Unspelled,

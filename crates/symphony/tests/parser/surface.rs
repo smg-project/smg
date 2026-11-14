@@ -41,7 +41,14 @@ const RE_EXPORTS: [(&str, &[&str]); 9] = [
     ),
     (
         "format",
-        &["CallId", "CallSyntax", "Emits", "Format", "Whitespace"],
+        &[
+            "CallId",
+            "CallSyntax",
+            "Emits",
+            "ForcedCall",
+            "Format",
+            "Whitespace",
+        ],
     ),
     (
         "grammar",
