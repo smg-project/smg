@@ -4466,7 +4466,7 @@ pub(super) const WORD: &[(u32, u32)] = &[
 /// For each ASCII letter, the non-ASCII characters `(?i:...)` also accepts for it.
 pub(super) const FOLD_EXTRA: &[(u8, &[char])] = &[(b'k', &['\u{212a}']), (b's', &['\u{17f}'])];
 
-/// The toolchain's `char::is_numeric` set (146 ranges): what `Digits` splits on;
+/// The toolchain's `char::is_numeric` set (148 ranges): what `Digits` splits on;
 /// the regex engine's `\p{N}` is another Unicode version.
 pub(super) const STD_NUMERIC: &[(char, char)] = &[
     ('\u{30}', '\u{39}'),
@@ -4588,7 +4588,9 @@ pub(super) const STD_NUMERIC: &[(char, char)] = &[
     ('\u{11de0}', '\u{11de9}'),
     ('\u{11f50}', '\u{11f59}'),
     ('\u{11fc0}', '\u{11fd4}'),
-    ('\u{12400}', '\u{1246e}'),
+    ('\u{12400}', '\u{1246f}'),
+    ('\u{12475}', '\u{1247f}'),
+    ('\u{12550}', '\u{12686}'),
     ('\u{16130}', '\u{16139}'),
     ('\u{16a60}', '\u{16a69}'),
     ('\u{16ac0}', '\u{16ac9}'),
