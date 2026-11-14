@@ -314,6 +314,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // frame; the prompt opens the thought after `<|Bot|>` (`<think>`, no newline), or writes a
     // bare `</think>` there when the request turns thinking off.
     ("spark-x2.6-4b", GenerationPrompt::OpensTheThought),
+    // MiniMax-M3.1-Flash ships a template of its own in M3's spelling (the thought closed with
+    // `</mm:think>`, an XML tree of arguments); the generation prompt adds nothing.
+    ("minimax-m3.1-flash", GenerationPrompt::ModelDecides),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
