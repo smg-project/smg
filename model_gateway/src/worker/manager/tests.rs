@@ -2433,6 +2433,37 @@ fn fleet_loads_with_no_polled_workers_has_no_aggregate() {
     assert!(body.aggregate.is_none());
 }
 
+/// The fleet's loads are answered on a public route: a worker registered
+/// with a password and a token in its query is named by its masked address,
+/// one with nothing to mask by the address as registered.
+#[test]
+fn fleet_loads_names_a_worker_by_its_masked_address() {
+    let registry = WorkerRegistry::new();
+    let with_secrets = "http://user:s3cret@w:1/?token=s3cret";
+    registry.register(make_worker(with_secrets, 1, 1)).unwrap();
+    registry.register(make_worker("http://w:2", 1, 1)).unwrap();
+    let snapshot = LoadSnapshot::from_loads_for_test(vec![
+        (with_secrets.to_string(), load_report(&[(0, 4, 1, 0.25)])),
+        ("http://w:2".to_string(), load_report(&[(0, 2, 0, 0.5)])),
+    ]);
+
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+
+    let answered = serde_json::to_string(&body).expect("the answer as JSON");
+    assert!(
+        !answered.contains("s3cret"),
+        "the answer carries the secret: {answered}"
+    );
+    let named: Vec<_> = body
+        .loads
+        .iter()
+        .filter_map(|rank| rank.worker.as_deref())
+        .collect();
+    assert_eq!(named.len(), 2, "{named:?}");
+    assert!(named[0].starts_with("http://***@w:1"), "{named:?}");
+    assert_eq!(named[1], "http://w:2");
+}
+
 /// A fleet where one worker's admin endpoint fails: both calls count the failed worker in
 /// their summary and name it in the failed list.
 #[tokio::test]
