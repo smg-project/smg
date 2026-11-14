@@ -378,7 +378,15 @@ fn sentence_of(path: &str, error: &ValidationError) -> Option<String> {
             let code = range_code(error);
             let (what, got) = match value {
                 Some(v) if v.is_i64() || v.is_u64() => ("an integer", v.to_string()),
-                Some(v) => ("a value", v.to_string()),
+                Some(v) => match v.as_f64() {
+                    // A decimal field (an `f32` throughout the crate) reaches
+                    // the report widened to `f64` (`2.1` as
+                    // `2.0999999046325684`): a value that round-trips through
+                    // `f32` prints as one.
+                    Some(f) if f64::from(f as f32) == f => ("a value", (f as f32).to_string()),
+                    Some(f) => ("a value", f.to_string()),
+                    None => return None,
+                },
                 None => return None,
             };
             let (sign, limit) = if code.ends_with("_below_min_value") {
@@ -404,33 +412,29 @@ fn sentence_of(path: &str, error: &ValidationError) -> Option<String> {
         }
         "length" => {
             let code = length_code(error);
-            let (what, len) = match value {
-                Some(Value::String(text)) => ("a string", text.chars().count()),
-                Some(Value::Array(items)) => ("an array", items.len()),
-                Some(Value::Object(members)) => ("an object", members.len()),
+            let (kind, what, len) = match value {
+                Some(Value::String(text)) => ("string", "a string", text.chars().count()),
+                Some(Value::Array(items)) => ("array", "an array", items.len()),
+                Some(Value::Object(members)) => ("object", "an object", members.len()),
                 _ => return None,
             };
-            if code == "empty_array" {
-                return Some(format!(
-                    "Invalid '{field}': empty array. Expected an array with minimum length 1, but got an empty array instead."
-                ));
-            }
-            let (bound_word, limit) = if code.contains("_below_min_") {
-                ("minimum", bound(error, "min"))
+            let below = code == "empty_array" || code.contains("_below_min_");
+            let limit = bound(error, if below { "min" } else { "max" })?;
+            let (bound_word, words) = if below {
+                ("minimum", "too short")
             } else {
-                ("maximum", bound(error, "max"))
+                ("maximum", "too long")
             };
-            let limit = limit?;
-            let unit = if code.ends_with("_properties") {
-                "properties"
+            Some(if kind == "object" {
+                // The routes' form for a property count.
+                let words = if below { "too few" } else { "too many" };
+                let noun = if len == 1 { "property" } else { "properties" };
+                format!("Invalid '{field}': {words} properties. The object has {len} {noun}, but the {bound_word} is {limit}.")
+            } else if below && len == 0 {
+                format!("Invalid '{field}': empty {kind}. Expected {what} with minimum length {limit}, but got an empty {kind} instead.")
             } else {
-                "length"
-            };
-            let words = code
-                .replace("_min_", " minimum ")
-                .replace("_max_", " maximum ")
-                .replace('_', " ");
-            Some(format!("Invalid '{field}': {words}. Expected {what} with {bound_word} {unit} {limit}, but got {len} instead."))
+                format!("Invalid '{field}': {kind} {words}. Expected {what} with {bound_word} length {limit}, but got {what} with length {len} instead.")
+            })
         }
         _ => None,
     }
@@ -2228,6 +2232,12 @@ mod tests {
                 "Invalid 'value': decimal above maximum value. Expected a value <= 1, but got 1.5 instead.",
             ),
             (
+                r#"{"value": 1.1, "name": "x"}"#,
+                "decimal_above_max_value",
+                "value",
+                "Invalid 'value': decimal above maximum value. Expected a value <= 1, but got 1.1 instead.",
+            ),
+            (
                 r#"{"value": 0.5, "name": "x", "count": 0}"#,
                 "integer_below_min_value",
                 "count",
@@ -2237,7 +2247,19 @@ mod tests {
                 r#"{"value": 0.5, "name": "toolongname"}"#,
                 "string_above_max_length",
                 "name",
-                "Invalid 'name': string above maximum length. Expected a string with maximum length 8, but got 11 instead.",
+                "Invalid 'name': string too long. Expected a string with maximum length 8, but got a string with length 11 instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": ""}"#,
+                "string_below_min_length",
+                "name",
+                "Invalid 'name': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "metadata": {"a": "1", "b": "2", "c": "3"}}"#,
+                "object_above_max_properties",
+                "metadata",
+                "Invalid 'metadata': too many properties. The object has 3 properties, but the maximum is 2.",
             ),
             (
                 r#"{"value": 0.5, "name": "x", "tags": []}"#,
