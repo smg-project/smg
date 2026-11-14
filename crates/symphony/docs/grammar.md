@@ -203,7 +203,8 @@ backend the worker's engine runs (`GrammarBackend`): for xgrammar the structural
 for byte, in the vocabulary the compiler reads; a backend with no spelling of the tree refuses the
 grammar by name there (`Unspelled`), before the request leaves, rather than sending a text the
 engine's compiler would reject with its own words after the prompt ran. What the gateway does
-with that refusal follows what the request asked: a forced call, the response template's answer
-and the whole turn are refused by the backend's name; under `auto`, and for a registry table's
-answer, the grammar counts as a tag the table does not have, and the request goes out as it
+with that refusal follows what the request asked and whose table reads the output: the response
+template's table, which alone can write its forced call or answer, refuses by the backend's name, as
+does the whole turn; under `auto` the grammar counts as a tag the table does not have, whatever the
+table, and so does a registry table's forced call or answer, which the older registry decides as it
 did before the table constrained it.
