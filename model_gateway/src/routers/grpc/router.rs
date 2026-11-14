@@ -51,6 +51,7 @@ use crate::{
     routers::{
         common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
     },
+    tenant::storage_tenant,
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -619,7 +620,7 @@ impl GrpcRouter {
             &ctx.response_storage,
             &queued,
             &request,
-            crate::tenant::storage_tenant(tenant_meta).as_deref(),
+            storage_tenant(tenant_meta).as_deref(),
             ctx.request_context.clone(),
         )
         .await
@@ -1223,7 +1224,7 @@ impl RouterTrait for GrpcRouter {
                 "Cancel response not implemented",
             );
         };
-        let tenant = crate::tenant::storage_tenant(tenant_meta);
+        let tenant = storage_tenant(tenant_meta);
         cancel_response_impl(responses_context, tenant.as_deref(), response_id).await
     }
 
