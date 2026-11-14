@@ -137,8 +137,10 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     for (name, value) in reqwest_headers {
         // Use case-insensitive checks to avoid string allocation.
         if should_forward_header_no_alloc(name.as_str()) {
-            // The original name and value are already valid, so we can just clone them
-            headers.insert(name.clone(), value.clone());
+            // One pair per value: a header the upstream sent more than once
+            // (`set-cookie`, `vary`, `link`, `www-authenticate`) keeps every
+            // value, in order. The name and value are already valid: a clone.
+            headers.append(name.clone(), value.clone());
         }
     }
 
@@ -485,6 +487,29 @@ mod tests {
             HeaderValue::from_static("message-threads-2026-08-1, message-threads-2026-08-123"),
         );
         assert!(!anthropic_beta_named(&headers, "message-threads"));
+    }
+
+    #[test]
+    fn preserve_response_headers_keeps_every_value_of_a_repeated_header() {
+        let mut upstream = HeaderMap::new();
+        upstream.append("set-cookie", HeaderValue::from_static("a=1"));
+        upstream.append("set-cookie", HeaderValue::from_static("b=2"));
+        upstream.append("vary", HeaderValue::from_static("accept"));
+        upstream.append("vary", HeaderValue::from_static("origin"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let forwarded = preserve_response_headers(&upstream);
+
+        fn values<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a str> {
+            headers
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect()
+        }
+        assert_eq!(values(&forwarded, "set-cookie"), ["a=1", "b=2"]);
+        assert_eq!(values(&forwarded, "vary"), ["accept", "origin"]);
+        assert_eq!(values(&forwarded, "content-type"), ["application/json"]);
     }
 
     #[test]
