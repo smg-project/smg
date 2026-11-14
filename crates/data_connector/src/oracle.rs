@@ -26,14 +26,14 @@ use super::core::{
 };
 use crate::{
     common::{
-        build_response_select_base, extra_column_defs, parse_json_value, parse_raw_response,
-        resolve_extra_column_values,
+        build_response_select_base, extra_column_defs, parse_conversation_metadata,
+        parse_json_value, parse_raw_response, resolve_extra_column_values,
     },
     config::OracleConfig,
     context::current_extra_columns,
     factory::{contact_blocking, StoreContactError},
     oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
-    schema::SchemaConfig,
+    schema::{SchemaConfig, TableConfig},
     versioning::{
         bootstrap_oracle_schema, oracle_recorded_version, run_oracle_migrations, Migration,
         OracleSchemaSteps,
@@ -483,8 +483,7 @@ impl OracleConversationStorage {
     fn parse_metadata(
         raw: Option<String>,
     ) -> Result<Option<ConversationMetadata>, ConversationStorageError> {
-        crate::common::parse_conversation_metadata(raw)
-            .map_err(ConversationStorageError::StorageError)
+        parse_conversation_metadata(raw).map_err(ConversationStorageError::StorageError)
     }
 }
 
@@ -1224,10 +1223,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
 
 /// Parse a single `oracle::Row` into a `ConversationItem`, respecting
 /// the `is_skipped` guards configured in `TableConfig`.
-fn build_item_from_oracle_row(
-    row: &Row,
-    si: &crate::schema::TableConfig,
-) -> Result<ConversationItem, String> {
+fn build_item_from_oracle_row(row: &Row, si: &TableConfig) -> Result<ConversationItem, String> {
     let id: String = row.get(si.col("id")).map_err(map_oracle_error)?;
     let response_id: Option<String> = if si.is_skipped("response_id") {
         None
@@ -1495,7 +1491,7 @@ impl OracleResponseStorage {
 /// those stored under the caller's (see
 /// [`tenant_scope_allows`](crate::core::tenant_scope_allows)). `None` when
 /// the schema skips the column: every row is served then, as before.
-fn tenant_scope_sql(s: &crate::schema::TableConfig, bind: usize) -> Option<String> {
+fn tenant_scope_sql(s: &TableConfig, bind: usize) -> Option<String> {
     if s.is_skipped("tenant") {
         return None;
     }
@@ -1514,7 +1510,7 @@ struct IdentifierScope<'a> {
 /// its binds: the identifier as `:1`, the tenant (NULL when absent) as `:2`
 /// when the table keeps a tenant column.
 fn identifier_filter<'a>(
-    s: &crate::schema::TableConfig,
+    s: &TableConfig,
     scope: IdentifierScope<'a>,
 ) -> (String, Vec<&'a dyn ToSql>) {
     let col_safety = s.col("safety_identifier");
@@ -1572,7 +1568,7 @@ impl ResponseRow {
     /// defaults' extra columns.
     fn columns_and_binds<'a>(
         &'a self,
-        s: &'a crate::schema::TableConfig,
+        s: &'a TableConfig,
         extra_cols: &'a [(&'a str, Option<String>)],
     ) -> (Vec<&'a str>, Vec<&'a dyn ToSql>) {
         let logical_fields: [(&str, &dyn ToSql); 9] = [
@@ -1830,7 +1826,7 @@ fn oracle_open_predicate(col_raw: &str) -> String {
 /// schema skips it: there is no status to check, so the conditional store is
 /// a plain update of the row under the id (every backend of this crate
 /// agrees).
-fn oracle_open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+fn oracle_open_predicate_for(s: &TableConfig) -> Option<String> {
     (!s.is_skipped("raw_response")).then(|| oracle_open_predicate(s.col("raw_response")))
 }
 
@@ -2510,7 +2506,7 @@ mod tests {
 
     #[test]
     fn a_schema_without_the_object_column_has_no_open_condition() {
-        let mut s = crate::schema::TableConfig::with_table("responses");
+        let mut s = TableConfig::with_table("responses");
         s.columns
             .insert("raw_response".to_string(), "payload".to_string());
         assert_eq!(

@@ -9,15 +9,18 @@ metadata:
   labels:
     {{- include "smg.labels" . | nindent 4 }}
     app.kubernetes.io/component: router
-  {{- with .Values.router.adminService.annotations }}
+  {{- /* No router.adminService when an upgrade reuses the values of a release
+       from before it, and only the members given when it is given in part:
+       the chart's defaults then. */}}
+  {{- with (.Values.router.adminService).annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.router.adminService.type }}
+  type: {{ (.Values.router.adminService).type | default "ClusterIP" }}
   ports:
     - name: admin
-      port: {{ .Values.router.adminService.port }}
+      port: {{ (.Values.router.adminService).port | default 9001 }}
       targetPort: admin
       protocol: TCP
   selector:
