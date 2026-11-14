@@ -128,6 +128,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A tool the model calls by name is refused when that name is the empty string (`400`,
+  `error.code` `empty_string`, in the public API's words: `Invalid 'tools[1].function.name': empty
+  string. Expected a string with minimum length 1, but got an empty string instead.`). On Chat
+  Completions that is a function (`error.param` the field; a function of the deprecated
+  `functions` list at the place its migration gives it), and the rule stands ahead of the
+  `tool_choice` rule, so a choice that rule refuses does not hide the unnamed tool. On Responses it
+  is a function, a custom tool, a namespace and a namespace's member (`tools[1].name`,
+  `tools[1].tools[0].name` in the message, `error.param` `tools`), and on Interactions a function.
+  The place counts every tool. Such a request passed validation, and the model could be made to
+  call a tool no client can dispatch.
 - A Messages request's Anthropic-defined tools keep their configuration when the request is
   written back for an upstream: a web search or web fetch tool's domain filters, use cap and
   location, a computer tool's display size, a text editor's `max_characters`, and any tool's

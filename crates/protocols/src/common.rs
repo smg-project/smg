@@ -325,6 +325,20 @@ pub(crate) fn on_field(
     error
 }
 
+/// The refusal of a tool the model calls by name (a function, a custom tool,
+/// a namespace or one of its members) declared with an empty name at `field`,
+/// in the public API's words: the model can be made to call such a tool, and
+/// the client cannot dispatch a call that names nothing.
+pub(crate) fn empty_tool_name(field: &str) -> validator::ValidationError {
+    invalid(
+        "empty_string",
+        format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1, but got \
+             an empty string instead."
+        ),
+    )
+}
+
 /// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
 pub(crate) fn json_type_name(value: &Value) -> &'static str {
     match value {

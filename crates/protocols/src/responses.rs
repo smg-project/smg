@@ -9,7 +9,7 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, json_type_name, strict_schema_missing_additional_properties,
+        default_true, empty_tool_name, json_type_name, strict_schema_missing_additional_properties,
         validate_json_schema_shape, validate_stop, ChatLogProbs, ContextManagementEntry,
         ConversationRef, Detail, Function, FunctionChoice, GenerationRequest, PromptCacheRetention,
         PromptTokenUsageInfo, ResponsePrompt, StreamOptions, StringOrArray,
@@ -3970,11 +3970,15 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
 
     for (idx, tool) in tools.iter().enumerate() {
         match tool {
-            // Function parameters are a JSON Schema object (the strict-mode
-            // pin on additionalProperties is a public-API rule applied under
-            // the OpenAI vendor profile in the cross-parameter validation).
+            // A function has a name, and its parameters are a JSON Schema
+            // object (the strict-mode pin on additionalProperties is a
+            // public-API rule applied under the OpenAI vendor profile in the
+            // cross-parameter validation).
             ResponseTool::Function(function_tool) => {
                 let function = &function_tool.function;
+                if function.name.is_empty() {
+                    return Err(empty_tool_name(&format!("tools[{idx}].name")));
+                }
                 if !function.parameters_schema().is_object() {
                     return Err(invalid(
                         "invalid_type",
@@ -3983,6 +3987,31 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                             json_type_name(function.parameters_schema())
                         ),
                     ));
+                }
+            }
+            // A custom tool has a name: the model is given a function of that
+            // name for it.
+            ResponseTool::Custom(custom) => {
+                if custom.name.is_empty() {
+                    return Err(empty_tool_name(&format!("tools[{idx}].name")));
+                }
+            }
+            // A namespace has a name, and so has each of its members: the
+            // model addresses a member as `namespace.member`.
+            ResponseTool::Namespace(namespace) => {
+                if namespace.name.is_empty() {
+                    return Err(empty_tool_name(&format!("tools[{idx}].name")));
+                }
+                for (member_idx, member) in namespace.tools.iter().enumerate() {
+                    let name = match member {
+                        NamespaceTool::Function(function_tool) => &function_tool.function.name,
+                        NamespaceTool::Custom(custom) => &custom.name,
+                    };
+                    if name.is_empty() {
+                        return Err(empty_tool_name(&format!(
+                            "tools[{idx}].tools[{member_idx}].name"
+                        )));
+                    }
                 }
             }
             // The hosted local_shell tool is not served by the gateway, and the

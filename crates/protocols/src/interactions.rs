@@ -9,7 +9,10 @@ use serde_with::skip_serializing_none;
 use validator::{Validate, ValidationError};
 
 use super::{
-    common::{default_true, deserialize_null_as_false, invalid, Function, GenerationRequest},
+    common::{
+        default_true, deserialize_null_as_false, empty_tool_name, invalid, Function,
+        GenerationRequest,
+    },
     sampling_params::validate_top_p_value,
     validated::Normalizable,
 };
@@ -1127,6 +1130,12 @@ fn validate_tools(tools: &[InteractionsTool]) -> Result<(), ValidationError> {
     {
         return Err(ValidationError::new("file_search_tool_not_supported"));
     }
+    // A function has a name
+    for (index, tool) in tools.iter().enumerate() {
+        if matches!(tool, InteractionsTool::Function(function) if function.name.is_empty()) {
+            return Err(empty_tool_name(&format!("tools[{index}].name")));
+        }
+    }
     Ok(())
 }
 
@@ -1242,6 +1251,34 @@ mod tests {
             err.code.to_string(),
             err.message.as_deref().unwrap_or("").to_string(),
         )
+    }
+
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: no client can dispatch a call that names nothing. The place
+    /// counts every tool, the built-in one ahead of the functions too. A
+    /// named function and a built-in tool, which has no name, pass.
+    #[test]
+    fn a_function_tool_has_a_name() {
+        let tools = |names: &[&str]| -> Vec<InteractionsTool> {
+            let mut tools = vec![InteractionsTool::GoogleSearch {}];
+            tools.extend(names.iter().map(|name| {
+                serde_json::from_value::<InteractionsTool>(
+                    serde_json::json!({"type": "function", "name": name}),
+                )
+                .expect("a function tool")
+            }));
+            tools
+        };
+        assert_eq!(
+            refusal(validate_tools(&tools(&["f", ""]))),
+            (
+                "empty_string".to_string(),
+                "Invalid 'tools[2].name': empty string. Expected a string with minimum length 1, \
+                 but got an empty string instead."
+                    .to_string()
+            )
+        );
+        assert!(validate_tools(&tools(&["f", "g"])).is_ok());
     }
 
     /// Each cross-field refusal keeps its code and its message.
