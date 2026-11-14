@@ -133,6 +133,10 @@ class Worker:
     extra_engine_args: list[str] | None = None
     # Overrides the model spec's tp, so a PD pair can run asymmetric pools.
     tp: int | None = None
+    # In-process DP engines for vLLM HTTP MoRI-IO workers; one registration
+    # represents the whole group. Other wires retain their existing launchers.
+    dp_size: int = 1
+    moriio_dp_rpc_port: int | None = None
     # KV transfer backend for this PD worker ("nixl", "mooncake" or "moriio");
     # None takes the lane's default, so one fleet can mix transports.
     kv_backend: str | None = None
@@ -456,9 +460,23 @@ class Worker:
 
     def _build_cmd(self) -> list[str]:
         """Build engine-specific launch command using model specs."""
+        if isinstance(self.dp_size, bool) or not isinstance(self.dp_size, int) or self.dp_size < 1:
+            raise ValueError("dp_size must be a positive integer")
+        if self.dp_size > 1 and not (
+            self.engine == "vllm"
+            and self.mode == ConnectionMode.HTTP
+            and self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE)
+            and self.effective_kv_backend() == "moriio"
+        ):
+            raise ValueError("dp_size > 1 requires a vLLM HTTP MoRI-IO PD worker")
         spec = get_model_spec(self.model_id)
         model_path = spec["model"]
         tp_size = self.tp or spec.get("tp", 1)
+        if self.dp_size > 1:
+            if len(self.gpu_ids) < tp_size * self.dp_size:
+                raise ValueError("DP worker GPU slice is smaller than dp_size * tp")
+            if any(arg.startswith("--data-parallel-") for arg in self.extra_engine_args or []):
+                raise ValueError("use dp_size instead of overriding data-parallel launch arguments")
         features = spec.get("features", [])
 
         if self.engine == "sglang":
@@ -610,6 +628,21 @@ class Worker:
                     "kv_role": kv_role,
                     "kv_connector_extra_config": self._moriio_extra_config(tp_size),
                 }
+                if self.dp_size > 1:
+                    cmd.extend(
+                        [
+                            "--data-parallel-size",
+                            str(self.dp_size),
+                            "--data-parallel-size-local",
+                            str(self.dp_size),
+                            "--data-parallel-backend",
+                            "mp",
+                            "--data-parallel-address",
+                            moriio_host(),
+                            "--data-parallel-rpc-port",
+                            str(self.moriio_dp_rpc_port),
+                        ]
+                    )
             else:
                 config = {
                     "kv_connector": "NixlConnector",
@@ -634,13 +667,26 @@ class Worker:
 
     def _moriio_extra_config(self, tp_size: int) -> dict:
         """MoRIIOConnector settings: this worker's address and ports, the lane's mode."""
+        if (
+            self.dp_size > 1
+            and self.moriio_handshake_port is not None
+            and self.moriio_dp_rpc_port is None
+        ):
+            raise ValueError("DP MoRI-IO side ports and RPC must be allocated together")
         if self.moriio_handshake_port is None:
-            self.moriio_handshake_port = get_open_port_block(1)
-            self.moriio_notify_port = get_open_port_block(tp_size)
+            ranks = tp_size * self.dp_size
+            # Keep the existing DP1 allocation; DP groups bind one handshake
+            # and notify listener per local DP/TP rank.
+            handshakes = ranks if self.dp_size > 1 else 1
+            self.moriio_handshake_port = get_open_port_block(handshakes)
+            self.moriio_notify_port = get_open_port_block(ranks)
             self._moriio_ports = [
-                self.moriio_handshake_port,
-                *range(self.moriio_notify_port, self.moriio_notify_port + tp_size),
+                *range(self.moriio_handshake_port, self.moriio_handshake_port + handshakes),
+                *range(self.moriio_notify_port, self.moriio_notify_port + ranks),
             ]
+            if self.dp_size > 1:
+                self.moriio_dp_rpc_port = get_engine_port()
+                self._moriio_ports.append(self.moriio_dp_rpc_port)
         else:
             for port in self._moriio_ports:
                 reserve_port(port)
@@ -672,6 +718,7 @@ class Worker:
                 "moriio_handshake_port": str(self.moriio_handshake_port),
                 "moriio_notify_port": str(self.moriio_notify_port),
                 "tp_size": str(tp),
+                "dp_size": str(self.dp_size),
             },
         }
 
@@ -1329,6 +1376,7 @@ def start_workers(
     gpus: int | None = None,
     extra_engine_args: list[str] | None = None,
     tp: int | None = None,
+    dp_size: int = 1,
     kv_backend: str | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> list[Worker]:
@@ -1365,7 +1413,7 @@ def start_workers(
         engine = get_runtime()
 
     spec = get_model_spec(model_id)
-    gpus_per_worker = gpus or tp or spec.get("tp", 1)
+    gpus_per_worker = gpus or (tp or spec.get("tp", 1)) * dp_size
     if gpus is None and mode == ConnectionMode.ZMQ:
         # A grouped ZMQ worker launches get_zmq_engine_count() engines, each
         # tp-wide, in one process — size its GPU slice accordingly. vLLM and
@@ -1421,6 +1469,7 @@ def start_workers(
                 log_dir=log_dir,
                 extra_engine_args=extra_engine_args,
                 tp=tp,
+                dp_size=dp_size,
                 kv_backend=kv_backend,
                 extra_env=extra_env,
             )
