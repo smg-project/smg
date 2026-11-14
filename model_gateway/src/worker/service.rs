@@ -870,7 +870,8 @@ impl WorkerService {
             }
         }
 
-        // The removal is pinned to the workers this DELETE saw by id and to
+        // The removal is pinned to the worker this DELETE named, by the id
+        // of the request itself, and to the rest of its group by theirs, at
         // no revision, as the removal step's guard reads it: a worker
         // rebuilt under its id before the removal runs (a PATCH or a PUT
         // answered earlier and still in flight, a label refresh) is the one
@@ -878,13 +879,17 @@ impl WorkerService {
         // since is not and stays. A revision pin held the removal behind
         // the job that moves the revision and then skipped the worker,
         // every time.
-        let entries = find_workers_by_url(&self.worker_registry, &url)
+        let mut entries = find_workers_by_url(&self.worker_registry, &url)
             .into_iter()
             .filter_map(|worker| {
                 let id = self.worker_registry.get_id_by_url(worker.url())?;
                 Some((id.as_str().to_string(), None))
             })
             .collect::<HashMap<String, Option<u64>>>();
+        // The named worker's own id, not one read back through the URL: a
+        // registration landing at the URL between the two reads is not this
+        // request's to remove.
+        entries.insert(worker_id.as_str().to_string(), None);
         let job = Job::RemoveWorker {
             url: url.clone(),
             expected_revisions: Some(entries),

@@ -294,6 +294,15 @@ impl Kept {
     }
 }
 
+/// How a failed registration's cleanup removal went in: queued as the URL's
+/// own job, or behind a removal in flight at the URL (kept to run on its
+/// heels, or its entries joined to the removal already kept there).
+#[derive(Debug, PartialEq, Eq)]
+enum CleanupRemoval {
+    Queued,
+    Behind,
+}
+
 /// A claimed submission's hold on its own status entry while it waits for a
 /// slot: dropped with its caller before the slot is held (a cancelled request
 /// on a full queue) or ended by a refused submission, it takes the claim back
@@ -553,6 +562,30 @@ impl JobQueue {
             kept.remove_if(url, |_, slots| slots.is_empty());
         }
         job
+    }
+
+    /// Joins `pins` to the removal kept for `url`, when one is kept: the one
+    /// removal that runs on the in-flight removal's heels then takes both
+    /// sets. A pin already there stays as it is (`None`, the id as it
+    /// stands, is the wider of the two), and a kept removal without pins
+    /// takes whatever stands under the URL, these included. False when no
+    /// removal is kept for the URL.
+    fn extend_kept_removal(&self, url: &str, pins: &HashMap<String, Option<u64>>) -> bool {
+        let Some(mut entry) = self.kept.get_mut(url) else {
+            return false;
+        };
+        let Some(Job::RemoveWorker {
+            expected_revisions, ..
+        }) = entry.removal.as_mut()
+        else {
+            return false;
+        };
+        if let Some(kept) = expected_revisions {
+            for (id, revision) in pins {
+                kept.entry(id.clone()).or_insert(*revision);
+            }
+        }
+        true
     }
 
     /// `job` goes back to the slot of its kind (`run_kept`, its claim
@@ -1035,31 +1068,44 @@ impl JobQueue {
     /// `entries` (their ids and revisions as the registry holds them now, so
     /// a worker registered or replaced since is left alone): the job a
     /// `DELETE` of a live worker queues, drain and bookkeeping included.
-    /// `Ok(false)` when a removal for the URL is in flight already (a
-    /// `DELETE`'s): that one owns it, and a second would find the worker
-    /// draining and remove it without the wait the first sits out.
+    /// Behind a removal in flight at the URL (a `DELETE`'s, an earlier end's)
+    /// it runs on that one's heels, as a `DELETE`'s does: that one takes the
+    /// workers it was queued for and leaves these standing when they are
+    /// not among its pins, so a second is needed, and finds nothing left
+    /// when they were. These entries join the pins of a removal already
+    /// kept for the URL rather than displacing it.
     async fn queue_removal(
         context: &Arc<AppContext>,
         url: &str,
         entries: HashMap<String, u64>,
-    ) -> Result<bool, String> {
+    ) -> Result<CleanupRemoval, String> {
         let queue = context
             .worker_job_queue
             .get()
             .ok_or_else(|| "Worker job queue not initialized".to_string())?;
+        let pins: HashMap<String, Option<u64>> = entries
+            .into_iter()
+            .map(|(id, revision)| (id, Some(revision)))
+            .collect();
         let job = Job::RemoveWorker {
             url: url.to_string(),
-            expected_revisions: Some(
-                entries
-                    .into_iter()
-                    .map(|(id, revision)| (id, Some(revision)))
-                    .collect(),
-            ),
+            expected_revisions: Some(pins.clone()),
         };
-        if !queue.claim_if_idle(&job) {
-            return Ok(false);
+        if queue.claim_if_idle(&job) {
+            return queue
+                .submit_claimed(job)
+                .await
+                .map(|()| CleanupRemoval::Queued);
         }
-        queue.submit_claimed(job).await.map(|()| true)
+        if queue.extend_kept_removal(url, &pins) {
+            return Ok(CleanupRemoval::Behind);
+        }
+        let submitted = queue.submit_or_defer(job).await?;
+        Ok(if submitted {
+            CleanupRemoval::Queued
+        } else {
+            CleanupRemoval::Behind
+        })
     }
 
     /// Takes the mark under `own_id`, if there is one: true when a `DELETE`
@@ -1157,13 +1203,13 @@ impl JobQueue {
                             }
                         } else {
                             match Self::queue_removal(context, &config.url, entries).await {
-                                Ok(true) => format!(
+                                Ok(CleanupRemoval::Queued) => format!(
                                     "{failure}; its workers were registered and leave through \
                                     a queued removal"
                                 ),
-                                Ok(false) => format!(
-                                    "{failure}; its workers were registered and a removal of \
-                                    them is in flight"
+                                Ok(CleanupRemoval::Behind) => format!(
+                                    "{failure}; its workers were registered and leave through \
+                                    a removal queued behind the one in flight"
                                 ),
                                 Err(submit) => format!(
                                     "{failure}; its workers were registered and their removal \
@@ -2735,9 +2781,10 @@ mod tests {
         assert!(marks.is_empty());
     }
 
-    /// A registration's cleanup removal is one per URL: a second submission
-    /// (a DELETE's, or a second end) finds the first in flight and queues
-    /// nothing, and the entry under the URL is the removal's own.
+    /// A registration's cleanup removal is one per URL at a time: a second
+    /// submission (a DELETE's, or a second end) finds the first in flight and
+    /// is kept to run on its heels with its own pins; the entry under the URL
+    /// is the first removal's own.
     #[tokio::test]
     async fn a_registrations_cleanup_removal_is_queued_once_per_url() {
         use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
@@ -2756,12 +2803,12 @@ mod tests {
         let entries = || HashMap::from([("worker-id".to_string(), 1u64)]);
         assert_eq!(
             JobQueue::queue_removal(&context, url, entries()).await,
-            Ok(true)
+            Ok(CleanupRemoval::Queued)
         );
         assert_eq!(
             JobQueue::queue_removal(&context, url, entries()).await,
-            Ok(false),
-            "a removal in flight owns the URL"
+            Ok(CleanupRemoval::Behind),
+            "a removal in flight owns the URL; the second runs on its heels"
         );
         let status = context
             .worker_job_queue
@@ -2770,6 +2817,78 @@ mod tests {
             .expect("the removal's entry");
         assert_eq!(status.job_type, "RemoveWorker");
         assert_eq!(status.status, "pending");
+        let queue = context.worker_job_queue.get().expect("the queue");
+        let slots = queue
+            .kept
+            .get(url)
+            .expect("a removal kept behind the one in flight");
+        let Some(Job::RemoveWorker {
+            expected_revisions: Some(pins),
+            ..
+        }) = slots.removal.as_ref()
+        else {
+            panic!("the kept job is the cleanup's pinned removal")
+        };
+        assert_eq!(
+            pins,
+            &HashMap::from([("worker-id".to_string(), Some(1u64))]),
+            "the kept removal carries the second cleanup's entries"
+        );
+    }
+
+    /// A removal in flight at the URL pinned to other workers does not own a
+    /// failed registration's: the cleanup's removal is kept to run on its
+    /// heels with its own pins, and a later cleanup's entries join the kept
+    /// removal's pins instead of displacing it.
+    #[tokio::test]
+    async fn a_cleanup_behind_a_removal_of_other_workers_keeps_its_own_pins() {
+        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        context.worker_job_queue.set(queue).ok();
+        let url = "http://w:8000";
+        let one = |id: &str, revision: u64| HashMap::from([(id.to_string(), revision)]);
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, one("old", 1)).await,
+            Ok(CleanupRemoval::Queued)
+        );
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, one("new", 3)).await,
+            Ok(CleanupRemoval::Behind),
+            "a removal of other workers in flight: the cleanup runs on its heels"
+        );
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, one("third", 5)).await,
+            Ok(CleanupRemoval::Behind),
+            "a later cleanup joins the kept removal"
+        );
+        let queue = context.worker_job_queue.get().expect("the queue");
+        let slots = queue
+            .kept
+            .get(url)
+            .expect("a removal kept behind the one in flight");
+        let Some(Job::RemoveWorker {
+            expected_revisions: Some(pins),
+            ..
+        }) = slots.removal.as_ref()
+        else {
+            panic!("the kept job is a pinned removal")
+        };
+        assert_eq!(
+            pins,
+            &HashMap::from([
+                ("new".to_string(), Some(3u64)),
+                ("third".to_string(), Some(5u64)),
+            ]),
+            "both cleanups' entries, none of the in-flight removal's"
+        );
     }
 
     /// A submission that fails must not leave its claim behind, or the next
