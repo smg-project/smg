@@ -181,6 +181,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   instead.`) instead of the validation library's rendering of the rule's name and parameters
   (`Validation error: range [{"min": Number(1), "value": Number(0)}]`); the code and param are
   unchanged. Every such rule of the crate (`dimensions`, the sampling parameters, ...) answers this way.
+- A Responses input file part with `detail: "auto"`, the public API's default (`FileInputDetail`),
+  parses, and a prompt's file variable keeps its `detail` when the request is written back for an
+  upstream. The crate refused the request with ``unknown variant `auto`, expected `low` or
+  `high` `` and dropped the variable's detail. Breaking: `FileDetail` gains `Auto`, now its default,
+  and `PromptVariableTyped::ResponseInputFile` gains `detail: Option<FileDetail>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
