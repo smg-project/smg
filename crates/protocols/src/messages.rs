@@ -17,6 +17,9 @@ use serde::{
 use serde_json::{Map, Value};
 use validator::Validate;
 
+/// The request rules that read the betas of the request beside its body
+/// ([`MessagesBetas`]), applied by the gateway's Messages handler.
+pub use crate::messages_validation::validate_with_betas;
 use crate::{
     chat::deserialize_reasoning_effort,
     common::{self, invalid, CachePartition, GenerationRequest},
@@ -128,6 +131,82 @@ impl Normalizable for CreateMessageRequest {
 pub enum MessageThread {
     Create,
     Continue { previous_message_id: String },
+}
+
+/// The betas a Messages request names in its `anthropic-beta` header, read
+/// once per request. The public API names a beta in its dated form,
+/// `name-YYYY-MM-DD`; the header may repeat, and each value may list several
+/// betas, comma separated. The set keeps the names: the rules that read it
+/// ([`validate_with_betas`]) ask whether a beta is named, and the request's
+/// raw headers reach the backend unchanged, dates and all. A token without
+/// the dated suffix names no beta, and a longer name that begins with a
+/// known one is another beta, not that one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessagesBetas {
+    names: Vec<String>,
+}
+
+impl MessagesBetas {
+    /// The beta under which `thinking.budget_tokens` may reach `max_tokens`.
+    pub const INTERLEAVED_THINKING: &'static str = "interleaved-thinking";
+    /// The beta a `thread` field needs.
+    pub const MESSAGE_THREADS: &'static str = "message-threads";
+
+    /// The set named by the header's values, each a comma-separated list.
+    pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            names: dated_beta_names(values).map(str::to_owned).collect(),
+        }
+    }
+
+    /// Whether the header's values name `name` in its dated form, read
+    /// without building the set.
+    pub fn values_name<'a>(values: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+        dated_beta_names(values).any(|named| named == name)
+    }
+
+    /// Whether the request names the beta `name`.
+    pub fn names(&self, name: &str) -> bool {
+        self.names.iter().any(|named| named == name)
+    }
+
+    /// Whether the interleaved-thinking beta is named.
+    pub fn interleaved_thinking(&self) -> bool {
+        self.names(Self::INTERLEAVED_THINKING)
+    }
+
+    /// Whether the message-threads beta is named.
+    pub fn message_threads(&self) -> bool {
+        self.names(Self::MESSAGE_THREADS)
+    }
+}
+
+/// `-YYYY-MM-DD`, the suffix a public beta's name ends with.
+const DATED_SUFFIX_LEN: usize = 11;
+
+/// The names of the dated betas in `values`, in their order.
+fn dated_beta_names<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> impl Iterator<Item = &'a str> {
+    values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| dated_beta_name(token.trim()))
+}
+
+/// `token` as `name-YYYY-MM-DD`: its name, or `None` when the token does not
+/// end with the dated suffix (the shape alone, not the calendar).
+fn dated_beta_name(token: &str) -> Option<&str> {
+    let bytes = token.as_bytes();
+    let at = bytes.len().checked_sub(DATED_SUFFIX_LEN)?;
+    let dated = bytes[at..].iter().enumerate().all(|(i, b)| {
+        if i == 0 || i == 5 || i == 8 {
+            *b == b'-'
+        } else {
+            b.is_ascii_digit()
+        }
+    });
+    (dated && at > 0 && token.is_char_boundary(at)).then(|| &token[..at])
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
