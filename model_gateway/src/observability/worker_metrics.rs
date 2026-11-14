@@ -252,10 +252,13 @@ impl Labels {
 /// show the value itself: an address with a userinfo, a query or a fragment,
 /// and a value the address parser refuses, which reads as the marker a log
 /// line writes for it. The registration check takes spellings the parser
-/// does not (an empty port, port 0, a host of digits alone after a
-/// userinfo), and each may carry a credential, so the mask asks nothing of
-/// the parser on its own. `None` for a value the mask leaves as it is: an
-/// address with nothing to mask, and a thread index, which is digits.
+/// refuses (an empty port, port 0, digits alone as the host after a
+/// userinfo that reads as no host and port), and each may carry a
+/// credential, so the mask asks nothing of the parser on its own. An
+/// address the parser reads as a host and its rank (`http://token@8080`)
+/// has no userinfo by that reading and keeps its bytes, as in a log line.
+/// `None` for a value the mask leaves as it is: an address with nothing to
+/// mask, and a thread index, which is digits.
 fn masked_form(value: &str) -> Option<String> {
     let masked = Endpoint::redacted_url(value);
     (masked != value).then_some(masked)

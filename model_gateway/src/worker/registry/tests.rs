@@ -3623,9 +3623,13 @@ fn a_registration_hands_the_series_store_the_workers_id() {
 }
 
 /// A worker registered at an address the endpoint parser refuses is named in
-/// the scrape by the marker, the second such worker by the marker and its
-/// id: the registration check takes an empty port and a host of digits alone,
-/// and each may follow a credential.
+/// the scrape by the marker, never by its address: the registration check
+/// takes an empty port, and digits alone as the host after a userinfo that
+/// reads as no host and port, and each may follow a credential. Every
+/// refused address shares the one marker and the store is the whole
+/// process's, so the case reads its own series by the name of its model:
+/// two labels, each the marker alone or the marker and that worker's id, as
+/// the other cases' refused addresses come and go.
 #[test]
 fn a_registered_address_the_parser_refuses_is_not_in_the_scrape() {
     let series = worker_metrics::installed_or_default();
@@ -3633,33 +3637,42 @@ fn a_registered_address_the_parser_refuses_is_not_in_the_scrape() {
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(series),
     );
+    let model = "a-refused-address-case";
     let worker = |url: &str| -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
-                .model(ModelCard::new("m"))
+                .model(ModelCard::new(model))
                 .health_config(no_health_check())
                 .build(),
         )
     };
     metrics::with_local_recorder(&recorder, || {
         let registry = WorkerRegistry::new();
-        registry
+        let first = registry
             .register(worker("http://key-three@refused-seam:/v1"))
             .unwrap();
         let second = registry.register(worker("http://key-four:x@8080")).unwrap();
         let mut rendered = String::new();
         series.render_into(&mut rendered);
-        assert!(
-            !rendered.contains("key-three") && !rendered.contains("key-four"),
-            "{rendered}"
-        );
-        let health = |label: &str| {
-            let line = format!("smg_worker_health{{worker=\"{label}\"}} ");
-            rendered.lines().any(|rendered| rendered.starts_with(&line))
-        };
-        assert!(health("<unparsable address>"), "{rendered}");
-        let with_id = format!("<unparsable address> {}", second.as_str());
-        assert!(health(&with_id), "{rendered}");
+        for part in ["key-three", "refused-seam", "key-four"] {
+            assert!(!rendered.contains(part), "{part} is in:\n{rendered}");
+        }
+        let of_this_case = format!("model=\"{model}\"");
+        let own = rendered
+            .lines()
+            .filter(|line| line.contains(&of_this_case))
+            .filter_map(|line| line.split_once("worker=\"")?.1.split_once('"'))
+            .map(|(label, _)| label)
+            .collect::<HashSet<_>>();
+        let marker = "<unparsable address>";
+        let by_id = [&first, &second].map(|id| format!("{marker} {}", id.as_str()));
+        assert_eq!(own.len(), 2, "{own:?} in:\n{rendered}");
+        for label in &own {
+            assert!(
+                *label == marker || by_id.iter().any(|by_id| by_id == label),
+                "{label} in:\n{rendered}"
+            );
+        }
     });
 }
 
