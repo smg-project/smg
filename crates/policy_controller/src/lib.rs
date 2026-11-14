@@ -88,8 +88,8 @@ pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch,
-    TieBand, Weighted,
+    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, Picker, Plan, Profile, Scorer,
+    Scratch, TieBand, Weighted,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
@@ -106,6 +106,16 @@ pub use view::{
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
 /// decision replays from its trace.
+///
+/// The streams a decision opens are listed here, so that a new site derives
+/// one that none of them reads:
+///
+/// - the seed's own stream: the profile's picker, and a plugin's draws;
+/// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
+/// - the seed under the alternates' mask: the order of equal counts among
+///   the workers the count-first picker passed over;
+/// - the first value of the seed's stream: the seed a pair plan hands its
+///   decode side, whose stages derive their streams from it as above.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

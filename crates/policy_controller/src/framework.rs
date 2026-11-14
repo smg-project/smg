@@ -6,8 +6,10 @@
 use std::fmt::Debug;
 
 use crate::{
-    builtins::{Best, FewestSessions, LeastRequests, Random},
-    decision::{Decision, Pair, Pick, Shed, ShedReason, Target, Targets, Trace, TRACE_TOP},
+    builtins::{target_of, Best, FewestSessions, LeastRequests, Random},
+    decision::{
+        Decision, Pair, Pick, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
@@ -66,10 +68,17 @@ impl TieBand {
     pub const NORMALIZED: Self = Self(1e-6);
 }
 
-/// Scores the surviving candidates. `out[i]` is the score of `kept[i]`,
-/// normalized to `0.0..=1.0` with higher better; a scorer that sees the whole
-/// pool normalizes against it, writes in place and allocates nothing. The
-/// returned [`TieBand`] is the band of the written values.
+/// Scores the set the profile's picker compares: every survivor of the
+/// filters, unless the picker narrows them ([`Picker::narrow`]). `out[i]` is
+/// the score of `kept[i]`, normalized to `0.0..=1.0` with higher better; a
+/// scorer normalizes against the rows it is handed, writes in place and
+/// allocates nothing. The narrowing bounds those rows and nothing else: a
+/// scorer that by its own rule reads the pool's facts, or a level it keeps
+/// for the fleet, still does. A plugin scorer's guest is one such: its
+/// interface builds it with every candidate of the decision and asks one
+/// score a candidate, and the host reads the scores of the rows handed, so
+/// what the guest takes from a candidate outside them is the guest's own.
+/// The returned [`TieBand`] is the band of the written values.
 pub trait Scorer: Lifecycle + Debug {
     fn name(&self) -> &'static str;
 
@@ -92,12 +101,61 @@ pub trait Scorer: Lifecycle + Debug {
     }
 }
 
-/// Turns the scored survivors into ordered targets. `scores[i]` belongs to
-/// `kept[i]` and `band` is the profile's tie band; the picker pushes its pick
-/// first and its alternates after it, and allocates nothing.
+/// What a picker's narrowing left of the survivors: the first `compared` are
+/// the set it compares, and the next `alternates` are survivors it passed
+/// over that still follow its pick as alternates, in the order it left them.
+/// They follow a pick and never stand in for one: when the picker pushes no
+/// target, none is appended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Narrowed {
+    /// How many survivors, from the front, the picker compares.
+    pub compared: usize,
+    /// How many survivors behind those follow the pick as alternates.
+    pub alternates: usize,
+}
+
+impl Narrowed {
+    /// Every survivor is compared.
+    pub const fn all(survivors: usize) -> Self {
+        Self {
+            compared: survivors,
+            alternates: 0,
+        }
+    }
+}
+
+/// Turns the survivors into ordered targets, in two steps the engine runs
+/// around the scorers: `narrow` names the set the picker compares, the
+/// scorers are handed that set alone, and `pick` orders it. `scores[i]`
+/// belongs to `kept[i]` and `band` is the profile's tie band; the picker
+/// pushes its pick first and its alternates after it, and allocates nothing.
 pub trait Picker: Lifecycle + Debug {
     fn name(&self) -> &'static str;
 
+    /// Names the set the picker compares, before the scorers run: it moves
+    /// that set to the front of `kept` and says how many survivors behind it
+    /// follow the pick as alternates. It permutes `kept` and writes no other
+    /// value. A survivor the picker passed over is handed to no scorer, so
+    /// it moves no input of a built-in's estimate. The default compares
+    /// every survivor.
+    fn narrow(
+        &self,
+        _facts: &RequestFacts<'_>,
+        _candidates: &[Candidate],
+        kept: &mut [u32],
+    ) -> Narrowed {
+        Narrowed::all(kept.len())
+    }
+
+    /// Orders the rows it is handed. The engine hands the set `narrow` left
+    /// and no other survivor. A caller that scored every survivor may hand
+    /// them all, as a plugin picker does to its fallback: the picker's whole
+    /// rule then runs here, and a picker that compares a part takes that
+    /// part itself, by the draws its narrowing would have made. The scores
+    /// on that path are the pool's: every survivor was scored, so the part
+    /// is compared by scores a worker outside it has moved. A profile that
+    /// wants the estimate made over the part names the narrowing picker as
+    /// its picker.
     fn pick(
         &self,
         facts: &RequestFacts<'_>,
@@ -211,10 +269,11 @@ pub struct Scratch {
     classes: Vec<u32>,
 }
 
-/// The buffers of one profile run: the survivors, their combined scores, one
-/// scorer's stage and the survivors a soft filter restores when it would
-/// leave nothing. A pair decision keeps the prefill's apart from the decode
-/// side's, so the prefill's survivors stay for the next prefill target.
+/// The buffers of one profile run: the survivors, the combined scores of the
+/// set the picker compares, one scorer's stage and the survivors a soft
+/// filter restores when it would leave nothing. A pair decision keeps the
+/// prefill's apart from the decode side's, so the prefill's survivors stay
+/// for the next prefill target.
 #[derive(Debug, Default)]
 struct Buffers {
     kept: Vec<u32>,
@@ -229,8 +288,8 @@ impl Scratch {
     }
 }
 
-/// Combined scores of the survivors, written into `scores`; the profile's tie
-/// band comes back.
+/// Combined scores of the rows in `kept`, written into `scores`; the
+/// profile's tie band comes back.
 fn combine(
     profile: &Profile,
     facts: &RequestFacts<'_>,
@@ -258,6 +317,53 @@ fn combine(
         }
     }
     TieBand(band)
+}
+
+/// The scorers and the picker over the survivors in `buf.kept`: the one place
+/// a profile's estimate is made. The picker names the set it compares, the
+/// scorers are handed that set alone, the picker orders it, and the
+/// survivors it passed over follow as alternates while targets are left.
+/// Alternates follow a pick and never stand in for one: a picker that pushes
+/// no target has declined, and no survivor it passed over is appended. On
+/// return the compared set leads `buf.kept` and `buf.scores` holds its
+/// scores.
+fn score_and_pick(
+    profile: &Profile,
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    buf: &mut Buffers,
+    targets: &mut Targets,
+) {
+    let narrowed = profile.picker.narrow(facts, candidates, &mut buf.kept);
+    let compared = narrowed.compared.min(buf.kept.len());
+    let alternates = narrowed.alternates.min(buf.kept.len() - compared);
+    let band = combine(
+        profile,
+        facts,
+        candidates,
+        &buf.kept[..compared],
+        &mut buf.scores,
+        &mut buf.stage,
+    );
+    let before = targets.len();
+    profile.picker.pick(
+        facts,
+        candidates,
+        &buf.kept[..compared],
+        &buf.scores,
+        band,
+        targets,
+    );
+    if targets.len() == before {
+        return;
+    }
+    // A full list keeps what it has: the walk is bounded by the list's size.
+    for &i in buf.kept[compared..compared + alternates]
+        .iter()
+        .take(MAX_TARGETS)
+    {
+        targets.push(target_of(&candidates[i as usize]));
+    }
 }
 
 /// The filters over `candidates`, stage by stage in profile order, each one
@@ -433,23 +539,10 @@ fn run_profile(
             trace_of(index, facts, pool, candidates, &[], &[]),
         );
     }
-    let band = combine(
-        profile,
-        facts,
-        candidates,
-        &buf.kept,
-        &mut buf.scores,
-        &mut buf.stage,
-    );
     let mut targets = Targets::new();
-    profile.picker.pick(
-        facts,
-        candidates,
-        &buf.kept,
-        &buf.scores,
-        band,
-        &mut targets,
-    );
+    score_and_pick(profile, facts, candidates, buf, &mut targets);
+    // The trace counts every survivor of the filters; its top rows are of
+    // the compared set, which leads the survivors and alone holds scores.
     let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
     if targets.is_empty() {
         return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
@@ -950,41 +1043,49 @@ impl Engine {
         candidates: &[Candidate],
         buf: &mut Buffers,
     ) -> Decision {
-        let kept = &buf.kept;
-        let (band, picker): (TieBand, &dyn Picker) = match rule.assignment {
-            Assignment::Delegate => (
-                combine(
-                    profile,
-                    facts,
-                    candidates,
-                    kept,
-                    &mut buf.scores,
-                    &mut buf.stage,
-                ),
-                profile.picker.as_ref(),
-            ),
+        let mut targets = Targets::new();
+        let picker: &dyn Picker = match rule.assignment {
+            // The profile's own stages, through the profile run's one home.
+            Assignment::Delegate => {
+                score_and_pick(profile, facts, candidates, buf, &mut targets);
+                profile.picker.as_ref()
+            }
             Assignment::Random => {
                 buf.scores.clear();
-                buf.scores.resize(kept.len(), 0.0);
-                (TieBand::NORMALIZED, &self.assignment.random)
+                buf.scores.resize(buf.kept.len(), 0.0);
+                let picker: &dyn Picker = &self.assignment.random;
+                picker.pick(
+                    facts,
+                    candidates,
+                    &buf.kept,
+                    &buf.scores,
+                    TieBand::NORMALIZED,
+                    &mut targets,
+                );
+                picker
             }
             Assignment::MinLoad | Assignment::MinGroup => {
                 buf.scores.clear();
-                buf.scores.resize(kept.len(), 0.0);
+                buf.scores.resize(buf.kept.len(), 0.0);
                 let scorer: &dyn Scorer = if rule.assignment == Assignment::MinLoad {
                     &self.assignment.least_requests
                 } else {
                     &self.assignment.fewest_sessions
                 };
-                (
-                    scorer.score(facts, candidates, kept, &mut buf.scores),
-                    &self.assignment.best,
-                )
+                let band = scorer.score(facts, candidates, &buf.kept, &mut buf.scores);
+                let picker: &dyn Picker = &self.assignment.best;
+                picker.pick(
+                    facts,
+                    candidates,
+                    &buf.kept,
+                    &buf.scores,
+                    band,
+                    &mut targets,
+                );
+                picker
             }
         };
-        let mut targets = Targets::new();
-        picker.pick(facts, candidates, kept, &buf.scores, band, &mut targets);
-        let trace = trace_of(index, facts, pool, candidates, kept, &buf.scores);
+        let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
         if targets.is_empty() {
             return shed(ShedReason::PolicyDeclined, picker.name(), trace);
         }
@@ -1301,9 +1402,14 @@ impl Lifecycle for Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::{
-        builtins::{Best, Healthy, LeastRequests, NotOverloaded, NotTried},
+        builtins::{
+            Best, CountFirst, Healthy, LeastRequests, NotOverloaded, NotTried, PowerOfTwo,
+            PowerOfTwoCountFirst,
+        },
         sessions::Recovery,
         spec::PolicySpec,
         view::{Health, Identity, MediaCounts, Role, WorkerId},
@@ -2217,6 +2323,536 @@ mod tests {
         );
         let pick = decision.pick().expect("the busier prefill still pairs");
         assert_eq!(pick.targets.first().map(|t| t.position), Some(1));
+    }
+
+    /// A scorer that keeps the rows it was handed and scores a row by its
+    /// position, the later the better.
+    #[derive(Debug)]
+    struct Handed(Arc<Mutex<Vec<u32>>>);
+
+    impl Lifecycle for Handed {}
+
+    impl Scorer for Handed {
+        fn name(&self) -> &'static str {
+            "handed"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            assert_eq!(out.len(), kept.len(), "one score a row handed");
+            *self.0.lock().expect("the probe's rows") = kept.to_vec();
+            for (o, &row) in out.iter_mut().zip(kept) {
+                *o = candidates[row as usize].position as f32 / 8.0;
+            }
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// The probe scorer under `picker` over the healthy workers, with the
+    /// rows the scorer was handed last.
+    fn probed(
+        picker: Box<dyn Picker>,
+        sessions: Option<SessionRule>,
+    ) -> (Engine, Arc<Mutex<Vec<u32>>>) {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let engine = Engine::new(
+            vec![Profile {
+                name: "probed".into(),
+                filters: vec![Box::new(Healthy)],
+                scorers: vec![Weighted {
+                    scorer: Box::new(Handed(Arc::clone(&handed))),
+                    weight: 1.0,
+                }],
+                picker,
+            }],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Single,
+                profile: 0,
+                decode_profile: None,
+                sessions,
+            }],
+            1,
+            Needs::default(),
+        );
+        (engine, handed)
+    }
+
+    /// The scorers are handed the set the picker compares and no other
+    /// survivor: the two drawn under a two-draw picker, the fewest in flight
+    /// under count-first, every survivor under a picker that does not
+    /// narrow. The trace counts the filters' survivors all the same, and its
+    /// top rows are of the set compared.
+    #[test]
+    fn the_scorers_are_handed_the_set_the_picker_compares() {
+        // Five workers up, the first two holding the fewest, and one down.
+        let mut pool = [
+            candidate(0, 1),
+            candidate(1, 1),
+            candidate(2, 3),
+            candidate(3, 3),
+            candidate(4, 3),
+            candidate(5, 0),
+        ];
+        pool[5].health.healthy = false;
+        let run = |picker: Box<dyn Picker>, seed: u64| {
+            let (engine, handed) = probed(picker, None);
+            let facts = RequestFacts {
+                model: "m",
+                seed,
+                ..RequestFacts::default()
+            };
+            let decision = engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            let pick = *decision.pick().expect("a pick");
+            let rows = handed.lock().expect("the probe's rows").clone();
+            let order: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+            let top: Vec<u64> = pick.trace.top[..usize::from(pick.trace.top_len)]
+                .iter()
+                .map(|(id, _)| id.0 - 100)
+                .collect();
+            assert_eq!(pick.trace.survivors, 5, "the filters' count");
+            (rows, order, top)
+        };
+        let mut pairs = std::collections::BTreeSet::new();
+        for seed in 0..64u64 {
+            let (rows, order, top) = run(Box::new(PowerOfTwo), seed);
+            assert_eq!(rows.len(), 2, "seed {seed}: the two drawn, {rows:?}");
+            assert!(rows[0] != rows[1] && rows.iter().all(|&row| row < 5));
+            let (better, other) = (rows[0].max(rows[1]), rows[0].min(rows[1]));
+            assert_eq!(order, [better, other], "seed {seed}: the later row leads");
+            assert_eq!(top, [u64::from(better), u64::from(other)], "seed {seed}");
+            pairs.insert((rows[0], rows[1]));
+
+            let (rows, order, top) = run(Box::new(PowerOfTwoCountFirst), seed);
+            assert_eq!(rows.len(), 2, "seed {seed}: the two drawn, {rows:?}");
+            let count = |row: u32| pool[row as usize].in_flight;
+            let lead = *rows
+                .iter()
+                .min_by_key(|&&row| (count(row), std::cmp::Reverse(row)))
+                .expect("two rows");
+            assert_eq!(
+                order[0], lead,
+                "seed {seed}: the fewer in flight, then the later"
+            );
+            assert_eq!(top.len(), 2, "seed {seed}");
+
+            let (rows, order, top) = run(Box::new(CountFirst), seed);
+            assert_eq!(rows.len(), 2, "seed {seed}: {rows:?}");
+            assert!(
+                rows.contains(&0) && rows.contains(&1),
+                "the two that hold one"
+            );
+            assert_eq!(
+                order[..2],
+                [1, 0],
+                "seed {seed}: the later of the fewest leads"
+            );
+            assert_eq!(order.len(), 4, "seed {seed}: two passed over follow");
+            assert!(order[2] != order[3] && order[2..].iter().all(|row| (2..5).contains(row)));
+            assert_eq!(top, [1, 0], "seed {seed}");
+
+            let (rows, order, top) = run(Box::new(Best), seed);
+            assert_eq!(rows, [0, 1, 2, 3, 4], "seed {seed}: every survivor");
+            assert_eq!(order, [4, 3, 2, 1], "seed {seed}");
+            assert_eq!(top, [4, 3, 2], "seed {seed}");
+        }
+        assert!(pairs.len() > 4, "the draw moves the pair: {pairs:?}");
+    }
+
+    /// A picker whose narrowing names more rows than the survivors hold, of
+    /// either kind, costs no decision its process: the engine compares what
+    /// there is and lets what there is follow.
+    #[test]
+    fn a_picker_that_claims_more_than_the_survivors_is_held_to_them() {
+        /// The first row compared leads; the narrowing claims what it holds.
+        #[derive(Debug)]
+        struct Claims(Narrowed);
+        impl Lifecycle for Claims {}
+        impl Picker for Claims {
+            fn name(&self) -> &'static str {
+                "claims"
+            }
+            fn narrow(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &mut [u32]) -> Narrowed {
+                self.0
+            }
+            fn pick(
+                &self,
+                _: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                _: &[f32],
+                _: TieBand,
+                out: &mut Targets,
+            ) {
+                if let Some(&row) = kept.first() {
+                    out.push(target_of(&candidates[row as usize]));
+                }
+            }
+        }
+        let pool = [candidate(0, 1), candidate(1, 2), candidate(2, 3)];
+        let all = Narrowed {
+            compared: usize::MAX,
+            alternates: usize::MAX,
+        };
+        let one = Narrowed {
+            compared: 1,
+            alternates: usize::MAX,
+        };
+        for (claim, compared, order) in
+            [(all, vec![0, 1, 2], vec![0]), (one, vec![0], vec![0, 1, 2])]
+        {
+            let (engine, handed) = probed(Box::new(Claims(claim)), None);
+            let facts = RequestFacts {
+                model: "m",
+                ..RequestFacts::default()
+            };
+            let decision = engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            let pick = decision.pick().expect("a pick");
+            assert_eq!(
+                *handed.lock().expect("the probe's rows"),
+                compared,
+                "{claim:?}"
+            );
+            let targets: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+            assert_eq!(targets, order, "{claim:?}");
+        }
+    }
+
+    /// Alternates follow a pick and never stand in for one. A picker that
+    /// compares one worker, keeps the rest as alternates and pushes no
+    /// target has declined: the decision is a shed that names the picker,
+    /// under the profile run and under a sessions rule that delegates, and
+    /// no worker it passed over is picked in its place.
+    #[test]
+    fn a_narrowing_picker_that_declines_sheds_whatever_it_passed_over() {
+        /// Compares the first survivor, keeps the rest and declines.
+        #[derive(Debug)]
+        struct Declines;
+        impl Lifecycle for Declines {}
+        impl Picker for Declines {
+            fn name(&self) -> &'static str {
+                "declines"
+            }
+            fn narrow(&self, _: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Narrowed {
+                Narrowed {
+                    compared: 1,
+                    alternates: kept.len().saturating_sub(1),
+                }
+            }
+            fn pick(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                _: &[f32],
+                _: TieBand,
+                _: &mut Targets,
+            ) {
+            }
+        }
+        let pool = [candidate(0, 1), candidate(1, 2), candidate(2, 3)];
+        for sessions in [None, Some(SESSIONS)] {
+            let keyed = sessions.is_some();
+            let site = if keyed {
+                "a delegating rule"
+            } else {
+                "the profile run"
+            };
+            let (engine, handed) = probed(Box::new(Declines), sessions);
+            let decision = if keyed {
+                decide_keyed(&engine, &pool, 41, 1_000)
+            } else {
+                let facts = RequestFacts {
+                    model: "m",
+                    ..RequestFacts::default()
+                };
+                engine.decide(
+                    &facts,
+                    &PoolFacts::default(),
+                    &pool,
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                )
+            };
+            assert_eq!(*handed.lock().expect("the probe's rows"), [0], "{site}");
+            match decision {
+                Decision::Shed(shed) => {
+                    assert_eq!(shed.reason, ShedReason::PolicyDeclined, "{site}");
+                    assert_eq!(shed.emptied_by, "declines", "{site}");
+                }
+                picked => panic!("{site}: a decline answered {picked:?}"),
+            }
+        }
+    }
+
+    /// The first survivor, unless it is of the refused pair class: then the
+    /// picker declines.
+    #[derive(Debug)]
+    struct RefusesClass(u32);
+
+    impl Lifecycle for RefusesClass {}
+
+    impl Picker for RefusesClass {
+        fn name(&self) -> &'static str {
+            "refuses-class"
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            let Some(first) = kept.first().map(|&row| &candidates[row as usize]) else {
+                return;
+            };
+            if first.pair_class != self.0 {
+                out.push(target_of(first));
+            }
+        }
+    }
+
+    /// Under the pair plan the prefill side's targets are walked until one
+    /// pairs. A narrowing picker keeps the survivors it passed over as
+    /// alternates, so when the decode side declines the partners of the
+    /// prefill compared, a prefill passed over still pairs: a pair that was a
+    /// pick before the narrowing is one after it.
+    #[test]
+    fn a_prefill_the_picker_passed_over_still_pairs_when_the_one_compared_cannot() {
+        // The idle prefill's decode is refused; the busy prefill's is not.
+        let mut prefills = [candidate(0, 0), candidate(1, 5)];
+        prefills[0].pair_class = 7;
+        prefills[1].pair_class = 8;
+        let mut decodes = [candidate(0, 0), candidate(1, 0)];
+        decodes[0].pair_class = 7;
+        decodes[1].pair_class = 8;
+        let pickers: [fn() -> Box<dyn Picker>; 3] = [
+            || Box::new(CountFirst),
+            || Box::new(PowerOfTwo),
+            || Box::new(PowerOfTwoCountFirst),
+        ];
+        for picker in pickers {
+            let picker = picker();
+            let name = picker.name();
+            let engine = Engine::new(
+                vec![
+                    Profile {
+                        name: "prefill".into(),
+                        filters: vec![Box::new(Healthy)],
+                        scorers: vec![Weighted {
+                            scorer: Box::new(LeastRequests),
+                            weight: 1.0,
+                        }],
+                        picker,
+                    },
+                    Profile {
+                        name: "decode".into(),
+                        filters: vec![Box::new(Healthy)],
+                        scorers: vec![],
+                        picker: Box::new(RefusesClass(7)),
+                    },
+                ],
+                vec![Binding {
+                    model: "*".into(),
+                    phases: vec![],
+                    plan: Plan::PdPair,
+                    profile: 0,
+                    decode_profile: Some(1),
+                    sessions: None,
+                }],
+                1,
+                Needs::default(),
+            );
+            for seed in 0..32u64 {
+                let facts = RequestFacts {
+                    model: "m",
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let decision = engine.decide_pair(
+                    &facts,
+                    &PoolFacts::default(),
+                    PairPools {
+                        prefills: &prefills,
+                        decodes: &decodes,
+                    },
+                    &Constraints::default(),
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                );
+                let Some(pick) = decision.pick() else {
+                    panic!("{name}, seed {seed}: no pair in {decision:?}")
+                };
+                let first = pick.targets.first().expect("a target");
+                assert_eq!(
+                    (first.position, first.pair.map(|pair| pair.decode_position)),
+                    (1, Some(1)),
+                    "{name}, seed {seed}"
+                );
+            }
+        }
+    }
+
+    /// Under the pair plan the decode side opens a stream of its own from
+    /// the request's seed. The order count-first gives equal counts among
+    /// the prefills it passed over shares no value with that stream: when
+    /// the lead prefill's decode run sheds, each of two tied alternates
+    /// pairs with each of its two decodes about as often. (Ordered by the
+    /// decode side's own stream, two of the four pairs are never reached.)
+    #[test]
+    fn a_passed_over_prefill_pairs_with_every_decode_of_its_class() {
+        /// The `random` picker, unless the first survivor is of the refused
+        /// pair class: then the picker declines.
+        #[derive(Debug)]
+        struct RandomUnlessClass(u32);
+        impl Lifecycle for RandomUnlessClass {}
+        impl Picker for RandomUnlessClass {
+            fn name(&self) -> &'static str {
+                "random-unless-class"
+            }
+            fn pick(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                scores: &[f32],
+                band: TieBand,
+                out: &mut Targets,
+            ) {
+                let first = kept.first().map(|&row| candidates[row as usize].pair_class);
+                if first != Some(self.0) {
+                    Random.pick(facts, candidates, kept, scores, band, out);
+                }
+            }
+        }
+        // The idle prefill leads and its decode side declines; the two busy
+        // prefills tie and hold a class of two decodes each.
+        let mut prefills = [candidate(0, 0), candidate(1, 5), candidate(2, 5)];
+        for (prefill, class) in prefills.iter_mut().zip([7, 8, 9]) {
+            prefill.pair_class = class;
+        }
+        let mut decodes = [
+            candidate(0, 0),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+            candidate(4, 0),
+        ];
+        for (decode, class) in decodes.iter_mut().zip([7, 8, 8, 9, 9]) {
+            decode.pair_class = class;
+        }
+        let engine = Engine::new(
+            vec![
+                Profile {
+                    name: "prefill".into(),
+                    filters: vec![Box::new(Healthy)],
+                    scorers: vec![Weighted {
+                        scorer: Box::new(LeastRequests),
+                        weight: 1.0,
+                    }],
+                    picker: Box::new(CountFirst),
+                },
+                Profile {
+                    name: "decode".into(),
+                    filters: vec![Box::new(Healthy)],
+                    scorers: vec![],
+                    picker: Box::new(RandomUnlessClass(7)),
+                },
+            ],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                sessions: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        // How often each busy prefill pairs with each decode of its class.
+        let mut pairs = [[0u32; 2]; 2];
+        for seed in 0..4_000u64 {
+            let facts = RequestFacts {
+                model: "m",
+                seed,
+                ..RequestFacts::default()
+            };
+            let decision = engine.decide_pair(
+                &facts,
+                &PoolFacts::default(),
+                PairPools {
+                    prefills: &prefills,
+                    decodes: &decodes,
+                },
+                &Constraints::default(),
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            let Some(pick) = decision.pick() else {
+                panic!("seed {seed}: no pair in {decision:?}")
+            };
+            let first = pick.targets.first().expect("a target");
+            let decode = first.pair.expect("a pair").decode_position;
+            assert!(
+                (1..=2).contains(&first.position) && (1..=4).contains(&decode),
+                "seed {seed}: {first:?}"
+            );
+            pairs[(first.position - 1) as usize][((decode - 1) % 2) as usize] += 1;
+        }
+        assert!(
+            pairs.iter().flatten().all(|n| (850..=1150).contains(n)),
+            "{pairs:?}"
+        );
+    }
+
+    /// A sessions rule that delegates runs the profile's own stages through
+    /// the profile run's one home: a keyed request's placement hands the
+    /// scorers the set the picker compares, as an unkeyed decision does.
+    #[test]
+    fn a_delegating_sessions_rule_narrows_as_the_profile_run_does() {
+        let (engine, handed) = probed(Box::new(CountFirst), Some(SESSIONS));
+        let pool = [
+            candidate(0, 4),
+            candidate(1, 2),
+            candidate(2, 2),
+            candidate(3, 9),
+        ];
+        let decision = decide_keyed(&engine, &pool, 41, 1_000);
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(
+            *handed.lock().expect("the probe's rows"),
+            [1, 2],
+            "the two that hold two"
+        );
+        let order: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+        assert_eq!(
+            order,
+            [2, 1, 0, 3],
+            "the later of the fewest, then by count"
+        );
+        assert_eq!(pick.trace.survivors, 4);
     }
 
     #[test]
