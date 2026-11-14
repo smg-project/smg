@@ -479,6 +479,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // MiniCPM5: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
     // prompt.
     ("minicpm5-2b", GenerationPrompt::ModelWritesTheThought),
+    // colgrep-agent-2B (a MiniCPM5-2B fine-tune) writes the MiniCPM5-2B base template: the same
+    // prompt shapes, the model writing its own `<think>`.
+    ("colgrep-agent-2b", GenerationPrompt::ModelWritesTheThought),
     // dots3: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
     // prompt.
     ("dots3-note-prev", GenerationPrompt::ModelWritesTheThought),

@@ -26,6 +26,7 @@
   {"model": "internlm/CapRL-Qwen3VL-4B", "also": ["CapRL-Qwen3VL-2B"], "table": "qwen3", "opener": null, "after": null},
   {"model": "internlm/CapRL-Video-4B", "also": ["inclusionAI/ArmorOCR"], "table": "qwen3", "opener": null, "after": null},
   {"model": "Salesforce/cogalign-internvl2_5-mpo-4b", "also": ["cogalign-internvl2_5-mpo-1b"], "table": "qwen2.5", "opener": null, "after": null},
+  {"model": "lightonai/colgrep-agent-2B", "also": [], "table": "minicpm5", "opener": null, "after": null},
   {"model": "tencent/ContextPilot-14B", "also": ["ByteDance-Seed/cudaLLM-8B", "FreedomIntelligence/HuatuoGPT-3-32B", "nvidia/Nemotron-Terminal-14B", "nvidia/Nemotron-Terminal-32B", "nvidia/Nemotron-Terminal-8B", "OpenMOSS-Team/Qwen3-32B-ABC", "ContextPilot-8B"], "table": "qwen3", "opener": null, "after": null},
   {"model": "nvidia/Cosmos3-Edge", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "nvidia/Cosmos3-Edge-Policy-DROID", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},

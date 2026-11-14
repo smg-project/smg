@@ -261,6 +261,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-05 | [d1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-3b) | LiquidAI/d1-3B |  | `lfm2.5` | 589,657 | replaying the set | none |
 | 2026-10-05 | [nld-uni](https://github.com/smg-project/bellwether/tree/main/fixtures/nld-uni) | nvidia/NLD-Uni |  | `qwen3`, tagged calls | 27 | replaying the set | none |
 | 2026-10-05 | [nvidia-nemotron-3.5-bolt-e4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-bolt-e4b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 |  | `gemma4` | 28 | replaying the set | `qwen_xml`, `nano_v3` |
+| 2026-10-03 | [colgrep-agent-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/colgrep-agent-2b) | lightonai/colgrep-agent-2B |  | `minicpm5` | 28 | replaying the set | none |
 | 2026-10-02 | [h2o-lightning-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/h2o-lightning-4b) | h2oai/h2o-lightning-4b |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
 | 2026-09-30 | [mistral-large-4-1t-a52b](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-large-4-1t-a52b) | mistralai/Mistral-Large-4-1T-A52B | Mistral-Large-4-1T-A52B-NVFP4 | `mistral_v13` | 28 | replaying the set | `mistral`, none |
 | 2026-09-29 | [arex-2](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-2) | BAAI/AREX-2 |  | `qwen3`, tagged calls | 474,563 | replaying the set | none |
