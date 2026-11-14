@@ -1181,6 +1181,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "granite-4.1-3b-llmon-preview",
+        model: "ibm-granite/granite-4.1-3b-llmon-preview",
+        also: &[],
+        released: "2026-10-01",
+        smg: (None, None),
+        table: Some(Table::Plain),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "granite-speech-3.2-8b",
         model: "ibm-granite/granite-speech-3.2-8b",
         also: &[],
