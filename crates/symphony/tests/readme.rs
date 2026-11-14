@@ -1770,6 +1770,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "memt-1.0-nano",
+        model: "MemTensor/MemT-1.0-Nano",
+        also: &[],
+        released: "2026-10-15",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "midashenglm-spatial",
         model: "mispeech/midashenglm-spatial",
         also: &[],

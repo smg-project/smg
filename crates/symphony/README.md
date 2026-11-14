@@ -265,6 +265,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-16 | [zwz2-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/zwz2-27b) | inclusionAI/ZwZ2-27B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-16 | [zwz2-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/zwz2-9b) | inclusionAI/ZwZ2-9B | ZwZ2-4B | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-15 | [hy-memory-30b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/hy-memory-30b-a3b) | tencent/Hy-Memory-30B-A3B | Hy-Memory-30B-A3B-FP8 | `hy_v3` | 19 | replaying the set | none |
+| 2026-10-15 | [memt-1.0-nano](https://github.com/smg-project/bellwether/tree/main/fixtures/memt-1.0-nano) | MemTensor/MemT-1.0-Nano |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-15 | [muse-spark-open-816b-a42b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-spark-open-816b-a42b) | meta-models/Muse-Spark-Open-816B-A42B | Muse-Spark-Open-816B-A42B-NVFP4 | `muse_spark` | — | awaiting fixtures | none |
 | 2026-10-14 | [granite-switch-4.1-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-switch-4.1-8b) | ibm-granite/granite-switch-4.1-8b | granite-switch-4.1-30b | `qwen2.5` | 19 | replaying the set | none |
 | 2026-10-13 | [ling-3.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/ling-3.1-flash) | inclusionAI/Ling-3.1-flash | Ling-3.1-flash-1019 | `ling` | 28 | replaying the set | none |
