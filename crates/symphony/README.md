@@ -236,14 +236,15 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-240 groups, 430 checkpoints, newest first.
-12 ready, 174 replaying a recorded set, 5 on main awaiting fixtures, 49 pending.
+241 groups, 431 checkpoints, newest first.
+12 ready, 175 replaying a recorded set, 5 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
 | 2026-10-30 | [mage-vl-cowork](https://github.com/smg-project/bellwether/tree/main/fixtures/mage-vl-cowork) | microsoft/Mage-VL-Cowork |  | `qwen3` | 28 | replaying the set | none |
 | 2026-10-24 | [d1-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-2b) | LiquidAI/d1-2B |  | `qwen3`, tagged calls | 9 | replaying the set | none |
 | 2026-10-24 | [d1-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-omni-2b) | LiquidAI/d1-Omni-2B |  | `qwen3`, tagged calls | — | awaiting fixtures | none |
+| 2026-10-24 | [nanbeige4.3-33b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.3-33b) | Nanbeige/Nanbeige4.3-33B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-23 | [lfm3-1.7b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-1.7b) | LiquidAI/LFM3-1.7B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-22 | [wevisone-vl-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/wevisone-vl-4b) | tencent/WeVisOne-VL-4B | WeVisOne-VL-2B | `qwen3` | 19 | replaying the set | none |
 | 2026-10-21 | [lfm3-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-omni-2b) | LiquidAI/LFM3-Omni-2B |  | `qwen3`, tagged calls | 19 | replaying the set | none |

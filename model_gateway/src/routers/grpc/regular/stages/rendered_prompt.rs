@@ -252,7 +252,7 @@ mod tests {
     fn media(mode: MmProcessingMode, placeholders: PlaceholderTokens) -> MediaContext {
         media_for(
             MediaPlan::new([MediaContentPart::ImageUrl {
-                url: "https://a/1.png".to_string(),
+                url: "https://a/1.png".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
@@ -329,7 +329,7 @@ mod tests {
         let placeholders = PlaceholderTokens::worker_only();
         let media = media_for(
             MediaPlan::new([MediaContentPart::AudioUrl {
-                url: "https://a/1.wav".to_string(),
+                url: "https://a/1.wav".to_string().into(),
                 uuid: None,
             }]),
             MmProcessingMode::Worker,

@@ -219,6 +219,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
+    /// The runtime a stream of this worker notes its progress on, captured
+    /// once at the stream's start (see `TrackedStream`): the shared
+    /// [`WorkerRuntime`] every handle of the worker reaches, so the runtime's
+    /// own millisecond rule decides every note. `None` for a worker without
+    /// one, whose streams note through [`Self::note_token_progress_at`].
+    ///
+    /// A stream keeps noting the runtime it captured, so a worker's runtime
+    /// is not swapped once the worker can take a stream: the one swap,
+    /// [`Self::inherit_shared_state_from`], runs on a replacement before the
+    /// registry publishes it.
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        None
+    }
+
     /// Check if the worker is currently healthy (status == Ready).
     ///
     /// This is a routing predicate — returns true only for `Ready` workers.
@@ -1754,6 +1768,10 @@ impl Worker for BasicWorker {
             self.publish_state();
         }
         changed
+    }
+
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        Some(self.runtime.load_full())
     }
 
     fn note_contact(&self) {

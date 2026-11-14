@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use serde::{
@@ -460,7 +460,9 @@ impl ContentPart {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct ImageUrl {
-    pub url: String,
+    /// The image's URL or `data:` URL, shared with every reader of the
+    /// request (the media plan among them) instead of copied.
+    pub url: Arc<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
     /// MiniMax-M3 extension: cap the image's long side before preprocessing.
@@ -478,20 +480,22 @@ pub struct ImageUrl {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct AudioUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct InputAudio {
-    /// Base64-encoded audio bytes.
-    pub data: String,
+    /// Base64-encoded audio bytes, shared with the readers that decode them.
+    pub data: Arc<String>,
     /// Encoded audio format. The OpenAI Chat API supports `wav` and `mp3`.
     pub format: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
     /// MiniMax-M3 extension: frames per second to sample the clip at.
     ///
     /// Valid range is 0.2 to 5.0 inclusive.
@@ -1738,6 +1742,10 @@ pub struct CompletionTokensDetails {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
+    /// Generated tokens. The public API's embeddings usage has no such key
+    /// (only `prompt_tokens` and `total_tokens`), so a usage written without
+    /// it reads as none generated.
+    #[serde(default)]
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub reasoning_tokens: Option<u32>,
@@ -2360,7 +2368,7 @@ mod tests {
             part,
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "https://example.com/audio.wav".to_string(),
+                    url: "https://example.com/audio.wav".to_string().into(),
                 },
             }
         );
@@ -2424,7 +2432,7 @@ mod tests {
             part,
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             }

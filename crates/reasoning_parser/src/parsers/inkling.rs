@@ -58,6 +58,9 @@ pub struct InklingParser {
     block_kind: Option<BlockKind>,
     buffer: String,
     max_buffer_size: usize,
+    json_mode: bool,
+    in_json_string: bool,
+    json_escape: bool,
 }
 
 impl InklingParser {
@@ -66,11 +69,35 @@ impl InklingParser {
             block_kind: None,
             buffer: String::new(),
             max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+            json_mode: false,
+            in_json_string: false,
+            json_escape: false,
         }
     }
 
-    fn find_control_candidate(text: &str) -> Option<ControlCandidate> {
-        for (start, _) in text.match_indices('<') {
+    fn find_control_candidate(&mut self, text: &str) -> Option<ControlCandidate> {
+        let json_content =
+            self.json_mode && matches!(self.block_kind, None | Some(BlockKind::Content));
+        for (start, character) in text.char_indices() {
+            if json_content {
+                if self.in_json_string {
+                    if self.json_escape {
+                        self.json_escape = false;
+                    } else if character == '\\' {
+                        self.json_escape = true;
+                    } else if character == '"' {
+                        self.in_json_string = false;
+                    }
+                    continue;
+                }
+                if character == '"' {
+                    self.in_json_string = true;
+                    continue;
+                }
+            }
+            if character != '<' {
+                continue;
+            }
             let suffix = &text[start..];
 
             if let Some(token) = CONTROL_TOKENS
@@ -153,7 +180,7 @@ impl InklingParser {
 
         while pos < text.len() {
             let remaining = &text[pos..];
-            match Self::find_control_candidate(remaining) {
+            match self.find_control_candidate(remaining) {
                 Some(ControlCandidate::Complete { start, token }) => {
                     self.emit_text(&remaining[..start], &mut result);
                     self.handle_control(token, &mut result);
@@ -194,6 +221,7 @@ impl ReasoningParser for InklingParser {
         // Complete parsing is independent of any prior streaming state.
         let mut parser = Self::new();
         parser.max_buffer_size = self.max_buffer_size;
+        parser.json_mode = self.json_mode;
         parser.buffer.push_str(text);
         Ok(parser.parse_buffer(true))
     }
@@ -218,6 +246,8 @@ impl ReasoningParser for InklingParser {
     fn reset(&mut self) {
         self.block_kind = None;
         self.buffer.clear();
+        self.in_json_string = false;
+        self.json_escape = false;
     }
 
     fn model_type(&self) -> &str {
@@ -226,6 +256,10 @@ impl ReasoningParser for InklingParser {
 
     fn requires_special_tokens(&self) -> bool {
         true
+    }
+
+    fn set_json_mode(&mut self, enabled: bool) {
+        self.json_mode = enabled;
     }
 
     fn is_in_reasoning(&self) -> bool {
@@ -334,5 +368,115 @@ mod tests {
             .parse_reasoning_streaming_incremental("plain answer")
             .unwrap();
         assert_eq!(result, ParserResult::normal("plain answer".to_string()));
+    }
+
+    #[test]
+    fn preserves_protocol_spellings_in_json_strings() {
+        let payload = r#"{"literal":"<|content_thinking|>quoted<|end_message|>"}"#;
+        let framed = format!("{MESSAGE_MODEL}{CONTENT_TEXT}{payload}{END_MESSAGE}");
+        let mut parser = InklingParser::new();
+        parser.set_json_mode(true);
+        let result = parser.detect_and_parse_reasoning(&framed).unwrap();
+        assert_eq!(result, ParserResult::normal(payload.to_string()));
+    }
+
+    fn parse_json_chunks(chunks: &[&str]) -> ParserResult {
+        let mut parser = InklingParser::new();
+        parser.set_json_mode(true);
+        let mut result = ParserResult::default();
+        for chunk in chunks {
+            let parsed = parser.parse_reasoning_streaming_incremental(chunk).unwrap();
+            result.normal_text.push_str(&parsed.normal_text);
+            result.reasoning_text.push_str(&parsed.reasoning_text);
+        }
+        let tail = parser.flush().unwrap();
+        result.normal_text.push_str(&tail.normal_text);
+        result.reasoning_text.push_str(&tail.reasoning_text);
+        assert!(parser.flush().unwrap().is_empty());
+        result
+    }
+
+    #[test]
+    fn json_keys_escapes_and_unicode_survive_every_partition() {
+        for token in CONTROL_TOKENS {
+            let payload = format!(r#"{{"{token}":"α\"{token}\\\\終"}}"#);
+            let framed = format!(
+                "{MESSAGE_MODEL}{CONTENT_THINKING}unmatched quote: \"{END_MESSAGE}\
+                 {MESSAGE_MODEL}{CONTENT_TEXT}{payload}{END_MESSAGE}{CONTENT_MODEL_END_SAMPLING}"
+            );
+            let expected = ParserResult::new(payload, "unmatched quote: \"".to_string());
+            for split in framed
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([framed.len()])
+            {
+                assert_eq!(
+                    parse_json_chunks(&[&framed[..split], &framed[split..]]),
+                    expected,
+                    "token {token}, split {split}"
+                );
+            }
+            let chunks: Vec<_> = framed
+                .char_indices()
+                .map(|(index, character)| &framed[index..index + character.len_utf8()])
+                .collect();
+            assert_eq!(parse_json_chunks(&chunks), expected);
+        }
+    }
+
+    #[test]
+    fn json_continuations_scalars_and_incomplete_strings_preserve_text() {
+        for payload in [
+            r#"["<|message_model|>","<|end_message|>"]"#,
+            r#""<|content_thinking|>""#,
+            "42",
+            "null",
+            "true",
+            r#"{"value":"<|content_thinking|>unfinished<|end_mes"#,
+            r#"{"value":"escaped quote: \"<|end_message|>"#,
+        ] {
+            assert_eq!(
+                parse_json_chunks(&[payload]),
+                ParserResult::normal(payload.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn json_reset_and_complete_parse_do_not_reuse_quote_state() {
+        let mut parser = InklingParser::new();
+        parser.set_json_mode(true);
+        parser
+            .parse_reasoning_streaming_incremental("{\"value\":\"\\")
+            .unwrap();
+        let framed = format!("{CONTENT_TEXT}\"{CONTENT_THINKING}\"{END_MESSAGE}");
+        let expected = ParserResult::normal(format!("\"{CONTENT_THINKING}\""));
+        assert_eq!(
+            parser.detect_and_parse_reasoning(&framed).unwrap(),
+            expected
+        );
+        parser.reset();
+        assert_eq!(
+            parser
+                .parse_reasoning_streaming_incremental(&framed)
+                .unwrap(),
+            expected
+        );
+        parser.reset();
+        parser.set_json_mode(false);
+        let parsed = parser.detect_and_parse_reasoning(&framed).unwrap();
+        assert_eq!(parsed.reasoning_text, "\"");
+        assert_eq!(parsed.normal_text, "\"");
+    }
+
+    #[test]
+    fn json_mode_preserves_existing_tool_block_behavior() {
+        assert_eq!(
+            parse_json_chunks(&[TYPED_OUTPUT]),
+            ParserResult::new(
+                format!("Here is the answer.{TOOL_BLOCK}"),
+                "check sources".to_string()
+            )
+        );
     }
 }
