@@ -123,11 +123,19 @@ pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
     }
 }
 
-/// The client-facing message for a media pipeline failure: the whole error
-/// chain, so the cause (the URL whose fetch ran out of its budget, the clip
-/// the decoder refused) reaches the caller, not only the outermost context.
+/// The client-facing message for a media pipeline failure: the route's
+/// sentence and the pipeline's verdict on the request (the connector's own
+/// words for the URL whose fetch ran out of its budget, the clip the decoder
+/// refused, the cap a payload met), without the gateway's stage frames between
+/// them: "failed to finalize the tracker" names a structure the client never
+/// sees. A failure with no verdict in its chain names its root cause. The
+/// whole chain, frames included, is the ERROR log line's at the call site.
 pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
-    format!("Multimodal processing failed: {error:#}")
+    let cause = match media_verdict(error) {
+        Some(media) => media.to_string(),
+        None => error.root_cause().to_string(),
+    };
+    format!("Multimodal processing failed: {cause}")
 }
 
 /// The media connector's own error in a pipeline failure's chain, if any:
@@ -557,7 +565,8 @@ mod tests {
     }
 
     /// A fetch that ran out of its budget is reported with its URL and the
-    /// budget, not as the bare "failed to finalize" context around it.
+    /// budget, under the route's sentence, without the "failed to finalize"
+    /// context frame around it.
     #[test]
     fn a_processing_failure_names_its_cause() {
         let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
@@ -567,8 +576,43 @@ mod tests {
         .context("Failed to finalize multimodal tracker");
         assert_eq!(
             processing_failed_message(&error),
-            "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
-             https://media.example/clip.mp4 timed out after 30s"
+            "Multimodal processing failed: media fetch of https://media.example/clip.mp4 timed \
+             out after 30s"
+        );
+    }
+
+    /// The message is the route's sentence and the pipeline's verdict on the
+    /// request: the gateway's stage frames around the verdict are the log's
+    /// (the chain keeps them), and the verdict's own source is not repeated
+    /// after it. A failure with no verdict in its chain names its root cause
+    /// the same way.
+    #[test]
+    fn a_processing_failures_message_leaves_the_stage_frames_to_the_log() {
+        let undecodable =
+            image::ImageError::Unsupported(image::error::UnsupportedError::from_format_and_kind(
+                image::error::ImageFormatHint::Unknown,
+                image::error::UnsupportedErrorKind::Format(image::error::ImageFormatHint::Unknown),
+            ));
+        let decoder_said = undecodable.to_string();
+        let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Image(
+            undecodable,
+        )))
+        .context("Failed to finalize multimodal tracker")
+        .context("Failed to process the plan");
+        assert_eq!(
+            processing_failed_message(&error),
+            format!("Multimodal processing failed: image decode error: {decoder_said}")
+        );
+        assert!(
+            format!("{error:#}").contains("Failed to finalize multimodal tracker: "),
+            "the chain keeps the frames for the log: {error:#}"
+        );
+
+        let no_verdict = anyhow::anyhow!("Multimodal not supported for model: m")
+            .context("Failed to push content part");
+        assert_eq!(
+            processing_failed_message(&no_verdict),
+            "Multimodal processing failed: Multimodal not supported for model: m"
         );
     }
 
@@ -599,7 +643,7 @@ mod tests {
     /// under `media_too_large`; a scratch file that failed on this side and
     /// a preprocessing task that died are 500 `server_error`s; a failure with
     /// no connector verdict keeps the pipeline's own 400 code. The message is
-    /// the whole chain in every case.
+    /// the route's sentence and the cause in every case.
     #[tokio::test]
     async fn a_pipeline_failure_is_answered_by_the_connectors_verdict() {
         let finalize = |media: MediaConnectorError| {
