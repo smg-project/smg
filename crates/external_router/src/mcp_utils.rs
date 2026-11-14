@@ -5,12 +5,14 @@ use std::{
     sync::Arc,
 };
 
+use axum::response::Response;
 use openai_protocol::responses::{McpAllowedTools, ResponseTool, ResponsesRequest};
 use serde_json::{json, Value};
 use smg_mcp::{BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport};
 use tracing::{debug, warn};
 
 use crate::{
+    error,
     openai_bridge::{
         self, apply_hosted_tool_overrides, extract_hosted_tool_overrides, FormatRegistry,
         ResponseFormat,
@@ -66,7 +68,9 @@ pub struct McpServerInput {
 ///
 /// For each input:
 /// - If `url` is present, connects a dynamic MCP server (SSE or Streamable).
-/// - If `url` is absent, registers the label as a static server reference.
+/// - If `url` is absent, binds the configured server held under the label; a
+///   label no connected server is held under binds nothing (a warning names
+///   it).
 ///
 /// Returns a list of [`McpServerBinding`]s for successfully connected servers.
 pub async fn connect_mcp_servers(
@@ -150,8 +154,17 @@ pub async fn connect_mcp_servers(
                 }
             }
         }
-        // Case B: Static Server (No URL)
-        else if !mcp_servers.iter().any(|b| b.server_key == input.label) {
+        // Case B: a configured server named by its label (no URL). A label no
+        // connected server is held under binds nothing: next to servers that
+        // bind it is dropped with the warning, alone it leaves the request to
+        // fail on the missing connection (`ensure_request_mcp_routing`),
+        // instead of listing no tools under a key that resolves to nothing.
+        else if !mcp_orchestrator.has_static_server(&input.label) {
+            warn!(
+                "Ignoring MCP tool '{}': no server_url and no connected MCP server of that name",
+                input.label
+            );
+        } else if !mcp_servers.iter().any(|b| b.server_key == input.label) {
             mcp_servers.push(McpServerBinding {
                 label: input.label.clone(),
                 server_key: input.label.clone(),
@@ -364,6 +377,32 @@ pub async fn ensure_request_mcp_client(
     ensure_mcp_servers(mcp_orchestrator, format_registry, &inputs, &builtin_types).await
 }
 
+/// The Responses routes' MCP routing, under the rule the gRPC router applies:
+/// a request that names an `mcp` tool and binds no server is refused on the
+/// missing connection (424 `connect_mcp_server_failed`) before anything goes
+/// upstream; built-in tools without MCP routing pass through to the model
+/// (`Ok(None)`).
+pub async fn ensure_request_mcp_routing(
+    mcp_orchestrator: &Arc<McpOrchestrator>,
+    format_registry: &FormatRegistry,
+    tools: &[ResponseTool],
+) -> Result<Option<Vec<McpServerBinding>>, Response> {
+    match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
+        Some(servers) => Ok(Some(servers)),
+        None if tools
+            .iter()
+            .any(|tool| matches!(tool, ResponseTool::Mcp(_))) =>
+        {
+            warn!("Failed to connect to MCP servers: the request names an mcp tool and none bound");
+            Err(error::failed_dependency(
+                "connect_mcp_server_failed",
+                "Failed to connect to MCP servers. Check server_url and authorization.",
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Forward the caller's `user` identifier into hosted-tool dispatch arguments.
 ///
 /// OpenAI's Responses API takes a top-level `user` field for end-user
@@ -458,6 +497,7 @@ mod tests {
         time::Duration,
     };
 
+    use axum::http::StatusCode;
     use openai_protocol::{
         common::Function,
         responses::{
@@ -573,7 +613,7 @@ mod tests {
             State(server): State<LocalServer>,
             headers: HeaderMap,
             Json(message): Json<Value>,
-        ) -> axum::response::Response {
+        ) -> Response {
             use axum::response::IntoResponse;
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             match message.get("method").and_then(Value::as_str) {
@@ -1033,6 +1073,108 @@ mod tests {
             lists,
             [("conf", vec!["big", "echo"]), ("conf-b", vec!["echo"])]
         );
+    }
+
+    /// An orchestrator holding one configured server, `conf-static`, a
+    /// local MCP server with one tool; and a registry.
+    async fn orchestrator_holding_conf_static() -> (Arc<McpOrchestrator>, FormatRegistry) {
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            ..Default::default()
+        })
+        .await;
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "conf-static".to_string(),
+                transport: McpTransport::Streamable {
+                    url,
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: false,
+            }],
+            pool: Default::default(),
+            proxy: None,
+            warmup: Vec::new(),
+            inventory: Default::default(),
+            policy: Default::default(),
+        };
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        let format_registry = FormatRegistry::new();
+        (orchestrator, format_registry)
+    }
+
+    /// A tool with no `server_url` names a configured server by its label
+    /// and binds it; a label no configured server has binds nothing (the
+    /// request then fails on the missing connection) instead of a server
+    /// key that resolves to no tools.
+    #[tokio::test]
+    async fn a_label_without_a_server_url_binds_only_a_configured_server() {
+        let (orchestrator, format_registry) = orchestrator_holding_conf_static().await;
+        let label_only = |label: &str| McpServerInput {
+            label: label.to_string(),
+            url: None,
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+
+        let bindings = connect_mcp_servers(
+            &orchestrator,
+            &format_registry,
+            &[label_only("conf-static")],
+        )
+        .await;
+        assert_eq!(
+            bindings.len(),
+            1,
+            "the configured server binds: {bindings:?}"
+        );
+        assert_eq!(bindings[0].server_key, "conf-static");
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        assert_eq!(session.list_tools_for_server("conf-static").len(), 1);
+
+        let bindings =
+            connect_mcp_servers(&orchestrator, &format_registry, &[label_only("conf")]).await;
+        assert!(
+            bindings.is_empty(),
+            "no configured server is named conf: {bindings:?}"
+        );
+    }
+
+    /// The Responses routes' rule: a request whose only `mcp` tool names no
+    /// held server is refused on the missing connection (424
+    /// `connect_mcp_server_failed`) before anything goes upstream; next to a
+    /// server that binds, the unknown label is dropped and the request
+    /// routes with the one binding.
+    #[tokio::test]
+    async fn an_mcp_tool_that_binds_nothing_is_refused_before_the_forward() {
+        let (orchestrator, format_registry) = orchestrator_holding_conf_static().await;
+        let mcp = |label: &str| -> ResponseTool {
+            serde_json::from_value(json!({"type": "mcp", "server_label": label}))
+                .expect("an mcp tool with no server_url")
+        };
+
+        let refused =
+            ensure_request_mcp_routing(&orchestrator, &format_registry, &[mcp("conf")]).await;
+        let response = refused.expect_err("a lone unknown label is refused");
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+
+        let routed = ensure_request_mcp_routing(
+            &orchestrator,
+            &format_registry,
+            &[mcp("conf"), mcp("conf-static")],
+        )
+        .await
+        .expect("the configured server routes the request");
+        let bindings = routed.expect("one binding");
+        assert_eq!(bindings.len(), 1, "{bindings:?}");
+        assert_eq!(bindings[0].server_key, "conf-static");
     }
 
     /// A server URL of a scheme the connector does not take is refused with
