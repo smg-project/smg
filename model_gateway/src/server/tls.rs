@@ -148,6 +148,7 @@ mod tests {
         },
     };
 
+    use tokio::sync::mpsc;
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     use super::*;
@@ -225,7 +226,7 @@ mod tests {
     /// Both constructors send `accept-encoding: identity` with every request.
     #[tokio::test]
     async fn every_client_names_identity_as_its_accepted_content_coding() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HeaderMap>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<HeaderMap>();
         let app = axum::Router::new().route(
             "/",
             axum::routing::get(move |headers: HeaderMap| {
