@@ -517,7 +517,7 @@ fn response_parts_to_message_content(
             } => {
                 parts.push(ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: url.clone(),
+                        url: url.clone().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -1769,7 +1769,7 @@ mod tests {
                 );
                 assert!(matches!(
                     &parts[1],
-                    ContentPart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,iVBORw0KGgo="
+                    ContentPart::ImageUrl { image_url } if *image_url.url == "data:image/png;base64,iVBORw0KGgo="
                 ));
             }
             other => panic!("the user turn carries parts: {other:?}"),
