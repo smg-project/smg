@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::{error::MediaFault, test_support::video_tools_available};
 
 fn cfg() -> VideoFetchConfig {
     VideoFetchConfig {
@@ -983,7 +984,7 @@ fn a_long_interval_selection_is_described_in_constant_size_at_a_stable_stride() 
 #[tokio::test]
 async fn the_selection_picks_the_same_frames_through_ffmpeg() {
     use std::process::{Command as Sync, Stdio};
-    if !crate::test_support::video_tools_available() {
+    if !video_tools_available() {
         return;
     }
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1224,7 +1225,7 @@ fn rotate_first_track(path: &Path) {
 /// `None` where the tools are not installed.
 fn small_clip(dir: &Path, name: &str) -> Option<PathBuf> {
     use std::process::Command as Sync;
-    if !crate::test_support::video_tools_available() {
+    if !video_tools_available() {
         return None;
     }
     let path = dir.join(name);
@@ -1709,7 +1710,7 @@ fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
         ),
         "{error}"
     );
-    assert_eq!(error.fault(), crate::error::MediaFault::Client);
+    assert_eq!(error.fault(), MediaFault::Client);
     assert_eq!(error.code().as_str(), "media_too_large");
 
     let mut lengths = Vec::new();

@@ -215,7 +215,12 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 .await
                 .unwrap(),
             );
-            RequestContext::for_messages(Arc::new(request), None, MODEL.into(), components)
+            RequestContext::for_messages_carrying_its_tools(
+                Arc::new(request),
+                None,
+                MODEL.into(),
+                components,
+            )
         };
         pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
         assert!(ctx.state.multimodal_intermediate.is_none());
