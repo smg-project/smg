@@ -151,12 +151,15 @@ fn the_namespace_marker_alone_is_not_a_prefix_hit() {
     let workers = workers();
     policy.init_workers(&workers);
 
+    // Each request ends before the next arrives, so only the loads set here
+    // decide the misses.
     let seed: Vec<u32> = (1..33).collect();
     workers[0].increment_load();
     assert_eq!(
         route_tokens(&policy, &workers, &seed, salted("tenant-a")),
         Some(1)
     );
+    policy.on_request_complete(workers[1].url());
     assert_eq!(
         route_text(
             &policy,
@@ -166,6 +169,7 @@ fn the_namespace_marker_alone_is_not_a_prefix_hit() {
         ),
         Some(1)
     );
+    policy.on_request_complete(workers[1].url());
     workers[1].increment_load();
     workers[1].increment_load();
     // One unrelated token (or char): were the marker counted, this would be
@@ -175,6 +179,7 @@ fn the_namespace_marker_alone_is_not_a_prefix_hit() {
         route_tokens(&policy, &workers, &[999], salted("tenant-a")),
         Some(0)
     );
+    policy.on_request_complete(workers[0].url());
     assert_eq!(
         route_text(&policy, &workers, "z", salted("tenant-a")),
         Some(0)

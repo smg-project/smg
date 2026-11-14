@@ -155,6 +155,16 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         self.scorer.remove_worker(url);
     }
 
+    /// A request's end releases its pick on the scorer.
+    fn on_request_complete(&self, worker_url: &str) {
+        self.scorer.on_request_complete(worker_url);
+    }
+
+    /// The load poll reaches the scorer's picks.
+    fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+        self.scorer.reconcile_in_flight(worker_url, in_flight);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -340,10 +350,31 @@ mod tests {
         );
     }
 
+    /// b holds one request; each pick on a is dropped before its guard is
+    /// taken, and the second poll that follows sets a back to the router's zero.
+    #[test]
+    fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
+        let policy = PowerOfTwoPolicy::new();
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
+        b.increment_load();
+        let workers = vec![a, b];
+        for _ in 0..50 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(0)
+            );
+            for _ in 0..2 {
+                policy.reconcile_in_flight(workers[0].url(), workers[0].load());
+            }
+        }
+    }
+
     #[test]
     fn cold_start_distribution_prefers_lower_in_flight() {
-        // Three dark workers with in-flight 10/5/0: every pair containing w3
-        // picks w3, the {w1,w2} pair picks w2, and w1 never wins.
+        // Three dark workers with in-flight 10/5/0, each request ending before
+        // the next: every pair containing w3 picks w3, the {w1,w2} pair picks
+        // w2, and w1 never wins.
         let policy = PowerOfTwoPolicy::new();
         let counts = {
             let w1 = make_worker("http://w1:8000");
@@ -362,6 +393,7 @@ mod tests {
                     .select_worker(&workers, &SelectWorkerInfo::default())
                     .unwrap();
                 counts[idx] += 1;
+                policy.on_request_complete(workers[idx].url());
             }
             counts
         };
@@ -470,6 +502,66 @@ mod tests {
         let with_requests = resident_tokens(100_000);
         TestFeed::attached_to(&with_requests).publish(&loads);
         assert_eq!(with_requests.select_worker(&workers, &info), Some(3));
+    }
+
+    /// A burst on workers with no report, before the router takes any of its
+    /// guards: each pick must count the picks before it.
+    #[test]
+    fn resident_tokens_counts_the_picks_of_a_dark_burst() {
+        for request_tokens in [0, 100_000] {
+            let policy = resident_tokens(request_tokens);
+            let workers = holding(&[0, 0, 0, 0]);
+            let mut hits = [0usize; 4];
+            for _ in 0..8 {
+                hits[policy
+                    .select_worker(&workers, &SelectWorkerInfo::default())
+                    .unwrap()] += 1;
+            }
+            assert_eq!(hits, [2, 2, 2, 2], "request_tokens {request_tokens}");
+        }
+    }
+
+    /// Beside a peer that reports resident tokens, a worker with no report
+    /// scores as that peer plus its in-flight. Its picks count there too, so
+    /// a burst does not herd onto it.
+    #[test]
+    fn resident_tokens_counts_the_picks_on_a_dark_worker_beside_a_reporting_peer() {
+        for _ in 0..20 {
+            let policy = resident_tokens(100_000);
+            let feed = TestFeed::attached_to(&policy);
+            let workers = holding(&[0, 0, 0]);
+            let mut loads = HashMap::new();
+            loads.insert("http://w2:8000".to_string(), resident(0, 0));
+            feed.publish(&loads);
+            let mut hits = [0usize; 3];
+            for _ in 0..8 {
+                hits[policy
+                    .select_worker(&workers, &SelectWorkerInfo::default())
+                    .unwrap()] += 1;
+            }
+            assert!(hits[0] <= 1 && hits[1] <= 1, "{hits:?}");
+        }
+    }
+
+    /// A worker whose report lacks resident tokens keeps the router's live
+    /// count, its picks not counted until their guards are taken: of two such
+    /// workers, a burst goes to the one with fewer live requests.
+    #[test]
+    fn resident_tokens_reads_the_live_count_of_a_worker_whose_report_lacks_them() {
+        let policy = resident_tokens(0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = holding(&[0, 1]);
+        let mut loads = HashMap::new();
+        for i in 0..2 {
+            loads.insert(format!("http://w{i}:8000"), one_rank_load(0, 0.1, 100.0));
+        }
+        feed.publish(&loads);
+        for _ in 0..8 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(0)
+            );
+        }
     }
 
     #[test]

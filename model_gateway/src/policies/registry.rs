@@ -888,10 +888,20 @@ impl PolicyRegistry {
     /// Reconcile the policy that places requests on `worker` against the
     /// router's live in-flight count there (see
     /// [`LoadBalancingPolicy::reconcile_in_flight`]). The worker monitor
-    /// calls this once per load poll for every polled worker.
+    /// calls this once per load poll for every polled worker. A regular
+    /// worker whose model has its own policy is reconciled on the default
+    /// policy too: a request that names no model is placed by the default
+    /// policy over every worker, and its end reaches only the worker's own.
     pub fn reconcile_in_flight(&self, worker: &dyn Worker) {
-        self.policy_for_worker(worker)
-            .reconcile_in_flight(worker.url(), worker.load());
+        let in_flight = worker.load();
+        let policy = self.policy_for_worker(worker);
+        policy.reconcile_in_flight(worker.url(), in_flight);
+        if matches!(worker.worker_type(), WorkerType::Regular)
+            && !Arc::ptr_eq(&policy, &self.default_policy)
+        {
+            self.default_policy
+                .reconcile_in_flight(worker.url(), in_flight);
+        }
     }
 
     /// The policy for `model_id`'s requests: built for the model's first
@@ -3182,6 +3192,78 @@ mod tests {
         drop(registry);
         drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
         assert_eq!(prefill_policy.completed.lock().unwrap().len(), 1);
+    }
+
+    /// A request that names no model is placed by the default policy over
+    /// every worker, while its end and the load poll reach the worker's model
+    /// policy. The poll reconciles the default policy there too, and only once
+    /// on a worker whose model shares it, so a pick still waiting for its
+    /// guard survives one poll on both and leaves at the second.
+    #[test]
+    fn the_load_poll_reconciles_the_default_policy_once_on_every_regular_worker() {
+        let registry = PolicyRegistry::new(PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.4,
+            mean_prefill_tokens: 2048,
+            default_throughput: 555.0,
+        });
+        registry.on_worker_added("llama-3", Some("least_load"));
+        registry.on_worker_added("plain", None);
+        let default = registry.get_default_policy();
+        let least_load = default.as_any().downcast_ref::<LeastLoadPolicy>().unwrap();
+        for model in ["llama-3", "plain"] {
+            let workers = [
+                ready_worker(&format!("http://{model}-a:8000"), model),
+                ready_worker(&format!("http://{model}-b:8000"), model),
+            ];
+            let _held = WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+            assert_eq!(
+                default.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(0)
+            );
+            for picked in [1, 0] {
+                registry.reconcile_in_flight(workers[0].as_ref());
+                assert_eq!(
+                    least_load.picked_for_test(workers[0].url()),
+                    picked,
+                    "{model}"
+                );
+            }
+        }
+    }
+
+    /// A request that names no model and runs to its end: the end reaches the
+    /// worker's model policy, so the default policy still counts the pick
+    /// until the polls clear it, at the second with nothing in flight.
+    #[test]
+    fn a_finished_request_with_no_model_leaves_the_default_policy_at_the_second_poll() {
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.4,
+            mean_prefill_tokens: 2048,
+            default_throughput: 555.0,
+        }));
+        registry.on_worker_added("llama-3", Some("least_load"));
+        let workers = [
+            ready_worker("http://a:8000", "llama-3"),
+            ready_worker("http://b:8000", "llama-3"),
+        ];
+        let sink = registry.completion_sink();
+        for worker in &workers {
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+        }
+        let held = WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        let default = registry.get_default_policy();
+        let least_load = default.as_any().downcast_ref::<LeastLoadPolicy>().unwrap();
+        assert_eq!(
+            default.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+        drop(WorkerLoadGuard::new(Arc::clone(&workers[0]), None));
+        drop(held);
+        assert_eq!(least_load.picked_for_test(workers[0].url()), 1);
+        for picked in [1, 0] {
+            registry.reconcile_in_flight(workers[0].as_ref());
+            assert_eq!(least_load.picked_for_test(workers[0].url()), picked);
+        }
     }
 
     #[test]
