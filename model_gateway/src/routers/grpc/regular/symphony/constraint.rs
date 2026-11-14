@@ -51,11 +51,11 @@ fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Cow<'_, Val
 /// structural tag, written straight from the tree, in the `vocabulary` the worker's grammar
 /// compiler takes (spelled without the newer nodes for a worker that advertises the older one,
 /// [`TagVocabulary`]). Every worker spells for xgrammar today. A backend with no spelling of the
-/// grammar is [`Unspelled`], and what that counts as follows what the request asked: a tag the
-/// table does not have where it asked for no constraint ([`auto_tag`], a registry table's
-/// answer through [`unspelled_tag`]), a refusal by the backend's name where it asked for what
-/// the table alone gives (a forced call and the response template's answer through
-/// [`unspelled_tag`], the [`whole_turn`]).
+/// grammar is [`Unspelled`], and what that counts as follows what the request asked and whose
+/// table reads the output: a tag the table does not have under `auto` ([`auto_tag`]) and for a
+/// registry table's forced call or answer ([`unspelled_tag`]: the older registry decides, as
+/// before), a refusal by the backend's name for the response template's forced call or answer
+/// ([`unspelled_tag`]: that table alone writes them) and for the [`whole_turn`].
 fn structural_tag(
     grammar: Grammar,
     vocabulary: TagVocabulary,
@@ -1167,10 +1167,10 @@ mod tests {
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
 
     /// A tag the worker's grammar backend has no spelling of counts as a tag the table does not
-    /// have: a registry table's request goes out as before (`auto` and a registry answer ask for
-    /// no constraint), the response template's table refuses by the backend's name, as it refuses
-    /// a tag it lacks. Every worker spells for xgrammar today, so the rule is pinned on the helper
-    /// that takes the spelling's refusal.
+    /// have: a registry table's request goes out as before, whatever it asked (the older registry
+    /// decides a forced call or an answer, `auto` asks for no constraint); the response template's
+    /// table refuses by the backend's name, as it refuses a tag it lacks. Every worker spells for
+    /// xgrammar today, so the rule is pinned on the helper that takes the spelling's refusal.
     #[test]
     fn an_unspelled_tag_counts_as_a_tag_the_table_does_not_have() {
         for backend in [GrammarBackend::Llguidance, GrammarBackend::Outlines] {

@@ -1093,6 +1093,50 @@ async fn canonicalisation_rewrites_the_owned_request_in_place() {
     }
 }
 
+/// No engine behind this router applies the reasoning config's `mode`,
+/// `context` or `generate_summary`, so the router clears them before the
+/// Responses layer reads the request. That layer echoes the config into
+/// every Response object: the non-streamed body and the stored object
+/// through the response builder, the streamed terminal event as the
+/// request's config is. Each then says `effort` and `summary`, what ran,
+/// and a `pro` request does not read back as run in `pro` mode.
+#[test]
+fn the_responses_layer_sees_no_reasoning_mode_context_or_generate_summary() {
+    let mut request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "m",
+        "input": "think it through",
+        "reasoning": {
+            "effort": "high",
+            "summary": "concise",
+            "mode": "pro",
+            "context": "all_turns",
+            "generate_summary": "detailed"
+        }
+    }))
+    .expect("responses request");
+    clear_unapplied_reasoning_keys(&mut request);
+
+    let applied = json!({"effort": "high", "summary": "concise"});
+    let built = openai_protocol::responses::ResponsesResponse::builder("resp_1", "m")
+        .copy_from_request(&request)
+        .build();
+    assert_eq!(
+        serde_json::to_value(&built).expect("serialize the response")["reasoning"],
+        applied,
+        "the non-streamed and stored objects"
+    );
+    assert_eq!(
+        serde_json::to_value(&request.reasoning).expect("serialize the config"),
+        applied,
+        "the streamed terminal event"
+    );
+
+    // A request without a reasoning config is left without one.
+    let mut bare = responses_request("m");
+    clear_unapplied_reasoning_keys(&mut bare);
+    assert!(bare.reasoning.is_none());
+}
+
 /// A per-model retry override must survive an alias. The override is keyed
 /// by canonical model ID and is read before the pipeline canonicalizes, so
 /// without its own resolution an alias silently falls back to the router
