@@ -639,8 +639,7 @@ impl WebRtcBridge {
                         call_id = self.call_id,
                         "Buffering client event (upstream channel not open)"
                     );
-                    self.pending_to_upstream
-                        .push((data.binary, data.data.to_vec()));
+                    self.pending_to_upstream.push((data.binary, data.data));
                 }
             }
             Event::ChannelClose(id) => {
@@ -707,8 +706,7 @@ impl WebRtcBridge {
                         call_id = self.call_id,
                         "Buffering upstream event (client channel not open)"
                     );
-                    self.pending_to_client
-                        .push((data.binary, data.data.to_vec()));
+                    self.pending_to_client.push((data.binary, data.data));
                 }
             }
             Event::ChannelClose(id) => {
