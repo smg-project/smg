@@ -38,7 +38,7 @@ change, and the setup with the base's spread. Paste it.
 | `make perf-build` | nothing: the release binaries. The gateway is built alone (`cargo build --release -p smg --bin smg`), then the mock engine, the client and the driver, because building the gateway together with another package changes its binary through feature unification; `perf-base` uses the same line | copies the gateway under `target/gateway-perf/head/` |
 | `make perf-base` | the base revision's gateway binary, `target/gateway-perf/base/smg` | `gateway-perf base <rev> <out>`: a detached worktree of `PERF_BASE_REV` built into its own target directory (a full release build; sccache shortens it) |
 | `make perf-bed` | the bed comes up and answers: one request per path, the first response shown, the scripted answers' hit and miss counts | `gateway-perf bed smoke` (`bed up` / `bed down` keep one running for `grpc_stress/cell.sh` or by hand) |
-| `make perf-alloc` | allocation calls per request, KiB requested per request (the allocator's size classes, small and large), allocations of 16 KiB and above per request, RSS and peak RSS after the window | jemalloc's exit statistics: the gateway is started with `_RJEM_MALLOC_CONF=stats_print:true,stats_print_opts:Jaxe` and prints them at its clean shutdown; no special build |
+| `make perf-alloc` | allocation calls per request, KiB requested per request (the allocator's size classes, small and large), allocations of 16 KiB and above per request, RSS after the window (whole, anonymous and file-backed) and the peak | jemalloc's exit statistics: the gateway is started with `_RJEM_MALLOC_CONF=stats_print:true,stats_print_opts:Jaxe` and prints them at its clean shutdown; no special build |
 | `make perf-cpu` | user instructions per request, instructions (user + kernel), cycles, context switches, from `perf stat -p <gateway pid>` over the window; CPU time per request (utime + stime) always | hardware counters need `perf`, a kernel that allows them (`kernel.perf_event_paranoid` at 2 or below for a process of your own) and hardware that exposes them (a virtual machine often does not: the run then says so and keeps the CPU-time column) |
 | `make perf-mem` | RSS after each of several windows on ONE gateway, the growth per 10,000 requests, the peak (`VmHWM`) after a burst window at twice the rate, the allocator's live bytes | `PERF_MEM_PATHS` (default `stream`, the path that holds the most per request), `--windows`, `--burst` |
 | `make perf-live` | an open-loop ramp: offered rate against achieved rate, TTFT and end-to-end p50/p99, errors, gateway CPU per request and RSS per step, and the capacity | a fresh gateway per step; the capacity rule below; the base too when its binary exists |
@@ -184,9 +184,24 @@ or hub id>`.
   request read 530 us with the counters on and 320 us without, on the same binary and bed);
   the column is comparable between the two sides of one run, and `alloc` mode gives the
   absolute.
-- **RSS**: after the window, from `/proc`; `VmHWM` is the peak. RSS moves with the allocator's
-  decay and the request mix in flight at the moment of reading: a few percent is its band.
-  `perf-mem` separates a slope (growth per 10,000 requests on one gateway) from the band.
+- **RSS**: after the window, from `/proc`: the whole set (`VmRSS`), its anonymous part and
+  its file part; `VmHWM` is the peak of the whole set (the kernel reports no peak of a
+  part), so it carries the file part too. The whole set is those two parts and shared memory
+  (`RssShmem`, zero for the gateway on the bed). The anonymous part (`RssAnon`) is what the
+  gateway allocated. It moves with the allocator's decay and the request mix in flight at
+  the moment of reading, a few percent, and it is the part the gate judges. The file part
+  (`RssFile`) is the file pages the kernel has mapped: mostly the gateway's own binary, and
+  its shared libraries (3.8 MB of 40 at idle on the bed). A fault maps the cached
+  neighbours inside the 64 KB window around it, so the part follows two things that are
+  not the gateway's work. One is how much of the measured FILE is cached: two copies of
+  one binary read apart, and on the hosted runner the copy whose pages the cache has
+  dropped reads lower. The other is where the linker put the code that runs: a change
+  that touched nearly as many pages of its binary on both sides held one megabyte more,
+  the same code lying in more windows. So the whole set, its peak and the file part are
+  reported and never judged. To compare them, read
+  both binaries whole before the run on an idle machine, and on a machine under memory
+  pressure keep both files locked in memory for its length. `perf-mem` separates a slope
+  (growth per 10,000 requests on one gateway) from the band.
 - **The spread** in the setup column is the base's (max - min) / median over its repeats:
   the floor under which a change is not a change. The verdict table applies the rule of
   `scripts/bench_gate.py`: an id regresses only when its change is worse than the threshold
@@ -211,7 +226,9 @@ to 8 cores, over the five paths ((max - min) / median of the per-side repeats):
 | user instructions per request | 0.08 - 0.17 % | the judgement; 2 % is a change |
 | allocation calls per request | 0.08 - 0.22 % | the judgement; 2 % is a change (the tools path's per-process modes stay under it) |
 | KiB requested per request | 0.01 - 0.02 % | the judgement; 2 % is a change |
-| RSS after the window | 1.3 - 2.6 % | 5 % is a change |
+| anonymous RSS after the window | 0.0 - 5.7 % (the pull-request job's cell: 4,000 requests, three paths; 95 of 96 per-side samples, one at 10.4 %) | 10 % is a change |
+| RSS after the window, whole | 1.3 - 2.6 % with both files cached alike; it carries the file part | report only |
+| file-backed RSS after the window | follows the page cache of the measured file and where the linker put the code that runs | report only |
 | instructions per request, user + kernel | 0.5 - 3.2 % | the kernel share is the host's noise: report only |
 | CPU time per request | 6.8 - 18.8 % | load-dependent: report only; read it with the load line under the table |
 | cycles per request | 9 - 29 % | load-dependent: report only |
@@ -223,7 +240,9 @@ request that touches `model_gateway/` or `crates/` (tests and benches excluded):
 commit's first parent against the pull request, built by the same cargo line (`perf-build`'s),
 on the chat, stream and tools paths, 4,000 requests per cell at half the bed's rates, 3+3 interleaved cells, judged by
 `.github/bench-gates/gateway-perf.toml` (allocation calls, KiB and user instructions at 2 %,
-RSS at 5 %; CPU time and cycles report only). The job is ADVISORY: the tables go to the step
+anonymous RSS at 10 %; the whole RSS, its peak, its file part, CPU time and cycles report only). The
+job reads both gateway binaries whole right before it measures, so both files are in the
+page cache when the cells start. The job is ADVISORY: the tables go to the step
 summary, to a comment on the pull request when the token may write one, and to the
 `gateway-perf-<sha>` artifact (with `results.json`, the per-repeat values); its verdict never
 fails the job. A hosted runner exposes no hardware counters, so the instruction ids are
