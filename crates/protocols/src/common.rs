@@ -2530,7 +2530,7 @@ mod tests {
                 | ContentPart::InputAudio { .. }
                 | ContentPart::VideoUrl { .. }
                 | ContentPart::Refusal { .. } => {}
-                ContentPart::Unknown(_) => unreachable!("a typed sample"),
+                ContentPart::Unknown(_) => panic!("a typed sample"),
             }
             let value = serde_json::to_value(&part).unwrap();
             assert_eq!(serde_json::from_value::<ContentPart>(value).unwrap(), part);
