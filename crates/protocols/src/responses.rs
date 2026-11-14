@@ -103,7 +103,11 @@ pub enum BuiltInToolChoiceType {
     #[serde(rename = "web_search_preview_2025_03_11")]
     WebSearchPreview20250311,
     ImageGeneration,
+    /// The GA computer tool; `computer_use` names it too, and
+    /// `computer_use_preview` the preview tool.
+    Computer,
     ComputerUsePreview,
+    ComputerUse,
     CodeInterpreter,
 }
 
@@ -195,10 +199,8 @@ pub enum ResponsesToolChoice {
     /// `"none"` | `"auto"` | `"required"`.
     Options(ToolChoiceOptions),
 
-    /// `{"type": "file_search" | "web_search" | "web_search_preview" |
-    /// "web_search_preview_2025_03_11" | "image_generation" |
-    /// "computer_use_preview" | "code_interpreter"}` — select a built-in
-    /// hosted tool by type alone (no additional payload).
+    /// `{"type": "<hosted tool>"}`, a type [`BuiltInToolChoiceType`] names:
+    /// select a built-in hosted tool by type alone (no additional payload).
     Types {
         #[serde(rename = "type")]
         tool_type: BuiltInToolChoiceType,
