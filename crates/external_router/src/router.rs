@@ -197,6 +197,12 @@ pub mod known {
     use openai_protocol::worker::ProviderType;
 
     use super::{ids, BuildFuture, ExternalContext, ExternalRouterSpec};
+    #[cfg(feature = "anthropic")]
+    use crate::anthropic::AnthropicRouter;
+    #[cfg(feature = "gemini")]
+    use crate::gemini::GeminiRouter;
+    #[cfg(feature = "openai")]
+    use crate::openai::OpenAIRouter;
 
     /// The OpenAI-compatible router: OpenAI, xAI and custom providers, and
     /// the fallback for external workers that name no provider.
@@ -259,7 +265,7 @@ pub mod known {
 
         use super::ExternalRouter;
         Box::pin(async move {
-            crate::openai::OpenAIRouter::new(&ctx)
+            OpenAIRouter::new(&ctx)
                 .await
                 .map(|router| Arc::new(router) as Arc<dyn ExternalRouter>)
         })
@@ -276,8 +282,7 @@ pub mod known {
 
         use super::ExternalRouter;
         Box::pin(async move {
-            crate::anthropic::AnthropicRouter::new(&ctx)
-                .map(|router| Arc::new(router) as Arc<dyn ExternalRouter>)
+            AnthropicRouter::new(&ctx).map(|router| Arc::new(router) as Arc<dyn ExternalRouter>)
         })
     }
 
@@ -292,7 +297,7 @@ pub mod known {
 
         use super::ExternalRouter;
         Box::pin(async move {
-            let router = crate::gemini::GeminiRouter::new(&ctx);
+            let router = GeminiRouter::new(&ctx);
             Ok(Arc::new(router) as Arc<dyn ExternalRouter>)
         })
     }
