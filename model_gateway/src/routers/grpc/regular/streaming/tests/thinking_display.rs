@@ -107,15 +107,37 @@ async fn the_thinking_text_leaves_the_stream_unless_the_display_is_omitted() {
                     Value::String("Hello".to_string()),
                 ));
                 assert_eq!(message_blocks(&events), expected, "{case}");
-                let thinking_deltas = events
+                // The thinking block's deltas: its text when returned, else one empty delta;
+                // then the signature, just before the stop, either way.
+                let thinking_deltas: Vec<&str> = events
                     .iter()
                     .filter(|event| event["delta"]["type"] == "thinking_delta")
-                    .count();
-                assert_eq!(
-                    thinking_deltas > 0,
-                    thought.is_some() && returned,
-                    "{case}: {events:#?}"
-                );
+                    .map(|event| event["delta"]["thinking"].as_str().unwrap_or("?"))
+                    .collect();
+                match (thought, returned) {
+                    (None, _) => assert!(thinking_deltas.is_empty(), "{case}: {events:#?}"),
+                    (Some(thought), true) => {
+                        assert_eq!(thinking_deltas.concat(), thought, "{case}: {events:#?}");
+                    }
+                    (Some(_), false) => assert_eq!(thinking_deltas, [""], "{case}: {events:#?}"),
+                }
+                let stop = events
+                    .iter()
+                    .position(|event| event["type"] == "content_block_stop")
+                    .unwrap_or_else(|| panic!("{case}: a content_block_stop"));
+                if thought.is_some() {
+                    assert_eq!(
+                        events[stop - 1]["delta"],
+                        serde_json::json!({"type": "signature_delta", "signature": ""}),
+                        "{case}: the signature comes just before the thinking block's stop: {events:#?}"
+                    );
+                } else {
+                    assert_ne!(
+                        events[stop - 1]["delta"]["type"],
+                        "signature_delta",
+                        "{case}: a text block has no signature: {events:#?}"
+                    );
+                }
                 let message_delta = events
                     .iter()
                     .find(|event| event["type"] == "message_delta")

@@ -38,6 +38,9 @@ pub(super) struct ChunkProcessor {
     carry: Vec<u8>,
     /// The last decoded text ended with `\r` that has not been emitted yet.
     pending_cr: bool,
+    /// Where the next block starts in `pending`: the blocks before it were
+    /// handed out already and are dropped at the next chunk.
+    read: usize,
 }
 
 impl ChunkProcessor {
@@ -46,6 +49,16 @@ impl ChunkProcessor {
             pending: String::new(),
             carry: Vec::new(),
             pending_cr: false,
+            read: 0,
+        }
+    }
+
+    /// Drop the blocks handed out so far: one move of the unread tail per
+    /// pushed chunk, not one per block.
+    fn compact(&mut self) {
+        if self.read > 0 {
+            self.pending.drain(..self.read);
+            self.read = 0;
         }
     }
 
@@ -92,6 +105,7 @@ impl ChunkProcessor {
         if s.is_empty() {
             return;
         }
+        self.compact();
         let mut s = Cow::Borrowed(s);
         if std::mem::take(&mut self.pending_cr) {
             if s.starts_with('\n') {
@@ -123,13 +137,16 @@ impl ChunkProcessor {
         }
     }
 
-    /// Extract the next complete SSE block from the buffer, if available
-    pub fn next_block(&mut self) -> Option<String> {
+    /// The next complete SSE block in the buffer, if any, borrowed from it:
+    /// no copy of the block and no move of the rest. The borrow ends at the
+    /// next call; the block is dropped from the buffer at the next chunk.
+    pub fn next_block(&mut self) -> Option<&str> {
         loop {
-            let pos = self.pending.find("\n\n")?;
-            let block = self.pending[..pos].to_string();
-            self.pending.drain(..pos + 2);
-
+            let rest = &self.pending[self.read..];
+            let pos = memchr::memmem::find(rest.as_bytes(), b"\n\n")?;
+            let start = self.read;
+            self.read = start + pos + 2;
+            let block = &self.pending[start..start + pos];
             if !block.trim().is_empty() {
                 return Some(block);
             }
@@ -138,12 +155,13 @@ impl ChunkProcessor {
 
     /// Check if there's remaining content in the buffer
     pub fn has_remaining(&self) -> bool {
-        !self.pending.trim().is_empty() || !self.carry.is_empty()
+        !self.pending[self.read..].trim().is_empty() || !self.carry.is_empty()
     }
 
     /// Take any remaining content from the buffer
     pub fn take_remaining(&mut self) -> String {
         self.flush_held();
+        self.compact();
         std::mem::take(&mut self.pending)
     }
 }
@@ -176,6 +194,7 @@ pub(super) fn parse_sse_block(block: &str) -> (Option<&str>, Cow<'_, str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::counting_alloc;
 
     #[test]
     fn test_parse_sse_block_event_and_data() {
@@ -218,7 +237,7 @@ mod tests {
         for &cut in cuts.iter().chain(std::iter::once(&bytes.len())) {
             cp.push_chunk(&bytes[start..cut]);
             while let Some(b) = cp.next_block() {
-                blocks.push(b);
+                blocks.push(b.to_string());
             }
             start = cut;
         }
@@ -304,5 +323,75 @@ mod tests {
         let (event, data) = parse_sse_block("");
         assert_eq!(event, None);
         assert!(data.is_empty());
+    }
+
+    /// Blocks handed out are dropped from the buffer at the end of the
+    /// stream too: `take_remaining` returns the unread tail alone (what the
+    /// record stores), not the blocks already relayed.
+    #[test]
+    fn test_chunk_processor_take_remaining_skips_handed_out_blocks() {
+        let (blocks, rest) = run_chunks(b"data: 1\n\ndata: 2", &[]);
+        assert_eq!(blocks, vec!["data: 1".to_string()]);
+        assert_eq!(rest, "data: 2");
+    }
+
+    /// The blocks handed out from one chunk are dropped when the next chunk
+    /// arrives, and a block split across the two chunks comes out whole.
+    #[test]
+    fn a_block_split_across_chunks_after_handed_out_blocks_comes_out_whole() {
+        let mut cp = ChunkProcessor::new();
+        cp.push_chunk(b"event: a\ndata: 1\n\nevent: b\ndata: 2");
+        assert_eq!(cp.next_block(), Some("event: a\ndata: 1"));
+        assert_eq!(cp.next_block(), None);
+        cp.push_chunk(b"\n\nevent: c\ndata: 3\n\n");
+        assert_eq!(cp.pending, "event: b\ndata: 2\n\nevent: c\ndata: 3\n\n");
+        assert_eq!(cp.next_block(), Some("event: b\ndata: 2"));
+        assert_eq!(cp.next_block(), Some("event: c\ndata: 3"));
+        assert_eq!(cp.next_block(), None);
+        assert!(!cp.has_remaining());
+        assert_eq!(cp.take_remaining(), "");
+    }
+
+    /// Draining one pushed chunk of ten blocks hands out ten borrowed blocks
+    /// and allocates nothing: no copy per block, no move of the rest per
+    /// block (the buffer is compacted once, at the next chunk). The count is
+    /// printed for the Numbers table.
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the count a pin reads is printed for the Numbers table"
+    )]
+    fn draining_a_chunk_of_ten_blocks_allocates_nothing() {
+        let chunk: String = (0..10)
+            .map(|i| {
+                format!(
+                    "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":{i},\"delta\":\"a dozen words of answer text that a model streams per step \"}}\n\n"
+                )
+            })
+            .collect();
+        let mut cp = ChunkProcessor::new();
+        cp.push_chunk(chunk.as_bytes());
+
+        let before = counting_alloc::calls();
+        let mut blocks = 0;
+        let mut bytes = 0;
+        while let Some(block) = cp.next_block() {
+            blocks += 1;
+            bytes += block.len();
+        }
+        let calls = counting_alloc::calls() - before;
+
+        eprintln!("draining a chunk of ten blocks: {calls} allocation calls");
+        assert_eq!(blocks, 10);
+        assert_eq!(
+            bytes,
+            chunk.len() - 10 * 2,
+            "every block, without its blank line"
+        );
+        assert!(!cp.has_remaining());
+        assert_eq!(
+            calls, 0,
+            "allocation calls while draining a chunk of ten blocks"
+        );
     }
 }

@@ -34,6 +34,7 @@ mod embed;
 mod engine;
 mod generate;
 mod info;
+mod lora;
 mod media_identity;
 mod service;
 #[cfg(test)]
@@ -305,6 +306,7 @@ impl crate::kv_events::RankLoads for State {
 
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
+    loras: lora::PreloadedLoras,
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
@@ -412,6 +414,7 @@ impl SglangServicerServer {
                         .map(str::to_owned)
                 });
         let state = Arc::new(State {
+            loras: lora::PreloadedLoras::from_server_args(&config.model.server_args_json)?,
             media_identity_key,
             media_disaggregation_mode,
             model: config.model,

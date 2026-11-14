@@ -133,59 +133,62 @@ const VLLM_NONE_HASH_SEED: &str = "vllm-none-hash";
 
 /// `NONE_HASH`: the parent of a chain's first block.
 pub fn vllm_none_hash() -> Digest32 {
-    let mut encoded = Vec::with_capacity(VLLM_NONE_HASH_SEED.len() + 1);
-    cbor::text(&mut encoded, VLLM_NONE_HASH_SEED);
-    Sha256::digest(&encoded).into()
+    let mut hasher = Sha256::new();
+    cbor::text(&mut hasher, VLLM_NONE_HASH_SEED);
+    hasher.finalize().into()
 }
 
-/// One block: `sha256(cbor([parent, tokens, extra_keys]))`.
+/// One block: `sha256(cbor([parent, tokens, extra_keys]))`. The encoding is
+/// fed to the hasher as it is produced, so a block costs the SHA-256 and no
+/// buffer; the parent of a chain's first block is derived only for it.
 pub fn vllm_block(
     parent: Option<&Digest32>,
     tokens: &[u32],
     extra_keys: Option<&[VllmExtraKey]>,
 ) -> Digest32 {
-    let none = vllm_none_hash();
-    let parent = parent.unwrap_or(&none);
-    let mut encoded = Vec::with_capacity(64 + tokens.len() * 3);
-    cbor::array(&mut encoded, 3);
-    cbor::bytes(&mut encoded, parent);
-    cbor::array(&mut encoded, tokens.len());
+    let mut hasher = Sha256::new();
+    cbor::array(&mut hasher, 3);
+    match parent {
+        Some(parent) => cbor::bytes(&mut hasher, parent),
+        None => cbor::bytes(&mut hasher, &vllm_none_hash()),
+    }
+    cbor::array(&mut hasher, tokens.len());
     for &token in tokens {
-        cbor::uint(&mut encoded, u64::from(token));
+        cbor::uint(&mut hasher, u64::from(token));
     }
     match extra_keys {
-        None => cbor::null(&mut encoded),
+        None => cbor::null(&mut hasher),
         Some(keys) => {
-            cbor::array(&mut encoded, keys.len());
+            cbor::array(&mut hasher, keys.len());
             for key in keys {
                 match key {
                     VllmExtraKey::Lora { name, path } => {
-                        cbor::array(&mut encoded, 3);
-                        cbor::text(&mut encoded, "lora");
-                        cbor::text(&mut encoded, name);
-                        cbor::text(&mut encoded, path);
+                        cbor::array(&mut hasher, 3);
+                        cbor::text(&mut hasher, "lora");
+                        cbor::text(&mut hasher, name);
+                        cbor::text(&mut hasher, path);
                     }
                     VllmExtraKey::Mm { identifier, offset } => {
-                        cbor::array(&mut encoded, 3);
-                        cbor::text(&mut encoded, "mm");
-                        cbor::text(&mut encoded, identifier);
-                        cbor::int(&mut encoded, *offset);
+                        cbor::array(&mut hasher, 3);
+                        cbor::text(&mut hasher, "mm");
+                        cbor::text(&mut hasher, identifier);
+                        cbor::int(&mut hasher, *offset);
                     }
                     VllmExtraKey::CacheSalt(salt) => {
-                        cbor::array(&mut encoded, 2);
-                        cbor::text(&mut encoded, "cache_salt");
-                        cbor::text(&mut encoded, salt);
+                        cbor::array(&mut hasher, 2);
+                        cbor::text(&mut hasher, "cache_salt");
+                        cbor::text(&mut hasher, salt);
                     }
                     VllmExtraKey::PromptEmbeds(digest) => {
-                        cbor::array(&mut encoded, 2);
-                        cbor::text(&mut encoded, "prompt_embeds");
-                        cbor::bytes(&mut encoded, digest);
+                        cbor::array(&mut hasher, 2);
+                        cbor::text(&mut hasher, "prompt_embeds");
+                        cbor::bytes(&mut hasher, digest);
                     }
                 }
             }
         }
     }
-    Sha256::digest(&encoded).into()
+    hasher.finalize().into()
 }
 
 /// The integer vLLM publishes for a digest (`VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES`):
@@ -218,32 +221,62 @@ pub fn vllm_chain(
 
 /// The subset of canonical CBOR (RFC 8949 §4.2) that vLLM's hash input uses:
 /// definite-length arrays, byte and text strings, integers and null. `cbor2`
-/// with `canonical=True` produces exactly these bytes for those values.
+/// with `canonical=True` produces exactly these bytes for those values. The
+/// encoder writes into a `Sink`: a byte buffer, or a hasher that takes the
+/// bytes as they come and never holds the whole encoding.
 pub(crate) mod cbor {
-    fn head(out: &mut Vec<u8>, major: u8, value: u64) {
-        let major = major << 5;
-        if value < 24 {
-            out.push(major | value as u8);
-        } else if value <= u64::from(u8::MAX) {
-            out.push(major | 24);
-            out.push(value as u8);
-        } else if value <= u64::from(u16::MAX) {
-            out.push(major | 25);
-            out.extend_from_slice(&(value as u16).to_be_bytes());
-        } else if value <= u64::from(u32::MAX) {
-            out.push(major | 26);
-            out.extend_from_slice(&(value as u32).to_be_bytes());
-        } else {
-            out.push(major | 27);
-            out.extend_from_slice(&value.to_be_bytes());
+    use sha2::{Digest, Sha256};
+
+    /// Where the encoded bytes go.
+    pub(crate) trait Sink {
+        fn put(&mut self, bytes: &[u8]);
+    }
+
+    impl Sink for Vec<u8> {
+        fn put(&mut self, bytes: &[u8]) {
+            self.extend_from_slice(bytes);
         }
     }
 
-    pub(crate) fn uint(out: &mut Vec<u8>, value: u64) {
+    impl Sink for Sha256 {
+        fn put(&mut self, bytes: &[u8]) {
+            self.update(bytes);
+        }
+    }
+
+    /// An item's head: the major type with its argument, one to nine bytes,
+    /// handed to the sink in one piece.
+    fn head(out: &mut impl Sink, major: u8, value: u64) {
+        let major = major << 5;
+        let mut bytes = [0u8; 9];
+        let len = if value < 24 {
+            bytes[0] = major | value as u8;
+            1
+        } else if value <= u64::from(u8::MAX) {
+            bytes[0] = major | 24;
+            bytes[1] = value as u8;
+            2
+        } else if value <= u64::from(u16::MAX) {
+            bytes[0] = major | 25;
+            bytes[1..3].copy_from_slice(&(value as u16).to_be_bytes());
+            3
+        } else if value <= u64::from(u32::MAX) {
+            bytes[0] = major | 26;
+            bytes[1..5].copy_from_slice(&(value as u32).to_be_bytes());
+            5
+        } else {
+            bytes[0] = major | 27;
+            bytes[1..9].copy_from_slice(&value.to_be_bytes());
+            9
+        };
+        out.put(&bytes[..len]);
+    }
+
+    pub(crate) fn uint(out: &mut impl Sink, value: u64) {
         head(out, 0, value);
     }
 
-    pub(crate) fn int(out: &mut Vec<u8>, value: i64) {
+    pub(crate) fn int(out: &mut impl Sink, value: i64) {
         if value >= 0 {
             head(out, 0, value as u64);
         } else {
@@ -251,22 +284,22 @@ pub(crate) mod cbor {
         }
     }
 
-    pub(crate) fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+    pub(crate) fn bytes(out: &mut impl Sink, value: &[u8]) {
         head(out, 2, value.len() as u64);
-        out.extend_from_slice(value);
+        out.put(value);
     }
 
-    pub(crate) fn text(out: &mut Vec<u8>, value: &str) {
+    pub(crate) fn text(out: &mut impl Sink, value: &str) {
         head(out, 3, value.len() as u64);
-        out.extend_from_slice(value.as_bytes());
+        out.put(value.as_bytes());
     }
 
-    pub(crate) fn array(out: &mut Vec<u8>, len: usize) {
+    pub(crate) fn array(out: &mut impl Sink, len: usize) {
         head(out, 4, len as u64);
     }
 
-    pub(crate) fn null(out: &mut Vec<u8>) {
-        out.push(0xf6);
+    pub(crate) fn null(out: &mut impl Sink) {
+        out.put(&[0xf6]);
     }
 }
 

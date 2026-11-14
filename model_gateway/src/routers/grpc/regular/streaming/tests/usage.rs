@@ -245,10 +245,20 @@ async fn non_streamed_chat_usage(scripted: Scripted, request: &ChatCompletionReq
 }
 
 async fn streamed_completion_usage(
-    (stream, server): Scripted,
+    scripted: Scripted,
     request: &CompletionRequest,
     reservation: Option<Arc<SharedReservationHandle>>,
 ) -> Value {
+    usage_chunk(&streamed_completion_events(scripted, request, reservation).await)
+}
+
+/// The `data:` events of one streamed completion, in order, `[DONE]` left
+/// out.
+async fn streamed_completion_events(
+    (stream, server): Scripted,
+    request: &CompletionRequest,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> Vec<Value> {
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
     let response = Arc::new(processor(false))
@@ -269,14 +279,13 @@ async fn streamed_completion_usage(
         .await
         .expect("the stream's body");
     server.abort();
-    let events: Vec<Value> = std::str::from_utf8(&body)
+    std::str::from_utf8(&body)
         .expect("UTF-8 SSE")
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).expect("SSE JSON"))
-        .collect();
-    usage_chunk(&events)
+        .collect()
 }
 
 async fn non_streamed_completion(
@@ -632,6 +641,57 @@ async fn completion_usage_is_the_same_streamed_and_not() {
             whole["prompt_tokens_details"]["cached_tokens"], counters.cached,
             "{name}: {whole}"
         );
+    }
+}
+
+/// Under `stream_options.include_usage` every chunk before the usage chunk
+/// carries `"usage": null`, as the public API writes it and a chat stream
+/// does; without the option no chunk carries the key.
+#[tokio::test]
+async fn a_completion_stream_that_asks_for_usage_writes_the_placeholder_before_the_usage_chunk() {
+    let counters = Counters {
+        prompt: 3,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    for stream_options in [
+        Some(json!({"include_usage": true})),
+        Some(json!({"include_usage": false})),
+        None,
+    ] {
+        let asks = stream_options
+            .as_ref()
+            .is_some_and(|options| options["include_usage"] == true);
+        let mut request = json!({"model": "eof-test", "prompt": "hi", "stream": true});
+        if let Some(options) = stream_options {
+            request["stream_options"] = options;
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(request).expect("completion request");
+        let events = streamed_completion_events(
+            engine_stream(frames(&["o", "k"], 1, counters)).await,
+            &request,
+            None,
+        )
+        .await;
+        if asks {
+            let (closing, chunks) = events.split_last().expect("the usage chunk");
+            assert!(closing["usage"].is_object(), "{events:?}");
+            assert!(!chunks.is_empty(), "{events:?}");
+            assert!(
+                chunks
+                    .iter()
+                    .all(|chunk| chunk.get("usage") == Some(&Value::Null)),
+                "every chunk before the usage chunk writes the placeholder: {events:?}"
+            );
+        } else {
+            assert!(!events.is_empty(), "{events:?}");
+            assert!(
+                events.iter().all(|chunk| chunk.get("usage").is_none()),
+                "no chunk carries usage without the option: {events:?}"
+            );
+        }
     }
 }
 
