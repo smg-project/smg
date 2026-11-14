@@ -32,6 +32,7 @@ pub mod middleware;
 pub mod observability;
 pub mod policies;
 pub mod rate_limit;
+pub mod rl_adapter;
 pub mod routers;
 pub mod secrets;
 pub mod server;

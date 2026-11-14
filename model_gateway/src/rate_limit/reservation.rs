@@ -1,6 +1,6 @@
 //! Abort-safe reservation lifecycle: [`SharedReservationHandle`] is held
 //! by whoever owns a reservation, and [`ReservationAttachment`] rides in a
-//! streaming response's body (see `worker::GuardedStream`) so an
+//! streaming response's body (see `routers::common::stream::GuardedStream`) so an
 //! aborted/disconnected stream still releases it.
 
 use std::sync::{
@@ -89,7 +89,7 @@ impl SharedReservationHandle {
     }
 }
 
-/// RAII guard: held by a streaming response's body (`worker::GuardedStream`)
+/// RAII guard: held by a streaming response's body (`routers::common::stream::GuardedStream`)
 /// so an aborted/disconnected stream still abandons an open reservation
 /// instead of leaking it as permanently reserved.
 pub struct ReservationAttachment {
