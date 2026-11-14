@@ -305,7 +305,7 @@
       }
     },
     "policyController": {
-      "type": "object",
+      "type": ["object", "null"],
       "additionalProperties": false,
       "if": {
         "required": ["enabled"],
@@ -314,102 +314,154 @@
       "then": {
         "required": [
           "image",
+          "replicas",
           "ports",
           "service",
           "logging",
+          "runtimeWorkerThreads",
           "podDisruptionBudget",
           "securityContext",
           "livenessProbe",
           "readinessProbe",
-          "shutdownGracePeriodSeconds"
+          "shutdownGracePeriodSeconds",
+          "terminationGraceMarginSeconds"
         ],
         "properties": {
-          "image": { "required": ["repository", "tag"] },
-          "ports": { "required": ["gateway", "control", "replication", "admin"] },
-          "logging": { "required": ["level"] },
-          "podDisruptionBudget": { "required": ["minAvailable"] },
+          "image": {
+            "type": "object",
+            "required": ["repository", "tag"],
+            "properties": {
+              "repository": { "type": "string" },
+              "tag": { "type": "string" }
+            }
+          },
+          "replicas": { "type": "integer" },
+          "ports": {
+            "type": "object",
+            "required": ["gateway", "control", "replication", "admin"],
+            "properties": {
+              "gateway": { "type": "integer" },
+              "control": { "type": "integer" },
+              "replication": { "type": "integer" },
+              "admin": { "type": "integer" }
+            }
+          },
+          "service": {
+            "type": "object",
+            "required": ["type"],
+            "properties": { "type": { "type": "string" } }
+          },
+          "logging": {
+            "type": "object",
+            "required": ["level"],
+            "properties": { "level": { "type": "string" } }
+          },
+          "runtimeWorkerThreads": { "type": "integer" },
+          "podDisruptionBudget": {
+            "type": "object",
+            "required": ["minAvailable"],
+            "properties": { "minAvailable": { "type": ["integer", "string"] } }
+          },
           "securityContext": { "type": "object" },
-          "livenessProbe": { "required": ["path"] },
-          "readinessProbe": { "required": ["path"] }
+          "livenessProbe": {
+            "type": "object",
+            "required": ["path", "initialDelaySeconds", "periodSeconds"],
+            "properties": {
+              "path": { "type": "string" },
+              "initialDelaySeconds": { "type": "integer" },
+              "periodSeconds": { "type": "integer" }
+            }
+          },
+          "readinessProbe": {
+            "type": "object",
+            "required": ["path", "initialDelaySeconds", "periodSeconds"],
+            "properties": {
+              "path": { "type": "string" },
+              "initialDelaySeconds": { "type": "integer" },
+              "periodSeconds": { "type": "integer" }
+            }
+          },
+          "shutdownGracePeriodSeconds": { "type": "integer" },
+          "terminationGraceMarginSeconds": { "type": "integer" }
         }
       },
       "properties": {
-        "enabled": { "type": "boolean" },
+        "enabled": { "type": ["boolean", "null"] },
         "image": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "registry": { "type": "string" },
-            "repository": { "type": "string" },
-            "tag": { "type": "string" }
+            "registry": { "type": ["string", "null"] },
+            "repository": { "type": ["string", "null"] },
+            "tag": { "type": ["string", "null"] }
           }
         },
-        "replicas": { "type": "integer", "minimum": 1 },
+        "replicas": { "type": ["integer", "null"], "minimum": 1 },
         "ports": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "gateway": { "type": "integer", "minimum": 1, "maximum": 65535 },
-            "control": { "type": "integer", "minimum": 1, "maximum": 65535 },
-            "replication": { "type": "integer", "minimum": 1, "maximum": 65535 },
-            "admin": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            "gateway": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "control": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "replication": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "admin": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
           }
         },
         "service": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "type": { "type": "string" },
-            "annotations": { "type": "object" }
+            "type": { "type": ["string", "null"], "minLength": 1 },
+            "annotations": { "type": ["object", "null"] }
           }
         },
         "logging": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
-            "json": { "type": "boolean" }
+            "level": { "type": ["string", "null"], "enum": ["debug", "info", "warn", "error", null] },
+            "json": { "type": ["boolean", "null"] }
           }
         },
-        "resources": { "type": "object" },
-        "runtimeWorkerThreads": { "type": ["integer", "null"], "minimum": 1, "maximum": 4096 },
-        "nodeSelector": { "type": "object" },
-        "tolerations": { "type": "array" },
-        "affinity": { "type": "object" },
-        "podAnnotations": { "type": "object" },
-        "podLabels": { "type": "object" },
-        "extraArgs": { "type": "array" },
-        "extraEnv": { "type": "array" },
+        "resources": { "type": ["object", "null"] },
+        "runtimeWorkerThreads": { "type": ["integer", "null"], "minimum": 0, "maximum": 4096 },
+        "nodeSelector": { "type": ["object", "null"] },
+        "tolerations": { "type": ["array", "null"] },
+        "affinity": { "type": ["object", "null"] },
+        "podAnnotations": { "type": ["object", "null"] },
+        "podLabels": { "type": ["object", "null"] },
+        "extraArgs": { "type": ["array", "null"] },
+        "extraEnv": { "type": ["array", "null"] },
         "podDisruptionBudget": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "enabled": { "type": "boolean" },
-            "minAvailable": { "type": ["integer", "string"] }
+            "enabled": { "type": ["boolean", "null"] },
+            "minAvailable": { "type": ["integer", "string", "null"], "minLength": 1 }
           }
         },
         "securityContext": { "type": ["object", "null"] },
         "livenessProbe": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "path": { "type": "string", "minLength": 1 },
-            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
-            "periodSeconds": { "type": "integer", "minimum": 1 }
+            "path": { "type": ["string", "null"], "minLength": 1 },
+            "initialDelaySeconds": { "type": ["integer", "null"], "minimum": 0 },
+            "periodSeconds": { "type": ["integer", "null"], "minimum": 1 }
           }
         },
         "readinessProbe": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "path": { "type": "string", "minLength": 1 },
-            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
-            "periodSeconds": { "type": "integer", "minimum": 1 }
+            "path": { "type": ["string", "null"], "minLength": 1 },
+            "initialDelaySeconds": { "type": ["integer", "null"], "minimum": 0 },
+            "periodSeconds": { "type": ["integer", "null"], "minimum": 1 }
           }
         },
-        "shutdownGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "shutdownGracePeriodSeconds": { "type": ["integer", "null"], "minimum": 1 },
         "shutdownSettleSeconds": { "type": ["integer", "null"], "minimum": 0 },
-        "terminationGraceMarginSeconds": { "type": "integer", "minimum": 0 }
+        "terminationGraceMarginSeconds": { "type": ["integer", "null"], "minimum": 0 }
       }
     }
   }

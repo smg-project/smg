@@ -69,16 +69,16 @@ def helm_template(settings: tuple[str, ...], files: tuple[Path, ...] = (), chart
     return subprocess.run(command, capture_output=True, text=True)
 
 
-def render(*settings: str, files: tuple[Path, ...] = ()) -> list[dict]:
+def render(*settings: str, files: tuple[Path, ...] = (), chart: Path = CHART) -> list[dict]:
     """The documents the chart renders with ``--set`` pairs."""
-    completed = helm_template(settings, files)
+    completed = helm_template(settings, files, chart)
     assert completed.returncode == 0, completed.stderr
     return [document for document in yaml.safe_load_all(completed.stdout) if document]
 
 
-def render_error(*settings: str) -> str:
+def render_error(*settings: str, files: tuple[Path, ...] = (), chart: Path = CHART) -> str:
     """Helm's error for ``--set`` pairs the chart must refuse."""
-    completed = helm_template(settings)
+    completed = helm_template(settings, files, chart)
     assert completed.returncode != 0, "the chart rendered values it should refuse"
     return completed.stderr
 
@@ -136,14 +136,17 @@ def chart_with_no_block(tmp_path) -> Path:
 
 @needs_helm
 def test_a_controller_that_is_off_asks_nothing_of_the_values(chart_with_no_block):
-    """With no block, a null block, the switch alone named off, or one value
-    and no switch, the chart renders what its defaults render, byte for byte.
+    """With no block, a null block over the chart's values or over none, the
+    switch alone named off or null, or one value and no switch, the chart
+    renders what its defaults render, byte for byte.
     Each again with the router's monitor on: the controller's monitor stands
     behind that switch."""
     cells = {
         "no block": (chart_with_no_block, ()),
         "a null block": (CHART, ("policyController=null",)),
+        "a null block over no block": (chart_with_no_block, ("policyController=null",)),
         "the switch alone, off": (chart_with_no_block, ("policyController.enabled=false",)),
+        "the switch alone, null": (chart_with_no_block, ("policyController.enabled=null",)),
         "one value and no switch": (chart_with_no_block, ("policyController.ports.admin=9000",)),
     }
     wrong = {}
@@ -162,10 +165,10 @@ def test_a_controller_that_is_off_asks_nothing_of_the_values(chart_with_no_block
     assert '"required"' not in json.dumps(schema_block()["properties"])
 
 
-def answered_as_the_schema_names(chart: Path) -> tuple[list[set[str]], list[dict]]:
+def answered_as_the_schema_names(chart: Path) -> tuple[list[set[str]], str, dict]:
     """The controller turned on over ``chart`` and given, round by round, the
     chart's own default for each value the schema names, until it renders:
-    the names of each round, and the documents."""
+    the names of each round, the render, and the block that was given."""
     defaults = yaml.safe_load(VALUES.read_text())["policyController"]
     # The image ON names: the chart has no default for it.
     defaults["image"].update(s.removeprefix("policyController.image.").split("=") for s in ON[1:])
@@ -177,9 +180,7 @@ def answered_as_the_schema_names(chart: Path) -> tuple[list[set[str]], list[dict
         answers.write_text(yaml.safe_dump({"policyController": given}))
         completed = helm_template((), files=(answers,), chart=chart)
         if completed.returncode == 0:
-            return rounds, [
-                document for document in yaml.safe_load_all(completed.stdout) if document
-            ]
+            return rounds, completed.stdout, given
         named = re.findall(r"policyController(?:\.(\w+))?: (\w+) is required", completed.stderr)
         assert named, completed.stderr
         rounds.append({f"{parent}.{name}" if parent else name for parent, name in named})
@@ -194,34 +195,31 @@ def answered_as_the_schema_names(chart: Path) -> tuple[list[set[str]], list[dict
 
 
 @needs_helm
-def test_turned_on_over_values_with_no_block_keeps_the_security_context(chart_with_no_block):
+def test_turned_on_over_values_with_no_block_renders_a_fresh_install(chart_with_no_block):
     """An upgrade that reuses the values of a release from before the block
-    and turns the controller on has none of the block's defaults. Answered as
-    the schema names until it renders, the controller has a fresh install's
-    security context and lacks four defaults, the four the README names: the
-    replica count, the worker threads, the grace margin, the probes' timings."""
-    rounds, answered = answered_as_the_schema_names(chart_with_no_block)
+    and turns the controller on has none of the block's defaults. The schema
+    names every value that holds one, round by round. Answered with the
+    chart's own values until it renders, the upgrade renders a fresh install,
+    byte for byte: nothing is left to another default."""
+    rounds, answered, given = answered_as_the_schema_names(chart_with_no_block)
     assert rounds[0] == set(schema_block()["then"]["required"])
-    fresh = render(*ON)
-    found = container(fresh)
-    assert container(answered).get("securityContext") == found["securityContext"]
-    # A fresh install without the four is what the upgrade renders, object
-    # for object: a fifth loss fails here.
-    deployment = one(fresh, "Deployment")["spec"]
-    deployment["replicas"] = None
-    threads = found["args"].index("--runtime-worker-threads")
-    del found["args"][threads : threads + 2]
-    grace = yaml.safe_load(VALUES.read_text())["policyController"]["shutdownGracePeriodSeconds"]
-    deployment["template"]["spec"]["terminationGracePeriodSeconds"] = grace
-    for probe in ("livenessProbe", "readinessProbe"):
-        found[probe].update(initialDelaySeconds=None, periodSeconds=None)
-    assert answered == fresh
+    fresh = helm_template(ON)
+    assert fresh.returncode == 0, fresh.stderr
+    assert answered == fresh.stdout
     # Over values with no block a null is not removed with a default: it is
     # there as a null, and refused as one.
-    null = helm_template(
-        (ON[0], "policyController.securityContext=null"), chart=chart_with_no_block
-    )
-    assert "policyController.securityContext: Invalid type" in null.stderr
+    for name in ("securityContext", "runtimeWorkerThreads"):
+        null = helm_template((ON[0], f"policyController.{name}=null"), chart=chart_with_no_block)
+        assert f"policyController.{name}: Invalid type" in null.stderr
+    # No default stands under a map given there either: an empty security
+    # context runs the container with none, where over the chart's own
+    # values the same answers keep the default.
+    given["securityContext"] = {}
+    no_context = chart_with_no_block.parent / "no-context.yaml"
+    no_context.write_text(yaml.safe_dump({"policyController": given}))
+    bare = container(render(files=(no_context,), chart=chart_with_no_block))
+    assert "securityContext" not in bare
+    assert helm_template((), files=(no_context,)).stdout == fresh.stdout
 
 
 @needs_helm
@@ -391,9 +389,9 @@ def test_the_arguments_follow_the_values():
     # HOSTNAME: the chart passes neither the flag nor the variable.
     assert "--controller-id" not in container(documents)["args"]
     assert "env" not in container(documents)
-    # null leaves the flag out: the controller then starts one worker thread
+    # 0 leaves the flag out: the controller then starts one worker thread
     # for every CPU the pod may use.
-    unset = controller_args("policyController.runtimeWorkerThreads=null")
+    unset = controller_args("policyController.runtimeWorkerThreads=0")
     assert "--runtime-worker-threads" not in unset
 
 
@@ -503,14 +501,23 @@ def test_the_schema_refuses_a_value_the_block_does_not_have():
         *ON, "policyController.logging.level=loud"
     )
     assert "policyController.replicas" in render_error(*ON, "policyController.replicas=0")
-    assert "policyController.runtimeWorkerThreads" in render_error(
-        *ON, "policyController.runtimeWorkerThreads=4097"
-    )
+    for threads in (-1, 4097):
+        assert "policyController.runtimeWorkerThreads" in render_error(
+            *ON, f"policyController.runtimeWorkerThreads={threads}"
+        )
     # An empty path is no path: the kubelet would ask the root.
     for probe in ("livenessProbe", "readinessProbe"):
         assert f"policyController.{probe}.path" in render_error(
             *ON, f"policyController.{probe}.path="
         )
+    # An empty Service type or budget number renders a field with no value,
+    # which leaves it to the cluster.
+    assert "policyController.service.type" in render_error(*ON, "policyController.service.type=")
+    assert "policyController.podDisruptionBudget.minAvailable" in render_error(
+        *ON,
+        "policyController.podDisruptionBudget.enabled=true",
+        "policyController.podDisruptionBudget.minAvailable=",
+    )
 
 
 def block_keys(values: dict, schema: dict, prefix: str = "") -> list[str]:
@@ -526,7 +533,7 @@ def block_keys(values: dict, schema: dict, prefix: str = "") -> list[str]:
 
 
 # A null removes a value's default. These nulls are legal and render what
-# the defaults render.
+# the defaults render: each default is empty.
 SAME_AS_THE_DEFAULT = {
     "image.registry",
     "service.annotations",
@@ -541,57 +548,97 @@ SAME_AS_THE_DEFAULT = {
     "extraEnv",
     "shutdownSettleSeconds",
 }
-# These are legal too, each with the one thing it changes: the cluster or
-# the controller then takes its own default.
-CHANGED_BY_A_NULL = {
+# These are legal too: each is a switch, and its null turns it off.
+SWITCHED_OFF_BY_A_NULL = {
     "enabled": lambda documents: of_the_controller(documents) == [],
-    "replicas": lambda documents: one(documents, "Deployment")["spec"]["replicas"] is None,
-    "service.type": lambda documents: one(documents, "Service")["spec"]["type"] is None,
-    "runtimeWorkerThreads": lambda documents: (
-        "--runtime-worker-threads" not in container(documents)["args"]
-    ),
     "podDisruptionBudget.enabled": lambda documents: (
         "PodDisruptionBudget" not in [document["kind"] for document in documents]
-    ),
-    "livenessProbe.initialDelaySeconds": lambda documents: (
-        container(documents)["livenessProbe"]["initialDelaySeconds"] is None
-    ),
-    "livenessProbe.periodSeconds": lambda documents: (
-        container(documents)["livenessProbe"]["periodSeconds"] is None
-    ),
-    "readinessProbe.initialDelaySeconds": lambda documents: (
-        container(documents)["readinessProbe"]["initialDelaySeconds"] is None
-    ),
-    "readinessProbe.periodSeconds": lambda documents: (
-        container(documents)["readinessProbe"]["periodSeconds"] is None
-    ),
-    "terminationGraceMarginSeconds": lambda documents: (
-        one(documents, "Deployment")["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
-        == 30
     ),
 }
 
 
+def default_of(block: dict, key: str):
+    for name in key.split("."):
+        block = block[name]
+    return block
+
+
 @needs_helm
-def test_a_null_is_refused_or_renders_what_this_case_names():
-    """Every key of the block set to null, one at a time: the schema refuses
-    it, or it is one of the legal nulls above. Without the refusals the chart
+def test_a_null_is_refused_or_renders_what_this_case_names(chart_with_no_block):
+    """Every key of the block set to null, one at a time, over the chart's
+    own values and over values with no block where the block is given whole
+    in a file: the schema refuses it, or it is one of the legal nulls above,
+    the same over both. Without the refusals the chart
     would render a listener on port 0, a flag with no value, a probe with no
-    path, a grace period of zero or a budget with no number. A key added to
-    the block fails here until it is one or the other."""
+    path, a grace period of zero or a budget with no number, or leave the
+    replica count, the worker threads, the grace margin, a probe's timing or
+    the Service's type to another default. A key added to the block fails
+    here until it is one or the other, and a legal null is for an empty
+    default or a switch: a value that holds a default is refused."""
     block = yaml.safe_load(VALUES.read_text())["policyController"]
+    for key in SAME_AS_THE_DEFAULT:
+        assert not default_of(block, key), f"{key} holds a default: refuse its null"
+    for key in SWITCHED_OFF_BY_A_NULL:
+        assert default_of(block, key) is False, f"{key} is no switch: refuse its null"
     switches = (*ON, "policyController.podDisruptionBudget.enabled=true")
     default = of_the_controller(render(*switches))
-    for key in block_keys(block, schema_block()):
-        setting = f"policyController.{key}=null"
-        if key in SAME_AS_THE_DEFAULT:
-            assert of_the_controller(render(*switches, setting)) == default, key
-        elif key in CHANGED_BY_A_NULL:
-            assert CHANGED_BY_A_NULL[key](render(*switches, setting)), key
-        else:
-            parent, _, name = f"policyController.{key}".rpartition(".")
-            error = render_error(*switches, setting)
-            assert f"{parent}: {name} is required" in error, f"{key}: {error}"
+    # Over values with no block a null is not removed with a default: it
+    # reaches the schema as a null, and a required value refuses it by type.
+    whole = chart_with_no_block.parent / "block.yaml"
+    whole.write_text(yaml.safe_dump({"policyController": block}))
+    sides: dict[str, dict] = {
+        "the chart's own values": {},
+        "values with no block": {"files": (whole,), "chart": chart_with_no_block},
+    }
+    for side, over in sides.items():
+        assert of_the_controller(render(*switches, **over)) == default, side
+        for key in block_keys(block, schema_block()):
+            setting = f"policyController.{key}=null"
+            if key in SAME_AS_THE_DEFAULT:
+                assert of_the_controller(render(*switches, setting, **over)) == default, (side, key)
+            elif key in SWITCHED_OFF_BY_A_NULL:
+                assert SWITCHED_OFF_BY_A_NULL[key](render(*switches, setting, **over)), (side, key)
+            else:
+                parent, _, name = f"policyController.{key}".rpartition(".")
+                refusal = (
+                    f"policyController.{key}: Invalid type"
+                    if over
+                    else f"{parent}: {name} is required"
+                )
+                error = render_error(*switches, setting, **over)
+                assert refusal in error, f"{side}, {key}: {error}"
+
+
+def every_key(values: dict, prefix: str = "") -> list[str]:
+    """Every key of the block as the values file has it, at every depth."""
+    keys = []
+    for key, value in values.items():
+        keys.append(f"{prefix}{key}")
+        if isinstance(value, dict):
+            keys += every_key(value, f"{prefix}{key}.")
+    return keys
+
+
+@needs_helm
+def test_a_controller_that_is_off_refuses_no_null(chart_with_no_block):
+    """With the controller off, every key of the block set to null, one at a
+    time and at every depth, over the chart's own values and over values with
+    no block, renders what the defaults render, byte for byte. A value is
+    required only while the controller reads it: its own type takes a null,
+    and the schema's condition holds the type while the controller is on."""
+    block = yaml.safe_load(VALUES.read_text())["policyController"]
+    default = helm_template(())
+    assert default.returncode == 0, default.stderr
+    sides = {"the chart's own values": CHART, "values with no block": chart_with_no_block}
+    wrong = {}
+    for side, chart in sides.items():
+        for key in every_key(block):
+            rendered = helm_template((f"policyController.{key}=null",), chart=chart)
+            if rendered.returncode != 0:
+                wrong[side, key] = rendered.stderr.strip().splitlines()[-1]
+            elif rendered.stdout != default.stdout:
+                wrong[side, key] = "renders other bytes than the defaults"
+    assert wrong == {}
 
 
 @pytest.fixture(scope="module")
@@ -619,7 +666,7 @@ ARGUMENT_SETS = {
         "policyController.shutdownGracePeriodSeconds=60",
         "policyController.shutdownSettleSeconds=20",
     ),
-    "no-thread-count": ("policyController.runtimeWorkerThreads=null",),
+    "no-thread-count": ("policyController.runtimeWorkerThreads=0",),
     "other-ports": (
         "policyController.ports.gateway=31100",
         "policyController.ports.control=31101",
