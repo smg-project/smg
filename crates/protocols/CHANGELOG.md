@@ -94,6 +94,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An Interactions request declaring a `computer_use`, `google_maps` or `retrieval` tool is
+  accepted, an `mcp_server` tool takes its `allowed_tools` as the list the public API declares, and
+  `google_search` keeps its `search_types`. The three tools were unknown variants and the list
+  failed to parse, each refusing the whole request, and `search_types` was dropped. Breaking:
+  `InteractionsTool` gains `ComputerUse`, `GoogleMaps` and `Retrieval`, `GoogleSearch` gains
+  `search_types`, `McpServer.allowed_tools` is a `Vec<AllowedTools>`, and `ToolChoiceType`, which
+  the SDK keeps open as it does the tools' other sets, gains `Other` and is `#[non_exhaustive]`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
