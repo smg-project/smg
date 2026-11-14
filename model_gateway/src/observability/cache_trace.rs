@@ -14,6 +14,7 @@ use std::{
 };
 
 use http::HeaderMap;
+use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::worker::Worker;
@@ -23,36 +24,110 @@ struct Capture {
     /// The request asked for its decision record (`x-smg-cache-trace: 1`).
     header_requested: bool,
     prediction: Value,
-    selections: Vec<Value>,
+    selections: Vec<Selection>,
     truncated: bool,
     gates: Vec<Value>,
-    candidates: Vec<Value>,
+    candidates: Vec<Candidate>,
     candidates_complete: bool,
     observation_started_ns: u64,
     observation_finished_ns: u64,
     scores: Vec<Value>,
 }
 
+/// One candidate as a selection observed it: the worker, and the state read
+/// from it where the pick runs, which may be under a caller's lock. Nothing
+/// here is text: the candidate's JSON object is written from these values
+/// when the evidence is (see its [`Serialize`]), after the pick and its lock.
+/// The URL and the advertised epochs are the worker's own and never change,
+/// so they are read at the write; whether those epochs were current is read
+/// here.
+struct Candidate {
+    worker: Arc<dyn Worker>,
+    load: usize,
+    healthy: bool,
+    overloaded: bool,
+    revision: u64,
+    epochs_valid: bool,
+}
+
+impl Serialize for Candidate {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let epochs = if self.epochs_valid {
+            self.worker.advertised_cache_trace_epochs()
+        } else {
+            Vec::new()
+        };
+        let epoch = if epochs.len() == 1 {
+            epochs.first()
+        } else {
+            None
+        };
+        let mut row = serializer.serialize_map(Some(8))?;
+        row.serialize_entry("worker", self.worker.redacted_url())?;
+        row.serialize_entry("load", &self.load)?;
+        row.serialize_entry("healthy", &self.healthy)?;
+        row.serialize_entry("overloaded", &self.overloaded)?;
+        row.serialize_entry("registry_revision", &self.revision)?;
+        row.serialize_entry("backend_cache_epoch", &epoch)?;
+        row.serialize_entry("backend_cache_epochs", &epochs)?;
+        row.serialize_entry("backend_cache_epoch_source", "registration_metadata")?;
+        row.end()
+    }
+}
+
+/// One selection's row as it was observed, kept as values until the evidence
+/// is written.
+struct Selection {
+    /// The policy's name and the seam's: static, so a row copies neither.
+    policy: &'static str,
+    origin: &'static str,
+    worker: Option<Arc<dyn Worker>>,
+    prediction: Value,
+    candidates: Vec<Candidate>,
+    candidates_complete: bool,
+    observation_started_ns: u64,
+    observation_finished_ns: u64,
+    scores: Vec<Value>,
+    gates: Vec<Value>,
+}
+
+impl Serialize for Selection {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let worker = self.worker.as_ref().map(|worker| worker.redacted_url());
+        let mut row = serializer.serialize_map(Some(14))?;
+        row.serialize_entry("policy", &self.policy)?;
+        row.serialize_entry("origin", &self.origin)?;
+        row.serialize_entry("worker", &worker)?;
+        row.serialize_entry("prediction", &self.prediction)?;
+        row.serialize_entry("candidates", &self.candidates)?;
+        row.serialize_entry("candidates_complete", &self.candidates_complete)?;
+        row.serialize_entry("observation_started_ns", &self.observation_started_ns)?;
+        row.serialize_entry("observation_finished_ns", &self.observation_finished_ns)?;
+        row.serialize_entry("snapshot_atomic", &false)?;
+        row.serialize_entry("scores", &self.scores)?;
+        row.serialize_entry("load_source", "router_inflight")?;
+        row.serialize_entry("eligibility_scope", "policy_candidates")?;
+        row.serialize_entry("load_observation_phase", "before_selection")?;
+        row.serialize_entry("gates", &self.gates)?;
+        row.end()
+    }
+}
+
 impl Capture {
+    /// Read the candidates where the pick is about to run: each worker's
+    /// handle and its live state, no text. A caller may hold a lock here.
     fn observe_candidates(&mut self, workers: &[Arc<dyn Worker>]) {
         self.observation_started_ns = timestamp_ns();
         self.candidates = workers
             .iter()
             .take(32)
-            .map(|worker| {
-                let epochs = worker.cache_trace_epochs();
-                let epoch = if epochs.len() == 1 {
-                    epochs.first()
-                } else {
-                    None
-                };
-                json!({
-                    "worker": worker.redacted_url(), "load": worker.load(), "healthy": worker.is_healthy(),
-                    "overloaded": worker.is_overloaded(), "registry_revision": worker.revision(),
-                    "backend_cache_epoch": epoch,
-                    "backend_cache_epochs": epochs,
-                    "backend_cache_epoch_source": "registration_metadata",
-                })
+            .map(|worker| Candidate {
+                epochs_valid: worker.cache_trace_epochs_valid(),
+                load: worker.load(),
+                healthy: worker.is_healthy(),
+                overloaded: worker.is_overloaded(),
+                revision: worker.revision(),
+                worker: Arc::clone(worker),
             })
             .collect();
         self.candidates_complete = workers.len() <= 32;
@@ -291,8 +366,8 @@ pub(crate) fn mark_truncated() {
 }
 
 pub(crate) fn selection(
-    policy: &str,
-    origin: &str,
+    policy: &'static str,
+    origin: &'static str,
     workers: &[Arc<dyn Worker>],
     selected: Option<usize>,
 ) {
@@ -301,25 +376,24 @@ pub(crate) fn selection(
     }
     let _ = CAPTURE.try_with(|capture| {
         let mut capture = capture.borrow_mut();
+        let capture = &mut *capture;
         if capture.selections.len() >= 16 {
             capture.truncated = true;
             return;
         }
-        let value = json!({
-            "policy": policy, "origin": origin,
-            "worker": selected.map(|idx| workers[idx].redacted_url()),
-            "prediction": std::mem::take(&mut capture.prediction),
-            "candidates": std::mem::take(&mut capture.candidates),
-            "candidates_complete": capture.candidates_complete,
-            "observation_started_ns": capture.observation_started_ns,
-            "observation_finished_ns": capture.observation_finished_ns,
-            "snapshot_atomic": false,
-            "scores": std::mem::take(&mut capture.scores),
-            "load_source": "router_inflight", "eligibility_scope": "policy_candidates",
-            "load_observation_phase": "before_selection",
-            "gates": std::mem::take(&mut capture.gates),
+        // The row's values, moved: its text is written with the evidence.
+        capture.selections.push(Selection {
+            policy,
+            origin,
+            worker: selected.map(|idx| Arc::clone(&workers[idx])),
+            prediction: std::mem::take(&mut capture.prediction),
+            candidates: std::mem::take(&mut capture.candidates),
+            candidates_complete: capture.candidates_complete,
+            observation_started_ns: capture.observation_started_ns,
+            observation_finished_ns: capture.observation_finished_ns,
+            scores: std::mem::take(&mut capture.scores),
+            gates: std::mem::take(&mut capture.gates),
         });
-        capture.selections.push(value);
     });
 }
 
@@ -388,14 +462,19 @@ fn gateway_header(value: &Value) -> Option<String> {
 pub(crate) fn failure(root_id: Option<&str>, status: u16) {
     if log_enabled() {
         let _ = CAPTURE.try_with(|capture| {
-            let capture = capture.borrow();
-            let evidence = json!({"root_id": root_id, "status": status,
-                "selections": capture.selections, "gates": capture.gates,
-                "truncated": capture.truncated});
+            let evidence = failure_evidence(&capture.borrow(), root_id, status);
             let evidence = encode_capped(evidence, max_bytes());
             tracing::info!(target: "smg::cache_trace", evidence = %evidence, "Cache routing failure");
         });
     }
+}
+
+/// A failed request's evidence: its rows so far, written from the capture
+/// and left in it, where a retry's dispatch still finds them.
+fn failure_evidence(capture: &Capture, root_id: Option<&str>, status: u16) -> Value {
+    json!({"root_id": root_id, "status": status,
+        "selections": capture.selections, "gates": capture.gates,
+        "truncated": capture.truncated})
 }
 
 /// The rows the capture in scope holds, each as the evidence line lists it
@@ -404,13 +483,188 @@ pub(crate) fn failure(root_id: Option<&str>, status: u16) {
 #[cfg(test)]
 pub(crate) fn captured_selections() -> Vec<Value> {
     CAPTURE
-        .try_with(|capture| capture.borrow().selections.clone())
+        .try_with(|capture| {
+            let capture = capture.borrow();
+            capture.selections.iter().map(|row| json!(row)).collect()
+        })
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first observed candidate as the evidence lists it.
+    fn first_candidate(capture: &Capture) -> Value {
+        json!(capture.candidates[0])
+    }
+
+    /// A row is written with the evidence from the values its selection
+    /// kept, and it is the row the selection used to write as text where it
+    /// ran: the same keys, order and values for a candidate that advertises
+    /// one epoch, one that advertises two and one that advertises none, with
+    /// the prediction, score and gate recorded for it. What a worker shows
+    /// when the evidence is written is not in it: a load credit, an overload
+    /// flag and a health failure after the selection leave the row as it was
+    /// observed.
+    #[tokio::test]
+    async fn a_row_written_with_the_evidence_is_the_row_as_it_was_observed() {
+        use openai_protocol::worker::WorkerStatus;
+
+        use crate::worker::BasicWorkerBuilder;
+        let worker = |url: &str, epochs: Option<&str>| -> Arc<dyn Worker> {
+            // Ready, so that the health failure below moves what a worker
+            // shows after its row was observed.
+            let mut builder = BasicWorkerBuilder::new(url).status(WorkerStatus::Ready);
+            if let Some(epochs) = epochs {
+                builder = builder.labels(std::collections::HashMap::from([(
+                    "cache_trace_epochs".to_string(),
+                    epochs.to_string(),
+                )]));
+            }
+            Arc::new(builder.build())
+        };
+        let workers = vec![
+            worker("grpc://one:50051", Some(r#"["first"]"#)),
+            worker("grpc://two:50051", Some(r#"["first","second"]"#)),
+            worker("grpc://none:50051", None),
+        ];
+        workers[2].increment_load();
+        scope(true, async {
+            // The rows as the selection wrote them before: one object per
+            // candidate, read from the workers where the pick ran.
+            let observed: Vec<Value> = workers
+                .iter()
+                .map(|worker| {
+                    let epochs = if worker.cache_trace_epochs_valid() {
+                        worker.advertised_cache_trace_epochs()
+                    } else {
+                        Vec::new()
+                    };
+                    let epoch = if epochs.len() == 1 {
+                        epochs.first()
+                    } else {
+                        None
+                    };
+                    json!({
+                        "worker": worker.redacted_url(), "load": worker.load(), "healthy": worker.is_healthy(),
+                        "overloaded": worker.is_overloaded(), "registry_revision": worker.revision(),
+                        "backend_cache_epoch": epoch,
+                        "backend_cache_epochs": epochs,
+                        "backend_cache_epoch_source": "registration_metadata",
+                    })
+                })
+                .collect();
+            assert_eq!(observed[0]["backend_cache_epoch"], "first");
+            assert_ne!(observed[0]["registry_revision"], 41);
+            assert_eq!(observed[1]["healthy"], true);
+            assert_eq!(observed[2]["load"], 1);
+            begin_selection(&workers);
+            prediction(json!({"source": "approximate_tree", "overlap_blocks": 4}));
+            score(json!({"worker": "grpc://two:50051", "score": 0.9}));
+            gate(json!({"spill": false}));
+            selection("cache_aware", "policy", &workers, Some(1));
+            // After the selection, before the evidence is written: a load
+            // credit, a revision raised, the overload flag, and a health
+            // failure, which also withdraws the epochs.
+            workers[0].increment_load();
+            workers[0].raise_revision_to(41);
+            workers[1].set_overloaded(true);
+            workers[1].set_status(WorkerStatus::NotReady);
+            assert_eq!(workers[0].revision(), 41);
+            assert!(workers[1].is_overloaded());
+            assert!(!workers[1].is_healthy());
+            assert!(!workers[1].cache_trace_epochs_valid());
+            let rows = captured_selections();
+            let row = &rows[0];
+            let expected = json!({
+                "policy": "cache_aware", "origin": "policy",
+                "worker": "grpc://two:50051",
+                "prediction": {"source": "approximate_tree", "overlap_blocks": 4},
+                "candidates": observed,
+                "candidates_complete": true,
+                "observation_started_ns": row["observation_started_ns"],
+                "observation_finished_ns": row["observation_finished_ns"],
+                "snapshot_atomic": false,
+                "scores": [{"worker": "grpc://two:50051", "score": 0.9}],
+                "load_source": "router_inflight", "eligibility_scope": "policy_candidates",
+                "load_observation_phase": "before_selection",
+                "gates": [{"spill": false}],
+            });
+            assert_eq!(*row, expected);
+            assert_eq!(row.to_string(), expected.to_string());
+        })
+        .await;
+    }
+
+    /// A row with no worker (a shed, a refused commit) stays in the capture
+    /// in pick order: the failure line writes it and leaves it, and the
+    /// dispatch that follows a re-decision writes it before the row of the
+    /// pick that held.
+    #[tokio::test]
+    async fn a_row_without_a_worker_is_written_in_pick_order_by_the_failure_and_the_dispatch() {
+        use crate::worker::BasicWorkerBuilder;
+        let workers: Vec<Arc<dyn Worker>> = ["grpc://one:50051", "grpc://two:50051"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        scope(true, async {
+            begin_selection(&workers);
+            selection("round_robin", "policy", &workers, None);
+            let failed =
+                CAPTURE.with(|capture| failure_evidence(&capture.borrow(), Some("root"), 503));
+            assert_eq!(failed["status"], 503);
+            assert_eq!(failed["selections"].as_array().map(Vec::len), Some(1));
+            assert!(failed["selections"][0]["worker"].is_null());
+            assert_eq!(
+                failed["selections"][0]["candidates"][1]["worker"],
+                "grpc://two:50051"
+            );
+            begin_selection(&workers[1..]);
+            selection("round_robin", "policy", &workers[1..], Some(0));
+            let rows = captured_selections();
+            assert_eq!(rows.len(), 2, "the failure line left the first row");
+            assert!(rows[0]["worker"].is_null());
+            assert_eq!(rows[0]["candidates"].as_array().map(Vec::len), Some(2));
+            assert_eq!(rows[1]["worker"], "grpc://two:50051");
+            assert_eq!(rows[1]["candidates"].as_array().map(Vec::len), Some(1));
+            let header = dispatch(Some("root"), 1, vec!["engine".into()], true, "regular")
+                .expect("the header for the request that asked");
+            let header: Value = serde_json::from_str(&header).unwrap();
+            assert!(header["selections"][0]["worker"].is_null());
+            assert_eq!(header["selections"][1]["worker"], "grpc://two:50051");
+            assert!(captured_selections().is_empty(), "the dispatch took them");
+        })
+        .await;
+    }
+
+    /// A selection observes 32 candidates at most and says whether that was
+    /// all of them; a pick beyond the 32 observed is still named.
+    #[tokio::test]
+    async fn a_row_observes_32_candidates_and_says_whether_that_was_all() {
+        use crate::worker::BasicWorkerBuilder;
+        let workers: Vec<Arc<dyn Worker>> = (0..33)
+            .map(|i| {
+                Arc::new(BasicWorkerBuilder::new(format!("grpc://w{i}:50051")).build())
+                    as Arc<dyn Worker>
+            })
+            .collect();
+        scope(true, async {
+            begin_selection(&workers[..32]);
+            selection("round_robin", "policy", &workers[..32], Some(31));
+            begin_selection(&workers);
+            selection("round_robin", "policy", &workers, Some(32));
+            let rows = captured_selections();
+            assert_eq!(rows[0]["candidates"].as_array().map(Vec::len), Some(32));
+            assert_eq!(rows[0]["candidates_complete"], true);
+            assert_eq!(rows[0]["worker"], "grpc://w31:50051");
+            assert_eq!(rows[1]["candidates"].as_array().map(Vec::len), Some(32));
+            assert_eq!(rows[1]["candidates_complete"], false);
+            assert_eq!(rows[1]["candidates"][31]["worker"], "grpc://w31:50051");
+            assert_eq!(rows[1]["worker"], "grpc://w32:50051");
+        })
+        .await;
+    }
 
     #[test]
     fn candidate_observation_survives_dispatch_load_credit() {
@@ -421,7 +675,7 @@ mod tests {
         let mut capture = Capture::default();
         capture.observe_candidates(&workers);
         workers[0].increment_load();
-        assert_eq!(capture.candidates[0]["load"], json!(0));
+        assert_eq!(first_candidate(&capture)["load"], json!(0));
         assert_eq!(workers[0].load(), 1);
         assert!(capture.candidates_complete);
         assert!(capture.observation_started_ns <= capture.observation_finished_ns);
@@ -443,15 +697,15 @@ mod tests {
         let mut capture = Capture::default();
         capture.observe_candidates(std::slice::from_ref(&worker));
         assert_eq!(
-            capture.candidates[0]["backend_cache_epochs"],
+            first_candidate(&capture)["backend_cache_epochs"],
             json!(["one", "two"])
         );
-        assert!(capture.candidates[0]["backend_cache_epoch"].is_null());
+        assert!(first_candidate(&capture)["backend_cache_epoch"].is_null());
         worker.set_status(WorkerStatus::NotReady);
         worker.set_status(WorkerStatus::Ready);
         capture.observe_candidates(&[worker]);
-        assert_eq!(capture.candidates[0]["backend_cache_epochs"], json!([]));
-        assert!(capture.candidates[0]["backend_cache_epoch"].is_null());
+        assert_eq!(first_candidate(&capture)["backend_cache_epochs"], json!([]));
+        assert!(first_candidate(&capture)["backend_cache_epoch"].is_null());
     }
 
     #[test]
