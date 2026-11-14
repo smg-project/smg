@@ -5,7 +5,6 @@ use std::{
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
-use smg_policy_controller::spec::DENIED_HEADERS;
 use tokio::sync::Semaphore;
 
 use super::*;
@@ -15,6 +14,20 @@ use crate::{
     tenant::MAX_TENANT_ID_LEN,
     worker::{endpoint::Endpoint, ConnectionMode},
 };
+
+/// The credential header names `routing_key_override.headers` may not carry
+/// (see [`ConfigValidator::validate_routing_key_headers`]). The policy
+/// controller crate refuses the same names in a specification's header
+/// lists.
+const DENIED_HEADERS: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -721,9 +734,8 @@ impl ConfigValidator {
     /// a thread turn's client lineage goes out under the first configured
     /// name, and the provider paths forward a request's `Authorization` over
     /// the worker's own key, so a credential name there sends a lineage as a
-    /// credential and the upstream refuses the turn. The names on the policy
-    /// contracts' header deny-list are refused at load by name, under both
-    /// policy engines, ahead of the engine build.
+    /// credential and the upstream refuses the turn. The names of
+    /// [`DENIED_HEADERS`] are refused at load by name.
     fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
         for name in &config.routing_key_override.headers {
             HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
@@ -3683,6 +3695,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The deny-list by name: a name dropped from it would be taken as a
+    /// routing-key header with no case above turning red.
+    #[test]
+    fn the_denied_routing_key_headers_are_the_seven_credential_names() {
+        assert_eq!(
+            DENIED_HEADERS,
+            [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key",
+                "api-key",
+                "x-goog-api-key",
+            ]
+        );
     }
 
     #[test]
