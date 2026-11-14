@@ -268,6 +268,8 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-01 | [userlm-2.0](https://github.com/smg-project/bellwether/tree/main/fixtures/userlm-2.0) | microsoft/UserLM-2.0 |  | `plain` | — | awaiting fixtures | none |
 | 2026-09-30 | [mistral-large-4-1t-a52b](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-large-4-1t-a52b) | mistralai/Mistral-Large-4-1T-A52B | Mistral-Large-4-1T-A52B-NVFP4 | `mistral_v13` | 28 | replaying the set | `mistral`, none |
 | 2026-09-29 | [arex-2](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-2) | BAAI/AREX-2 |  | `qwen3`, tagged calls | 474,563 | replaying the set | none |
+| 2026-09-29 | [jais-3-32b-fp8](https://github.com/smg-project/bellwether/tree/main/fixtures/jais-3-32b-fp8) | IFM/Jais-3-32B-FP8 | Jais-3-3.7B-FP8, Jais-3-375B-A23B-FP8, Jais-3-7B-FP8 | `k2_horizon` | 8 | replaying the set | none |
+| 2026-09-29 | [jais-3-mova-36b-a4b-fp8](https://github.com/smg-project/bellwether/tree/main/fixtures/jais-3-mova-36b-a4b-fp8) | IFM/Jais-3-MoVA-36B-A4B-FP8 |  | `k2_horizon` | 8 | replaying the set | none |
 | 2026-09-28 | [iquest-q1](https://github.com/smg-project/bellwether/tree/main/fixtures/iquest-q1) | IQuestLab/IQuest-Q1 |  | `iquest` | 503,285 | replaying the set | none |
 | 2026-09-24 | [huatuogpt-3-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/huatuogpt-3-27b) | FreedomIntelligence/HuatuoGPT-3-27B |  | `qwen3`, tagged calls | 474,563 | replaying the set | none |
 | 2026-09-23 | [midashenglm-spatial](https://github.com/smg-project/bellwether/tree/main/fixtures/midashenglm-spatial) | mispeech/midashenglm-spatial |  | `plain` | 5 | replaying the set | `json`, none |

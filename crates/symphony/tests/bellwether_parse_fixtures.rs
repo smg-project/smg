@@ -437,6 +437,17 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // assistant turn without a thinking field, so bellwether records five of its sixteen common
     // cases, the reasoning ones and the thinking-on call.
     ("k2-horizon-36b", GenerationPrompt::AlwaysOpensTheThought),
+    // The Jais 3 line (two groups: the dense checkpoints under the 32B, the MoVA one on its own
+    // tokenizer) writes K2-Horizon's shape on a template of its own: the thought opened by the
+    // prompt whatever `enable_thinking` says (`reasoning_effort` picks the tag, `<ifm|think>` by
+    // default, as K2-Horizon's), the calls in the block; its render set lacks every case
+    // with an assistant turn in the history but the one carrying reasoning content, and each
+    // parse set holds the thinking-on call, the reasoning cases and three turn shapes.
+    ("jais-3-32b-fp8", GenerationPrompt::AlwaysOpensTheThought),
+    (
+        "jais-3-mova-36b-a4b-fp8",
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     ("iquest-q1", GenerationPrompt::OpensTheThought),
     // Content and nothing else: templates without a thought or a call syntax, whose parse sets
     // hold content alone.
