@@ -1,0 +1,158 @@
+/// smg:policy, the WebAssembly world of the policy controller's user plugins
+/// (design 4.5 and appendix B). The records mirror the engine crate's view,
+/// decision and lifecycle types field for field and in the same order, less
+/// the fields the host keeps for itself (a candidate's position and sample
+/// instant, a request's host clock, a lease's issue instant and session
+/// verdict); a crate test holds the two together.
+///
+/// Versioning: the package carries the world version. Within a published 1.x
+/// no type or signature changes (the component model types a record by its
+/// exact shape): a 1.y release adds host functions, interfaces or worlds a
+/// module may leave unused, a module's extra exports are ignored, and a
+/// changed shape is a new type or the next major. The world is pre-release
+/// until the first shipped release that carries it; the rule binds from then
+/// on. The loader's error names the module's version and the accepted range.
+///
+/// Sandbox (design 4.5): no WASI, the only imports are `host` below. One
+/// instance per module per shard thread, created at apply and kept; the call
+/// runs under fuel metering with a memory cap. A trap, an exhausted budget or
+/// a decline falls back to the configured stage; a trap or an exhausted
+/// budget re-instantiates the instance, a decline keeps it.
+
+package smg:policy@1.0.0;
+
+/// The view (design 4.1) and the lifecycle (4.3) as the guest sees them.
+{{types}}
+
+/// What the host lends a plugin: a rate-limited log line with a level cap,
+/// the host's clock, counters over the ids the spec declared
+/// (`plugins[].metrics`), and a draw from the decision's seed, so a decision
+/// replays from its trace. `now-micros` is the decision's instant inside
+/// `filter`, `score` and `pick` (fixed for the decision, supplied again by a
+/// replay) and the live clock inside `observe`; its origin is the host's, so
+/// only differences mean anything.
+interface host {
+  log: func(level: u8, msg: string);
+  now-micros: func() -> u64;
+  counter: func(id: u32, by: u64);
+  random-u64: func() -> u64;
+}
+
+/// The record form. One `decision` resource per decision per module: the
+/// host constructs it once, calls the stages it asked for, drops it. Validity
+/// rules, enforced by the host (a violation is a trap): `filter` returns
+/// positions unique and in range; `score` one finite value per candidate,
+/// clamped to 0..1 by the host (a NaN is a trap); `pick` a position within
+/// the surviving set the host passes back through `scores` (a score below
+/// zero marks a filtered-out row). `init` failure fails the whole apply.
+interface plugin {
+  use types.{request, candidate, pool, decline, lifecycle-event};
+
+  /// Once per instance with `plugins[].config`.
+  init: func(config: list<u8>) -> result<_, string>;
+
+  resource decision {
+    constructor(req: request, cands: list<candidate>, pool: pool);
+    /// Surviving positions.
+    filter: func() -> result<list<u32>, decline>;
+    /// One score per candidate, finite, 0..1.
+    score: func() -> result<list<f32>, decline>;
+    /// A position within the surviving set, or none to decline the pick.
+    pick: func(scores: list<f32>) -> result<option<u32>, decline>;
+  }
+
+  observe: func(event: lifecycle-event);
+}
+
+/// The packed form: the same view written once into guest memory as
+/// little-endian rows the module keeps between the stage calls.
+///
+/// Candidate row, 104 bytes, offsets in bytes:
+///   0 id u64; 8 in-flight u32; 12 running u32; 16 queued u32;
+///   20 waiting-uncached-tokens u32; 24 overlap-blocks u32;
+///   28 predicted-blocks u32; 32 resident-tokens u32; 36 pair-class u32;
+///   40 admitted-age-ms u32; 44 report-age-ms u32; 48 indexed-growth u32;
+///   52 live-rate u32; 56 max-running u32; 60 kv-usage-permille u16;
+///   62 active-kv-permille u16; 64 dp-rank u16; 66 dp-size u16; 68 zone u16;
+///   70 engine-kind u16; 72 connector u16; 74 session-in-flight u16;
+///   76 health u8 (flag bits as in `types.health`); 77 wire-modes u8;
+///   78 role u8 (0 single, 1 prefill, 2 decode, 3 encode); 79 source u8
+///   (0 none, 1 events, 2 scrape, 3 relay, 4 poll); 80 bits u8 (bit 0
+///   session-hit, 1 has-capacity, 2 has-room, 3 ec-compatible, 4 vision,
+///   5 host-local, 6 load-present); 81 zero; 82 active-sessions u16;
+///   84 key u32; 88 labels u64; 96 indexed-blocks u32; 100 zero (the next
+///   row's u64 at 104).
+/// Request block: an 80-byte header, then the variable sections in the order
+/// below (the header carries their counts, not offsets: a reader walks the
+/// sections in order), offsets relative to the block's start:
+///   0 namespace-seed u64; 8 seed u64; 16 tenant u64; 24 session-key u64
+///   (the key's fingerprint in both the hash and the plain form: 64-bit
+///   FNV-1a over the key's bytes, offset basis 0xcbf29ce484222325, prime
+///   0x100000001b3, a zero result mapped to 1, so 0 is `none`; under `plain`
+///   the string follows in its section and bit 1 or 2 says so);
+///   32 budget-micros u32;
+///   36 prompt-tokens u32; 40 max-output-tokens u32; 44 priority s32;
+///   48 hash-count u16; 50 tried-count u16; 52 header-count u16;
+///   54 model-len u16; 56 phase u8 (0 single, 1 prefill, 2 decode,
+///   3 encode); 57 hash-kind u8 (0 token, 1 text); 58 attempt u8;
+///   59 bits u8 (bit 0 streaming, 1 tenant-plain-present,
+///   2 session-plain-present); 60 media-images u16; 62 media-audio u16;
+///   64 media-video u16; 66 zero; 68 media-bytes u32; 72 block-size u32;
+///   76 zero;
+///   then: model bytes (UTF-8), zero bytes to the next multiple of 8 from
+///   the block's start, block hashes u64 x hash-count, tried u64 x
+///   tried-count (both 8-byte aligned for any name length: a 12-byte name
+///   puts the hashes at 96), headers as (u8 name, zero-based, u16 len, bytes) x
+///   header-count, the plain tenant and session key as (u16 len, bytes)
+///   when present. The host passes the block's total length; a module reads
+///   nothing past it. The three counts are bounded by the engine's caps, far
+///   below u16: hash-count by the spec's `view.max_block_hashes` (default
+///   256; the view holds the first N hashes in every form, record and packed
+///   alike), header-count by the allow-list (at most 256 names), tried-count
+///   by the attempt counter (u8) times the four targets of a decision; a spec
+///   whose cap exceeds 65,535 is refused at apply when a packed plugin is
+///   configured, never a truncated block. The string lengths are u16 as
+///   well: a request whose model name, header value or plain identity
+///   exceeds 65,535 bytes is not packed; the host skips the packed plugin
+///   for that decision (its stages take their fallbacks, as for a
+///   `not-applicable` decline) and the record form carries the request
+///   unchanged.
+/// Pool block, 40 bytes then the zone rows, offsets relative to its start:
+///   0 pool-size u32; 4 regime u8 (0 none, 1 partial, 2 saturated); 5 to 7
+///   zero; 8 membership-epoch u64; 16 ring-epoch u64; 24 generation u64;
+///   32 zone-count u16; 34 to 39 zero; then zone-count rows of 12 bytes:
+///   0 zone u16; 2 zero; 4 healthy u32; 8 total u32.
+/// Every block starts 8-byte aligned in guest memory: a packed-form guest's
+/// `cabi_realloc` returns 8-aligned memory for these lists, or the guest
+/// reads the u64 and u32 fields with unaligned little-endian loads.
+/// The three blocks together are the record world's view: nothing the
+/// record form passes is left out of the packed one.
+interface plugin-packed {
+  use types.{decline, lifecycle-event};
+
+  init: func(config: list<u8>) -> result<_, string>;
+
+  resource decision {
+    /// `request` is one request block; `candidates` is `count` rows of
+    /// 104 bytes; `pool` is one pool block.
+    constructor(request: list<u8>, candidates: list<u8>, count: u32, pool: list<u8>);
+    filter: func() -> result<list<u32>, decline>;
+    score: func() -> result<list<f32>, decline>;
+    pick: func(scores: list<f32>) -> result<option<u32>, decline>;
+  }
+
+  observe: func(event: lifecycle-event);
+}
+
+/// The world a record-form module targets.
+world policy {
+  import host;
+  export plugin;
+}
+
+/// The world a packed-form module targets. The engine accepts either world
+/// and reads the module's exports to tell them apart.
+world policy-packed {
+  import host;
+  export plugin-packed;
+}

@@ -550,7 +550,7 @@ fn is_mp3_frame_sync(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::MediaFault;
+    use crate::error::{MediaErrorCode, MediaFault};
 
     /// A 16-bit PCM WAV whose `fmt ` chunk says what the caller asks: the
     /// sample rate and channel count as given, the byte rate and block align
@@ -622,7 +622,7 @@ mod tests {
         // The size refusal keeps its code through the decoder's mapping, on the symphonia path
         // here and on the ffmpeg path, which maps its own check the same way.
         let refused = audio_decode(error);
-        assert_eq!(refused.code(), crate::error::MediaErrorCode::TooLarge);
+        assert_eq!(refused.code(), MediaErrorCode::TooLarge);
         assert_eq!(
             refused.to_string(),
             "decoded audio payload would be 12 bytes, exceeding SMG_AUDIO_MAX_DECODED_BYTES=8"
@@ -668,7 +668,7 @@ mod tests {
                 "{refused}"
             );
             assert_eq!(refused.fault(), MediaFault::Client);
-            assert_eq!(refused.code(), crate::error::MediaErrorCode::InvalidRequest);
+            assert_eq!(refused.code(), MediaErrorCode::InvalidRequest);
         }
         for rate in [705_600_u32, 768_000, 2_822_400, 67_108_864] {
             let decoded = decode_audio_mono_f32_symphonia(Bytes::from(wav_i16(rate, 1, &[0; 480])))

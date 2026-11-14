@@ -46,3 +46,24 @@ spec:
     - port: metrics
       interval: {{ .Values.router.metrics.serviceMonitor.interval }}
 {{- end }}
+{{- /* The policy controller's ServiceMonitor, under the same switch and
+settings: its Service's `metrics` port is the admin listener. */ -}}
+{{- if and .Values.router.metrics.serviceMonitor.enabled (.Values.policyController).enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    {{- range $key, $value := .Values.router.metrics.serviceMonitor.labels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "smg.policyControllerSelectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.router.metrics.serviceMonitor.interval }}
+{{- end }}
