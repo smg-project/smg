@@ -95,11 +95,17 @@ impl PoolKey {
 #[derive(Clone)]
 pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
+    /// Why this connection's tool listing failed; `None` once a listing
+    /// succeeded. It leaves the pool with the connection.
+    pub list_error: Option<String>,
 }
 
 impl CachedConnection {
     pub fn new(client: Arc<McpClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            list_error: None,
+        }
     }
 }
 
@@ -246,6 +252,37 @@ impl McpConnectionPool {
             total_connections: self.connection_count.load(Ordering::Relaxed),
             capacity: self.max_connections,
         }
+    }
+
+    /// Record the outcome of a connection's tool listing: the failure's
+    /// message, or `None` for a listing that succeeded. A key the pool no
+    /// longer holds is left alone.
+    pub fn set_list_error(&self, key: &PoolKey, error: Option<String>) {
+        if let Some(cached) = self.connections.lock().peek_mut(key) {
+            cached.list_error = error;
+        }
+    }
+
+    /// The listing failure reported for `url`: `None` as soon as one of the
+    /// connections to it listed its tools (the inventory holds them), else the
+    /// most recently used connection's failure; `None` with no connection.
+    pub fn list_error_by_url(&self, url: &str) -> Option<String> {
+        let connections = self.connections.lock();
+        let mut failure = None;
+        for (key, cached) in connections.iter() {
+            if key.url != url {
+                continue;
+            }
+            match &cached.list_error {
+                None => return None,
+                Some(message) => {
+                    if failure.is_none() {
+                        failure = Some(message.clone());
+                    }
+                }
+            }
+        }
+        failure
     }
 
     pub fn list_keys(&self) -> Vec<PoolKey> {

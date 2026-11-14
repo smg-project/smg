@@ -518,16 +518,22 @@ mod tests {
         )
     }
 
-    /// A local MCP server over HTTP that initializes but answers `tools/list`
-    /// with a JSON-RPC error; the URL it serves on.
-    async fn serve_a_server_whose_listing_fails() -> String {
+    /// A local MCP server over HTTP that initializes and answers `tools/list`
+    /// with `tools` (each with an empty schema), or with a JSON-RPC error when
+    /// `tools` is `None`; the URL it serves on.
+    async fn serve_local_mcp_server(tools: Option<&'static [&'static str]>) -> String {
         use axum::{
+            extract::State,
             http::{HeaderMap, StatusCode},
             routing::post,
             Json, Router,
         };
 
-        async fn mcp(_headers: HeaderMap, Json(message): Json<Value>) -> axum::response::Response {
+        async fn mcp(
+            State(tools): State<Option<&'static [&'static str]>>,
+            _headers: HeaderMap,
+            Json(message): Json<Value>,
+        ) -> axum::response::Response {
             use axum::response::IntoResponse;
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             match message.get("method").and_then(Value::as_str) {
@@ -540,11 +546,22 @@ mod tests {
                     }
                 }))
                 .into_response(),
-                Some("tools/list") => Json(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32603, "message": "tools/list refused by the server"}
-                }))
-                .into_response(),
+                Some("tools/list") => match tools {
+                    Some(names) => Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"tools": names.iter().map(|name| json!({
+                            "name": name,
+                            "description": format!("the {name} tool"),
+                            "inputSchema": {"type": "object", "properties": {}}
+                        })).collect::<Vec<_>>()}
+                    }))
+                    .into_response(),
+                    None => Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32603, "message": "tools/list refused by the server"}
+                    }))
+                    .into_response(),
+                },
                 Some(method) if method.starts_with("notifications/") => {
                     StatusCode::ACCEPTED.into_response()
                 }
@@ -565,9 +582,12 @@ mod tests {
             reason = "a test server that lives as long as the test's runtime; nothing waits for it"
         )]
         tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/mcp", post(mcp)))
-                .await
-                .expect("the local MCP server serves");
+            axum::serve(
+                listener,
+                Router::new().route("/mcp", post(mcp)).with_state(tools),
+            )
+            .await
+            .expect("the local MCP server serves");
         });
         format!("http://127.0.0.1:{port}/mcp")
     }
@@ -580,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_tools_list_is_the_list_items_error() {
         let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-        let url = serve_a_server_whose_listing_fails().await;
+        let url = serve_local_mcp_server(None).await;
         let inputs = [McpServerInput {
             label: "conf".to_string(),
             url: Some(url),
@@ -610,6 +630,59 @@ mod tests {
         let json = openai_bridge::mcp_list_tools_json(&session, "conf", &server_key);
         assert_eq!(json["error"].as_str(), Some(error));
         assert_eq!(json["tools"], json!([]));
+    }
+
+    /// A listing failure leaves with its connection: with a pool of one, the
+    /// second server's connect evicts the first, and the first's failure is
+    /// no longer the list item's error for its URL (nothing is keyed by the
+    /// URL alone). The read goes through the item builder, as a request's
+    /// does.
+    #[tokio::test]
+    async fn a_listing_failure_leaves_with_its_connection() {
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 1;
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        let format_registry = FormatRegistry::new();
+        let refusing = serve_local_mcp_server(None).await;
+        let listing = serve_local_mcp_server(Some(&["echo"])).await;
+        let input = |label: &str, url: &str| McpServerInput {
+            label: label.to_string(),
+            url: Some(url.to_string()),
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        let item_error = |bindings: Vec<McpServerBinding>, label: &str| {
+            let server_key = bindings
+                .iter()
+                .find(|binding| binding.label == label)
+                .expect("the label is bound")
+                .server_key
+                .clone();
+            let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+            openai_bridge::mcp_list_tools_json(&session, label, &server_key)
+                .get("error")
+                .cloned()
+        };
+
+        let first =
+            connect_mcp_servers(&orchestrator, &format_registry, &[input("a", &refusing)]).await;
+        assert_eq!(first.len(), 1);
+        assert!(
+            item_error(first.clone(), "a").is_some_and(|error| error.is_string()),
+            "the failure stands while its connection is pooled"
+        );
+
+        let second =
+            connect_mcp_servers(&orchestrator, &format_registry, &[input("b", &listing)]).await;
+        assert_eq!(second.len(), 1);
+        let bindings = [first, second].concat();
+        assert_eq!(item_error(bindings.clone(), "b"), None);
+        assert_eq!(
+            item_error(bindings, "a"),
+            None,
+            "the evicted connection took its failure with it"
+        );
     }
 
     /// A server URL of a scheme the connector does not take is refused with

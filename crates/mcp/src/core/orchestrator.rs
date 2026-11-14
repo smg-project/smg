@@ -353,6 +353,9 @@ struct ServerEntry {
     client: Arc<McpClientWithHandler>,
     handler: Arc<SmgClientHandler>,
     config: McpServerConfig,
+    /// Why the server's tool listing failed; `None` once a listing succeeded
+    /// (the first load, a refresh).
+    list_error: Option<String>,
 }
 
 /// Internal result type for approval-checked execution.
@@ -675,7 +678,7 @@ impl McpOrchestrator {
         self.tool_inventory.clear_server_tools(&config.name);
 
         // Load tools from server
-        self.load_server_inventory(&config.name, &client).await;
+        let list_error = self.load_server_inventory(&config.name, &client).await;
 
         self.apply_tool_configs(config);
 
@@ -686,6 +689,7 @@ impl McpOrchestrator {
                 client,
                 handler,
                 config: config.clone(),
+                list_error,
             },
         );
 
@@ -755,23 +759,29 @@ impl McpOrchestrator {
         }
     }
 
-    /// Load tools, prompts, and resources from a server into the inventory.
-    async fn load_server_inventory(&self, server_key: &str, client: &Arc<McpClientWithHandler>) {
-        match tools_of(client.as_ref(), server_key, ToolCategory::Static).await {
+    /// Load tools, prompts, and resources from a server into the inventory;
+    /// the tool listing's failure when it failed (the server's entry keeps it).
+    async fn load_server_inventory(
+        &self,
+        server_key: &str,
+        client: &Arc<McpClientWithHandler>,
+    ) -> Option<String> {
+        let list_error = match tools_of(client.as_ref(), server_key, ToolCategory::Static).await {
             Ok(entries) => {
-                self.tool_inventory.clear_list_error(server_key);
                 for entry in entries {
                     self.tool_inventory.insert_entry(entry);
                 }
+                None
             }
-            Err(message) => self.tool_inventory.set_list_error(server_key, message),
-        }
+            Err(message) => Some(message),
+        };
         if let Some(prompts) = prompts_of(client.as_ref(), server_key).await {
             install_prompts(&self.tool_inventory, server_key, prompts);
         }
         if let Some(resources) = resources_of(client.as_ref(), server_key).await {
             install_resources(&self.tool_inventory, server_key, resources);
         }
+        list_error
     }
 
     /// Spawn background handler for inventory refresh requests.
@@ -813,18 +823,17 @@ impl McpOrchestrator {
                             // does: the tools, then the config's aliases and
                             // argument mappings.
                             let key = request.server_key.as_str();
-                            let tools =
-                                match tools_of(client.as_ref(), key, ToolCategory::Static).await {
-                                    Ok(tools) => tools,
-                                    Err(message) => {
-                                        tool_inventory.set_list_error(key, message);
-                                        continue;
-                                    }
-                                };
+                            let Ok(tools) =
+                                tools_of(client.as_ref(), key, ToolCategory::Static).await
+                            else {
+                                continue;
+                            };
                             let prompts = prompts_of(client.as_ref(), key).await;
                             let resources = resources_of(client.as_ref(), key).await;
                             tool_inventory.clear_server_tool_entries(key);
-                            tool_inventory.clear_list_error(key);
+                            if let Some(mut entry) = static_servers.get_mut(key) {
+                                entry.list_error = None;
+                            }
                             for entry in tools {
                                 tool_inventory.insert_entry(entry);
                             }
@@ -1670,7 +1679,7 @@ impl McpOrchestrator {
 
         let client = self
             .connection_pool
-            .get_or_create(pool_key, config.clone(), |cfg, _proxy| async move {
+            .get_or_create(pool_key.clone(), config.clone(), |cfg, _proxy| async move {
                 match &cfg.transport {
                     McpTransport::Streamable {
                         url,
@@ -1698,16 +1707,18 @@ impl McpOrchestrator {
             })
             .await?;
 
-        // Pooled connections are keyed by URL.
-        match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
+        // The tools go to the inventory by URL; the listing's outcome stays
+        // with this connection (its pool key), not with the URL.
+        let list_error = match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
             Ok(entries) => {
-                inventory_clone.clear_list_error(&server_key);
                 for entry in entries {
                     inventory_clone.insert_entry(entry);
                 }
+                None
             }
-            Err(message) => inventory_clone.set_list_error(&server_key, message),
-        }
+            Err(message) => Some(message),
+        };
+        self.connection_pool.set_list_error(&pool_key, list_error);
 
         self.metrics.record_connection_opened();
         Ok(server_key)
@@ -1776,9 +1787,15 @@ impl McpOrchestrator {
         Arc::clone(&self.tool_inventory)
     }
 
-    /// Why a server's tools could not be listed, when its last listing failed.
+    /// Why a server's tools could not be listed, when its last listing failed:
+    /// a static server's own entry, else the pooled connections to the URL
+    /// (`None` as soon as one of them listed; the record leaves with the
+    /// connection on eviction).
     pub fn list_error_for_server(&self, server_key: &str) -> Option<String> {
-        self.tool_inventory.list_error(server_key)
+        if let Some(entry) = self.static_servers.get(server_key) {
+            return entry.list_error.clone();
+        }
+        self.connection_pool.list_error_by_url(server_key)
     }
 
     /// Get the approval manager.

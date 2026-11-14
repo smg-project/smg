@@ -823,18 +823,17 @@ impl ResponseStreamEventEmitter {
         })
     }
 
+    /// The failure itself is on the done item (`error`), not on the event.
     pub fn emit_mcp_list_tools_failed(
         &mut self,
         output_index: usize,
         item_id: &str,
-        error: &str,
     ) -> serde_json::Value {
         json!({
             "type": McpEvent::LIST_TOOLS_FAILED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
-            "item_id": item_id,
-            "error": error
+            "item_id": item_id
         })
     }
 
@@ -1917,9 +1916,9 @@ impl ResponseStreamEventEmitter {
     /// over multiple MCP servers without mutating the emitter's own label.
     /// The list-tools item's events: `output_item.added`, `in_progress`, then
     /// `completed` with the tools or, when the server's listing failed
-    /// (`error`), `failed` with the failure, and `output_item.done` with the
-    /// item as the completed response carries it (the error on it); every
-    /// event carries the item's id.
+    /// (`error`), `failed`, and `output_item.done` with the item as the
+    /// completed response carries it (the error on it); every event carries
+    /// the item's id.
     pub async fn emit_mcp_list_tools_sequence(
         &mut self,
         server_label: &str,
@@ -1953,9 +1952,10 @@ impl ResponseStreamEventEmitter {
         self.send_event(&event, tx).await?;
 
         // Emit mcp_list_tools.completed, or .failed when the listing failed
-        let event = match error {
-            Some(error) => self.emit_mcp_list_tools_failed(output_index, &item_id, error),
-            None => self.emit_mcp_list_tools_completed(output_index, &item_id, &tool_items),
+        let event = if error.is_some() {
+            self.emit_mcp_list_tools_failed(output_index, &item_id)
+        } else {
+            self.emit_mcp_list_tools_completed(output_index, &item_id, &tool_items)
         };
         self.send_event(&event, tx).await?;
 
@@ -2144,9 +2144,9 @@ mod tests {
     }
 
     /// A server whose listing failed streams its list item as `added`,
-    /// `mcp_list_tools.in_progress`, `mcp_list_tools.failed` with the failure,
-    /// then `output_item.done` whose item carries the error and no tools;
-    /// a listed server streams `completed` and an item without an error.
+    /// `mcp_list_tools.in_progress`, `mcp_list_tools.failed`, then
+    /// `output_item.done` whose item carries the error and no tools; a
+    /// listed server streams `completed` and an item without an error.
     #[tokio::test]
     async fn a_failed_listing_streams_the_failed_event_and_the_items_error() {
         let failed =
@@ -2163,7 +2163,7 @@ mod tests {
                 "response.output_item.done",
             ]
         );
-        assert_eq!(failed[2]["error"], "Mcp error: -32603: tools/list refused");
+        assert_eq!(failed[2].get("error"), None, "the failure is on the item");
         assert_eq!(failed[2]["output_index"], 0);
         let item = &failed[3]["item"];
         assert_eq!(item["type"], "mcp_list_tools");
