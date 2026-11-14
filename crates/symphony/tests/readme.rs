@@ -1181,6 +1181,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "glm5.3-flash-e192-dgx-spark",
+        model: "autotrust/GLM5.3-Flash-E192-DGX-Spark",
+        also: &[],
+        released: "2026-10-09",
+        smg: (None, None),
+        table: Some(Table::Glm),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "granite-4.1-3b",
         model: "ibm-granite/granite-4.1-3b",
         also: &["granite-4.1-30b"],
