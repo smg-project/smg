@@ -201,6 +201,7 @@ def _evidence_identity(tmp_path, inputs, attempt="1"):
             **INTERPRETER_ENV,
             "PATH": str(binary),
             "EVIDENCE_INPUTS": json.dumps(inputs),
+            "GITHUB_RUN_ID": "43532195044",
             "GITHUB_RUN_ATTEMPT": attempt,
             "GITHUB_OUTPUT": str(output),
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -212,10 +213,11 @@ def _evidence_identity(tmp_path, inputs, attempt="1"):
     )
     assert result.returncode == 0, result.stderr
     fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert set(fields) == {"complete_artifact", "worker_artifact"}
+    assert set(fields) == {"complete_artifact", "worker_artifact", "junit_artifact"}
     complete = fields["complete_artifact"].removeprefix("sglang-complete-results-")
     worker = fields["worker_artifact"].removeprefix("e2e-worker-logs-")
-    assert complete == worker
+    junit = fields["junit_artifact"].removeprefix("e2e-junit-43532195044-")
+    assert complete == worker == junit
     assert re.fullmatch(r"[A-Za-z0-9_.-]+", complete)
     contract, actual_attempt, unique = complete.rsplit("-", 2)
     assert actual_attempt == attempt
@@ -250,6 +252,24 @@ def test_evidence_artifacts_feed_only_their_uploads(tmp_path):
     ]
     assert "${{ steps.evidence-identity.outputs.complete_artifact }}" in uploads
     assert "${{ steps.log-snapshot.outputs.artifact }}" in uploads
+    assert "${{ steps.evidence-identity.outputs.junit_artifact }}" in uploads
+    ordinary_uploads = [
+        step for step in job["steps"] if step.get("name") == "Upload ordinary E2E JUnit report"
+    ]
+    assert len(ordinary_uploads) == 1
+    ordinary = ordinary_uploads[0]
+    assert ordinary["if"] == (
+        "always() && !inputs.final_environment_check && "
+        "(steps.e2e-tests.outcome == 'success' || steps.e2e-tests.outcome == 'failure' || "
+        "steps.e2e-tests.outcome == 'cancelled')"
+    )
+    assert ordinary.get("continue-on-error", False) is False
+    assert ordinary["with"] == {
+        "name": "${{ steps.evidence-identity.outputs.junit_artifact }}",
+        "path": "e2e-logs/e2e-results.xml",
+        "retention-days": 7,
+        "if-no-files-found": "error",
+    }
     snapshots = [step for step in job["steps"] if step.get("id") == "log-snapshot"]
     worker_uploads = [step for step in job["steps"] if step.get("id") == "upload-worker-logs"]
     assert len(snapshots) == len(worker_uploads) == 1
@@ -421,12 +441,10 @@ def test_evidence_attempt_and_source_looking_json_remain_data(tmp_path):
     assert not marker.exists()
 
 
-def test_evidence_identity_stays_inside_the_opt_in():
+def test_evidence_identity_metadata_is_always_available():
     step = _evidence_step()
-    assert step["if"] == (
-        "always() && inputs.final_environment_check && inputs.engine == 'sglang' "
-        "&& inputs.gpu_vendor == 'amd'"
-    )
+    # Metadata also names ordinary JUnit; native payloads remain opt-in above.
+    assert step["if"] == "always()"
     names = [step.get("name") for step in _document()["jobs"]["run"]["steps"]]
     assert names.index("Identify row evidence") < names.index("Check final AMD SGLang environment")
     assert names.index("Check final AMD SGLang environment") < names.index(
