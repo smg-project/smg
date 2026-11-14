@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main, release/** ]
     paths-ignore:
-      - "docs/**"
       - "*.md"
   pull_request:
     branches: [ main, release/** ]
@@ -1121,7 +1120,6 @@ jobs:
               # documentation, licences, assets, lint and format configuration
               ("**/*.md",                                        NONE),
               ("**/LICENSE",                                     NONE),
-              ("docs/**",                                        NONE),
               ("assets/**",                                      NONE),
               (".gitignore",                                     NONE),
               (".dockerignore",                                  NONE),
