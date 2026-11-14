@@ -15,7 +15,14 @@
 //! - `SelectWorkerInfo::rid_key`: the fallback session key derived from the
 //!   request body's `rid` (populated under `--routing-key-override`)
 
-use std::{borrow::Borrow, sync::Arc, time::Instant};
+use std::{
+    borrow::Borrow,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::RngExt;
@@ -119,6 +126,11 @@ impl Node {
 #[derive(Debug)]
 pub struct ManualPolicy {
     routing_map: Arc<DashMap<RoutingId, Node>>,
+    /// The map's entry count, kept where the map changes (a key it did not
+    /// hold, the idle eviction) and published to the size gauge from there:
+    /// `DashMap::len` locks and walks every shard, so a selection reads
+    /// nothing about the size.
+    entries: Arc<AtomicUsize>,
     assignment_mode: ManualAssignmentMode,
     _eviction_task: Option<PeriodicTask>,
 }
@@ -135,33 +147,19 @@ impl ManualPolicy {
     }
 
     pub fn with_config(config: ManualConfig) -> Self {
-        use std::time::Duration;
-
         let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
+        let entries = Arc::new(AtomicUsize::new(0));
 
         let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
             let routing_map_clone = Arc::clone(&routing_map);
+            let entries_clone = Arc::clone(&entries);
             let max_idle = Duration::from_secs(config.max_idle_secs);
 
             Some(PeriodicTask::spawn(
                 config.eviction_interval_secs,
                 "ManualPolicyEviction",
                 move || {
-                    let now = Instant::now();
-                    let before_size = routing_map_clone.len();
-
-                    routing_map_clone
-                        .retain(|_, node| now.duration_since(node.last_access) < max_idle);
-
-                    let evicted_count = before_size - routing_map_clone.len();
-                    if evicted_count > 0 {
-                        info!(
-                            "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
-                            evicted_count,
-                            routing_map_clone.len(),
-                            max_idle.as_secs()
-                        );
-                    }
+                    evict_idle(&routing_map_clone, &entries_clone, max_idle, Instant::now());
                 },
             ))
         } else {
@@ -170,9 +168,23 @@ impl ManualPolicy {
 
         Self {
             routing_map,
+            entries,
             assignment_mode: config.assignment_mode,
             _eviction_task: eviction_task,
         }
+    }
+
+    /// A key the map did not hold was inserted: the count and the size gauge
+    /// move here, not on the selection path.
+    fn note_new_entry(&self) {
+        let entries = self.entries.fetch_add(1, Ordering::Relaxed) + 1;
+        Metrics::set_manual_policy_cache_entries(entries);
+    }
+
+    /// The entry count as kept: what the size gauge shows.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.load(Ordering::Relaxed)
     }
 
     fn select_new_worker(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
@@ -187,10 +199,6 @@ impl ManualPolicy {
 
     pub(crate) fn assignment_mode(&self) -> ManualAssignmentMode {
         self.assignment_mode
-    }
-
-    pub(crate) fn map_len(&self) -> usize {
-        self.routing_map.len()
     }
 
     /// Probe the pin for `key` without reassigning: the first of its
@@ -238,6 +246,7 @@ impl ManualPolicy {
                     candi_worker_urls: vec![url.to_string()],
                     last_access: Instant::now(),
                 });
+                self.note_new_entry();
             }
         }
     }
@@ -292,6 +301,7 @@ impl ManualPolicy {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                     last_access: Instant::now(),
                 });
+                self.note_new_entry();
                 (selected_idx, ExecutionBranch::Vacant)
             }
         }
@@ -337,7 +347,6 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         Metrics::record_worker_manual_policy_branch(branch.as_str());
-        Metrics::set_manual_policy_cache_entries(self.routing_map.len());
         result
     }
 
@@ -348,6 +357,38 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// The idle eviction: every entry not used within `max_idle` of `now` leaves
+/// the map, the kept count and the size gauge follow by the number removed,
+/// and a pass that removed anything is logged. Returns that number.
+fn evict_idle(
+    routing_map: &DashMap<RoutingId, Node>,
+    entries: &AtomicUsize,
+    max_idle: Duration,
+    now: Instant,
+) -> usize {
+    let mut evicted = 0;
+    routing_map.retain(|_, node| {
+        let kept = now.duration_since(node.last_access) < max_idle;
+        if !kept {
+            evicted += 1;
+        }
+        kept
+    });
+    if evicted > 0 {
+        let remaining = entries
+            .fetch_sub(evicted, Ordering::Relaxed)
+            .saturating_sub(evicted);
+        Metrics::set_manual_policy_cache_entries(remaining);
+        info!(
+            "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
+            evicted,
+            remaining,
+            max_idle.as_secs()
+        );
+    }
+    evicted
 }
 
 /// The first of a pin's candidate URLs that is in `workers` and that
@@ -421,6 +462,7 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
 mod tests {
     use std::collections::HashMap;
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
@@ -844,6 +886,80 @@ mod tests {
         assert_eq!(config.max_idle_secs, 4 * 3600);
     }
 
+    /// The pin of the kept count: a selection publishes the map's size only
+    /// when it inserted a key; a hit records nothing about the size.
+    #[test]
+    fn a_selection_publishes_the_map_size_only_for_a_new_key() {
+        let policy = ManualPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = headers_with_routing_key("conv-1");
+        let info = with_headers(&headers);
+
+        let first = PrometheusBuilder::new().build_recorder();
+        let first_handle = first.handle();
+        ::metrics::with_local_recorder(&first, || {
+            policy.select_worker(&workers, &info);
+        });
+        assert!(
+            first_handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 1"),
+            "the new key sets the gauge to 1"
+        );
+
+        let hits = PrometheusBuilder::new().build_recorder();
+        let hits_handle = hits.handle();
+        ::metrics::with_local_recorder(&hits, || {
+            for _ in 0..3 {
+                policy.select_worker(&workers, &info);
+            }
+        });
+        assert!(
+            !hits_handle
+                .render()
+                .contains("smg_manual_policy_cache_entries"),
+            "a hit publishes nothing about the map's size"
+        );
+    }
+
+    #[test]
+    fn the_idle_eviction_takes_the_count_and_the_gauge_down_by_what_it_removed() {
+        let policy = ManualPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        for key in ["conv-1", "conv-2", "conv-3"] {
+            let headers = headers_with_routing_key(key);
+            policy.select_worker(&workers, &with_headers(&headers));
+        }
+        policy.pin_front("conv-1", "http://w2:8000");
+        assert_eq!(
+            policy.entry_count(),
+            3,
+            "a pin of a held key counts nothing"
+        );
+        policy.pin_front("conv-4", "http://w2:8000");
+        assert_eq!(policy.entry_count(), 4, "a pin of a new key counts it");
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let evicted = ::metrics::with_local_recorder(&recorder, || {
+            evict_idle(
+                &policy.routing_map,
+                &policy.entries,
+                Duration::ZERO,
+                Instant::now(),
+            )
+        });
+        assert_eq!(evicted, 4);
+        assert_eq!(policy.entry_count(), 0);
+        assert_eq!(policy.routing_map.len(), 0);
+        assert!(
+            handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 0"),
+            "the eviction publishes the count it left"
+        );
+    }
+
     #[test]
     fn test_manual_with_disabled_eviction() {
         let config = ManualConfig {
@@ -870,7 +986,7 @@ mod tests {
         let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
         assert!(access_after_vacant.elapsed().as_millis() < 100);
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
 
         // OccupiedHit: same worker still healthy
         let (_, branch) = policy.select_worker_impl(&workers, &info);
@@ -878,7 +994,7 @@ mod tests {
         let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
         assert!(access_after_hit > access_after_vacant);
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
 
         // OccupiedMiss: worker becomes unhealthy
         workers[first_idx].set_status(WorkerStatus::NotReady);
@@ -890,8 +1006,6 @@ mod tests {
 
     #[test]
     fn test_manual_ttl_eviction_logic() {
-        use std::time::Duration;
-
         let config = ManualConfig {
             eviction_interval_secs: 2,
             max_idle_secs: 2,
