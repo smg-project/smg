@@ -25,8 +25,8 @@ use tonic::Status;
 
 use crate::{
     kv_events::{
-        load_changed, unix_seconds, LoadFromState, RankLoads, DEFAULT_HEARTBEAT_BACKOFF,
-        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LOAD_TICK,
+        load_changed, unix_seconds, LoadFromState, LoadSource, RankLoads,
+        DEFAULT_HEARTBEAT_BACKOFF, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LOAD_TICK,
     },
     BoxStream,
 };
@@ -63,7 +63,7 @@ impl<S: RankLoads> RankedLoads for LoadFromState<S> {
     }
 
     fn rank_record(&self, rank: i32) -> Option<common::EngineLoad> {
-        crate::kv_events::LoadSource::load(self, Some(rank))
+        LoadSource::load(self, Some(rank))
     }
 }
 

@@ -240,7 +240,7 @@ mod tests {
     use openai_protocol::worker::ConnectionMode;
 
     use super::*;
-    use crate::{config::RouterConfig, worker::BasicWorkerBuilder};
+    use crate::{config::RouterConfig, server::http_client, worker::BasicWorkerBuilder};
 
     fn view_with(config: &RouterConfig, workers: Vec<Arc<dyn Worker>>) -> RegistryRlView {
         let registry = Arc::new(WorkerRegistry::new());
@@ -269,7 +269,7 @@ mod tests {
     /// for it (HTTP version, TLS identity, pool tuning), not a second one.
     #[test]
     fn http_worker_controls_itself_with_its_negotiated_client() {
-        let client = Arc::new(crate::server::http_client());
+        let client = Arc::new(http_client());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://engine:30000")
                 .connection_mode(ConnectionMode::Http)

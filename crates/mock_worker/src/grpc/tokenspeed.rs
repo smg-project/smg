@@ -644,12 +644,13 @@ fn logprobs(logprobs: LogProbs) -> ts::OutputLogProbs {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::watch;
     use tonic::Code;
 
     use super::*;
     use crate::config::{Config, SchedulerWire};
 
-    fn service(port: u16) -> (MockScheduler, tokio::sync::watch::Sender<bool>) {
+    fn service(port: u16) -> (MockScheduler, watch::Sender<bool>) {
         MockScheduler::for_tests(
             Config {
                 grpc_wire: SchedulerWire::TokenSpeed,
