@@ -182,8 +182,14 @@ impl Assembler {
         }
     }
 
-    /// The region closed by a marker: a table that puts the list between markers.
-    pub fn close(self, out: &mut Events) {
+    /// The region closed by a marker: a table that puts the list between markers. With no
+    /// markers around the calls a marker closes the region only before its first byte that is
+    /// not whitespace (the engine asks the assembler whether it closes), and the whitespace held
+    /// there is the template's wrapping, not prose.
+    pub fn close(mut self, out: &mut Events) {
+        if !self.framed && matches!(self.stage, Stage::Deciding) {
+            self.drop_carried(out);
+        }
         self.finish(out);
     }
 
@@ -445,6 +451,16 @@ impl crate::engine::CallAssembler for Assembler {
     ) -> usize {
         self.feed(text, out);
         text.len()
+    }
+
+    /// Between markers the region's closing marker closes it, wherever it stands. With no
+    /// markers around the calls, a terminal with a row out of the state leaves it only before
+    /// the first byte that is not whitespace, where a table that reads a thought before the
+    /// calls has the thought's opener
+    /// ([`Format::with_forced_call`](crate::Format::with_forced_call)); once that byte decided,
+    /// every terminal is the calls' text, as a JSON string may hold any, or the prose's.
+    fn closes(&mut self, _terminal: &str) -> bool {
+        self.framed || matches!(self.stage, Stage::Deciding)
     }
 
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {

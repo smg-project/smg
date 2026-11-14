@@ -302,6 +302,14 @@ impl<'a> Asks<'a> {
         }
     }
 
+    /// The tool calls the conversation's history already holds.
+    pub(super) fn history_tool_calls_count(self) -> usize {
+        match self {
+            Self::Chat(request) => request.history_tool_calls_count(),
+            Self::Messages { request, .. } => request.history_tool_calls_count(),
+        }
+    }
+
     /// The request carries a `regex` or `ebnf` constraint, which applies outside a template's
     /// format; a Messages request carries neither.
     fn constrains_outside_the_format(self) -> bool {
@@ -1460,9 +1468,13 @@ mod tests {
             .expect("assigned");
             assert_eq!(assigned.format.name(), "kimi_k2");
         }
-        // The older path's forced call (a JSON schema) is still read by the older parsers.
+        // The older registry's forced call (a JSON schema) is the table's to read too, with its
+        // forced call: the thought as the table reads one, then the arguments alone.
         let schema = ("json_schema".to_string(), "{}".to_string());
-        assert!(assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt).is_none());
+        let forced = assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt)
+            .expect("the table reads the forced call");
+        assert_eq!(forced.format.name(), "kimi_k2");
+        assert_eq!(forced.forcing.as_deref(), Some("lookup"));
     }
 
     /// A forced or required call on a table whose calls are named arguments inside a block takes
@@ -1537,16 +1549,19 @@ mod tests {
             .expect("assigned");
             assert_eq!(assigned.format.name(), "deepseek_v3.1");
         }
-        // The older path's forced call (a JSON schema) is still read by the older parsers.
+        // The older registry's forced call (a JSON schema) is the table's to read too, with its
+        // forced call: the thought as the table reads one, then the arguments alone.
         let schema = ("json_schema".to_string(), "{}".to_string());
-        assert!(assign(
+        let forced = assign(
             ParserChoice::Symphony,
             &deepseek,
             &named,
             Some(&schema),
-            prompt
+            prompt,
         )
-        .is_none());
+        .expect("the table reads the forced call");
+        assert_eq!(forced.format.name(), "deepseek_v3.1");
+        assert_eq!(forced.forcing.as_deref(), Some("lookup"));
     }
 
     /// The model's workers name the start when they all carry the same label; none or a missing

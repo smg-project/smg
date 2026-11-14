@@ -143,6 +143,8 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         }),

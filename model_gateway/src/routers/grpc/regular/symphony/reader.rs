@@ -4,24 +4,27 @@
 use std::sync::{atomic::AtomicBool, Arc, LazyLock};
 
 use llm_tokenizer::stop::StopSequenceDecoder;
-use openai_protocol::{common::Tool, profile::ProviderProfile};
+use openai_protocol::{
+    common::{Tool, ToolChoice},
+    profile::ProviderProfile,
+};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use symphony::{
-    Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
-    TokenSpan,
+    Declared, DropReason, Engine, EngineFinish, Event, Events, ForcedCall, Format, Input,
+    Parser as _, Text, TokenSpan,
 };
 use tracing::{debug, Span};
 
 use super::{
     constraint::Asks,
-    names::{Fallback, Reading},
+    names::Reading,
     telemetry::{self, Tally, Who},
     SymphonyError,
 };
 #[cfg(test)]
 use super::{names::reading, template::Templates};
-use crate::routers::grpc::utils::isolation;
+use crate::routers::grpc::utils::{isolation, CallIdFamily};
 #[cfg(test)]
 use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
 
@@ -41,6 +44,16 @@ pub(crate) struct Assignment {
     /// the reader reads and delivers like the rest, and a marker of the table kept as text in it
     /// is no failure of the table's reading ([`Tally::new`]).
     pub past_the_end: bool,
+    /// The function the request forces (`tool_choice` naming it) where the output's JSON is its
+    /// arguments alone under the gateway's JSON-schema constraint: the table reads them as the
+    /// forced call ([`forced`]), and the reader names that one call so ([`assign_for`]).
+    pub forcing: Option<String>,
+    /// The model's family and the count of calls in the conversation's history, where the
+    /// gateway's JSON-schema constraint forces the call and the family numbers its ids by the
+    /// conversation ([`CallIdFamily`]). The forced JSON has no header for the table to take an id
+    /// from, so the reader gives each of its calls the family's id, as the older forced arm does.
+    /// `None` for every other request: its ids are the table's.
+    pub forced_ids: Option<(CallIdFamily, usize)>,
     /// The request's span, current where the assignment is made ([`assignment`]), for the record
     /// a reading that was not clean leaves on it ([`Reader::end`], [`Reader::failed`]). A streamed
     /// response's reading runs outside the span (the response body drives it), so the span
@@ -67,6 +80,8 @@ pub(super) fn assignment(
     prompt: &str,
     forbids_calls: bool,
     past_the_end: bool,
+    forcing: Option<String>,
+    forced_ids: Option<(CallIdFamily, usize)>,
 ) -> Assignment {
     debug!(model, table = format.name(), "Symphony reads the response");
     let prompt = format.replay(prompt).to_string();
@@ -75,6 +90,8 @@ pub(super) fn assignment(
         prompt,
         forbids_calls,
         past_the_end,
+        forcing,
+        forced_ids,
         span: Span::current(),
         marked: Arc::default(),
     }
@@ -92,21 +109,61 @@ pub(super) fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> 
     if !no_calls && !no_reasoning {
         return format;
     }
+    variant(
+        format,
+        Ask {
+            calls: if no_calls { Calls::None } else { Calls::Read },
+            no_reasoning,
+        },
+    )
+}
+
+/// The table as a request reads it whose call the gateway's JSON-schema constraint forces: the
+/// output is the model's thought, where the engine lets it think first, and then the JSON alone,
+/// so the table keeps its thought and reads everything else as the call, written as `written`
+/// says ([`Format::with_forced_call`]); without its thought when the request keeps the reasoning
+/// in the content, which then holds the thought's text ahead of the call. Kept per table as
+/// [`asked`]'s variants are.
+pub(super) fn forced(format: Arc<Format>, written: ForcedCall, no_reasoning: bool) -> Arc<Format> {
+    variant(
+        format,
+        Ask {
+            calls: Calls::Forced(written),
+            no_reasoning,
+        },
+    )
+}
+
+/// What a request asks of the table's calls: read as the table reads them, none
+/// ([`Format::without_calls`]), or the one the JSON-schema constraint forces
+/// ([`Format::with_forced_call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Calls {
+    Read,
+    None,
+    Forced(ForcedCall),
+}
+
+/// What a request asks of the table that reads it: the key of a kept variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Ask {
+    calls: Calls,
+    no_reasoning: bool,
+}
+
+/// The variant of `format` that `ask` makes, kept per shared table.
+fn variant(format: Arc<Format>, ask: Ask) -> Arc<Format> {
     // A table nobody else holds (one built for this request) is made over in
     // place, as before; a shared table's variant is kept, so the next request
     // that asks the same of it reads with the one copy.
     if Arc::strong_count(&format) == 1 {
-        return Arc::new(variant_of(
-            Arc::unwrap_or_clone(format),
-            no_calls,
-            no_reasoning,
-        ));
+        return Arc::new(variant_of(Arc::unwrap_or_clone(format), ask));
     }
-    let key = (Arc::as_ptr(&format) as usize, no_calls, no_reasoning);
+    let key = (Arc::as_ptr(&format) as usize, ask);
     if let Some(kept) = ASKED_VARIANTS.read().get(&key) {
         return Arc::clone(&kept.variant);
     }
-    let variant = Arc::new(variant_of((*format).clone(), no_calls, no_reasoning));
+    let variant = Arc::new(variant_of((*format).clone(), ask));
     let mut kept = ASKED_VARIANTS.write();
     // Another request may have kept the same variant between the read and
     // the write: theirs is the one every reader shares from here on.
@@ -126,35 +183,39 @@ pub(super) fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> 
     variant
 }
 
-/// `format` as [`asked`] makes it: without its calls, its thought, or both.
-fn variant_of(mut format: Format, no_calls: bool, no_reasoning: bool) -> Format {
-    if no_calls {
-        format = format.without_calls();
-    }
-    if no_reasoning {
+/// `format` as `ask` makes it: without its calls or with the forced one, then without its
+/// thought.
+fn variant_of(mut format: Format, ask: Ask) -> Format {
+    format = match ask.calls {
+        Calls::Read => format,
+        Calls::None => format.without_calls(),
+        Calls::Forced(written) => format.with_forced_call(written),
+    };
+    if ask.no_reasoning {
         format = format.without_reasoning();
     }
     format
 }
 
-/// The variants [`asked`] made of the shared tables, by the table's address
-/// and the ask. A chat request without tools asks for the table without its
-/// calls, which was rebuilt from the shared table on every such request (a
-/// clone and the walks of `without_calls`: 19 allocation calls per request,
-/// 2026-10-21).
+/// The variants [`asked`] and [`forced`] made of the shared tables, by the
+/// table's address and the ask. A chat request without tools asks for the
+/// table without its calls, which was rebuilt from the shared table on every
+/// such request (a clone and the walks of `without_calls`: 19 allocation calls
+/// per request, 2026-10-21).
 static ASKED_VARIANTS: LazyLock<RwLock<AskedVariants>> =
     LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
-/// The kept variants by the shared table's address and the ask (no calls, no
+/// The kept variants by the shared table's address and the ask (the calls, no
 /// reasoning); the key is the process's own, hashed with the Fx hasher as the
 /// gateway's other address-keyed maps are.
-type AskedVariants = FxHashMap<(usize, bool, bool), AskedVariant>;
+type AskedVariants = FxHashMap<(usize, Ask), AskedVariant>;
 
 /// How many variants are kept before the map starts over: the registry's
 /// groups, the named tables and the templates' tables come to a few hundred,
-/// each with up to three asks; a gateway serving every one of them with every
-/// ask stays under this, and a stream of tables built per worker cannot grow
-/// the map without bound.
+/// each with up to three asks and, for a call the JSON schema forces, four
+/// more; a gateway serving the tables of the models it runs with every ask
+/// stays under this, and a stream of tables built per worker cannot grow the
+/// map without bound.
 const ASKED_VARIANTS_KEPT: usize = 1024;
 
 /// One kept variant: the shared table it was made of (held, so the address
@@ -191,14 +252,23 @@ pub(crate) fn assign(
 
 /// Symphony's assignment to a request, if a table reads the response (`read`, the table decision:
 /// preparation reads it once per request, [`reading`](super::names::reading), and request building
-/// passes it, `ProcessingState::reading`) and the constraint is not a JSON schema: the older
-/// path's forced call, whose output has no markers for a table to read, which the older registry
-/// writes where the table has no tag. The table goes without its calls where the legacy path would
-/// run no tool parser, without its thought where it would run no reasoning parser
+/// passes it, `ProcessingState::reading`). The table goes without its calls where the legacy path
+/// would run no tool parser, without its thought where it would run no reasoning parser
 /// ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call the conversation
-/// established without a tool inventory comes back as a call under either parser. `None` where
-/// the legacy parsers read the response, which the response's header then says; a request
-/// Symphony was configured for is counted once here, by the reason
+/// established without a tool inventory comes back as a call under either parser.
+///
+/// Under a JSON-schema constraint (the forced call the older registry writes where the table has
+/// no tag for it) the output has none of the table's call markers: it is the model's thought,
+/// where the engine holds the output to the schema only once the thought is over, and then the
+/// JSON alone. The table reads it with its forced call ([`forced`]): the thought as the table
+/// reads a thought, then the arguments of the function the request names
+/// ([`Assignment::forcing`]) or the list of calls a required call writes. A schema with no call
+/// forced is an answer, which the table reads without its calls. The older reasoning parser is
+/// not asked. The forced call's id is the family's where the model's family numbers its ids
+/// ([`Assignment::forced_ids`]), the table's otherwise.
+///
+/// `None` where the legacy parsers read the response, which the response's header then says; a
+/// request Symphony was configured for is counted once here, by the reason
 /// ([`telemetry::record_fallback`]): request building asks once per request, and nothing else
 /// decides the reader. `provider` is the model's provider profile as the preparation stage derived
 /// it once per request; request building passes it. The tests ask through `assign`, which reads
@@ -214,24 +284,46 @@ pub(crate) fn assign_for(
         Reading::Table(format, _) => format,
         Reading::Legacy => return None,
         Reading::Fallback(why) => {
-            telemetry::record_fallback(why, None);
+            telemetry::record_fallback(why);
             return None;
         }
     };
-    if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
-        telemetry::record_fallback(
-            Fallback::ForcedCallWithoutTag,
-            Some(telemetry::table_label(format.name())),
-        );
-        return None;
-    }
-    let format = asked(format, asks.no_calls_for(provider), asks.no_reasoning());
+    let schema_alone = constraint.is_some_and(|(kind, _)| kind == "json_schema");
+    let (format, forcing, is_forced) = if schema_alone {
+        match asks.choice().as_deref() {
+            Some(ToolChoice::Function { function, .. }) => (
+                forced(format, ForcedCall::Arguments, asks.no_reasoning()),
+                Some(function.name.clone()),
+                true,
+            ),
+            Some(choice) if choice.forces_call() => (
+                forced(format, ForcedCall::List, asks.no_reasoning()),
+                None,
+                true,
+            ),
+            _ => (asked(format, true, asks.no_reasoning()), None, false),
+        }
+    } else {
+        (
+            asked(format, asks.no_calls_for(provider), asks.no_reasoning()),
+            None,
+            false,
+        )
+    };
+    // The forced JSON has no header to read an id from: a family that numbers its ids by the
+    // conversation numbers these too, as the older forced arm does.
+    let forced_ids = is_forced
+        .then(|| CallIdFamily::of(asks.model()))
+        .flatten()
+        .map(|family| (family, asks.history_tool_calls_count()));
     Some(assignment(
         format,
         asks.model(),
         prompt,
         asks.forbids_calls_for(provider),
         asks.past_the_end(),
+        forcing,
+        forced_ids,
     ))
 }
 
@@ -316,6 +408,9 @@ pub(crate) struct Reader {
     /// read them whole, and the engine's own server delivers nothing of such a call
     /// ([`Assignment::forbids_calls`]).
     forbids_calls: bool,
+    /// Give every call the family's id by its place in the conversation
+    /// ([`Assignment::forced_ids`]).
+    forced_ids: Option<(CallIdFamily, usize)>,
     /// Whether the output showed the client anything yet: text, reasoning or a call.
     shown: bool,
     /// The whitespace the table dropped before the output showed anything: the template's
@@ -365,15 +460,20 @@ impl Reader {
         tools: Arc<[Tool]>,
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
+        let declared = match &assignment.forcing {
+            Some(name) => Declared::shared(tools).forcing(name.clone()),
+            None => Declared::shared(tools),
+        };
         let mut reader = Self {
             table: assignment.table(),
-            engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
+            engine: Engine::shared(Arc::clone(&assignment.format), declared),
             tally: Tally::new(assignment.past_the_end),
             last_token: None,
             read: 0,
             ended: false,
             first_call_only: false,
             forbids_calls: assignment.forbids_calls,
+            forced_ids: assignment.forced_ids,
             shown: false,
             unshown: String::new(),
             called: false,
@@ -557,9 +657,10 @@ impl Reader {
     }
 
     /// Feeds `input` to the engine, its events into `out` after the ones already there: the
-    /// reader's one way in. The events this step added are tallied, and limited to the first
-    /// call where the request asks. An output the engine refuses is recorded as failed for the
-    /// table, which the error names.
+    /// reader's one way in. A call the step started takes its family's id first, where the
+    /// assignment gives one ([`Assignment::forced_ids`]). The events this step added are tallied,
+    /// and limited to the first call where the request asks. An output the engine refuses is
+    /// recorded as failed for the table, which the error names.
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
         let before = out.len();
         let last = out.as_slice().last().map_or(0, telemetry::bytes_of);
@@ -575,6 +676,16 @@ impl Reader {
             self.tally.grew(telemetry::bytes_of(grown) - last);
         }
         let fresh = &mut out.as_mut_slice()[before..];
+        if let Some((family, history)) = self.forced_ids {
+            for event in fresh.iter_mut() {
+                if let Event::ToolCallStart {
+                    index, id, name, ..
+                } = event
+                {
+                    *id = family.id(name, *index as usize, history);
+                }
+            }
+        }
         // Where the step's first event starts in the output: the held runs below are placed by it.
         let start = self.tally.at();
         for event in fresh.iter() {
@@ -771,7 +882,7 @@ mod tests {
 
     #[test]
     fn a_shared_tables_asked_variant_is_kept_and_read_with_by_the_next_request() {
-        let shared = symphony::formats::Table::Qwen3.shared();
+        let shared = Table::Qwen3.shared();
         let first = asked(Arc::clone(&shared), true, false);
         let second = asked(Arc::clone(&shared), true, false);
         assert!(
@@ -793,6 +904,28 @@ mod tests {
             Arc::ptr_eq(&asked(Arc::clone(&shared), false, false), &shared),
             "a request that asks for nothing reads with the shared table itself"
         );
+        let named = forced(Arc::clone(&shared), ForcedCall::Arguments, false);
+        assert!(
+            Arc::ptr_eq(
+                &named,
+                &forced(Arc::clone(&shared), ForcedCall::Arguments, false)
+            ),
+            "a forced call's variant is kept like the others"
+        );
+        assert_eq!(
+            *named,
+            (*shared).clone().with_forced_call(ForcedCall::Arguments)
+        );
+        let listed = forced(Arc::clone(&shared), ForcedCall::List, true);
+        assert_eq!(
+            *listed,
+            (*shared)
+                .clone()
+                .with_forced_call(ForcedCall::List)
+                .without_reasoning(),
+            "the list a required call writes, the thought kept in the content"
+        );
+        assert!(!Arc::ptr_eq(&named, &listed) && !Arc::ptr_eq(&named, &first));
         let unique = Arc::new((*shared).clone());
         let weak = Arc::downgrade(&unique);
         let made_over = asked(unique, true, true);
@@ -806,7 +939,12 @@ mod tests {
             "a table nobody else holds is not kept: nothing pins it"
         );
     }
-    use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
+    use symphony::formats::Table;
+
+    use crate::routers::grpc::{
+        regular::symphony::testing::{assign, constraint, *},
+        utils::parse_json_schema_response,
+    };
 
     /// A reader over `format` after `prompt`, fed `pieces` one by one, ended with `finish`.
     fn read_pieces(
@@ -820,6 +958,8 @@ mod tests {
             prompt: prompt.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -1880,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_model_and_a_json_schema_constraint_are_not_assigned() {
+    fn an_unknown_model_is_not_assigned_and_a_json_schema_constraint_is() {
         assert!(assign(
             ParserChoice::Symphony,
             &ModelNames::default(),
@@ -1889,15 +2029,21 @@ mod tests {
             PROMPT
         )
         .is_none());
+        // A schema with no call forced is an answer: the table reads it without its calls.
         let schema = ("json_schema".to_string(), "{}".to_string());
-        assert!(assign(
+        let answer = assign(
             ParserChoice::Symphony,
             &ModelNames::default(),
             &request(json!({})),
             Some(&schema),
-            PROMPT
+            PROMPT,
         )
-        .is_none());
+        .expect("the table reads an answer under the schema");
+        assert_eq!(
+            *answer.format,
+            (*table_of(&request(json!({})))).clone().without_calls()
+        );
+        assert_eq!(answer.forcing, None);
         let tag = ("structural_tag".to_string(), "{}".to_string());
         assert!(assign(
             ParserChoice::Symphony,
@@ -1907,6 +2053,322 @@ mod tests {
             PROMPT
         )
         .is_some());
+    }
+
+    /// The two calls a JSON schema forces, as the request asks and as the model writes them
+    /// after a thought the prompt opened: the function the request names, whose JSON is the
+    /// arguments alone, and a required call, whose JSON is the list.
+    fn forced_under_the_schema() -> [(Value, Option<&'static str>, ForcedCall, &'static str); 2] {
+        [
+            (
+                json!({"type": "function", "function": {"name": "lookup"}}),
+                Some("lookup"),
+                ForcedCall::Arguments,
+                r#"plan</think>{"q": 1}"#,
+            ),
+            (
+                json!("required"),
+                None,
+                ForcedCall::List,
+                r#"plan</think>[{"name": "lookup", "parameters": {"q": 1}}]"#,
+            ),
+        ]
+    }
+
+    /// The reasoning text among `events`.
+    fn thought_of(events: &[Event<'_>]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) => Some(&*text.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A call the gateway's JSON schema forces, on an engine that holds the output to the schema
+    /// once the model's thought is over: the output thinks, closes the thought and then writes
+    /// the JSON. The model's table reads it with its forced call, so the thought is reasoning and
+    /// the call holds the JSON alone, for the function the request names and for a required
+    /// call's list. No legacy parser reads it, and the output counts under the model's table.
+    #[test]
+    fn a_forced_call_under_the_schema_keeps_the_thought_the_models_table_reads() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        for (choice, forcing, _, output) in forced_under_the_schema() {
+            let forced = request(json!({
+                "tools": declared.clone(), "tool_choice": choice, "separate_reasoning": true,
+            }));
+            let assignment = assign(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                &forced,
+                Some(&schema),
+                PROMPT,
+            )
+            .expect("the model's table reads the forced call");
+            assert_eq!(assignment.table(), "qwen3");
+            assert_eq!(assignment.forcing.as_deref(), forcing);
+            let mut replayed = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+            let events = read_tail(&mut reader, output);
+            assert_eq!(thought_of(&events), "plan", "{events:?}");
+            assert_eq!(content_of(&events), "", "{events:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{events:?}"
+            );
+            assert_eq!(
+                calls_of(&events),
+                vec![("lookup".to_string(), json!({"q": 1}))],
+                "{events:?}"
+            );
+        }
+    }
+
+    /// The same request keeping the reasoning in the content: the thought's text is content
+    /// ahead of the call, and the call still holds the JSON alone.
+    #[test]
+    fn a_forced_call_under_the_schema_reads_a_thought_kept_in_the_content_before_the_call() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        for (choice, _, _, output) in forced_under_the_schema() {
+            let forced = request(json!({
+                "tools": declared.clone(), "tool_choice": choice, "separate_reasoning": false,
+            }));
+            let assignment = assign(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                &forced,
+                Some(&schema),
+                PROMPT,
+            )
+            .expect("the model's table reads the forced call");
+            let mut replayed = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+            let events = read_tail(&mut reader, output);
+            assert_eq!(
+                (thought_of(&events), content_of(&events)),
+                (String::new(), "plan".to_string()),
+                "{events:?}"
+            );
+            assert_eq!(
+                calls_of(&events),
+                vec![("lookup".to_string(), json!({"q": 1}))],
+                "{events:?}"
+            );
+        }
+    }
+
+    /// Every table of the registry, the call forced by name and as required: the assignment
+    /// under the schema is the table's own forced variant, named by the table, with the forced
+    /// function's name where the request names one. The crate reads a thought and then the JSON
+    /// with that variant on every table (`every_table_reads_a_forced_call_after_each_way_into_
+    /// its_thought`), so the two together are every table under both choices.
+    #[test]
+    fn every_table_is_assigned_its_forced_variant_under_the_schema() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        for table in Table::ALL {
+            for (choice, forcing, written, _) in forced_under_the_schema() {
+                let forced = request(json!({
+                    "tools": declared.clone(), "tool_choice": choice, "separate_reasoning": true,
+                }));
+                let assignment = assign_for(
+                    Reading::Table(table.shared(), false),
+                    Asks::Chat(&forced),
+                    Some(&schema),
+                    PROMPT,
+                    ProviderProfile::for_model(&forced.model),
+                )
+                .expect("a table reads");
+                assert_eq!(
+                    *assignment.format,
+                    table.format().with_forced_call(written),
+                    "{}",
+                    table.name()
+                );
+                assert_eq!(assignment.forcing.as_deref(), forcing, "{}", table.name());
+                assert_eq!(
+                    assignment.table(),
+                    telemetry::table_label(table.format().name()),
+                    "{}",
+                    table.name()
+                );
+            }
+        }
+    }
+
+    /// The ids of the calls among `events`.
+    fn ids_of(events: &[Event<'_>]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A forced call's JSON has no header for the table to take an id from. On a family that
+    /// numbers its ids by the conversation the reader gives the family's id, as the older forced
+    /// arm does: the K2 line's `functions.{name}:{n}` and the K3 line's `{name}_{n}`, counted on
+    /// from the calls the history holds, for the function the request names and for a required
+    /// call's list. Every other model keeps the id the table mints.
+    #[test]
+    fn a_forced_call_takes_the_familys_id_where_the_family_numbers_its_ids() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        // Two calls in the history: the forced calls are the conversation's third and fourth.
+        let history = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "1"},
+            {"role": "tool", "tool_call_id": "b", "content": "2"},
+        ]);
+        let named = json!({"type": "function", "function": {"name": "lookup"}});
+        let list = r#"[{"name": "lookup", "parameters": {"q": 1}}, {"name": "lookup", "parameters": {"q": 2}}]"#;
+        for (model, table, ids) in [
+            (
+                "moonshotai/Kimi-K2-Instruct",
+                Table::KimiK2,
+                ["functions.lookup:2", "functions.lookup:3"],
+            ),
+            (
+                "moonshotai/Kimi-K3",
+                Table::KimiK3,
+                ["lookup_2", "lookup_3"],
+            ),
+        ] {
+            for (choice, output, expected) in [
+                (named.clone(), r#"{"q": 1}"#, &ids[..1]),
+                (json!("required"), list, &ids[..]),
+            ] {
+                let forced = request(json!({
+                    "model": model, "messages": history.clone(),
+                    "tools": declared.clone(), "tool_choice": choice,
+                }));
+                let assignment = assign_for(
+                    Reading::Table(table.shared(), false),
+                    Asks::Chat(&forced),
+                    Some(&schema),
+                    "",
+                    ProviderProfile::for_model(&forced.model),
+                )
+                .expect("the table reads the forced call");
+                let mut replayed = Events::new();
+                let mut reader =
+                    Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+                let events = read_tail(&mut reader, output);
+                assert_eq!(ids_of(&events), expected, "{model}: {events:?}");
+            }
+        }
+        // A model whose ids are minted: the table's id stands.
+        let minted = request(json!({
+            "messages": history, "tools": declared, "tool_choice": named,
+        }));
+        let assignment = assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &minted,
+            Some(&schema),
+            PROMPT,
+        )
+        .expect("the table reads the forced call");
+        assert_eq!(assignment.forced_ids, None);
+        let mut replayed = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+        let ids = ids_of(&read_tail(&mut reader, r#"plan</think>{"q": 1}"#));
+        assert!(
+            matches!(ids.as_slice(), [id] if id.starts_with("call_")),
+            "{ids:?}"
+        );
+    }
+
+    /// The events of `output` read as two deltas cut at `cut`, then ended by a stop, owned.
+    fn read_cut(reader: &mut Reader, output: &str, cut: usize) -> Vec<Event<'static>> {
+        let mut all = Vec::new();
+        for part in [&output[..cut], &output[cut..]] {
+            let mut delta = Delta::default();
+            let mut events = Events::new();
+            reader
+                .tail(part.to_string(), &mut delta, &mut events)
+                .expect("read");
+            all.extend(events.into_owned().drain());
+        }
+        let mut events = Events::new();
+        reader
+            .end(EngineFinish::Stop, who(), &mut events)
+            .expect("ended");
+        all.extend(events.into_owned().drain());
+        all
+    }
+
+    /// The JSON a schema forces reads through every table as the older arm reads it: the same
+    /// calls by name and by JSON value and no content, for the function the request names and
+    /// for a required call's list, whole and cut anywhere into two deltas. The output is the
+    /// JSON alone after a prompt that opens no thought, which every table reads from its
+    /// arguments state: a table without a thought has no other, and a table with one was
+    /// written none.
+    #[test]
+    fn every_table_reads_the_json_a_schema_forces_as_the_older_arm_does() {
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let schema = ("json_schema".to_string(), "{}".to_string());
+        for (choice, output) in [
+            (
+                json!({"type": "function", "function": {"name": "lookup"}}),
+                r#"{"q": "Paris", "n": [1, {"deep": null}]}"#,
+            ),
+            (
+                json!("required"),
+                r#"[{"name": "lookup", "parameters": {"q": "Paris"}}, {"name": "lookup", "parameters": {}}]"#,
+            ),
+        ] {
+            let forced = request(json!({"tools": declared.clone(), "tool_choice": choice}));
+            let (older, rest) =
+                parse_json_schema_response(output, forced.tool_choice.as_ref(), &forced.model, 0);
+            assert_eq!(rest, "");
+            let older: Vec<(String, Value)> = older
+                .expect("the older arm reads the calls")
+                .into_iter()
+                .map(|call| {
+                    let arguments = call.function.arguments.expect("arguments");
+                    let arguments = serde_json::from_str(&arguments).expect("arguments as JSON");
+                    (call.function.name, arguments)
+                })
+                .collect();
+            for table in Table::ALL {
+                let assignment = assign_for(
+                    Reading::Table(table.shared(), false),
+                    Asks::Chat(&forced),
+                    Some(&schema),
+                    "",
+                    ProviderProfile::for_model(&forced.model),
+                )
+                .expect("a table reads");
+                for cut in output
+                    .char_indices()
+                    .map(|(at, _)| at)
+                    .chain([output.len()])
+                {
+                    let mut replayed = Events::new();
+                    let mut reader =
+                        Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+                    let events = read_cut(&mut reader, output, cut);
+                    let case = format!("{} cut {cut}", table.name());
+                    assert_eq!(calls_of(&events), older, "{case}: {events:?}");
+                    assert_eq!(content_of(&events), "", "{case}: {events:?}");
+                    assert_eq!(thought_of(&events), "", "{case}: {events:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1934,6 +2396,8 @@ mod tests {
             prompt: "<|message_model|>".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2008,6 +2472,8 @@ mod tests {
             prompt: GLM4_PROMPT.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2067,6 +2533,8 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2097,6 +2565,8 @@ mod tests {
                     PROMPT,
                     false,
                     false,
+                    None,
+                    None,
                 )
             });
             assert_eq!(assignment.span.id(), span.id());
@@ -2148,6 +2618,8 @@ mod tests {
                     "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
                     false,
                     false,
+                    None,
+                    None,
                 )
             });
             span.in_scope(
@@ -2206,6 +2678,8 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2333,6 +2807,8 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2366,6 +2842,8 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2416,6 +2894,8 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2452,6 +2932,8 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: true,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2504,6 +2986,8 @@ mod tests {
         let allowed = Assignment {
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            forced_ids: None,
             span: Span::none(),
             marked: Arc::default(),
             ..assignment
@@ -2570,8 +3054,9 @@ mod tests {
     }
 
     /// A request Symphony was configured for that the legacy parsers read is counted once, under
-    /// the reason the seam names and the table that had no tag for it, or `none`; a table's
-    /// assignment, and the gateway's own choice of the legacy parsers, count nothing.
+    /// the reason the seam names and the table `none`; a table's assignment, under a structural
+    /// tag or the older registry's JSON schema alike, and the gateway's own choice of the legacy
+    /// parsers, count nothing.
     #[test]
     fn a_request_the_legacy_parsers_read_under_symphony_is_counted_once_by_reason() {
         let unknown = request(json!({"model": "acme/ministral-3-14b-instruct-w4a16"}));
@@ -2618,8 +3103,9 @@ mod tests {
         );
 
         // The shape a table without a tag for a forced call hands over: the seam's constraint is
-        // nothing, the older registry writes its JSON schema for the named tool, request building
-        // passes it here, and the table that reads the model is the one counted.
+        // nothing, the older registry writes its JSON schema for the named tool, and request
+        // building passes it here. The table reads the output with its forced call, so nothing
+        // is counted: no legacy parser reads it.
         let forced = request(json!({
             "tools": serde_json::to_value(tools()).expect("tools"),
             "tool_choice": {"type": "function", "function": {"name": "lookup"}},
@@ -2636,11 +3122,19 @@ mod tests {
             .expect("the older registry's schema")
             .to_tuple();
         assert_eq!(schema.0, "json_schema");
-        labelled(
-            &counted(&ModelNames::default(), &forced, Some(&schema)),
-            "forced_call_without_tag",
-            "qwen3",
-        );
+        let scrape = rendered(|| {
+            let assigned = assign(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                &forced,
+                Some(&schema),
+                PROMPT,
+            )
+            .expect("the table reads the forced call");
+            assert_eq!(assigned.table(), "qwen3");
+            assert_eq!(assigned.forcing.as_deref(), Some("lookup"));
+        });
+        assert!(!scrape.contains(telemetry::FALLBACK), "{scrape}");
         // A message the same way.
         let message = message_request(json!({}));
         let scrape = rendered(|| {
@@ -2656,13 +3150,9 @@ mod tests {
                 &templates(),
             )
             .expect("no hf");
-            assert!(assigned.is_none());
+            assert!(assigned.is_some());
         });
-        labelled(
-            line_with(&scrape, telemetry::FALLBACK, &[]).expect("counted"),
-            "forced_call_without_tag",
-            "qwen3",
-        );
+        assert!(!scrape.contains(telemetry::FALLBACK), "{scrape}");
 
         // Nothing counted where a table reads, under a structural tag too, nor under `legacy`.
         let tag = ("structural_tag".to_string(), "{}".to_string());
@@ -2700,6 +3190,8 @@ mod tests {
                 prompt: prompt.to_string(),
                 forbids_calls: false,
                 past_the_end: false,
+                forcing: None,
+                forced_ids: None,
                 span: Span::none(),
                 marked: Arc::default(),
             };

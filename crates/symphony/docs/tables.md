@@ -711,10 +711,9 @@ which writes the bare list as the `xlam` table's does and is not yet proven on a
 
 ## The forced call (`forced`)
 
-Not a table an operator names: the gateway picks this format for a request whose `tool_choice`
-names a function and whose constraint is the JSON schema the older path builds for it (the
-function's `parameters`), so the whole output is that function's arguments, with no marker and no
-name in it. The name comes from the request (`Declared::forcing`), and `ToolCallStart` carries it
+Not a table an operator names: the format of a request whose `tool_choice` names a function and
+whose constraint is the JSON schema the older path builds for it (the function's `parameters`), so
+the whole output is that function's arguments, with no marker and no name in it. The name comes from the request (`Declared::forcing`), and `ToolCallStart` carries it
 with no source byte of its own. The value streams through `json::Arguments` (`json::forced` drives
 it): the whitespace before it is dropped, a fragment for every byte, a JSON prefix until a
 `Malformed { InvalidArguments }` event of no bytes says where it stopped being one, and the call's
@@ -722,6 +721,18 @@ end where the value is whole or where the stream ends; the engine reports text a
 as text after the object. A required call
 under the same path is a list of `{"name": …, "parameters": …}` objects, which the `json` table
 reads.
+
+A model that thinks first writes its thought before the JSON, where the engine holds the output to
+the schema only once the thought is over. `Format::with_forced_call` makes the variant of the
+model's own table that reads such an output: the thought's states stay, with every row into, out
+of and between them, and every other state is one arguments state, the first, which reads the JSON
+as this format does (`ForcedCall::Arguments`) or as the `json` table reads a required call's list
+(`ForcedCall::List`). A row out of that state is taken only before the JSON's first byte: the
+thought's opener enters the thought, and any other marker with a row is the template's framing,
+dropped. From the first byte on every marker is the call's text, as a JSON string may hold any:
+the two assemblers close at no terminal once their value began (`CallAssembler::closes`). With no
+thought written the variant reads what this format reads, so the gateway reads every such request
+with the variant of the model's table and the output counts under that table.
 
 What the format leaves open: it derives no grammar, since its constraint is the request's own
 schema; bellwether #19 records the constrained outputs, which replay here when they land, so the
