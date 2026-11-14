@@ -1005,6 +1005,19 @@ fn parse_item_from_value(
         .map(String::from);
 
     if item_type == "message" {
+        if let Some(other) = item_val
+            .get("role")
+            .filter(|role| !role.is_null() && !role.is_string())
+        {
+            return Err(refused(
+                Some("items[].role"),
+                "invalid_type",
+                &format!(
+                    "Invalid type for 'items[].role': expected a string, but got {} instead.",
+                    json_type_name(other)
+                ),
+            ));
+        }
         if role.is_none() {
             return Err(bad_request("Message items require 'role' field"));
         }
@@ -1104,7 +1117,8 @@ fn validate_message_fields(item_val: &Value) -> Result<(), Response> {
 /// without a guess: a part that is not an object is `invalid_type`; one
 /// without a `type` is `missing_required_parameter` on its type, one whose
 /// `type` is not a string `invalid_type` on it, one whose `type` is outside
-/// the part set `invalid_value` on it; a missing field of a part that holds
+/// the part set `invalid_value` on it (a type the set knows is never blamed
+/// for a nested variant of the same name); a missing field of a part that holds
 /// nothing nested is `missing_required_parameter` on that field. serde names
 /// a missing field or an unknown variant without its path, so an error that
 /// may come from inside a nested value (an annotation's field, a `detail`
@@ -1118,7 +1132,7 @@ fn part_refused(index: usize, part: &Value, reason: &str) -> Response {
     let (param, code) = match part.get("type") {
         _ if !part.is_object() => (part_param.clone(), "invalid_type"),
         None | Some(Value::Null) => (format!("{part_param}.type"), "missing_required_parameter"),
-        Some(Value::String(own)) if unknown_variant_is(reason, own) => {
+        Some(Value::String(own)) if unknown_variant_is(reason, own) && !part_type_is_known(own) => {
             (format!("{part_param}.type"), "invalid_value")
         }
         Some(Value::String(_)) => {
@@ -1144,6 +1158,16 @@ fn part_refused(index: usize, part: &Value, reason: &str) -> Response {
         code,
         &format!("Invalid '{part_param}': {reason}"),
     )
+}
+
+/// Whether the part set knows `type_name`: a part of that type alone fails on a
+/// missing field (or passes), never on an unknown variant, so an unknown-variant
+/// reason on such a part comes from a value nested inside it.
+fn part_type_is_known(type_name: &str) -> bool {
+    match serde_json::from_value::<ResponseContentPart>(json!({ "type": type_name })) {
+        Ok(_) => true,
+        Err(error) => !error.to_string().starts_with("unknown variant"),
+    }
 }
 
 /// Whether serde's reason is the unknown-variant refusal of `name` itself
@@ -1712,6 +1736,7 @@ mod tests {
                 "invalid_value",
                 "items[].role",
             ),
+            (message(json!({"role": 42})), "invalid_type", "items[].role"),
             (
                 message(json!({"status": "flying"})),
                 "invalid_value",
@@ -1773,6 +1798,15 @@ mod tests {
             (
                 message(json!({"content": [
                     {"type": "output_text", "text": "x", "annotations": [{"type": "bogus"}]}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            // A nested variant that carries the part's own type name is still the
+            // part's error, not its type's.
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "output_text"}]}
                 ]})),
                 "invalid_value",
                 "items[].content[0]",
