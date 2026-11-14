@@ -2816,14 +2816,16 @@ fn stop_the_mesh(mesh_handler: Option<&MeshServerHandler>) {
 /// gives up and says so. Phase 3, the teardown, is the caller's once the
 /// listeners have stopped and this drain has ended (see
 /// [`drain_before_teardown`]). Returns the end of the grace, the deadline
-/// the phases share, for the caller's own wait to end by.
+/// the phases share, for the caller's own wait to end by; `None` when this
+/// drain ran to that deadline and gave up there, which it said: the caller
+/// has nothing left to wait for or to say.
 async fn graceful_shutdown(
     inflight_tracker: &InFlightRequestTracker,
     budget: ShutdownBudget,
     leave_mesh: impl Future<Output = ()>,
     stop_mesh: impl FnOnce(),
     stop_listeners: impl FnOnce(Duration),
-) -> tokio::time::Instant {
+) -> Option<tokio::time::Instant> {
     // Phase 1: Flip readiness to 503, hold the listener open through the
     // settle window so propagation-lagged requests still land, then gate
     // new connections.
@@ -2873,11 +2875,12 @@ async fn graceful_shutdown(
                 timeout_secs = drain_timeout.as_secs(),
                 "Drain timed out, forcing shutdown with requests still in-flight"
             );
+            return None;
         }
     }
     // Phase 3: the teardown is the main task's, once the listeners have
     // stopped and this drain has ended (`drain_before_teardown`).
-    deadline
+    Some(deadline)
 }
 
 /// What a listener's failure does about the rest of the gateway. Every
@@ -2916,7 +2919,7 @@ async fn serve_until_drained(
     admin: Serving,
     on_failure: OnFailure<impl FnOnce(), impl FnOnce(), impl Future<Output = ()>, impl FnOnce()>,
     inflight_tracker: &InFlightRequestTracker,
-    shutdown: tokio::task::JoinHandle<tokio::time::Instant>,
+    shutdown: tokio::task::JoinHandle<Option<tokio::time::Instant>>,
     drain: Duration,
 ) -> (std::io::Result<()>, std::io::Result<()>) {
     let OnFailure {
@@ -2995,14 +2998,17 @@ async fn serve_until_drained(
 /// of the grace: the `shutdown` task hands it back once its own drain has
 /// ended (the settle window first, when a listener failed inside it), and
 /// what was admitted after that drain, while the listeners still closed
-/// their connections, gets what is left of the grace. With none (a listener
-/// failed, and no shutdown was under way by then) it is one `drain` after
-/// the failure, the end of the `drain` a listener it stopped was given; a
-/// signal that comes after the failure does not move it. `failure` is what
-/// the failure found: its instant, and whether a shutdown was under way.
+/// their connections, gets what is left of the grace. What is still in
+/// flight at its end is said, with no time left too; a task whose own drain
+/// ran to the deadline hands nothing back, having said what it gave up on.
+/// With none (a listener failed, and no shutdown was under way by then) it
+/// is one `drain` after the failure, the end of the `drain` a listener it
+/// stopped was given; a signal that comes after the failure does not move
+/// it. `failure` is what the failure found: its instant, and whether a
+/// shutdown was under way.
 async fn drain_before_teardown(
     inflight_tracker: &InFlightRequestTracker,
-    shutdown: tokio::task::JoinHandle<tokio::time::Instant>,
+    shutdown: tokio::task::JoinHandle<Option<tokio::time::Instant>>,
     failure: Option<(tokio::time::Instant, bool)>,
     drain: Duration,
 ) {
@@ -3015,17 +3021,20 @@ async fn drain_before_teardown(
         failure.unwrap_or_else(|| (tokio::time::Instant::now(), inflight_tracker.is_draining()));
     if shutdown_under_way {
         match shutdown.await {
-            Ok(deadline) => {
-                // With no time left there is nothing to wait for: the task's
-                // own drain ran to the deadline and said so.
+            // The task's drain ended before the deadline and said nothing
+            // of what was admitted since: that work gets what is left, and
+            // with no time left it is given up on here, and said.
+            Ok(Some(deadline)) => {
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if !left.is_zero() && !inflight_tracker.wait_for_drain(left).await {
+                if !inflight_tracker.wait_for_drain(left).await {
                     warn!(
                         remaining = inflight_tracker.len(),
                         "Drain timed out, forcing shutdown with requests still in-flight"
                     );
                 }
             }
+            // The task's own drain ran to the deadline and said so.
+            Ok(None) => {}
             Err(e) => error!("The shutdown task ended abnormally: {e}"),
         }
     } else {
@@ -4041,6 +4050,114 @@ mod tests {
         );
     }
 
+    /// Work the exit gives up on at the deadline is said, once, with its
+    /// count: by the exit's own wait when it runs out, by the exit when the
+    /// listeners took until the deadline and no time is left, and by the
+    /// shutdown task alone when its own drain ran to the deadline.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn work_given_up_on_at_the_deadline_is_said_once() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        // The drain lines so far that count one request in flight.
+        let said_so_far = || {
+            let said = std::cell::Cell::new(0);
+            logs_assert(|lines: &[&str]| {
+                said.set(
+                    lines
+                        .iter()
+                        .filter(|line| line.contains("Drain timed out"))
+                        .filter(|line| line.contains("remaining=1"))
+                        .count(),
+                );
+                Ok(())
+            });
+            said.get()
+        };
+        let mut said = Vec::new();
+        // A mutation admitted at 6 s, after the shutdown task's drain ended
+        // on an empty count, never answers: the listeners close in 2 s, then
+        // take the whole 25 s that were left.
+        for closing in [2, 25] {
+            let tracker = InFlightRequestTracker::new();
+            let admitted = async {
+                tokio::time::sleep(secs(6)).await;
+                let (call, _gate) = a_mutation_at_its_gate(&tracker);
+                drop(call);
+            };
+            let (times, ()) = tokio::join!(
+                exit(&tracker, budget, WayOut::Signal, secs(closing)),
+                admitted
+            );
+            assert_eq!(
+                times,
+                (secs(5 + closing), secs(30)),
+                "closing in {closing} s"
+            );
+            said.push(said_so_far());
+        }
+        // A mutation in flight from the start never answers: the shutdown
+        // task's own drain runs to the deadline.
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let times = exit(&tracker, budget, WayOut::Signal, Duration::ZERO).await;
+        assert_eq!(times, (secs(5), secs(30)));
+        said.push(said_so_far());
+        assert_eq!(
+            said,
+            [1, 2, 3],
+            "the drain lines after each exit: one more every time"
+        );
+    }
+
+    /// A mutation that answers inside the settle window holds nothing: the
+    /// exit ends with the listeners, takes no drain wait and writes no drain
+    /// line.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_mutation_that_answers_inside_the_settle_window_holds_nothing() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let tracker = InFlightRequestTracker::new();
+        let (call, gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let answered = async {
+            tokio::time::sleep(secs(3)).await;
+            gate.notify_one();
+        };
+        let signal = exit(&tracker, budget, WayOut::Signal, secs(2));
+        let (times, ()) = tokio::join!(signal, answered);
+        assert_eq!(times, (secs(7), secs(7)));
+        assert!(!logs_contain("Drain timed out"));
+    }
+
+    /// Work admitted after the shutdown task's drain ended that answers
+    /// before the deadline is waited for, and nothing is said of it: the
+    /// exit ends at its answer.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn work_that_ends_before_the_deadline_is_waited_for_and_not_said() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let tracker = InFlightRequestTracker::new();
+        // Admitted at 6 s, after the task's drain ended on an empty count;
+        // it answers at 12 s. The listeners close in 2 s.
+        let admitted = async {
+            tokio::time::sleep(secs(6)).await;
+            let (call, gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::time::sleep(secs(6)).await;
+            gate.notify_one();
+        };
+        let signal = exit(&tracker, budget, WayOut::Signal, secs(2));
+        let (times, ()) = tokio::join!(signal, admitted);
+        assert_eq!(times, (secs(7), secs(12)));
+        assert!(!logs_contain("Drain timed out"));
+    }
+
     /// A leave of the mesh that takes `leaving`, and the read of when it
     /// began, counted from now: `None` while it has not.
     fn a_leave_taking(
@@ -4222,7 +4339,7 @@ mod tests {
             clippy::disallowed_methods,
             reason = "the stand-in for the shutdown task `startup` spawns; its signal never comes"
         )]
-        let shutdown = spawn(std::future::pending::<tokio::time::Instant>());
+        let shutdown = spawn(std::future::pending::<Option<tokio::time::Instant>>());
         let exit = serve_until_drained(
             data,
             no_admin,
