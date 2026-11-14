@@ -13,6 +13,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 
+use crate::common::describe_error;
+
 // ============================================================================
 // Shared helpers
 // ============================================================================
@@ -741,7 +743,7 @@ impl Failure {
     pub fn pool(error: &dyn std::error::Error) -> Self {
         Self::Unavailable(format!(
             "no connection from the pool: {}",
-            crate::common::describe_error(error)
+            describe_error(error)
         ))
     }
 
@@ -773,7 +775,7 @@ impl Failure {
     /// read-only standby after a failover (`25006`). Any other server answer
     /// (a constraint, a refused statement) is the store's own.
     pub fn postgres(error: &tokio_postgres::Error) -> Self {
-        let text = crate::common::describe_error(error);
+        let text = describe_error(error);
         let Some(db) = error.as_db_error() else {
             return Self::Unavailable(text);
         };

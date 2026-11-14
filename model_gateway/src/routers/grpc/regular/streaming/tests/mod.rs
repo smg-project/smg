@@ -20,7 +20,7 @@ mod thinking_display;
 mod usage;
 mod usage_chunk;
 
-use super::*;
+use super::{frames::TextDelta, *};
 
 /// The frames write exactly the bytes of the serialized whole chunk
 /// structs, so a field added to a struct turns up here, not on the wire
@@ -41,23 +41,37 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
             logprobs: None,
             finish_reason: Some("stop".to_string()),
         };
-        let frame = CompletionChunkFrame::new("cmpl-1", "model-x", 1_700_000_000, fingerprint);
-        let mut buffer = BytesMut::new();
-        frame.write_chunk(&mut buffer, &choice);
         let whole = CompletionStreamResponse {
             id: "cmpl-1".to_string(),
             object: "text_completion".to_string(),
             created: 1_700_000_000,
-            choices: vec![choice],
+            choices: vec![choice.clone()],
             model: "model-x".to_string(),
             system_fingerprint: fingerprint.map(str::to_string),
             usage: None,
         };
-        assert_eq!(
-            event(&buffer),
-            serde_json::to_vec(&whole).unwrap(),
-            "completion, fingerprint {fingerprint:?}"
-        );
+        for usage_null_placeholder in [false, true] {
+            let frame = CompletionChunkFrame::new(
+                "cmpl-1",
+                "model-x",
+                1_700_000_000,
+                fingerprint,
+                usage_null_placeholder,
+            );
+            let mut buffer = BytesMut::new();
+            frame.write_chunk(&mut buffer, &choice);
+            // The placeholder goes where a serialized `usage` would: last.
+            let mut expected = serde_json::to_vec(&whole).unwrap();
+            if usage_null_placeholder {
+                expected.pop();
+                expected.extend_from_slice(b",\"usage\":null}");
+            }
+            assert_eq!(
+                event(&buffer),
+                expected,
+                "completion, fingerprint {fingerprint:?}, placeholder {usage_null_placeholder}"
+            );
+        }
 
         let choice = assistant_choice(0, Some("tok".to_string()), None, None);
         let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, fingerprint);
@@ -126,7 +140,10 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
                 "\u{0}\u{1f}\u{7f}",
             ] {
                 let choice = bare(index, field, text);
-                assert_eq!(text_delta(&choice), Some((field, text)));
+                let (read_field, read_text, read_logprobs) =
+                    text_delta(&choice).expect("a bare text delta");
+                assert_eq!((read_field, read_text), (field, text));
+                assert!(read_logprobs.is_none());
                 for (usage, emit_usage_null) in [
                     (None, false),
                     (None, true),
@@ -156,22 +173,155 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
 
     let mut finished = bare(0, TextDelta::Content, "x");
     finished.finish_reason = Some(Cow::Borrowed("stop"));
-    assert_eq!(text_delta(&finished), None, "a finished choice");
+    assert!(text_delta(&finished).is_none(), "a finished choice");
     let mut stopped = bare(0, TextDelta::Content, "x");
     stopped.matched_stop = Some(serde_json::json!(7));
-    assert_eq!(text_delta(&stopped), None, "a matched stop");
+    assert!(text_delta(&stopped).is_none(), "a matched stop");
     let mut with_role = bare(0, TextDelta::Content, "x");
     with_role.delta.role = Some(Cow::Borrowed("assistant"));
-    assert_eq!(text_delta(&with_role), None, "a role");
+    assert!(text_delta(&with_role).is_none(), "a role");
     let mut with_call = bare(0, TextDelta::Content, "x");
     with_call.delta.tool_calls = Some(vec![]);
-    assert_eq!(text_delta(&with_call), None, "tool calls");
+    assert!(text_delta(&with_call).is_none(), "tool calls");
     let mut both = bare(0, TextDelta::Content, "x");
     both.delta.reasoning_content = Some(Cow::Borrowed("y"));
-    assert_eq!(text_delta(&both), None, "two texts");
+    assert!(text_delta(&both).is_none(), "two texts");
     let mut neither = bare(0, TextDelta::Content, "x");
     neither.delta.content = None;
-    assert_eq!(text_delta(&neither), None, "no text");
+    assert!(text_delta(&neither).is_none(), "no text");
+}
+
+/// A bare text delta carrying the token's logprobs, written in one pass, is
+/// byte for byte the serialized choice: tokens with every escape, byte lists
+/// of one to eight bytes and none, logprobs that are negative, zero, whole,
+/// tiny, large and not finite, no candidates, a refusal list, a null content
+/// and a raw logprobs value; over both text fields, texts that need escaping
+/// and the usage tail's three shapes.
+#[test]
+fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
+    use std::borrow::Cow;
+
+    use openai_protocol::{
+        chat::{ChatMessageDeltaRef, ChatStreamChoiceRef},
+        common::{ChatLogProbs, ChatLogProbsContent, TopLogProb},
+    };
+
+    fn entry(
+        token: &str,
+        logprob: f32,
+        bytes: Option<&[u8]>,
+        candidates: &[(&str, f32, Option<&[u8]>)],
+    ) -> ChatLogProbsContent {
+        ChatLogProbsContent {
+            token: token.to_string(),
+            logprob,
+            bytes: bytes.map(<[u8]>::to_vec),
+            top_logprobs: candidates
+                .iter()
+                .map(|&(token, logprob, bytes)| TopLogProb {
+                    token: token.to_string(),
+                    logprob,
+                    bytes: bytes.map(<[u8]>::to_vec),
+                })
+                .collect(),
+        }
+    }
+    let utf8 = |text: &'static str| -> Option<&'static [u8]> { Some(text.as_bytes()) };
+    let raw_bytes: &[u8] = &[0, 31, 255, 128, 100, 10, 9, 1];
+    let none_bytes: Option<&[u8]> = None;
+    let empty_bytes: Option<&[u8]> = Some(&[]);
+    let shapes = [
+        ChatLogProbs::Detailed {
+            content: Some(vec![
+                entry(
+                    "he",
+                    -0.125,
+                    utf8("he"),
+                    &[
+                        ("he", -0.125, utf8("he")),
+                        ("she", -1.5, utf8("she")),
+                        ("\"q\"", -2.0, utf8("\"q\"")),
+                        ("\\", -3.25, none_bytes),
+                        ("\n", -1e-7, utf8("\n")),
+                    ],
+                ),
+                entry(" \u{1F642}", -0.0, utf8(" \u{1F642}"), &[]),
+                entry(
+                    "\u{0}\u{1f}",
+                    f32::NEG_INFINITY,
+                    Some(raw_bytes),
+                    &[("x", f32::NAN, utf8("x")), ("y", 1234.5678, none_bytes)],
+                ),
+                entry("", 0.0, empty_bytes, &[("", f32::INFINITY, empty_bytes)]),
+            ]),
+            refusal: None,
+        },
+        ChatLogProbs::Detailed {
+            content: None,
+            refusal: Some(vec![entry(
+                "no",
+                -0.5,
+                utf8("no"),
+                &[("no", -0.5, utf8("no"))],
+            )]),
+        },
+        ChatLogProbs::Detailed {
+            content: None,
+            refusal: None,
+        },
+        ChatLogProbs::Raw(serde_json::json!({
+            "content": [{"token": "t", "logprob": -1.0}],
+            "extra": [1, "two", null]
+        })),
+    ];
+    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
+    for logprobs in shapes {
+        for field in [TextDelta::Content, TextDelta::Reasoning] {
+            for text in ["a", "he said \"hi\" \\ done", "\u{1F642} ünïcödé", ""] {
+                let choice = ChatStreamChoiceRef {
+                    index: 3,
+                    delta: ChatMessageDeltaRef {
+                        role: None,
+                        content: (field == TextDelta::Content).then_some(Cow::Borrowed(text)),
+                        tool_calls: None,
+                        reasoning_content: (field == TextDelta::Reasoning)
+                            .then_some(Cow::Borrowed(text)),
+                    },
+                    logprobs: Some(logprobs.clone()),
+                    finish_reason: None,
+                    matched_stop: None,
+                };
+                let Some((read_field, read_text, Some(read_logprobs))) = text_delta(&choice) else {
+                    panic!("a bare delta with logprobs reads as one: {field:?} {text:?}");
+                };
+                assert_eq!((read_field, read_text), (field, text));
+                for (usage, emit_usage_null) in [
+                    (None, false),
+                    (None, true),
+                    (Some(Usage::from_counts(3, 2)), false),
+                ] {
+                    let mut expected = BytesMut::new();
+                    frame.write_chunk(&mut expected, &choice, usage.as_ref(), emit_usage_null);
+                    let mut got = BytesMut::new();
+                    frame.write_text_delta_logprobs(
+                        &mut got,
+                        3,
+                        field,
+                        text,
+                        read_logprobs,
+                        usage.as_ref(),
+                        emit_usage_null,
+                    );
+                    assert_eq!(
+                        got,
+                        expected,
+                        "{field:?} {text:?} usage {} placeholder {emit_usage_null}",
+                        usage.is_some()
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A generate event written from the choice's escaped text is byte for byte
@@ -290,7 +440,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
             },
         ));
     }
-    let usage = serde_json::to_value(tracker.snapshot(0)).unwrap();
+    let usage = serde_json::to_value(tracker.snapshot(0, None)).unwrap();
     assert_eq!(usage["prompt_tokens"], 10);
     assert_eq!(usage["completion_tokens"], 9);
     assert_eq!(usage["total_tokens"], 19);
@@ -307,7 +457,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 3,
         ..Default::default()
     }));
-    let usage = tracker.snapshot(0);
+    let usage = tracker.snapshot(0, None);
     assert_eq!(usage.completion_tokens, 10);
     let details = usage.completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(2));
@@ -321,7 +471,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 1,
         ..Default::default()
     }));
-    let details = tracker.snapshot(0).completion_tokens_details.unwrap();
+    let details = tracker.snapshot(0, None).completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(3));
     assert_eq!(details.rejected_prediction_tokens, Some(1));
 }
@@ -340,7 +490,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             },
         ));
     }
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
     tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
         proto::GenerateComplete {
             prompt_tokens: 10,
@@ -348,7 +498,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             ..Default::default()
         },
     )));
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
 }
 
 /// Wire contract: cache counters serialize as integer zeros, never null,
@@ -614,5 +764,77 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
     assert_eq!(
         formatted(&stop),
         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"
+    );
+}
+
+/// The chat writer stops at the flush bound and resumes: a step of many
+/// events (content and reasoning in turns, since consecutive content events
+/// merge on push) is written by calls that each return at the bound, the
+/// caller splitting the frame off between them, and the frames hold every
+/// event's text in order, each frame at most the bound plus the event that
+/// crossed it.
+#[test]
+fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
+    const EVENTS: usize = 600;
+    const ONE_EVENT: usize = 1024;
+    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
+    let texts: Vec<String> = (0..EVENTS)
+        .map(|i| {
+            format!(
+                "{}{i:04}-{}",
+                if i % 2 == 0 { 'c' } else { 'r' },
+                "x".repeat(40)
+            )
+        })
+        .collect();
+    let mut events = Events::new();
+    for (i, text) in texts.iter().enumerate() {
+        let text = symphony::event::Text::new(text.as_str(), 1);
+        if i % 2 == 0 {
+            events.push(Event::Content(text));
+        } else {
+            events.push(Event::Reasoning(text));
+        }
+    }
+    let mut buffer = BytesMut::new();
+    let mut logprobs = None;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut pending = events.consume();
+    while StreamingProcessor::write_events(
+        &mut buffer,
+        &frame,
+        0,
+        &mut pending,
+        &mut logprobs,
+        None,
+        false,
+    ) {
+        assert!(
+            buffer.len() >= CHUNK_FLUSH_BYTES && buffer.len() < CHUNK_FLUSH_BYTES + ONE_EVENT,
+            "the writer returned at the bound: {} bytes",
+            buffer.len()
+        );
+        frames.push(buffer.split().to_vec());
+    }
+    drop(pending);
+    frames.push(buffer.split().to_vec());
+    assert!(
+        frames.len() > 2,
+        "the step left in more than two frames: {}",
+        frames.len()
+    );
+    let all: Vec<u8> = frames.concat();
+    let mut at = 0;
+    for text in &texts {
+        let found = all[at..]
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .unwrap_or_else(|| panic!("{text} missing or out of order"));
+        at += found + text.len();
+    }
+    assert_eq!(
+        all.windows(6).filter(|&window| window == b"data: ").count(),
+        EVENTS,
+        "every event left exactly once across the flushes"
     );
 }

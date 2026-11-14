@@ -19,11 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use jsonwebtoken::{
-    decode, decode_header,
-    jwk::{AlgorithmParameters, Jwk},
-    Algorithm, DecodingKey, TokenData, Validation,
-};
+use jsonwebtoken::{decode, decode_header, Algorithm, TokenData, Validation};
 use lru::LruCache;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -31,11 +27,21 @@ use tracing::{debug, warn};
 
 use crate::{
     config::{JwtConfig, Role},
-    jwks::{JwksError, JwksProvider},
+    jwks::{self, JwksError, JwksProvider},
 };
 
 /// Default size for JTI cache (number of tokens to track)
 const DEFAULT_JTI_CACHE_SIZE: usize = 10_000;
+
+/// The key algorithms a token may be signed with; a token is decoded with its
+/// key's algorithm alone.
+const SUPPORTED_ALGORITHMS: [Algorithm; 5] = [
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+];
 
 /// Error types for JWT validation.
 #[derive(Debug, thiserror::Error)]
@@ -173,8 +179,10 @@ pub struct JwtValidator {
     /// JWT configuration
     config: JwtConfig,
 
-    /// Pre-configured validation settings
-    validation: Validation,
+    /// The validation settings per accepted key algorithm: the shared
+    /// settings (audience, issuer, leeway, `nbf`) with the one algorithm a
+    /// token's key requires, built once so a token's check copies nothing.
+    validations: Vec<(Algorithm, Validation)>,
 
     /// JTI cache for replay protection (optional)
     /// Maps JTI -> expiration time
@@ -191,29 +199,32 @@ impl JwtValidator {
         jwks_provider: Arc<JwksProvider>,
         enable_jti_check: bool,
     ) -> Self {
-        let mut validation = Validation::default();
+        let mut shared = Validation::default();
 
         // Set audience
-        validation.set_audience(&[&config.audience]);
+        shared.set_audience(&[&config.audience]);
 
         // Set issuer
-        validation.set_issuer(&[&config.issuer]);
+        shared.set_issuer(&[&config.issuer]);
 
         // Set leeway for clock skew
-        validation.leeway = config.leeway_secs;
+        shared.leeway = config.leeway_secs;
 
         // Enforce `nbf`: jsonwebtoken leaves it off by default, which let a token
         // minted for a future window through. Same leeway as `exp`; a token
         // without the claim is still accepted.
-        validation.validate_nbf = true;
+        shared.validate_nbf = true;
 
-        validation.algorithms = vec![
-            Algorithm::RS256,
-            Algorithm::RS384,
-            Algorithm::RS512,
-            Algorithm::ES256,
-            Algorithm::ES384,
-        ];
+        // One settings value per accepted algorithm, so a token's check borrows
+        // the one its key requires instead of copying the shared settings.
+        let validations = SUPPORTED_ALGORITHMS
+            .iter()
+            .map(|&algorithm| {
+                let mut validation = shared.clone();
+                validation.algorithms = vec![algorithm];
+                (algorithm, validation)
+            })
+            .collect();
 
         let jti_cache = if enable_jti_check {
             let cache_size = NonZeroUsize::new(DEFAULT_JTI_CACHE_SIZE).unwrap_or(NonZeroUsize::MIN);
@@ -225,7 +236,7 @@ impl JwtValidator {
         Self {
             jwks_provider,
             config,
-            validation,
+            validations,
             jti_cache,
             enable_jti_check,
         }
@@ -268,11 +279,16 @@ impl JwtValidator {
             kid, token_algorithm
         );
 
-        // Get the signing key
-        let jwk = self.jwks_provider.get_key(&kid).await?;
-
-        // Determine algorithm from JWK
-        let key_algorithm = Self::jwk_to_algorithm(&jwk)?;
+        // Get the signing key: the cached set's entry, its parsed form built
+        // when the set was fetched, borrowed for this check. The key's
+        // algorithm comes first (the parsed form's, or the conversion's for a
+        // key this validator cannot use), so the mismatch check below keeps
+        // its place before the key's conversion, as it had.
+        let key = self.jwks_provider.get_key(&kid).await?;
+        let key_algorithm = match &key.parsed {
+            Some(parsed) => parsed.algorithm,
+            None => jwks::key_algorithm(&key.jwk)?,
+        };
 
         // SECURITY: Verify token algorithm matches key algorithm
         // This prevents algorithm confusion attacks
@@ -287,15 +303,25 @@ impl JwtValidator {
             });
         }
 
-        // Create decoding key from JWK
-        let decoding_key = Self::jwk_to_decoding_key(&jwk)?;
+        // The decoding key: the parsed form's, or built here for a key without
+        // one (the conversion's error, after the mismatch check, as before).
+        let fresh;
+        let decoding_key = match &key.parsed {
+            Some(parsed) => &parsed.decoding_key,
+            None => {
+                fresh = jwks::decoding_key(&key.jwk)?;
+                &fresh
+            }
+        };
 
-        // Create validation with specific algorithm
-        let mut validation = self.validation.clone();
-        validation.algorithms = vec![key_algorithm];
-
-        // Decode and validate token
-        let token_data: TokenData<StandardClaims> = decode(token, &decoding_key, &validation)?;
+        // Decode and validate the token with the settings of its key's algorithm
+        let validation = self
+            .validations
+            .iter()
+            .find(|(algorithm, _)| *algorithm == key_algorithm)
+            .map(|(_, validation)| validation)
+            .ok_or(JwtValidatorError::UnsupportedAlgorithm(key_algorithm))?;
+        let token_data: TokenData<StandardClaims> = decode(token, decoding_key, validation)?;
 
         let claims = token_data.claims;
 
@@ -444,61 +470,6 @@ impl JwtValidator {
         Role::User
     }
 
-    /// Convert a JWK to a DecodingKey.
-    fn jwk_to_decoding_key(jwk: &Jwk) -> Result<DecodingKey, JwtValidatorError> {
-        match &jwk.algorithm {
-            AlgorithmParameters::RSA(rsa) => Ok(DecodingKey::from_rsa_components(&rsa.n, &rsa.e)?),
-            AlgorithmParameters::EllipticCurve(ec) => {
-                Ok(DecodingKey::from_ec_components(&ec.x, &ec.y)?)
-            }
-            AlgorithmParameters::OctetKey(_) => {
-                Err(JwtValidatorError::UnsupportedAlgorithm(Algorithm::HS256))
-            }
-            AlgorithmParameters::OctetKeyPair(_) => {
-                Err(JwtValidatorError::UnsupportedAlgorithm(Algorithm::EdDSA))
-            }
-        }
-    }
-
-    /// Determine the algorithm from a JWK.
-    fn jwk_to_algorithm(jwk: &Jwk) -> Result<Algorithm, JwtValidatorError> {
-        // First check if algorithm is explicitly specified
-        if let Some(alg) = &jwk.common.key_algorithm {
-            return Ok(match alg {
-                jsonwebtoken::jwk::KeyAlgorithm::RS256 => Algorithm::RS256,
-                jsonwebtoken::jwk::KeyAlgorithm::RS384 => Algorithm::RS384,
-                jsonwebtoken::jwk::KeyAlgorithm::RS512 => Algorithm::RS512,
-                jsonwebtoken::jwk::KeyAlgorithm::ES256 => Algorithm::ES256,
-                jsonwebtoken::jwk::KeyAlgorithm::ES384 => Algorithm::ES384,
-                other => {
-                    return Err(JwtValidatorError::ValidationFailed(format!(
-                        "Unsupported key algorithm: {other:?}"
-                    )))
-                }
-            });
-        }
-
-        // Infer from key type
-        match &jwk.algorithm {
-            AlgorithmParameters::RSA(_) => Ok(Algorithm::RS256), // Default RSA to RS256
-            AlgorithmParameters::EllipticCurve(ec) => {
-                use jsonwebtoken::jwk::EllipticCurve;
-                match ec.curve {
-                    EllipticCurve::P256 => Ok(Algorithm::ES256),
-                    EllipticCurve::P384 => Ok(Algorithm::ES384),
-                    // Other curves not supported for ECDSA
-                    _ => Err(JwtValidatorError::ValidationFailed(format!(
-                        "Unsupported EC curve: {:?}",
-                        ec.curve
-                    ))),
-                }
-            }
-            _ => Err(JwtValidatorError::ValidationFailed(
-                "Cannot determine algorithm from key".to_string(),
-            )),
-        }
-    }
-
     /// Get a reference to the JWT config.
     pub fn config(&self) -> &JwtConfig {
         &self.config
@@ -523,7 +494,7 @@ pub(crate) mod test_support {
         traits::PublicKeyParts,
         RsaPrivateKey,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tokio::net::TcpListener;
 
     use super::JwtValidator;
@@ -537,7 +508,7 @@ pub(crate) mod test_support {
     /// the public components are what the JWKS endpoint serves.
     struct TestKeyPair {
         private_key_pem: String,
-        jwk: serde_json::Value,
+        jwk: Value,
     }
 
     static TEST_KEYS: LazyLock<TestKeyPair> = LazyLock::new(|| {
@@ -560,13 +531,27 @@ pub(crate) mod test_support {
         }
     });
 
+    /// The module's RSA public components (`n`, `e`, base64url), for a key set
+    /// a test serves under its own `kid`s: a key the provider can parse.
+    pub(crate) fn rsa_components() -> (String, String) {
+        let jwk = &TEST_KEYS.jwk;
+        let field = |name: &str| jwk[name].as_str().unwrap_or_default().to_string();
+        (field("n"), field("e"))
+    }
+
     /// A validator with the default leeway, reading the test key set over loopback.
+    pub(crate) async fn validator() -> JwtValidator {
+        validator_over(vec![TEST_KEYS.jwk.clone()]).await
+    }
+
+    /// A validator with the default leeway, reading `keys` as its key set over
+    /// loopback.
     #[expect(
         clippy::disallowed_methods,
         reason = "the JWKS server lives exactly as long as the test"
     )]
-    pub(crate) async fn validator() -> JwtValidator {
-        let jwks = json!({ "keys": [TEST_KEYS.jwk.clone()] });
+    pub(crate) async fn validator_over(keys: Vec<Value>) -> JwtValidator {
+        let jwks = json!({ "keys": keys });
         let app = Router::new().route(
             "/jwks.json",
             get(move || {
@@ -617,10 +602,11 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use jsonwebtoken::errors::ErrorKind;
+    use jsonwebtoken::{encode, errors::ErrorKind, EncodingKey, Header};
+    use serde_json::json;
 
     use super::{
-        test_support::{now, token, validator, ISSUER},
+        test_support::{now, token, validator, validator_over, ISSUER},
         *,
     };
     use crate::jwks::test_support::discovery_server;
@@ -673,6 +659,36 @@ mod tests {
             assert_eq!(validated.subject, "alice");
             assert_eq!(validated.role, Role::Admin);
         }
+    }
+
+    #[tokio::test]
+    async fn a_token_of_another_algorithm_naming_an_unusable_key_reads_the_mismatch() {
+        // An octet key declaring RS256: its algorithm converts, its material
+        // does not, so the cached set keeps it without a parsed form. A token
+        // of another algorithm naming it reads the mismatch (and its warning),
+        // not the conversion's error: the check keeps its place before the
+        // key's conversion.
+        let validator = validator_over(vec![json!({
+            "kty": "oct", "alg": "RS256", "kid": "oct-1", "k": "c2VjcmV0",
+        })])
+        .await;
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("oct-1".to_string());
+        let claims = json!({ "iss": ISSUER, "aud": "smg", "sub": "alice", "exp": now() + 3600 });
+        let token = encode(&header, &claims, &EncodingKey::from_secret(b"secret")).unwrap();
+
+        let err = validator.validate(&token).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                JwtValidatorError::AlgorithmMismatch {
+                    token_alg: Algorithm::HS256,
+                    key_alg: Algorithm::RS256,
+                }
+            ),
+            "expected the mismatch, got {err:?}"
+        );
     }
 
     #[tokio::test]

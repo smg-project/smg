@@ -167,6 +167,7 @@ mod tests {
     use super::*;
     use crate::{
         config::RlConfig,
+        router,
         testing::{worker, FakeEngine, FakeView},
     };
 
@@ -187,7 +188,7 @@ mod tests {
     async fn all_success_is_200_and_each_engine_called_once() {
         let e1 = FakeEngine::start(StatusCode::OK, json!({"ok": 1}), 0).await;
         let e2 = FakeEngine::start(StatusCode::OK, json!({"ok": 2}), 0).await;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![
                 worker("w1", &e1.url, RuntimeType::Sglang),
                 worker("w2", &e2.url, RuntimeType::Sglang),
@@ -228,7 +229,7 @@ mod tests {
         let mut grpc = worker("g1", &format!("{}/grpc", good.url), RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
         grpc.control_url = None;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![
                 worker("w1", &good.url, RuntimeType::Sglang),
                 worker("w2", &bad.url, RuntimeType::Sglang),
@@ -279,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn selector_errors_are_400() {
         let e = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
-        let app = crate::router::<()>(state(vec![worker("w1", &e.url, RuntimeType::Sglang)], 8));
+        let app = router::<()>(state(vec![worker("w1", &e.url, RuntimeType::Sglang)], 8));
 
         let r = app
             .clone()
@@ -330,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn dp_ranks_collapse_to_one_call_and_url_selector_targets_one() {
         let e = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![
                 worker("r0", &format!("{}@0", e.url), RuntimeType::Sglang),
                 worker("r1", &format!("{}@1", e.url), RuntimeType::Sglang),
@@ -362,7 +363,7 @@ mod tests {
             })
             .collect();
         // base_url differs per worker (path suffix) so they are 6 targets on one engine.
-        let app = crate::router::<()>(state(workers, 2));
+        let app = router::<()>(state(workers, 2));
         let r = app
             .oneshot(
                 Request::post("/engine/pause?selector=engine%3Dsglang")
@@ -396,7 +397,7 @@ mod tests {
         use crate::testing::{zmq_worker, FakeCalls};
 
         let (a, b) = (FakeCalls::succeeding(2), FakeCalls::succeeding(1));
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![zmq_worker("z1", a.clone()), zmq_worker("z2", b.clone())],
             8,
         ));

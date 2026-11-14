@@ -42,7 +42,7 @@ the same values without coordination.
 
 ```
 model_gateway (model_gateway/src/mesh): adapters that bridge MeshKV
-namespaces to the worker registry, the rate limiter and the prefix tree
+namespaces to the worker registry and the prefix tree
         │
         ▼
 service.rs        MeshServerBuilder / MeshServer / MeshServerHandler:
@@ -115,7 +115,7 @@ The gateway wires these (`model_gateway/src/mesh/wiring.rs`):
 | Prefix | Kind, merge | Content | Gateway adapter |
 |---|---|---|---|
 | `worker:` | CRDT, last writer wins | `WorkerState` of every worker a member registered locally (id, model, URL, health, load, spec, owner); a tombstone when it is removed. Peers import them into their worker registry. | `adapters/worker_sync.rs` |
-| `rl:` | CRDT, epoch-max-wins | One rate-limit shard per member and counter (`rl:<counter>:<node>`): a window epoch and a count; totals are the sum of the shards at the newest epoch. | `adapters/rate_limit_sync.rs` |
+| `rl:` | CRDT, epoch-max-wins | One rate-limit shard per member and counter (`rl:<counter>:<node>`): a window epoch and a count; totals are the sum of the shards at the newest epoch. The engine is available to the embedding application; the gateway registers no `rl:` namespace today (its rate limits are per gateway). | — |
 | `config:` | CRDT, last writer wins | Built into every `MeshKV` for the embedding application; the gateway writes nothing there today. | — |
 | `td:` | stream, broadcast | Per-model deltas of the cache-aware prefix tree, one entry per model and round. | `adapters/tree_sync.rs` |
 | `tree:req:`, `tree:page:` | stream, targeted | Repair requests for a prefix a member does not know, and the pages answering them, each sent to one peer. | `adapters/tree_sync.rs` |

@@ -52,8 +52,8 @@ pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use format::{CallId, CallSyntax, Emits, Format, Whitespace};
 pub use grammar::{
-    Bound, Grammar, GrammarStart, Output, OutputAnswer, OutputChoice, OutputPosition,
-    OutputSpelling, Tag, Turn,
+    Bound, Grammar, GrammarBackend, GrammarStart, Output, OutputAnswer, OutputChoice,
+    OutputPosition, OutputSpelling, Spelling, Tag, Turn, Unspelled,
 };
 pub use ids::CallIds;
 pub use input::{EngineFinish, Input, TokenSpan};

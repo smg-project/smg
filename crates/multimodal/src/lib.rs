@@ -68,6 +68,7 @@ pub(crate) mod test_support {
 
     use crate::{
         audio::DecodedAudio,
+        jpeg_turbo::{turbojpeg_available, turbojpeg_reads_warnings},
         vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs},
     };
 
@@ -91,7 +92,7 @@ pub(crate) mod test_support {
         reason = "a skip says so; the harness shows it under --nocapture"
     )]
     pub(crate) fn turbojpeg_or_skip(test: &str) -> bool {
-        if crate::jpeg_turbo::turbojpeg_available() {
+        if turbojpeg_available() {
             return true;
         }
         let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());
@@ -116,7 +117,7 @@ pub(crate) mod test_support {
         if !turbojpeg_or_skip(test) {
             return false;
         }
-        if crate::jpeg_turbo::turbojpeg_reads_warnings() {
+        if turbojpeg_reads_warnings() {
             return true;
         }
         let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());

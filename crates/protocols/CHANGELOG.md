@@ -6,12 +6,30 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
+  a caller that owns a Messages request's tools converts them into chat tools without copying the
+  schemas (the properties and the additional fields move in); the by-reference forms stay for a
+  caller that keeps its tools and copy once, as before.
+- `MessagesBetas`, beside `CreateMessageRequest`: the betas a Messages request names in its
+  `anthropic-beta` header, read once from the header's values as the public API names them (the
+  dated form `name-YYYY-MM-DD`; a header that repeats or lists several; a longer name that begins
+  with a known one is another beta), with `values_name` for a reader that keeps no set; and
+  `validate_with_betas`, the request rules that read a beta beside the body
+  (`thinking.budget_tokens` under `max_tokens` unless the interleaved-thinking beta is named;
+  `thread` only with the message-threads beta), refused with the codes and messages the gateway's
+  Messages route answered before. That route reads both through a typed header extractor, and the
+  external router's beta reading shares the grammar.
 - `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
   transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
   handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
   one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
   `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
   read it.
+- `Usage::with_image_tokens`: the prompt's image token count reported as
+  `prompt_tokens_details.image_tokens`, kept within `prompt_tokens`; `None` leaves the details as
+  they are. The gateway's chat route reports the tokens its own multimodal expansion wrote into
+  the prompt for the request's images, on the non-streamed answer and the final usage chunk
+  alike; a request without such an image answers as before.
 - `ValidatedQuery<T>` and `ValidatedPath<T>`, behind the `axum` feature: a route's query string
   and path segments read as the typed routes' body extractor reads a body. A query value the type
   does not take, one that does not parse or a required one that is missing, and a path segment
@@ -29,12 +47,26 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- Breaking: `normalize_input_item` takes the item by value. A bare `{role, content}` message moves
+  its content and role into the message item built from it, and every other item comes back as it
+  was passed, so a caller that owns its input no longer copies each item; a caller holding a
+  reference passes `item.clone()`, which costs what the old signature did.
+- `ContentPart`: a part whose `type` names a kind the gateway knows (`text`, `image_url`,
+  `audio_url`, `input_audio`, `video_url`, `refusal`) but whose body does not fit it is refused with
+  serde's reason for the field (`400`, `error.code` `invalid_type`, `integer_below_min_value` or
+  `missing_required_parameter`, `error.param` the message's path, extended by the missing field's
+  path when a field is the one missing) instead of reading as an unknown part, which the gRPC
+  routes refused as an unsupported part type and the HTTP relay passed through.
+- `MessageContent`: a part's refusal reaches the request's error under the part's place
+  (`` missing field `content[1].image_url.url` ``, `` ..., in `content[1].image_url` ``) instead of
+  the untagged read's generic words (`data did not match any variant of untagged enum
+  MessageContent`), so `error.code` and `error.param` are the field's.
 - `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
   `identity`, in whichever field of a repeated header or position of a comma-separated list it
   stands) before it reads the body, as a `415` in the gateway's JSON error envelope (`error.code`
-  `json_parse_error`, the encoding named in the message) with `Accept-Encoding: identity`; it
-  parsed the compressed bytes as JSON and
-  refused them as a `400` with a syntax error. `undecodable_content_encoding`,
+  `json_parse_error`, the encoding named in the message, at most 64 characters of it, a longer
+  one cut and marked with `...`) with `Accept-Encoding: identity`; it parsed the compressed bytes
+  as JSON and refused them as a `400` with a syntax error. `undecodable_content_encoding`,
   `content_encoding_message` and `with_accept_encoding_identity`, behind the `axum` feature, are
   the header's reading, the message and the answer's header, shared with the gateway's
   control-plane JSON extractor, which answers the same.
@@ -85,6 +117,36 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages request's Anthropic-defined tools keep their configuration when the request is
+  written back for an upstream: a web search or web fetch tool's domain filters, use cap and
+  location, a computer tool's display size, a text editor's `max_characters`, and any tool's
+  `defer_loading`, `strict` or `input_examples`. The untagged `Tool` reads every tool with a
+  `type` and a `name` and no `input_schema` as `ToolSearch`, which kept only those two keys,
+  `allowed_callers` and `cache_control`, so the provider route dropped the rest. Breaking:
+  `ToolSearchTool` gains `extra: Map<String, Value>`.
+- An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
+  writes it, parses, with no completion tokens. The crate refused the whole answer with
+  ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
+  read the same way; a usage the gateway writes is unchanged.
+- `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
+  `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
+  "input_image" in a function output for text-only backends: only text parts are carried as a tool
+  result`, where every such part answered the one fixed message `Multimodal function output is not
+  supported by this text-only backend`. The gateway's `400 unsupported_content_part` for a function
+  output now names the part, as the same route's refusal of a message part does; the code and the
+  status are unchanged.
+  The message reaches a client on both routes that read it: the chat-family Responses conversion
+  (`400 unsupported_content_part`) and the Harmony builder's tool message
+  (`400 harmony_build_failed`).
+- The generate route's request rule refuses an empty `text` under `prompt_empty` only when the body
+  has no `input_ids` and no media field carries an item (beside ids the engine serves the ids without
+  reading the text; a media-only prompt is sent with an empty `text`, as the engine reads it);
+  a body with two prompts (two of `text`, `input_ids` and `input_embeds`) is served, the engine
+  taking the ids over the text (and the embeds only without a text), and the gateway's gRPC
+  generate path now reads the ids before the text too, where it read the text first and dropped
+  the ids without a word. The
+  request's media read (`GenerateRequest::media_fields`, `carries_media`) is one definition here,
+  read by the gRPC path's media refusal as well.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
@@ -117,7 +179,18 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   answer the gateway's JSON error envelope (`400`, with `error.code` and `error.param`) where
   axum's own text/plain `422`, `415` and `400` answered before. `V1RerankReqInput` refuses an
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
-  its `top_n` keeps reading `0` as all documents. The four other types declare no rule.
+  its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
+  declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
+  an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
+  member of another kind than the first is refused by its index), and `EmbeddingRequest` the
+  API's bound on `dimensions` (at least one), so the gateway refuses the shapes the API refuses
+  in its error envelope with the field in `error.param` (`empty_array`, `empty_input`,
+  `invalid_type`, `integer_below_min_value`) before a worker sees them, on the gRPC path and the
+  HTTP relay alike. `validate_input` is the classify route's rule and the base of the embeddings
+  route's (`validate_embedding_input`), which also takes the serving engine's array of objects, a
+  structured member each, forwarded with no field of them read. The rule reads shape only: a
+  batch's length, the `encoding_format` and the objects' fields are the serving engine's to bound.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses

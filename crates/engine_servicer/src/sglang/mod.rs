@@ -34,6 +34,7 @@ mod embed;
 mod engine;
 mod generate;
 mod info;
+mod lora;
 mod media_identity;
 mod service;
 #[cfg(test)]
@@ -51,7 +52,7 @@ use tonic::service::Routes;
 use crate::{
     engine_link::EngineLink,
     health_probe,
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads},
     metrics::{Identity, ServicerMetrics},
     proto_json,
     servicer::{self, Shared, WireState},
@@ -282,16 +283,13 @@ impl std::fmt::Debug for SglangServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         // A connected rank reads its own entry (zero-filled until its first
         // load tail), never another rank's figures; a rank past the
         // connected ones gets no record.
         let load = info::rank_load(self, dp_rank)?;
-        Some(crate::kv_events::record_with_queue(
-            &load,
-            load.num_waiting_uncached_tokens,
-        ))
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {
@@ -305,6 +303,7 @@ impl crate::kv_events::RankLoads for State {
 
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
+    loras: lora::PreloadedLoras,
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
@@ -412,6 +411,7 @@ impl SglangServicerServer {
                         .map(str::to_owned)
                 });
         let state = Arc::new(State {
+            loras: lora::PreloadedLoras::from_server_args(&config.model.server_args_json)?,
             media_identity_key,
             media_disaggregation_mode,
             model: config.model,

@@ -92,6 +92,7 @@ use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, ConsulDiscoveryConfig, RoutingMode},
     observability::metrics::metrics_labels,
+    server::http_client_builder,
     worker::{http_client::build_client, EndpointKey},
 };
 
@@ -357,7 +358,7 @@ impl ConsulProviderConfig {
                 format!("CONSUL_CLIENT_CERT and CONSUL_CLIENT_KEY do not parse: {error}")
             })?;
         let make_builder = || {
-            let mut builder = crate::server::http_client_builder()
+            let mut builder = http_client_builder()
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none());
             if https {

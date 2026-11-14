@@ -32,7 +32,7 @@
 
 use tokio_postgres::GenericClient;
 
-use crate::schema::SchemaConfig;
+use crate::{common::describe_error, schema::SchemaConfig};
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -514,7 +514,7 @@ pub async fn run_postgres_migrations(
                     "migration v{} ({}) failed: {}",
                     migration.version,
                     migration.description,
-                    crate::common::describe_error(&e)
+                    describe_error(&e)
                 )
             })?;
         }
@@ -529,7 +529,7 @@ pub async fn run_postgres_migrations(
             format!(
                 "failed to record migration v{}: {}",
                 migration.version,
-                crate::common::describe_error(&e)
+                describe_error(&e)
             )
         })?;
 
@@ -575,7 +575,7 @@ pub async fn stamp_postgres_versions(
                 format!(
                     "failed to record migration v{} on the fresh database: {}",
                     migration.version,
-                    crate::common::describe_error(&e)
+                    describe_error(&e)
                 )
             })?;
     }
@@ -599,7 +599,7 @@ pub async fn postgres_table_exists(
         .map_err(|e| {
             format!(
                 "failed to check for the {table} table: {}",
-                crate::common::describe_error(&e)
+                describe_error(&e)
             )
         })?;
     Ok(row.get(0))
@@ -616,7 +616,7 @@ pub(crate) async fn postgres_current_version(client: &impl GenericClient) -> Res
         .map_err(|e| {
             format!(
                 "failed to read current schema version: {}",
-                crate::common::describe_error(&e)
+                describe_error(&e)
             )
         })?;
 

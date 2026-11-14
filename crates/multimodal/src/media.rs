@@ -27,12 +27,17 @@ use tokio::{fs, io::AsyncReadExt, process::Command, task, time};
 use tracing::{info, warn};
 use url::Url;
 
+#[cfg(feature = "opencv-video")]
+use crate::opencv_buffer::{open_capture, BufferedCapture, RgbOutputBuffer};
 use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
-    types::TransparencyPolicy,
+    hasher::{hash_audio, hash_image_with_transparency, hash_video_with_sampling},
+    jpeg_turbo::{decode_jpeg_rgb, end_is_served, is_jpeg},
+    types::{ImageSize, TransparencyPolicy},
     video_seek::{FrameTable, SeekPlan, SeekSegment},
     vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
+    webp_native::decode_webp,
 };
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -313,8 +318,15 @@ impl Default for VideoFetchConfig {
 
 #[derive(Debug, Clone)]
 pub enum MediaSource {
-    Url(String),
-    DataUrl(String),
+    /// A URL fetched over the network, shared with the request.
+    Url(Arc<String>),
+    /// A `data:` URL, shared with the request.
+    DataUrl(Arc<String>),
+    /// Base64 text with its media type, read in place as a data URL's payload.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
     InlineBytes(Vec<u8>),
     File(PathBuf),
 }
@@ -323,12 +335,60 @@ pub enum MediaSource {
 /// it per fetch so later parts of the same request can be compared against
 /// it for deduplication, while the task reads it in place; inline bytes
 /// become `Bytes` so the frame keeps them without a copy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub(crate) enum FetchSource {
-    Url(String),
-    DataUrl(String),
+    Url(Arc<String>),
+    DataUrl(Arc<String>),
+    /// A base64 source: one payload with the data URL it stands for, so the
+    /// two forms compare, hash and measure alike.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
     InlineBytes(Bytes),
     File(PathBuf),
+}
+
+impl PartialEq for FetchSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Url(a), Self::Url(b)) | (Self::DataUrl(a), Self::DataUrl(b)) => a == b,
+            (Self::InlineBytes(a), Self::InlineBytes(b)) => a == b,
+            (Self::File(a), Self::File(b)) => a == b,
+            (
+                Self::Base64 {
+                    media_type: a_type,
+                    data: a_data,
+                },
+                Self::Base64 {
+                    media_type: b_type,
+                    data: b_data,
+                },
+            ) => a_type == b_type && a_data == b_data,
+            (Self::DataUrl(url), Self::Base64 { media_type, data })
+            | (Self::Base64 { media_type, data }, Self::DataUrl(url)) => {
+                base64_is_data_url(media_type, data, url)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The head of a data URL and the marker before its base64 payload.
+const DATA_URL_HEAD: &str = "data:";
+const DATA_URL_BASE64: &str = ";base64,";
+
+/// Whether the data URL `url` carries exactly `data` under `media_type`: the
+/// two forms of one payload.
+fn base64_is_data_url(media_type: &str, data: &str, url: &str) -> bool {
+    // A `,` in the media type would move the delimiter a data URL parser
+    // splits on: such a source is no twin of any data URL.
+    !media_type.contains(',')
+        && url
+            .strip_prefix(DATA_URL_HEAD)
+            .and_then(|rest| rest.strip_prefix(media_type))
+            .and_then(|rest| rest.strip_prefix(DATA_URL_BASE64))
+            .is_some_and(|payload| payload == data)
 }
 
 impl From<MediaSource> for FetchSource {
@@ -336,6 +396,7 @@ impl From<MediaSource> for FetchSource {
         match source {
             MediaSource::Url(url) => Self::Url(url),
             MediaSource::DataUrl(url) => Self::DataUrl(url),
+            MediaSource::Base64 { media_type, data } => Self::Base64 { media_type, data },
             MediaSource::InlineBytes(bytes) => Self::InlineBytes(Bytes::from(bytes)),
             MediaSource::File(path) => Self::File(path),
         }
@@ -343,30 +404,55 @@ impl From<MediaSource> for FetchSource {
 }
 
 impl FetchSource {
-    /// Which kind of source this is, as a small tag.
+    /// Which kind of source this is, as a small tag; a base64 source is the
+    /// data URL it stands for, unless its media type carries a `,`: that one
+    /// is no data URL's twin and keeps a kind of its own, so the fetch key
+    /// never puts the two in one bucket.
     pub(crate) fn kind(&self) -> u8 {
         match self {
             Self::Url(_) => 0,
-            Self::DataUrl(_) => 1,
+            Self::Base64 { media_type, .. } if media_type.contains(',') => 4,
+            Self::DataUrl(_) | Self::Base64 { .. } => 1,
             Self::InlineBytes(_) => 2,
             Self::File(_) => 3,
         }
     }
 
-    /// Length of the payload a part names (the URL, the data URL, the bytes,
-    /// or the path).
+    /// Length of the payload a part names (the URL, the data URL carried or
+    /// stood for, the bytes, or the path).
     pub(crate) fn len(&self) -> usize {
-        self.payload().len()
+        match self {
+            Self::Url(url) | Self::DataUrl(url) => url.len(),
+            Self::Base64 { media_type, data } => {
+                DATA_URL_HEAD.len() + media_type.len() + DATA_URL_BASE64.len() + data.len()
+            }
+            Self::InlineBytes(bytes) => bytes.len(),
+            Self::File(path) => path.as_os_str().len(),
+        }
     }
 
-    /// The payload a part names, as bytes: the URL, the data URL, the bytes,
-    /// or the path.
-    pub(crate) fn payload(&self) -> &[u8] {
+    /// The digest of the payload a part names, a base64 source digested as
+    /// its data URL without building it.
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
         match self {
-            Self::Url(url) | Self::DataUrl(url) => url.as_bytes(),
-            Self::InlineBytes(bytes) => bytes,
-            Self::File(path) => path.as_os_str().as_encoded_bytes(),
+            Self::Url(url) | Self::DataUrl(url) => {
+                hasher.update(url.as_bytes());
+            }
+            Self::Base64 { media_type, data } => {
+                hasher.update(DATA_URL_HEAD.as_bytes());
+                hasher.update(media_type.as_bytes());
+                hasher.update(DATA_URL_BASE64.as_bytes());
+                hasher.update(data.as_bytes());
+            }
+            Self::InlineBytes(bytes) => {
+                hasher.update(bytes);
+            }
+            Self::File(path) => {
+                hasher.update(path.as_os_str().as_encoded_bytes());
+            }
         }
+        hasher.finalize().into()
     }
 }
 
@@ -432,6 +518,7 @@ impl MediaConnector {
         match source {
             FetchSource::Url(url) => self.fetch_http_image(url, cfg).await,
             FetchSource::DataUrl(data_url) => Self::fetch_data_url(data_url, cfg),
+            FetchSource::Base64 { data, .. } => Self::fetch_base64(data, cfg),
             FetchSource::InlineBytes(bytes) => Self::decode_image(
                 bytes.clone(),
                 cfg.detail,
@@ -459,6 +546,7 @@ impl MediaConnector {
         match source {
             FetchSource::Url(url) => self.fetch_http_video(url, cfg).await,
             FetchSource::DataUrl(data_url) => self.fetch_video_data_url(data_url, cfg).await,
+            FetchSource::Base64 { data, .. } => self.fetch_video_base64(data, cfg).await,
             FetchSource::InlineBytes(bytes) => {
                 self.decode_video(bytes.clone(), cfg, VideoSource::InlineBytes)
                     .await
@@ -481,6 +569,7 @@ impl MediaConnector {
         match source {
             FetchSource::Url(url) => self.fetch_http_audio(url).await,
             FetchSource::DataUrl(data_url) => self.fetch_audio_data_url(data_url).await,
+            FetchSource::Base64 { data, .. } => self.fetch_audio_base64(data).await,
             FetchSource::InlineBytes(bytes) => {
                 self.decode_audio(bytes.clone(), AudioSource::InlineBytes)
                     .await
@@ -520,18 +609,16 @@ impl MediaConnector {
         data_url: &str,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+        Self::fetch_base64(data_url_payload(data_url)?, cfg)
+    }
 
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
+    /// An image from its base64 text, a data URL's payload or a base64
+    /// source: one bounded decode for both forms.
+    fn fetch_base64(
+        data: &str,
+        cfg: ImageFetchConfig,
+    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        let decoded = decode_base64_with_limit(data.trim(), image_max_input_bytes(), "image")?;
         Self::decode_image(
             decoded.into(),
             cfg.detail,
@@ -546,18 +633,16 @@ impl MediaConnector {
         data_url: &str,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+        self.fetch_video_base64(data_url_payload(data_url)?, cfg)
+            .await
+    }
 
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, video_max_input_bytes(), "video")?;
+    async fn fetch_video_base64(
+        &self,
+        data: &str,
+        cfg: VideoFetchConfig,
+    ) -> Result<Arc<VideoClip>, MediaConnectorError> {
+        let decoded = decode_base64_with_limit(data.trim(), video_max_input_bytes(), "video")?;
         self.decode_video(decoded.into(), cfg, VideoSource::DataUrl)
             .await
     }
@@ -566,18 +651,11 @@ impl MediaConnector {
         &self,
         data_url: &str,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+        self.fetch_audio_base64(data_url_payload(data_url)?).await
+    }
 
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, audio_max_input_bytes(), "audio")?;
+    async fn fetch_audio_base64(&self, data: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
+        let decoded = decode_base64_with_limit(data.trim(), audio_max_input_bytes(), "audio")?;
         self.decode_audio(decoded.into(), AudioSource::DataUrl)
             .await
     }
@@ -808,8 +886,7 @@ impl MediaConnector {
         // The cap and the transparency policy change the decoded pixels, so
         // both are part of the identity the pixel cache and the backend's mm
         // cache key off.
-        let hash =
-            crate::hasher::hash_image_with_transparency(&bytes, max_long_side_pixel, transparency);
+        let hash = hash_image_with_transparency(&bytes, max_long_side_pixel, transparency);
         // The header is enough to plan the request by; the pixels are decoded
         // when preprocessing first asks for them, which a pixel-cache hit
         // never does.
@@ -827,7 +904,7 @@ impl MediaConnector {
         source: AudioSource,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         ensure_input_byte_limit(bytes.len(), audio_max_input_bytes(), "audio")?;
-        let hash = crate::hasher::hash_audio(&bytes);
+        let hash = hash_audio(&bytes);
         let decoded = decode_audio_mono_f32(bytes.clone()).await?;
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
@@ -863,7 +940,7 @@ impl MediaConnector {
 
         // The sampling rate and the per-frame cap both change the decoded
         // frames, so they belong in the identity the caches key off.
-        let hash = crate::hasher::hash_video_with_sampling(
+        let hash = hash_video_with_sampling(
             &bytes,
             cfg.sample_fps,
             cfg.max_long_side_pixel,
@@ -1028,6 +1105,19 @@ fn checked_payload_length(
         .checked_add(additional)
         .filter(|length| *length <= limit)
         .ok_or(MediaConnectorError::PayloadTooLarge { media, limit })
+}
+
+/// The base64 payload of `data_url`, as every data URL fetch reads it.
+fn data_url_payload(data_url: &str) -> Result<&str, MediaConnectorError> {
+    let (metadata, data) = data_url
+        .split_once(',')
+        .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+    if !metadata.ends_with(";base64") {
+        return Err(MediaConnectorError::DataUrl(
+            "only base64 encoded data URLs are supported".into(),
+        ));
+    }
+    Ok(data)
 }
 
 fn decode_base64_with_limit(
@@ -1523,7 +1613,7 @@ impl OpenCvCaptureOwner for videoio::VideoCapture {
 }
 
 #[cfg(feature = "opencv-video")]
-impl OpenCvCaptureOwner for crate::opencv_buffer::BufferedCapture {
+impl OpenCvCaptureOwner for BufferedCapture {
     fn capture_mut(&mut self) -> &mut videoio::VideoCapture {
         self.capture_mut()
     }
@@ -1652,7 +1742,7 @@ where
             })?;
             ensure_decoded_byte_limit(decoded_bytes)?;
             rgb_output = Some(
-                crate::opencv_buffer::RgbOutputBuffer::with_capacity(decoded_bytes)
+                RgbOutputBuffer::with_capacity(decoded_bytes)
                     .map_err(MediaConnectorError::VideoDecode)?,
             );
         }
@@ -1721,8 +1811,8 @@ where
 fn open_opencv_video_capture_from_buffer(
     bytes: Bytes,
     decoder_threads: i32,
-) -> Result<crate::opencv_buffer::BufferedCapture, MediaConnectorError> {
-    crate::opencv_buffer::open_capture(bytes, decoder_threads).map_err(|error| {
+) -> Result<BufferedCapture, MediaConnectorError> {
+    open_capture(bytes, decoder_threads).map_err(|error| {
         MediaConnectorError::VideoDecode(format!("OpenCV could not open video buffer: {error}"))
     })
 }
@@ -4924,7 +5014,7 @@ pub(crate) fn decode_image_bytes(
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
-    let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
+    let mut image = match decode_jpeg_rgb(bytes) {
         Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
             oriented(image, jpeg_orientation(bytes))
@@ -4944,7 +5034,7 @@ pub(crate) fn decode_image_bytes(
             // on its own. The reading waits until here: a file the library
             // decoded clean reached a real end marker and pays no walk over
             // its data.
-            if crate::jpeg_turbo::is_jpeg(bytes) && !crate::jpeg_turbo::end_is_served(bytes) {
+            if is_jpeg(bytes) && !end_is_served(bytes) {
                 return Err(MediaConnectorError::Image(image::ImageError::Decoding(
                     image::error::DecodingError::new(
                         image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg),
@@ -4952,7 +5042,7 @@ pub(crate) fn decode_image_bytes(
                     ),
                 )));
             }
-            match crate::webp_native::decode_webp(bytes) {
+            match decode_webp(bytes) {
                 Some(image) => {
                     // libwebp yields pixels only; the tag comes from the file's
                     // metadata chunk, read as the fallback decoder reads it.
@@ -5231,7 +5321,7 @@ fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
 pub(crate) fn encoded_image_size(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
-) -> Result<crate::types::ImageSize, MediaConnectorError> {
+) -> Result<ImageSize, MediaConnectorError> {
     // The same entry the decode reads, so the two agree on an icon.
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -5250,7 +5340,7 @@ pub(crate) fn encoded_image_size(
     let (width, height) = max_long_side_pixel
         .and_then(|cap| capped_dimensions(width, height, cap))
         .unwrap_or((width, height));
-    Ok(crate::types::ImageSize::new(width, height))
+    Ok(ImageSize::new(width, height))
 }
 
 /// The EXIF orientation of a JPEG, from its header alone; absent or

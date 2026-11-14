@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main, release/** ]
     paths-ignore:
-      - "docs/**"
       - "*.md"
   pull_request:
     branches: [ main, release/** ]
@@ -427,6 +426,25 @@ jobs:
           source "$HOME/.cargo/env"
           bash crates/wasm/tests/fixtures/build_fixtures.sh
 
+      # The example policy plugin, built with the line a user runs (its
+      # build.sh: the bare wasm32 target of the pinned toolchain, then one
+      # wasm-tools command, here the pinned release). The policy crate's
+      # tests load the component that line wrote. The guest is a workspace
+      # of its own, which the repository's fmt and clippy do not reach, so
+      # the copy a user starts from is checked here: the repository's
+      # formatter (rustfmt runs on nightly) and the pinned toolchain's clippy.
+      - name: Build the example policy plugin
+        if: contains(matrix.needs, 'policy-guest')
+        run: |
+          source "$HOME/.cargo/env"
+          bash scripts/ci_install_wasm_tools.sh
+          export PATH="$HOME/.local/bin:$PATH"
+          bash examples/wasm/wasm-guest-policy/build.sh
+          cd examples/wasm/wasm-guest-policy
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          cargo +nightly fmt -- --check
+          cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings
+
       # --strict makes a fixture that fails to generate fail this step (the Rust
       # golden tests skip a missing fixture directory, so a silent skip here
       # would silently drop coverage). The step does not block the Rust tests,
@@ -484,6 +502,9 @@ jobs:
           # Where libjpeg-turbo is installed, the TurboJPEG decode tests must
           # run: a library that does not load fails them instead of skipping them.
           SMG_REQUIRE_TURBOJPEG: ${{ contains(matrix.needs, 'turbojpeg') && '1' || '' }}
+          # Where the example policy plugin is built, the tests that load it
+          # must run: a missing component fails them instead of skipping them.
+          SMG_REQUIRE_POLICY_GUEST: ${{ contains(matrix.needs, 'policy-guest') && '1' || '' }}
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
@@ -545,11 +566,8 @@ jobs:
   # first in a nightly image or a release build. This job lints the crates
   # with target-specific code and runs their tests on an arm64 runner
   # (GitHub-hosted, free for a public repository), on the pull requests the
-  # rust-lint job runs for. The cache key is the job's own: the action
-  # already keys by the runner's architecture, but this job's target
-  # directory holds another crate set and profile than the rust-tests shards',
-  # and the entry fills from the runs on main (the action saves on main
-  # only). The gateway binary's own AArch64 check
+  # rust-lint job runs for. The job keeps no Rust cache and builds cold
+  # (see its setup step). The gateway binary's own AArch64 check
   # (model_gateway/tests/startup/allocator_artifact_test.rs: jemalloc's 64 KiB page
   # setting) is not run here: it builds the smg binary, which the hosted
   # runner cannot afford on every pull request; it stays with the nightly
@@ -571,10 +589,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # No Rust cache: the entry took 0.6 GB of the repository's 10 GB cache,
+      # and after a restore of 45 s the job's steps ran as long as cold.
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: rust-aarch64
+          cache: 'false'
 
       - name: Lint the crates with AArch64-only code
         run: |
@@ -959,7 +979,16 @@ jobs:
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
               - 'crates/policy_controller/**'
+              - 'examples/wasm/wasm-guest-policy/**'
+              - 'scripts/ci_install_wasm_tools.sh'
               - 'crates/radix_tree/**'
+              - 'crates/grpc_client/**'
+              - 'crates/engine_zmq_client/**'
+              - 'crates/engine_zmq_adapter/**'
+              - 'crates/engine_servicer/**'
+              - 'crates/mock_worker/**'
+              - 'crates/protocols/**'
+              - 'crates/tokenizer/**'
             rust-radix:
               - *rust-infra
               - 'crates/radix_tree/**'
@@ -1114,7 +1143,6 @@ jobs:
               # documentation, licences, assets, lint and format configuration
               ("**/*.md",                                        NONE),
               ("**/LICENSE",                                     NONE),
-              ("docs/**",                                        NONE),
               ("assets/**",                                      NONE),
               (".gitignore",                                     NONE),
               (".dockerignore",                                  NONE),
@@ -1169,6 +1197,7 @@ jobs:
               ("scripts/oracle_flyway/**",                       "agentic vendor"),
               ("scripts/ci_cargo_audit.sh",                      NONE),
               ("scripts/ci_rust_tests.sh",                       NONE),
+              ("scripts/ci_install_wasm_tools.sh",               NONE),
               ("scripts/ci_gpu_runner_image.py",                 NONE),
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
@@ -1260,9 +1289,11 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
-              # the policy controller crate: linked by no binary yet (its gateway host is
-              # a later change, which moves this row to the core)
-              ("crates/policy_controller/**",                    NONE),
+              # the policy controller crate: linked by the gateway (the placement and
+              # selection types on every request, the load monitor's scrape reading); its
+              # engine decides behind --policy-engine engine alone, which no lane sets:
+              # the core
+              ("crates/policy_controller/**",                    CORE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path
@@ -2056,7 +2087,7 @@ jobs:
   # wire, decoding and parsing run against it on a CPU runner, no engine. Two
   # of the classes run on no other lane: the constraint-failure and the
   # reader-panic classes answer only the mock. The job builds the mock worker
-  # under a Rust cache key of its own, installs the wheel, and fetches the
+  # cold, with no Rust cache, installs the wheel, and fetches the
   # tokenizer files of the classes' models from ungated repositories at
   # pinned revisions, no hub token. A few CPU minutes on every push and on
   # every pull request that is not documentation-only, before any GPU lane
@@ -2071,8 +2102,8 @@ jobs:
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.docs-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    # A cold build of the mock worker and its dependencies takes minutes; the
-    # warm one (main's entry under the job's own cache key) a fraction.
+    # The mock worker and its dependencies build cold, about two minutes of
+    # the job.
     timeout-minutes: 40
     permissions:
       contents: read
@@ -2107,14 +2138,15 @@ jobs:
         with:
           python-version: "3.13"
 
-      # A key of this job's own: it builds one crate in the dev profile, so an
-      # entry it saved under the unit-test shards' key after a lockfile change
-      # would be a fragment the shards and the cache warmer then restore as
-      # up to date.
+      # No Rust cache: the job builds one crate in the dev profile, about two
+      # minutes cold. An entry of its own took 0.6 GB of the repository's
+      # 10 GB cache to save under a minute of that, and an entry under the
+      # unit-test shards' key would be a fragment the shards and the cache
+      # warmer then restore as up to date.
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: e2e-cpu-mock
+          cache: 'false'
 
       - name: Build the mock worker
         run: |
@@ -2135,10 +2167,14 @@ jobs:
       # A few megabytes per model, kept between runs so the hub serves one
       # download per model list, not one per run (its rate limit answers a
       # share of a busy day's requests with 429). The key follows the list
-      # (this file) and the specs; a run that misses fetches the files and
-      # saves the entry.
+      # (this file) and the specs. Every ref restores and main alone saves
+      # (the step after the fetch): an entry a pull request saves is visible
+      # to that pull request only, so each one saved its own copy, and the
+      # copies helped push main's larger entries out of the repository's
+      # 10 GB cache. A run that misses fetches the files.
       - name: Restore the tokenizer files
-        uses: actions/cache@v6
+        id: tokenizers
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/models
           key: e2e-cpu-mock-tokenizers-${{ hashFiles('.github/workflows/pr-test-rust.yml', 'e2e_test/infra/model_specs.py') }}
@@ -2169,6 +2205,15 @@ jobs:
           echo "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d  $vocab" | sha256sum -c --status 2>/dev/null \
             || bash scripts/ci_retry.sh 3 30 curl -fsSL --connect-timeout 10 --max-time 120 -o "$vocab" \
               https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+
+      # Right after the fetch and before the tests, so a run on main that the
+      # next push cancels during the tests has saved already.
+      - name: Save the tokenizer files
+        if: github.ref == 'refs/heads/main' && steps.tokenizers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/models
+          key: ${{ steps.tokenizers.outputs.cache-primary-key }}
 
       - name: Run the mock e2e tests
         timeout-minutes: 15
@@ -2493,7 +2538,12 @@ jobs:
   finish:
     needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
-    # Keep this pure CPU verdict off the shared runner queue.
+    # A hosted runner, never a self-hosted pool: this job runs on a cancelled
+    # run too, and a cancelled run is complete only once it has run. Until
+    # then the concurrency group holds the next push's run with no job
+    # created, so a wait for a runner here is a wait for every later head.
+    # The job reads this file and the results of the jobs above, nothing of
+    # a pool.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -2593,7 +2643,9 @@ jobs:
 
   summarize-benchmarks:
     needs: [benchmarks]
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    # A hosted runner, for the reason `finish` has one: once the benchmarks
+    # ended, this job runs on a cancelled run too.
+    runs-on: ubuntu-latest
     if: always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)
     permissions:
       contents: read

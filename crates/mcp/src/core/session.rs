@@ -648,7 +648,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::core::config::{test_support::sse_server, Tool as McpTool};
+    use crate::{
+        core::config::{test_support::sse_server, Tool as McpTool},
+        inventory::ArgMapping,
+    };
 
     #[test]
     fn test_session_creation_keeps_servers() {
@@ -1036,10 +1039,7 @@ mod tests {
                 "web_search",
                 "server1",
                 "brave_web_search",
-                Some(
-                    crate::inventory::ArgMapping::new()
-                        .with_override("enable_brave", serde_json::json!(false)),
-                ),
+                Some(ArgMapping::new().with_override("enable_brave", serde_json::json!(false))),
             )
             .expect("alias registration should succeed");
 

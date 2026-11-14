@@ -98,7 +98,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     message: format!(
                         "ZMQ worker {} has no model identity: EngineCore does not report a \
                          served model name, so --model-path (or a model_id label) is required",
-                        config.url
+                        Endpoint::redacted_str(&config.url)
                     ),
                 })?
         } else {
@@ -198,7 +198,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 message: format!(
                     "ZMQ worker {} has unsupported runtime {}: only vllm, tokenspeed and \
                      sglang are supported over the ZMQ direct backend",
-                    config.url, runtime_type
+                    Endpoint::redacted_str(&config.url),
+                    runtime_type
                 ),
             });
         }
@@ -447,30 +448,28 @@ pub(super) fn validate_constrained_decoding_label(
     }
 }
 
+/// A KV transfer value as given, an empty one being none: the spec's fields
+/// and the label values alike at registration, and the engine's report at a
+/// label refresh (`EngineKvMetadata::take`), so a value that says nothing is
+/// never a set field a later report cannot fill.
+pub(super) fn kv_transfer_value(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// The worker's KV transfer fields out of the spec and the labels (the
+/// three keys leave the labels): the spec's value when it says something,
+/// else the label's, read through [`kv_transfer_value`] on both sides.
 fn take_kv_transfer_metadata(
     config: &WorkerSpec,
     labels: &mut HashMap<String, String>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let connector_label = labels.remove("kv_connector");
-    let role_label = labels.remove("kv_role");
-    let engine_id_label = labels.remove("kv_engine_id");
+    let connector_label = kv_transfer_value(labels.remove("kv_connector"));
+    let role_label = kv_transfer_value(labels.remove("kv_role"));
+    let engine_id_label = kv_transfer_value(labels.remove("kv_engine_id"));
     (
-        config
-            .kv_connector
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or(connector_label),
-        config
-            .kv_role
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or(role_label),
-        config
-            .kv_engine_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or(engine_id_label)
-            .filter(|s| !s.is_empty()),
+        kv_transfer_value(config.kv_connector.clone()).or(connector_label),
+        kv_transfer_value(config.kv_role.clone()).or(role_label),
+        kv_transfer_value(config.kv_engine_id.clone()).or(engine_id_label),
     )
 }
 
@@ -561,8 +560,9 @@ pub(super) fn validate_parser_overrides(
     )
     .map_err(|why| {
         format!(
-            "worker {worker_url} declares a parser override for model '{}' the gateway cannot \
+            "worker {} declares a parser override for model '{}' the gateway cannot \
              read with: {why}",
+            Endpoint::redacted_str(worker_url),
             card.id
         )
     })
@@ -623,11 +623,12 @@ fn registry_reads_over_the_flags(
     let spell =
         |name: Option<&str>| name.map_or_else(|| "unset".to_string(), |name| format!("'{name}'"));
     Some(format!(
-        "the registry's table '{}' reads model '{}' for worker {worker_url}, whose labels select \
+        "the registry's table '{}' reads model '{}' for worker {}, whose labels select \
          no reader; the gateway's --tool-call-parser {} / --reasoning-parser {} name {named}, which \
          reads only the models the registry does not know",
         table.name(),
         card.id,
+        Endpoint::redacted_str(worker_url),
         spell(flags.tool.as_deref()),
         spell(flags.reasoning.as_deref()),
     ))
@@ -818,7 +819,7 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
         return Err(format!(
             "worker {} sets overload.waiting_requests to 0: Must be >= 1 \
              (0 would mark every worker overloaded)",
-            config.url
+            Endpoint::redacted_str(&config.url)
         ));
     }
     if let Some(threshold) = config.overload.token_usage {
@@ -826,7 +827,7 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
             return Err(format!(
                 "worker {} sets overload.token_usage to {threshold}: Must be a \
                  fraction in (0.0, 1.0]",
-                config.url
+                Endpoint::redacted_str(&config.url)
             ));
         }
     }
@@ -857,7 +858,7 @@ fn validate_zmq_handshake_override(
         return Err(format!(
             "worker {} sets zmq_handshake_address but its connection mode is \
              {connection_mode:?}: the field is only meaningful for ZMQ workers",
-            config.url
+            Endpoint::redacted_str(&config.url)
         ));
     }
     Ok(())
@@ -903,9 +904,11 @@ fn validate_zmq_handshake_address(
         };
         if existing_handshake == handshake {
             return Err(format!(
-                "ZMQ worker {url} would bind handshake address {handshake}, already claimed by \
-                 worker {existing_url}: the derived port is a hash of the ipc path, so rename \
-                 this worker's ipc path or set zmq_handshake_address to a free tcp:// address"
+                "ZMQ worker {} would bind handshake address {handshake}, already claimed by \
+                 worker {}: the derived port is a hash of the ipc path, so rename \
+                 this worker's ipc path or set zmq_handshake_address to a free tcp:// address",
+                Endpoint::redacted_str(url),
+                Endpoint::redacted_str(existing_url)
             ));
         }
     }
@@ -990,7 +993,10 @@ fn validate_zmq_worker_type(
     };
     Err(WorkflowError::StepFailed {
         step_id: StepId::new("create_worker"),
-        message: format!("ZMQ worker {url} cannot serve worker type {worker_type}: {reason}"),
+        message: format!(
+            "ZMQ worker {} cannot serve worker type {worker_type}: {reason}",
+            Endpoint::redacted_str(url)
+        ),
     })
 }
 
@@ -1136,8 +1142,9 @@ fn validate_zmq_dp(
         return Err(WorkflowError::StepFailed {
             step_id: StepId::new("create_worker"),
             message: format!(
-                "ZMQ worker {url} cannot be dp-aware expanded (dp_size={dp_size}); \
-                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead"
+                "ZMQ worker {} cannot be dp-aware expanded (dp_size={dp_size}); \
+                 configure a grouped ZMQ worker (`dp_size` on the worker spec) instead",
+                Endpoint::redacted_str(url)
             ),
         });
     }
@@ -1149,7 +1156,12 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::test_support::RefusedAddress;
+    use crate::{
+        app_context::AppContext,
+        config::RouterConfig,
+        server::http_client,
+        worker::{test_support::RefusedAddress, DEFAULT_BOOTSTRAP_PORT},
+    };
 
     /// The parser-override warning skips the worker itself when it is replaced
     /// at an address registered with a trailing slash: the registry's key keeps
@@ -1226,7 +1238,7 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
         let symphony = || {
             app_context_with(
-                crate::config::RouterConfig::builder()
+                RouterConfig::builder()
                     .worker_startup_timeout_secs(1)
                     .parser(ParserChoice::Symphony)
                     .build_unchecked(),
@@ -1279,7 +1291,7 @@ mod tests {
     fn grpc_worker_context(
         model: &str,
         registration_mode: WorkerRegistrationMode,
-        app_context: Arc<crate::app_context::AppContext>,
+        app_context: Arc<AppContext>,
     ) -> WorkflowContext<WorkerWorkflowData> {
         use openai_protocol::worker::WorkerModels;
         use wfaas::WorkflowInstanceId;
@@ -1312,9 +1324,11 @@ mod tests {
                 registry_reads_over_the_flags(card, url, parser, flags, registry)
             };
 
+        // The worker is named through the mask: a credential in its address
+        // is in no message (the helper masks, so no caller can forget).
         let first = said(
             &known,
-            "grpc://a:1",
+            "grpc://user:secret@a:1",
             ParserChoice::Symphony,
             &flags,
             &registry,
@@ -1324,7 +1338,8 @@ mod tests {
             first.contains("'Qwen/Qwen3-8B'")
                 && first.contains("'qwen3'")
                 && first.contains("the table 'mistral_v13'")
-                && first.contains("grpc://a:1"),
+                && first.contains("***@a:1")
+                && !first.contains("secret"),
             "{first}"
         );
         registry
@@ -1415,17 +1430,15 @@ mod tests {
         );
     }
 
-    fn make_app_context() -> Arc<crate::app_context::AppContext> {
+    fn make_app_context() -> Arc<AppContext> {
         app_context_with(
-            crate::config::RouterConfig::builder()
+            RouterConfig::builder()
                 .worker_startup_timeout_secs(1)
                 .build_unchecked(),
         )
     }
 
-    fn app_context_with(
-        router_config: crate::config::RouterConfig,
-    ) -> Arc<crate::app_context::AppContext> {
+    fn app_context_with(router_config: RouterConfig) -> Arc<AppContext> {
         use crate::app_context::testing::app_context_for_tests;
 
         app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
@@ -1462,7 +1475,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(
@@ -1509,7 +1522,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         data.discovered_labels = HashMap::from([
             ("page_size".to_string(), "256".to_string()),
             ("max_num_seqs".to_string(), "8".to_string()),
@@ -1541,7 +1554,7 @@ mod tests {
         let mut spec = WorkerSpec::new("http://worker:8000");
         spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
         spec.labels = HashMap::from([("enable_dp_attention".to_string(), "true".to_string())]);
-        let router_config = crate::config::RouterConfig::builder()
+        let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
             .dp_aware(true)
             .build_unchecked();
@@ -1553,7 +1566,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         data
     }
 
@@ -1663,7 +1676,7 @@ mod tests {
         let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
 
@@ -1787,7 +1800,7 @@ mod tests {
     fn something_listens_on_the_default_bootstrap_port() -> bool {
         use std::net::{SocketAddr, TcpStream};
 
-        let address = SocketAddr::from(([127, 0, 0, 1], crate::worker::DEFAULT_BOOTSTRAP_PORT));
+        let address = SocketAddr::from(([127, 0, 0, 1], DEFAULT_BOOTSTRAP_PORT));
         TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()
     }
 
@@ -1900,6 +1913,60 @@ mod tests {
         labels.insert("kv_role".to_string(), "kv_consumer".to_string());
         let (_, role, _) = take_kv_transfer_metadata(&spec, &mut labels);
         assert_eq!(role.as_deref(), Some("kv_consumer"));
+    }
+
+    /// A registration refused for a worker whose address carries userinfo
+    /// names the address through the mask: the credential is in no refusal
+    /// text (the job log prints the refusal beside the masked worker).
+    #[tokio::test]
+    async fn a_refusal_names_the_workers_address_through_the_mask() {
+        use openai_protocol::worker::{OverloadUpdate, WorkerModels};
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("http://user:secret@worker:8000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.overload = OverloadUpdate {
+            waiting_requests: Some(0),
+            ..Default::default()
+        };
+        let mut data =
+            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(http_client()));
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        let text = CreateLocalWorkerStep
+            .execute(&mut ctx)
+            .await
+            .expect_err("the overload override is refused")
+            .to_string();
+        assert!(text.contains("http://***@worker:8000"), "{text}");
+        assert!(
+            !text.contains("secret") && !text.contains("user:"),
+            "{text}"
+        );
+    }
+
+    /// An empty label value is no KV field, as an empty spec value is: a
+    /// registration carrying `kv_connector: ""` or `kv_role: ""` leaves the
+    /// field unset for a later report to fill, instead of holding `Some("")`
+    /// that nothing fills.
+    #[test]
+    fn an_empty_kv_label_value_is_no_field() {
+        let spec = WorkerSpec::new("http://worker:8080");
+        let mut labels = HashMap::from([
+            ("kv_connector".to_string(), String::new()),
+            ("kv_role".to_string(), String::new()),
+            ("kv_engine_id".to_string(), String::new()),
+        ]);
+        assert_eq!(
+            take_kv_transfer_metadata(&spec, &mut labels),
+            (None, None, None)
+        );
+        assert!(labels.is_empty(), "the keys leave the labels all the same");
     }
 
     #[test]
@@ -2504,27 +2571,37 @@ mod tests {
         )
         .is_ok());
 
+        // The refusal names the worker through the mask: a credential in its
+        // address is in no refusal (the helper masks, so no caller can forget).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://w:1",
+            "http://user:secret@w:1",
             ParserChoice::Legacy,
             Some(&tool_factory),
             None,
         )
         .expect_err("unknown tool parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
+        assert!(
+            err.contains("http://***@w:1") && !err.contains("secret"),
+            "{err}"
+        );
 
         let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://w:1",
+            "http://user:secret@w:1",
             ParserChoice::Legacy,
             None,
             Some(&reasoning_factory),
         )
         .expect_err("unknown reasoning parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
+        assert!(
+            err.contains("http://***@w:1") && !err.contains("secret"),
+            "{err}"
+        );
 
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");

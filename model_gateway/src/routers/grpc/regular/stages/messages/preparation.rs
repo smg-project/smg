@@ -81,7 +81,10 @@ impl MessagePreparationStage {
         // narrowed by tool_choice and shared with count_tokens so both render
         // the same prompt; the constraints read the narrowed tools too, the
         // parsers read them all from the spec.
-        let spec = Box::new(MessagesResponseSpec::from(request));
+        let spec = Box::new(MessagesResponseSpec::with_tools(
+            request,
+            ctx.state.messages_tools.clone(),
+        ));
         let filtered_tools =
             message_utils::template_tools(&spec.chat_tools, request.tool_choice.as_ref());
         let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
@@ -163,6 +166,7 @@ impl MessagePreparationStage {
             symphony::Asks::Messages {
                 request,
                 continues: request.continues_final_assistant(),
+                has_tools: spec.has_tools,
             },
             &filtered_tools,
             &processed_messages.text,
@@ -280,6 +284,7 @@ mod tests {
         use serde_json::{json, Value};
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -301,7 +306,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
@@ -314,7 +319,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),
@@ -347,6 +352,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -371,7 +377,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (model, profile, rendered) in [
             (
@@ -390,7 +396,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 model.into(),
@@ -426,6 +432,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -449,7 +456,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         let schema = json!({
             "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]
@@ -469,7 +476,7 @@ mod tests {
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),

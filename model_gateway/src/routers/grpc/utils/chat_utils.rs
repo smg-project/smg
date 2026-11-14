@@ -24,8 +24,8 @@ use llm_tokenizer::{
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
-        ContentPart, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice,
-        ToolChoiceValue,
+        ContentPart, FunctionCallResponse, ResponseFormat, StringOrArray, Tool, ToolCall,
+        ToolChoice, ToolChoiceValue,
     },
     generate::GenerateFinishReason,
     profile::ProviderProfile,
@@ -680,7 +680,7 @@ pub(crate) fn process_content_format(
 }
 
 pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
-const TOOL_CHOICE_KEY: &str = "tool_choice";
+pub(super) const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
 
 /// The template kwarg both prompt paths tell the tool choice through: the
@@ -708,11 +708,16 @@ pub(crate) fn insert_tool_choice_kwarg(
 /// switch among the kwargs where the template reads that key, `thinking_key`
 /// being the tokenizer's detected thinking key as the backed plan gates its
 /// mode kwargs, else the typed toggle or the profile's reading of the effort),
-/// and the entry removed when the profile hands the template none.
+/// and the entry removed when the profile hands the template none. A control
+/// the renderer never reads (`reads`: the tokenizer's
+/// [`Tokenizer::template_reads`]) is left out: it could not reach the prompt,
+/// and a `response_format` carries a schema the copy into the kwarg walks
+/// node by node.
 fn build_chat_template_kwargs(
     request: &ChatCompletionRequest,
     provider: ProviderProfile,
     thinking_key: Option<ThinkingKeyName>,
+    reads: impl Fn(&str) -> bool,
 ) -> HashMap<String, Value> {
     let request_kwargs = request
         .chat_template_kwargs
@@ -725,10 +730,19 @@ fn build_chat_template_kwargs(
         request.effective_reasoning_effort(),
         explicit.or_else(|| request.template_thinking_for(provider)),
     );
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .filter(|_| reads(TOOL_CHOICE_KEY));
+    let response_format = request
+        .response_format
+        .as_ref()
+        .filter(|_| reads(RESPONSE_FORMAT_KEY));
     // A plain request (no tool choice, no response format, no kwargs, no
-    // effort) renders with no kwargs at all: its map stays unallocated.
-    let mut combined = if request.tool_choice.is_some()
-        || request.response_format.is_some()
+    // effort), or one whose controls the template never reads, renders with
+    // no kwargs at all: its map stays unallocated.
+    let mut combined = if tool_choice.is_some()
+        || response_format.is_some()
         || request_kwargs > 0
         || reasoning_effort.is_some()
     {
@@ -736,10 +750,10 @@ fn build_chat_template_kwargs(
     } else {
         HashMap::new()
     };
-    if let Some(tool_choice) = &request.tool_choice {
+    if let Some(tool_choice) = tool_choice {
         insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
-    if let Some(response_format) = &request.response_format {
+    if let Some(response_format) = response_format {
         if let Ok(value) = serde_json::to_value(response_format) {
             combined.insert(RESPONSE_FORMAT_KEY.to_string(), value);
         }
@@ -774,9 +788,25 @@ fn resolve_template_thinking(
     request.template_thinking_for(provider)
 }
 
-/// gRPC backends require content parts the gateway knows how to render, and
-/// a refusal part only where the contract defines it: on an assistant turn.
+/// Validate content sent to a model template, using the tool declarations
+/// that the template will receive.
+pub(crate) fn validate_chat_template_content_parts(
+    request: &ChatCompletionRequest,
+) -> Result<(), String> {
+    validate_chat_parts(&request.messages, Some(request))
+}
+
+/// Validate gRPC chat content outside the regular template preparation path.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
+    validate_chat_parts(messages, None)
+}
+
+/// Reject unsupported parts and permit a homogeneous list of declared Flash
+/// tool references only in a tool message sent to the model template.
+fn validate_chat_parts(
+    messages: &[ChatMessage],
+    template_request: Option<&ChatCompletionRequest>,
+) -> Result<(), String> {
     for message in messages {
         let content = match message {
             ChatMessage::System { content, .. }
@@ -796,6 +826,18 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
                             .get("type")
                             .and_then(Value::as_str)
                             .unwrap_or("<missing>");
+                        if let Some(request) = template_request.filter(|request| {
+                            type_name == "tool_reference"
+                                && matches!(message, ChatMessage::Tool { .. })
+                                && ProviderProfile::for_model(&request.model)
+                                    .supports_chat_tool_references(&request.model)
+                        }) {
+                            validate_tool_references(
+                                parts,
+                                request.tools.as_deref().unwrap_or_default(),
+                            )?;
+                            break;
+                        }
                         return Err(format!(
                             "Unsupported chat content part type {type_name:?} for gRPC backends"
                         ));
@@ -810,6 +852,33 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
                     _ => {}
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The template selects the reference path by the first block and emits only
+/// matching tools. Refuse mixed lists and unknown names before they can lose
+/// content in that rendering.
+fn validate_tool_references(parts: &[ContentPart], tools: &[Tool]) -> Result<(), String> {
+    for part in parts {
+        let fields = match part {
+            ContentPart::Unknown(fields)
+                if fields.get("type").and_then(Value::as_str) == Some("tool_reference") =>
+            {
+                fields
+            }
+            _ => return Err("tool_reference content must contain only tool references".into()),
+        };
+        let name = fields.get("name").and_then(Value::as_str);
+        if !name.is_some_and(|name| {
+            tools
+                .iter()
+                .any(|tool| tool.tool_type == "function" && tool.function.name == name)
+        }) {
+            return Err(
+                "tool_reference.name must name a function available to the template".into(),
+            );
         }
     }
     Ok(())
@@ -913,9 +982,11 @@ fn transform_content_field(
             // Replace media parts with placeholders. The default order builds
             // separate media/text buckets for the front placement; the
             // authored order appends each rendered part as it is encountered.
-            let mut media_parts: Vec<String> = Vec::new();
-            let mut text_parts: Vec<String> = Vec::new();
-            let mut authored_parts: Vec<String> = Vec::new();
+            // The lists borrow the parts from the message's own values and the
+            // template's placeholders; the join copies each part once.
+            let mut media_parts: Vec<&str> = Vec::new();
+            let mut text_parts: Vec<&str> = Vec::new();
+            let mut authored_parts: Vec<&str> = Vec::new();
             for part in content_array {
                 let Some(obj) = part.as_object() else {
                     continue;
@@ -926,8 +997,8 @@ fn transform_content_field(
                     Some(type_name @ ("text" | "refusal")) => {
                         if let Some(t) = obj.get(type_name).and_then(|t| t.as_str()) {
                             match media_order {
-                                MediaPartOrder::MediaFirst => text_parts.push(t.to_string()),
-                                MediaPartOrder::Authored => authored_parts.push(t.to_string()),
+                                MediaPartOrder::MediaFirst => text_parts.push(t),
+                                MediaPartOrder::Authored => authored_parts.push(t),
                             }
                         }
                     }
@@ -945,10 +1016,10 @@ fn transform_content_field(
                         })?;
                         match media_order {
                             MediaPartOrder::MediaFirst => {
-                                media_parts.push(placeholder.to_string());
+                                media_parts.push(placeholder);
                             }
                             MediaPartOrder::Authored => {
-                                authored_parts.push(placeholder.to_string());
+                                authored_parts.push(placeholder);
                             }
                         }
                     }
@@ -956,7 +1027,7 @@ fn transform_content_field(
                 }
             }
 
-            let ordered: Vec<String> = match media_order {
+            let ordered: Vec<&str> = match media_order {
                 MediaPartOrder::MediaFirst => media_parts.into_iter().chain(text_parts).collect(),
                 MediaPartOrder::Authored => authored_parts,
             };
@@ -1170,7 +1241,30 @@ pub(crate) fn process_chat_messages_with_placeholders(
         let prepared_tools = request.tools.as_deref().map(prepare_tools).transpose()?;
 
         let combined_template_kwargs =
-            build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name());
+            build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name(), |name| {
+                tokenizer.template_reads(name)
+            });
+
+        // A renderer may constrain JSON responses: the actual response format
+        // and the continuation the render will take (an explicit template
+        // argument over the request field) decide the check.
+        if matches!(
+            request.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        ) {
+            let continuation = combined_template_kwargs
+                .get("continue_final_message")
+                .and_then(Value::as_bool)
+                .unwrap_or(request.continue_final_message);
+            let assistant_prefix = transformed_messages
+                .last()
+                .filter(|message| continuation && message["role"] == "assistant")
+                .and_then(|message| message["content"].as_str());
+            tokenizer
+                .renderer_capabilities()
+                .validate_json_response(request.separate_reasoning, assistant_prefix)
+                .map_err(|error| error.to_string())?;
+        }
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None

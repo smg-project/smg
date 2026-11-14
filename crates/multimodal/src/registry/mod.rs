@@ -2,6 +2,7 @@ mod deepseek_v41;
 mod gemma4;
 mod glm53_flash;
 mod inkling;
+mod inkling2;
 mod kimi_k25;
 mod kimi_k3;
 mod layouts;
@@ -24,6 +25,7 @@ pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
 use gemma4::Gemma4Spec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
+use inkling2::Inkling2Spec;
 use kimi_k25::KimiK25VisionSpec;
 use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
@@ -58,6 +60,7 @@ impl ModelRegistry {
                 // Gemma 4 matches its own model_type / id only.
                 LazySpec::new(|| Box::new(Gemma4Spec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
+                LazySpec::new(|| Box::new(Inkling2Spec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
                 // share a transport layout but not a prompt shape.
@@ -129,6 +132,7 @@ pub(super) mod test_helpers {
 
     use crate::{
         encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
+        registry::Tokenizer,
         types::ImageSize,
     };
 
@@ -160,7 +164,7 @@ pub(super) mod test_helpers {
         }
     }
 
-    impl crate::registry::Tokenizer for TestTokenizer {
+    impl Tokenizer for TestTokenizer {
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.vocab.get(token).copied()
         }

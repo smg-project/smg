@@ -41,3 +41,10 @@ pub mod version;
 pub mod wasm;
 pub mod worker;
 pub mod workflow;
+
+/// The lib's tests run under the allocator the executable runs under
+/// (`main.rs`), so a test can read what a path allocates on its own thread
+/// through the allocator's counters (`routers::grpc::testing`).
+#[cfg(all(test, not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

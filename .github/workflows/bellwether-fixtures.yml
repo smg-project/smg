@@ -71,18 +71,23 @@ on:
 permissions:
   contents: read
 
-# One group per pull request and one per branch: a newer push cancels the
-# superseded run. Keep the pull request form in sync with
+# One group per pull request and one per branch. A pull request's newer push
+# cancels its superseded run. A run on a branch (a push to `main`, a
+# dispatch) runs to its end: the run on `main` is the one that saves the
+# tokenizer files, once its tests passed, and a run that finds no entry
+# fetches every file first, for longer than the time between two pushes to
+# `main`. The newest push waits behind the run in progress, and a later push
+# takes the waiting run's place. Keep the pull request form in sync with
 # cancel-pr-workflows.yml.
 concurrency:
   group: bellwether-fixtures-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fixture-tests:
     name: fixture-tests (tokenizers-v1)
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    timeout-minutes: 140
+    timeout-minutes: 200
     permissions:
       contents: read
     steps:
@@ -308,8 +313,15 @@ jobs:
       # records 1,470 models, 814 with sets; the tree the job unpacks holds
       # their hand-written sets whole and one compressed set in 3,500 (the
       # unpack step above), on which the render-parity and the tokenizer
-      # harnesses take minutes, so the step has far more than the longest
-      # needs and the build. Symphony's replay reads every parse case the
+      # harnesses take minutes with the tokenizer files in the cache, so the
+      # step has far more than the longest needs and the build. With the cache
+      # cold (the entry evicted from the repository's budget within hours of
+      # its save) each run fetches every file from the hub and the two
+      # harnesses wait out its rate limit together (6288.57 and 6290.15 s on
+      # one run of main), past the 120 minutes the step had while many runs
+      # fetched at once; the cap is 180 (the job's 200) until the entry stays
+      # cached, so the step ends on its targets' verdicts.
+      # Symphony's replay reads every parse case the
       # tree holds for the models its own list names (the render sets and
       # the unlisted models' sets are not its): at this pin (ee0e698a) that
       # is 4,253 recorded cases, 1,474 of them from the three benchmark-scale
@@ -330,7 +342,7 @@ jobs:
       # print them in the log as well. A target that failed fails the step
       # once the others have ended.
       - name: Run the tests that read bellwether
-        timeout-minutes: 120
+        timeout-minutes: 180
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
           BELLWETHER_REPORT_DIR: ${{ runner.temp }}/bellwether-reports

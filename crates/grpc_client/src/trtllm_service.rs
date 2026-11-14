@@ -10,8 +10,8 @@ use tracing::{debug, warn};
 use crate::{
     channel::Channel,
     request_fields::{
-        body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
-        OutputConstraint, PlainSampling,
+        body_format, completion_constraint, plain_constraint, seed_bits, stop_strings,
+        ConstraintKind, OutputConstraint, PlainSampling,
     },
     AbortOnDropClient, BoxedTraceInjector,
 };
@@ -40,6 +40,8 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, T
 pub struct TrtllmServiceClient {
     client: proto::trtllm_service_client::TrtllmServiceClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
 }
 
 impl AbortOnDropClient for TrtllmServiceClient {
@@ -578,7 +580,7 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: request.seed.map(|s| s as u64),
+            seed: request.seed.map(seed_bits),
             temperature: Some(request.temperature.unwrap_or(1.0)),
             min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
@@ -688,15 +690,15 @@ mod tests {
             "model": "m", "prompt": "hi", "logit_bias": {"1": -100}
         }))
         .expect("a completion request");
+        let channel = Channel::unconnected(
+            "http://127.0.0.1:1",
+            crate::channel::DEFAULT_CONNECT_TIMEOUT,
+        )
+        .expect("a channel to nowhere");
         let client = TrtllmServiceClient {
-            client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::unconnected(
-                    "http://127.0.0.1:1",
-                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
-                )
-                .expect("a channel to nowhere"),
-            ),
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+            channel,
         };
         let error = client
             .build_generate_request_from_completion(
@@ -1016,15 +1018,15 @@ mod tests {
 
         // A client over a lazy channel nothing listens on (made under the
         // runtime a channel needs): the builders dial nothing.
+        let channel = Channel::unconnected(
+            "http://127.0.0.1:1",
+            crate::channel::DEFAULT_CONNECT_TIMEOUT,
+        )
+        .expect("a channel to nowhere");
         let client = TrtllmServiceClient {
-            client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::unconnected(
-                    "http://127.0.0.1:1",
-                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
-                )
-                .expect("a channel to nowhere"),
-            ),
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+            channel,
         };
         let build = |request: &ResponsesRequest| {
             client

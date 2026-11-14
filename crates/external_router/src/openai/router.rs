@@ -29,6 +29,7 @@ use super::{
     responses::route::{self as responses_route, ResponsesRouterContext},
 };
 use crate::{
+    error::bad_request,
     header_utils::extract_auth_header,
     known,
     metrics::{metrics_labels, Metrics},
@@ -282,10 +283,7 @@ impl ExternalRouter for OpenAIRouter {
                 {
                     return StatusCode::PAYLOAD_TOO_LARGE.into_response();
                 }
-                return crate::error::bad_request(
-                    "invalid_body",
-                    format!("Failed to read body: {e}"),
-                );
+                return bad_request("invalid_body", format!("Failed to read body: {e}"));
             }
         };
 

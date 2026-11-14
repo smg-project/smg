@@ -95,9 +95,12 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::block::{
-    chain_prefix_hash, ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock,
-    WorkerIdExhausted,
+use crate::{
+    block::{
+        chain_prefix_hash, ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock,
+        WorkerIdExhausted,
+    },
+    prefetch::prefetch_read,
 };
 
 mod arena;
@@ -1635,7 +1638,7 @@ impl ChainIndex {
             Some((child, generation)) => {
                 // The child's header is the next line the walk reads: ask for it while the
                 // version is confirmed.
-                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
+                prefetch_read(std::ptr::from_ref(self.slab.run(child)));
                 Plan::Descend(child, generation)
             }
             None if window.children != NONE => Plan::InsertAt(offset),
@@ -1893,7 +1896,7 @@ impl ChainIndex {
         // so their misses overlap instead of serialising one run after another.
         for removal in &work {
             if removal.run != GONE {
-                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
+                prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
             }
         }
         let mut freed = Vec::new();

@@ -1,0 +1,25 @@
+[package]
+name = "wasm-guest-policy"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A package of its own, outside the repository's workspace: it builds for
+# wasm32-unknown-unknown with its own lock file.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57"
+
+# A plugin is loaded once and called on every decision: small code, and a
+# panic that ends the call as a trap (the host then takes the stage's
+# fallback and rebuilds the instance).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

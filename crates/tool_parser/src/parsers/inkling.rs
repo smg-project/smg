@@ -39,6 +39,35 @@ const HEADER_CONTROL_TOKENS: [&str; 7] = [
     MODEL_END_SAMPLING,
 ];
 
+/// Quote state of JSON response text, carried across stream chunks.
+#[derive(Debug, Clone, Copy, Default)]
+struct JsonStringState {
+    in_string: bool,
+    escaped: bool,
+}
+
+impl JsonStringState {
+    fn advance(&mut self, text: &str) {
+        text.bytes().for_each(|byte| self.step(byte));
+    }
+
+    /// Quotes and backslashes are ASCII, so stepping over UTF-8 bytes never
+    /// misreads part of a multibyte character.
+    fn step(&mut self, byte: u8) {
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+            } else if byte == b'"' {
+                self.in_string = false;
+            }
+        } else if byte == b'"' {
+            self.in_string = true;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamingState {
     Text,
@@ -57,12 +86,17 @@ enum StreamingState {
 /// that text is returned to the OpenAI-compatible API. Headerless text-mode
 /// invocations cannot be represented losslessly by the OpenAI function-call
 /// shape, so their frame is safely suppressed instead of becoming answer text.
+///
+/// For a JSON response format, protocol spellings inside JSON strings of the
+/// answer are text: they neither start a tool frame nor get removed.
 pub struct InklingParser {
     partial_json: PartialJson,
     buffer: String,
     state: StreamingState,
     current_tool_index: usize,
     current_tool_name: Option<String>,
+    json_mode: bool,
+    json_strings: JsonStringState,
 }
 
 impl InklingParser {
@@ -73,6 +107,8 @@ impl InklingParser {
             state: StreamingState::Text,
             current_tool_index: 0,
             current_tool_name: None,
+            json_mode: false,
+            json_strings: JsonStringState::default(),
         }
     }
 
@@ -107,7 +143,10 @@ impl InklingParser {
         })
     }
 
-    fn clean_normal_text(text: &str) -> String {
+    /// Remove response framing from text outside tool frames. With `json`,
+    /// the quote state at the start of `text`, tokens inside JSON strings stay,
+    /// and the state advances over the returned text.
+    fn clean_normal_text(text: &str, json: &mut Option<JsonStringState>) -> String {
         let controls = [
             MESSAGE_MODEL,
             CONTENT_TEXT,
@@ -121,15 +160,17 @@ impl InklingParser {
 
         while cursor < text.len() {
             let remaining = &text[cursor..];
-            let Some((start, token)) = find_earliest_token(remaining, &controls) else {
+            let Some((start, token)) = find_protocol_token(remaining, &controls, *json) else {
                 if !in_header {
                     output.push_str(remaining);
+                    advance_json(json, remaining);
                 }
                 break;
             };
 
             if !in_header {
                 output.push_str(&remaining[..start]);
+                advance_json(json, &remaining[..start]);
             }
             cursor += start + token.len();
             in_header = token == MESSAGE_MODEL;
@@ -141,17 +182,24 @@ impl InklingParser {
     fn parse_complete_impl(
         text: &str,
         allowed_tools: Option<&HashSet<&str>>,
+        json_mode: bool,
     ) -> (String, Vec<ToolCall>) {
         let tool_markers = [TOOL_CALL_JSON_START, TOOL_CALL_TEXT_START];
         let mut normal_text = String::new();
         let mut calls = Vec::new();
         let mut cursor = 0;
+        // A marker is found only outside JSON strings, so every segment
+        // between tool frames starts outside a string.
+        let mut json = json_mode.then(JsonStringState::default);
 
         while let Some((relative_start, marker)) =
-            find_earliest_token(&text[cursor..], &tool_markers)
+            find_protocol_token(&text[cursor..], &tool_markers, json)
         {
             let marker_start = cursor + relative_start;
-            normal_text.push_str(&Self::clean_normal_text(&text[cursor..marker_start]));
+            normal_text.push_str(&Self::clean_normal_text(
+                &text[cursor..marker_start],
+                &mut json,
+            ));
             let payload_start = marker_start + marker.len();
 
             if marker == TOOL_CALL_TEXT_START {
@@ -196,14 +244,16 @@ impl InklingParser {
             }
         }
 
-        normal_text.push_str(&Self::clean_normal_text(&text[cursor..]));
+        normal_text.push_str(&Self::clean_normal_text(&text[cursor..], &mut json));
         (normal_text, calls)
     }
 
     fn process_text(&mut self, result: &mut StreamingParseResult) -> bool {
         let state_markers = [MESSAGE_MODEL, TOOL_CALL_JSON_START, TOOL_CALL_TEXT_START];
-        if let Some((start, marker)) = find_earliest_token(&self.buffer, &state_markers) {
-            let normal_text = Self::clean_normal_text(&self.buffer[..start]);
+        let mut json = self.json_mode.then_some(self.json_strings);
+        if let Some((start, marker)) = find_protocol_token(&self.buffer, &state_markers, json) {
+            let normal_text = Self::clean_normal_text(&self.buffer[..start], &mut json);
+            self.store_json_strings(json);
             result.normal_text.push_str(&normal_text);
             self.buffer.drain(..start + marker.len());
             self.state = if marker == MESSAGE_MODEL {
@@ -219,16 +269,31 @@ impl InklingParser {
             return true;
         }
 
-        let keep = longest_partial_token_suffix(&self.buffer, &STREAM_CONTROL_TOKENS);
+        // A token can only begin outside a JSON string, so text that ends
+        // inside one holds back no partial token.
+        let mut probe = json;
+        advance_json(&mut probe, &self.buffer);
+        let keep = if probe.is_some_and(|state| state.in_string) {
+            0
+        } else {
+            longest_partial_token_suffix(&self.buffer, &STREAM_CONTROL_TOKENS)
+        };
         let safe_len = self.buffer.len() - keep;
         if safe_len > 0 {
             let safe_text = self.buffer[..safe_len].to_string();
             self.buffer.drain(..safe_len);
             result
                 .normal_text
-                .push_str(&Self::clean_normal_text(&safe_text));
+                .push_str(&Self::clean_normal_text(&safe_text, &mut json));
+            self.store_json_strings(json);
         }
         false
+    }
+
+    fn store_json_strings(&mut self, json: Option<JsonStringState>) {
+        if let Some(state) = json {
+            self.json_strings = state;
+        }
     }
 
     fn process_message_header(&mut self) -> bool {
@@ -384,7 +449,7 @@ impl Default for InklingParser {
 #[async_trait]
 impl ToolParser for InklingParser {
     async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
-        Ok(Self::parse_complete_impl(text, None))
+        Ok(Self::parse_complete_impl(text, None, self.json_mode))
     }
 
     async fn parse_complete_with_tools(
@@ -396,7 +461,11 @@ impl ToolParser for InklingParser {
             .iter()
             .map(|tool| tool.function.name.as_str())
             .collect::<HashSet<_>>();
-        Ok(Self::parse_complete_impl(text, Some(&allowed_tools)))
+        Ok(Self::parse_complete_impl(
+            text,
+            Some(&allowed_tools),
+            self.json_mode,
+        ))
     }
 
     async fn parse_incremental(
@@ -427,6 +496,10 @@ impl ToolParser for InklingParser {
         Ok(result)
     }
 
+    fn set_json_mode(&mut self, enabled: bool) {
+        self.json_mode = enabled;
+    }
+
     fn has_tool_markers(&self, text: &str) -> bool {
         text.contains(TOOL_CALL_JSON_START) || text.contains(TOOL_CALL_TEXT_START)
     }
@@ -436,6 +509,7 @@ impl ToolParser for InklingParser {
         self.state = StreamingState::Text;
         self.current_tool_index = 0;
         self.current_tool_name = None;
+        self.json_strings = JsonStringState::default();
     }
 }
 
@@ -465,6 +539,37 @@ fn find_earliest_token<'a>(text: &str, tokens: &'a [&'a str]) -> Option<(usize, 
         .iter()
         .filter_map(|token| text.find(token).map(|start| (start, *token)))
         .min_by_key(|(start, _)| *start)
+}
+
+/// Like [`find_earliest_token`]. With `json`, the quote state at the start of
+/// `text`, a token inside a JSON string is text and does not match.
+fn find_protocol_token<'a>(
+    text: &str,
+    tokens: &'a [&'a str],
+    json: Option<JsonStringState>,
+) -> Option<(usize, &'a str)> {
+    let Some(mut state) = json else {
+        return find_earliest_token(text, tokens);
+    };
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if !state.in_string && *byte == b'<' {
+            if let Some(token) = tokens
+                .iter()
+                .find(|token| bytes[index..].starts_with(token.as_bytes()))
+            {
+                return Some((index, *token));
+            }
+        }
+        state.step(*byte);
+    }
+    None
+}
+
+fn advance_json(json: &mut Option<JsonStringState>, text: &str) {
+    if let Some(state) = json {
+        state.advance(text);
+    }
 }
 
 /// Return the first byte after a discarded tool frame. Both end markers match

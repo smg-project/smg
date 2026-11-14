@@ -9,7 +9,7 @@ use std::io;
 use bytes::BytesMut;
 use openai_protocol::{
     chat::{ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef},
-    common::{ToolCallDelta, ToolChoice, Usage},
+    common::{ChatLogProbs, ChatLogProbsContent, ToolCallDelta, ToolChoice, TopLogProb, Usage},
     completion::CompletionStreamChoice,
 };
 use serde::Serialize;
@@ -137,6 +137,45 @@ impl ChatChunkFrame {
         Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
     }
 
+    /// [`Self::write_text_delta`] for a bare text delta that carries the
+    /// token's logprobs ([`text_delta`] with `Some` logprobs): the choice's
+    /// constant text and the logprobs object's structure (its keys, brackets
+    /// and `refusal` null) are written as literals, and serde writes the
+    /// index, the text and each entry's token and logprob alone, through the
+    /// calls it makes for them inside the struct, so each is the bytes it
+    /// writes there; an entry's byte list is written in decimal as serde
+    /// writes a `Vec<u8>`. Walked as a struct, the object cost an escape scan
+    /// and three writes per key (22 keys a token at five candidates) and
+    /// serde's dispatch per byte of the lists: about a quarter of a logprobs
+    /// stream request's user instructions were its serialization. The bytes
+    /// are those [`Self::write_chunk`] writes for the same choice (pinned by
+    /// test); a raw logprobs value stays serde's.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the delta writer's inputs plus the logprobs, not state"
+    )]
+    pub(super) fn write_text_delta_logprobs(
+        &self,
+        buffer: &mut BytesMut,
+        index: u32,
+        field: TextDelta,
+        text: &str,
+        logprobs: &ChatLogProbs,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        buffer.extend_from_slice(b"{\"index\":");
+        push_json(FrameSink(buffer), &index);
+        buffer.extend_from_slice(field.opener());
+        push_json(FrameSink(buffer), text);
+        buffer.extend_from_slice(b"},\"logprobs\":");
+        push_logprobs(buffer, logprobs);
+        buffer.extend_from_slice(b",\"finish_reason\":null}");
+        Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
     /// The chunk's end after its choice: `]`, the usage or its `null`
     /// placeholder, `}` and the event's blank line; a choice that failed to
     /// serialize leaves an error event in its place.
@@ -186,41 +225,145 @@ impl TextDelta {
     }
 }
 
-/// The field and the text of `choice` when it is a bare per-token delta: one
-/// text field and nothing else (no role, no tool calls, no logprobs, not
-/// finished, no matched stop), the shape [`ChatChunkFrame::write_text_delta`]
-/// writes; `None` for every other choice, which stays serde's. Both structs
-/// are matched field by field with no rest pattern, so a field added to
-/// either is a compile error here until this read says what it does.
-pub(super) fn text_delta<'a>(choice: &'a ChatStreamChoiceRef<'_>) -> Option<(TextDelta, &'a str)> {
+/// The field, the text and the logprobs of `choice` when it is a bare
+/// per-token delta: one text field and nothing else (no role, no tool calls,
+/// not finished, no matched stop), the shape [`ChatChunkFrame::write_text_delta`]
+/// writes and, when the token's logprobs ride along,
+/// [`ChatChunkFrame::write_text_delta_logprobs`]; `None` for every other
+/// choice, which stays serde's. Both structs are matched field by field with
+/// no rest pattern, so a field added to either is a compile error here until
+/// this read says what it does.
+pub(super) fn text_delta<'a>(
+    choice: &'a ChatStreamChoiceRef<'_>,
+) -> Option<(TextDelta, &'a str, Option<&'a ChatLogProbs>)> {
     let ChatStreamChoiceRef {
         index: _,
         delta,
-        logprobs: None,
+        logprobs,
         finish_reason: None,
         matched_stop: None,
     } = choice
     else {
         return None;
     };
-    match delta {
+    let (field, text) = match delta {
         ChatMessageDeltaRef {
             role: None,
             content: Some(text),
             tool_calls: None,
             reasoning_content: None,
-        } => Some((TextDelta::Content, text.as_ref())),
+        } => (TextDelta::Content, text.as_ref()),
         ChatMessageDeltaRef {
             role: None,
             content: None,
             tool_calls: None,
             reasoning_content: Some(text),
-        } => Some((TextDelta::Reasoning, text.as_ref())),
-        _ => None,
-    }
+        } => (TextDelta::Reasoning, text.as_ref()),
+        _ => return None,
+    };
+    Some((field, text, logprobs.as_ref()))
 }
 
-/// Serializing a string or an integer into memory cannot fail.
+/// The logprobs object of a chat choice as serde writes a [`ChatLogProbs`]:
+/// `{"content":<entries or null>,"refusal":<entries or null>}` for the
+/// detailed object, its structure as literals and its values through serde;
+/// a raw value is serde's whole.
+fn push_logprobs(buffer: &mut BytesMut, logprobs: &ChatLogProbs) {
+    let ChatLogProbs::Detailed { content, refusal } = logprobs else {
+        push_json(FrameSink(buffer), logprobs);
+        return;
+    };
+    buffer.extend_from_slice(b"{\"content\":");
+    push_logprob_entries(buffer, content.as_deref());
+    buffer.extend_from_slice(b",\"refusal\":");
+    push_logprob_entries(buffer, refusal.as_deref());
+    buffer.extend_from_slice(b"}");
+}
+
+/// A list of token entries as serde writes an `Option<Vec<ChatLogProbsContent>>`:
+/// `null`, or each token's entry with its candidates under `top_logprobs`.
+/// Both structs are matched field by field with no rest pattern, so a field
+/// added to either is a compile error here until this writer says where it
+/// goes.
+fn push_logprob_entries(buffer: &mut BytesMut, entries: Option<&[ChatLogProbsContent]>) {
+    let Some(entries) = entries else {
+        buffer.extend_from_slice(b"null");
+        return;
+    };
+    buffer.extend_from_slice(b"[");
+    for (at, entry) in entries.iter().enumerate() {
+        if at > 0 {
+            buffer.extend_from_slice(b",");
+        }
+        let ChatLogProbsContent {
+            token,
+            logprob,
+            bytes,
+            top_logprobs,
+        } = entry;
+        push_logprob_token(buffer, token, *logprob, bytes.as_deref());
+        buffer.extend_from_slice(b",\"top_logprobs\":[");
+        for (at, candidate) in top_logprobs.iter().enumerate() {
+            if at > 0 {
+                buffer.extend_from_slice(b",");
+            }
+            let TopLogProb {
+                token,
+                logprob,
+                bytes,
+            } = candidate;
+            push_logprob_token(buffer, token, *logprob, bytes.as_deref());
+            buffer.extend_from_slice(b"}");
+        }
+        buffer.extend_from_slice(b"]}");
+    }
+    buffer.extend_from_slice(b"]");
+}
+
+/// The opening of a token's entry, `{"token":…,"logprob":…,"bytes":…`: the
+/// three fields an entry and a candidate share, as serde writes them inside
+/// the struct (the token escaped, the logprob formatted or `null` when it is
+/// not finite, both through serde; the bytes in decimal). The caller closes
+/// the entry after whatever follows.
+fn push_logprob_token(buffer: &mut BytesMut, token: &str, logprob: f32, bytes: Option<&[u8]>) {
+    buffer.extend_from_slice(b"{\"token\":");
+    push_json(FrameSink(buffer), token);
+    buffer.extend_from_slice(b",\"logprob\":");
+    push_json(FrameSink(buffer), &logprob);
+    buffer.extend_from_slice(b",\"bytes\":");
+    push_byte_list(buffer, bytes);
+}
+
+/// An `Option<Vec<u8>>` as serde writes it: `null`, or the bytes in decimal
+/// between brackets, comma-separated.
+fn push_byte_list(buffer: &mut BytesMut, bytes: Option<&[u8]>) {
+    let Some(bytes) = bytes else {
+        buffer.extend_from_slice(b"null");
+        return;
+    };
+    buffer.extend_from_slice(b"[");
+    for (at, &byte) in bytes.iter().enumerate() {
+        if at > 0 {
+            buffer.extend_from_slice(b",");
+        }
+        let mut digits = [0u8; 3];
+        let mut rest = byte;
+        let mut from = digits.len();
+        loop {
+            from -= 1;
+            digits[from] = b'0' + rest % 10;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        buffer.extend_from_slice(&digits[from..]);
+    }
+    buffer.extend_from_slice(b"]");
+}
+
+/// Serializing a string, an integer, a float or a value made of them into
+/// memory cannot fail.
 fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
     let _ = serde_json::to_writer(writer, value);
 }
@@ -267,8 +410,11 @@ impl EscapedText {
 /// from `]` to the end of the event are serialized once per stream and
 /// copied around each chunk's choice, so a chunk costs the serialization of
 /// its choice only. The bytes are exactly those of a serialized
-/// [`openai_protocol::completion::CompletionStreamResponse`] without `usage`, which a chunk of this
-/// stream never carries.
+/// [`openai_protocol::completion::CompletionStreamResponse`] whose `usage` is
+/// `None` (a per-token chunk never carries the counts), except that a stream
+/// that asks for usage writes `"usage":null` last, where serde writes
+/// `usage`: the public API writes the placeholder on every chunk before the
+/// usage chunk, as a chat stream does.
 pub(super) struct CompletionChunkFrame {
     head: Vec<u8>,
     tail: Vec<u8>,
@@ -280,6 +426,7 @@ impl CompletionChunkFrame {
         model: &str,
         created: u64,
         system_fingerprint: Option<&str>,
+        usage_null_placeholder: bool,
     ) -> Self {
         let mut head = Vec::with_capacity(128);
         head.extend_from_slice(b"data: {\"id\":");
@@ -293,6 +440,9 @@ impl CompletionChunkFrame {
         if let Some(system_fingerprint) = system_fingerprint {
             tail.extend_from_slice(b",\"system_fingerprint\":");
             push_json(&mut tail, system_fingerprint);
+        }
+        if usage_null_placeholder {
+            tail.extend_from_slice(b",\"usage\":null");
         }
         tail.extend_from_slice(b"}\n\n");
         Self { head, tail }

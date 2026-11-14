@@ -13,9 +13,10 @@ use crate::{
     middleware::scheduler,
     policies::{
         cost as selection_cost,
-        engine_host::{encode_preset_name, preset_name, Decider},
+        engine_host::{encode_preset_name, preset_name, unsupported_form, Decider},
     },
-    worker::endpoint::Endpoint,
+    tenant::MAX_TENANT_ID_LEN,
+    worker::{endpoint::Endpoint, ConnectionMode},
 };
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
@@ -78,7 +79,7 @@ fn names_a_local_path(source: &str) -> bool {
 /// register); or a start-up URL names a gRPC worker itself. The connection
 /// mode alone misses the middle two: it follows the start-up URLs only.
 fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
-    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+    if config.connection_mode == ConnectionMode::Grpc
         || config.enable_igw
         || config.discovery.is_some()
     {
@@ -507,9 +508,13 @@ impl ConfigValidator {
                 return Err(ConfigError::invalid_value(
                     "policy_engine",
                     policy.name(),
-                    "the policy engine carries random, round_robin, passthrough, power_of_two \
-                     (expected_wait, requests, least_requests), least_load and manual in this \
-                     build",
+                    format!(
+                        "the policy engine does not carry the stages of {} in this build; it \
+                         carries random, round_robin, passthrough, power_of_two (expected_wait, \
+                         requests, least_requests), least_load, manual and cache_aware in its \
+                         default form",
+                        unsupported_form(policy)
+                    ),
                 ));
             }
         }
@@ -901,12 +906,11 @@ impl ConfigValidator {
             }
             // The canonical key is stored with every response and
             // conversation, in a 255-byte column on the SQL backends.
-            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+            if entry.tenant_id.len() > MAX_TENANT_ID_LEN {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "tenant_api_keys tenant_id '{}' is longer than {} bytes",
-                        entry.tenant_id,
-                        crate::tenant::MAX_TENANT_ID_LEN
+                        entry.tenant_id, MAX_TENANT_ID_LEN
                     ),
                 });
             }
@@ -994,6 +998,14 @@ impl ConfigValidator {
             return Err(ConfigError::invalid_value(
                 "oracle.pool_timeout_secs",
                 oracle.pool_timeout_secs,
+                "Must be > 0",
+            ));
+        }
+
+        if oracle.op_timeout_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "oracle.op_timeout_secs",
+                oracle.op_timeout_secs,
                 "Must be > 0",
             ));
         }
@@ -2538,7 +2550,6 @@ impl ConfigValidator {
 mod tests {
 
     use super::*;
-    use crate::worker::ConnectionMode;
 
     /// Serialized thresholds survive round trips and reject invalid values for either role.
     #[test]
@@ -2820,20 +2831,39 @@ mod tests {
         assert!(ConfigValidator::validate(&legacy).is_ok());
     }
 
-    /// Under `engine` a policy the engine does not carry is refused at start
-    /// by name, on the default and on a pair side; the legacy path takes it.
+    /// Under `engine` a policy, or a form of one, the engine does not carry
+    /// is refused at start by name, on the default and on a pair side; the
+    /// legacy path takes it, and the engine takes the default form.
     #[test]
     fn the_engine_switch_refuses_a_policy_the_engine_does_not_carry() {
+        let mut tempered = PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000);
+        if let PolicyConfig::CacheAware {
+            selection_temperature,
+            ..
+        } = &mut tempered
+        {
+            *selection_temperature = 0.5;
+        }
         let config = RouterConfig {
             policy_engine: PolicyEngineMode::Engine,
-            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
+            policy: tempered,
             ..Default::default()
         };
         assert!(matches!(
             ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, .. })
-                if field == "policy_engine" && value == "cache_aware"
+            Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
+                if field == "policy_engine"
+                    && value == "cache_aware"
+                    && reason.contains("cache_aware with a selection temperature")
         ));
+        let served = RouterConfig {
+            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
+            ..config.clone()
+        };
+        assert!(
+            ConfigValidator::validate(&served).is_ok(),
+            "the default form is served"
+        );
         let legacy = RouterConfig {
             policy_engine: PolicyEngineMode::Legacy,
             ..config

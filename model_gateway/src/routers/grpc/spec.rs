@@ -13,7 +13,7 @@ use std::sync::Arc;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{StreamOptions, StringOrArray, Tool, ToolChoice},
+    common::{ResponseFormat, StreamOptions, StringOrArray, Tool, ToolChoice},
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
@@ -79,6 +79,8 @@ pub(crate) struct ChatResponseSpec {
     /// the client asked for ([`Wire::of`]): the stream's shape follows it.
     pub wire: Wire,
     pub separate_reasoning: bool,
+    /// Preserve JSON string data when a typed reasoning parser removes framing.
+    pub json_mode: bool,
     pub tool_choice: Option<ToolChoice>,
     /// The tools the response is read against, shared with the readers that
     /// type its calls (one per choice) rather than copied into each.
@@ -100,6 +102,12 @@ pub(crate) struct ChatResponseSpec {
     pub skip_special_tokens: bool,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
+    /// The image tokens the gateway's multimodal expansion wrote into the
+    /// prompt, summed over the request's images, reported as
+    /// `prompt_tokens_details.image_tokens`; set by request building from the
+    /// multimodal intermediate. `None` for a request without an image the
+    /// gateway processed (no media, or media a worker processes itself).
+    pub image_tokens: Option<u32>,
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
@@ -144,6 +152,10 @@ impl ChatResponseSpec {
         Self {
             wire: Wire::of(provider),
             separate_reasoning: request.separate_reasoning,
+            json_mode: matches!(
+                request.response_format,
+                Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+            ),
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included: the request's own list shared, not copied (a new list
@@ -166,6 +178,7 @@ impl ChatResponseSpec {
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
+            image_tokens: None,
             reasoning_in_prefill: false,
             symphony: None,
             parser_names: None,
@@ -239,8 +252,54 @@ pub(crate) struct MessagesResponseSpec {
     pub parser_names: Option<Names>,
 }
 
+/// A Messages request's tools as the pipeline carries them: whether the
+/// request declared a `tools` field, and its custom tools as chat tools,
+/// converted once. The route takes them out of the request it still owns
+/// before the request is shared, so the schemas move instead of being copied
+/// per request; a reader with only a borrowed request converts by reference.
+#[derive(Clone)]
+pub(crate) struct MessagesTools {
+    pub declared: bool,
+    pub chat_tools: Arc<[Tool]>,
+}
+
+impl MessagesTools {
+    /// The tools taken out of `request`: its `tools` field reads `None` from
+    /// here on, and `declared` remembers that it was set.
+    pub(crate) fn take_from(request: &mut CreateMessageRequest) -> Self {
+        let tools = request.tools.take();
+        Self {
+            declared: tools.is_some(),
+            chat_tools: tools
+                .map(messages::into_chat_tools)
+                .unwrap_or_default()
+                .into(),
+        }
+    }
+}
+
+impl From<&CreateMessageRequest> for MessagesTools {
+    /// The tools of a request its caller keeps, converted by reference.
+    fn from(request: &CreateMessageRequest) -> Self {
+        Self {
+            declared: request.tools.is_some(),
+            chat_tools: request.chat_tools().into(),
+        }
+    }
+}
+
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
+        Self::with_tools(request, None)
+    }
+}
+
+impl MessagesResponseSpec {
+    /// The spec of `request`, its tools handed in by the route that owned the
+    /// request (`tools`) or, when `None`, converted from the request by
+    /// reference.
+    pub(crate) fn with_tools(request: &CreateMessageRequest, tools: Option<MessagesTools>) -> Self {
+        let tools = tools.unwrap_or_else(|| MessagesTools::from(request));
         Self {
             thinking_requested: request.thinking_toggle().unwrap_or(false),
             thinking_text_returned: request
@@ -251,9 +310,9 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             max_tokens: request.max_tokens,
             context_window: None,
             tool_choice: request.tool_choice.clone(),
-            has_tools: request.tools.is_some(),
+            has_tools: tools.declared,
             history_tool_calls_count: request.history_tool_calls_count(),
-            chat_tools: request.chat_tools().into(),
+            chat_tools: tools.chat_tools,
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
@@ -543,5 +602,25 @@ mod tests {
             spec.length_stop_reason(u32::MAX, 64),
             ModelContextWindowExceeded
         );
+    }
+
+    #[test]
+    fn chat_spec_selects_json_mode_only_for_structured_json() {
+        for (format, expected) in [
+            (Value::Null, false),
+            (json!({"type": "text"}), false),
+            (json!({"type": "json_object"}), true),
+            (
+                json!({"type": "json_schema", "json_schema": {
+                    "name": "answer", "schema": {"type": "object"}
+                }}),
+                true,
+            ),
+        ] {
+            let request = chat_request(json!({
+                "model": "test", "messages": [], "response_format": format
+            }));
+            assert_eq!(ChatResponseSpec::from(&request).json_mode, expected);
+        }
     }
 }

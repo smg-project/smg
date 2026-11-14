@@ -307,30 +307,45 @@ impl IdStamp {
             Self::Suffixed { base } => plan.set_request_id(suffixed_id(base, uuid::Uuid::now_v7())),
             Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
-                let ExecutionPlan::Batch {
-                    shared_request_id,
-                    requests,
-                    ..
-                } = plan
-                else {
-                    error!(
-                        function = "IdStamp::restamp",
-                        "Batch id stamp on a non-batch plan"
-                    );
-                    return Err(error::internal_error(
-                        "id_stamp_plan_mismatch",
-                        "Id stamp does not match the plan shape",
-                    ));
-                };
                 let shared = batch
                     .stable_shared
                     .clone()
                     .unwrap_or_else(|| minted_id(batch.prefix, uuid::Uuid::now_v7()));
-                for (i, request) in requests.iter_mut().enumerate() {
-                    request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                match plan {
+                    ExecutionPlan::Batch {
+                        shared_request_id,
+                        requests,
+                        ..
+                    } => {
+                        for (i, request) in requests.iter_mut().enumerate() {
+                            request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                        }
+                        *shared_request_id = shared;
+                        Ok(())
+                    }
+                    ExecutionPlan::EmbedBatch {
+                        shared_request_id,
+                        requests,
+                    } => {
+                        for (i, request) in requests.iter_mut().enumerate() {
+                            request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                        }
+                        *shared_request_id = shared;
+                        Ok(())
+                    }
+                    ExecutionPlan::Single(_)
+                    | ExecutionPlan::PrefillDecode(_)
+                    | ExecutionPlan::EncodePrefillDecode { .. } => {
+                        error!(
+                            function = "IdStamp::restamp",
+                            "Batch id stamp on a non-batch plan"
+                        );
+                        Err(error::internal_error(
+                            "id_stamp_plan_mismatch",
+                            "Id stamp does not match the plan shape",
+                        ))
+                    }
                 }
-                *shared_request_id = shared;
-                Ok(())
             }
         }
     }
@@ -1063,7 +1078,7 @@ pub(crate) fn finish_generate_request(
             ));
         }
         let refs =
-            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            assemble_media_refs(&plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
         proto_request
             .set_media_refs(refs)
             .map_err(|e| error::bad_request("multimodal_not_supported", e))?;

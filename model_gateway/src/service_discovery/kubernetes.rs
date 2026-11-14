@@ -706,7 +706,7 @@ mod tests {
     use super::*;
     use crate::{
         service_discovery::testing::make_labeled_pod,
-        worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey},
+        worker::{endpoint::Endpoint, endpoint_key, registry::WorkerId, EndpointKey},
     };
 
     /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),
@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     fn key(url: &str) -> EndpointKey {
-        crate::worker::endpoint_key(url).expect(url)
+        endpoint_key(url).expect(url)
     }
 
     /// A registered worker whose Pod the tests then stop publishing, so its

@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use crate::{
     channel::Channel,
     request_fields::{
-        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
+        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint, seed_bits,
         stop_strings, ConstraintKind, OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
@@ -48,6 +48,7 @@ pub type AbortOnDropStream =
 pub struct TokenSpeedSchedulerClient {
     client: tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    channel: Channel,
 }
 
 crate::impl_abort_for_drop_with_reason!(TokenSpeedSchedulerClient);
@@ -252,7 +253,7 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
-            sampling_seed: Self::chat_sampling_seed(request)?,
+            sampling_seed: Self::chat_sampling_seed(request),
             n: request.n.unwrap_or(1),
             logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint: Self::build_constraint_for_chat(request, constraint)?,
@@ -336,7 +337,7 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
-            sampling_seed: Self::completion_sampling_seed(request)?,
+            sampling_seed: Self::completion_sampling_seed(request),
             n: request.n.unwrap_or(1),
             logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint: Self::constraint_of(completion_constraint(request)?),
@@ -470,34 +471,26 @@ impl TokenSpeedSchedulerClient {
         })
     }
 
-    fn unsigned_sampling_seed(seed: Option<i64>) -> Result<Option<u64>, String> {
-        seed.map(|seed| {
-            u64::try_from(seed).map_err(|_| "sampling seed must be an unsigned integer".to_owned())
-        })
-        .transpose()
+    /// The OpenAI-compatible `seed` on this wire's unsigned word: its bits ([`seed_bits`]).
+    fn unsigned_sampling_seed(seed: Option<i64>) -> Option<u64> {
+        seed.map(seed_bits)
     }
 
     /// Resolve the TokenSpeed sampling seed: the native `sampling_seed` field
     /// wins when set; the OpenAI-compatible `seed` is only the fallback.
-    fn resolve_sampling_seed(
-        sampling_seed: Option<u64>,
-        legacy_seed: Option<i64>,
-    ) -> Result<Option<u64>, String> {
-        match sampling_seed {
-            Some(seed) => Ok(Some(seed)),
-            None => Self::unsigned_sampling_seed(legacy_seed),
-        }
+    fn resolve_sampling_seed(sampling_seed: Option<u64>, legacy_seed: Option<i64>) -> Option<u64> {
+        sampling_seed.or_else(|| Self::unsigned_sampling_seed(legacy_seed))
     }
 
     #[expect(
         deprecated,
         reason = "TokenSpeed preserves the OpenAI-compatible chat seed on its sampling wire"
     )]
-    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Result<Option<u64>, String> {
+    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Option<u64> {
         Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 
-    fn completion_sampling_seed(request: &CompletionRequest) -> Result<Option<u64>, String> {
+    fn completion_sampling_seed(request: &CompletionRequest) -> Option<u64> {
         Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 }
@@ -569,6 +562,39 @@ impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::Worke
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate,
             sampled_at: None,
+        }
+    }
+}
+
+impl TokenSpeedSchedulerClient {
+    /// `generate` with the request's large inline tensors as body frames of
+    /// their own (the crate's private `framed` module): no encode buffer of
+    /// the message's size, the same message on the wire. A plain fn like
+    /// `generate`, for the same reason: the request becomes its frames before
+    /// the future exists, so the boxed future holds the frame list and the
+    /// request id, not the request; the trace context is injected at the
+    /// first poll, as there.
+    pub fn generate_framed(
+        &self,
+        req: tokenspeed_proto::GenerateRequest,
+    ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
+        let request_id = req.request_id.clone();
+        let frames = crate::framed::tokenspeed_frames(req);
+        async move {
+            let frames = frames?;
+            let mut carrier = Request::new(());
+            if let Err(e) = self.trace_injector.inject(carrier.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+            let (metadata, _extensions, ()) = carrier.into_parts();
+            let stream = crate::framed::call_with_frames::<tokenspeed_proto::GenerateResponse>(
+                self.channel(),
+                "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/Generate",
+                metadata.into_headers(),
+                frames,
+            )
+            .await?;
+            Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
         }
     }
 }
@@ -754,29 +780,31 @@ mod seed_resolution_tests {
 
     #[test]
     fn native_sampling_seed_wins_over_legacy_seed() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42))
-            .expect("native seed should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42));
         assert_eq!(resolved, Some(7));
     }
 
     #[test]
     fn legacy_seed_is_the_fallback() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42))
-            .expect("legacy seed should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42));
         assert_eq!(resolved, Some(42));
     }
 
     #[test]
-    fn negative_legacy_seed_is_rejected() {
-        let err = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1))
-            .expect_err("negative legacy seed must be rejected");
-        assert!(err.contains("unsigned integer"), "{err}");
+    fn a_negative_legacy_seed_is_its_bits() {
+        assert_eq!(
+            TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1)),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(i64::MIN)),
+            Some(1 << 63)
+        );
     }
 
     #[test]
     fn no_seed_stays_none() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None)
-            .expect("absent seeds should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None);
         assert_eq!(resolved, None);
     }
 }

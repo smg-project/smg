@@ -230,40 +230,6 @@ impl Scorer for FewestSessions {
     }
 }
 
-/// Prefix overlap in blocks over the request's blocks.
-#[derive(Debug)]
-pub struct PrefixAffinity;
-
-impl Lifecycle for PrefixAffinity {}
-
-impl Scorer for PrefixAffinity {
-    fn name(&self) -> &'static str {
-        "prefix-affinity"
-    }
-
-    fn score(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        kept: &[u32],
-        out: &mut [f32],
-    ) -> TieBand {
-        let blocks = facts.block_hashes.len().max(1) as f32;
-        for (o, &i) in out.iter_mut().zip(kept) {
-            *o = (candidates[i as usize].overlap_blocks as f32 / blocks).clamp(0.0, 1.0);
-        }
-        TieBand::NORMALIZED
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            token_hashes: true,
-            events: true,
-            ..Needs::default()
-        }
-    }
-}
-
 /// Dispatches to one rank row no report reflects yet, oldest first within
 /// each lane. What a decision reads (the held token-work and requests) rides
 /// one atomic word, so deciding threads read a row without a lock. The
@@ -656,7 +622,9 @@ impl LeastLoad {
         } else {
             nominal
         };
-        let k = r.active_kv().clamp(0.0, 0.999_999);
+        // The active share, at the legacy formula's clamp: a saturated row
+        // prices its barrier at 999 times the weight, not a million.
+        let k = r.active_kv().clamp(0.0, 0.999);
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
@@ -1367,7 +1335,10 @@ mod tests {
     pub(super) static RETIRE_WAITS: AtomicUsize = AtomicUsize::new(0);
 
     use super::*;
-    use crate::view::{Health, LoadRow};
+    use crate::{
+        decision::Pair,
+        view::{Health, LoadRow},
+    };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
         Candidate {
@@ -1774,6 +1745,36 @@ mod tests {
     }
 
     #[test]
+    fn the_kv_barrier_reads_the_active_share_at_the_legacy_clamp() {
+        let scorer = LeastLoad::new(0.15, 1024, 2000.0);
+        let row = |active: u16, total: u16, queued: u32| LoadRow {
+            active_kv_permille: active,
+            kv_usage_permille: total,
+            queued,
+            live_rate: 2000,
+            ..LoadRow::default()
+        };
+        let facts = RequestFacts::default();
+        // A saturated row prices its barrier at 999 times the weight (150 s
+        // at 0.15), so a queue of 400 requests at the mean prefill (205 s)
+        // loses to it; at a clamp of 0.999999 the barrier would be 150,000 s
+        // and the queue would win.
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(row(1000, 1000, 0));
+        pool[1].load = Some(row(0, 0, 400));
+        let mut scores = [0.0f32; 2];
+        scorer.score(&facts, &pool, &kept(2), &mut scores);
+        assert!(scores[0] > scores[1], "{scores:?}");
+        // The barrier reads the active share: a cache full of evictable
+        // blocks (total 1.0, active 0.1) is lighter than one half held by
+        // running requests.
+        pool[0].load = Some(row(100, 1000, 0));
+        pool[1].load = Some(row(500, 500, 0));
+        scorer.score(&facts, &pool, &kept(2), &mut scores);
+        assert!(scores[0] > scores[1], "{scores:?}");
+    }
+
+    #[test]
     fn least_load_ties_within_a_microsecond_of_wait_on_a_spread_pool() {
         // Two workers a quarter of a microsecond apart in expected wait, and a
         // third four seconds behind that stretches the normalized scale: the
@@ -1996,7 +1997,7 @@ mod tests {
             position: 0,
             id: WorkerId(1),
             dp_rank: 0,
-            pair: Some(crate::decision::Pair {
+            pair: Some(Pair {
                 decode_position: 0,
                 decode_id: WorkerId(2),
                 decode_dp_rank: 0,
@@ -2071,7 +2072,7 @@ mod tests {
             position: 0,
             id: WorkerId(1),
             dp_rank: 0,
-            pair: Some(crate::decision::Pair {
+            pair: Some(Pair {
                 decode_position: 1,
                 decode_id: WorkerId(7),
                 decode_dp_rank: 1,
@@ -2584,14 +2585,10 @@ mod tests {
             ..RequestFacts::default()
         };
         let mut pool = [candidate(0, 0), candidate(1, 0)];
-        pool[0].overlap_blocks = 2;
         pool[1].session_hit = true;
         let mut scores = [0.0f32; 2];
-        PrefixAffinity.score(&facts, &pool, &kept(2), &mut scores);
-        assert_eq!(scores, [0.5, 0.0]);
         SessionAffinity.score(&facts, &pool, &kept(2), &mut scores);
         assert_eq!(scores, [0.0, 1.0]);
-        assert!(PrefixAffinity.needs().token_hashes && PrefixAffinity.needs().events);
         assert!(SessionAffinity.needs().headers);
         assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().loads);
     }

@@ -9,7 +9,10 @@ use redis::{AsyncCommands, AsyncConnectionConfig};
 use serde_json::Value;
 
 use crate::{
-    common::{parse_json_value, parse_raw_response, resolve_extra_column_values},
+    common::{
+        parse_conversation_metadata, parse_json_value, parse_raw_response,
+        resolve_extra_column_values,
+    },
     config::RedisConfig,
     context::current_extra_columns,
     core::{
@@ -134,8 +137,7 @@ impl RedisConversationStorage {
     fn parse_metadata(
         metadata: Option<String>,
     ) -> Result<Option<ConversationMetadata>, ConversationStorageError> {
-        crate::common::parse_conversation_metadata(metadata)
-            .map_err(ConversationStorageError::StorageError)
+        parse_conversation_metadata(metadata).map_err(ConversationStorageError::StorageError)
     }
 
     /// The tenant stored on a conversation's hash: `None` when the schema

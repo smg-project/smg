@@ -280,6 +280,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "arete-27b",
+        model: "NousResearch/Arete-27B",
+        also: &[],
+        released: "2026-11-06",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "arex-2",
         model: "BAAI/AREX-2",
         also: &[],
@@ -317,6 +327,16 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen3),
         set: Some(583_086),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "atria-dawn",
+        model: "internlm/Atria-Dawn",
+        also: &[],
+        released: "2026-10-23",
+        smg: (None, None),
+        table: Some(Table::Glm),
+        set: Some(28),
         status: Status::Replaying,
     },
     Group {
@@ -527,6 +547,16 @@ const GROUPS: &[Group] = &[
         table: None,
         set: Some(328_662),
         status: Status::Pending,
+    },
+    Group {
+        slug: "colgrep-agent-2b",
+        model: "lightonai/colgrep-agent-2B",
+        also: &[],
+        released: "2026-10-03",
+        smg: (None, None),
+        table: Some(Table::MiniCpm5),
+        set: Some(28),
+        status: Status::Replaying,
     },
     Group {
         slug: "contextpilot-14b",
@@ -740,7 +770,7 @@ const GROUPS: &[Group] = &[
         released: "2025-08-21",
         smg: (Some("deepseek31"), Some("deepseek_v31")),
         table: Some(Table::DeepSeekV3_1),
-        set: Some(19_299),
+        set: Some(19_300),
         status: Status::Replaying,
     },
     Group {
@@ -794,7 +824,7 @@ const GROUPS: &[Group] = &[
         released: "2025-11-28",
         smg: (None, None),
         table: Some(Table::MistralV13),
-        set: Some(570_194),
+        set: Some(570_202),
         status: Status::Replaying,
     },
     Group {
@@ -804,7 +834,7 @@ const GROUPS: &[Group] = &[
         released: "2025-08-11",
         smg: (Some("json"), None),
         table: Some(Table::LlamaNemotron),
-        set: Some(416_850),
+        set: Some(416_856),
         status: Status::Replaying,
     },
     Group {
@@ -844,7 +874,7 @@ const GROUPS: &[Group] = &[
         released: "2026-08-09",
         smg: (None, None),
         table: Some(Table::Dots3),
-        set: Some(589_296),
+        set: Some(589_308),
         status: Status::Replaying,
     },
     Group {
@@ -1007,7 +1037,7 @@ const GROUPS: &[Group] = &[
         released: "2026-03-02",
         smg: (Some("json"), None),
         table: Some(Table::Gemma4),
-        set: Some(478_241),
+        set: Some(478_253),
         status: Status::Replaying,
     },
     Group {
@@ -1027,7 +1057,7 @@ const GROUPS: &[Group] = &[
         released: "2025-09-29",
         smg: (Some("glm45_moe"), None),
         table: Some(Table::Glm4),
-        set: Some(492_389),
+        set: Some(492_400),
         status: Status::Replaying,
     },
     Group {
@@ -1067,7 +1097,7 @@ const GROUPS: &[Group] = &[
         released: "2026-01-19",
         smg: (Some("glm47_moe"), None),
         table: Some(Table::Glm),
-        set: Some(1_947),
+        set: Some(1_958),
         status: Status::Replaying,
     },
     Group {
@@ -1117,7 +1147,7 @@ const GROUPS: &[Group] = &[
         released: "2026-08-25",
         smg: (Some("glm47_moe"), Some("glm45")),
         table: Some(Table::Glm),
-        set: Some(503_273),
+        set: Some(503_285),
         status: Status::Replaying,
     },
     Group {
@@ -1187,7 +1217,7 @@ const GROUPS: &[Group] = &[
         released: "2025-08-30",
         smg: (None, None),
         table: Some(Table::Qwen2_5),
-        set: Some(576_772),
+        set: Some(576_780),
         status: Status::Replaying,
     },
     Group {
@@ -1211,13 +1241,23 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "hy-memory-30b-a3b",
+        model: "tencent/Hy-Memory-30B-A3B",
+        also: &["Hy-Memory-30B-A3B-FP8"],
+        released: "2026-10-15",
+        smg: (None, None),
+        table: Some(Table::HyV3),
+        set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "hy4-preview",
         model: "tencent/Hy4-preview",
         also: &[],
         released: "2026-08-27",
         smg: (Some("hy_v4"), Some("hy_v4")),
         table: Some(Table::Hy4),
-        set: Some(589_298),
+        set: Some(589_310),
         status: Status::Replaying,
     },
     Group {
@@ -1237,7 +1277,7 @@ const GROUPS: &[Group] = &[
         released: "2026-09-28",
         smg: (None, None),
         table: Some(Table::IQuest),
-        set: Some(503_273),
+        set: Some(503_285),
         status: Status::Replaying,
     },
     Group {
@@ -1247,7 +1287,7 @@ const GROUPS: &[Group] = &[
         released: "2025-12-26",
         smg: (None, None),
         table: Some(Table::Qwen3),
-        set: Some(503_634),
+        set: Some(503_646),
         status: Status::Replaying,
     },
     Group {
@@ -1257,7 +1297,7 @@ const GROUPS: &[Group] = &[
         released: "2026-09-01",
         smg: (None, None),
         table: Some(Table::K2Horizon),
-        set: Some(12_814),
+        set: Some(12_815),
         status: Status::Replaying,
     },
     Group {
@@ -1327,7 +1367,7 @@ const GROUPS: &[Group] = &[
         released: "2026-06-13",
         smg: (Some("kimi_k3"), Some("kimi_k3")),
         table: Some(Table::KimiK3),
-        set: Some(54_418),
+        set: Some(54_430),
         status: Status::Ready,
     },
     Group {
@@ -1337,7 +1377,7 @@ const GROUPS: &[Group] = &[
         released: "2026-04-23",
         smg: (None, None),
         table: Some(Table::Glm4),
-        set: Some(490_452),
+        set: Some(490_460),
         status: Status::Replaying,
     },
     Group {
@@ -1347,13 +1387,13 @@ const GROUPS: &[Group] = &[
         released: "2026-01-06",
         smg: (None, None),
         table: Some(Table::Lfm2_5),
-        set: Some(589_657),
+        set: Some(589_669),
         status: Status::Replaying,
     },
     Group {
         slug: "lfm2.5-24b-a2b",
         model: "LiquidAI/LFM2.5-24B-A2B",
-        also: &[],
+        also: &["LFM2.5-24B-A2B-FP8"],
         released: "2026-10-12",
         smg: (None, None),
         table: Some(Table::Lfm2_5),
@@ -1503,7 +1543,7 @@ const GROUPS: &[Group] = &[
         released: "2025-03-16",
         smg: (Some("json"), Some("nano_v3")),
         table: Some(Table::LlamaNemotron),
-        set: Some(416_850),
+        set: Some(416_856),
         status: Status::Replaying,
     },
     Group {
@@ -1606,7 +1646,7 @@ const GROUPS: &[Group] = &[
         released: "2025-03-27",
         smg: (Some("json"), None),
         table: Some(Table::Xlam),
-        set: Some(483_062),
+        set: Some(483_069),
         status: Status::Replaying,
     },
     Group {
@@ -1620,13 +1660,43 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "longcat-2.5",
+        model: "meituan-longcat/LongCat-2.5",
+        also: &[],
+        released: "2026-11-04",
+        smg: (None, None),
+        table: Some(Table::LongCat),
+        set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "mage-vl-cowork",
+        model: "microsoft/Mage-VL-Cowork",
+        also: &[],
+        released: "2026-10-30",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "midashenglm-spatial",
+        model: "mispeech/midashenglm-spatial",
+        also: &[],
+        released: "2026-09-23",
+        smg: (Some("json"), None),
+        table: Some(Table::Plain),
+        set: Some(5),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "mimo-v2.5",
         model: "XiaomiMiMo/MiMo-V2.5",
         also: &["MiMo-V2.5-Base"],
         released: "2026-04-27",
         smg: (None, None),
         table: Some(Table::Qwen3TaggedDirect),
-        set: Some(589_278),
+        set: Some(589_290),
         status: Status::Replaying,
     },
     Group {
@@ -1666,7 +1736,7 @@ const GROUPS: &[Group] = &[
         released: "2026-09-06",
         smg: (None, None),
         table: Some(Table::MiniCpm5),
-        set: Some(589_277),
+        set: Some(589_289),
         status: Status::Replaying,
     },
     Group {
@@ -1676,7 +1746,7 @@ const GROUPS: &[Group] = &[
         released: "2025-10-22",
         smg: (Some("minimax_m2"), Some("minimax")),
         table: Some(Table::MinimaxM2),
-        set: Some(12_821),
+        set: Some(12_825),
         status: Status::Replaying,
     },
     Group {
@@ -1696,7 +1766,7 @@ const GROUPS: &[Group] = &[
         released: "2026-04-09",
         smg: (Some("minimax_m2"), Some("minimax")),
         table: Some(Table::MinimaxM2),
-        set: Some(12_821),
+        set: Some(12_825),
         status: Status::Replaying,
     },
     Group {
@@ -1706,7 +1776,7 @@ const GROUPS: &[Group] = &[
         released: "2026-06-02",
         smg: (Some("minimax_m3"), Some("minimax_m3")),
         table: Some(Table::MinimaxM3),
-        set: Some(589_302),
+        set: Some(589_314),
         status: Status::Replaying,
     },
     Group {
@@ -1716,7 +1786,7 @@ const GROUPS: &[Group] = &[
         released: "2025-10-31",
         smg: (None, None),
         table: Some(Table::MistralV13),
-        set: Some(570_194),
+        set: Some(570_202),
         status: Status::Replaying,
     },
     Group {
@@ -1775,7 +1845,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "mistral-large-4-1t-a52b",
         model: "mistralai/Mistral-Large-4-1T-A52B",
-        also: &[],
+        also: &["Mistral-Large-4-1T-A52B-NVFP4"],
         released: "2026-09-30",
         smg: (Some("mistral"), None),
         table: Some(Table::MistralV13),
@@ -1799,7 +1869,7 @@ const GROUPS: &[Group] = &[
         released: "2025-01-28",
         smg: (Some("mistral"), None),
         table: Some(Table::Mistral),
-        set: Some(184_972),
+        set: Some(184_973),
         status: Status::Replaying,
     },
     Group {
@@ -1819,7 +1889,7 @@ const GROUPS: &[Group] = &[
         released: "2026-08-09",
         smg: (None, None),
         table: Some(Table::MuseSpark),
-        set: Some(494_673),
+        set: Some(494_683),
         status: Status::Replaying,
     },
     Group {
@@ -1839,7 +1909,17 @@ const GROUPS: &[Group] = &[
         released: "2026-07-21",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
-        set: Some(589_298),
+        set: Some(589_310),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "nanbeige4.3-33b",
+        model: "Nanbeige/Nanbeige4.3-33B",
+        also: &[],
+        released: "2026-10-24",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
         status: Status::Replaying,
     },
     Group {
@@ -1978,7 +2058,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-3.5-super-vl-120b-a12b-bf16",
         model: "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16",
-        also: &[],
+        also: &["NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"],
         released: "2026-10-12",
         smg: (Some("qwen_xml"), Some("nano_v3")),
         table: Some(Table::Qwen3Tagged),
@@ -2008,7 +2088,10 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-labs-dory1.0-4b-bf16",
         model: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
-        also: &[],
+        also: &[
+            "NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8",
+            "NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+        ],
         released: "2026-10-16",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
@@ -2032,7 +2115,7 @@ const GROUPS: &[Group] = &[
         released: "2025-11-19",
         smg: (None, None),
         table: Some(Table::Olmo3),
-        set: Some(570_199),
+        set: Some(570_207),
         status: Status::Replaying,
     },
     Group {
@@ -2097,13 +2180,23 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "otel-2.0-llm-31b-it",
+        model: "RedHatAI/OTel-2.0-LLM-31B-IT",
+        also: &[],
+        released: "2026-10-26",
+        smg: (None, None),
+        table: Some(Table::Gemma4),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "phi-4-mini-instruct",
         model: "microsoft/Phi-4-mini-instruct",
         also: &[],
         released: "2025-02-19",
         smg: (None, None),
         table: Some(Table::Plain),
-        set: Some(328_662),
+        set: Some(328_664),
         status: Status::Replaying,
     },
     Group {
@@ -2123,7 +2216,7 @@ const GROUPS: &[Group] = &[
         released: "2026-06-22",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3Tagged),
-        set: Some(474_563),
+        set: Some(474_575),
         status: Status::Replaying,
     },
     Group {
@@ -2166,7 +2259,7 @@ const GROUPS: &[Group] = &[
         released: "2025-01-23",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen2_5),
-        set: Some(576_772),
+        set: Some(576_780),
         status: Status::Replaying,
     },
     Group {
@@ -2211,7 +2304,7 @@ const GROUPS: &[Group] = &[
         released: "2025-04-27",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
-        set: Some(583_086),
+        set: Some(583_098),
         status: Status::Replaying,
     },
     Group {
@@ -2278,7 +2371,7 @@ const GROUPS: &[Group] = &[
         released: "2025-04-27",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
-        set: Some(54_418),
+        set: Some(54_430),
         status: Status::Ready,
     },
     Group {
@@ -2524,8 +2617,18 @@ const GROUPS: &[Group] = &[
         released: "2025-08-20",
         smg: (None, None),
         table: Some(Table::SeedOss),
-        set: Some(495_977),
+        set: Some(495_989),
         status: Status::Replaying,
+    },
+    Group {
+        slug: "sentiment-analysis-7b",
+        model: "microsoft/Sentiment-Analysis-7B",
+        also: &[],
+        released: "2026-10-17",
+        smg: (None, None),
+        table: Some(Table::Plain),
+        set: None,
+        status: Status::AwaitingFixtures,
     },
     Group {
         slug: "step-3.5-flash",
@@ -2554,8 +2657,8 @@ const GROUPS: &[Group] = &[
         released: "2023-12-30",
         smg: (Some("json"), None),
         table: Some(Table::Plain),
-        set: Some(27_865),
-        status: Status::Ready,
+        set: Some(328_664),
+        status: Status::Replaying,
     },
     Group {
         slug: "trinity-mini",
@@ -2568,14 +2671,24 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "userlm-2.0",
+        model: "microsoft/UserLM-2.0",
+        also: &[],
+        released: "2026-10-01",
+        smg: (None, None),
+        table: Some(Table::Plain),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "webworld-32b",
         model: "Qwen/WebWorld-32B",
         also: &["WebWorld-8B", "WebWorld-14B"],
         released: "2026-02-13",
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
-        set: Some(54_418),
-        status: Status::Ready,
+        set: Some(583_086),
+        status: Status::Replaying,
     },
     Group {
         slug: "wevisone-vl-4b",
@@ -2585,6 +2698,16 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen3),
         set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "youtu-parsing-omni",
+        model: "tencent/Youtu-Parsing-Omni",
+        also: &[],
+        released: "2026-10-09",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: Some(1),
         status: Status::Replaying,
     },
 ];
@@ -2606,19 +2729,18 @@ fn count(n: u32) -> String {
 fn render() -> String {
     let mut groups: Vec<&Group> = GROUPS.iter().collect();
     groups.sort_by_key(|group| (std::cmp::Reverse(group.released), group.slug));
-    let tally = |status: fn(&Status) -> bool| groups.iter().filter(|g| status(&g.status)).count();
-    let checkpoints: usize = groups.iter().map(|group| 1 + group.also.len()).sum();
     let mut out = String::new();
+    let legend = [
+        Status::Ready,
+        Status::Replaying,
+        Status::AwaitingFixtures,
+        Status::Pending,
+    ]
+    .map(Status::cell);
     let _ = writeln!(
         out,
-        "{} groups, {} checkpoints, newest first.\n{} ready, {} replaying a recorded \
-         set, {} on main awaiting fixtures, {} pending.",
-        groups.len(),
-        checkpoints,
-        tally(|s| *s == Status::Ready),
-        tally(|s| *s == Status::Replaying),
-        tally(|s| *s == Status::AwaitingFixtures),
-        tally(|s| *s == Status::Pending),
+        "Newest first; the status column reads {}, {}, {}, or {}.",
+        legend[0], legend[1], legend[2], legend[3]
     );
     out.push('\n');
     out.push_str(

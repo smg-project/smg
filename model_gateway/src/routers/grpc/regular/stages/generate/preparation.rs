@@ -47,7 +47,7 @@ impl GeneratePreparationStage {
         // and token ids only. A request that names media is refused as the
         // chat route refuses media no worker takes, instead of being served
         // without it.
-        let media = media_fields(request);
+        let media = request.media_fields();
         if !media.is_empty() {
             return Err(error::bad_request(
                 "multimodal_not_supported",
@@ -109,14 +109,10 @@ impl GeneratePreparationStage {
         worker_registry: &WorkerRegistry,
         model_id: &str,
     ) -> Result<(Option<String>, Vec<u32>), String> {
-        if let Some(text) = &request.text {
-            return self
-                .tokenize_single_text(tokenizer, text)
-                .await
-                .map(|(original, ids)| (Some(original), ids));
-        }
-
-        // Handle input_ids - validate and convert
+        // The engine's order: the ids before the text, so a body that carries
+        // both is served from the ids as the engine serves it (the text rode
+        // along for the client's own reading); a text-first read dropped the
+        // ids without a word.
         if let Some(input_ids) = &request.input_ids {
             return match input_ids {
                 InputIds::Single(ids) => {
@@ -136,6 +132,13 @@ impl GeneratePreparationStage {
             };
         }
 
+        if let Some(text) = &request.text {
+            return self
+                .tokenize_single_text(tokenizer, text)
+                .await
+                .map(|(original, ids)| (Some(original), ids));
+        }
+
         Err("Either `text` or `input_ids` must be provided".to_string())
     }
 
@@ -149,75 +152,5 @@ impl GeneratePreparationStage {
             .await
             .map_err(|e| format!("Tokenization failed: {e}"))?;
         Ok((text.to_string(), encoding.into_token_ids()))
-    }
-}
-
-/// The media fields of `request` that carry something: `image_data`,
-/// `video_data` and `audio_data` when present and naming an item (a null, an
-/// empty list, or a list of nulls and empty lists is no media, as the engine
-/// reads it).
-fn media_fields(request: &GenerateRequest) -> Vec<&'static str> {
-    [
-        ("image_data", &request.image_data),
-        ("video_data", &request.video_data),
-        ("audio_data", &request.audio_data),
-    ]
-    .into_iter()
-    .filter(|(_, value)| value.as_ref().is_some_and(carries_media))
-    .map(|(name, _)| name)
-    .collect()
-}
-
-/// Whether `value` names media as the engine reads it: anything but a null,
-/// or a list, nested to any depth, one of whose items does.
-fn carries_media(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Null => false,
-        serde_json::Value::Array(items) => items.iter().any(carries_media),
-        _ => true,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    fn request(extra: serde_json::Value) -> GenerateRequest {
-        let mut body = json!({"model": "m", "text": "hi"});
-        body.as_object_mut()
-            .expect("an object")
-            .extend(extra.as_object().expect("an object").clone());
-        serde_json::from_value(body).expect("a generate request")
-    }
-
-    /// A body names media when one of the three fields carries something; a
-    /// text-only body, a null, an empty list and a list of nulls and empty
-    /// lists do not.
-    #[test]
-    fn the_media_fields_that_carry_something_are_named() {
-        assert!(media_fields(&request(json!({}))).is_empty());
-        assert!(media_fields(&request(json!({"image_data": null}))).is_empty());
-        assert!(media_fields(&request(json!({"image_data": []}))).is_empty());
-        assert!(media_fields(&request(json!({"image_data": [null]}))).is_empty());
-        assert!(media_fields(&request(json!({"video_data": [[]]}))).is_empty());
-        assert!(media_fields(&request(json!({"audio_data": [null, [], [null]]}))).is_empty());
-        assert_eq!(
-            media_fields(&request(json!({"image_data": [[null, "a.png"]]}))),
-            ["image_data"]
-        );
-        assert_eq!(
-            media_fields(&request(
-                json!({"image_data": "data:image/png;base64,iVBORw0KGgo="})
-            )),
-            ["image_data"]
-        );
-        assert_eq!(
-            media_fields(&request(
-                json!({"video_data": ["clip.mp4"], "audio_data": "a.wav"})
-            )),
-            ["video_data", "audio_data"]
-        );
     }
 }

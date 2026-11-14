@@ -15,7 +15,14 @@
 //! - `SelectWorkerInfo::rid_key`: the fallback session key derived from the
 //!   request body's `rid` (populated under `--routing-key-override`)
 
-use std::{borrow::Borrow, sync::Arc, time::Instant};
+use std::{
+    borrow::Borrow,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::RngExt;
@@ -119,6 +126,11 @@ impl Node {
 #[derive(Debug)]
 pub struct ManualPolicy {
     routing_map: Arc<DashMap<RoutingId, Node>>,
+    /// The map's entry count, kept where the map changes (a key it did not
+    /// hold, the idle eviction) and published to the size gauge from there:
+    /// `DashMap::len` locks and walks every shard, so a selection reads
+    /// nothing about the size.
+    entries: Arc<AtomicUsize>,
     assignment_mode: ManualAssignmentMode,
     _eviction_task: Option<PeriodicTask>,
 }
@@ -129,39 +141,39 @@ impl Default for ManualPolicy {
     }
 }
 
+impl Drop for ManualPolicy {
+    /// The map goes with the policy (the registry drops a model's policy
+    /// with its last worker), and its entries leave the size gauge with it:
+    /// the eviction task is stopped and joined first, so no pass sits
+    /// between its `retain` and its decrement when the count is read.
+    fn drop(&mut self) {
+        self._eviction_task.take();
+        let remaining = self.entries.swap(0, Ordering::Relaxed);
+        if remaining > 0 {
+            Metrics::manual_policy_cache_entries_evicted(remaining);
+        }
+    }
+}
+
 impl ManualPolicy {
     pub fn new() -> Self {
         Self::with_config(ManualConfig::default())
     }
 
     pub fn with_config(config: ManualConfig) -> Self {
-        use std::time::Duration;
-
         let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
+        let entries = Arc::new(AtomicUsize::new(0));
 
         let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
             let routing_map_clone = Arc::clone(&routing_map);
+            let entries_clone = Arc::clone(&entries);
             let max_idle = Duration::from_secs(config.max_idle_secs);
 
             Some(PeriodicTask::spawn(
                 config.eviction_interval_secs,
                 "ManualPolicyEviction",
                 move || {
-                    let now = Instant::now();
-                    let before_size = routing_map_clone.len();
-
-                    routing_map_clone
-                        .retain(|_, node| now.duration_since(node.last_access) < max_idle);
-
-                    let evicted_count = before_size - routing_map_clone.len();
-                    if evicted_count > 0 {
-                        info!(
-                            "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
-                            evicted_count,
-                            routing_map_clone.len(),
-                            max_idle.as_secs()
-                        );
-                    }
+                    evict_idle(&routing_map_clone, &entries_clone, max_idle, Instant::now());
                 },
             ))
         } else {
@@ -170,9 +182,26 @@ impl ManualPolicy {
 
         Self {
             routing_map,
+            entries,
             assignment_mode: config.assignment_mode,
             _eviction_task: eviction_task,
         }
+    }
+
+    /// A key the map did not hold was inserted: the count and the size gauge
+    /// move here, not on the selection path. The gauge moves by one rather
+    /// than to the count read back: two inserts racing would publish their
+    /// counts in either order, and nothing rewrites the gauge until the next
+    /// change.
+    fn note_new_entry(&self) {
+        self.entries.fetch_add(1, Ordering::Relaxed);
+        Metrics::manual_policy_cache_entry_added();
+    }
+
+    /// The entry count as kept: what the size gauge shows.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.load(Ordering::Relaxed)
     }
 
     fn select_new_worker(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
@@ -187,10 +216,6 @@ impl ManualPolicy {
 
     pub(crate) fn assignment_mode(&self) -> ManualAssignmentMode {
         self.assignment_mode
-    }
-
-    pub(crate) fn map_len(&self) -> usize {
-        self.routing_map.len()
     }
 
     /// Probe the pin for `key` without reassigning: the first of its
@@ -238,6 +263,7 @@ impl ManualPolicy {
                     candi_worker_urls: vec![url.to_string()],
                     last_access: Instant::now(),
                 });
+                self.note_new_entry();
             }
         }
     }
@@ -292,6 +318,7 @@ impl ManualPolicy {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                     last_access: Instant::now(),
                 });
+                self.note_new_entry();
                 (selected_idx, ExecutionBranch::Vacant)
             }
         }
@@ -337,7 +364,6 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         Metrics::record_worker_manual_policy_branch(branch.as_str());
-        Metrics::set_manual_policy_cache_entries(self.routing_map.len());
         result
     }
 
@@ -348,6 +374,38 @@ impl LoadBalancingPolicy for ManualPolicy {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// The idle eviction: every entry not used within `max_idle` of `now` leaves
+/// the map, the kept count and the size gauge follow by the number removed,
+/// and a pass that removed anything is logged. Returns that number.
+fn evict_idle(
+    routing_map: &DashMap<RoutingId, Node>,
+    entries: &AtomicUsize,
+    max_idle: Duration,
+    now: Instant,
+) -> usize {
+    let mut evicted = 0;
+    routing_map.retain(|_, node| {
+        let kept = now.duration_since(node.last_access) < max_idle;
+        if !kept {
+            evicted += 1;
+        }
+        kept
+    });
+    if evicted > 0 {
+        let remaining = entries
+            .fetch_sub(evicted, Ordering::Relaxed)
+            .saturating_sub(evicted);
+        Metrics::manual_policy_cache_entries_evicted(evicted);
+        info!(
+            "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
+            evicted,
+            remaining,
+            max_idle.as_secs()
+        );
+    }
+    evicted
 }
 
 /// The first of a pin's candidate URLs that is in `workers` and that
@@ -379,29 +437,33 @@ where
     V: Ord,
     F: Fn(K) -> V,
 {
-    let mut min_val: Option<V> = None;
-    let mut candidates = Vec::new();
-
+    // One pass and no list of the ties: the n-th candidate tied for the
+    // minimum replaces the pick with probability 1/n, which leaves every
+    // tied candidate as likely as a draw from a list of them did.
+    let mut rng = rand::rng();
+    let mut pick: Option<(K, V)> = None;
+    let mut ties: u32 = 0;
     for &idx in indices {
         let val = get_value(idx);
-        match min_val.as_ref().map(|m| val.cmp(m)) {
+        match pick.as_ref().map(|(_, min)| val.cmp(min)) {
             None | Some(std::cmp::Ordering::Less) => {
-                min_val = Some(val);
-                candidates.clear();
-                candidates.push(idx);
+                pick = Some((idx, val));
+                ties = 1;
             }
             Some(std::cmp::Ordering::Equal) => {
-                candidates.push(idx);
+                ties += 1;
+                if rng.random_range(0..ties) == 0 {
+                    pick = Some((idx, val));
+                }
             }
             Some(std::cmp::Ordering::Greater) => {}
         }
     }
-
-    if candidates.len() == 1 {
-        candidates[0]
-    } else {
-        let mut rng = rand::rng();
-        candidates[rng.random_range(0..candidates.len())]
+    match pick {
+        Some((idx, _)) => idx,
+        // Every caller returns early on an empty pool, so a pick always exists;
+        // this index is the invariant's check, not a recovery path.
+        None => indices[0],
     }
 }
 
@@ -417,6 +479,7 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
 mod tests {
     use std::collections::HashMap;
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
@@ -840,6 +903,108 @@ mod tests {
         assert_eq!(config.max_idle_secs, 4 * 3600);
     }
 
+    /// The pin of the kept count: a selection publishes the map's size only
+    /// when it inserted a key; a hit records nothing about the size.
+    #[test]
+    fn a_selection_publishes_the_map_size_only_for_a_new_key() {
+        let policy = ManualPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = headers_with_routing_key("conv-1");
+        let info = with_headers(&headers);
+
+        let first = PrometheusBuilder::new().build_recorder();
+        let first_handle = first.handle();
+        ::metrics::with_local_recorder(&first, || {
+            policy.select_worker(&workers, &info);
+        });
+        assert!(
+            first_handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 1"),
+            "the new key sets the gauge to 1"
+        );
+
+        let hits = PrometheusBuilder::new().build_recorder();
+        let hits_handle = hits.handle();
+        ::metrics::with_local_recorder(&hits, || {
+            for _ in 0..3 {
+                policy.select_worker(&workers, &info);
+            }
+        });
+        assert!(
+            !hits_handle
+                .render()
+                .contains("smg_manual_policy_cache_entries"),
+            "a hit publishes nothing about the map's size"
+        );
+    }
+
+    #[test]
+    fn the_idle_eviction_takes_the_count_and_the_gauge_down_by_what_it_removed() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            let policy = ManualPolicy::new();
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            for key in ["conv-1", "conv-2", "conv-3"] {
+                let headers = headers_with_routing_key(key);
+                policy.select_worker(&workers, &with_headers(&headers));
+            }
+            policy.pin_front("conv-1", "http://w2:8000");
+            assert_eq!(
+                policy.entry_count(),
+                3,
+                "a pin of a held key counts nothing"
+            );
+            policy.pin_front("conv-4", "http://w2:8000");
+            assert_eq!(policy.entry_count(), 4, "a pin of a new key counts it");
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 4"),
+                "every new key moved the gauge up by one"
+            );
+
+            // Two entries used an hour later: a pass at that instant with a
+            // minute's bound removes the other two, not everything (a reset
+            // to zero would read the same as a full pass).
+            let later = Instant::now() + Duration::from_secs(3600);
+            for key in ["conv-3", "conv-4"] {
+                policy
+                    .routing_map
+                    .get_mut(&RoutingId(key.to_string()))
+                    .expect("a kept key")
+                    .last_access = later;
+            }
+            let evicted = evict_idle(
+                &policy.routing_map,
+                &policy.entries,
+                Duration::from_secs(60),
+                later,
+            );
+            assert_eq!(evicted, 2);
+            assert_eq!(policy.entry_count(), 2);
+            assert_eq!(policy.routing_map.len(), 2);
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 2"),
+                "the pass moved the gauge down by what it removed"
+            );
+
+            let evicted = evict_idle(&policy.routing_map, &policy.entries, Duration::ZERO, later);
+            assert_eq!(evicted, 2);
+            assert_eq!(policy.entry_count(), 0);
+            assert_eq!(policy.routing_map.len(), 0);
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 0"),
+                "the last pass left the gauge at zero"
+            );
+        });
+    }
+
     #[test]
     fn test_manual_with_disabled_eviction() {
         let config = ManualConfig {
@@ -866,7 +1031,7 @@ mod tests {
         let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
         assert!(access_after_vacant.elapsed().as_millis() < 100);
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
 
         // OccupiedHit: same worker still healthy
         let (_, branch) = policy.select_worker_impl(&workers, &info);
@@ -874,7 +1039,7 @@ mod tests {
         let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
         assert!(access_after_hit > access_after_vacant);
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
 
         // OccupiedMiss: worker becomes unhealthy
         workers[first_idx].set_status(WorkerStatus::NotReady);
@@ -886,8 +1051,6 @@ mod tests {
 
     #[test]
     fn test_manual_ttl_eviction_logic() {
-        use std::time::Duration;
-
         let config = ManualConfig {
             eviction_interval_secs: 2,
             max_idle_secs: 2,
@@ -1118,5 +1281,45 @@ mod tests {
             selected_worker_0,
             "Random mode should sometimes select worker 0 despite higher load"
         );
+    }
+
+    /// A policy dropped with its map takes its entries out of the gauge: a
+    /// replacement's keys count from zero, not from the old map's worth.
+    #[test]
+    fn a_dropped_policy_takes_its_entries_out_of_the_gauge() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            let policy = ManualPolicy::new();
+            for key in ["conv-1", "conv-2", "conv-3"] {
+                let headers = headers_with_routing_key(key);
+                policy.select_worker(&workers, &with_headers(&headers));
+            }
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 3"),
+                "three new keys moved the gauge to 3"
+            );
+
+            drop(policy);
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 0"),
+                "the dropped policy's entries left the gauge"
+            );
+
+            let replacement = ManualPolicy::new();
+            let headers = headers_with_routing_key("conv-4");
+            replacement.select_worker(&workers, &with_headers(&headers));
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 1"),
+                "a replacement's keys count from zero"
+            );
+        });
     }
 }

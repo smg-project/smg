@@ -36,9 +36,12 @@ use tonic_health::pb::{
 
 use crate::{
     admin_ops::{AdminOps, ProfileOptions},
+    bootstrap::{accept_and_close, bind},
     config::{Config, Role, SchedulerWire},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
+    kv_zmq,
+    overrides::{self, for_port, WorkerOverrides},
     replay::Capture,
     script::{self, Answer, MatchedStop},
 };
@@ -111,7 +114,7 @@ pub async fn serve_with_listener_until(
         .map(|a| a.port())
         .and_then(|port| port.checked_sub(cfg.grpc_base_port))
         .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+    let bootstrap = match bind(&cfg.host, bootstrap_port).await {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!("grpc worker {addr:?} {e}");
@@ -131,7 +134,7 @@ pub async fn serve_with_listener_until(
         let port = addr.map(|a| a.port())?;
         let index = port.checked_sub(cfg.grpc_base_port)?;
         cfg.kv_zmq_for(index, 0)
-            .map(|kv| crate::kv_zmq::serve(rank.engine.clone(), kv))
+            .map(|kv| kv_zmq::serve(rank.engine.clone(), kv))
     });
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
@@ -142,15 +145,14 @@ pub async fn serve_with_listener_until(
         shutdown.await;
         let _ = stop.send(true);
     };
-    let overrides = crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0));
+    let overrides = for_port(addr.map(|a| a.port()).unwrap_or(0));
     let wire = cfg.grpc_wire;
     let health = MockHealth {
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
         service: health_service_name(wire, cfg.role),
     };
-    let bootstrap =
-        bootstrap.map(|listener| crate::bootstrap::accept_and_close(listener, stopped.clone()));
+    let bootstrap = bootstrap.map(|listener| accept_and_close(listener, stopped.clone()));
     let service = MockScheduler {
         cfg,
         name,
@@ -184,7 +186,14 @@ pub async fn serve_with_listener_until(
         // detection asks each wire's health check in turn and takes the
         // first that answers, so another wire's scheduler here would name the
         // worker's runtime for it.
-        let mut builder = Server::builder();
+        // A receiver's windows set the sender's pace. The gateway's media
+        // requests carry inline tensors of tens of megabytes; on hyper's
+        // server defaults each one stalls on window updates frame by frame.
+        // The windows and frames follow the engine servicer's.
+        let mut builder = Server::builder()
+            .initial_stream_window_size(Some(16 * 1024 * 1024))
+            .initial_connection_window_size(Some(64 * 1024 * 1024))
+            .max_frame_size(Some(1024 * 1024));
         let routes = match wire {
             // An encode worker on this wire mounts the engine's encoder service
             // beside the scheduler's, as the servicer does: the gateway's encode
@@ -291,7 +300,7 @@ struct MockScheduler {
     ops: Arc<AdminOps>,
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
-    overrides: Arc<crate::overrides::WorkerOverrides>,
+    overrides: Arc<WorkerOverrides>,
     /// The bootstrap port this worker bound and advertises: a prefill
     /// worker's, when it was given one.
     bootstrap_port: Option<u16>,
@@ -1028,7 +1037,7 @@ impl MockScheduler {
         if let Some(protocol) = &self.cfg.pairing_protocol {
             fields.insert("pairing_protocol".to_string(), string(protocol.clone()));
         }
-        fields.extend(crate::overrides::server_args(&self.overrides.info()).fields);
+        fields.extend(overrides::server_args(&self.overrides.info()).fields);
         (!fields.is_empty()).then_some(prost_types::Struct { fields })
     }
 
@@ -1170,7 +1179,7 @@ impl MockScheduler {
             capture: None,
             stopped,
             in_flight: WorkerInFlight::default(),
-            overrides: crate::overrides::for_port(port),
+            overrides: for_port(port),
             bootstrap_port: cfg.bootstrap_base_port,
             ops: AdminOps::register(&name),
             name,
@@ -1195,7 +1204,7 @@ type HealthWatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, S
 /// engine servicer hosts it.
 #[derive(Clone)]
 struct MockHealth {
-    overrides: Arc<crate::overrides::WorkerOverrides>,
+    overrides: Arc<WorkerOverrides>,
     /// Flips when the worker stops: ends the watch streams, which have no
     /// end of their own, so the server's drain can finish.
     stopped: watch::Receiver<bool>,
@@ -2074,6 +2083,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::engine::{FaultScope, RequestFault};
 
     /// The next item of a health watch, within the test's patience.
     async fn next(watch: &mut tonic::Streaming<HealthCheckResponse>) -> ServingStatus {
@@ -2190,13 +2200,13 @@ mod tests {
         // The override map is process-wide and keyed by port: put the entry
         // back on the way out (a failed assertion included), or a later test
         // that draws the same ephemeral port would start out not serving.
-        struct Restore(Arc<crate::overrides::WorkerOverrides>);
+        struct Restore(Arc<WorkerOverrides>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 self.0.set_serving(true);
             }
         }
-        let overrides = crate::overrides::for_port(addr.port());
+        let overrides = for_port(addr.port());
         let _restore = Restore(Arc::clone(&overrides));
         overrides.set_serving(false);
         assert_eq!(check("").await.expect("check"), ServingStatus::NotServing);
@@ -2723,15 +2733,13 @@ mod tests {
     #[tokio::test]
     async fn the_first_cut_ends_a_fanned_out_request_before_the_next_choice_is_read() {
         let (service, _stop) = scheduler_with_ranks(1, 65_113);
-        service.ranks[0]
-            .engine
-            .fault_fail(Some(crate::engine::RequestFault {
-                status: 503,
-                stall: std::time::Duration::ZERO,
-                after_tokens: Some(1),
-                finish_error: true,
-                scope: crate::engine::FaultScope::Requests(1),
-            }));
+        service.ranks[0].engine.fault_fail(Some(RequestFault {
+            status: 503,
+            stall: std::time::Duration::ZERO,
+            after_tokens: Some(1),
+            finish_error: true,
+            scope: FaultScope::Requests(1),
+        }));
         let mut request = generate_request("two-choices-cut", None, 4);
         request.stream = false;
         request.sampling_params = Some(ts::SamplingParams {
@@ -3248,15 +3256,13 @@ mod tests {
     #[tokio::test]
     async fn an_n_above_the_gateways_bound_is_refused_before_the_fault_hook() {
         let (service, _stop) = scheduler_with_ranks(1, 65_114);
-        service.ranks[0]
-            .engine
-            .fault_fail(Some(crate::engine::RequestFault {
-                status: 503,
-                stall: std::time::Duration::ZERO,
-                after_tokens: None,
-                finish_error: false,
-                scope: crate::engine::FaultScope::Requests(1),
-            }));
+        service.ranks[0].engine.fault_fail(Some(RequestFault {
+            status: 503,
+            stall: std::time::Duration::ZERO,
+            after_tokens: None,
+            finish_error: false,
+            scope: FaultScope::Requests(1),
+        }));
         let mut request = generate_request("too-many-choices", None, 2);
         request.sampling_params = Some(ts::SamplingParams {
             max_new_tokens: Some(2),

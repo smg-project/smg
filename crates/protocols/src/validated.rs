@@ -496,11 +496,20 @@ pub fn undecodable_content_encoding(req: &Request) -> Option<String> {
         .find(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
 }
 
+/// The most of a refused coding the 415 message echoes: a header value is
+/// the client's own text, cut here so that the message stays one line.
+#[cfg(feature = "axum")]
+const CONTENT_ENCODING_ECHO_CHARS: usize = 64;
+
 /// The message of the 415 a JSON body under an encoding the gateway does
-/// not decode is answered with.
+/// not decode is answered with; a coding longer than the echo bound is cut
+/// there and the cut marked.
 #[cfg(feature = "axum")]
 pub fn content_encoding_message(encoding: &str) -> String {
-    format!("Content-Encoding `{encoding}` is not decoded: send the JSON body unencoded")
+    let mut chars = encoding.chars();
+    let shown: String = chars.by_ref().take(CONTENT_ENCODING_ECHO_CHARS).collect();
+    let cut = if chars.next().is_some() { "..." } else { "" };
+    format!("Content-Encoding `{shown}{cut}` is not decoded: send the JSON body unencoded")
 }
 
 /// The 415 with its `Accept-Encoding: identity`, the header by which a
@@ -723,7 +732,10 @@ mod tests {
     use validator::Validate;
 
     use super::*;
-    use crate::chat::{ChatCompletionRequest, ChatMessage};
+    use crate::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{invalid, invalid_at},
+    };
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct TestRequest {
@@ -992,6 +1004,41 @@ mod tests {
                 "{encoding}: {body}"
             );
         }
+    }
+
+    /// The 415 message echoes at most the echo bound of a refused coding,
+    /// counted in characters, and marks the cut: a header value is the
+    /// client's text, not the message's.
+    #[test]
+    fn the_415_message_cuts_a_long_coding() {
+        assert_eq!(
+            content_encoding_message("gzip"),
+            "Content-Encoding `gzip` is not decoded: send the JSON body unencoded"
+        );
+        let at_the_bound = "y".repeat(CONTENT_ENCODING_ECHO_CHARS);
+        assert!(
+            content_encoding_message(&at_the_bound).contains(&format!("`{at_the_bound}`")),
+            "a coding at the bound is echoed whole"
+        );
+        let long = "x".repeat(CONTENT_ENCODING_ECHO_CHARS + 1);
+        assert_eq!(
+            content_encoding_message(&long),
+            format!(
+                "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
+                "x".repeat(CONTENT_ENCODING_ECHO_CHARS)
+            )
+        );
+        // The bound counts characters, not bytes: an obs-text byte of the header
+        // reaches the helper as the three-byte replacement character.
+        let accented = "é".repeat(CONTENT_ENCODING_ECHO_CHARS + 1);
+        assert_eq!(
+            content_encoding_message(&accented),
+            format!(
+                "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
+                "é".repeat(CONTENT_ENCODING_ECHO_CHARS)
+            ),
+            "the cut is counted in characters"
+        );
     }
 
     /// A rejection carries its code as the `RejectionCode` extension (the
@@ -1372,14 +1419,14 @@ mod tests {
 
     fn crossed(request: &CrossRequest) -> Result<(), ValidationError> {
         if request.top && !request.base {
-            return Err(crate::common::invalid_at(
+            return Err(invalid_at(
                 "top",
                 "top_requires_base",
                 "top is only allowed when base is set",
             ));
         }
         if request.whole {
-            return Err(crate::common::invalid(
+            return Err(invalid(
                 "whole_request_refused",
                 "the request as a whole is refused",
             ));
@@ -1456,6 +1503,47 @@ mod tests {
         assert!(lines[0].starts_with("name: "), "{json}");
         assert!(lines[1].starts_with("value: "), "{json}");
         assert_eq!(json["error"]["param"], "name", "{json}");
+    }
+
+    /// A content part whose `type` the gateway knows but whose body does not
+    /// fit it is refused at serde's reason for the field: the code is the
+    /// reason's, the param the message serde's path stops at, with the part's
+    /// place and the missing field under it when a field is the one missing;
+    /// never the gRPC routes' `unsupported_content_part`.
+    #[tokio::test]
+    async fn a_malformed_known_content_part_is_refused_at_its_field() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (part, code, param) in [
+            (
+                r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","max_long_side_pixel":-1}}"#,
+                "integer_below_min_value",
+                "messages[0]",
+            ),
+            (
+                r#"{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AA==","fps":"1"}}"#,
+                "invalid_type",
+                "messages[0]",
+            ),
+            (
+                r#"{"type":"image_url","image_url":{"detail":"high"}}"#,
+                "missing_required_parameter",
+                "messages[0].content[1].image_url.url",
+            ),
+            (
+                r#"{"type":"image_url"}"#,
+                "missing_required_parameter",
+                "messages[0].content[1].image_url",
+            ),
+        ] {
+            let body = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}},{part}]}}]}}"#
+            );
+            let (status, json) = rejected::<ChatCompletionRequest>(&body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+        }
     }
 
     /// The Chat Completions rules checked across fields name their field;
@@ -1787,6 +1875,220 @@ mod tests {
                     status,
                     serde_json::from_slice(&bytes).unwrap_or(Value::Null),
                 ))
+            }
+        }
+    }
+
+    /// Omitted, null and true all keep Flash's sampling defaults and explicit values.
+    #[tokio::test]
+    async fn glm_flash_sampling_defaults_and_explicit_values() {
+        for do_sample in [None, Some(Value::Null), Some(json!(true))] {
+            let mut body = json!({
+                "model": "zai-org/GLM-5.3-Flash",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(do_sample) = do_sample {
+                body["do_sample"] = do_sample;
+            }
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.0), Some(0.95), None)
+            );
+
+            body["temperature"] = json!(0.7);
+            body["top_p"] = json!(0.8);
+            body["top_k"] = json!(20);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(0.8), Some(20))
+            );
+
+            body["top_p"] = json!(0);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(1.0), Some(1))
+            );
+        }
+    }
+
+    /// A registered Flash alias takes the same greedy override and validation as its model.
+    #[tokio::test]
+    async fn glm_flash_sampling_validates_effective_values_for_the_model_and_its_alias() {
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "flash-sampling-chat-alias";
+        const CHECKPOINT: &str = "flash-sampling-chat-checkpoint";
+        ProviderProfile::register_model_aliases([
+            (ALIAS, "zai-org/GLM-5.3-Flash"),
+            ("glm-5.3-flash-sampling-checkpoint-alias", CHECKPOINT),
+        ]);
+        for model in [
+            "zai-org/GLM-5.3-Flash",
+            "GLM5.3-FLASH-FP8",
+            ALIAS,
+            CHECKPOINT,
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 99, "top_p": -1, "top_k": 0
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.0), Some(1.0), Some(1))
+            );
+
+            body["top_k"] = json!(20);
+            body["top_p"] = json!(0.9);
+            body["do_sample"] = json!(true);
+            body["temperature"] = json!(1.01);
+            let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["param"], "temperature");
+
+            body["temperature"] = json!(-0.01);
+            assert!(chat_request(&body.to_string()).await.is_err());
+            for temperature in [0.0, 1.0] {
+                body["temperature"] = json!(temperature);
+                assert!(chat_request(&body.to_string()).await.is_ok());
+            }
+            for invalid in [json!(0), json!("false"), json!([]), json!({})] {
+                body["do_sample"] = invalid;
+                let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(error["error"]["param"], "do_sample");
+            }
+        }
+    }
+
+    /// Flash-specific sampling rules leave neighboring models and their extensions alone.
+    #[tokio::test]
+    async fn glm_flash_sampling_rules_do_not_reach_other_models() {
+        for model in [
+            "glm-5.3-air",
+            "glm-5.3-flashlight",
+            "glm53flash2",
+            "local-model",
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 1.5, "top_p": 0.7, "top_k": 20
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.5), Some(0.7), Some(20))
+            );
+            assert_eq!(req.other["do_sample"], false);
+            body["do_sample"] = json!("false");
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(req.other["do_sample"], "false");
+            body["top_p"] = json!(0);
+            let (status, _) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// The Chat Completions extractor applies the Flash budget to model names
+    /// and registered aliases, preserving both wire fields and their precedence.
+    #[tokio::test]
+    async fn glm53_flash_chat_output_budget() {
+        use serde_json::json;
+
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "opaque-glm-flash-budget-test";
+        ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
+
+        for (model, flash) in [
+            ("glm-5.3-flash", true),
+            ("zai-org/GLM-5.3-Flash-FP8", true),
+            ("glm53flash", false),
+            (ALIAS, true),
+            ("glm-5.3", false),
+            ("glm-5.2", false),
+            ("glm-5.3-flashlight", false),
+            ("glm-5.3-flash2", false),
+            ("local-model", false),
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let request = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(request.output_token_cap(), None, "{model}");
+            if !flash {
+                body["max_completion_tokens"] = json!(163_840);
+                let request = chat_request(&body.to_string()).await.unwrap();
+                assert_eq!(request.output_token_cap(), Some(163_840), "{model}");
+                continue;
+            }
+
+            body["max_tokens"] = Value::Null;
+            body["max_completion_tokens"] = Value::Null;
+            assert_eq!(
+                chat_request(&body.to_string())
+                    .await
+                    .unwrap()
+                    .output_token_cap(),
+                None
+            );
+
+            let mut minimum_only = body.clone();
+            minimum_only["min_tokens"] = json!(65_537);
+            assert!(chat_request(&minimum_only.to_string()).await.is_ok());
+
+            for fields in [
+                json!({"max_tokens": 1}),
+                json!({"max_tokens": 131_072}),
+                json!({"max_completion_tokens": 1}),
+                json!({"max_completion_tokens": 131_072}),
+                json!({"max_tokens": 131_072, "max_completion_tokens": 1}),
+                json!({"max_tokens": 1, "max_completion_tokens": 131_072}),
+            ] {
+                let mut input = body.clone();
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let request = chat_request(&input.to_string()).await.unwrap();
+                assert_eq!(
+                    request.output_token_cap().map(u64::from),
+                    fields["max_completion_tokens"]
+                        .as_u64()
+                        .or_else(|| fields["max_tokens"].as_u64()),
+                    "{input}"
+                );
+                let serialized = serde_json::to_value(request).unwrap();
+                assert_eq!(serialized["max_tokens"], fields["max_tokens"], "{input}");
+                assert_eq!(
+                    serialized["max_completion_tokens"], fields["max_completion_tokens"],
+                    "{input}"
+                );
+            }
+
+            for (value, code) in [
+                (0, "integer_below_min_value"),
+                (131_073, "max_tokens_out_of_range"),
+            ] {
+                for (field, other) in [
+                    ("max_tokens", "max_completion_tokens"),
+                    ("max_completion_tokens", "max_tokens"),
+                ] {
+                    for other_value in [Value::Null, json!(1)] {
+                        body[field] = json!(value);
+                        body[other] = other_value;
+                        let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                        assert_eq!(error["error"]["code"], code, "{body}: {error}");
+                        assert_eq!(error["error"]["param"], field, "{body}: {error}");
+                    }
+                }
             }
         }
     }

@@ -8,6 +8,7 @@ use smg_grpc_client::sglang_proto as sg;
 use tonic::Status;
 
 use super::State;
+use crate::embed::guarded;
 
 /// Handle one `Embed` request against the connected scheduler.
 pub(super) async fn embed(
@@ -18,7 +19,7 @@ pub(super) async fn embed(
     // A generation scheduler has no pooler to answer with. The Router only
     // sends embeddings to workers advertising `is_generation = false`, so
     // this guards a misrouted request rather than a supported path.
-    crate::embed::guarded(
+    guarded(
         state,
         req.request_id.clone(),
         state.model.is_generation,

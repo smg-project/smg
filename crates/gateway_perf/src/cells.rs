@@ -1119,6 +1119,7 @@ pub fn elapsed_since(t: f64) -> f64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::{bed::Fleet, paths::path_named};
 
     /// A results file from per-id samples: run i holds the i-th value of every id that
     /// has one.
@@ -1392,7 +1393,7 @@ pub(crate) mod tests {
             json!({"sent": 10, "ok": 9, "failed": 1}),
             json!({"sent": 10, "ok": 7, "failed": 2, "unfinished": 1}),
         ];
-        let spec = crate::paths::path_named("stream").unwrap();
+        let spec = path_named("stream").unwrap();
         let measured = SoakMeasured {
             rows,
             summaries: summaries.to_vec(),
@@ -1439,12 +1440,12 @@ pub(crate) mod tests {
             setup_text(&settings, "alloc"),
             "alloc: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines, 8 runtime threads; gateway pinned to cores 0-7"
         );
-        settings.bed.fleet = crate::bed::Fleet::PrefillDecode;
+        settings.bed.fleet = Fleet::PrefillDecode;
         assert_eq!(
             setup_text(&settings, "cpu"),
             "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 1 prefill and 4 decode scripted mock engines on the prefill-decode path, 8 runtime threads; gateway pinned to cores 0-7"
         );
-        settings.bed.fleet = crate::bed::Fleet::Http;
+        settings.bed.fleet = Fleet::Http;
         assert_eq!(
             setup_text(&settings, "cpu"),
             "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines on the HTTP wire, 8 runtime threads; gateway pinned to cores 0-7"

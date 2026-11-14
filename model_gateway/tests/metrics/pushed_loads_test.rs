@@ -17,7 +17,10 @@ use smg::{
     worker::{KvEventMonitor, ModelCard, SubscriptionKind},
 };
 
-use crate::common::grpc_harness::{grpc_test_context, grpc_worker, serve_mock_worker_with};
+use crate::{
+    common::grpc_harness::{grpc_test_context, grpc_worker, serve_mock_worker_with},
+    metrics::recorder,
+};
 
 const MODEL: &str = "mock-model";
 const WORKERS: usize = 8;
@@ -45,7 +48,7 @@ async fn start_realistic_worker() -> u16 {
 
 #[tokio::test]
 async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     let (metrics_addr, _metrics_server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

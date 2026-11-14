@@ -24,7 +24,7 @@ use tokio::net::TcpSocket;
 
 use crate::{
     error,
-    worker::{ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
+    worker::{self, ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
     RetryConfig,
 };
 
@@ -84,7 +84,7 @@ impl StubWorker {
     pub(crate) fn at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
-            redacted: crate::worker::redacted_url(url).into_owned(),
+            redacted: worker::redacted_url(url).into_owned(),
             healthy: true,
             client: http_client(),
         })
@@ -98,7 +98,7 @@ impl StubWorker {
     pub(crate) fn unhealthy_at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
-            redacted: crate::worker::redacted_url(url).into_owned(),
+            redacted: worker::redacted_url(url).into_owned(),
             healthy: false,
             client: http_client(),
         })

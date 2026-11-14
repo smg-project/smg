@@ -547,6 +547,7 @@ class Router:
                 pool_min=args_dict.get("oracle_pool_min", 1),
                 pool_max=args_dict.get("oracle_pool_max", 16),
                 pool_timeout_secs=args_dict.get("oracle_pool_timeout_secs", 30),
+                op_timeout_secs=args_dict.get("oracle_op_timeout_secs", 5),
             )
         args_dict["oracle_config"] = oracle_config
         args_dict["history_backend"] = history_backend
@@ -597,6 +598,7 @@ class Router:
             "oracle_pool_min",
             "oracle_pool_max",
             "oracle_pool_timeout_secs",
+            "oracle_op_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
             "postgres_op_timeout_secs",

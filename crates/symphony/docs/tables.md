@@ -849,6 +849,43 @@ the calls as JSON objects or with a typed tag per argument (`tool_call_format`);
 hold the default thought and the default calls, read here. A thought under one of the other tags is
 content until a set shows it.
 
+## Hy V3 (`hy_v3`)
+
+The template decides the thought by `reasoning_effort`, and the table reads the decision from the
+prompt: `no_think` (the default, and any value the template does not know) writes `<think></think>`
+after the turn opener, so the output starts in content; `low` and `high` write `<think>` alone, so it
+starts inside the thought. `enable_thinking` moves nothing. The recorded sets hold the default alone
+(bellwether refused every thought-bearing probe at record time), so the thought's shapes rest on the
+table's rows, which are Hy4's under the plain markers.
+
+What the table leaves out, for want of fixtures: the template can spell every marker with a suffix of
+its own (`<think:…>`, `<tool_sep:…>`; Hy4's `:opensource` is that spelling), and its search mode renders
+tool outputs under other markers; the recorded sets hold the plain spelling, read here. A turn under a
+suffixed spelling is content until a set shows it.
+
+## LongCat (`longcat`)
+
+The template writes the thinking switch into the user turn, not the assistant header: `/think_on`
+after the user's text when the request's `enable_thinking` is true, `/think_off` otherwise (the
+default; `reasoning_effort` moves nothing). The assistant header follows the switch, and the table
+reads the decision from the prompt's tail: `<longcat_think>` alone when thinking is on, so the
+output starts inside the thought; `<longcat_think>\n\n</longcat_think>\n` otherwise, so it starts in
+content. The recorded sets hold the default alone (bellwether refused every thought-bearing probe at
+record time), so the thought's shapes rest on the table's rows, which are GLM 4.6's under the
+prefixed markers.
+
+The template writes each call right after the content's last byte and a newline after each call's
+close, the last one before the turn's end: between two calls, and after the last, that newline is a
+stay of whitespace alone, the template's spacing, dropped (`Dropped { Whitespace }`), as GLM 4.6's
+between its calls; a newline the model writes before words stays content, as under every table
+without a trim row (bellwether #17's question). The tools' declaration block
+(`<longcat_tool_declare>`) and the observation turn that carries tool results
+(`<longcat_observation>`, `<longcat_tool_response>`) are the prompt's, before the turn opener the
+replay starts at; the model writes neither.
+
+What the table leaves open, for want of fixtures: a thought under the opened header, which no
+recorded case shows, read by the rows alone.
+
 ## Muse Spark (`muse_spark`)
 
 The template opens the turn with `<|start|>assistant` and writes every message as

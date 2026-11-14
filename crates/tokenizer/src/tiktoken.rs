@@ -31,7 +31,8 @@ use crate::{
         },
         marks, PromptSegment, RendererProfile, TemplateAnswers,
     },
-    factory::discover_chat_template_in_dir,
+    eos::{load_eos_token_ids, with_tokenizer_eos},
+    factory::{discover_chat_template_in_dir, processor_chat_template},
     kimi_k2_tokenizer,
     native::{Added, AddedTokens, NativeEncoder},
     tekken,
@@ -552,8 +553,8 @@ impl TiktokenTokenizer {
 
         // Load merged EOS token IDs from config.json + generation_config.json,
         // plus the tokenizer's own eos_token (structured-output grammars end on it).
-        let eos_token_ids = crate::eos::with_tokenizer_eos(
-            crate::eos::load_eos_token_ids(dir),
+        let eos_token_ids = with_tokenizer_eos(
+            load_eos_token_ids(dir),
             special_tokens
                 .eos_token
                 .as_deref()
@@ -571,8 +572,7 @@ impl TiktokenTokenizer {
         // The processor's legacy template beside the files, for the requests
         // without tools, read as the conversion of the checkpoint reads it
         // (`factory::processor_chat_template`, one read for both backends).
-        let processor_template =
-            crate::factory::processor_chat_template(Some(dir), chat_template_path);
+        let processor_template = processor_chat_template(Some(dir), chat_template_path);
         let mut chat_template =
             ChatTemplateState::from_checkpoint(chat_template, processor_template)?;
         let controls = structural_controls
@@ -1448,6 +1448,10 @@ impl TokenizerTrait for TiktokenTokenizer {
     ) -> Option<bool> {
         self.template_answers()
             .native_thinking_mode(template_kwargs, thinking)
+    }
+
+    fn template_reads(&self, name: &str) -> bool {
+        self.template_answers().template_reads(name)
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {

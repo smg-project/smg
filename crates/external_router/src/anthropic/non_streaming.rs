@@ -21,11 +21,14 @@ use super::{
 use crate::{error, mcp_utils::DEFAULT_MAX_ITERATIONS, metrics::Metrics};
 
 /// Execute a non-streaming Messages API request, handling both
-/// plain and MCP tool loop paths.
+/// plain and MCP tool loop paths. The plain path relays the provider's answer
+/// as it wrote it; the MCP loop reads each answer typed to find its tool calls.
 pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext) -> Response {
     if req_ctx.mcp_servers.is_none() {
-        return match send_one_request(router, &req_ctx).await {
-            Ok(message) => (StatusCode::OK, Json(message)).into_response(),
+        return match send_to_worker(router, &req_ctx).await {
+            Ok((response, start_time)) => {
+                worker::relay_response(response, &req_ctx.model_id, start_time).await
+            }
             Err(response) => response,
         };
     }
@@ -110,6 +113,17 @@ async fn send_one_request(
     router: &RouterContext,
     req_ctx: &RequestContext,
 ) -> Result<Message, Response> {
+    let (response, start_time) = send_to_worker(router, req_ctx).await?;
+    worker::parse_response(response, &req_ctx.model_id, start_time).await
+}
+
+/// Send a single non-streaming request to a worker: its successful answer,
+/// unread, with the time the request started; a refusal answered as the
+/// provider's error.
+async fn send_to_worker(
+    router: &RouterContext,
+    req_ctx: &RequestContext,
+) -> Result<(reqwest::Response, Instant), Response> {
     let model_id = &req_ctx.model_id;
     let start_time = Instant::now();
 
@@ -130,5 +144,5 @@ async fn send_one_request(
         return Err(worker::handle_error_response(response, model_id, start_time).await);
     }
 
-    worker::parse_response(response, model_id, start_time).await
+    Ok((response, start_time))
 }

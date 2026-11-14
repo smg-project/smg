@@ -36,6 +36,8 @@ use smg_test_harness::{
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tower::ServiceExt;
 
+use crate::metrics::recorder;
+
 const MODEL: &str = "stream-cut-count-test-model";
 /// The streamed routes the count covers, each with a request of its own: the
 /// chat and text completions, the Messages route and the native generate
@@ -280,7 +282,7 @@ fn label<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 /// The `smg_http_responses_total` samples of `path` in this binary's
 /// recorder, as `(status_code, error_code, count)`, sorted.
 fn responses_of_path(path: &str) -> Vec<(String, String, u64)> {
-    let rendered = crate::metrics::recorder().render();
+    let rendered = recorder().render();
     let mut samples: Vec<(String, String, u64)> = rendered
         .lines()
         .filter(|line| {
