@@ -1365,10 +1365,9 @@ impl RequestContext {
         )
     }
 
-    /// Create context for messages request
-    /// A Messages context carries the request's tools beside the request
+    /// A Messages context: it carries the request's tools beside the request
     /// (`tools`, taken out of the request by the route while it still owned
-    /// it): the preparation builds the response spec from them.
+    /// it), and the preparation builds the response spec from them.
     pub fn for_messages(
         request: Arc<CreateMessageRequest>,
         tools: MessagesTools,
