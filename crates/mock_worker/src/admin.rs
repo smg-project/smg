@@ -59,7 +59,9 @@ use crate::{
     admin_ops::AdminOps,
     config::Config,
     engine::{self, Engine, FaultScope, RequestFault},
+    overrides::for_port,
     script,
+    zmq::rank_output_counts,
 };
 
 struct AdminState {
@@ -105,7 +107,7 @@ fn router(state: Arc<AdminState>) -> Router {
 }
 
 async fn serving_get(Path(port): Path<u16>) -> Json<Value> {
-    Json(json!({ "port": port, "serving": crate::overrides::for_port(port).serving() }))
+    Json(json!({ "port": port, "serving": for_port(port).serving() }))
 }
 
 /// Body `{"serving": true|false}`: whether the worker's gRPC health check
@@ -113,7 +115,7 @@ async fn serving_get(Path(port): Path<u16>) -> Json<Value> {
 async fn serving_set(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
     match body.get("serving").and_then(Value::as_bool) {
         Some(serving) => {
-            crate::overrides::for_port(port).set_serving(serving);
+            for_port(port).set_serving(serving);
             Json(json!({ "port": port, "serving": serving })).into_response()
         }
         None => (StatusCode::BAD_REQUEST, "body: {\"serving\": true|false}").into_response(),
@@ -121,12 +123,7 @@ async fn serving_set(Path(port): Path<u16>, Json(body): Json<Value>) -> Response
 }
 
 async fn info_get(Path(port): Path<u16>) -> Json<Value> {
-    Json(Value::Object(
-        crate::overrides::for_port(port)
-            .info()
-            .into_iter()
-            .collect(),
-    ))
+    Json(Value::Object(for_port(port).info().into_iter().collect()))
 }
 
 /// Body: a JSON object merged into the info the worker reports (its gRPC
@@ -135,7 +132,7 @@ async fn info_get(Path(port): Path<u16>) -> Json<Value> {
 async fn info_patch(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
     match body.as_object() {
         Some(patch) => {
-            let overrides = crate::overrides::for_port(port);
+            let overrides = for_port(port);
             overrides.patch_info(patch);
             Json(Value::Object(overrides.info().into_iter().collect())).into_response()
         }
@@ -478,7 +475,7 @@ fn injected_failures() -> Value {
 /// the wave starts it accepted and its current wave, so a test tells a park
 /// from a wake.
 async fn zmq_rank(Path(worker): Path<String>) -> Response {
-    match crate::zmq::rank_output_counts(&worker) {
+    match rank_output_counts(&worker) {
         Some(counts) => {
             let (batch_messages, outputs) = counts.read();
             let (parks, wakes, wave) = counts.waves();
@@ -729,6 +726,7 @@ async fn truth_served() -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::Role, grpc::serve_with_listener, tls::install_crypto_provider};
 
     fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -768,14 +766,14 @@ mod tests {
             grpc_base_port: port,
             grpc_count: 1,
             realistic: true,
-            role: Some(crate::config::Role::Prefill),
+            role: Some(Role::Prefill),
             bootstrap_base_port: Some(taken_port),
             ..Config::default()
         });
         // The worker stops at the bind: serving returns instead of running on.
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            crate::grpc::serve_with_listener(std::sync::Arc::clone(&cfg), listener),
+            serve_with_listener(std::sync::Arc::clone(&cfg), listener),
         )
         .await
         .expect("the worker stops at the bootstrap bind");
@@ -816,7 +814,7 @@ mod tests {
                 let _ = stopped.await;
             },
         ));
-        crate::tls::install_crypto_provider();
+        install_crypto_provider();
         #[expect(
             clippy::disallowed_methods,
             reason = "a test's client; the process TLS crypto provider is installed first"

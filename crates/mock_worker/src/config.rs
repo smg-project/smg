@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel};
+use crate::{
+    engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel},
+    kv_zmq::{KvZmqConfig, Wire},
+};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -110,7 +113,7 @@ pub struct Config {
     /// Batches each publisher keeps for replay.
     pub kv_events_buffer_steps: usize,
     /// Which engine's wire the publishers speak.
-    pub kv_events_wire: crate::kv_zmq::Wire,
+    pub kv_events_wire: Wire,
     /// Which backend's load report the workers imitate (`GetLoads`, `/v1/loads`).
     pub loads_like: LoadsLike,
     /// What the load record says of the mock's wire: `true` imitates an
@@ -375,7 +378,7 @@ impl Default for Config {
             kv_events_replay: true,
             kv_events_topic: String::new(),
             kv_events_buffer_steps: 10_000,
-            kv_events_wire: crate::kv_zmq::Wire::Vllm,
+            kv_events_wire: Wire::Vllm,
             loads_like: LoadsLike::Mock,
             step_reports: false,
             role: None,
@@ -580,8 +583,7 @@ impl Config {
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
         }
-        if cfg.kv_events_wire == crate::kv_zmq::Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1
-        {
+        if cfg.kv_events_wire == Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1 {
             return Err(
                 "--kv-cache-groups names several groups, but the SGLang wire (--kv-events-wire \
                  sglang) publishes one cache group"
@@ -683,17 +685,13 @@ impl Config {
     /// then ZMQ ranks), when publishing is on and the engine is realistic.
     /// `dp_rank` is the rank the publisher stamps on the vLLM wire: 0 for a
     /// gRPC worker, the engine index a ZMQ rank advertises.
-    pub(crate) fn kv_zmq_for(
-        &self,
-        index: u16,
-        dp_rank: i32,
-    ) -> Option<crate::kv_zmq::KvZmqConfig> {
+    pub(crate) fn kv_zmq_for(&self, index: u16, dp_rank: i32) -> Option<KvZmqConfig> {
         if !self.realistic {
             return None;
         }
         let base = self.kv_events_zmq_base_port?;
         let port = base.checked_add(index.checked_mul(2)?)?;
-        Some(crate::kv_zmq::KvZmqConfig {
+        Some(KvZmqConfig {
             host: self.host.clone(),
             port,
             replay: self.kv_events_replay,
