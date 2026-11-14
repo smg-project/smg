@@ -90,7 +90,7 @@ pub struct HostStores {
     /// One lock per worker's feed, so the subscriptions' batches apply in
     /// parallel as they do on their own tasks today.
     feeds: DashMap<WorkerId, FeedCell>,
-    reservations: Mutex<HashMap<(GatewayId, LeaseId), Vec<Claim>>>,
+    reservations: Mutex<HashMap<LeaseId, Vec<Claim>>>,
 }
 
 /// What one lease holds on one worker: the handle it claimed on (a same-URL
@@ -1056,20 +1056,13 @@ impl ReservationStore for HostStores {
         self.resolve(id)?.max_running_requests().map(u32::from)
     }
 
-    fn try_reserve(
-        &self,
-        gateway: GatewayId,
-        id: WorkerId,
-        kind: ReservationKind,
-        count: u32,
-        lease: LeaseId,
-    ) -> bool {
+    fn try_reserve(&self, id: WorkerId, kind: ReservationKind, count: u32, lease: LeaseId) -> bool {
         let Some(worker) = self.resolve(id) else {
             return false;
         };
         let mut reservations = self.reservations.lock();
         let holds_kind = reservations
-            .get(&(gateway, lease))
+            .get(&lease)
             .is_some_and(|held| held.iter().any(|claim| claim.kind == kind));
         if holds_kind {
             return false;
@@ -1104,19 +1097,16 @@ impl ReservationStore for HostStores {
                 taken
             }
         };
-        reservations
-            .entry((gateway, lease))
-            .or_default()
-            .push(Claim {
-                worker,
-                kind,
-                count: claimed,
-            });
+        reservations.entry(lease).or_default().push(Claim {
+            worker,
+            kind,
+            count: claimed,
+        });
         true
     }
 
-    fn release(&self, gateway: GatewayId, lease: LeaseId) {
-        let Some(held) = self.reservations.lock().remove(&(gateway, lease)) else {
+    fn release(&self, lease: LeaseId) {
+        let Some(held) = self.reservations.lock().remove(&lease) else {
             return;
         };
         for Claim {
@@ -2385,28 +2375,28 @@ mod tests {
         let id = worker_id(decode.as_ref());
         assert_eq!(host.window(id, ReservationKind::Room), Some(2));
         let (a, b, c) = (LeaseId(1), LeaseId(2), LeaseId(3));
-        assert!(host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 2, a));
+        assert!(host.try_reserve(id, ReservationKind::Room, 2, a));
         assert!(
-            !host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, b),
+            !host.try_reserve(id, ReservationKind::Room, 1, b),
             "the window is full"
         );
         assert!(
-            !host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, a),
+            !host.try_reserve(id, ReservationKind::Room, 1, a),
             "one room claim per lease"
         );
         assert_eq!(host.held(id, ReservationKind::Room), 2);
-        host.release(GatewayId::LOCAL, a);
+        host.release(a);
         assert_eq!(host.held(id, ReservationKind::Room), 0);
-        assert!(host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Slot, 1, b));
-        assert!(host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Slot, 1, c));
+        assert!(host.try_reserve(id, ReservationKind::Slot, 1, b));
+        assert!(host.try_reserve(id, ReservationKind::Slot, 1, c));
         assert!(
-            !host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Slot, 1, LeaseId(4)),
+            !host.try_reserve(id, ReservationKind::Slot, 1, LeaseId(4)),
             "two slots fit"
         );
         assert_eq!(host.held(id, ReservationKind::Slot), 2);
         assert_eq!(decode.load(), 2, "a slot is the load guard");
-        host.release(GatewayId::LOCAL, b);
-        host.release(GatewayId::LOCAL, b);
+        host.release(b);
+        host.release(b);
         assert_eq!(decode.load(), 1);
 
         let plain = worker_of("http://r:8000", WorkerType::Regular);
@@ -2414,13 +2404,7 @@ mod tests {
         let plain_id = worker_id(plain.as_ref());
         assert_eq!(host.window(plain_id, ReservationKind::Room), None);
         assert!(
-            host.try_reserve(
-                GatewayId::LOCAL,
-                plain_id,
-                ReservationKind::Room,
-                5,
-                LeaseId(5)
-            ),
+            host.try_reserve(plain_id, ReservationKind::Room, 5, LeaseId(5)),
             "no window: the gate abstains"
         );
         assert_eq!(
@@ -2428,52 +2412,16 @@ mod tests {
             0,
             "and nothing is claimed"
         );
-        assert!(host.try_reserve(
-            GatewayId::LOCAL,
-            plain_id,
-            ReservationKind::Slot,
-            3,
-            LeaseId(6)
-        ));
+        assert!(host.try_reserve(plain_id, ReservationKind::Slot, 3, LeaseId(6)));
         assert_eq!(plain.load(), 3);
-        host.release(GatewayId::LOCAL, LeaseId(6));
+        host.release(LeaseId(6));
         assert_eq!(plain.load(), 0);
         // The contract's other half: a worker the host does not know is
         // refused, the same answer the memory store gives.
         assert!(
-            !host.try_reserve(
-                GatewayId::LOCAL,
-                WorkerId(77),
-                ReservationKind::Room,
-                1,
-                LeaseId(7)
-            ),
+            !host.try_reserve(WorkerId(77), ReservationKind::Room, 1, LeaseId(7)),
             "a worker the host does not know is refused"
         );
-    }
-
-    #[test]
-    fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
-        let registry = Arc::new(WorkerRegistry::new());
-        let host = host(&registry);
-        let decode = decode_worker("grpc://d:8000", "2");
-        registry.register(Arc::clone(&decode)).expect("registered");
-        let id = worker_id(decode.as_ref());
-        let (g1, g2) = (GatewayId(1), GatewayId(2));
-        assert!(host.try_reserve(g1, id, ReservationKind::Room, 1, LeaseId(1)));
-        assert!(
-            host.try_reserve(g2, id, ReservationKind::Room, 1, LeaseId(1)),
-            "the other gateway's lease of the same number is its own"
-        );
-        assert_eq!(host.held(id, ReservationKind::Room), 2);
-        host.release(g1, LeaseId(1));
-        assert_eq!(
-            host.held(id, ReservationKind::Room),
-            1,
-            "one gateway's release frees its own claim alone"
-        );
-        host.release(g2, LeaseId(1));
-        assert_eq!(host.held(id, ReservationKind::Room), 0);
     }
 
     fn decode_worker(url: &str, window: &str) -> Arc<dyn Worker> {
@@ -2496,8 +2444,8 @@ mod tests {
         let decode = decode_worker("grpc://d:8000", "2");
         registry.register(Arc::clone(&decode)).expect("registered");
         let id = worker_id(decode.as_ref());
-        assert!(host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Room, 1, LeaseId(1)));
-        assert!(host.try_reserve(GatewayId::LOCAL, id, ReservationKind::Slot, 1, LeaseId(1)));
+        assert!(host.try_reserve(id, ReservationKind::Room, 1, LeaseId(1)));
+        assert!(host.try_reserve(id, ReservationKind::Slot, 1, LeaseId(1)));
         let successor = decode_worker("grpc://d:8000", "2");
         registry.register_or_replace(Arc::clone(&successor));
         assert_eq!(
@@ -2505,7 +2453,7 @@ mod tests {
             (1, 1),
             "the counters moved with the runtime"
         );
-        host.release(GatewayId::LOCAL, LeaseId(1));
+        host.release(LeaseId(1));
         assert_eq!(
             (successor.pd_admitted(), successor.load()),
             (0, 0),
