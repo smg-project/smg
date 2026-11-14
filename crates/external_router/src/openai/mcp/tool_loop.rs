@@ -872,22 +872,10 @@ pub(crate) fn mcp_list_tools_bindings_to_emit(
         .collect()
 }
 
-/// Inject MCP metadata into a streaming response: the loop's output prefix
-/// in front of the response's output, the kept `mcp_list_tools` items copied
-/// (the `response.completed` event, which is not the last render; see
-/// [`inject_mcp_metadata_last`]).
-pub(crate) fn inject_mcp_metadata_streaming(
-    response: &mut Value,
-    state: &mut ToolLoopState,
-    session: &McpToolSession<'_>,
-) {
-    let prefix = mcp_output_prefix(state, session, 0);
-    inject_mcp_output_prefix(response, prefix);
-}
-
-/// Inject MCP metadata into a response's last render: the stored record on
-/// the streaming path, the answered response on the non-streaming path. The
-/// kept `mcp_list_tools` items move into it; nothing reads them afterwards.
+/// Inject MCP metadata into a response's last render: the streamed loop's
+/// final response (the wire and the record share it), the answered response
+/// on the non-streaming path. The kept `mcp_list_tools` items move into it;
+/// nothing reads them afterwards.
 pub(crate) fn inject_mcp_metadata_last(
     response: &mut Value,
     state: &mut ToolLoopState,
@@ -908,24 +896,13 @@ fn inject_mcp_output_prefix(response: &mut Value, prefix: Vec<Value>) {
     }
 }
 
-/// The items the loop renders in front of a response's output: its
-/// `mcp_list_tools` items (copied: the `response.completed` render, which is
-/// not the last reader; see [`mcp_output_prefix_last`]), then the calls it
-/// executed (the stored transformed items, no reconstruction), the internal
-/// servers' left out; with room for `extra` items the caller appends.
-fn mcp_output_prefix(
-    state: &mut ToolLoopState,
-    session: &McpToolSession<'_>,
-    extra: usize,
-) -> Vec<Value> {
-    let list_tools_items = state.mcp_list_tools_items(session).to_vec();
-    mcp_output_prefix_with(list_tools_items, state, session, extra)
-}
-
 /// The prefix of a response's last render: the kept `mcp_list_tools` items
 /// moved, not copied (the answered, the approval and the tool-call-limit
-/// responses of the non-streaming path, the stored record of the streaming
-/// one); nothing reads them afterwards.
+/// responses of the non-streaming path, the streamed loop's final response
+/// that the wire and the record share), then the calls the loop executed
+/// (the stored transformed items, no reconstruction), the internal servers'
+/// left out; with room for `extra` items the caller appends. Nothing reads
+/// the moved items afterwards.
 fn mcp_output_prefix_last(
     state: &mut ToolLoopState,
     session: &McpToolSession<'_>,
@@ -935,8 +912,8 @@ fn mcp_output_prefix_last(
     mcp_output_prefix_with(list_tools_items, state, session, extra)
 }
 
-/// The prefix around `mcp_list_tools` items the caller already owns (copied
-/// or taken), then the executed calls.
+/// The prefix around the `mcp_list_tools` items the caller took, then the
+/// executed calls.
 fn mcp_output_prefix_with(
     list_tools_items: Vec<Value>,
     state: &ToolLoopState,

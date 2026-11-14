@@ -38,7 +38,7 @@ use super::{
 };
 use crate::{
     routers::grpc::proto_wrapper::vllm_mm_identity,
-    worker::{http_client::build_with, RuntimeType},
+    worker::{connection::http_client::build_with, RuntimeType},
 };
 
 /// A worker serves one model: the config registry's one key.

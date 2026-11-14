@@ -18,7 +18,7 @@ pub use update_policies::UpdatePoliciesStep;
 use crate::{
     observability::metrics::Metrics,
     worker::{
-        basic::{ConnectionModeExt, WorkerTypeExt},
+        identity::basic::{ConnectionModeExt, WorkerTypeExt},
         Worker, WorkerRegistry,
     },
 };

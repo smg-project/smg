@@ -10,7 +10,7 @@ use rand::RngExt as _;
 use crate::{
     config::CacheIndexKind,
     policies::hash_ring::HashRing,
-    worker::{load_state::LoadReceiver, runtime::RoutingState, Worker, UNKNOWN_MODEL_ID},
+    worker::{load::state::LoadReceiver, runtime::RoutingState, Worker, UNKNOWN_MODEL_ID},
 };
 
 mod bucket;
@@ -678,7 +678,9 @@ mod tests {
 
         use openai_protocol::worker::WorkerStatus;
 
-        use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker};
+        use crate::worker::{
+            health::circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker,
+        };
 
         fn worker(url: &str) -> Arc<dyn Worker> {
             let worker: Arc<dyn Worker> = Arc::new(

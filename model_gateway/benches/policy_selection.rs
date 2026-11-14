@@ -31,8 +31,8 @@ use smg::{
     },
     routers::common::bench_support::PairPath,
     worker::{
-        kv_event_monitor::bench_support::IndexFeed,
-        load_state::{one_rank_load, TestFeed},
+        kv::event_monitor::bench_support::IndexFeed,
+        load::state::{one_rank_load, TestFeed},
         BasicWorkerBuilder, ConnectionMode, KvEventMonitor, KvIndex, ModelCard, RuntimeType,
         Worker, WorkerRegistry, WorkerType,
     },

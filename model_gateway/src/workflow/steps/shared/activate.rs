@@ -99,7 +99,7 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        worker::{event::WorkerEvent, BasicWorkerBuilder, WorkerRegistry},
+        worker::{registry::event::WorkerEvent, BasicWorkerBuilder, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 

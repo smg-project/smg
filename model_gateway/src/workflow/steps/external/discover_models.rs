@@ -14,7 +14,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     routers::provider_support,
     server::http_client_builder,
-    worker::endpoint::Endpoint,
+    worker::identity::endpoint::Endpoint,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
