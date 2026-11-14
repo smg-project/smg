@@ -1156,7 +1156,12 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::test_support::RefusedAddress;
+    use crate::{
+        app_context::AppContext,
+        config::RouterConfig,
+        server::http_client,
+        worker::{test_support::RefusedAddress, DEFAULT_BOOTSTRAP_PORT},
+    };
 
     /// The parser-override warning skips the worker itself when it is replaced
     /// at an address registered with a trailing slash: the registry's key keeps
@@ -1233,7 +1238,7 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
         let symphony = || {
             app_context_with(
-                crate::config::RouterConfig::builder()
+                RouterConfig::builder()
                     .worker_startup_timeout_secs(1)
                     .parser(ParserChoice::Symphony)
                     .build_unchecked(),
@@ -1286,7 +1291,7 @@ mod tests {
     fn grpc_worker_context(
         model: &str,
         registration_mode: WorkerRegistrationMode,
-        app_context: Arc<crate::app_context::AppContext>,
+        app_context: Arc<AppContext>,
     ) -> WorkflowContext<WorkerWorkflowData> {
         use openai_protocol::worker::WorkerModels;
         use wfaas::WorkflowInstanceId;
@@ -1425,17 +1430,15 @@ mod tests {
         );
     }
 
-    fn make_app_context() -> Arc<crate::app_context::AppContext> {
+    fn make_app_context() -> Arc<AppContext> {
         app_context_with(
-            crate::config::RouterConfig::builder()
+            RouterConfig::builder()
                 .worker_startup_timeout_secs(1)
                 .build_unchecked(),
         )
     }
 
-    fn app_context_with(
-        router_config: crate::config::RouterConfig,
-    ) -> Arc<crate::app_context::AppContext> {
+    fn app_context_with(router_config: RouterConfig) -> Arc<AppContext> {
         use crate::app_context::testing::app_context_for_tests;
 
         app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
@@ -1472,7 +1475,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(
@@ -1519,7 +1522,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         data.discovered_labels = HashMap::from([
             ("page_size".to_string(), "256".to_string()),
             ("max_num_seqs".to_string(), "8".to_string()),
@@ -1551,7 +1554,7 @@ mod tests {
         let mut spec = WorkerSpec::new("http://worker:8000");
         spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
         spec.labels = HashMap::from([("enable_dp_attention".to_string(), "true".to_string())]);
-        let router_config = crate::config::RouterConfig::builder()
+        let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
             .dp_aware(true)
             .build_unchecked();
@@ -1563,7 +1566,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         data
     }
 
@@ -1673,7 +1676,7 @@ mod tests {
         let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
 
@@ -1797,7 +1800,7 @@ mod tests {
     fn something_listens_on_the_default_bootstrap_port() -> bool {
         use std::net::{SocketAddr, TcpStream};
 
-        let address = SocketAddr::from(([127, 0, 0, 1], crate::worker::DEFAULT_BOOTSTRAP_PORT));
+        let address = SocketAddr::from(([127, 0, 0, 1], DEFAULT_BOOTSTRAP_PORT));
         TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()
     }
 
@@ -1932,7 +1935,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         let text = CreateLocalWorkerStep

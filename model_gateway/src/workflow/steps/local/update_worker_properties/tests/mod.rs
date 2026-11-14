@@ -27,6 +27,7 @@ use crate::{
             zmq_client::{EosTokenIds, ZmqEngineClient},
         },
     },
+    server::http_client,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         registry::WorkerId,
@@ -1260,7 +1261,7 @@ async fn a_zmq_refresh_keeps_the_window_the_operator_set() {
 /// entry the old worker was keeping alive.
 #[tokio::test]
 async fn http_update_adopts_the_materialized_shared_client() {
-    let client = Arc::new(crate::server::http_client());
+    let client = Arc::new(http_client());
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
             .http_client(Arc::clone(&client))
@@ -1285,7 +1286,7 @@ async fn http_update_adopts_the_materialized_shared_client() {
 async fn http_update_preserves_http2() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
-            .http_client(Arc::new(crate::server::http_client()))
+            .http_client(Arc::new(http_client()))
             .http2(true)
             .status(WorkerStatus::Ready)
             .build(),
@@ -1673,12 +1674,9 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
 async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
     use openai_protocol::worker::WorkerModels;
 
-    use crate::{
-        server::http_client,
-        workflow::{
-            data::{WorkerKind, WorkerRegistrationMode},
-            steps::{create_worker_workflow_data, local::CreateLocalWorkerStep},
-        },
+    use crate::workflow::{
+        data::{WorkerKind, WorkerRegistrationMode},
+        steps::{create_worker_workflow_data, local::CreateLocalWorkerStep},
     };
 
     let app_ctx = make_app_context(&[]);
