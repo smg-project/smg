@@ -95,7 +95,7 @@ CRATES = (
     crate("smg-auth", "crates/auth", "smg-auth"),
     crate("smg-mcp", "crates/mcp", "smg-mcp"),
     crate("kv-index", "crates/kv_index", "kv-index"),
-    crate("smg-radix-tree", "crates/radix_tree", "smg-radix-tree"),
+    crate("smg-radix-tree", "crates/radix_tree"),
     crate("data-connector", "crates/data_connector", "smg-data-connector"),
     crate("llm-multimodal", "crates/multimodal", "llm-multimodal"),
     crate("smg-wasm", "crates/wasm", "smg-wasm"),

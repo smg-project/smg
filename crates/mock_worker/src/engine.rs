@@ -1475,7 +1475,7 @@ async fn run(
             let faults = &shared.faults;
             let dropped = faults
                 .drop_batches
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok();
             if dropped {
                 faults.dropped_total.fetch_add(1, Ordering::Relaxed);

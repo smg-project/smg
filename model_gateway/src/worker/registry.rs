@@ -917,7 +917,7 @@ impl WorkerRegistry {
             // Saturating: a double-clear must never wrap the counter into a
             // permanent all-overloaded verdict for the model.
             entry
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_sub(1))
                 })
                 .unwrap_or(0)
