@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use tracing_test::traced_test;
 
 use super::*;
-use crate::{policies::test_support::make_workers, worker::load_state::TestFeed};
+use crate::{policies::test_support::make_workers, worker::load::state::TestFeed};
 
 #[test]
 fn text_is_wanted_only_without_token_ids() {

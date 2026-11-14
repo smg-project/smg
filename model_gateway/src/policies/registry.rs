@@ -33,7 +33,9 @@ use crate::{
     routers::common::header_utils::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
-    worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
+    worker::{
+        load::state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType,
+    },
 };
 
 /// Routes a request completion to the policy that placed the request: the
@@ -1163,7 +1165,7 @@ mod tests {
             BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
-            load_state::LoadSnapshot,
+            load::state::LoadSnapshot,
             test_support::{ready_worker, worker_of},
             Worker, WorkerLoadGuard, WorkerType,
         },

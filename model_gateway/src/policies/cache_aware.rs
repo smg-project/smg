@@ -127,8 +127,8 @@ use crate::{
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::{cache_trace, metrics::Metrics},
     worker::{
-        liveness,
-        load_state::{LoadReceiver, LoadSnapshot},
+        health::liveness,
+        load::state::{LoadReceiver, LoadSnapshot},
         KvEventMonitor, KvIndex, Worker,
     },
 };

@@ -49,7 +49,7 @@ use crate::{
             },
         },
     },
-    worker::{liveness, Worker},
+    worker::{health::liveness, Worker},
 };
 
 /// The message a sequential decode side's silence verdict starts with (see

@@ -102,8 +102,8 @@ use crate::{
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
-        endpoint::Endpoint,
-        manager::{WorkerManager, WorkerManagerConfig},
+        health::manager::{WorkerManager, WorkerManagerConfig},
+        identity::endpoint::Endpoint,
         ConnectionMode,
     },
     workflow::{
