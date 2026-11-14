@@ -119,7 +119,7 @@ fn connector(allowed: Option<&[&str]>, allow_private_hosts: bool) -> MediaConnec
 
 async fn fetch(connector: &MediaConnector, url: String) -> Result<(u32, u32), MediaConnectorError> {
     connector
-        .fetch_image(MediaSource::Url(url), ImageFetchConfig::default())
+        .fetch_image(MediaSource::Url(url.into()), ImageFetchConfig::default())
         .await
         .map(|frame| (frame.size().width, frame.size().height))
 }
