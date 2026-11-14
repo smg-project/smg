@@ -66,6 +66,10 @@ use crate::{
             overload,
             pd_failure::{PdSide, SidePhase},
             placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
+            prefill_admission::{
+                acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
+                PrefillLoadGuard, PrefillSelectionContext,
+            },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
@@ -85,9 +89,8 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, endpoint::Endpoint, PdPairIndex, PdWire, PrefillAcquireError,
-        PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        endpoint::Endpoint, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
+        WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
