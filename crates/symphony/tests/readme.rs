@@ -2649,19 +2649,18 @@ fn count(n: u32) -> String {
 fn render() -> String {
     let mut groups: Vec<&Group> = GROUPS.iter().collect();
     groups.sort_by_key(|group| (std::cmp::Reverse(group.released), group.slug));
-    let tally = |status: fn(&Status) -> bool| groups.iter().filter(|g| status(&g.status)).count();
-    let checkpoints: usize = groups.iter().map(|group| 1 + group.also.len()).sum();
     let mut out = String::new();
+    let legend = [
+        Status::Ready,
+        Status::Replaying,
+        Status::AwaitingFixtures,
+        Status::Pending,
+    ]
+    .map(Status::cell);
     let _ = writeln!(
         out,
-        "{} groups, {} checkpoints, newest first.\n{} ready, {} replaying a recorded \
-         set, {} on main awaiting fixtures, {} pending.",
-        groups.len(),
-        checkpoints,
-        tally(|s| *s == Status::Ready),
-        tally(|s| *s == Status::Replaying),
-        tally(|s| *s == Status::AwaitingFixtures),
-        tally(|s| *s == Status::Pending),
+        "Newest first; the status column reads {}, {}, {}, or {}.",
+        legend[0], legend[1], legend[2], legend[3]
     );
     out.push('\n');
     out.push_str(
