@@ -547,18 +547,24 @@ async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() 
         .await
         .expect("arm the stall");
     assert_eq!(armed.status(), 200);
-    let (complete, during) = tokio::join!(encoder_completion(&mut client, "ec-s1"), async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let mut during = usize::MAX;
-        for _ in 0..5 {
-            let now = drain::in_flight();
-            assert!(now >= 1, "the stalled request is not counted in flight");
-            during = during.min(now);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let (complete, during) = tokio::join!(
+        async {
+            encoder_completion(&mut client, "ec-s1")
+                .await
+                .expect("the encoder completes")
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut during = usize::MAX;
+            for _ in 0..5 {
+                let now = drain::in_flight();
+                assert!(now >= 1, "the stalled request is not counted in flight");
+                during = during.min(now);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            during
         }
-        during
-    });
-    let complete = complete.expect("the encoder completes");
+    );
     assert_eq!(complete.finish_reason, "stop");
     let deadline = Instant::now() + Duration::from_secs(5);
     while drain::in_flight() >= during {
@@ -1029,32 +1035,38 @@ async fn a_canned_http_prefill_worker_reports_its_held_request_as_running() {
     // request in its own load report, and the report reads idle again once
     // the completion is out.
     let held = disaggregated_chat(Some(1), None, false);
-    let (response, during) = tokio::join!(chat(&client, &base, &held), async {
-        // Sampled once the request is held, not after a fixed wait: a
-        // slow box must not let a sample read the worker before then.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while http_running_reqs(&client, &base)
+    let (response, during) = tokio::join!(
+        async {
+            chat(&client, &base, &held)
                 .await
-                .expect("the running count")
-                == 0
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the held request never showed in the worker's load report");
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            seen.push(
-                http_running_reqs(&client, &base)
+                .expect("the worker answers")
+        },
+        async {
+            // Sampled once the request is held, not after a fixed wait: a
+            // slow box must not let a sample read the worker before then.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while http_running_reqs(&client, &base)
                     .await
-                    .expect("the running count"),
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+                    .expect("the running count")
+                    == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the held request never showed in the worker's load report");
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                seen.push(
+                    http_running_reqs(&client, &base)
+                        .await
+                        .expect("the running count"),
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            seen
         }
-        seen
-    });
-    let response = response.expect("the worker answers");
+    );
     assert_eq!(response.status(), 200);
     assert_eq!(
         during, [1; 5],
@@ -1085,24 +1097,30 @@ async fn a_canned_encode_worker_reports_its_held_request_as_running() {
     // Held for the canned delay, the request is the worker's one running
     // request in its own load report (whatever the process's other workers
     // carry), and the report reads idle again once the completion is out.
-    let (complete, during) = tokio::join!(encoder_completion(&mut client, "ec-l1"), async {
-        // Sampled once the request is admitted, not after a fixed wait: a
-        // slow box must not let a sample read the worker before it holds it.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while running_reqs(&mut poller).await.expect("the load report") == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    let (complete, during) = tokio::join!(
+        async {
+            encoder_completion(&mut client, "ec-l1")
+                .await
+                .expect("the encoder completes")
+        },
+        async {
+            // Sampled once the request is admitted, not after a fixed wait: a
+            // slow box must not let a sample read the worker before it holds it.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while running_reqs(&mut poller).await.expect("the load report") == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the held request never showed in the worker's load report");
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                seen.push(running_reqs(&mut poller).await.expect("the load report"));
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        })
-        .await
-        .expect("the held request never showed in the worker's load report");
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            seen.push(running_reqs(&mut poller).await.expect("the load report"));
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            seen
         }
-        seen
-    });
-    let complete = complete.expect("the encoder completes");
+    );
     assert_eq!(complete.finish_reason, "stop");
     assert_eq!(
         during, [1; 5],

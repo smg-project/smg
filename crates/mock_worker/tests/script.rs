@@ -1060,11 +1060,17 @@ async fn grpc_reports_the_scripted_answers_in_flight_as_running() {
     // The answer is paced over four pauses: a poll during them reads the one
     // request as running, and as the whole of the load.
     let (frames, busy) = tokio::join!(
-        generate(&client, grpc_request("r", &[8], true, false)),
-        grpc_running_settles_to(&client, 1)
+        async {
+            generate(&client, grpc_request("r", &[8], true, false))
+                .await
+                .expect("the worker answers")
+        },
+        async {
+            grpc_running_settles_to(&client, 1)
+                .await
+                .expect("the running count settles")
+        }
     );
-    let frames = frames.expect("the worker answers");
-    let busy = busy.expect("the running count settles");
     assert_eq!(busy.num_total_reqs, 1, "{busy:?}");
     assert_eq!(busy.num_waiting_reqs, 0, "{busy:?}");
     assert_eq!(
@@ -1105,7 +1111,11 @@ async fn a_worker_reports_its_own_requests_in_flight_not_the_process_total() {
     // process reports none of it: a gateway that polls both sees where the
     // work is.
     let (frames, (busy, idle)) = tokio::join!(
-        generate(&serving, grpc_request("r", &[8], true, false)),
+        async {
+            generate(&serving, grpc_request("r", &[8], true, false))
+                .await
+                .expect("the worker answers")
+        },
         async {
             let busy = grpc_running_settles_to(&serving, 1)
                 .await
@@ -1119,7 +1129,6 @@ async fn a_worker_reports_its_own_requests_in_flight_not_the_process_total() {
             (busy, idle)
         }
     );
-    let frames = frames.expect("the worker answers");
     assert_eq!(busy.num_total_reqs, 1, "{busy:?}");
     assert_eq!(
         idle.num_running_reqs, 0,
@@ -1195,9 +1204,12 @@ async fn http_reports_the_scripted_answers_in_flight_as_running() {
                 .await
                 .expect("chat")
         },
-        http_running_settles_to(&http, &base, 1)
+        async {
+            http_running_settles_to(&http, &base, 1)
+                .await
+                .expect("the running count settles")
+        }
     );
-    let busy = busy.expect("the running count settles");
     assert_eq!(response.status(), 200);
     assert_eq!(busy["num_total_reqs"], 1, "{busy}");
     assert_eq!(busy["num_waiting_reqs"], 0, "{busy}");
