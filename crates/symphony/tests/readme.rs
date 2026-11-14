@@ -2651,6 +2651,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "step-5-preview",
+        model: "stepfun-ai/Step-5-Preview",
+        also: &[],
+        released: "2026-09-20",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(3),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "step3",
         model: "stepfun-ai/step3",
         also: &[],
