@@ -36,6 +36,11 @@ pub trait ToolParser: Send + Sync {
         tools: &[Tool],
     ) -> ParserResult<StreamingParseResult>;
 
+    /// Configure structured JSON output before parsing a request.
+    /// Typed protocols can then keep framing spellings inside JSON strings as
+    /// text. Parsers without typed framing need no change.
+    fn set_json_mode(&mut self, _enabled: bool) {}
+
     /// Check if text contains tool calls in this parser's format
     fn has_tool_markers(&self, text: &str) -> bool;
 
