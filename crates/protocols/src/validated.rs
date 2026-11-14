@@ -732,7 +732,10 @@ mod tests {
     use validator::Validate;
 
     use super::*;
-    use crate::chat::{ChatCompletionRequest, ChatMessage};
+    use crate::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{invalid, invalid_at},
+    };
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct TestRequest {
@@ -1416,14 +1419,14 @@ mod tests {
 
     fn crossed(request: &CrossRequest) -> Result<(), ValidationError> {
         if request.top && !request.base {
-            return Err(crate::common::invalid_at(
+            return Err(invalid_at(
                 "top",
                 "top_requires_base",
                 "top is only allowed when base is set",
             ));
         }
         if request.whole {
-            return Err(crate::common::invalid(
+            return Err(invalid(
                 "whole_request_refused",
                 "the request as a whole is refused",
             ));

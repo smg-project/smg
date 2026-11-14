@@ -14,6 +14,8 @@ use axum::{
 
 #[cfg(feature = "axum")]
 use crate::transcription::{AudioFile, TranscriptionRequest};
+#[cfg(feature = "axum")]
+use crate::validated::rejection;
 
 /// Extractor for `/v1/audio/transcriptions` requests.
 ///
@@ -184,7 +186,7 @@ impl<S: Send + Sync> FromRequest<S> for AudioTranscriptionMultipart {
 /// refusal is about when there is one.
 #[cfg(feature = "axum")]
 fn bad_request(code: &str, param: Option<&str>, message: String) -> Response {
-    crate::validated::rejection(
+    rejection(
         StatusCode::BAD_REQUEST,
         code,
         param.map(str::to_owned),

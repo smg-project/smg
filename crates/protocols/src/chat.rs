@@ -1489,7 +1489,7 @@ mod tests {
         ThinkingParam, ThinkingType,
     };
     use crate::{
-        common::{FunctionCallDelta, ToolCallDelta},
+        common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
         profile::ProviderProfile,
     };
 
@@ -2143,10 +2143,10 @@ mod tests {
             content: None,
             refusal: None,
             annotations: Vec::new(),
-            tool_calls: Some(vec![crate::common::ToolCall {
+            tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),
-                function: crate::common::FunctionCallResponse {
+                function: FunctionCallResponse {
                     name: "get_weather".to_string(),
                     arguments: Some("{}".to_string()),
                 },
