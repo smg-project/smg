@@ -9,7 +9,7 @@ use crate::{
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         test_support::no_health_check,
-        BasicWorkerBuilder, WorkerLoadGuard,
+        BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
     },
 };
 
@@ -3291,7 +3291,7 @@ fn test_wildcard_hash_ring_follows_removals() {
 /// port: the port derived from a temporary ipc path is a hash into a band
 /// other listeners on the host may hold, and a collision there fails the
 /// handshake bind after the data-plane sockets are already bound.
-async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::BasicWorker> {
+async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
     let worker = Arc::new(
         BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)
