@@ -2359,10 +2359,12 @@ mod fanout_tests {
 
     use super::*;
     use crate::{
-        routers::grpc::common::response_collection::drain_prefill,
+        routers::{
+            common::prefill_admission::{PrefillAdmission, PrefillLoadGuard},
+            grpc::common::response_collection::drain_prefill,
+        },
         worker::{
-            test_support::select_worker, BasicWorkerBuilder, PrefillAdmission, PrefillLoadGuard,
-            Worker, WorkerLoadGuard, WorkerType,
+            test_support::select_worker, BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType,
         },
     };
 
