@@ -509,6 +509,7 @@ impl GrpcRouter {
         // work behind the response id; with the mode switched off such a
         // request runs in the foreground, and its object says so.
         let mut body = body.into_owned();
+        clear_unapplied_reasoning_keys(&mut body);
         if body.background == Some(true) {
             if responses_context.background.enabled() {
                 let request_context = smg_data_connector::current_request_context();
@@ -1362,6 +1363,24 @@ fn canonicalize_responses_request<'a>(
         Cow::Owned(canonical_body),
         Cow::Owned(canonical_model.to_string()),
     )
+}
+
+/// Clears the reasoning config's `mode`, `context` and `generate_summary`,
+/// which no engine behind this router applies.
+///
+/// The router reads only `effort` from the config (the chat request's
+/// `reasoning_effort`, or the Harmony prompt's). Every Response object it
+/// writes for the request echoes the config: the streamed terminal event,
+/// the non-streamed body and the stored object that
+/// `GET /v1/responses/{id}` reads back. Left in, a `mode: "pro"` request
+/// would read back as run in `pro` mode on an engine that ran in its
+/// default. `effort` and `summary` are echoed as before.
+fn clear_unapplied_reasoning_keys(body: &mut ResponsesRequest) {
+    if let Some(reasoning) = body.reasoning.as_mut() {
+        reasoning.mode = None;
+        reasoning.context = None;
+        reasoning.generate_summary = None;
+    }
 }
 
 #[cfg(test)]
