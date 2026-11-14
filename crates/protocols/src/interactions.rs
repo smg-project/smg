@@ -108,40 +108,48 @@ impl GenerationRequest for InteractionsRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        fn extract_from_content(content: &Content) -> Option<String> {
+        fn text_of(content: &Content) -> Option<&str> {
             match content {
-                Content::Text { text, .. } => text.clone(),
+                Content::Text { text, .. } => text.as_deref(),
                 _ => None,
             }
         }
 
-        fn extract_from_turn(turn: &Turn) -> String {
-            match &turn.content {
-                Some(TurnContent::Text(text)) => text.clone(),
-                Some(TurnContent::Contents(contents)) => contents
-                    .iter()
-                    .filter_map(extract_from_content)
-                    .collect::<Vec<String>>()
-                    .join(" "),
-                None => String::new(),
+        /// `texts` into `buffer`, a space between each: the shape `join(" ")`
+        /// gives, empty pieces included.
+        fn push_joined<'a>(buffer: &mut String, texts: impl Iterator<Item = &'a str>) {
+            for (index, text) in texts.enumerate() {
+                if index > 0 {
+                    buffer.push(' ');
+                }
+                buffer.push_str(text);
             }
         }
 
         match &self.input {
             InteractionsInput::Text(text) => text.clone(),
-            InteractionsInput::Content(content) => {
-                extract_from_content(content).unwrap_or_default()
+            InteractionsInput::Content(content) => text_of(content).unwrap_or_default().to_owned(),
+            InteractionsInput::Contents(contents) => {
+                let mut buffer = String::new();
+                push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                buffer
             }
-            InteractionsInput::Contents(contents) => contents
-                .iter()
-                .filter_map(extract_from_content)
-                .collect::<Vec<String>>()
-                .join(" "),
-            InteractionsInput::Turns(turns) => turns
-                .iter()
-                .map(extract_from_turn)
-                .collect::<Vec<String>>()
-                .join(" "),
+            InteractionsInput::Turns(turns) => {
+                let mut buffer = String::new();
+                for (index, turn) in turns.iter().enumerate() {
+                    if index > 0 {
+                        buffer.push(' ');
+                    }
+                    match &turn.content {
+                        Some(TurnContent::Text(text)) => buffer.push_str(text),
+                        Some(TurnContent::Contents(contents)) => {
+                            push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                        }
+                        None => {}
+                    }
+                }
+                buffer
+            }
         }
     }
 }
@@ -1391,5 +1399,43 @@ mod tests {
                 "Stop sequences cannot contain empty strings".to_string()
             )
         );
+    }
+
+    /// The routing text joins every text piece with one space, empty pieces
+    /// and content-less turns included, and drops non-text content: the
+    /// shape `join(" ")` gave, which a request's prefix-cache hash depends on.
+    #[test]
+    fn the_routing_text_joins_each_text_with_one_space() {
+        let cases = [
+            (serde_json::json!("plain"), "plain"),
+            (serde_json::json!({"type": "text", "text": "one"}), "one"),
+            (serde_json::json!({"type": "image", "uri": "u"}), ""),
+            (
+                serde_json::json!([
+                    {"type": "text", "text": "a"},
+                    {"type": "image", "uri": "u"},
+                    {"type": "text"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "b"}
+                ]),
+                "a  b",
+            ),
+            (
+                serde_json::json!([
+                    {"role": "user", "content": "first"},
+                    {"role": "model"},
+                    {"role": "user", "content": [{"type": "image", "uri": "u"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}
+                ]),
+                "first   x y",
+            ),
+        ];
+        for (input, expected) in cases {
+            let request = InteractionsRequest {
+                input: serde_json::from_value(input.clone()).expect("an input"),
+                ..Default::default()
+            };
+            assert_eq!(request.extract_text_for_routing(), expected, "{input}");
+        }
     }
 }

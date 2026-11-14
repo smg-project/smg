@@ -3,3 +3,5 @@
 //! against the ETag the writer read.
 
 pub mod document;
+pub(crate) mod json;
+pub(crate) mod params;
