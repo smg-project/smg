@@ -364,7 +364,7 @@ fn push_byte_list(buffer: &mut BytesMut, bytes: Option<&[u8]>) {
 
 /// Serializing a string, an integer, a float or a value made of them into
 /// memory cannot fail.
-fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
+pub(super) fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
     let _ = serde_json::to_writer(writer, value);
 }
 
