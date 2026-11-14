@@ -127,7 +127,7 @@ async fn answer(State(state): State<WorkerState>, body: Bytes) -> Response {
     state.requests.fetch_add(1, Ordering::SeqCst);
     if state
         .failures
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
     {
         return (StatusCode::SERVICE_UNAVAILABLE, "overloaded").into_response();

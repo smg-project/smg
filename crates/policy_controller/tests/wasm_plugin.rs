@@ -2651,7 +2651,7 @@ fn runtime_steered_for(steer: &Arc<AtomicU8>, asks: &Arc<AtomicU8>) -> Arc<Runti
     Arc::new(
         Runtime::with_clock(move || {
             let armed = asks
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok();
             match steer.load(Ordering::Relaxed) {
                 value if armed && value != 0 => u64::from(value - 1),

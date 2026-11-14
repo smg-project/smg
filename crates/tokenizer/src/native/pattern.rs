@@ -158,7 +158,7 @@ impl PlaneSet {
 
     /// The complement within the plane.
     fn negate(&mut self) {
-        for word in self.0.iter_mut() {
+        for word in &mut *self.0 {
             *word = !*word;
         }
     }
