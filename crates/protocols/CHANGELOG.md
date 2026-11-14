@@ -136,6 +136,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `type` and a `name` and no `input_schema` as `ToolSearch`, which kept only those two keys,
   `allowed_callers` and `cache_control`, so the provider route dropped the rest. Breaking:
   `ToolSearchTool` gains `extra: Map<String, Value>`.
+- A reasoning output item without `content`, as the public API writes it (`id`, `summary` and
+  `encrypted_content`), parses, with no content. The crate refused the item, and any Response
+  carrying it, with ``missing field `content` ``. An item the gateway writes is unchanged.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
