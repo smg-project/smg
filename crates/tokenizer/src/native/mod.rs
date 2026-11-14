@@ -281,6 +281,15 @@ const SEED_THREADS: usize = 4;
 /// (2.3 MB, four threads: 8.4 -> 9.4 ms against the one-pass check before
 /// it); at 128 the same cuts, the same ids, 8.0 ms.
 const CUT_CHECK_WINDOW: usize = 128;
+/// How far the cut search moves past a candidate without a window: at
+/// least the margin (`CUT_CHECK_WINDOW`), so that the next candidate's walk
+/// back can stop at this one's space and a blob followed by prose keeps
+/// the prose's cuts, and no shorter than the margin was before it shrank:
+/// each skipped candidate costs the walks back and forward over the reach,
+/// and on a text whose candidates all lack a window (letters joined by
+/// single spaces under a pattern that reads the join inside a match) a
+/// skip of a quarter of this would read every byte of it four times over.
+const CUT_SEARCH_SKIP: usize = 512;
 /// How far before and after a candidate cut the window's start and end may
 /// be looked for when a stage can read a space after a non-whitespace
 /// character inside one match (a letter run joined by spaces, a class read
@@ -2460,8 +2469,8 @@ impl NativeEncoder {
     /// A candidate without a window within the check's reach
     /// ([`Self::window_start`], [`Self::window_end`]: a stretch without a
     /// space longer than the reach on one side of it) is skipped, with the
-    /// window after it (the walks of the candidates there meet the same
-    /// stretch), and not counted: its own space begins a whitespace run,
+    /// skip after it ([`CUT_SEARCH_SKIP`]: the walks of the candidates there
+    /// meet the same stretch), and not counted: its own space begins a whitespace run,
     /// where the next candidate's walk back can stop, so a blob followed by
     /// prose keeps its cuts past the blob. `None` when
     /// the text has no such point past `from`, or when
@@ -2500,14 +2509,18 @@ impl NativeEncoder {
                     .next_back()
                     .is_some_and(|c| !c.is_whitespace())
             {
-                let (Some(start), Some(end)) =
-                    (self.window_start(text, p), self.window_end(text, p))
-                else {
-                    // No window within the check's reach on one side: a stretch without a
-                    // space there, which the walks of every candidate within a window of
-                    // this one meet too. A skip, not a rejection: the rejections count the
-                    // candidates the check read.
-                    p += CUT_CHECK_WINDOW;
+                let Some(start) = self.window_start(text, p) else {
+                    // No window within the check's reach before the candidate: a stretch
+                    // without a space there, which the walks of every candidate within
+                    // the skip of this one meet too. A skip, not a rejection: the
+                    // rejections count the candidates the check read.
+                    p += CUT_SEARCH_SKIP;
+                    continue;
+                };
+                let Some(end) = self.window_end(text, p) else {
+                    // The same after the candidate; the walk forward runs only once the
+                    // walk back has found a start.
+                    p += CUT_SEARCH_SKIP;
                     continue;
                 };
                 if self.piece_starts_at(&text[start..end], p - start) {
