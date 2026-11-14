@@ -215,10 +215,10 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "granite-4.1-3b-llmon-preview/render/*",
-        "the checkpoint's template draws a nonce after every role with Jinja's `random` \
-         filter, which the gateway's renderer does not provide, so each render fails before \
-         its first byte; a renderer with the filter would still not reproduce the \
-         reference's draw byte for byte",
+        "the checkpoint's template draws a two-character nonce after every role with Jinja's \
+         `random` filter; the reference holds one unseeded draw (112 distinct nonces across \
+         the 24 cases), so no render reproduces it byte for byte (the gateway's renderer \
+         draws afresh too, as the reference did)",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
