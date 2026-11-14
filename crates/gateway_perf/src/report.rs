@@ -54,7 +54,7 @@ pub struct MetricRow {
     pub relative: bool,
 }
 
-pub const METRIC_ROWS: [MetricRow; 12] = [
+pub const METRIC_ROWS: [MetricRow; 14] = [
     MetricRow {
         key: "user_instructions_per_request_M",
         title: "user instructions per request",
@@ -77,6 +77,18 @@ pub const METRIC_ROWS: [MetricRow; 12] = [
         key: "cpu_us_per_request",
         title: "gateway CPU per request",
         format: Format::Micros,
+        relative: true,
+    },
+    MetricRow {
+        key: "rss_anon_mb_after_window",
+        title: "anonymous RSS after the window",
+        format: Format::Megabytes,
+        relative: true,
+    },
+    MetricRow {
+        key: "rss_file_mb_after_window",
+        title: "file-backed RSS after the window",
+        format: Format::Megabytes,
         relative: true,
     },
     MetricRow {
@@ -292,6 +304,40 @@ mod tests {
             "{}",
             lines[4]
         );
+    }
+
+    #[test]
+    fn the_resident_set_prints_its_anonymous_part_then_its_file_part_then_the_whole() {
+        let res = results_of(
+            &[
+                ("chat/rss_mb_after_window", &[100.0, 101.0, 100.0]),
+                ("chat/rss_file_mb_after_window", &[60.0, 61.0, 60.0]),
+                ("chat/rss_anon_mb_after_window", &[40.0, 40.0, 40.0]),
+            ],
+            &[
+                ("chat/rss_mb_after_window", &[103.0, 103.0, 104.0]),
+                ("chat/rss_file_mb_after_window", &[63.0, 63.0, 64.0]),
+                ("chat/rss_anon_mb_after_window", &[40.0, 40.0, 40.0]),
+            ],
+        );
+        let table = numbers_table(&res, "x");
+        let lines: Vec<&str> = table.lines().collect();
+        for (line, start) in [
+            (
+                lines[2],
+                "| chat: anonymous RSS after the window | 40.0 MB | 40.0 MB (+0.0 %) |",
+            ),
+            (
+                lines[3],
+                "| chat: file-backed RSS after the window | 60.0 MB | 63.0 MB (+5.0 %) |",
+            ),
+            (
+                lines[4],
+                "| chat: RSS after the window | 100.0 MB | 103.0 MB (+3.0 %) |",
+            ),
+        ] {
+            assert!(line.starts_with(start), "{line}");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The query-string and path-segment extractors of the control-plane
 //! management endpoints (the worker and tokenizer routes): a value the type
 //! does not take is refused in the control plane's own error envelope
-//! (`{"error": ..., "code": ...}`, the shape [`super::admin_json::AdminJson`]
+//! (`{"error": ..., "code": ...}`, the shape [`super::json::AdminJson`]
 //! answers for a body), not with the framework's plain-text 400, so a client
 //! reads one shape from these endpoints whatever went wrong.
 
@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 
-use super::admin_json::refusal;
+use crate::admin::json::refusal;
 
 /// A query string of the control-plane management endpoints.
 pub(crate) struct AdminQuery<T>(pub T);

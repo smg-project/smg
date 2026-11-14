@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::grpc_harness::{free_port, grpc_router_config, grpc_test_context, grpc_worker};
+use common::grpc_harness::{grpc_router_config, grpc_test_context, grpc_worker};
 use openai_protocol::{completion::CompletionRequest, model_card::ModelCard, worker::WorkerStatus};
 use smg::{
     app_context::AppContext,
@@ -66,7 +66,15 @@ impl MockEngine {
             .await
             .expect("bind the mock engine");
         let port = listener.local_addr().expect("mock engine address").port();
-        let admin_port = free_port().await;
+        // Bound here and handed to the admin server below, as the engine's
+        // listener is: the port is never released for another test to take.
+        let admin_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock engine's admin API");
+        let admin_port = admin_listener
+            .local_addr()
+            .expect("admin API address")
+            .port();
         let cfg = Arc::new(mock_worker::config::Config {
             admin_port: None,
             context_length: 32768,
@@ -100,10 +108,11 @@ impl MockEngine {
             },
         ));
         let (stop_admin, admin_stopped) = oneshot::channel();
-        let admin = tokio::spawn(mock_worker::admin::serve_until(
+        // The listener is bound and queuing connections already: the first
+        // admin call needs no wait for the server to come up.
+        let admin = tokio::spawn(mock_worker::admin::serve_with_listener_until(
             cfg,
-            "127.0.0.1".to_string(),
-            admin_port,
+            admin_listener,
             async move {
                 let _ = admin_stopped.await;
             },
@@ -112,21 +121,14 @@ impl MockEngine {
             .no_proxy()
             .build()
             .expect("test client");
-        let engine = Self {
+        Self {
             port,
             admin_port,
             name: format!("grpc:{port}"),
             client,
             stop: Some((stop, stop_admin)),
             served: Some((served, admin)),
-        };
-        let health = format!("http://127.0.0.1:{admin_port}/admin/health");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.client.get(&health).send().await.is_err() {
-            assert!(Instant::now() < deadline, "the admin API did not come up");
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        engine
     }
 
     /// Switch a fault hook of the engine through its admin API.
