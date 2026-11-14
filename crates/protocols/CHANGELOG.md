@@ -6,6 +6,20 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
+  a caller that owns a Messages request's tools converts them into chat tools without copying the
+  schemas (the properties and the additional fields move in); the by-reference forms stay for a
+  caller that keeps its tools and copy once, as before.
+- `MessagesBetas`, beside `CreateMessageRequest`: the two betas the request rules read, kept as
+  flags filled in one pass over the `anthropic-beta` header's values as the public API names them
+  (the dated form `name-YYYY-MM-DD`; a header that repeats or lists several; a longer name that
+  begins with a known one is another beta; no allocation per request), with `values_name` for
+  another name read from the raw values; and
+  `validate_with_betas`, the request rules that read a beta beside the body
+  (`thinking.budget_tokens` under `max_tokens` unless the interleaved-thinking beta is named;
+  `thread` only with the message-threads beta), refused with the codes and messages the gateway's
+  Messages route answered before. That route reads both through a typed header extractor, and the
+  external router's beta reading shares the grammar.
 - `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
   transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
   handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
@@ -34,10 +48,31 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A rerank worker's answer is read as `RerankWorkerResponse { results, usage, id }`: its `usage`
+  (a rerank server's `prompt_tokens` and `total_tokens`, read as the crate's `UsageInfo`, whose
+  `completion_tokens` defaults; a usage in another spelling is left out, as before) and its `id`
+  ride into the gateway's response, and
+  `RerankResponse::new` sorts the results by score, highest first, before `top_n` cuts them,
+  whatever order the worker sent. The crate read the results alone and kept the worker's order,
+  so a worker that did not sort lost its best documents to the cut and the response carried none
+  of the worker's usage. A `RerankRequest` without a `user` writes no `user` key, as one without a
+  `rid` writes none. Breaking: `RerankWorkerResponse` is a struct (the enum and its `into_results`
+  are gone) and `RerankResponse::new` takes `(results, model, usage, id)` where it took
+  `(results, model, request_id)`.
 - Breaking: `normalize_input_item` takes the item by value. A bare `{role, content}` message moves
   its content and role into the message item built from it, and every other item comes back as it
   was passed, so a caller that owns its input no longer copies each item; a caller holding a
   reference passes `item.clone()`, which costs what the old signature did.
+- `ContentPart`: a part whose `type` names a kind the gateway knows (`text`, `image_url`,
+  `audio_url`, `input_audio`, `video_url`, `refusal`) but whose body does not fit it is refused with
+  serde's reason for the field (`400`, `error.code` `invalid_type`, `integer_below_min_value` or
+  `missing_required_parameter`, `error.param` the message's path, extended by the missing field's
+  path when a field is the one missing) instead of reading as an unknown part, which the gRPC
+  routes refused as an unsupported part type and the HTTP relay passed through.
+- `MessageContent`: a part's refusal reaches the request's error under the part's place
+  (`` missing field `content[1].image_url.url` ``, `` ..., in `content[1].image_url` ``) instead of
+  the untagged read's generic words (`data did not match any variant of untagged enum
+  MessageContent`), so `error.code` and `error.param` are the field's.
 - `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
   `identity`, in whichever field of a repeated header or position of a comma-separated list it
   stands) before it reads the body, as a `415` in the gateway's JSON error envelope (`error.code`
@@ -94,9 +129,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
-- A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
-  (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
-  `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
+- A Messages request's Anthropic-defined tools keep their configuration when the request is
+  written back for an upstream: a web search or web fetch tool's domain filters, use cap and
+  location, a computer tool's display size, a text editor's `max_characters`, and any tool's
+  `defer_loading`, `strict` or `input_examples`. The untagged `Tool` reads every tool with a
+  `type` and a `name` and no `input_schema` as `ToolSearch`, which kept only those two keys,
+  `allowed_callers` and `cache_control`, so the provider route dropped the rest. Breaking:
+  `ToolSearchTool` gains `extra: Map<String, Value>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
@@ -111,6 +150,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   The message reaches a client on both routes that read it: the chat-family Responses conversion
   (`400 unsupported_content_part`) and the Harmony builder's tool message
   (`400 harmony_build_failed`).
+- The generate route's request rule refuses an empty `text` under `prompt_empty` only when the body
+  has no `input_ids` and no media field carries an item (beside ids the engine serves the ids without
+  reading the text; a media-only prompt is sent with an empty `text`, as the engine reads it);
+  a body with two prompts (two of `text`, `input_ids` and `input_embeds`) is served, the engine
+  taking the ids over the text (and the embeds only without a text), and the gateway's gRPC
+  generate path now reads the ids before the text too, where it read the text first and dropped
+  the ids without a word. The
+  request's media read (`GenerateRequest::media_fields`, `carries_media`) is one definition here,
+  read by the gRPC path's media refusal as well.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
@@ -133,6 +181,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
   choice it does not expect. A choice with log probabilities is written as before.
+- A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
+  (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
+  `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
