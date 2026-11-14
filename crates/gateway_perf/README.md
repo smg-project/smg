@@ -185,7 +185,8 @@ or hub id>`.
   the column is comparable between the two sides of one run, and `alloc` mode gives the
   absolute.
 - **RSS**: after the window, from `/proc`: the whole set (`VmRSS`), its anonymous part and
-  its file part; `VmHWM` is the peak. The whole set is those two parts and shared memory
+  its file part; `VmHWM` is the peak of the whole set (the kernel reports no peak of a
+  part), so it carries the file part too. The whole set is those two parts and shared memory
   (`RssShmem`, zero for the gateway on the bed). The anonymous part (`RssAnon`) is what the
   gateway allocated. It moves with the allocator's decay and the request mix in flight at
   the moment of reading, a few percent, and it is the part the gate judges. The file part
@@ -193,10 +194,11 @@ or hub id>`.
   its shared libraries (3.8 MB of 40 at idle on the bed). A fault maps the cached
   neighbours inside the 64 KB window around it, so the part follows two things that are
   not the gateway's work. One is how much of the measured FILE is cached: two copies of
-  one binary read apart, and the copy whose pages the cache has dropped reads lower. The
-  other is where the linker put the code that runs: a change that touched as many pages of
-  its binary on both sides held one megabyte more, the same code lying in more windows.
-  So the whole set and the file part are reported and never judged. To compare them, read
+  one binary read apart, and on the hosted runner the copy whose pages the cache has
+  dropped reads lower. The other is where the linker put the code that runs: a change
+  that touched nearly as many pages of its binary on both sides held one megabyte more,
+  the same code lying in more windows. So the whole set, its peak and the file part are
+  reported and never judged. To compare them, read
   both binaries whole before the run on an idle machine, and on a machine under memory
   pressure keep both files locked in memory for its length. `perf-mem` separates a slope
   (growth per 10,000 requests on one gateway) from the band.
@@ -238,9 +240,9 @@ request that touches `model_gateway/` or `crates/` (tests and benches excluded):
 commit's first parent against the pull request, built by the same cargo line (`perf-build`'s),
 on the chat, stream and tools paths, 4,000 requests per cell at half the bed's rates, 3+3 interleaved cells, judged by
 `.github/bench-gates/gateway-perf.toml` (allocation calls, KiB and user instructions at 2 %,
-anonymous RSS at 10 %; the whole RSS, its file part, CPU time and cycles report only). The
-job reads both gateway binaries whole right before it measures, so the two start from the
-same cached state whichever was built first. The job is ADVISORY: the tables go to the step
+anonymous RSS at 10 %; the whole RSS, its peak, its file part, CPU time and cycles report only). The
+job reads both gateway binaries whole right before it measures, so both files are in the
+page cache when the cells start. The job is ADVISORY: the tables go to the step
 summary, to a comment on the pull request when the token may write one, and to the
 `gateway-perf-<sha>` artifact (with `results.json`, the per-repeat values); its verdict never
 fails the job. A hosted runner exposes no hardware counters, so the instruction ids are

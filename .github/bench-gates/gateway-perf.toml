@@ -19,11 +19,13 @@
 #   cpu_us_per_request                  6.8 - 18.8 %                report only (load-dependent: the machine's noise, not the code's)
 #
 # The thresholds are ten times the identical-build spread of the exact counts (the perf
-# ledger's bar for a hot-path change is +2 % user instructions and +5 % RSS) and twice the
-# band of the memory id. The deterministic ids are the judgement; CPU time, cycles,
-# instructions with the kernel share, context switches, large allocations and the peak RSS
-# are report only until the hosted runner's own spread is read from the uploaded
-# results.json files.
+# ledger's bar for a hot-path change is +2 % user instructions and +5 % RSS) and about
+# twice the band of the memory id. The deterministic ids are the judgement; CPU time,
+# cycles, instructions with the kernel share, context switches and large allocations are
+# report only until the hosted runner's own spread is read from the uploaded results.json
+# files. The peak RSS is the whole set's high-water mark (VmHWM; the kernel reports no
+# peak of a part): it carries the file part, so like the whole set it is reported and
+# never judged across two binaries.
 #
 # The memory id is the ANONYMOUS part of the resident set (RssAnon: what the gateway
 # allocated). The whole set also holds the file pages the kernel has mapped (RssFile:
@@ -35,8 +37,8 @@
 # repeat under every base repeat; the head's binary is built first and two more builds
 # push its pages out of the cache), while the anonymous part of the same cells read -2.0
 # to +2.4 %. The other is where the linker put the code that runs: with both files held
-# in the cache, a change that touched as many pages of its binary on both sides read the
-# whole set 0.9 to 2.6 % higher on every path, the same code lying in more windows. The
+# in the cache, a change that touched nearly as many pages of its binary on both sides read
+# the whole set 0.9 to 2.6 % higher on every path, the same code lying in more windows. The
 # anonymous band is the per-side spread of three repeats of one binary at the job's own
 # cell (4,000 requests, three paths): 95 of 96 samples inside it and one at 10.4 %. 10 %
 # of the part is 2 to 2.5 MB, under the 3 MB that 5 % of the whole set was. The whole set
