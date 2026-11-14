@@ -3,6 +3,8 @@
 //! answers with `BatchTokenIDSlimOutput` batches, as the SMG plugin inside a
 //! headless scheduler does.
 
+mod lora;
+
 use std::{
     collections::BTreeMap,
     sync::{

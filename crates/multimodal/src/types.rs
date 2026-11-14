@@ -57,12 +57,26 @@ pub enum MediaContentPart {
         text: String,
     },
     ImageUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
         /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_long_side_pixel: Option<u32>,
+    },
+    /// An image carried as base64 text with its media type (a base64 source
+    /// of the Messages API): the decoder reads the text in place, as it reads
+    /// a data URL's payload; nothing re-encodes it into one.
+    ImageBase64 {
+        media_type: String,
+        data: Arc<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_long_side_pixel: Option<u32>,
     },
@@ -81,7 +95,16 @@ pub enum MediaContentPart {
         uuid: Option<String>,
     },
     AudioUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
+    /// Audio carried as base64 text with its media type (a chat `input_audio`
+    /// part): read in place, as a data URL's payload.
+    AudioBase64 {
+        media_type: String,
+        data: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
@@ -93,7 +116,8 @@ pub enum MediaContentPart {
         uuid: Option<String>,
     },
     VideoUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
         /// MiniMax-M3 extension: frames per second to sample at.

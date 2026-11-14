@@ -92,6 +92,13 @@ struct Cli {
     #[arg(long, help_heading = "TLS")]
     replication_client_ca: Option<PathBuf>,
 
+    // ==================== Load Monitoring ====================
+    /// Seconds between two load polls of an engine whose stream is not
+    /// serving it, and the freshness bound a pushed record must meet to
+    /// stand in for the poll; the gateway's flag of the same name
+    #[arg(long, default_value_t = Config::DEFAULT_LOAD_POLL_INTERVAL.as_secs(), help_heading = "Load Monitoring")]
+    load_monitor_interval: u64,
+
     // ==================== Shutdown ====================
     /// Seconds the listeners keep accepting after readiness fails, so the
     /// probes see the change first; at most half the grace period
@@ -223,6 +230,7 @@ impl Cli {
             admin: self.admin_listen,
             shutdown_settle: Duration::from_secs(self.shutdown_settle_secs),
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
+            load_poll_interval: Duration::from_secs(self.load_monitor_interval),
         })
     }
 }
@@ -553,6 +561,16 @@ mod tests {
         assert_eq!(bounds.shutdown_grace, Duration::from_secs(10));
         let zero = config(&["--shutdown-grace-period-secs", "0"]).expect("parsed");
         assert_eq!(zero.validate(), Err(ConfigError::ZeroShutdownGrace));
+    }
+
+    #[test]
+    fn the_load_poll_interval_is_the_gateways_default_and_refuses_zero() {
+        let default = config(&[]).expect("parsed");
+        assert_eq!(default.load_poll_interval, Duration::from_secs(10));
+        let two = config(&["--load-monitor-interval", "2"]).expect("parsed");
+        assert_eq!(two.load_poll_interval, Duration::from_secs(2));
+        let zero = config(&["--load-monitor-interval", "0"]).expect("parsed");
+        assert_eq!(zero.validate(), Err(ConfigError::ZeroLoadPollInterval));
     }
 
     #[test]

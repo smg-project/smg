@@ -5,6 +5,9 @@
 //! The helpers return `Result`s and the tests expect them: a helper is not a
 //! test to the lints.
 
+#[path = "common/net.rs"]
+mod net;
+
 use std::{
     io::Write,
     net::{Ipv4Addr, SocketAddr},
@@ -12,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use net::{http_get, loopback, vm_rss_kib};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -23,19 +27,11 @@ use smg_policy_controller::{
     store::{LoadSink, LoadSource, WorkerFacts, WorkersStore},
     view::{LoadRow, Role},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::oneshot,
-};
+use tokio::{net::TcpStream, sync::oneshot};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
-
-fn loopback() -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
-}
 
 fn listener(name: &str, scopes: &[Scope]) -> Listener {
     Listener {
@@ -59,33 +55,8 @@ fn config() -> Config {
         admin: loopback(),
         shutdown_settle: Duration::from_millis(100),
         shutdown_grace: Duration::from_secs(5),
+        load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
     }
-}
-
-/// One HTTP/1.1 GET over a plain socket: the status code and the body.
-async fn http_get(addr: SocketAddr, path: &str) -> Result<(u16, String), String> {
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .map_err(|error| format!("connect {addr}: {error}"))?;
-    stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|error| error.to_string())?;
-    let text = String::from_utf8_lossy(&response).into_owned();
-    let status = text
-        .split(' ')
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| format!("no status line in {text:?}"))?;
-    let body = text.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
-    Ok((status, body))
 }
 
 /// A plaintext health check of `service` on the listener at `addr`.
@@ -492,19 +463,6 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
 }
 
 /// `VmRSS` of this process, in KiB; `0` where `/proc` has no answer.
-fn vm_rss_kib() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status.lines().find_map(|line| {
-                line.strip_prefix("VmRSS:")
-                    .and_then(|rest| rest.trim().split(' ').next())
-                    .and_then(|kib| kib.parse().ok())
-            })
-        })
-        .unwrap_or(0)
-}
-
 /// The Numbers table's resident rows: the controller serving idle, then with
 /// a thousand workers and their load rows in its store. A measurement, run
 /// by name with `--ignored`; it prints and asserts only that the feed landed.
