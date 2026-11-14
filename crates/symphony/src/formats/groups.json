@@ -122,6 +122,7 @@
   {"model": "Salesforce/Llama-xLAM-2-8b-fc-r", "also": [], "table": "xlam", "opener": null, "after": null},
   {"model": "meituan-longcat/LongCat-2.5", "also": [], "table": "longcat", "opener": null, "after": null},
   {"model": "microsoft/Mage-VL-Cowork", "also": [], "table": "qwen3", "opener": null, "after": null},
+  {"model": "MemTensor/MemT-1.0-Nano", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "mispeech/midashenglm-spatial", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "XiaomiMiMo/MiMo-V2.5", "also": ["MiMo-V2.5-Base"], "table": "qwen3_tagged_direct", "opener": null, "after": null},
   {"model": "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B", "also": [], "table": "qwen3_tagged_direct", "opener": null, "after": null},
