@@ -36,7 +36,10 @@ use crate::{
     policies::hash_ring::HashRing,
     worker::{
         health::circuit_breaker::CircuitState,
-        identity::basic::{RuntimeType, WorkerType},
+        identity::{
+            basic::{RuntimeType, WorkerType},
+            endpoint::Endpoint,
+        },
         pd::{
             pair_index::{PdPairIndex, PdWire},
             pairing::PdPairingMode,
@@ -1482,7 +1485,7 @@ impl WorkerRegistry {
         // Recover by clearing the stale entry and retrying full registration.
         tracing::error!(
             "register_or_replace: inconsistent state for URL {}, clearing stale entry",
-            worker.url()
+            worker.redacted_url()
         );
         self.url_to_id.remove(worker.url());
         // register() will now succeed since we cleared the entry.
@@ -1589,7 +1592,7 @@ impl WorkerRegistry {
             if current != expected {
                 tracing::warn!(
                     worker_id = %worker_id.as_str(),
-                    worker_url = old_worker.url(),
+                    worker_url = old_worker.redacted_url(),
                     expected,
                     current,
                     "Aborting replacement: worker was replaced before the lock was acquired"
@@ -1604,8 +1607,8 @@ impl WorkerRegistry {
         // URL changes are not supported via replace — use remove + register instead
         if old_worker.url() != new_worker.url() {
             tracing::error!(
-                old_url = old_worker.url(),
-                new_url = new_worker.url(),
+                old_url = old_worker.redacted_url(),
+                new_url = new_worker.redacted_url(),
                 "replace() does not support URL changes"
             );
             return false;
@@ -1620,7 +1623,7 @@ impl WorkerRegistry {
         if !new_worker.inherit_shared_state_from(&*old_worker) {
             tracing::warn!(
                 worker_id = %worker_id.as_str(),
-                worker_url = old_worker.url(),
+                worker_url = old_worker.redacted_url(),
                 "replace() did not preserve shared mutable worker state"
             );
         }
@@ -2273,7 +2276,7 @@ impl WorkerRegistry {
                     model_id = %model_id,
                     worker_type = %worker_type,
                     connection_mode = %ConnectionMode::Grpc,
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     observed_values = ?values,
                     "Divergent default sampling params reported by workers in the same routing group"
                 );
@@ -2897,7 +2900,7 @@ impl WorkerRegistry {
         // this guard also covers peers running older builds.
         if ConnectionMode::from_url(&state.url) == Some(ConnectionMode::Zmq) {
             tracing::debug!(
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 "Ignoring mesh state for host-local ZMQ worker"
             );
             return;
@@ -2919,7 +2922,7 @@ impl WorkerRegistry {
             // local health state machine is the single writer.
             if self.origin_of(&existing_id) == Some(WorkerOrigin::Local) {
                 tracing::debug!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     "Ignoring mesh state for locally-owned worker"
                 );
                 return;
@@ -2952,7 +2955,7 @@ impl WorkerRegistry {
                         if self.replace_inner(&existing_id, replacement, None, None, Some(record)) {
                             tracing::info!(
                                 worker_id = %existing_id.as_str(),
-                                url = %state.url,
+                                url = %Endpoint::redacted_str(&state.url),
                                 model = %state.model_id,
                                 version = state.version,
                                 "Rebuilt mesh-synced worker from its owner's replacement"
@@ -2974,7 +2977,7 @@ impl WorkerRegistry {
                     PublishedSpec::Undecodable(err) => {
                         tracing::warn!(
                             worker_id = %existing_id.as_str(),
-                            url = %state.url,
+                            url = %Endpoint::redacted_str(&state.url),
                             version = state.version,
                             %err,
                             "the owner's replacement of a mesh-synced worker carries a spec this node cannot decode"
@@ -3010,7 +3013,7 @@ impl WorkerRegistry {
             });
             if outcome.is_some() {
                 tracing::debug!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     healthy = state.health,
                     "Updated health for existing mesh-synced worker"
                 );
@@ -3029,7 +3032,7 @@ impl WorkerRegistry {
             PublishedSpec::Absent => None,
             PublishedSpec::Undecodable(err) => {
                 tracing::warn!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     %err,
                     "undecodable WorkerSpec in mesh state; importing minimal worker"
                 );
@@ -3069,7 +3072,7 @@ impl WorkerRegistry {
             self.import_records.insert(id.clone(), record);
             tracing::info!(
                 worker_id = %id.as_str(),
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 model = %state.model_id,
                 healthy = state.health,
                 spec_applied,
@@ -3108,7 +3111,7 @@ impl WorkerRegistry {
         if self.replace_inner(import_id, replacement, None, None, Some(record)) {
             tracing::info!(
                 worker_id = %import_id.as_str(),
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 model = %state.model_id,
                 version = state.version,
                 "Rebuilt the minimal mesh-synced worker from its owner's replacement"
@@ -3207,7 +3210,7 @@ impl WorkerRegistry {
                 // the URL scheme — not routable from this node.
                 if spec.connection_mode == ConnectionMode::Zmq {
                     tracing::debug!(
-                        url = %state.url,
+                        url = %Endpoint::redacted_str(&state.url),
                         "Ignoring mesh state for host-local ZMQ worker"
                     );
                     return PublishedSpec::HostLocal;
