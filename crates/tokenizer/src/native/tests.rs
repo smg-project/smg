@@ -46,6 +46,9 @@ use crate::{
 };
 
 const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Three files' split pattern: a letter run with its marks, words joined by
+/// single spaces, as one piece.
+const JOINED_LETTER_RUNS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
 const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const DIGITS: &str = r"\p{N}{1,3}";
 /// A parse family's punctuation stage: a bracket, or a capturing group of one
@@ -405,6 +408,21 @@ fn shapes() -> Vec<Shape> {
             pre_tokenizers: vec![byte_level(true)],
             ignore_merges: false,
             special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // The NFC normalizer, the split whose second alternative is the joined
+        // letter run (words joined by single spaces as one piece), and the
+        // `ByteLevel` without its regex: the chain of a family's files.
+        Shape {
+            name: "nfc-then-joined-letter-runs",
+            normalizer: Normalizer::Nfc,
+            pre_tokenizers: vec![
+                split(JOINED_LETTER_RUNS, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["[|endofturn|]", "[|tool|]"],
             added: &[],
             stripped: &[],
         },
@@ -1626,6 +1644,578 @@ fn a_removed_split_drops_its_matches_as_the_library_does() {
             "{text:?}"
         );
     }
+}
+
+#[test]
+fn a_joined_letter_run_encodes_as_the_library_does() {
+    // The joined-letter-run shape on texts with words joined by single
+    // spaces, two spaces, marks after letters and after a space, digits and
+    // punctuation between words, a line break, and an added token.
+    let mut state = 0x4A4F_494E_4544_5201u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "nfc-then-joined-letter-runs")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "hello world",
+        "hello  world",
+        "h\u{e9}llo w\u{f6}rld, c\u{327}a va",
+        "ab\u{301} c\u{301}d a \u{301}b",
+        "x1 y2 z 33 words",
+        "one two\nthree four",
+        "[|endofturn|] a b [|tool|]c d",
+        "it's a dog's life",
+        "no",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+/// A letter run joined by spaces can span the pool's cut candidates, and a
+/// window started at one of its joins would read the space by another
+/// alternative (` \p{L}` at once; ` ?\p{L}+` after a comma, where the run
+/// does not restart), part from the whole text's pieces and approve a cut
+/// inside the run; so would a window begun at a space a whitespace run took
+/// (the text lands on the letter after it, where the run begins, the window
+/// reads ` b` instead), or at a space some other alternative reads after
+/// the character before it inside one match (`\p{N}+ ?` takes `1 `,
+/// `[^\s\p{L}\p{N}]+ ?` takes `, `, a literal prefix takes `x `, an optional
+/// digit or prefix before the space the same; the text lands on the letter
+/// after the space the same way): the check starts its
+/// window at a space after a character that is neither whitespace, nor one
+/// a run reaches the space from, nor one such an alternative reads before a
+/// space, and refuses a candidate without one in reach; a pattern without
+/// a joined run whose letter run reads an optional space takes the same
+/// guarded start. The patterns, the family's, five with such an alternative
+/// and the one without a run, on a text that is one run, on prose with a
+/// comma, on runs after two spaces and after a line break with a space, on
+/// prose joined by a period and two spaces, on lines indented by four
+/// spaces, on runs after `1 `, after `, `, after a literal prefix and after
+/// an optional one, and on single-spaced words: the pool's units hold the
+/// whole text's pieces, and the pool's ids are the serial encode's and the
+/// library's.
+#[test]
+fn a_space_joined_run_is_never_cut_by_the_pool() {
+    let mut state = 0x4A4F_494E_4544_5203u64;
+    let one_run = format!("a{}", " b".repeat(40_000));
+    let prose = {
+        let words = "lorem ipsum dolor sit amet ".repeat(4_000);
+        format!("{words}word, then more {words}end")
+    };
+    let double_space = format!("{}  b{}", "c".repeat(31_767), " b".repeat(20_000));
+    let newline_space = format!("{}\n b{}", "c".repeat(32_000), " b".repeat(20_000));
+    let period_prose = "lorem ipsum dolor sit amet consectetur.  ".repeat(3_000);
+    let indented = "    lorem ipsum dolor sit amet\n".repeat(4_000);
+    let digit_space = format!("{}1 b{}", "c".repeat(31_000), " b".repeat(20_000));
+    let comma_space = format!("{}, b{}", "c".repeat(31_000), " b".repeat(20_000));
+    let prefix_run = format!("{}x {}", "z".repeat(31_767), "a ".repeat(20_000));
+    let prefix_opt = format!(
+        "{}x {}c {}",
+        "z".repeat(31_767),
+        "a".repeat(230),
+        "a ".repeat(20_000)
+    );
+    let letter_space = "abc ".repeat(20_000);
+    let long_alternative = format!("{}{}", "z".repeat(31_768), " a".repeat(20_000));
+    let lookahead_at_the_end = format!("! {} ", "a".repeat(1_000)).repeat(120);
+    for (index, pattern) in [
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\s+",
+        JOINED_LETTER_RUNS,
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}+ ?| ?\p{L}+|\s+",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|[^\s\p{L}\p{N}]+ ?| ?\p{L}+|\s+",
+        r"x (?:ab*(?: ab*)*)+| a[ a]{998}| (?:ab*(?: ab*)*)+",
+        r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\p{N}? |\s+",
+        r" [ ac]{999}|x? a+|(?:ab*(?: ab*)*)+",
+        r"\p{L}+ ?| ?\p{L}+|\s+",
+        r" [ a]{1999}| [ a]{999}| a",
+        r" a{1000}(?!\s)|a+",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shape = Shape {
+            name: "space-joined-run",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(pattern, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &[],
+            added: &[],
+            stripped: &[],
+        };
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        for text in [
+            one_run.as_str(),
+            prose.as_str(),
+            double_space.as_str(),
+            newline_space.as_str(),
+            period_prose.as_str(),
+            indented.as_str(),
+            digit_space.as_str(),
+            comma_space.as_str(),
+            prefix_run.as_str(),
+            prefix_opt.as_str(),
+            letter_space.as_str(),
+            long_alternative.as_str(),
+            lookahead_at_the_end.as_str(),
+        ] {
+            let whole: Vec<String> = {
+                let mut out = Vec::new();
+                native.pieces(0, text, &mut |piece| out.push(piece.to_owned()));
+                out
+            };
+            let mut chunked = Vec::new();
+            let units = native.units(text, true, true);
+            for unit in units.as_slice() {
+                let Segment::Text(chunk) = unit else {
+                    panic!("no added tokens in this text");
+                };
+                native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+            }
+            assert_eq!(chunked, whole, "pattern {index}: a cut split a piece");
+            let pooled = native
+                .encode_with(Some(tokenizer.get_model()), text, true, false)
+                .expect("pooled");
+            let serial = native
+                .encode_with(Some(tokenizer.get_model()), text, false, false)
+                .expect("serial");
+            assert_eq!(pooled, serial, "pattern {index}: the pool changed the ids");
+            let reference = tokenizer
+                .encode(text, false)
+                .expect("encode")
+                .get_ids()
+                .to_vec();
+            assert_eq!(pooled, reference, "pattern {index}: against the reference");
+        }
+    }
+}
+
+/// A whitespace run of odd length under a fixed-count whitespace alternative
+/// (`\s{2}`): the text leaves one space before the letters after the run,
+/// which a window begun inside the run at the other parity would not, and a
+/// space-led alternative with a lookahead at its end (` a{100}(?!\s)`) reads
+/// that space one way inside the text and another at a unit's end. The cut
+/// check's window begins where the run begins, as the text's match loop
+/// does, so the pool's units hold the text's pieces and the pool's ids are
+/// the serial encode's and the library's, under a split that removes its
+/// matches as under one that keeps them.
+#[test]
+fn a_cut_window_begins_where_a_whitespace_run_begins_under_a_fixed_count_alternative() {
+    let text = format!(
+        "{}{}{} b{}",
+        "z".repeat(32_067),
+        " ".repeat(601),
+        "a".repeat(100),
+        "z".repeat(40_000)
+    );
+    for (index, (pattern, behavior)) in [
+        (r"\s{2}| a{100}(?!\s)| b", SplitDelimiterBehavior::Removed),
+        (
+            r"\s{2}| a{100}(?!\s)| b|\s+",
+            SplitDelimiterBehavior::Isolated,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut state = 0x4649_5845_4432_5553u64;
+        let shape = Shape {
+            name: "fixed-count-whitespace",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![split(pattern, behavior, false), byte_level(false)],
+            ignore_merges: false,
+            special: &[],
+            added: &[],
+            stripped: &[],
+        };
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let whole: Vec<String> = {
+            let mut out = Vec::new();
+            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            out
+        };
+        let mut chunked = Vec::new();
+        let units = native.units(&text, true, true);
+        for unit in units.as_slice() {
+            let Segment::Text(chunk) = unit else {
+                panic!("no added tokens in this text");
+            };
+            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+        }
+        assert_eq!(chunked, whole, "case {index}: a cut split a piece");
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), &text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), &text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "case {index}: the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "case {index}: against the reference");
+    }
+}
+
+/// A whitespace run longer than a chunk before a candidate: the window
+/// would begin at the run's start, however far back, and under a
+/// whitespace split the check would collect one span per space over it, so
+/// the candidate has no window and the search skips it instead; the text,
+/// with no other candidate, stays one unit, its pool ids the serial
+/// encode's and the library's; a run within a chunk keeps its cut, the
+/// window begun at the run's start.
+#[test]
+fn a_whitespace_run_past_a_chunk_before_a_candidate_refuses_the_cut() {
+    let mut state = 0x5245_4143_4852_554Eu64;
+    let shape = Shape {
+        name: "long-whitespace",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let spaces = PARALLEL_CHUNK_BYTES + CUT_CHECK_REACH;
+    let text = format!("{}a b{}", " ".repeat(spaces), "z".repeat(40_000));
+    assert_eq!(
+        native.window_start(&text, spaces + 1),
+        None,
+        "a window begun at the text's start, the whole run inside it"
+    );
+    let units = native.units(&text, true, true);
+    assert_eq!(units.as_slice().len(), 1, "the text stays one unit");
+    let pooled = native
+        .encode_with(Some(tokenizer.get_model()), &text, true, false)
+        .expect("pooled");
+    let serial = native
+        .encode_with(Some(tokenizer.get_model()), &text, false, false)
+        .expect("serial");
+    assert_eq!(pooled, serial, "the pool changed the ids");
+    let reference = tokenizer
+        .encode(text.as_str(), false)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(pooled, reference, "against the reference");
+    let run = CUT_CHECK_REACH / 2;
+    let within = format!(
+        "{}{}a b{}",
+        "z".repeat(40_000),
+        " ".repeat(run),
+        "z".repeat(40_000)
+    );
+    assert_eq!(
+        native.window_start(&within, 40_000 + run + 1),
+        Some(40_000),
+        "a run within a chunk: the window begins at its start"
+    );
+}
+
+/// A stretch without a space longer than a chunk before or after a
+/// candidate (line breaks under a whitespace split, digits under a digit
+/// split: one piece per byte, one span each in the check): the window
+/// would begin at the stretch's start or end at its end, however far, so
+/// the candidate has no window and the search skips it instead; the text,
+/// with no other candidate, stays one unit, its pool ids the serial
+/// encode's and the library's; a stretch within a chunk keeps its cut, the
+/// window begun at the space before it.
+#[test]
+fn a_space_free_stretch_past_a_chunk_around_a_candidate_refuses_the_cut() {
+    let mut state = 0x5354_5245_5443_4821u64;
+    let line_breaks = Shape {
+        name: "long-line-breaks",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&line_breaks, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let stretch = PARALLEL_CHUNK_BYTES + CUT_CHECK_REACH;
+    let before = format!("{}a b{}", "\n".repeat(stretch), "z".repeat(40_000));
+    assert_eq!(
+        native.window_start(&before, stretch + 1),
+        None,
+        "a window begun at the text's start, the stretch inside it"
+    );
+    let after = format!("{}a b{}", "z".repeat(40_000), "\n".repeat(stretch));
+    assert_eq!(
+        native.window_end(&after, 40_001),
+        None,
+        "a window ended at the text's end, the stretch inside it"
+    );
+    for text in [&before, &after] {
+        let units = native.units(text, true, true);
+        assert_eq!(units.as_slice().len(), 1, "the text stays one unit");
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "against the reference");
+    }
+    let digits = Shape {
+        name: "long-digits",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\p{N}", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&digits, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let text = format!("{}a b{}", "1".repeat(stretch), "z".repeat(40_000));
+    assert_eq!(
+        native.window_start(&text, stretch + 1),
+        None,
+        "digits: a window begun at the text's start"
+    );
+    let run = PARALLEL_CHUNK_BYTES / 2;
+    let within = format!(
+        "{} {}a b{}",
+        "z".repeat(40_000),
+        "\n".repeat(run),
+        "z".repeat(40_000)
+    );
+    assert_eq!(
+        native.window_start(&within, 40_000 + run + 2),
+        Some(40_000),
+        "a stretch within a chunk: the window begins at the space before it"
+    );
+}
+
+/// A stretch without a space longer than a chunk, followed by prose: the
+/// candidates in the first window of prose after it have no window within
+/// the reach (their walks back meet the stretch) and would end the search
+/// if they counted as rejections, the whole tail one unit; skipped, the
+/// search cuts at the first candidate past that window, so the prose keeps
+/// its pool cuts, before such a stretch and after it, with the pooled ids
+/// the serial encode's and the library's.
+#[test]
+fn a_space_free_stretch_longer_than_a_chunk_keeps_the_cuts_of_the_prose_after_it() {
+    let mut state = 0x5441_494C_4355_5453u64;
+    let shape = Shape {
+        name: "stretch-then-prose",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let stretch = "\n".repeat(PARALLEL_CHUNK_BYTES + CUT_CHECK_REACH);
+    let prose = "the pool cuts a long text at a space before a letter ".repeat(2_000);
+    for text in [
+        format!("{stretch}{prose}"),
+        format!("{}{stretch}{prose}", &prose[..40_000]),
+    ] {
+        let units = native.units(&text, true, true);
+        let longest = units
+            .as_slice()
+            .iter()
+            .map(|unit| match unit {
+                Segment::Text(text) => text.len(),
+                Segment::Added(_) => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            units.as_slice().len() > 1 && longest <= 3 * PARALLEL_CHUNK_BYTES,
+            "{} units, the longest {longest} bytes: the stretch ended the cutting",
+            units.as_slice().len()
+        );
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), &text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), &text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "against the reference");
+    }
+}
+
+#[test]
+fn a_later_stage_runs_over_the_earlier_stage_pieces_of_the_cut_window() {
+    // Stacked stages around a cut candidate, each case a chain of splits
+    // (the byte level after them) and a text: two isolated stages whose
+    // later one begins its match where the earlier one's piece ends (the
+    // cut check ran it from the window's start instead); two whose later
+    // one splits the earlier one's match on the candidate, where the next
+    // unit's first stage begins inside that match (the check read the text
+    // before the candidate on its own and nothing from it on); and a
+    // dropped match the next unit begins inside the same way.
+    let mut state = 0x5354_4147_4544_0001u64;
+    let cases: [(Vec<PreTokenizerWrapper>, String); 4] = [
+        (
+            vec![
+                split("aa", SplitDelimiterBehavior::Isolated, false),
+                split(r" [ a]{999}", SplitDelimiterBehavior::Isolated, false),
+            ],
+            format!(
+                "{}{}  aa{}z {}",
+                "z".repeat(31_768),
+                " a".repeat(115),
+                " a".repeat(883),
+                "z".repeat(40_000)
+            ),
+        ),
+        (
+            vec![
+                split(r"[ a]{999}", SplitDelimiterBehavior::Isolated, false),
+                split(" a", SplitDelimiterBehavior::Isolated, false),
+            ],
+            format!(
+                "{}{}z {}",
+                "z".repeat(31_968),
+                " a".repeat(1_000),
+                "z".repeat(40_000)
+            ),
+        ),
+        (
+            vec![
+                split(
+                    r"[a-z]+ [a-z]+|[0-9]+",
+                    SplitDelimiterBehavior::Isolated,
+                    false,
+                ),
+                split(r" ?[a-z]+", SplitDelimiterBehavior::Isolated, false),
+            ],
+            "12ab cd ef. ".repeat(8_000),
+        ),
+        (
+            vec![split(
+                r"[a-z]+ ?[a-z]*",
+                SplitDelimiterBehavior::Removed,
+                false,
+            )],
+            "12ab cd. ".repeat(10_000),
+        ),
+    ];
+    for (index, (splits, text)) in cases.into_iter().enumerate() {
+        let mut pre_tokenizers = splits;
+        pre_tokenizers.push(byte_level(false));
+        let shape = Shape {
+            name: "stacked-stages",
+            normalizer: Normalizer::None,
+            pre_tokenizers,
+            ignore_merges: false,
+            special: &[],
+            added: &[],
+            stripped: &[],
+        };
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let whole: Vec<String> = {
+            let mut out = Vec::new();
+            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            out
+        };
+        let mut chunked = Vec::new();
+        for unit in native.units(&text, true, true).as_slice() {
+            let Segment::Text(chunk) = unit else {
+                panic!("no added tokens in this text");
+            };
+            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+        }
+        assert_eq!(chunked, whole, "case {index}: a cut split a piece");
+        let pooled = native
+            .encode_with(Some(tokenizer.get_model()), &text, true, false)
+            .expect("pooled");
+        let serial = native
+            .encode_with(Some(tokenizer.get_model()), &text, false, false)
+            .expect("serial");
+        assert_eq!(pooled, serial, "case {index}: the pool changed the ids");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, reference, "case {index}: against the reference");
+    }
+}
+
+/// When no stage reads a space after a non-whitespace character inside one
+/// match (the shape's before-space classes are whitespace alone), the cut
+/// check's window starts at the nearest space back that begins a whitespace
+/// run, within a chunk of the candidate: a text whose spaces stand further
+/// apart than the check's reach keeps its pool cuts, and the pool's ids are
+/// the serial encode's and the library's.
+#[test]
+fn sparse_spaces_keep_the_pool_cuts_without_a_joined_run() {
+    let mut state = 0x5350_4152_5345_0001u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "cl100k-ignore-merges")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let text = format!("{} ", "x".repeat(2_099)).repeat(48);
+    let units = native.units(&text, true, true);
+    assert!(
+        units.as_slice().len() > 1,
+        "{} unit: the sparse spaces lost the cuts",
+        units.as_slice().len()
+    );
+    let pooled = native
+        .encode_with(Some(tokenizer.get_model()), &text, true, false)
+        .expect("pooled");
+    let serial = native
+        .encode_with(Some(tokenizer.get_model()), &text, false, false)
+        .expect("serial");
+    assert_eq!(pooled, serial, "the pool changed the ids");
+    let reference = tokenizer
+        .encode(text.as_str(), false)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(pooled, reference, "against the reference");
 }
 
 #[test]

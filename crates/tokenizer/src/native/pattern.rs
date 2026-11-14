@@ -258,6 +258,20 @@ fn in_categories(categories: u16, code: u32) -> bool {
 }
 
 impl Class {
+    /// The class's one code point, when it is exactly one (no category, no
+    /// exclusion, one range of one code point, not negated).
+    fn single_code_point(&self) -> Option<char> {
+        match (
+            self.negated,
+            self.categories,
+            self.without,
+            self.ranges.as_slice(),
+        ) {
+            (false, 0, 0, [(start, end)]) if start == end => char::from_u32(*start),
+            _ => None,
+        }
+    }
+
     /// Whether two finished classes are the same set: the same categories,
     /// exclusions, negation and (sorted, merged) ranges.
     fn same_set(&self, other: &Self) -> bool {
@@ -340,6 +354,19 @@ impl Class {
     /// Whether the class may hold a character beyond ASCII.
     pub(super) fn may_hold_beyond_ascii(&self) -> bool {
         self.first().non_ascii
+    }
+
+    /// Whether every character the class can hold is whitespace: no
+    /// negation or exclusion, no category but `\s`, every range within the
+    /// characters [`char::is_whitespace`] accepts. The classes of a
+    /// whitespace run are that; a class that may hold anything else is not.
+    pub(super) fn whitespace_only(&self) -> bool {
+        !self.negated
+            && self.without == 0
+            && self.categories & !CAT_SPACE == 0
+            && self.ranges.iter().all(|&(start, end)| {
+                (start..=end).all(|code| char::from_u32(code).is_some_and(char::is_whitespace))
+            })
     }
 
     /// Whether every character the class can hold is printable ASCII
@@ -469,6 +496,40 @@ pub(super) enum Node {
         second: usize,
         min: u32,
     },
+    /// `(?:XYZ*)*` as the parser first meets it: the tail of a
+    /// [`Node::JoinedRun`], folded into the run with the `YZ*` before it
+    /// under the outer `+`; one left anywhere else declines the pattern
+    /// ([`joined_tail_loose`]).
+    JoinedTail {
+        join: usize,
+        letter: usize,
+        mark: usize,
+    },
+    /// `(?:YZ*(?:XYZ*)*)+`: a run of `letter`s each with its `mark`s, the
+    /// runs joined one `join` character at a time (a letter run with its
+    /// combining marks, words joined by single spaces, as one family's split
+    /// pattern writes it): one letter and its marks, then letters, marks and
+    /// join-then-letter while they come, taken whole. Each step is one
+    /// character of either class or the join's one code point and a letter,
+    /// so whichever class the engine reads a character as it moves to the
+    /// same position (the classes may share characters), and with the join
+    /// in neither class one step applies at any position or none: the
+    /// engine's greedy path through the run is the longest run, and the run
+    /// stands at the end of its alternative ([`unit_run_misplaced`]), where
+    /// nothing follows to give a character back to. Neither class holds the
+    /// space (`joined_run_of`), so a space inside a run is its join, after a
+    /// letter or a mark and before a letter: the thread pool's cut check,
+    /// which runs the stages from a space before the cut, starts at a space
+    /// that is not that, that no whitespace run took and that no other
+    /// alternative reads after the character before it
+    /// ([`Pattern::spans_space_between`], [`Pattern::reads_space_after`],
+    /// `NativeEncoder::window_start`), where the text's own loop begins a
+    /// piece.
+    JoinedRun {
+        join: usize,
+        letter: usize,
+        mark: usize,
+    },
 }
 
 /// What ends the group run of a digit-grouping lookahead
@@ -559,6 +620,10 @@ pub(crate) struct Pattern {
     /// Whether the pattern holds a `+` after a bare interval inside the
     /// digit-grouping lookahead (see [`Self::repeats_bare_interval`]).
     bare_interval_repeat: bool,
+    /// The classes of every alternative that can read a space anywhere but
+    /// at its first position, the join of a letter run aside
+    /// ([`Self::reads_space_after`]).
+    before_space: Vec<usize>,
 }
 
 /// The matcher of a pattern: a hand-written scanner for the two template
@@ -624,6 +689,13 @@ enum Op {
         first: usize,
         second: usize,
         min: u32,
+    },
+    /// A joined letter run: one `letter`, then `mark`s, `letter`s and
+    /// `join`-then-`letter` while they come; taken whole, no choice left.
+    JoinedRun {
+        join: usize,
+        letter: usize,
+        mark: usize,
     },
     /// A choice: the ops that follow are tried first; `next` is where to go
     /// when they fail (the following alternative's `Split`, the op after an
@@ -743,6 +815,7 @@ impl Pattern {
             || groups_ahead_leads(&root, true)
             || misplaced_run(&root, true)
             || unit_run_misplaced(&root, &parser.classes, Follow::Nothing)
+            || joined_tail_loose(&root)
         {
             return None;
         }
@@ -761,6 +834,7 @@ impl Pattern {
         let end_anchored = holds_end(&root);
         let reads_word_boundary = holds_word_boundary(&root);
         let anchored = holds_anchor(&root);
+        let before_space = classes_before_space(&root, &parser.classes);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
@@ -775,6 +849,7 @@ impl Pattern {
             reads_word_boundary,
             anchored,
             bare_interval_repeat: parser.bare_interval_repeat,
+            before_space,
         })
     }
 
@@ -835,6 +910,65 @@ impl Pattern {
     /// every match of it is a run of them.
     pub(super) fn decimal_digits_only(&self) -> bool {
         self.classes.iter().all(Class::decimal_digits)
+    }
+
+    /// Whether a joined letter run of the pattern ([`Op::JoinedRun`]) can
+    /// span a space between `before` and `after`: the run's join is the
+    /// space, `before` is in its letter or mark class and `after` in its
+    /// letter class. The thread pool's cut check starts its window at a
+    /// space no piece spans (`piece_starts_at`), which with such a run is
+    /// a space that is not that.
+    pub(super) fn spans_space_between(&self, before: char, after: Option<char>) -> bool {
+        self.program.iter().any(|op| match *op {
+            Op::JoinedRun { join, letter, mark } => {
+                self.classes[join].contains(' ')
+                    && (self.classes[letter].contains(before)
+                        || self.classes[mark].contains(before))
+                    && after.is_some_and(|after| self.classes[letter].contains(after))
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether the pattern holds a letter run joined by spaces (an
+    /// [`Op::JoinedRun`] whose join class holds the space): the thread
+    /// pool's cut check then chooses its window's start with care
+    /// (`NativeEncoder::window_start`).
+    pub(super) fn joins_with_space(&self) -> bool {
+        self.program
+            .iter()
+            .any(|op| matches!(*op, Op::JoinedRun { join, .. } if self.classes[join].contains(' ')))
+    }
+
+    /// Whether some alternative of the pattern can read a space right after
+    /// `before` inside one match, the join of a letter run aside
+    /// ([`Self::spans_space_between`] reads that one): `before` is in a
+    /// class of an alternative that reads a space anywhere but at its first
+    /// position (every class of such an alternative, which is more than the
+    /// characters a space can follow in it, never fewer). The thread pool's
+    /// cut check starts its window at no such space
+    /// (`NativeEncoder::window_start`).
+    pub(super) fn reads_space_after(&self, before: char) -> bool {
+        self.before_space
+            .iter()
+            .any(|&class| self.classes[class].contains(before))
+    }
+
+    /// Whether some alternative of the pattern can read a space right after
+    /// a character outside whitespace inside one match: a letter run joined
+    /// by spaces ([`Self::joins_with_space`]), or an alternative that reads
+    /// a space anywhere but at its first position through a class that
+    /// holds such a character ([`Self::reads_space_after`]; the whitespace
+    /// runs of the common byte-level shape read one after whitespace
+    /// alone). Under such a pattern a piece of the whole text holds a space
+    /// inside it, so the thread pool's cut check chooses its window's start
+    /// with care (`NativeEncoder::window_start`).
+    pub(super) fn reads_space_inside(&self) -> bool {
+        self.joins_with_space()
+            || self
+                .before_space
+                .iter()
+                .any(|&class| !self.classes[class].whitespace_only())
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
@@ -1186,6 +1320,34 @@ impl Pattern {
                         pos = p;
                         pc += 1;
                         false
+                    }
+                }
+                Op::JoinedRun { join, letter, mark } => {
+                    let letter = &self.classes[letter];
+                    let mark = &self.classes[mark];
+                    let join = &self.classes[join];
+                    match next_char(text, pos) {
+                        Some((c, len)) if letter.contains(c) => {
+                            let mut p = pos + len;
+                            loop {
+                                match next_char(text, p) {
+                                    Some((c, len)) if mark.contains(c) || letter.contains(c) => {
+                                        p += len;
+                                    }
+                                    Some((c, len)) if join.contains(c) => {
+                                        match next_char(text, p + len) {
+                                            Some((d, n)) if letter.contains(d) => p += len + n,
+                                            _ => break,
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            pos = p;
+                            pc += 1;
+                            false
+                        }
+                        _ => true,
                     }
                 }
                 Op::Split { next, first } => {
@@ -1766,6 +1928,14 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             second: *second,
             min: *min,
         }),
+        Node::JoinedRun { join, letter, mark } => program.push(Op::JoinedRun {
+            join: *join,
+            letter: *letter,
+            mark: *mark,
+        }),
+        // A loose tail declines at parse (`joined_tail_loose`); a folded one
+        // is part of its run.
+        Node::JoinedTail { .. } => {}
     }
 }
 
@@ -1782,6 +1952,8 @@ fn choices(node: &Node) -> usize {
         | Node::GroupsAhead { .. }
         | Node::NotAheadSeq { .. }
         | Node::UnitRun { .. }
+        | Node::JoinedTail { .. }
+        | Node::JoinedRun { .. }
         | Node::RunOfOne { .. } => 0,
         Node::ClassRepeat { possessive, .. } => usize::from(!*possessive),
         Node::Repeat { node, max, .. } => {
@@ -1903,9 +2075,136 @@ fn can_match_empty(node: &Node) -> bool {
         | Node::TextEnd
         | Node::SearchStart
         | Node::NotAheadSeq { .. }
+        | Node::JoinedTail { .. }
         | Node::GroupsAhead { .. } => true,
         Node::UnitRun { min, .. } => *min == 0,
         Node::RunOfOne { .. } => false,
+        Node::JoinedRun { .. } => false,
+    }
+}
+
+/// The classes of every alternative of `node` that can read a space anywhere
+/// but at the first position of its match, the join of a letter run aside
+/// (sorted, each once): a space inside a match of such an alternative
+/// follows a character of one of them, so the thread pool's cut check, which
+/// starts its window where the whole text's match loop begins a piece,
+/// starts at no space after such a character
+/// ([`Pattern::reads_space_after`]).
+fn classes_before_space(node: &Node, classes: &[Class]) -> Vec<usize> {
+    let alternatives = match node {
+        Node::Alt { alternatives, .. } => alternatives.as_slice(),
+        node => std::slice::from_ref(node),
+    };
+    let mut out = Vec::new();
+    for alternative in alternatives {
+        if reads_space_beyond_start(alternative, classes, true) {
+            classes_of(alternative, &mut out);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Whether a match of `node` can read a space anywhere but at its first
+/// position, the join of a letter run aside (its letter and mark classes
+/// hold no space); `at_start` says the node stands where the match begins,
+/// so a space it reads first is the match's first character; it holds on
+/// across nodes that consume nothing only (a node that may match empty but
+/// may also consume moves the start).
+fn reads_space_beyond_start(node: &Node, classes: &[Class], at_start: bool) -> bool {
+    let space = |class: &usize| classes[*class].contains(' ');
+    match node {
+        Node::Class(class) => !at_start && space(class),
+        Node::ClassRepeat { class, max, .. } => space(class) && (!at_start || *max > 1),
+        Node::Repeat { node, max, .. } => {
+            reads_space_beyond_start(node, classes, at_start)
+                || (*max > 1 && reads_space_beyond_start(node, classes, false))
+        }
+        Node::Concat(nodes) => {
+            let mut at_start = at_start;
+            nodes.iter().any(|node| {
+                let reads = reads_space_beyond_start(node, classes, at_start);
+                at_start = at_start
+                    && matches!(
+                        node,
+                        Node::NotAhead(_)
+                            | Node::NotAheadSeq { .. }
+                            | Node::End
+                            | Node::Start
+                            | Node::TextEnd
+                            | Node::SearchStart
+                            | Node::GroupsAhead { .. }
+                    );
+                reads
+            })
+        }
+        Node::Alt { alternatives, .. } => alternatives
+            .iter()
+            .any(|node| reads_space_beyond_start(node, classes, at_start)),
+        Node::NotAhead(_)
+        | Node::NotAheadSeq { .. }
+        | Node::End
+        | Node::Start
+        | Node::TextEnd
+        | Node::SearchStart
+        | Node::GroupsAhead { .. } => false,
+        Node::UnitRun { first, second, .. } => space(first) || space(second),
+        Node::JoinedTail { .. } | Node::JoinedRun { .. } => false,
+        Node::RunOfOne { class, .. } => space(class),
+    }
+}
+
+/// Every class a match of `node` reads a character from, appended to `out`.
+fn classes_of(node: &Node, out: &mut Vec<usize>) {
+    match node {
+        Node::Class(class) | Node::ClassRepeat { class, .. } | Node::RunOfOne { class, .. } => {
+            out.push(*class);
+        }
+        Node::Repeat { node, .. } => classes_of(node, out),
+        Node::Concat(nodes)
+        | Node::Alt {
+            alternatives: nodes,
+            ..
+        } => {
+            nodes.iter().for_each(|node| classes_of(node, out));
+        }
+        Node::NotAhead(_)
+        | Node::NotAheadSeq { .. }
+        | Node::End
+        | Node::Start
+        | Node::TextEnd
+        | Node::SearchStart
+        | Node::GroupsAhead { .. } => {}
+        Node::UnitRun { first, second, .. } => out.extend([*first, *second]),
+        Node::JoinedTail { join, letter, mark } | Node::JoinedRun { join, letter, mark } => {
+            out.extend([*join, *letter, *mark]);
+        }
+    }
+}
+
+/// Whether a [`Node::JoinedTail`] stands anywhere under `node` other than
+/// inside the run it belongs to (`quantified` folds that one into a
+/// [`Node::JoinedRun`]): the tail alone is a repeated group the engine runs
+/// with its choice stack, so such a pattern declines.
+fn joined_tail_loose(node: &Node) -> bool {
+    match node {
+        Node::JoinedTail { .. } => true,
+        Node::Class(_)
+        | Node::ClassRepeat { .. }
+        | Node::NotAhead(_)
+        | Node::NotAheadSeq { .. }
+        | Node::UnitRun { .. }
+        | Node::JoinedRun { .. }
+        | Node::End
+        | Node::Start
+        | Node::TextEnd
+        | Node::SearchStart
+        | Node::GroupsAhead { .. }
+        | Node::RunOfOne { .. } => false,
+        Node::Repeat { node, .. } => joined_tail_loose(node),
+        Node::Concat(nodes) => nodes.iter().any(joined_tail_loose),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(joined_tail_loose),
     }
 }
 
@@ -1943,6 +2242,8 @@ fn groups_ahead_leads(node: &Node, leading: bool) -> bool {
         | Node::GroupsAhead { .. }
         | Node::NotAheadSeq { .. }
         | Node::UnitRun { .. }
+        | Node::JoinedTail { .. }
+        | Node::JoinedRun { .. }
         | Node::RunOfOne { .. } => false,
     }
 }
@@ -1964,6 +2265,8 @@ fn holds(node: &Node, is: &dyn Fn(&Node) -> bool) -> bool {
             | Node::GroupsAhead { .. }
             | Node::NotAheadSeq { .. }
             | Node::UnitRun { .. }
+            | Node::JoinedTail { .. }
+            | Node::JoinedRun { .. }
             | Node::RunOfOne { .. } => false,
         }
 }
@@ -2031,7 +2334,9 @@ fn misplaced_run(node: &Node, last: bool) -> bool {
         | Node::SearchStart
         | Node::NotAheadSeq { .. }
         | Node::UnitRun { .. }
-        | Node::GroupsAhead { .. } => false,
+        | Node::GroupsAhead { .. }
+        | Node::JoinedTail { .. }
+        | Node::JoinedRun { .. } => false,
     }
 }
 
@@ -2074,6 +2379,7 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
             }
             Follow::Lookahead(_) | Follow::Other => true,
         },
+        Node::JoinedRun { .. } => !matches!(follow, Follow::Nothing),
         Node::Concat(nodes) => nodes.iter().enumerate().any(|(i, node)| {
             // The run before a sequence lookahead answers for it.
             if matches!(node, Node::NotAheadSeq { .. })
@@ -2104,7 +2410,8 @@ fn unit_run_misplaced(node: &Node, classes: &[Class], follow: Follow<'_>) -> boo
         | Node::TextEnd
         | Node::SearchStart
         | Node::RunOfOne { .. }
-        | Node::GroupsAhead { .. } => false,
+        | Node::GroupsAhead { .. }
+        | Node::JoinedTail { .. } => false,
     }
 }
 
@@ -2167,6 +2474,11 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
             ..classes[*first].first().or(classes[*second].first())
         },
         Node::RunOfOne { class, .. } => classes[*class].first(),
+        Node::JoinedTail { join, .. } => First {
+            nullable: true,
+            ..classes[*join].first()
+        },
+        Node::JoinedRun { letter, .. } => classes[*letter].first(),
     }
 }
 
@@ -2336,6 +2648,8 @@ impl Parser<'_> {
             | Node::GroupsAhead { .. }
             | Node::NotAheadSeq { .. }
             | Node::UnitRun { .. }
+            | Node::JoinedTail { .. }
+            | Node::JoinedRun { .. }
             | Node::RunOfOne { .. } => return None,
             // A possessive group would need the engine's rule for the choices
             // inside it (an atomic group): declined.
@@ -2343,10 +2657,24 @@ impl Parser<'_> {
             // `(?:X?Y)+` (`{n,}` too): a run of units taken whole, accepted at
             // the end of its alternative or before the lookahead over its own
             // unit (see `unit_run_misplaced`).
-            Node::Concat(ref nodes) if min >= 1 && max == u32::MAX => match Self::unit_of(nodes) {
-                Some((first, second)) => Node::UnitRun { first, second, min },
-                None => return None,
-            },
+            Node::Concat(ref nodes) if min >= 1 && max == u32::MAX => {
+                match (Self::unit_of(nodes), self.joined_run_of(nodes)) {
+                    (Some((first, second)), _) => Node::UnitRun { first, second, min },
+                    // `(?:YZ*(?:XYZ*)*)+`: the joined letter run, under `+` alone.
+                    (None, Some((join, letter, mark))) if min == 1 => {
+                        Node::JoinedRun { join, letter, mark }
+                    }
+                    _ => return None,
+                }
+            }
+            // `(?:XYZ*)*`: the tail of a joined letter run, folded into the
+            // run by the group around it or declined (`joined_tail_loose`).
+            Node::Concat(ref nodes) if min == 0 && max == u32::MAX => {
+                match Self::joined_tail_of(nodes) {
+                    Some((join, letter, mark)) => Node::JoinedTail { join, letter, mark },
+                    None => return None,
+                }
+            }
             // A group that repeats would need the engine's rule for an empty
             // iteration and an unbounded choice stack: only the optional form
             // is accepted, longer runs stay with `tokenizers`.
@@ -2689,6 +3017,60 @@ impl Parser<'_> {
         }
     }
 
+    /// The classes of a joined run's tail `XYZ*` (a class, a class, a run of
+    /// a class), when `nodes` are exactly that.
+    fn joined_tail_of(nodes: &[Node]) -> Option<(usize, usize, usize)> {
+        match nodes {
+            [Node::Class(join), Node::Class(letter), Node::ClassRepeat {
+                class: mark,
+                min: 0,
+                max: u32::MAX,
+                possessive: false,
+            }] => Some((*join, *letter, *mark)),
+            _ => None,
+        }
+    }
+
+    /// The classes of a joined letter run `YZ*(?:XYZ*)*`, when `nodes` are
+    /// exactly that (a class, a run of a second, the tail over the same two
+    /// classes and a join) and the join is one code point in neither class,
+    /// which keeps the engine's greedy path through the run the longest run
+    /// ([`Node::JoinedRun`]); the classes may share characters but neither
+    /// holds the space: the thread pool cuts at spaces and checks a cut with
+    /// the stages run from a space before it, and with the space in neither
+    /// class a space is inside a run only as its join, after a letter or a
+    /// mark and before a letter, which the check's window start avoids
+    /// ([`Pattern::spans_space_between`]); a space in a class could be a
+    /// run's mark or letter anywhere, and no start would be safe.
+    fn joined_run_of(&self, nodes: &[Node]) -> Option<(usize, usize, usize)> {
+        let [Node::Class(letter), Node::ClassRepeat {
+            class: mark,
+            min: 0,
+            max: u32::MAX,
+            possessive: false,
+        }, Node::JoinedTail {
+            join,
+            letter: tail_letter,
+            mark: tail_mark,
+        }] = nodes
+        else {
+            return None;
+        };
+        let (letter, mark, join) = (*letter, *mark, *join);
+        let (letters, marks, joins) = (
+            &self.classes[letter],
+            &self.classes[mark],
+            &self.classes[join],
+        );
+        let same = self.classes[*tail_letter].same_set(letters)
+            && self.classes[*tail_mark].same_set(marks);
+        let joined_by_one = joins
+            .single_code_point()
+            .is_some_and(|c| !letters.contains(c) && !marks.contains(c));
+        let no_space = !letters.contains(' ') && !marks.contains(' ');
+        (same && joined_by_one && no_space).then_some((join, letter, mark))
+    }
+
     /// A group whose alternatives are each one character of a class
     /// (`(?:\p{L}|\p{M}|\u200C|\u200D)`) is the class of their union: the
     /// engine matches one character of whichever alternative, as it matches
@@ -2974,7 +3356,17 @@ mod tests {
     /// lookahead holding at the run's end as the engine finds it.
     const LINE_BREAK_RUNS: &str = r"(?:\r?\n)+(?!\r?\n)";
 
-    const PATTERNS: [&str; 26] = [
+    /// Three files' split pattern: a letter run with its marks, words joined
+    /// by single spaces, as one piece (`(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+`).
+    const JOINED_LETTER_RUNS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
+
+    /// Joined runs over classes that share characters, for the sweeps:
+    /// letters with upper-case letters as the marks, numbers with Han
+    /// characters as the marks (the Han numerals are in both).
+    const OVERLAPPING_JOINED_RUNS: &str =
+        r"(?:\p{L}\p{Lu}*(?: \p{L}\p{Lu}*)*)+|(?:\p{N}\p{Han}*(?:-\p{N}\p{Han}*)*)+|\s+";
+
+    const PATTERNS: [&str; 28] = [
         GPT2,
         QWEN2,
         QWEN35,
@@ -3001,6 +3393,8 @@ mod tests {
         DIGIT_GROUPS_FROM_THE_START,
         LINE_BREAK_RUNS,
         NUMBER_GROUPS,
+        JOINED_LETTER_RUNS,
+        OVERLAPPING_JOINED_RUNS,
     ];
 
     /// `\s+$` as deepseek-prover-v2-7b's fourth stage spells it: a whitespace
@@ -3257,6 +3651,84 @@ mod tests {
         }
     }
 
+    /// The classes some alternative reads a space after inside one match
+    /// ([`Pattern::reads_space_after`]): under the family's pattern the
+    /// whitespace of its runs and nothing else; the digits under `\p{N}+ ?`,
+    /// the punctuation under `[^\s\p{L}\p{N}]+ ?`, a literal prefix and the
+    /// run's own classes under a pattern that reads them before a space;
+    /// nothing under a pattern whose spaces are all at an alternative's
+    /// start or the join.
+    #[test]
+    fn the_classes_read_before_a_space_inside_a_match() {
+        const JOINED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
+        const DIGIT_SPACE: &str = r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}+ ?| ?\p{L}+|\s+";
+        const PUNCT_SPACE: &str =
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|[^\s\p{L}\p{N}]+ ?| ?\p{L}+|\s+";
+        const PREFIX: &str = r"x (?:ab*(?: ab*)*)+| a[ a]{998}| (?:ab*(?: ab*)*)+";
+        const START_ONLY: &str = r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| \p{L}";
+        const DIGIT_OPT_SPACE: &str = r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+| ?\p{L}+|\p{N}? |\s+";
+        const PREFIX_OPT: &str = r" [ ac]{999}|x? a+|(?:ab*(?: ab*)*)+";
+        for (pattern, before, reads) in [
+            (JOINED, ' ', true),
+            (JOINED, '\t', true),
+            (JOINED, 'a', false),
+            (JOINED, '1', false),
+            (JOINED, ',', false),
+            (DIGIT_SPACE, '1', true),
+            (DIGIT_SPACE, ' ', true),
+            (DIGIT_SPACE, 'a', false),
+            (DIGIT_SPACE, ',', false),
+            (PUNCT_SPACE, ',', true),
+            (PUNCT_SPACE, '1', false),
+            (PUNCT_SPACE, 'a', false),
+            (PREFIX, 'x', true),
+            (PREFIX, 'a', true),
+            (PREFIX, 'z', false),
+            (START_ONLY, ' ', false),
+            (START_ONLY, 'a', false),
+            (DIGIT_OPT_SPACE, '1', true),
+            (DIGIT_OPT_SPACE, 'a', false),
+            (PREFIX_OPT, 'x', true),
+            (PREFIX_OPT, 'c', true),
+            (PREFIX_OPT, 'z', false),
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert_eq!(
+                parsed.reads_space_after(before),
+                reads,
+                "{pattern} after {before:?}"
+            );
+        }
+    }
+
+    /// Whether a pattern can read a space after a non-whitespace character
+    /// inside one match ([`Pattern::reads_space_inside`]): the family's
+    /// joined run, a digit run before an optional space and a letter run
+    /// before one say so; the common byte-level shape (its spaces at an
+    /// alternative's start or in whitespace runs), whitespace runs before
+    /// line breaks and a pattern whose space starts its alternative do not.
+    #[test]
+    fn a_space_inside_a_match_is_read_at_parse() {
+        const JOINED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]?|\s*[\r\n]|\s+(?!\S)|\s+";
+        const DIGIT_SPACE: &str = r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+|\p{N}+ ?| ?\p{L}+|\s+";
+        const LETTER_SPACE: &str = r"\p{L}+ ?| ?\p{L}+|\s+";
+        const BYTE_LEVEL: &str =
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+        const BREAKS: &str = r"\s*[\r\n]|\s+(?!\S)|\s+| ?\p{L}+";
+        const LEAD_ONLY: &str = r"[a-z]+| [a-z]+|\s+";
+        for (pattern, reads) in [
+            (JOINED, true),
+            (DIGIT_SPACE, true),
+            (LETTER_SPACE, true),
+            (BYTE_LEVEL, false),
+            (BREAKS, false),
+            (LEAD_ONLY, false),
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert_eq!(parsed.reads_space_inside(), reads, "{pattern}");
+        }
+    }
+
     #[test]
     fn unsupported_syntax_is_rejected() {
         for pattern in [
@@ -3395,6 +3867,24 @@ mod tests {
             r"a(?!\r\n\n)",
             r"a(?!ab)",
             r"a(?!\r?\n)+",
+            // a joined letter run outside its one shape: something after it, a
+            // loose tail, not under `+` alone, a join that is a class or in a
+            // class, the tail over other classes, a class holding the space
+            // (the thread pool's cut check runs from a space)
+            r"(?:a[ x]*(?:-a[ x]*)*)+| [a-z]+",
+            r"(?:[ a][x]*(?:-[ a][x]*)*)+",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+x",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+(?!\S)",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)*",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*){2,}",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)++",
+            r"\p{L}\p{M}*(?: \p{L}\p{M}*)*",
+            r"(?: \p{L}\p{M}*)+",
+            r"(?: \p{L}\p{M}*)*x",
+            r"(?:\p{L}\p{M}*(?:\p{M}\p{L}\p{M}*)*)+",
+            r"(?:\p{L}\p{M}*(?:\p{L}\p{L}\p{M}*)*)+",
+            r"(?:\p{L}\p{M}*(?: \p{N}\p{M}*)*)+",
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{N}*)*)+",
             // a run of units with something after it that is not the lookahead
             // over its own unit (the engine may give a unit back to it)
             r"(?:\r?\n)+a",
@@ -3663,6 +4153,65 @@ mod tests {
                     oracle_matches(pattern, &text),
                     "{pattern} on {text:?}"
                 );
+            }
+        }
+    }
+
+    /// A joined letter run cut as the engine cuts it: words joined by single
+    /// spaces as one piece, two spaces or a mark after the space ending it,
+    /// marks after letters inside it, digits and punctuation outside it, the
+    /// run under the file's whole pattern and alone, and with a hyphen and
+    /// numbers for the join and the marks, and over classes that share
+    /// characters (one inside the other either way round, meeting in part,
+    /// the same class twice, a range class and a negated one).
+    #[test]
+    fn a_joined_letter_run_is_cut_as_the_engine_cuts_it() {
+        for pattern in [
+            JOINED_LETTER_RUNS,
+            r"(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+",
+            r"(?:\p{L}\p{N}*(?:-\p{L}\p{N}*)*)+",
+            r"(?:\p{L}\p{Lu}*(?: \p{L}\p{Lu}*)*)+",
+            r"(?:\p{Lu}\p{L}*(?: \p{Lu}\p{L}*)*)+",
+            r"(?:\p{N}\p{Han}*(?: \p{N}\p{Han}*)*)+",
+            r"(?:\p{L}\p{L}*(?: \p{L}\p{L}*)*)+",
+            r"(?:[a-z]\p{M}*(?: [a-z]\p{M}*)*)+",
+            r"(?:[^\s\p{N}][0-9]*(?: [^\s\p{N}][0-9]*)*)+",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(
+                parsed
+                    .program
+                    .iter()
+                    .any(|op| matches!(op, Op::JoinedRun { .. })),
+                "{pattern}"
+            );
+            for text in [
+                "hello world",
+                "hello  world",
+                "h\u{e9}llo w\u{f6}rld",
+                "a b c d e",
+                "a b  c",
+                "ab\u{301} c\u{301}d",
+                "a \u{301}b",
+                "\u{301}a b",
+                "x1 y2 z",
+                "abc def!",
+                " lead and trail ",
+                "a-b-c d",
+                "one two\nthree four",
+                "\u{f1}and\u{fa} \u{fc}ber \u{e7}\u{e0}",
+                "it's a dog's life",
+                "a1b 2c d3",
+                "Ab cD eF Gh",
+                "ABC def GHI jkl",
+                "\u{3007}\u{3021} \u{3007}x \u{3021}-\u{3007}",
+                "a1 b2 c3 4 d",
+                "Zo\u{eb} \u{3a9}mega \u{1c5}x",
+                "",
+                " ",
+            ] {
+                let ours: Vec<(usize, usize)> = parsed.find_iter(text).collect();
+                assert_eq!(ours, oracle_matches(pattern, text), "{pattern} on {text:?}");
             }
         }
     }
@@ -4484,7 +5033,7 @@ mod tests {
                     assert!(Pattern::parse(pattern).is_none(), "{pattern}");
                 }
                 let text = "\r\n".repeat(50_000) + &" x".repeat(50_000) + &"'s".repeat(5_000);
-                for pattern in [GPT2, QWEN35, CASED, LINE_BREAK_RUNS] {
+                for pattern in [GPT2, QWEN35, CASED, LINE_BREAK_RUNS, JOINED_LETTER_RUNS] {
                     let parsed = Pattern::parse(pattern).expect("parses");
                     let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
                     assert_eq!(ours, oracle_matches(pattern, &text), "{pattern}");
