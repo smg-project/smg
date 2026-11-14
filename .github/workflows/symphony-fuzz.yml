@@ -34,6 +34,9 @@ jobs:
   campaign:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # No Rust cache step: this one run a day would be its entry's only reader, and the entry would
+    # take room in the repository's cache budget from the entries every pull request reads. The
+    # builds it would spare take about two minutes of the job.
     steps:
       - uses: actions/checkout@v7
       # The seeds are the recorded outputs of bellwether's hand-written sets for the tables'
@@ -60,10 +63,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: symphony-fuzz
-          workspaces: crates/symphony/fuzz
       # The crate is a workspace of its own, outside the repository's fmt, clippy and rustdoc
       # jobs. Its seed tests read the tree; without the variable they would skip.
       - name: Format, lint, document and test the fuzz crate

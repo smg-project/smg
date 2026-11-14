@@ -1,6 +1,10 @@
 use image::codecs::jpeg::JpegEncoder;
 
 use super::super::*;
+use crate::{
+    jpeg_turbo::{turbojpeg_available, turbojpeg_reads_warnings},
+    test_support::warned_decode_or_skip,
+};
 
 /// A 16x8 JPEG with a left-to-right ramp, written by the `image` crate's
 /// encoder, which ends it with the end-of-image marker.
@@ -83,7 +87,7 @@ fn a_single_scan_file_ending_in_a_comment_is_served_as_the_reference_serves_it()
     for tail in tails {
         let file = [cut, tail].concat();
         let decoded = decode_image_bytes(&file, None, TransparencyPolicy::KeepAlpha);
-        if crate::jpeg_turbo::turbojpeg_reads_warnings() {
+        if turbojpeg_reads_warnings() {
             let served = decoded.expect("served with the library").to_rgb8();
             assert!(
                 served.as_raw() == clean.as_raw(),
@@ -197,7 +201,7 @@ fn segments_libjpeg_parses_behind_a_single_scan_are_refused_as_the_reference_ref
             "{error}"
         );
     }
-    if !crate::test_support::warned_decode_or_skip("the served short-length tails") {
+    if !warned_decode_or_skip("the served short-length tails") {
         return;
     }
     let clean = decode_image_bytes(&jpeg, None, TransparencyPolicy::KeepAlpha)
@@ -277,7 +281,7 @@ fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_fallback_decod
     }
     let complete = [&jpeg[..jpeg.len() - 2], own_table, marker].concat();
     let decoded = decode_image_bytes(&complete, None, TransparencyPolicy::KeepAlpha);
-    if crate::jpeg_turbo::turbojpeg_available() {
+    if turbojpeg_available() {
         let clean = decode_image_bytes(&jpeg, None, TransparencyPolicy::KeepAlpha)
             .expect("decode")
             .to_rgb8();

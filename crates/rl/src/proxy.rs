@@ -392,7 +392,8 @@ mod tests {
     use crate::{
         calls::{CallFailure, RankReply},
         config::RlConfig,
-        testing::{worker, zmq_worker, FakeCalls, FakeEngine, FakeView},
+        router,
+        testing::{test_client, worker, zmq_worker, FakeCalls, FakeEngine, FakeView},
     };
 
     fn state(workers: Vec<RlWorkerInfo>, timeout_secs: u64) -> Arc<RlState> {
@@ -413,7 +414,7 @@ mod tests {
         let engine = FakeEngine::start(StatusCode::OK, json!({"success": true}), 0).await;
         let mut w = worker("w1", &engine.url, RuntimeType::Vllm);
         w.api_key = Some("engine-secret".to_string());
-        let app = crate::router::<()>(state(vec![w], 5));
+        let app = router::<()>(state(vec![w], 5));
 
         let req = Request::post("/workers/w1/engine/pause?mode=keep&selector=engine%3Dvllm")
             .header("content-type", "application/json")
@@ -444,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn defaults_content_type_when_body_has_no_header() {
         let engine = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang)],
             5,
         ));
@@ -472,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn get_is_forwarded_and_text_bodies_are_wrapped() {
         let engine = FakeEngine::start(StatusCode::OK, json!("plain"), 0).await;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang)],
             5,
         ));
@@ -497,7 +498,7 @@ mod tests {
             0,
         )
         .await;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang)],
             5,
         ));
@@ -521,7 +522,7 @@ mod tests {
         let mut grpc = worker("g1", &engine.url, RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
         grpc.control_url = None;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang), grpc],
             5,
         ));
@@ -583,7 +584,7 @@ mod tests {
         w.connection_mode = ConnectionMode::Grpc;
         w.control_url = Some(control_app.url.clone());
         w.api_key = Some("ts-secret".to_string());
-        let app = crate::router::<()>(state(vec![w], 5));
+        let app = router::<()>(state(vec![w], 5));
 
         let resp = app
             .oneshot(
@@ -608,7 +609,7 @@ mod tests {
         w.connection_mode = ConnectionMode::Grpc;
         w.control_url = Some("http://ctl:1".to_string());
         w.control_client = Err("bad CA bundle".to_string());
-        let app = crate::router::<()>(state(vec![w], 5));
+        let app = router::<()>(state(vec![w], 5));
         let r = app
             .oneshot(
                 Request::post("/workers/g2/engine/pause")
@@ -630,8 +631,8 @@ mod tests {
     async fn control_timeout_is_applied_per_request_on_the_worker_client() {
         let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
         let mut w = worker("slow", &slow_engine.url, RuntimeType::Sglang);
-        w.control_client = Ok(crate::testing::test_client());
-        let app = crate::router::<()>(state(vec![w], 1));
+        w.control_client = Ok(test_client());
+        let app = router::<()>(state(vec![w], 1));
 
         let r = app
             .oneshot(
@@ -655,7 +656,7 @@ mod tests {
         let dead = worker("d1", "http://127.0.0.1:9", RuntimeType::Sglang);
         let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
         let slow = worker("s1", &slow_engine.url, RuntimeType::Sglang);
-        let app = crate::router::<()>(state(vec![dead, slow], 1));
+        let app = router::<()>(state(vec![dead, slow], 1));
 
         let r = app
             .clone()
@@ -697,7 +698,7 @@ mod tests {
             0,
         )
         .await;
-        let app = crate::router::<()>(state(
+        let app = router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang)],
             5,
         ));
@@ -722,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_without_a_control_app_is_driven_over_its_engine_connection() {
         let calls = FakeCalls::succeeding(2);
-        let app = crate::router::<()>(state(vec![zmq_worker("z1", calls.clone())], 7));
+        let app = router::<()>(state(vec![zmq_worker("z1", calls.clone())], 7));
         let resp = app
             .oneshot(
                 Request::post("/workers/z1/engine/update_weights_from_disk")
@@ -751,7 +752,7 @@ mod tests {
             success: false,
             message: "a pause is already in progress".to_string(),
         }]));
-        let app = crate::router::<()>(state(vec![zmq_worker("z2", refused.clone())], 7));
+        let app = router::<()>(state(vec![zmq_worker("z2", refused.clone())], 7));
         let resp = app
             .oneshot(
                 Request::post("/workers/z2/engine/pause_generation")
@@ -767,7 +768,7 @@ mod tests {
 
         // `{}`, which callers send to bodyless routes, is no argument either.
         let flushed = FakeCalls::succeeding(1);
-        let app = crate::router::<()>(state(vec![zmq_worker("z4", flushed.clone())], 7));
+        let app = router::<()>(state(vec![zmq_worker("z4", flushed.clone())], 7));
         let resp = app
             .oneshot(
                 Request::post("/workers/z4/engine/flush_cache")
@@ -790,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn what_the_engine_connection_cannot_carry_is_refused() {
         let calls = FakeCalls::succeeding(1);
-        let app = crate::router::<()>(state(vec![zmq_worker("z1", calls.clone())], 5));
+        let app = router::<()>(state(vec![zmq_worker("z1", calls.clone())], 5));
         for (request, status, code) in [
             (
                 Request::get("/workers/z1/engine/get_weight_version")
@@ -833,7 +834,7 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
         ] {
-            let app = crate::router::<()>(state(
+            let app = router::<()>(state(
                 vec![zmq_worker("z3", FakeCalls::answering(Err(failure)))],
                 5,
             ));
@@ -856,7 +857,7 @@ mod tests {
         let calls = FakeCalls::succeeding(1);
         let mut w = zmq_worker("z1", calls.clone());
         w.control_url = Some(control_app.url.clone());
-        let app = crate::router::<()>(state(vec![w], 5));
+        let app = router::<()>(state(vec![w], 5));
         let resp = app
             .oneshot(
                 Request::post("/workers/z1/engine/continue_generation")
