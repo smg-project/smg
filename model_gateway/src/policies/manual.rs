@@ -175,10 +175,13 @@ impl ManualPolicy {
     }
 
     /// A key the map did not hold was inserted: the count and the size gauge
-    /// move here, not on the selection path.
+    /// move here, not on the selection path. The gauge moves by one rather
+    /// than to the count read back: two inserts racing would publish their
+    /// counts in either order, and nothing rewrites the gauge until the next
+    /// change.
     fn note_new_entry(&self) {
-        let entries = self.entries.fetch_add(1, Ordering::Relaxed) + 1;
-        Metrics::set_manual_policy_cache_entries(entries);
+        self.entries.fetch_add(1, Ordering::Relaxed);
+        Metrics::manual_policy_cache_entry_added();
     }
 
     /// The entry count as kept: what the size gauge shows.
@@ -380,7 +383,7 @@ fn evict_idle(
         let remaining = entries
             .fetch_sub(evicted, Ordering::Relaxed)
             .saturating_sub(evicted);
-        Metrics::set_manual_policy_cache_entries(remaining);
+        Metrics::manual_policy_cache_entries_evicted(evicted);
         info!(
             "ManualPolicy TTL eviction: evicted {} entries, remaining {} (max_idle: {}s)",
             evicted,
@@ -924,40 +927,68 @@ mod tests {
 
     #[test]
     fn the_idle_eviction_takes_the_count_and_the_gauge_down_by_what_it_removed() {
-        let policy = ManualPolicy::new();
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        for key in ["conv-1", "conv-2", "conv-3"] {
-            let headers = headers_with_routing_key(key);
-            policy.select_worker(&workers, &with_headers(&headers));
-        }
-        policy.pin_front("conv-1", "http://w2:8000");
-        assert_eq!(
-            policy.entry_count(),
-            3,
-            "a pin of a held key counts nothing"
-        );
-        policy.pin_front("conv-4", "http://w2:8000");
-        assert_eq!(policy.entry_count(), 4, "a pin of a new key counts it");
-
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        let evicted = ::metrics::with_local_recorder(&recorder, || {
-            evict_idle(
+        ::metrics::with_local_recorder(&recorder, || {
+            let policy = ManualPolicy::new();
+            let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+            for key in ["conv-1", "conv-2", "conv-3"] {
+                let headers = headers_with_routing_key(key);
+                policy.select_worker(&workers, &with_headers(&headers));
+            }
+            policy.pin_front("conv-1", "http://w2:8000");
+            assert_eq!(
+                policy.entry_count(),
+                3,
+                "a pin of a held key counts nothing"
+            );
+            policy.pin_front("conv-4", "http://w2:8000");
+            assert_eq!(policy.entry_count(), 4, "a pin of a new key counts it");
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 4"),
+                "every new key moved the gauge up by one"
+            );
+
+            // Two entries used an hour later: a pass at that instant with a
+            // minute's bound removes the other two, not everything (a reset
+            // to zero would read the same as a full pass).
+            let later = Instant::now() + Duration::from_secs(3600);
+            for key in ["conv-3", "conv-4"] {
+                policy
+                    .routing_map
+                    .get_mut(&RoutingId(key.to_string()))
+                    .expect("a kept key")
+                    .last_access = later;
+            }
+            let evicted = evict_idle(
                 &policy.routing_map,
                 &policy.entries,
-                Duration::ZERO,
-                Instant::now(),
-            )
+                Duration::from_secs(60),
+                later,
+            );
+            assert_eq!(evicted, 2);
+            assert_eq!(policy.entry_count(), 2);
+            assert_eq!(policy.routing_map.len(), 2);
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 2"),
+                "the pass moved the gauge down by what it removed"
+            );
+
+            let evicted = evict_idle(&policy.routing_map, &policy.entries, Duration::ZERO, later);
+            assert_eq!(evicted, 2);
+            assert_eq!(policy.entry_count(), 0);
+            assert_eq!(policy.routing_map.len(), 0);
+            assert!(
+                handle
+                    .render()
+                    .contains("smg_manual_policy_cache_entries 0"),
+                "the last pass left the gauge at zero"
+            );
         });
-        assert_eq!(evicted, 4);
-        assert_eq!(policy.entry_count(), 0);
-        assert_eq!(policy.routing_map.len(), 0);
-        assert!(
-            handle
-                .render()
-                .contains("smg_manual_policy_cache_entries 0"),
-            "the eviction publishes the count it left"
-        );
     }
 
     #[test]

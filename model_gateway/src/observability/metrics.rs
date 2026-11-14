@@ -2981,9 +2981,16 @@ impl Metrics {
         );
     }
 
-    /// Set manual policy cache entries count
-    pub fn set_manual_policy_cache_entries(count: usize) {
-        gauge!("smg_manual_policy_cache_entries").set(count as f64);
+    /// A key the manual policy's map did not hold was inserted: the map's
+    /// size gauge moves up by one.
+    pub fn manual_policy_cache_entry_added() {
+        gauge!("smg_manual_policy_cache_entries").increment(1.0);
+    }
+
+    /// `count` entries left the manual policy's map in one eviction pass:
+    /// the map's size gauge moves down by that many.
+    pub fn manual_policy_cache_entries_evicted(count: usize) {
+        gauge!("smg_manual_policy_cache_entries").decrement(count as f64);
     }
 
     /// Record which source supplied the sticky routing key for a keyed request
