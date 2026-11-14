@@ -17,6 +17,7 @@ use super::{
     common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
     RadixTree,
 };
+use crate::snapshot::{SnapshotNode, TreeSnapshot};
 
 type NodeRef = Arc<Node>;
 
@@ -1821,13 +1822,13 @@ impl Tree {
     /// RwLock guards ensure individual reads are safe, but the snapshot
     /// may reflect a mix of pre-split and post-split state.  This is
     /// acceptable for mesh sync (eventual consistency).
-    pub fn snapshot(&self) -> crate::snapshot::TreeSnapshot {
+    pub fn snapshot(&self) -> TreeSnapshot {
         let mut nodes = Vec::new();
         Self::snapshot_node(&self.root, &mut nodes);
-        crate::snapshot::TreeSnapshot { nodes }
+        TreeSnapshot { nodes }
     }
 
-    fn snapshot_node(node: &Node, out: &mut Vec<crate::snapshot::SnapshotNode>) {
+    fn snapshot_node(node: &Node, out: &mut Vec<SnapshotNode>) {
         let text = node.text.read();
         let edge = text.as_str().to_string();
         drop(text);
@@ -1848,7 +1849,7 @@ impl Tree {
             .collect();
         children.sort_by_key(|(c, _)| *c);
 
-        out.push(crate::snapshot::SnapshotNode {
+        out.push(SnapshotNode {
             edge,
             tenants,
             child_count: children.len() as u32,
@@ -1983,7 +1984,7 @@ impl Tree {
     ///
     /// The snapshot must be in pre-order (parent before children) with
     /// `child_count` fields indicating tree structure.
-    pub fn from_snapshot(snapshot: &crate::snapshot::TreeSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: &TreeSnapshot) -> Self {
         let tree = Tree::new();
         if snapshot.nodes.is_empty() {
             return tree;
@@ -1994,12 +1995,7 @@ impl Tree {
         tree
     }
 
-    fn restore_node(
-        &self,
-        target: &NodeRef,
-        nodes: &[crate::snapshot::SnapshotNode],
-        idx: &mut usize,
-    ) {
+    fn restore_node(&self, target: &NodeRef, nodes: &[SnapshotNode], idx: &mut usize) {
         if *idx >= nodes.len() {
             return;
         }
@@ -2031,7 +2027,7 @@ impl Tree {
             let Some(first_char) = child_snap.edge.chars().next() else {
                 // Empty edge for a child node — skip it. Advance idx
                 // past this node and all its descendants.
-                fn skip(nodes: &[crate::snapshot::SnapshotNode], idx: &mut usize) {
+                fn skip(nodes: &[SnapshotNode], idx: &mut usize) {
                     if *idx >= nodes.len() {
                         return;
                     }
@@ -2066,7 +2062,7 @@ impl Tree {
     /// 1. Exact edge match → recurse into both subtrees
     /// 2. Local edge is prefix of remote → descend into local, continue with remainder
     /// 3. Shared prefix shorter than both → split local node, attach remote remainder
-    pub fn merge_snapshot(&self, snapshot: &crate::snapshot::TreeSnapshot) {
+    pub fn merge_snapshot(&self, snapshot: &TreeSnapshot) {
         if snapshot.nodes.is_empty() {
             return;
         }
