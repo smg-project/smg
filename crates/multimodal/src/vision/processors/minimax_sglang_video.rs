@@ -3,6 +3,7 @@
 use super::MiniMaxM3VisionProcessor;
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
+    minimax_resize::sglang_dimensions,
     types::RgbFrameRef,
     vision::{
         processor::{VideoClipOptions, VisionPreProcessor},
@@ -42,7 +43,7 @@ impl MiniMaxM3VisionProcessor {
             ));
         }
         let cap = clip.max_long_side_pixel.unwrap_or(cap as u32);
-        let (stage_w, stage_h) = crate::minimax_resize::sglang_dimensions(width, height, cap)
+        let (stage_w, stage_h) = sglang_dimensions(width, height, cap)
             .map_err(|error| TransformError::ShapeError(error.to_string()))?;
         let total_pixels = u64::from(stage_w) * u64::from(stage_h) * frames.len() as u64;
         if total_pixels > 301_056_000 {
@@ -97,6 +98,7 @@ mod tests {
     use super::*;
     use crate::{
         encoder_inputs::{EncoderInput, ModelSpecificValue},
+        minimax_resize::SGLANG_RESIZE_KEY,
         vision::{PreProcessorConfig, VisionPreProcessor},
     };
 
@@ -111,9 +113,7 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config
-            .extra
-            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
+        config.extra.insert(SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let frames: Vec<_> = golden["sampled_indices"]
             .as_array()
@@ -178,9 +178,7 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config
-            .extra
-            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
+        config.extra.insert(SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let output = processor
             .preprocess_video(
@@ -204,9 +202,7 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config
-            .extra
-            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
+        config.extra.insert(SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let output = processor
             .preprocess_video(

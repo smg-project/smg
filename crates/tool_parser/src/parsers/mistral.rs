@@ -7,7 +7,7 @@ use crate::{
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// Mistral format parser for tool calls
@@ -312,7 +312,7 @@ impl ToolParser for MistralParser {
         text.contains("[TOOL_CALLS]")
     }
 
-    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::types::ToolCallItem>> {
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 

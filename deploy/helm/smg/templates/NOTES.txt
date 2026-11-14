@@ -5,6 +5,13 @@ Router:
   Metrics:  http://{{ $fullname }}-router:{{ .Values.router.metrics.port }}/metrics
   Policy:   {{ .Values.router.policy }}
 
+{{- if (.Values.policyController).enabled }}
+
+Policy controller:
+  gRPC:     {{ $fullname }}-policy-controller:{{ .Values.policyController.ports.gateway }}
+  Metrics:  http://{{ $fullname }}-policy-controller:{{ .Values.policyController.ports.admin }}/metrics
+{{- end }}
+
 {{- if .Values.router.ingress.enabled }}
 
 Ingress:

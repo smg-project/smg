@@ -4,7 +4,10 @@
 //! the logging; the routing policy itself is the spec's and arrives over the
 //! control scope.
 
-use std::{future::pending, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    ffi::OsStr, future::pending, io::IsTerminal, net::SocketAddr, path::PathBuf, process::ExitCode,
+    time::Duration,
+};
 
 use clap::Parser;
 use smg_policy_controller::controller::{
@@ -237,16 +240,54 @@ impl Cli {
 
 /// `RUST_LOG` wins when set, as in the gateway and the servicer; otherwise
 /// the flag sets this binary's own crates and the dependencies stay at
-/// `warn`.
+/// `warn`. The text log is colored by the gateway's rule
+/// ([`color_for_stdout`]).
 fn init_logging(level: &str, json: bool) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("warn,smg_policy_controller={level}")));
-    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(color_for_stdout());
     if json {
         subscriber.json().init();
     } else {
         subscriber.init();
     }
+}
+
+/// Whether the text log is colored, by the gateway's rule and its three
+/// inputs: ANSI escapes go to a terminal, not into a pipe or a file (a
+/// redirected start, a container runtime collecting stdout), where they are
+/// bytes on every line that nothing renders and a consumer has to strip.
+/// `NO_COLOR` set to a non-empty value turns color off on a terminal too;
+/// `FORCE_COLOR` or `CLICOLOR_FORCE` set to a non-empty value other than `0`
+/// turns it on into a pipe too (the no-color.org and clicolors conventions,
+/// where `0` means "do not force"; an explicit ask wins).
+fn color_for_stdout() -> bool {
+    color_for(
+        std::io::stdout().is_terminal(),
+        set(std::env::var_os("NO_COLOR").as_deref()),
+        truthy(std::env::var_os("FORCE_COLOR").as_deref())
+            || truthy(std::env::var_os("CLICOLOR_FORCE").as_deref()),
+    )
+}
+
+/// The decision behind [`color_for_stdout`]: forced wins over refused, and
+/// refused over the terminal.
+fn color_for(terminal: bool, refused: bool, forced: bool) -> bool {
+    forced || (terminal && !refused)
+}
+
+/// Whether an environment variable's value counts as set: present and
+/// non-empty (an empty value counts as unset, as the conventions say).
+fn set(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+/// Whether an environment variable's value forces: present, non-empty and
+/// not `0`, the clicolors reading of a force variable.
+fn truthy(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// Resolves on SIGTERM (the orchestrator's stop) or SIGINT (a terminal's).
@@ -346,6 +387,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsStr,
         path::{Path, PathBuf},
         time::Duration,
     };
@@ -353,7 +395,7 @@ mod tests {
     use clap::Parser;
     use smg_policy_controller::controller::{Config, ConfigError, Scope};
 
-    use super::Cli;
+    use super::{color_for, set, truthy, Cli};
 
     fn parse(args: &[&str]) -> Cli {
         let mut argv = vec!["smg-policy-controller", "--controller-id", "controller-0"];
@@ -613,5 +655,36 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_terminal_is_colored_unless_refused_and_a_pipe_only_when_forced() {
+        // (terminal, refused, forced)
+        assert!(color_for(true, false, false));
+        assert!(!color_for(true, true, false));
+        assert!(color_for(true, true, true));
+        assert!(!color_for(false, false, false));
+        assert!(!color_for(false, true, false));
+        assert!(color_for(false, false, true));
+        assert!(color_for(false, true, true));
+    }
+
+    /// A force variable set to `0` does not force (clicolors); `NO_COLOR` set
+    /// to anything non-empty, `0` included, refuses (no-color.org); an empty
+    /// value is unset for both. The readers are pure: the process environment
+    /// is not touched.
+    #[test]
+    fn a_force_variable_set_to_zero_does_not_force_and_an_empty_one_is_unset() {
+        let zero = Some(OsStr::new("0"));
+        let empty = Some(OsStr::new(""));
+        let one = Some(OsStr::new("1"));
+        assert!(set(zero));
+        assert!(!truthy(zero));
+        assert!(!set(empty));
+        assert!(!truthy(empty));
+        assert!(set(one));
+        assert!(truthy(one));
+        assert!(!set(None));
+        assert!(!truthy(None));
     }
 }
