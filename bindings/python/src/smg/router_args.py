@@ -1575,12 +1575,6 @@ class RouterArgs:
 
         # PD/EPD-specific arguments
         pd_group.add_argument(
-            f"--{prefix}sglang-managed-epd",
-            type=str,
-            default=None,
-            help="Enable managed SGLang EPD using a deployment JSON file",
-        )
-        pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
