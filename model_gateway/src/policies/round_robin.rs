@@ -37,11 +37,13 @@ struct Rotation {
 /// happen to interleave, pinning each set to a subset of its workers.
 ///
 /// A set is identified by its healthy workers in the order the caller lists
-/// them; callers hand over a stable order (a pool snapshot, a pair index's
-/// partners), which the rotation relies on either way. A set seen for the
-/// first time starts from a shared, advancing position rather than its
-/// first worker, so a fleet whose shape keeps changing does not lean on
-/// index 0.
+/// them, each by its handle and never by its URL. Callers hand over a stable
+/// order and the same handles for the same workers (a pool snapshot, a pair
+/// index's partners), which the rotation relies on either way: a worker
+/// under a new handle is a new member, and the sets that hold it start
+/// again. A set seen for the first time starts from a shared, advancing
+/// position rather than its first worker, so a fleet whose shape keeps
+/// changing does not lean on index 0.
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
     counters: DashMap<u64, Rotation>,
@@ -66,15 +68,10 @@ impl RoundRobinPolicy {
     /// a freed address that a later worker takes over.
     fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
         let mut hasher = FxHasher::default();
-        Self::feed_set(workers, healthy, &mut hasher);
-        hasher.finish()
-    }
-
-    /// Feeds `hasher` what [`Self::set_key`] hashes.
-    fn feed_set(workers: &[Arc<dyn Worker>], healthy: &[usize], hasher: &mut impl Hasher) {
         for &i in healthy {
-            hasher.write_usize(Arc::as_ptr(&workers[i]).cast::<()>() as usize);
+            hasher.write_usize(Arc::as_ptr(&workers[i]).addr());
         }
+        hasher.finish()
     }
 
     /// This set's next position, creating its rotation on first sight.
@@ -332,35 +329,23 @@ mod tests {
         assert_ne!(key, RoundRobinPolicy::set_key(&replaced, &[0, 1, 2]));
     }
 
-    /// Counts what it is fed and hashes nothing.
-    #[derive(Default)]
-    struct Fed {
-        writes: usize,
-        bytes: usize,
-    }
-
-    impl Hasher for Fed {
-        fn write(&mut self, bytes: &[u8]) {
-            self.writes += 1;
-            self.bytes += bytes.len();
-        }
-
-        fn finish(&self) -> u64 {
-            0
-        }
-    }
-
     #[test]
-    fn a_set_is_hashed_as_one_word_a_healthy_worker() {
-        // Every selection pays the key: one word a healthy candidate,
-        // however long the workers' URLs are.
+    fn a_set_key_is_one_address_word_a_healthy_worker() {
+        // Every selection pays the key: the healthy handles' addresses in
+        // order, one word each through the Fx hasher, however long the
+        // workers' URLs are. Anything more written, or another hasher, is
+        // another key.
         let workers = make_regular_workers("a-worker-under-a-long-host-name-", 8);
         workers[3].set_status(WorkerStatus::NotReady);
         let healthy = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
         assert_eq!(healthy, [0, 1, 2, 4, 5, 6, 7]);
-        let mut fed = Fed::default();
-        RoundRobinPolicy::feed_set(&workers, &healthy, &mut fed);
-        assert_eq!(fed.writes, healthy.len());
-        assert_eq!(fed.bytes, healthy.len() * size_of::<usize>());
+        let mut words = FxHasher::default();
+        for &i in &healthy {
+            words.write_usize(Arc::as_ptr(&workers[i]).addr());
+        }
+        assert_eq!(
+            RoundRobinPolicy::set_key(&workers, &healthy),
+            words.finish()
+        );
     }
 }
