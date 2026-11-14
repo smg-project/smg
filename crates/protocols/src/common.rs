@@ -326,7 +326,7 @@ pub(crate) fn on_field(
 }
 
 /// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
-pub(crate) fn json_type_name(value: &Value) -> &'static str {
+pub fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",
@@ -2104,10 +2104,11 @@ pub enum Detail {
 
 /// Retention policy for prompt-cache entries on the Responses API.
 ///
-/// Spec: `prompt_cache_retention: "in-memory" | "24h"`.
+/// Spec: `prompt_cache_retention: "in_memory" | "24h"` (`PromptCacheRetentionEnum`).
+/// `in-memory`, the spelling this crate wrote before, still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PromptCacheRetention {
-    #[serde(rename = "in-memory")]
+    #[serde(rename = "in_memory", alias = "in-memory")]
     InMemory,
     #[serde(rename = "24h")]
     Duration24h,

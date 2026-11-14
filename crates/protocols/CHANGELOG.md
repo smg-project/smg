@@ -6,6 +6,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
+  map of its pairs), `responses::validate_metadata_pair_count` (its 16-pair bound alone, for a
+  count read on its own), `responses::validate_input_message_role` (an input message's role in
+  the public set) and `common::json_type_name` are public: a route that reads a metadata object or
+  stores message items of its own (the gateway's Conversations routes) validates them with the
+  rules the Responses request already validates with, in the same words and under the same codes.
 - `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
   a caller that owns a Messages request's tools converts them into chat tools without copying the
   schemas (the properties and the additional fields move in); the by-reference forms stay for a
@@ -48,6 +54,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A `metadata` value that is not a string is refused as `400 invalid_type`, naming the key and the
+  type sent (`Invalid type for 'metadata.k': expected a string, but got an object instead.`), as
+  the public API refuses one; before, a request's `metadata` passed validation with an object, a
+  number, a boolean or a null value under a key.
 - A rerank worker's answer is read as `RerankWorkerResponse { results, usage, id }`: its `usage`
   (a rerank server's `prompt_tokens` and `total_tokens`, read as the crate's `UsageInfo`, whose
   `completion_tokens` defaults; a usage in another spelling is left out, as before) and its `id`
@@ -136,10 +146,17 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `type` and a `name` and no `input_schema` as `ToolSearch`, which kept only those two keys,
   `allowed_callers` and `cache_control`, so the provider route dropped the rest. Breaking:
   `ToolSearchTool` gains `extra: Map<String, Value>`.
+- A reasoning output item without `content`, as the public API writes it (`id`, `summary` and
+  `encrypted_content`), parses, with no content. The crate refused the item, and any Response
+  carrying it, with ``missing field `content` ``. An item the gateway writes is unchanged.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
   read the same way; a usage the gateway writes is unchanged.
+- `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
+  (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
+  request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public
+  API does not list, in the requests and responses it serialized.
 - `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
   `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
   "input_image" in a function output for text-only backends: only text parts are carried as a tool
@@ -159,6 +176,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the ids without a word. The
   request's media read (`GenerateRequest::media_fields`, `carries_media`) is one definition here,
   read by the gRPC path's media refusal as well.
+- A built-in `range` or `length` rule that carries no message of its own answers a sentence in the
+  routes' form (`Invalid 'dimensions': integer below minimum value. Expected an integer >= 1, but got 0
+  instead.`) instead of the validation library's rendering of the rule's name and parameters
+  (`Validation error: range [{"min": Number(1), "value": Number(0)}]`); the code and param are
+  unchanged. Every such rule of the crate (`dimensions`, the sampling parameters, ...) answers this way.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
