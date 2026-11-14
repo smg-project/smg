@@ -423,7 +423,7 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
 // Content Parts (for multimodal messages)
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
@@ -440,10 +440,86 @@ pub enum ContentPart {
     /// replays it in the history; the renderers read it as the turn's text.
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
-    /// Pass through unknown content objects to HTTP backends.
-    /// Also matches malformed known types; gRPC backends reject this variant.
+    /// Pass through unknown content objects to HTTP backends; gRPC backends
+    /// reject this variant. A known `type` whose body does not fit it is no
+    /// unknown part: it refuses with serde's reason for the field.
     #[serde(untagged)]
     Unknown(Map<String, Value>),
+}
+
+/// The parts the gateway knows, read by their `type` as serde reads a tagged
+/// enum, so a malformed one carries serde's reason for the field.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum KnownContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+}
+
+impl KnownContentPart {
+    /// The `type` names a kind the gateway knows.
+    fn names(kind: &str) -> bool {
+        matches!(
+            kind,
+            "text" | "image_url" | "audio_url" | "input_audio" | "video_url" | "refusal"
+        )
+    }
+}
+
+impl From<KnownContentPart> for ContentPart {
+    fn from(part: KnownContentPart) -> Self {
+        match part {
+            KnownContentPart::Text { text } => Self::Text { text },
+            KnownContentPart::ImageUrl { image_url } => Self::ImageUrl { image_url },
+            KnownContentPart::AudioUrl { audio_url } => Self::AudioUrl { audio_url },
+            KnownContentPart::InputAudio { input_audio } => Self::InputAudio { input_audio },
+            KnownContentPart::VideoUrl { video_url } => Self::VideoUrl { video_url },
+            KnownContentPart::Refusal { refusal } => Self::Refusal { refusal },
+        }
+    }
+}
+
+/// A part is an object; one whose `type` the gateway knows must fit that
+/// kind (its refusal is serde's, naming the field's reason), any other is
+/// kept whole for the backends that read it.
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = Map::<String, Value>::deserialize(deserializer)?;
+        let kind = match fields.get("type").and_then(Value::as_str) {
+            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
+            _ => return Ok(Self::Unknown(fields)),
+        };
+        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
+            .map(Self::from)
+            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+    }
+}
+
+/// Serde's reason for a known part's refusal, opening with serde's words so
+/// a reader keeps its code: a field missing from the kind's body is named
+/// under the kind (`missing field `image_url.url``), any other reason names
+/// the body after itself (`..., in `image_url``), since serde's own path
+/// stops at the message a tagged enum buffers.
+fn known_part_reason(kind: &str, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    let missing = reason
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'));
+    match missing {
+        Some(field) if field != kind => format!("missing field `{kind}.{field}`"),
+        Some(_) => reason,
+        None => format!("{reason}, in `{kind}`"),
+    }
 }
 
 impl ContentPart {
@@ -2372,6 +2448,93 @@ mod tests {
                 },
             }
         );
+    }
+
+    /// A known `type` whose body does not fit it is refused with serde's
+    /// reason for the field, not read as an unknown part.
+    #[test]
+    fn content_part_refuses_a_malformed_known_type_with_the_fields_reason() {
+        for (value, reason) in [
+            (
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}),
+                "invalid value: integer `-1`, expected u32, in `image_url`",
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA==", "fps": "1"}}),
+                "invalid type: string \"1\", expected f64, in `video_url`",
+            ),
+            (
+                json!({"type": "image_url", "image_url": {"detail": "high"}}),
+                "missing field `image_url.url`",
+            ),
+            (json!({"type": "image_url"}), "missing field `image_url`"),
+            (
+                json!({"type": "text", "text": 5}),
+                "invalid type: integer `5`, expected a string, in `text`",
+            ),
+            (
+                json!({"type": "refusal", "refusal": null}),
+                "invalid type: null, expected a string, in `refusal`",
+            ),
+        ] {
+            let error = serde_json::from_value::<ContentPart>(value.clone()).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{value}");
+        }
+    }
+
+    /// Every typed kind reads back typed: the `ContentPart` variants, the
+    /// `KnownContentPart` mirror and `KnownContentPart::names` name the same
+    /// set, and the match below has no wildcard, so a new variant does not
+    /// compile until it has a sample here (a kind missing from the mirror or
+    /// the names would read back as an unknown part and fail the round trip).
+    #[test]
+    fn every_typed_content_part_reads_back_typed() {
+        let samples = [
+            ContentPart::Text {
+                text: "t".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "u".to_string().into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "u".to_string().into(),
+                },
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "d".to_string().into(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::VideoUrl {
+                video_url: VideoUrl {
+                    url: "u".to_string().into(),
+                    fps: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::Refusal {
+                refusal: "r".to_string(),
+            },
+        ];
+        for part in samples {
+            match &part {
+                ContentPart::Text { .. }
+                | ContentPart::ImageUrl { .. }
+                | ContentPart::AudioUrl { .. }
+                | ContentPart::InputAudio { .. }
+                | ContentPart::VideoUrl { .. }
+                | ContentPart::Refusal { .. } => {}
+                ContentPart::Unknown(_) => panic!("a typed sample"),
+            }
+            let value = serde_json::to_value(&part).unwrap();
+            assert_eq!(serde_json::from_value::<ContentPart>(value).unwrap(), part);
+        }
     }
 
     #[test]
