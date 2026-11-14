@@ -7,6 +7,11 @@
 //! exact across its shards; at the default scales it is one shard of
 //! `holder_count` slots.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test oracle: a broken step ends the test"
+)]
+
 use std::collections::BTreeMap;
 
 use kv_index::{ChainBlockMap, ContentHash, SequenceHash, ShardedChainIndex, StoredBlock};

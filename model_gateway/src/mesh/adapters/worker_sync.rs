@@ -999,7 +999,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
 
     fn worker_namespace(mesh: &MeshKV) -> Arc<CrdtNamespace> {
         mesh.configure_crdt_prefix(PREFIX, MergeStrategy::LastWriterWins)
@@ -1513,7 +1513,7 @@ mod tests {
             BasicWorkerBuilder::new("grpc://remote:9000")
                 .model(ModelCard::new("llama-3"))
                 .connection_mode(ConnectionMode::Grpc)
-                .worker_type(crate::worker::WorkerType::Decode)
+                .worker_type(WorkerType::Decode)
                 .build(),
         );
         pub_registry.register(worker).unwrap();
@@ -1530,7 +1530,7 @@ mod tests {
         );
         assert_eq!(
             *imported.worker_type(),
-            crate::worker::WorkerType::Decode,
+            WorkerType::Decode,
             "worker type must survive the spec round trip"
         );
     }
@@ -1566,7 +1566,7 @@ mod tests {
         let replacement: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(url)
                 .model(ModelCard::new("llama-4"))
-                .worker_type(crate::worker::WorkerType::Decode)
+                .worker_type(WorkerType::Decode)
                 .build(),
         );
         pub_registry.register_or_replace(replacement);
@@ -1584,7 +1584,7 @@ mod tests {
         let followed = sub_registry.get_by_url(url).unwrap();
         assert_eq!(
             *followed.worker_type(),
-            crate::worker::WorkerType::Decode,
+            WorkerType::Decode,
             "the role follows too"
         );
         assert_eq!(

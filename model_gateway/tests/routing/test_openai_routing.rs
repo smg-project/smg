@@ -42,6 +42,7 @@ use tokio::{
 use tower::ServiceExt;
 
 use crate::common::{
+    create_test_context,
     mock_openai_server::MockOpenAIServer,
     test_app::{create_test_app_context, register_external_worker},
 };
@@ -588,7 +589,7 @@ async fn test_router_factory_openai_mode() {
 
     let router_config = RouterConfig::new(routing_mode, PolicyConfig::Random);
 
-    let app_context = crate::common::create_test_context(router_config).await;
+    let app_context = create_test_context(router_config).await;
 
     let router = RouterFactory::create_router(&app_context).await;
     assert!(

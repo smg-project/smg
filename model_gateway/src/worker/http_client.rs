@@ -13,7 +13,10 @@ use std::{
 use openai_protocol::worker::HttpPoolConfig;
 use tracing::{debug, warn};
 
-use crate::config::RouterConfig;
+use crate::{
+    config::RouterConfig,
+    server::{http_client, http_client_builder},
+};
 
 /// Default pool settings for worker-directed HTTP clients.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
@@ -187,7 +190,7 @@ impl WorkerHttpClientCache {
             .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
 
         let make_builder = || {
-            let mut builder = crate::server::http_client_builder()
+            let mut builder = http_client_builder()
                 .pool_max_idle_per_host(key.pool_max_idle_per_host)
                 .pool_idle_timeout(pool_idle_timeout)
                 .timeout(Duration::from_secs(key.timeout_secs))
@@ -347,8 +350,7 @@ impl LazyHttpClient {
     }
 
     fn init(&self) -> &Arc<reqwest::Client> {
-        self.cell
-            .get_or_init(|| Arc::new(crate::server::http_client()))
+        self.cell.get_or_init(|| Arc::new(http_client()))
     }
 }
 
