@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- Interactions content takes every MIME type the public API names: audio in `audio/mpeg`, `m4a`,
+  `l16`, `opus`, `alaw`, `mulaw` and `webm`; images in `gif`, `bmp` and `tiff`; documents in
+  `text/csv` and the Office and OpenDocument formats beside PDF. Each was an unknown variant that
+  refused the whole request, or failed the answer that held it. Breaking: `AudioMimeType`,
+  `ImageMimeType` and `DocumentMimeType` gain the variants.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

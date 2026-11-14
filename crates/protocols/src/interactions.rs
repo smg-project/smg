@@ -692,7 +692,7 @@ pub enum Content {
         mime_type: Option<AudioMimeType>,
     },
 
-    /// Document content (PDF)
+    /// Document content (PDF, CSV, or an office document)
     Document {
         data: Option<String>,
         uri: Option<String>,
@@ -926,6 +926,12 @@ pub enum ImageMimeType {
     Heic,
     #[serde(rename = "image/heif")]
     Heif,
+    #[serde(rename = "image/gif")]
+    Gif,
+    #[serde(rename = "image/bmp")]
+    Bmp,
+    #[serde(rename = "image/tiff")]
+    Tiff,
 }
 
 impl ImageMimeType {
@@ -936,6 +942,9 @@ impl ImageMimeType {
             ImageMimeType::Webp => "image/webp",
             ImageMimeType::Heic => "image/heic",
             ImageMimeType::Heif => "image/heif",
+            ImageMimeType::Gif => "image/gif",
+            ImageMimeType::Bmp => "image/bmp",
+            ImageMimeType::Tiff => "image/tiff",
         }
     }
 }
@@ -955,6 +964,20 @@ pub enum AudioMimeType {
     Ogg,
     #[serde(rename = "audio/flac")]
     Flac,
+    #[serde(rename = "audio/mpeg")]
+    Mpeg,
+    #[serde(rename = "audio/m4a")]
+    M4a,
+    #[serde(rename = "audio/l16")]
+    L16,
+    #[serde(rename = "audio/opus")]
+    Opus,
+    #[serde(rename = "audio/alaw")]
+    Alaw,
+    #[serde(rename = "audio/mulaw")]
+    Mulaw,
+    #[serde(rename = "audio/webm")]
+    Webm,
 }
 
 impl AudioMimeType {
@@ -966,6 +989,13 @@ impl AudioMimeType {
             AudioMimeType::Aac => "audio/aac",
             AudioMimeType::Ogg => "audio/ogg",
             AudioMimeType::Flac => "audio/flac",
+            AudioMimeType::Mpeg => "audio/mpeg",
+            AudioMimeType::M4a => "audio/m4a",
+            AudioMimeType::L16 => "audio/l16",
+            AudioMimeType::Opus => "audio/opus",
+            AudioMimeType::Alaw => "audio/alaw",
+            AudioMimeType::Mulaw => "audio/mulaw",
+            AudioMimeType::Webm => "audio/webm",
         }
     }
 }
@@ -975,12 +1005,53 @@ impl AudioMimeType {
 pub enum DocumentMimeType {
     #[serde(rename = "application/pdf")]
     Pdf,
+    #[serde(rename = "text/csv")]
+    Csv,
+    #[serde(rename = "application/vnd.openxmlformats-officedocument.presentationml.presentation")]
+    Pptx,
+    #[serde(rename = "application/vnd.ms-powerpoint")]
+    Ppt,
+    #[serde(rename = "application/vnd.oasis.opendocument.presentation")]
+    Odp,
+    #[serde(rename = "application/vnd.openxmlformats-officedocument.wordprocessingml.document")]
+    Docx,
+    #[serde(rename = "application/msword")]
+    Doc,
+    #[serde(rename = "application/vnd.openxmlformats-officedocument.wordprocessingml.template")]
+    Dotx,
+    #[serde(rename = "application/vnd.oasis.opendocument.text")]
+    Odt,
+    #[serde(rename = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")]
+    Xlsx,
+    #[serde(rename = "application/vnd.ms-excel")]
+    Xls,
+    #[serde(rename = "application/vnd.oasis.opendocument.spreadsheet")]
+    Ods,
 }
 
 impl DocumentMimeType {
     pub fn as_str(&self) -> &'static str {
         match self {
             DocumentMimeType::Pdf => "application/pdf",
+            DocumentMimeType::Csv => "text/csv",
+            DocumentMimeType::Pptx => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            }
+            DocumentMimeType::Ppt => "application/vnd.ms-powerpoint",
+            DocumentMimeType::Odp => "application/vnd.oasis.opendocument.presentation",
+            DocumentMimeType::Docx => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            DocumentMimeType::Doc => "application/msword",
+            DocumentMimeType::Dotx => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+            }
+            DocumentMimeType::Odt => "application/vnd.oasis.opendocument.text",
+            DocumentMimeType::Xlsx => {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            }
+            DocumentMimeType::Xls => "application/vnd.ms-excel",
+            DocumentMimeType::Ods => "application/vnd.oasis.opendocument.spreadsheet",
         }
     }
 }
@@ -1235,6 +1306,84 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every MIME type the public API names for audio, image and document
+    /// content reads, is written back as sent and is named by `as_str`.
+    #[test]
+    fn content_takes_every_mime_type_the_public_api_names() {
+        let kinds: [(&str, &[&str]); 3] = [
+            (
+                "audio",
+                &[
+                    "audio/wav",
+                    "audio/mp3",
+                    "audio/aiff",
+                    "audio/aac",
+                    "audio/ogg",
+                    "audio/flac",
+                    "audio/mpeg",
+                    "audio/m4a",
+                    "audio/l16",
+                    "audio/opus",
+                    "audio/alaw",
+                    "audio/mulaw",
+                    "audio/webm",
+                ],
+            ),
+            (
+                "image",
+                &[
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                    "image/heic",
+                    "image/heif",
+                    "image/gif",
+                    "image/bmp",
+                    "image/tiff",
+                ],
+            ),
+            (
+                "document",
+                &[
+                    "application/pdf",
+                    "text/csv",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "application/vnd.ms-powerpoint",
+                    "application/vnd.oasis.opendocument.presentation",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "application/msword",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+                    "application/vnd.oasis.opendocument.text",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "application/vnd.ms-excel",
+                    "application/vnd.oasis.opendocument.spreadsheet",
+                ],
+            ),
+        ];
+        for (kind, mime_types) in kinds {
+            for mime_type in mime_types {
+                let content =
+                    serde_json::json!({"type": kind, "data": "AAAA", "mime_type": mime_type});
+                let read: Content = serde_json::from_value(content.clone())
+                    .unwrap_or_else(|e| panic!("{mime_type}: {e}"));
+                let named = match &read {
+                    Content::Audio {
+                        mime_type: Some(m), ..
+                    } => m.as_str(),
+                    Content::Image {
+                        mime_type: Some(m), ..
+                    } => m.as_str(),
+                    Content::Document {
+                        mime_type: Some(m), ..
+                    } => m.as_str(),
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(named, *mime_type);
+                assert_eq!(serde_json::to_value(&read).unwrap(), content);
+            }
+        }
+    }
 
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {
         let err = result.expect_err("a refusal");
