@@ -473,7 +473,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ResponsesRequest,
+        mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         let (Some(responses_context), Some(harmony_responses_context)) =
@@ -497,8 +497,8 @@ impl GrpcRouter {
             return error_response;
         }
 
-        let (body, canonical_model_id) =
-            canonicalize_responses_request(&self.worker_registry, &body, model_id);
+        let canonical_model_id =
+            canonicalize_responses_request(&self.worker_registry, &mut body, model_id);
         let model_id = canonical_model_id.as_ref();
 
         // Choose implementation based on Harmony model detection (checks worker metadata)
@@ -508,7 +508,6 @@ impl GrpcRouter {
         // `background: true` answers the queued object at once and runs the
         // work behind the response id; with the mode switched off such a
         // request runs in the foreground, and its object says so.
-        let mut body = body.into_owned();
         if body.background == Some(true) {
             if responses_context.background.enabled() {
                 let request_context = smg_data_connector::current_request_context();
@@ -1344,24 +1343,21 @@ impl RouterTrait for GrpcRouter {
 /// gone before dispatch. Otherwise a plain answer reports the canonical ID
 /// while a tool call answer reports the alias.
 ///
-/// Returns both halves together so a caller cannot take the canonical model ID
-/// and forget the body, or the reverse. The common path borrows both untouched
+/// The id is rewritten on the body the router already owns, so neither the
+/// alias nor the canonical case copies the request. Returns the canonical
+/// model ID the workers are selected by; the common path borrows it untouched
 /// and allocates nothing.
 fn canonicalize_responses_request<'a>(
     worker_registry: &WorkerRegistry,
-    body: &'a ResponsesRequest,
+    body: &mut ResponsesRequest,
     model_id: &'a str,
-) -> (Cow<'a, ResponsesRequest>, Cow<'a, str>) {
+) -> Cow<'a, str> {
     let Some(canonical_model) = worker_registry.resolve_model_alias(model_id) else {
-        return (Cow::Borrowed(body), Cow::Borrowed(model_id));
+        return Cow::Borrowed(model_id);
     };
-    let mut canonical_body = body.clone();
-    canonical_body.model.clear();
-    canonical_body.model.push_str(&canonical_model);
-    (
-        Cow::Owned(canonical_body),
-        Cow::Owned(canonical_model.to_string()),
-    )
+    body.model.clear();
+    body.model.push_str(&canonical_model);
+    Cow::Owned(canonical_model.to_string())
 }
 
 #[cfg(test)]

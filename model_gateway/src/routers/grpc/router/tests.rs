@@ -1005,6 +1005,34 @@ async fn epd_router_501s_responses_and_cancel() {
 #[tokio::test]
 async fn responses_request_is_canonical_before_the_responses_layer_sees_it() {
     let ctx = grpc_ctx(pd_routing_mode()).await;
+    register_aliased_pd_workers(&ctx.worker_registry);
+
+    let mut request = responses_request("model-alias");
+    let model_id =
+        canonicalize_responses_request(&ctx.worker_registry, &mut request, "model-alias");
+    assert_eq!(
+        request.model, "canonical-model",
+        "the Responses layer must see the canonical model ID"
+    );
+    assert_eq!(
+        model_id, "canonical-model",
+        "worker selection must use the canonical model ID"
+    );
+
+    // The canonical ID is left alone, and costs no copy.
+    let mut already_canonical = responses_request("canonical-model");
+    let model_id = canonicalize_responses_request(
+        &ctx.worker_registry,
+        &mut already_canonical,
+        "canonical-model",
+    );
+    assert_eq!(already_canonical.model, "canonical-model");
+    assert!(matches!(model_id, Cow::Borrowed(_)));
+}
+
+/// A prefill and a decode worker serving `canonical-model` under the alias
+/// `model-alias`.
+fn register_aliased_pd_workers(registry: &WorkerRegistry) {
     for (url, worker_type) in [
         ("grpc://prefill:30000", WorkerType::Prefill),
         ("grpc://decode:30000", WorkerType::Decode),
@@ -1018,29 +1046,40 @@ async fn responses_request_is_canonical_before_the_responses_layer_sees_it() {
                 ..Default::default()
             })
             .build();
-        ctx.worker_registry
+        registry
             .register(Arc::new(worker))
             .expect("register worker");
     }
+}
 
-    let request = responses_request("model-alias");
-    let (body, model_id) =
-        canonicalize_responses_request(&ctx.worker_registry, &request, "model-alias");
-    assert_eq!(
-        body.model, "canonical-model",
-        "the Responses layer must see the canonical model ID"
-    );
-    assert_eq!(
-        model_id, "canonical-model",
-        "worker selection must use the canonical model ID"
-    );
-
-    // The canonical ID is left alone, and costs no copy.
-    let already_canonical = responses_request("canonical-model");
-    let (body, model_id) =
-        canonicalize_responses_request(&ctx.worker_registry, &already_canonical, "canonical-model");
-    assert!(matches!(body, Cow::Borrowed(_)));
-    assert!(matches!(model_id, Cow::Borrowed(_)));
+/// The helper rewrites the model id on the request it is given: the request's
+/// instructions buffer keeps its address across the call, under an alias and
+/// under the canonical id alike. This pins the helper alone; the caller's copy
+/// of the previous tree (an `into_owned` of a borrowed body) is gone with the
+/// body `Cow` itself, which the signature no longer returns.
+#[tokio::test]
+async fn canonicalisation_rewrites_the_owned_request_in_place() {
+    let ctx = grpc_ctx(pd_routing_mode()).await;
+    register_aliased_pd_workers(&ctx.worker_registry);
+    for model in ["model-alias", "canonical-model"] {
+        let mut request = responses_request(model);
+        request.instructions = Some("the buffer whose address the pin follows".to_string());
+        let before = request
+            .instructions
+            .as_deref()
+            .expect("instructions")
+            .as_ptr();
+        canonicalize_responses_request(&ctx.worker_registry, &mut request, model);
+        let after = request
+            .instructions
+            .as_deref()
+            .expect("instructions")
+            .as_ptr();
+        assert!(
+            std::ptr::eq(before, after),
+            "the request sent as {model} was copied to rewrite its model id"
+        );
+    }
 }
 
 /// A per-model retry override must survive an alias. The override is keyed
