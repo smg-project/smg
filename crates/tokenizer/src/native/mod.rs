@@ -272,8 +272,15 @@ const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
 /// loads on its own, sized by its host) reads on that pool instead.
 const SEED_THREADS: usize = 4;
 /// Text on each side of a candidate cut that every stage's pattern is run
-/// over to confirm a piece starts there (widened to the spaces around it).
-const CUT_CHECK_WINDOW: usize = 512;
+/// over to confirm a piece starts there (widened to the spaces around it:
+/// the window starts where the text's match loop begins a piece and ends
+/// just after such a space whatever the margin, see `window_start` and
+/// `window_end`). The check walks the window three times (`piece_starts_at`),
+/// serially in the cut search before the units encode, so the margin is
+/// its cost: at 512 bytes it took a fifth of a long text's pooled encode
+/// (2.3 MB, four threads: 8.4 -> 9.4 ms against the one-pass check before
+/// it); at 128 the same cuts, the same ids, 8.0 ms.
+const CUT_CHECK_WINDOW: usize = 128;
 /// How far before and after a candidate cut the window's start and end may
 /// be looked for when a stage can read a space after a non-whitespace
 /// character inside one match (a letter run joined by spaces, a class read
@@ -283,8 +290,11 @@ const CUT_CHECK_WINDOW: usize = 512;
 /// cut is lost). Without such a stage
 /// the start and the end are looked for within a chunk instead (see
 /// `cut_check_reach`): such a stretch is many pieces there, and a text
-/// whose spaces stand further apart than this reach keeps its cuts.
-const CUT_CHECK_REACH: usize = 4 * CUT_CHECK_WINDOW;
+/// whose spaces stand further apart than this reach keeps its cuts. Two
+/// kibibytes, on its own: the margin of the window (`CUT_CHECK_WINDOW`) is
+/// the check's cost, this reach is how far a space may be from a candidate
+/// under such a stage, and the one does not follow the other.
+const CUT_CHECK_REACH: usize = 2 << 10;
 /// Candidates one cut search may reject before it gives up: the byte scan for
 /// a candidate is cheap, the window check on each one is not, so a text whose
 /// candidates keep failing the check costs at most this many checks per cut.
