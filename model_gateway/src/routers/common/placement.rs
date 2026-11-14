@@ -1670,9 +1670,6 @@ pub(crate) fn decide_pair(
         sequence: inputs.sequence,
         affinity: None,
     };
-    // The capture observes the open prefills before the engine reads them,
-    // as the single seam does; the row follows the shed or the commit.
-    cache_trace::begin_selection(&prefills);
     let (decision, lease, decodes) = decider.decide_pair(
         &request,
         &prefills,
@@ -1685,9 +1682,6 @@ pub(crate) fn decide_pair(
         excluded,
     );
     if let Decision::Shed(shed) = &decision {
-        // A decision that places nothing leaves its row with no worker, as
-        // the legacy pick does when its policy declines.
-        cache_trace::selection(prefill_policy.name(), "policy", &prefills, None);
         let failure = pair_shed(policies, decider, model_id, shed);
         if live.lift_prefill
             && failure.role == WorkerRole::Prefill
@@ -1759,48 +1753,6 @@ fn pair_shed(
     Box::new(PairFailure { role, verdict })
 }
 
-/// The decode rows a pair decision read for the committed pair: the slice of
-/// `decodes` that is the committed prefill's pair class, and the committed
-/// decode's position in it. The decision hands back the rows of every pair
-/// class in one slice, each class's rows together and in its partner list's
-/// order, one row for every open partner and none for a closed one. So the
-/// class is read outward from the committed row (`committed`) along
-/// `partners`, the committed prefill's list: the row before belongs while
-/// it is an earlier partner, the row after while it is a later one. A row
-/// of another class never matches, because the partners past either end of
-/// the class are closed and a closed decode has no row in any class. One
-/// pass over the list, nothing allocated; a committed decode the list does
-/// not hold is its own row alone. The reading does not hold under the
-/// lifted decode veto, where a list keeps its least-loaded partners alone:
-/// no decode row is written there.
-fn partner_rows<'d>(
-    partners: &[Arc<dyn Worker>],
-    decodes: &'d [Arc<dyn Worker>],
-    committed: usize,
-) -> (&'d [Arc<dyn Worker>], usize) {
-    let is_row = |partner: &Arc<dyn Worker>, row: usize| Arc::ptr_eq(partner, &decodes[row]);
-    let Some(at) = partners.iter().position(|p| is_row(p, committed)) else {
-        return (&decodes[committed..=committed], 0);
-    };
-    // Leftward, each earlier row of the class is an earlier partner.
-    let (mut first, mut before) = (committed, at);
-    while first > 0 {
-        let earlier = partners[..before]
-            .iter()
-            .rposition(|p| is_row(p, first - 1));
-        let Some(found) = earlier else { break };
-        (first, before) = (first - 1, found);
-    }
-    // Rightward, each later row is a later partner.
-    let (mut end, mut after) = (committed + 1, at + 1);
-    while end < decodes.len() {
-        let later = partners[after..].iter().position(|p| is_row(p, end));
-        let Some(found) = later else { break };
-        (end, after) = (end + 1, after + found + 1);
-    }
-    (&decodes[first..end], committed - first)
-}
-
 /// [`select_pair`] through the policy engine, the commit half, right after
 /// the decision under the same hold of the admission lock: `has_capacity`
 /// is the window re-read, since a regular or an unbounded dispatch moves a
@@ -1810,14 +1762,11 @@ fn partner_rows<'d>(
 /// when every target misses, the missed ids go to
 /// `missed` for the one re-decision and the request waits for a slot. The
 /// room itself is claimed at dispatch (`pd_admission::admit_decode`), as
-/// under the legacy path. A traced pair leaves its rows here: the prefill's
-/// at the commit or the miss, the decode's over the committed prefill's
-/// partners in `pairs`, the index the decision read.
+/// under the legacy path.
 pub(crate) fn commit_pair(
     policies: &PolicyRegistry,
     decider: &Decider,
     model_id: &str,
-    pairs: &PdPairIndex,
     proposal: PairProposal,
     has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
     missed: &mut Vec<WorkerId>,
@@ -1842,13 +1791,8 @@ pub(crate) fn commit_pair(
             && open_under(prefill, pd.lift_prefill)
             && decode_of(target).is_some_and(|d| partner_live(d, pd.lift_decode, pd.pair_runtime))
     };
-    // The policy the trace rows and the selection metric name.
-    let prefill_policy = policies.get_prefill_policy().name();
     let Some(target) = decider.commit_pair(&pd.lease, pd.decode_tokens, &pd.decision, accept)
     else {
-        // Every target missed: the decision's row names no worker, and the
-        // one re-decision writes its own.
-        cache_trace::selection(prefill_policy, "policy", &pd.prefills, None);
         if let Some(pick) = pd.decision.pick() {
             for target in pick.targets.iter() {
                 missed.push(target.id);
@@ -1860,18 +1804,10 @@ pub(crate) fn commit_pair(
             PlacementFailure::PrefillAtCapacity,
         ));
     };
-    cache_trace::selection(
-        prefill_policy,
-        "policy",
-        &pd.prefills,
-        Some(target.position as usize),
-    );
     let prefill = Arc::clone(&pd.prefills[target.position as usize]);
-    let decode_row = target
-        .pair
-        .map(|pair| pair.decode_position as usize)
+    let decode = decode_of(&target)
+        .map(Arc::clone)
         .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?;
-    let decode = Arc::clone(&pd.decodes[decode_row]);
     if pd.prefill_over || pd.lift_decode {
         Metrics::record_worker_overload_fallback(STAGE_SELECTION);
         debug!(
@@ -1889,31 +1825,16 @@ pub(crate) fn commit_pair(
         metrics_labels::WORKER_PREFILL,
         prefill.connection_mode().as_metric_label(),
         model_id,
-        prefill_policy,
+        policies.get_prefill_policy().name(),
     );
     // A decode paired by load under the lift is the veto fallback's pick,
     // counted above, not a selection of the decode policy.
     if !pd.lift_decode {
-        let decode_policy = policies.get_decode_policy().name();
-        if cache_trace::enabled() {
-            // The decode side's row, as the legacy pair leaves it: the
-            // committed prefill's partners among the decode rows the
-            // decision read, observed here at the commit, under the same
-            // hold of the lock.
-            let partners: &[Arc<dyn Worker>] =
-                match pairs.prefill.iter().position(|p| Arc::ptr_eq(p, &prefill)) {
-                    Some(at) => &pairs.partners[at],
-                    None => &[],
-                };
-            let (rows, picked) = partner_rows(partners, &pd.decodes, decode_row);
-            cache_trace::begin_selection(rows);
-            cache_trace::selection(decode_policy, "policy", rows, Some(picked));
-        }
         Metrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             decode.connection_mode().as_metric_label(),
             model_id,
-            decode_policy,
+            policies.get_decode_policy().name(),
         );
     }
     debug!(
@@ -1969,7 +1890,6 @@ pub(crate) fn place_pair_through_engine(
         policies,
         decider,
         model_id,
-        pairs,
         decide(&[])?,
         has_capacity,
         &mut missed,
@@ -1984,7 +1904,6 @@ pub(crate) fn place_pair_through_engine(
         policies,
         decider,
         model_id,
-        pairs,
         decide(&missed)?,
         has_capacity,
         &mut Vec::new(),
@@ -2205,7 +2124,7 @@ mod tests {
             PlacementInputs::default(),
             &excluded,
         )?;
-        commit_pair(policies, decider, MODEL, &pairs, proposal, capacity, missed)
+        commit_pair(policies, decider, MODEL, proposal, capacity, missed)
     }
 
     /// Selections per worker URL over `requests` pairs decided through the
@@ -2399,490 +2318,6 @@ mod tests {
         );
         assert_eq!(pair.decode.url(), "grpc://d:1");
         assert_eq!(decider.decisions(), 2, "one re-decision");
-    }
-
-    /// A pair decided through the engine scopes the cache-trace capture as
-    /// the single path does: the prefill decision is one selection record,
-    /// so a traced request's dispatch header names the policy and the worker
-    /// instead of an empty `selections` list.
-    #[tokio::test]
-    async fn a_pair_decided_through_the_engine_records_its_selection_in_the_cache_trace() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        let decider = policies.decider().expect("hosted");
-        let pairs = pairs_of(&registry, &policies);
-        let (pair, header) = cache_trace::scope(true, async {
-            let pair = place_pair_through_engine(
-                &registry,
-                &policies,
-                decider,
-                MODEL,
-                &pairs,
-                None,
-                true,
-                &|_| true,
-                PlacementInputs::default(),
-            )
-            .expect("the engine pairs");
-            (pair, cache_trace::dispatch(None, 1, vec![], true, "pd"))
-        })
-        .await;
-        let header = header.expect("the request asked for its decision record");
-        let record: serde_json::Value =
-            serde_json::from_str(&header).expect("the header is the record's JSON");
-        let selections = record["selections"]
-            .as_array()
-            .expect("the record lists its selections");
-        assert!(
-            !selections.is_empty(),
-            "a pair decided through the engine left no selection in the trace: {record}"
-        );
-        assert_eq!(
-            selections[0]["worker"],
-            serde_json::json!(pair.prefill.redacted_url()),
-            "the first selection is the prefill decision: {record}"
-        );
-    }
-
-    /// One pair placed through the engine seam under a capture the request
-    /// asked for: the placement's result and the rows the capture holds, as
-    /// the evidence line lists them.
-    async fn traced_pair(
-        registry: &WorkerRegistry,
-        policies: &PolicyRegistry,
-        has_capacity: &dyn Fn(&Arc<dyn Worker>) -> bool,
-    ) -> (Result<Pair, Box<PairFailure>>, Vec<serde_json::Value>) {
-        let decider = policies.decider().expect("hosted");
-        let pairs = pairs_of(registry, policies);
-        cache_trace::scope(true, async {
-            let placed = place_pair_through_engine(
-                registry,
-                policies,
-                decider,
-                MODEL,
-                &pairs,
-                None,
-                true,
-                has_capacity,
-                PlacementInputs::default(),
-            );
-            (placed, cache_trace::captured_selections())
-        })
-        .await
-    }
-
-    /// The workers a row observed, by URL, sorted.
-    fn observed(row: &serde_json::Value) -> Vec<&str> {
-        let mut urls: Vec<&str> = row["candidates"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|candidate| candidate["worker"].as_str())
-            .collect();
-        urls.sort_unstable();
-        urls
-    }
-
-    /// A traced pair under the engine leaves the two rows the legacy pair
-    /// leaves: the prefill pick under the prefill policy's name over the
-    /// open prefills, then the decode pick under the decode policy's name
-    /// over the decode rows the decision read. A prediction left in the
-    /// capture before the decision does not reach either row.
-    #[tokio::test]
-    async fn a_traced_pair_names_each_side_under_its_own_policy() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let round_robin = PolicyConfig::RoundRobin;
-        let power_of_two = PolicyConfig::PowerOfTwo {
-            load_metric: Default::default(),
-        };
-        let policies = PolicyRegistry::new(round_robin.clone());
-        policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
-        policies.set_decode_policy(Arc::new(PowerOfTwoPolicy::new()));
-        let policies =
-            policies.with_policy_engine(PolicyEngineMode::Engine, &round_robin, &power_of_two);
-        let decider = policies.decider().expect("hosted");
-        let pairs = pairs_of(&registry, &policies);
-        let (pair, rows) = cache_trace::scope(true, async {
-            cache_trace::prediction(serde_json::json!({"left": "by an earlier pick"}));
-            let pair = place_pair_through_engine(
-                &registry,
-                &policies,
-                decider,
-                MODEL,
-                &pairs,
-                None,
-                true,
-                &|_| true,
-                PlacementInputs::default(),
-            )
-            .expect("the engine pairs");
-            (pair, cache_trace::captured_selections())
-        })
-        .await;
-        assert_eq!(rows.len(), 2, "a prefill row and a decode row: {rows:?}");
-        let (prefill, decode) = (&rows[0], &rows[1]);
-        assert_eq!(prefill["policy"], "round_robin");
-        assert_eq!(prefill["origin"], "policy");
-        assert_eq!(
-            prefill["worker"],
-            serde_json::json!(pair.prefill.redacted_url())
-        );
-        assert_eq!(observed(prefill), ["grpc://p:1", "grpc://p:2"]);
-        assert!(
-            prefill["prediction"].is_null(),
-            "the decision's row starts clean: {prefill}"
-        );
-        assert_eq!(decode["policy"], "power_of_two");
-        assert_eq!(decode["origin"], "policy");
-        assert_eq!(
-            decode["worker"],
-            serde_json::json!(pair.decode.redacted_url())
-        );
-        assert_eq!(observed(decode), ["grpc://d:1", "grpc://d:2"]);
-        assert!(decode["prediction"].is_null(), "{decode}");
-    }
-
-    /// A pair the engine sheds leaves one row that names no worker, under
-    /// the prefill policy's name, so a refused traced request still carries
-    /// its decision.
-    #[tokio::test]
-    async fn a_pair_the_engine_sheds_leaves_one_row_without_a_worker() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        // The prelude reads an open window; the engine's own read finds it
-        // closed and sheds on its capacity filter.
-        let first_read = Cell::new(true);
-        let has_capacity = |_: &Arc<dyn Worker>| first_read.replace(false);
-        let (shed, rows) = traced_pair(&registry, &policies, &has_capacity).await;
-        let shed = shed.err().expect("the engine shed the pool");
-        assert!(matches!(shed.verdict, PlacementFailure::PrefillAtCapacity));
-        assert_eq!(rows.len(), 1, "the shed decision's row alone: {rows:?}");
-        assert_eq!(rows[0]["policy"], "round_robin");
-        assert!(rows[0]["worker"].is_null(), "{rows:?}");
-        assert_eq!(observed(&rows[0]), ["grpc://p:1"]);
-    }
-
-    /// A commit that refuses every target leaves the decision's row with no
-    /// worker, and the one re-decision writes its own rows after it: the
-    /// prefill it pairs, then the decode.
-    #[tokio::test]
-    async fn a_refused_pair_commit_leaves_its_row_before_the_re_decisions() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        // The fourth read of the window is the first commit's: it closes the
-        // decided prefill, as in the seam's own re-decision test.
-        let reads = Cell::new(0_u32);
-        let closed: RefCell<Option<String>> = RefCell::new(None);
-        let has_capacity = |worker: &Arc<dyn Worker>| {
-            reads.set(reads.get() + 1);
-            if reads.get() == 4 {
-                *closed.borrow_mut() = Some(worker.url().to_string());
-            }
-            closed.borrow().as_deref() != Some(worker.url())
-        };
-        let (pair, rows) = traced_pair(&registry, &policies, &has_capacity).await;
-        let pair = pair.expect("the re-decision pairs the other prefill");
-        assert_eq!(
-            rows.len(),
-            3,
-            "the refused row, then the pair's two: {rows:?}"
-        );
-        assert!(rows[0]["worker"].is_null(), "{rows:?}");
-        assert_eq!(observed(&rows[0]), ["grpc://p:1", "grpc://p:2"]);
-        assert_eq!(
-            rows[1]["worker"],
-            serde_json::json!(pair.prefill.redacted_url())
-        );
-        assert_eq!(
-            rows[2]["worker"],
-            serde_json::json!(pair.decode.redacted_url())
-        );
-    }
-
-    /// A decode paired by load under the lift is the veto fallback's pick
-    /// and no selection of the decode policy: the trace carries the prefill
-    /// row alone, as the selection metric counts the prefill alone.
-    #[tokio::test]
-    async fn a_decode_paired_by_load_under_the_lift_leaves_no_decode_row() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        for url in ["grpc://d:1", "grpc://d:2"] {
-            let worker = registry.get_by_url(url).expect("registered");
-            registry.set_worker_overloaded(&worker, true);
-        }
-        let (pair, rows) = traced_pair(&registry, &policies, &|_| true).await;
-        let pair = pair.expect("a pair is open");
-        assert_eq!(rows.len(), 1, "the prefill row alone: {rows:?}");
-        assert_eq!(
-            rows[0]["worker"],
-            serde_json::json!(pair.prefill.redacted_url())
-        );
-    }
-
-    /// The decode row lists the committed prefill's partners, as the legacy
-    /// row lists the pick's: with two pairing descriptors in the fleet the
-    /// decision reads the decode rows of both, and the other prefill's
-    /// partners stay out of the row.
-    #[tokio::test]
-    async fn a_decode_row_lists_the_committed_prefills_partners_alone() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:3", WorkerType::Decode, Some("MooncakeConnector")),
-            ("grpc://d:4", WorkerType::Decode, Some("MooncakeConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        // Round robin takes the two prefills in turn: one pair per class.
-        let mut prefills = Vec::new();
-        for _ in 0..2 {
-            let (pair, rows) = traced_pair(&registry, &policies, &|_| true).await;
-            let pair = pair.expect("a pair is open");
-            assert_eq!(rows.len(), 2, "{rows:?}");
-            let partners = match pair.prefill.url() {
-                "grpc://p:1" => ["grpc://d:1", "grpc://d:2"],
-                _ => ["grpc://d:3", "grpc://d:4"],
-            };
-            assert_eq!(observed(&rows[0]), ["grpc://p:1", "grpc://p:2"]);
-            assert_eq!(observed(&rows[1]), partners, "{rows:?}");
-            assert_eq!(
-                rows[1]["worker"],
-                serde_json::json!(pair.decode.redacted_url())
-            );
-            prefills.push(pair.prefill.url().to_owned());
-        }
-        prefills.sort_unstable();
-        assert_eq!(prefills, ["grpc://p:1", "grpc://p:2"]);
-    }
-
-    /// The decode rows of `pairs` traced pairs over `registry` under round
-    /// robin on both roles: each pair's prefill, its decode, and the workers
-    /// its decode row lists and names.
-    async fn decode_rows(
-        registry: &WorkerRegistry,
-        pairs: usize,
-    ) -> Vec<(String, String, Vec<String>, serde_json::Value)> {
-        let policies = engine_cohort_policies();
-        let mut read = Vec::new();
-        for _ in 0..pairs {
-            let (pair, rows) = traced_pair(registry, &policies, &|_| true).await;
-            let pair = pair.expect("a pair is open");
-            assert_eq!(rows.len(), 2, "a prefill row and a decode row: {rows:?}");
-            read.push((
-                pair.prefill.url().to_owned(),
-                pair.decode.url().to_owned(),
-                observed(&rows[1]).into_iter().map(str::to_owned).collect(),
-                rows[1]["worker"].clone(),
-            ));
-        }
-        read
-    }
-
-    /// The decode row is its class's rows whichever decode of the class is
-    /// the pick: the first, with the class's other row behind it, or the
-    /// last, with the other class's rows beside it. Round robin takes the
-    /// two prefills in turn and, within a class, its two decodes in turn, so
-    /// four pairs pick every decode once.
-    #[tokio::test]
-    async fn a_decode_row_is_its_class_whichever_decode_is_the_pick() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:3", WorkerType::Decode, Some("MooncakeConnector")),
-            ("grpc://d:4", WorkerType::Decode, Some("MooncakeConnector")),
-        ]);
-        let mut picked = Vec::new();
-        for (prefill, decode, listed, named) in decode_rows(&registry, 4).await {
-            let class = match prefill.as_str() {
-                "grpc://p:1" => ["grpc://d:1", "grpc://d:2"],
-                _ => ["grpc://d:3", "grpc://d:4"],
-            };
-            assert_eq!(listed, class, "{prefill} with {decode}");
-            assert_eq!(named, serde_json::json!(decode), "the row names the pick");
-            picked.push(decode);
-        }
-        picked.sort_unstable();
-        assert_eq!(
-            picked,
-            ["grpc://d:1", "grpc://d:2", "grpc://d:3", "grpc://d:4"]
-        );
-    }
-
-    /// Two classes that share a decode keep to their own rows: a decode
-    /// that reports no connector pairs with both prefills, so it has a row
-    /// in each class, and each class's row ends at its own copy.
-    #[tokio::test]
-    async fn a_decode_row_keeps_to_its_class_beside_a_shared_decode() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:2", WorkerType::Decode, None),
-            ("grpc://d:3", WorkerType::Decode, Some("MooncakeConnector")),
-        ]);
-        let mut pairs = Vec::new();
-        for (prefill, decode, listed, named) in decode_rows(&registry, 4).await {
-            let class = match prefill.as_str() {
-                "grpc://p:1" => ["grpc://d:1", "grpc://d:2"],
-                _ => ["grpc://d:2", "grpc://d:3"],
-            };
-            assert_eq!(listed, class, "{prefill} with {decode}");
-            assert_eq!(named, serde_json::json!(decode), "the row names the pick");
-            pairs.push((prefill, decode));
-        }
-        pairs.sort_unstable();
-        let pair = |prefill: &str, decode: &str| (prefill.to_owned(), decode.to_owned());
-        assert_eq!(
-            pairs,
-            [
-                pair("grpc://p:1", "grpc://d:1"),
-                pair("grpc://p:1", "grpc://d:2"),
-                pair("grpc://p:2", "grpc://d:2"),
-                pair("grpc://p:2", "grpc://d:3"),
-            ],
-            "each class picks its own two decodes, the shared one from both"
-        );
-    }
-
-    /// A partner that is not ready has no row in the decision, so it stays
-    /// out of the decode row: the row is the open partners on either side
-    /// of it, whichever of them is the pick.
-    #[tokio::test]
-    async fn a_decode_row_leaves_a_closed_partner_out() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:3", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        registry
-            .get_by_url("grpc://d:2")
-            .expect("registered")
-            .set_status(WorkerStatus::NotReady);
-        let mut picked = Vec::new();
-        for (_, decode, listed, named) in decode_rows(&registry, 2).await {
-            assert_eq!(listed, ["grpc://d:1", "grpc://d:3"], "the open partners");
-            assert_eq!(named, serde_json::json!(decode), "the row names the pick");
-            picked.push(decode);
-        }
-        picked.sort_unstable();
-        assert_eq!(picked, ["grpc://d:1", "grpc://d:3"]);
-    }
-
-    /// A committed decode its prefill's list does not hold is its own row
-    /// alone, never the rows of every class. The index and the decision are
-    /// one snapshot on the request path, so this is the reading of a list
-    /// that is not the decision's.
-    #[test]
-    fn a_decode_its_list_does_not_hold_is_its_own_row_alone() {
-        let registry = pd_registry(&[
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:3", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let decodes: Vec<Arc<dyn Worker>> = ["grpc://d:1", "grpc://d:2", "grpc://d:3"]
-            .iter()
-            .map(|url| registry.get_by_url(url).expect("registered"))
-            .collect();
-        for list in [&decodes[..0], &decodes[..1]] {
-            let (rows, picked) = partner_rows(list, &decodes, 2);
-            assert_eq!(rows.len(), 1, "the committed row alone");
-            assert!(Arc::ptr_eq(&rows[0], &decodes[2]));
-            assert_eq!(picked, 0);
-        }
-    }
-
-    /// The pair is one decision: a prediction the engine leaves for it
-    /// between the decision and the commit rides the prefill row, and the
-    /// decode row carries none. The prefill row is written before the decode
-    /// side's observation begins, so that beginning never clears it.
-    #[tokio::test]
-    async fn the_pairs_prediction_rides_the_prefill_row() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        let decider = policies.decider().expect("hosted");
-        let pairs = pairs_of(&registry, &policies);
-        let rows = cache_trace::scope(true, async {
-            let proposal = decide_pair(
-                &registry,
-                &policies,
-                decider,
-                MODEL,
-                &pairs,
-                None,
-                true,
-                &|_| true,
-                PlacementInputs::default(),
-                &[],
-            )
-            .expect("a pair is open");
-            // Where a record of the decision itself would land.
-            cache_trace::prediction(serde_json::json!({"decision": 7}));
-            commit_pair(
-                &policies,
-                decider,
-                MODEL,
-                &pairs,
-                proposal,
-                &|_| true,
-                &mut Vec::new(),
-            )
-            .expect("the commit pairs");
-            cache_trace::captured_selections()
-        })
-        .await;
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0]["prediction"], serde_json::json!({"decision": 7}));
-        assert!(rows[1]["prediction"].is_null(), "{rows:?}");
-    }
-
-    /// The prelude's own verdicts are settled before any engine call and
-    /// write no row, as the legacy path writes none there: a pool with no
-    /// capacity queues the request with an empty trace.
-    #[tokio::test]
-    async fn a_pair_the_prelude_settles_writes_no_row() {
-        let registry = pd_registry(&[
-            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
-        ]);
-        let policies = engine_cohort_policies();
-        let (queued, rows) = traced_pair(&registry, &policies, &|_| false).await;
-        let queued = queued.err().expect("no prefill has capacity");
-        assert!(matches!(
-            queued.verdict,
-            PlacementFailure::PrefillAtCapacity
-        ));
-        assert_eq!(policies.decider().expect("hosted").decisions(), 0);
-        assert!(
-            rows.is_empty(),
-            "the prelude's verdict writes no row: {rows:?}"
-        );
     }
 
     /// A window that closes between the prelude's read and the engine's:
@@ -3111,7 +2546,6 @@ mod tests {
             &policies,
             decider,
             MODEL,
-            &pairs_of(&registry, &policies),
             PairProposal::Decided(pd),
             &|_| true,
             &mut missed,
