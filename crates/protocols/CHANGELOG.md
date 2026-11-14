@@ -94,6 +94,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Realtime session or client secret request keeps what the public API takes, so the
+  `/v1/realtime/sessions`, `/client_secrets` and `/transcription_sessions` routes, which write the
+  typed request back for the upstream, forward it: the session's `tools` as a list (an empty one
+  clears them), where any list was refused; a `turn_detection` of `null`, which turns voice
+  activity detection off, where it was dropped and so left server VAD on; and the client secret's
+  `expires_after`, where it was dropped and so every secret lived the default 600 seconds.
+  Breaking: `RealtimeSessionCreateRequest.tools` is a `Vec`, `RealtimeAudioConfigInput.turn_detection`
+  is an `Option<Option<TurnDetection>>`, and `RealtimeClientSecretCreateRequest` gains
+  `expires_after`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
