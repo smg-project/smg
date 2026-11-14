@@ -57,7 +57,9 @@ pub struct RerankRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<StringOrArray>,
 
-    /// User identifier
+    /// User identifier; written to the forwarded body only when given, as
+    /// `rid` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
 
@@ -216,19 +218,26 @@ where
 /// itself answers with (the embeddings-server contract writes the same list,
 /// `text` for the document), or under `results` as the Cohere-style object
 /// of the OpenAI-compatible rerank servers (`relevance_score`, the document
-/// as text or as `{text}`; the object's `id`, `model` and `usage` are not
-/// read). One `from_slice` reads every shape; the results keep the worker's
-/// order, which every contract sorts by score, highest first. Read by a
+/// as text or as `{text}`), whose `usage` and `id` are read with them (its
+/// `model` is not: the gateway names the model that ran). One `from_slice`
+/// reads every shape; the results are in the worker's order. Read by a
 /// visitor on the first token rather than an untagged enum, so a body in no
 /// rerank shape is refused in serde's own words (the field a new server's
 /// spelling lacks, not "no variant matched") and the body streams through
 /// without being buffered first.
 #[derive(Debug)]
-pub enum RerankWorkerResponse {
-    /// The results as a bare list.
-    List(Vec<RerankResult>),
-    /// The results under `results`.
-    Object { results: Vec<RerankResult> },
+pub struct RerankWorkerResponse {
+    /// The ranked results, in the worker's order.
+    pub results: Vec<RerankResult>,
+    /// The usage the object form reports, in the rerank servers' spelling
+    /// (`prompt_tokens` and `total_tokens`; no `completion_tokens`, which
+    /// reads as none generated); a usage in another spelling is left out,
+    /// the results read as before; the bare list has none.
+    pub usage: Option<UsageInfo>,
+    /// The id the object form reports, a string or a list of strings; an id
+    /// in another shape is left out, the results read as before; the bare
+    /// list has none.
+    pub id: Option<StringOrArray>,
 }
 
 impl<'de> Deserialize<'de> for RerankWorkerResponse {
@@ -243,35 +252,44 @@ impl<'de> Deserialize<'de> for RerankWorkerResponse {
             }
 
             fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                Vec::deserialize(de::value::SeqAccessDeserializer::new(seq))
-                    .map(RerankWorkerResponse::List)
+                Vec::deserialize(de::value::SeqAccessDeserializer::new(seq)).map(|results| {
+                    RerankWorkerResponse {
+                        results,
+                        usage: None,
+                        id: None,
+                    }
+                })
             }
 
             fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut results = None;
+                let mut usage = None;
+                let mut id = None;
                 while let Some(key) = map.next_key::<String>()? {
-                    if key == "results" {
-                        results = Some(map.next_value()?);
-                    } else {
-                        map.next_value::<de::IgnoredAny>()?;
+                    match key.as_str() {
+                        "results" => results = Some(map.next_value()?),
+                        "usage" => {
+                            usage = map
+                                .next_value::<Option<Value>>()?
+                                .and_then(|usage| serde_json::from_value::<UsageInfo>(usage).ok());
+                        }
+                        "id" => {
+                            id = map
+                                .next_value::<Option<Value>>()?
+                                .and_then(|id| serde_json::from_value::<StringOrArray>(id).ok());
+                        }
+                        _ => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
                     }
                 }
                 results
-                    .map(|results| RerankWorkerResponse::Object { results })
+                    .map(|results| RerankWorkerResponse { results, usage, id })
                     .ok_or_else(|| de::Error::missing_field("results"))
             }
         }
 
         deserializer.deserialize_any(ResponseVisitor)
-    }
-}
-
-impl RerankWorkerResponse {
-    /// The ranked results in the worker's order.
-    pub fn into_results(self) -> Vec<RerankResult> {
-        match self {
-            Self::List(results) | Self::Object { results } => results,
-        }
     }
 }
 
@@ -299,23 +317,29 @@ pub struct RerankResponse {
 }
 
 impl RerankResponse {
-    /// Create a new RerankResponse with the given results and model
+    /// A response of `results` sorted highest score first, whatever order
+    /// they came in (every rerank contract promises that order; a stable
+    /// sort keeps the worker's order among equal scores), with the model
+    /// that ran, the usage the worker reported and the answer's `id` (the
+    /// client's `rid`, or the worker's id).
     pub fn new(
-        results: Vec<RerankResult>,
+        mut results: Vec<RerankResult>,
         model: String,
-        request_id: Option<StringOrArray>,
+        usage: Option<UsageInfo>,
+        id: Option<StringOrArray>,
     ) -> Self {
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         RerankResponse {
             results,
             model,
-            usage: None,
+            usage,
             object: default_rerank_object(),
-            id: request_id,
+            id,
             created: current_timestamp(),
         }
     }
 
-    /// Apply top_k limit to results
+    /// Keep the `k` best results: the list is sorted highest score first.
     pub fn apply_top_k(&mut self, k: usize) {
         self.results.truncate(k);
     }
@@ -408,5 +432,112 @@ mod tests {
             serde_json::to_value(&with_rid).expect("a body")["rid"],
             "r-1"
         );
+    }
+
+    /// A request without a `user` writes no `user` key, as one without a
+    /// `rid` writes no `rid` key; a set `user` is written.
+    #[test]
+    fn a_rerank_request_without_user_writes_no_user_key() {
+        let request: RerankRequest =
+            serde_json::from_value(json!({"model": "m", "query": "q", "documents": ["d"]}))
+                .expect("a well-formed request");
+        let body = serde_json::to_value(&request).expect("a body");
+        assert!(body.get("user").is_none(), "{body}");
+        let with_user: RerankRequest = serde_json::from_value(
+            json!({"model": "m", "query": "q", "documents": ["d"], "user": "u-1"}),
+        )
+        .expect("a well-formed request");
+        assert_eq!(
+            serde_json::to_value(&with_user).expect("a body")["user"],
+            "u-1"
+        );
+    }
+
+    fn result(index: usize, score: f32) -> RerankResult {
+        RerankResult {
+            score,
+            document: None,
+            index,
+            meta_info: None,
+        }
+    }
+
+    /// The object form's `usage` (in the rerank servers' spelling, without
+    /// `completion_tokens`) and `id` are read with the results; the bare list
+    /// has none.
+    #[test]
+    fn the_worker_s_usage_and_id_are_read_from_the_object_form() {
+        let object: RerankWorkerResponse = serde_json::from_str(
+            r#"{"id":"rerank-up-1","model":"m","results":[{"index":0,"relevance_score":0.5}],"usage":{"prompt_tokens":11,"total_tokens":11},"meta":{"billed_units":{"search_units":1}}}"#,
+        )
+        .expect("the object form reads");
+        assert_eq!(object.results.len(), 1);
+        let usage = object.usage.expect("the object's usage is read");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (11, 0, 11)
+        );
+        assert_eq!(
+            object.id,
+            Some(StringOrArray::String("rerank-up-1".to_string()))
+        );
+        let list: RerankWorkerResponse =
+            serde_json::from_str(r#"[{"index":0,"score":0.5}]"#).expect("the list form reads");
+        assert!(list.usage.is_none() && list.id.is_none());
+    }
+
+    /// A usage in another spelling (no `prompt_tokens`) is left out and the
+    /// results still read, as they did before the usage was read at all.
+    #[test]
+    fn a_usage_in_another_spelling_is_left_out_and_the_results_still_read() {
+        let object: RerankWorkerResponse = serde_json::from_str(
+            r#"{"results":[{"index":0,"relevance_score":0.5}],"usage":{"total_tokens":9}}"#,
+        )
+        .expect("the results read");
+        assert_eq!(object.results.len(), 1);
+        assert!(
+            object.usage.is_none(),
+            "a usage in another spelling is left out"
+        );
+    }
+
+    /// An `id` in another shape (a number, an object) is left out and the
+    /// results still read, as they did before the id was read at all.
+    #[test]
+    fn an_id_in_another_shape_is_left_out_and_the_results_still_read() {
+        for body in [
+            r#"{"id":42,"results":[{"index":0,"relevance_score":0.5}]}"#,
+            r#"{"id":{"req":"x"},"results":[{"index":0,"relevance_score":0.5}]}"#,
+        ] {
+            let object: RerankWorkerResponse =
+                serde_json::from_str(body).expect("the results read");
+            assert_eq!(object.results.len(), 1, "{body}");
+            assert!(
+                object.id.is_none(),
+                "an id in another shape is left out: {body}"
+            );
+        }
+    }
+
+    /// The response's results are sorted highest score first whatever order
+    /// they came in, the worker's order kept among equal scores, and `top_k`
+    /// keeps the best of them.
+    #[test]
+    fn a_response_sorts_by_score_before_the_cut() {
+        let mut response = RerankResponse::new(
+            vec![result(0, 0.1), result(1, 0.9), result(2, 0.9)],
+            "m".to_string(),
+            None,
+            None,
+        );
+        let order: Vec<usize> = response.results.iter().map(|r| r.index).collect();
+        assert_eq!(order, [1, 2, 0]);
+        response.apply_top_k(1);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].index, 1);
     }
 }
