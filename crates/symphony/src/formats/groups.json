@@ -15,6 +15,7 @@
   {"model": "BAAI/AREX-Base", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "BAAI/AREX-Turbo", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "allenai/AstaBrief_8B", "also": ["AstaBrief_8B_SFT"], "table": "qwen3", "opener": null, "after": null},
+  {"model": "internlm/Atria-Dawn", "also": [], "table": "glm", "opener": null, "after": null},
   {"model": "internlm/Atria-Dawn-Preview", "also": ["Atria-Dawn-Preview-Ascend-w8a8"], "table": "glm", "opener": null, "after": null},
   {"model": "baichuan-inc/Baichuan-M3-235B", "also": [], "table": "qwen3", "opener": null, "after": null},
   {"model": "baichuan-inc/BaichuanMed-OCR-7B", "also": ["BaichuanMed-OCR-72B"], "table": "qwen2.5", "opener": null, "after": null},

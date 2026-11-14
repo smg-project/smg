@@ -593,8 +593,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("glm-4.6v", GenerationPrompt::ModelWritesTheThought),
     ("glm-4.6v-flash", GenerationPrompt::ModelWritesTheThought),
     // GLM's compact keyed spelling; the prompt opens the thought, or closes it when the request
-    // turns thinking off; GLM-5.3 opens it whatever the request says.
+    // turns thinking off; GLM-5.3 opens it whatever the request says. Atria-Dawn writes the
+    // preview's template.
     ("atria-dawn-preview", GenerationPrompt::OpensTheThought),
+    ("atria-dawn", GenerationPrompt::OpensTheThought),
     ("glm-4.7", GenerationPrompt::OpensTheThought),
     ("glm-4.7-flash", GenerationPrompt::OpensTheThought),
     ("glm-5", GenerationPrompt::OpensTheThought),
