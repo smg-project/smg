@@ -13,14 +13,29 @@
 #   allocation_calls_per_request        0.08 - 0.22 %               2 %   (the tools path has per-process modes of a few calls per thousand)
 #   kib_requested_per_request           0.01 - 0.02 %               2 %
 #   user_instructions_per_request_M     0.08 - 0.17 %               2 %   (only where perf stat counts; a hosted runner has no PMU)
-#   rss_mb_after_window                 1.3 - 2.6 %                 5 %   (the allocator's decay band)
+#   rss_anon_mb_after_window            0.0 - 5.7 % (see below)     10 %  (the allocator's decay band on the anonymous part)
+#   rss_mb_after_window                 1.3 - 2.6 %                 report only (carries the file part)
+#   rss_file_mb_after_window            follows the page cache      report only
 #   cpu_us_per_request                  6.8 - 18.8 %                report only (load-dependent: the machine's noise, not the code's)
 #
 # The thresholds are ten times the identical-build spread of the exact counts (the perf
 # ledger's bar for a hot-path change is +2 % user instructions and +5 % RSS) and twice the
-# RSS band. The deterministic ids are the judgement; CPU time, cycles, instructions with the
-# kernel share, context switches, large allocations and the peak RSS are report only until
-# the hosted runner's own spread is read from the uploaded results.json files.
+# band of the memory id. The deterministic ids are the judgement; CPU time, cycles,
+# instructions with the kernel share, context switches, large allocations and the peak RSS
+# are report only until the hosted runner's own spread is read from the uploaded
+# results.json files.
+#
+# The memory id is the ANONYMOUS part of the resident set (RssAnon: what the gateway
+# allocated). The whole set also holds the pages of the gateway's own binary the kernel has
+# mapped, and that part follows how much of the measured FILE the page cache holds (a fault
+# maps the cached neighbours of the faulting page), not the code: on the pull-request job
+# the whole set read 7 to 15 % lower on the head on ten runs in a row (30 cells, every
+# head repeat under every base repeat; the head's binary is built first and two more
+# builds push its pages out of the cache), while the anonymous part of the same cells read
+# -2.0 to +2.4 %. The anonymous band is the per-side spread of three repeats of one binary
+# at the job's own cell (4,000 requests, three paths): 95 of 96 samples inside it and one
+# at 10.4 %. 10 % of the part is 2 to 2.5 MB, under the 3 MB that 5 % of the whole set
+# was. The whole set stays in the tables for one release beside its two parts.
 
 repeats = 3
 
@@ -40,6 +55,6 @@ threshold = 0.02
 note = "identical build 0.08 - 0.17 %; present only where perf stat counts instructions"
 
 [[gate]]
-pattern = "/rss_mb_after_window$"
-threshold = 0.05
-note = "identical build 1.3 - 2.6 %; the allocator's decay band"
+pattern = "/rss_anon_mb_after_window$"
+threshold = 0.10
+note = "identical build 0.0 - 5.7 %; the allocator's decay band on the anonymous part; the whole set and the file part are report only"
