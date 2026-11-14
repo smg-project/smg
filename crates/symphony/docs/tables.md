@@ -501,6 +501,21 @@ What the table says beyond the others:
   what the engine's own server delivers for it. A request with no tools anywhere still reads with
   the variant without calls, whatever its `tool_choice`.
 
+- **A JSON answer's quoted spellings are the answer's text under the engine's JSON-answer
+  option.** A model held to a JSON answer may spell a marker in a key or a value, and the
+  table alone reads the spelling as the marker: the answer's own marker inside a string starts
+  its text over and drops the bytes, a quoted thinking marker opens a thought, a quoted close
+  ends the message early, and a quoted close inside a call's arguments ends the call there. The
+  family's own parsers keep such spellings under their JSON mode, in the answer and in a call's
+  arguments alike, and the table reads the same under `Engine::reads_json_answer`, which the
+  gateway sets from the request's response format (`docs/engine.md`): the quote state is read
+  over the answer's text and over a call's arguments (a named-JSON call is one JSON value), a
+  marker inside a string takes no row, and a frame outside the strings is a call as before, its
+  arguments whole when they quote a spelling. The cases are the parsers' own, in the table's
+  tests (`json_answer_tests`), and
+  the recorded `json-string` set of the group replays through the corpus harness, whose
+  engine takes the option from each case's `response_format`.
+
 What the table leaves out, for want of fixtures: image and audio messages, which the template writes
 for the user and never for the model; and the text-mode invocation, `<|content_invoke_tool_text|>`,
 which the gateway's older Inkling parsers drop as protocol data. No recorded set holds one. The

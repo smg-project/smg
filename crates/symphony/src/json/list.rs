@@ -100,6 +100,18 @@ pub struct Assembler {
     /// Whether a `;` followed the lone object: it is held with the whitespace around it until the
     /// next byte decides whether an object follows it, and a `;` nothing follows is text.
     separated: bool,
+    /// Which runs of the last piece's bytes were the list's own value, in order: its objects'
+    /// bytes, its close from inside it, or the prose of an output that is no list. The JSON-answer
+    /// option's quote state steps over these alone
+    /// ([`CallAssembler::quote_value`](crate::engine::CallAssembler::quote_value)): text between
+    /// calls, a malformed list's bytes and the text after the `]` are no JSON value. The capacity
+    /// stays from piece to piece; recorded under `tracked` alone.
+    value: Vec<std::ops::Range<usize>>,
+    /// Whether `value` is recorded: the JSON-answer option asked for it
+    /// ([`CallAssembler::track_value`](crate::engine::CallAssembler::track_value)); off, a feed
+    /// records nothing and `value` stays empty, so a request without the option pays nothing
+    /// per piece for the runs.
+    tracked: bool,
 }
 
 /// What frames the calls: how the first byte that is not whitespace reads, and what text in place
@@ -174,6 +186,8 @@ impl Assembler {
             released: false,
             opener: framing.opener(),
             separated: false,
+            value: Vec::new(),
+            tracked: false,
         }
     }
 
@@ -181,8 +195,35 @@ impl Assembler {
     /// object's argument fragment that lies within `bytes` borrows them (`'d`, the delta's life).
     pub fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) {
         let mut rest = bytes;
+        if !self.tracked {
+            while !rest.is_empty() {
+                rest = self.take(rest, out);
+            }
+            return;
+        }
+        self.value.clear();
         while !rest.is_empty() {
+            let at = bytes.len() - rest.len();
+            let from_object = matches!(self.stage, Stage::Object(_));
+            let from_inside = from_object || matches!(self.stage, Stage::Between);
             rest = self.take(rest, out);
+            // A take's bytes are the value's by the stage it ends in: an object took them, they are
+            // the prose of an output that is no list, or they closed the list from inside it. The
+            // `[`, the whitespace and commas between objects, text between calls, a malformed list's
+            // bytes and the text after the `]` are not, whichever piece they arrive in.
+            let counted = match self.stage {
+                Stage::Object(_) | Stage::Content => true,
+                Stage::After => from_inside,
+                Stage::Between => from_object,
+                Stage::Deciding | Stage::Opening { .. } | Stage::Malformed => false,
+            };
+            if counted {
+                let end = bytes.len() - rest.len();
+                match self.value.last_mut() {
+                    Some(run) if run.end == at => run.end = end,
+                    _ => self.value.push(at..end),
+                }
+            }
         }
     }
 
@@ -474,6 +515,19 @@ impl crate::engine::CallAssembler for Assembler {
         !self.framed && matches!(self.stage, Stage::Object(_))
     }
 
+    /// The value runs are recorded from this call on: the quote state will ask for them.
+    fn track_value(&mut self) {
+        self.tracked = true;
+    }
+
+    /// The list's own value: its objects, its close; nothing between calls, nothing where a
+    /// malformed list should be, nothing after its `]`.
+    fn quote_value(&self, taken: usize, piece: &str, quoted: &mut crate::engine::Quoted) {
+        for run in &self.value {
+            quoted.advance(&piece[run.start.min(taken)..run.end.min(taken)]);
+        }
+    }
+
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
         (*self).close(out);
         false
@@ -500,6 +554,23 @@ mod tests {
         "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, ",
         "{\"name\": \"get_stock_price\", \"arguments\": {}}]"
     );
+
+    #[test]
+    fn the_value_runs_are_recorded_under_the_json_answer_option_alone() {
+        // A request without the option pays nothing per piece for the runs: an untracked feed
+        // records none, whatever the bytes; told, the same feed records the prose as one run.
+        let mut out = Events::new();
+        let mut untracked = Assembler::new(0, ids(), Framing::Bare);
+        untracked.feed("The forecast ", &mut out);
+        untracked.feed("stays mild", &mut out);
+        assert!(untracked.value.is_empty());
+        let mut tracked = Assembler::new(0, ids(), Framing::Bare);
+        crate::engine::CallAssembler::track_value(&mut tracked);
+        tracked.feed("The forecast ", &mut out);
+        assert_eq!(tracked.value, vec![0..13]);
+        tracked.feed("stays mild", &mut out);
+        assert_eq!(tracked.value, vec![0..10]);
+    }
 
     fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, ids(), Framing::Bare);
