@@ -24,7 +24,7 @@ use crate::{
     },
     factory::StoreContactError,
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
-    schema::SchemaConfig,
+    schema::{SchemaConfig, TableConfig},
     versioning::{
         postgres_create_versions_table, postgres_current_version, postgres_table_exists,
         postgres_table_exists_sql, run_postgres_migrations, schema_ahead_check,
@@ -531,7 +531,7 @@ impl PostgresConversationStorage {
 
     /// The columns a conversation is read with: the id, then its creation
     /// time, metadata and tenant when the schema keeps them.
-    fn row_columns(s: &crate::schema::TableConfig) -> Vec<String> {
+    fn row_columns(s: &TableConfig) -> Vec<String> {
         let mut columns = vec![s.col("id").to_string()];
         for name in ["created_at", "metadata", "tenant"] {
             if !s.is_skipped(name) {
@@ -543,7 +543,7 @@ impl PostgresConversationStorage {
 
     /// The conversation a row read with [`Self::row_columns`] holds.
     fn conversation_from_row(
-        s: &crate::schema::TableConfig,
+        s: &TableConfig,
         row: &Row,
     ) -> Result<Conversation, ConversationStorageError> {
         let id_str: String = row.get(s.col("id"));
@@ -1157,7 +1157,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
 /// the `is_skipped` guards configured in `TableConfig`.
 fn build_item_from_row(
     row: &Row,
-    si: &crate::schema::TableConfig,
+    si: &TableConfig,
 ) -> Result<ConversationItem, ConversationItemStorageError> {
     let id: String = row.get(si.col("id"));
     let response_id: Option<String> = if si.is_skipped("response_id") {
@@ -1450,7 +1450,7 @@ impl PostgresResponseStorage {
 /// those stored under the caller's (see
 /// [`tenant_scope_allows`](crate::core::tenant_scope_allows)). `None` when
 /// the schema skips the column: every row is served then, as before.
-fn tenant_scope_sql(s: &crate::schema::TableConfig, param: usize) -> Option<String> {
+fn tenant_scope_sql(s: &TableConfig, param: usize) -> Option<String> {
     if s.is_skipped("tenant") {
         return None;
     }
@@ -1718,7 +1718,7 @@ fn locked_merge_sql(table: &str, col_names: &[&str]) -> String {
     reason = "the previous id is pushed as a `&dyn ToSql` that lives as long as the caller's `Option<String>`"
 )]
 fn write_columns<'a>(
-    s: &'a crate::schema::TableConfig,
+    s: &'a TableConfig,
     response: &'a StoredResponse,
     previous_id: &'a Option<String>,
     extra_cols: &'a [(&'a str, Option<String>)],
@@ -1779,7 +1779,7 @@ fn open_predicate(col_raw: &str) -> String {
 /// [`open_predicate`] over the schema's object column; none when the schema
 /// skips it: there is no status to check, so the conditional store is a plain
 /// update of the row under the id (every backend of this crate agrees).
-fn open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+fn open_predicate_for(s: &TableConfig) -> Option<String> {
     (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")))
 }
 
@@ -2431,12 +2431,12 @@ mod tests {
 
     #[test]
     fn the_tenant_scope_condition_serves_untenanted_rows_and_the_callers_own() {
-        let s = crate::schema::TableConfig::with_table("responses");
+        let s = TableConfig::with_table("responses");
         assert_eq!(
             tenant_scope_sql(&s, 2).as_deref(),
             Some(" AND (tenant IS NULL OR tenant = $2)")
         );
-        let mut skipped = crate::schema::TableConfig::with_table("responses");
+        let mut skipped = TableConfig::with_table("responses");
         skipped.skip_columns.insert("tenant".to_string());
         assert_eq!(tenant_scope_sql(&skipped, 2), None);
     }
@@ -2490,7 +2490,7 @@ mod tests {
 
     #[test]
     fn a_schema_without_the_object_column_has_no_open_condition() {
-        let mut s = crate::schema::TableConfig::with_table("responses");
+        let mut s = TableConfig::with_table("responses");
         s.columns
             .insert("raw_response".to_string(), "payload".to_string());
         assert_eq!(
