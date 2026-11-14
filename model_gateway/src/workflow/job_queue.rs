@@ -2111,13 +2111,13 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn a_cancelled_registrations_warning_and_status_name_its_worker_masked() {
-        use crate::service_discovery::testing::live_app_context;
-        let port = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("a loopback port")
-            .local_addr()
-            .expect("the bound address")
-            .port();
+        use crate::{
+            service_discovery::testing::live_app_context, worker::test_support::RefusedAddress,
+        };
+        // Held for the whole case: no other case's listener can draw the
+        // port and answer a registration's probe.
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         let first = format!("http://alice:s3cret-a@127.0.0.1:{port}");
         let second = format!("http://bob:s3cret-b@127.0.0.1:{port}");
         let context = live_app_context();
@@ -2128,9 +2128,15 @@ mod tests {
         let jobs = [add(&first), add(&second)];
         let marks = DashSet::new();
         let cancel_one_then_the_other = async {
-            while registrations_running(&context).await < 2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            // Bounded: a registration that ended before the cancel is a red
+            // case, never a wait without end.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while registrations_running(&context).await < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("two registrations running within the bound");
             let ended = JobQueue::cancel_registration_states(&context, &first).await;
             assert_eq!(ended, Ok((1, false)), "the first address ends its own");
             assert_eq!(
