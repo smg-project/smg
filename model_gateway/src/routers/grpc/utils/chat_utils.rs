@@ -24,8 +24,8 @@ use llm_tokenizer::{
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
-        ContentPart, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice,
-        ToolChoiceValue,
+        ContentPart, FunctionCallResponse, ResponseFormat, StringOrArray, Tool, ToolCall,
+        ToolChoice, ToolChoiceValue,
     },
     generate::GenerateFinishReason,
     profile::ProviderProfile,
@@ -1242,6 +1242,27 @@ pub(crate) fn process_chat_messages_with_placeholders(
             build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name(), |name| {
                 tokenizer.template_reads(name)
             });
+
+        // A renderer may constrain JSON responses: the actual response format
+        // and the continuation the render will take (an explicit template
+        // argument over the request field) decide the check.
+        if matches!(
+            request.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        ) {
+            let continuation = combined_template_kwargs
+                .get("continue_final_message")
+                .and_then(Value::as_bool)
+                .unwrap_or(request.continue_final_message);
+            let assistant_prefix = transformed_messages
+                .last()
+                .filter(|message| continuation && message["role"] == "assistant")
+                .and_then(|message| message["content"].as_str());
+            tokenizer
+                .renderer_capabilities()
+                .validate_json_response(request.separate_reasoning, assistant_prefix)
+                .map_err(|error| error.to_string())?;
+        }
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None

@@ -280,6 +280,19 @@ async fn prepare_placeholder_tokens_with_env(
         );
         return Ok(PlaceholderTokens::worker_only());
     };
+    // Reject request overrides before the media connector can resize pixels.
+    if spec.name() == "inkling2" {
+        anyhow::ensure!(
+            !plan.parts.iter().any(|part| matches!(
+                part,
+                MediaContentPart::ImageUrl {
+                    max_long_side_pixel: Some(_),
+                    ..
+                }
+            )),
+            "Inkling2 requires original image dimensions. max_long_side_pixel is unsupported"
+        );
+    }
     let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
         anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
     })?;
@@ -1213,5 +1226,151 @@ pub(crate) mod tests {
         );
         assert!(message.contains("no media spec"), "{message}");
         assert!(message.contains("--mm-processing worker"), "{message}");
+    }
+
+    /// A chat request with one image part, its `max_long_side_pixel` as `cap`.
+    fn image_chat_plan(cap: Option<serde_json::Value>) -> MediaPlan {
+        let mut image_url = serde_json::json!({"url": "https://invalid.example/image.png"});
+        if let Some(cap) = cap {
+            image_url["max_long_side_pixel"] = cap;
+        }
+        let request: openai_protocol::chat::ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "checkpoint",
+                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": image_url}]}]
+            }))
+            .unwrap();
+        super::super::media_plan_chat(&request.messages)
+    }
+
+    fn image_components(config: serde_json::Value) -> MultimodalComponents {
+        let components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        components.config_registry.insert(
+            "image-plan-test".to_string(),
+            Arc::new(MultimodalModelConfig::new(
+                config,
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        components
+    }
+
+    fn image_tokenizer() -> (
+        tempfile::TempDir,
+        llm_tokenizer::huggingface::HuggingFaceTokenizer,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"<|image_pad|>":1,"<|unused_200054|>":200054},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        let tokenizer =
+            llm_tokenizer::huggingface::HuggingFaceTokenizer::from_file(path.to_str().unwrap())
+                .unwrap();
+        (dir, tokenizer)
+    }
+
+    async fn image_placeholders(
+        plan: &MediaPlan,
+        model_id: &str,
+        tokenizer: &dyn TokenizerTrait,
+        components: &MultimodalComponents,
+    ) -> Result<PlaceholderTokens> {
+        prepare_placeholder_tokens_with_env(
+            plan,
+            model_id,
+            tokenizer,
+            components,
+            "image-plan-test",
+            "unused-local-source",
+            &HashMap::new(),
+            |_| true,
+            |_| None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn inkling2_image_plan_rejects_request_resize_before_fetch() {
+        let tokenizer = MockTokenizer::new();
+        for config in [
+            serde_json::json!({"model_type": "inkling2"}),
+            serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+        ] {
+            let components = image_components(config);
+            for cap in [0, 504, u32::MAX] {
+                let plan = image_chat_plan(Some(serde_json::json!(cap)));
+                let error = image_placeholders(&plan, "checkpoint", &tokenizer, &components)
+                    .await
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("max_long_side_pixel is unsupported"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inkling2_image_plan_accepts_missing_or_null_resize() {
+        let (_dir, tokenizer) = image_tokenizer();
+        for config in [
+            serde_json::json!({"model_type": "inkling2"}),
+            serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+        ] {
+            let components = image_components(config);
+            for cap in [None, Some(serde_json::Value::Null)] {
+                let placeholders = image_placeholders(
+                    &image_chat_plan(cap),
+                    "checkpoint",
+                    &tokenizer,
+                    &components,
+                )
+                .await
+                .unwrap();
+                assert_eq!(placeholders.get(Modality::Image), Some("<|unused_200054|>"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_plan_preserves_resize_for_other_model_specs() {
+        let (_dir, tokenizer) = image_tokenizer();
+        for (model_id, config, placeholder) in [
+            (
+                "org/inkling2-name-only",
+                serde_json::json!({"model_type": "inkling_mm_model", "vision_config": {"decoder_dmodel": 1}}),
+                "<|unused_200054|>",
+            ),
+            (
+                "org/inkling2-name-only",
+                serde_json::json!({"architectures": ["Inkling2ForConditionalGenerationSuffix"], "vision_config": {"decoder_dmodel": 1}}),
+                "<|unused_200054|>",
+            ),
+            (
+                "qwen2-vl",
+                serde_json::json!({"model_type": "qwen2_vl"}),
+                "<|image_pad|>",
+            ),
+        ] {
+            let components = image_components(config);
+            let placeholders = image_placeholders(
+                &image_chat_plan(Some(serde_json::json!(504))),
+                model_id,
+                &tokenizer,
+                &components,
+            )
+            .await
+            .unwrap();
+            assert_eq!(placeholders.get(Modality::Image), Some(placeholder));
+        }
     }
 }
