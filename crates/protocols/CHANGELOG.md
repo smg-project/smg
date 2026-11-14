@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An Interactions request with a typed `response_format` (`text`, `image`, `audio` or `video`, or
+  a list of them), which names its own `mime_type`, validates without `response_mime_type`, as the
+  public API's polymorphic field takes it. Only the legacy form, a raw JSON schema, still needs
+  `response_mime_type`, which the public API has deprecated. Every typed format had been refused
+  as `response_mime_type_required`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
