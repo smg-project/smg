@@ -1090,7 +1090,9 @@ pub enum Tool {
     /// it and falls through, while CustomTool JSON with "type" would incorrectly
     /// match ToolSearchTool's less-restrictive shape if tried first)
     Custom(CustomTool),
-    /// Tool search tool
+    /// Tool search tool, and every other Anthropic-defined tool: a tool with a
+    /// `type` and a `name` and no `input_schema` that reads as one reads here,
+    /// its configuration kept in [`ToolSearchTool::extra`].
     ToolSearch(ToolSearchTool),
     /// Bash tool (computer use)
     Bash(BashTool),
@@ -2744,7 +2746,10 @@ pub enum WebFetchToolResultErrorCode {
 // Beta Features - Tool Search Types
 // ============================================================================
 
-/// Tool search tool (beta)
+/// Tool search tool (beta). The untagged [`Tool`] reads every
+/// Anthropic-defined tool (web search, web fetch, computer use, bash, the text
+/// editor, ...) as this one, so the keys those tools take beyond `type` and
+/// `name` ride in [`Self::extra`].
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolSearchTool {
@@ -2758,6 +2763,12 @@ pub struct ToolSearchTool {
 
     /// Cache control for this tool
     pub cache_control: Option<CacheControl>,
+
+    /// The tool's other keys (a web search tool's domain filters and use cap,
+    /// a computer tool's display size, `defer_loading`, `strict`, ...),
+    /// forwarded as written.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Tool reference block (beta) - returned by tool search
@@ -3704,6 +3715,44 @@ mod tests {
                 "Expected McpToolset, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    /// An Anthropic-defined tool reads as `ToolSearch` and is written back as
+    /// the client sent it, its configuration included: a web search tool's
+    /// domain filters, use cap and location, a web fetch tool's, a computer
+    /// tool's display size, a text editor's `max_characters`, and a bash
+    /// tool's `defer_loading`, `strict` and `input_examples`.
+    #[test]
+    fn an_anthropic_defined_tool_keeps_its_configuration() {
+        for tool in [
+            json!({
+                "type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["example.com"], "max_uses": 3,
+                "user_location": {"type": "approximate", "city": "Paris", "country": "FR"}
+            }),
+            json!({
+                "type": "web_fetch_20250910", "name": "web_fetch",
+                "blocked_domains": ["example.org"], "max_uses": 2,
+                "max_content_tokens": 1000, "citations": {"enabled": true}
+            }),
+            json!({
+                "type": "computer_20250124", "name": "computer",
+                "display_width_px": 1024, "display_height_px": 768, "display_number": 1
+            }),
+            json!({
+                "type": "text_editor_20250728", "name": "str_replace_based_edit_tool",
+                "max_characters": 10000
+            }),
+            json!({
+                "type": "bash_20250124", "name": "bash", "defer_loading": true,
+                "strict": true, "input_examples": [{"command": "ls"}]
+            }),
+        ] {
+            let parsed: Tool =
+                serde_json::from_value(tool.clone()).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(matches!(parsed, Tool::ToolSearch(_)), "{tool}");
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), tool);
         }
     }
 

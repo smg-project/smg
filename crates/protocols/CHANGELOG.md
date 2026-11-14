@@ -103,6 +103,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages request's Anthropic-defined tools keep their configuration when the request is
+  written back for an upstream: a web search or web fetch tool's domain filters, use cap and
+  location, a computer tool's display size, a text editor's `max_characters`, and any tool's
+  `defer_loading`, `strict` or `input_examples`. The untagged `Tool` reads every tool with a
+  `type` and a `name` and no `input_schema` as `ToolSearch`, which kept only those two keys,
+  `allowed_callers` and `cache_control`, so the provider route dropped the rest. Breaking:
+  `ToolSearchTool` gains `extra: Map<String, Value>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
