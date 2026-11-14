@@ -61,6 +61,7 @@ from smg_grpc_servicer.sglang.loads import (
     load_record,
     ranks_with_a_window,
 )
+from smg_grpc_servicer.sglang.lora import PreloadedLoras
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -174,6 +175,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.loras = PreloadedLoras(server_args)
         # SamplingParams.normalize requires a tokenizer whenever string stops
         # are used; the scheduler matches them with its own tokenizer.
         if server_args.skip_tokenizer_init:
@@ -218,6 +220,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.request_manager.auto_create_handle_loop()
 
         logger.info("gRPC scheduler servicer initialized")
+
+    async def ListLoadedLoRAAdapters(
+        self,
+        request: sglang_scheduler_pb2.ListLoadedLoRAAdaptersRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse:
+        return sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse(
+            loaded_adapters=self.loras.adapters
+        )
 
     async def Generate(
         self,
@@ -1015,7 +1026,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ),
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
-            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
+            lora_id=self.loras.resolve(grpc_req.lora_id) if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),

@@ -227,7 +227,7 @@ impl HarmonyResponseProcessor {
         let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
-        let response = ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
             .created(dispatch.created)
             .choices(choices)
             .usage(usage)

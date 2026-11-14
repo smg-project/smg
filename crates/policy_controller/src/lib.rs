@@ -41,14 +41,22 @@
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`elector::Fence`] a shard thread reads before every decision it sends.
 //!
+//! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
+//!   path (the `GetLoads` poll per engine under the store's poll
+//!   arbitration, the metrics scrape of an engine without a servicer) and
+//!   the load helpers the gateway shares with the controller (the row
+//!   conversion, the scrape parser). The KV subscription, the prober and
+//!   discovery arrive in the step's later PRs.
+//!
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness and the drain,
-//!   and the binary of the package's name over them. The scopes' calls, the
-//!   ingestion drivers and the election arrive in the step's later PRs.
+//!   the load driver over the store, and the binary of the package's name
+//!   over them. The scopes' calls and the election arrive in the step's
+//!   later PRs.
 //!
 //! What this step does not hold: the plugin hosts, the operator calls, the
-//! ingestion drivers and the gRPC API; they arrive in later
+//! other ingestion drivers and the gRPC API; they arrive in later
 //! steps and build on these types. The
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
@@ -60,6 +68,8 @@ pub mod controller;
 pub mod decision;
 pub mod elector;
 pub mod framework;
+#[cfg(feature = "ingest")]
+pub mod ingest;
 pub mod lease;
 pub mod ring;
 pub mod sessions;
