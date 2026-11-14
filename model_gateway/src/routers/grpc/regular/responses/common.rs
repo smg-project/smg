@@ -40,17 +40,21 @@ use crate::{
 // ============================================================================
 
 /// State for tracking multi-turn tool calling loop
+///
+/// The state holds no copy of the request: the loop owns its request and
+/// rebuilds it in place each iteration ([`build_next_request`]), so the input
+/// the loop started from (the request's history loaded, a stored turn's tool
+/// calls and outputs in front of the calls this loop executes) is carried by
+/// the request itself and copied by no iteration.
+#[derive(Default)]
 pub(super) struct ToolLoopState {
-    tools: Option<Vec<responses::ResponseTool>>,
     pub iteration: usize,
     pub total_calls: usize,
     pub usage: Option<ResponseUsage>,
-    /// The calls this loop executed, each with its output, in order.
-    pub conversation_history: Vec<ResponseInputOutputItem>,
-    /// The input the loop started from, the request's history loaded: every
-    /// later iteration is rebuilt on it, so a stored turn's tool calls and
-    /// their outputs stay in front of the calls this loop executes.
-    pub base_input: ResponseInput,
+    /// The calls this loop executed since its request was last built, each
+    /// with its output, in order: the next build moves them into the request
+    /// behind the items it already carries.
+    pub calls_to_carry: Vec<ResponseInputOutputItem>,
     pub mcp_call_items: Vec<ResponseOutputItem>,
 }
 
@@ -64,19 +68,6 @@ pub(super) struct ResponsesCallContext {
 }
 
 impl ToolLoopState {
-    /// `request` is the request the loop starts from, its history loaded.
-    pub fn new(request: &ResponsesRequest) -> Self {
-        Self {
-            tools: request.tools.clone(),
-            iteration: 0,
-            total_calls: 0,
-            usage: None,
-            conversation_history: Vec::new(),
-            base_input: request.input.clone(),
-            mcp_call_items: Vec::new(),
-        }
-    }
-
     /// Usage is per model request; missing reports must not erase prior totals.
     pub fn record_usage(&mut self, usage: Option<&Usage>) {
         let Some(usage) = usage else {
@@ -110,19 +101,21 @@ impl ToolLoopState {
         }
     }
 
+    /// `tools` are the request's own tool definitions, read for the call's
+    /// namespace; the loop's request carries them, so the state keeps no copy.
     pub fn record_call(
         &mut self,
+        tools: Option<&[responses::ResponseTool]>,
         call_id: String,
         tool_name: String,
         args_json_str: String,
         output_str: String,
         output_item: ResponseOutputItem,
-        _success: bool,
     ) {
         // Add function_tool_call item with both arguments and output
         let id = call_id.clone();
-        let (name, namespace) = resolve_function_identity(self.tools.as_deref(), &tool_name);
-        self.conversation_history
+        let (name, namespace) = resolve_function_identity(tools, &tool_name);
+        self.calls_to_carry
             .push(ResponseInputOutputItem::FunctionToolCall {
                 id: Some(id),
                 call_id,
@@ -316,15 +309,18 @@ pub(super) fn dispatch_arguments(
     arguments
 }
 
-/// An executed MCP call's metrics and its place in the loop's history.
+/// An executed MCP call's metrics and its place in the loop's history;
+/// `request` is the loop's current request (its model labels the metrics, its
+/// tools name the call's namespace).
 pub(super) fn record_mcp_call(
     state: &mut ToolLoopState,
-    model: &str,
+    request: &ResponsesRequest,
     output: ToolExecutionOutput,
     output_str: String,
     output_item: ResponseOutputItem,
 ) {
     let success = !output.is_error;
+    let model = request.model.as_str();
     Metrics::record_mcp_tool_duration(model, &output.tool_name, output.duration);
     Metrics::record_mcp_tool_call(
         model,
@@ -336,12 +332,12 @@ pub(super) fn record_mcp_call(
         },
     );
     state.record_call(
+        request.tools.as_deref(),
         output.call_id,
         output.tool_name,
         output.arguments_str,
         output_str,
         output_item,
-        success,
     );
 }
 
@@ -350,16 +346,17 @@ pub(super) fn convert_mcp_tools_to_chat_tools(session: &McpToolSession<'_>) -> V
 }
 
 /// Build next request with updated conversation history: the input the loop
-/// started from, then every call this loop executed with its output.
+/// started from, then every call this loop executed with its output. The
+/// items the request already carries are moved into the next request as they
+/// are (the loaded input is turned into items once, on the first build) and
+/// the calls recorded since the last build are moved in behind them: no
+/// iteration copies the base input or the calls before it.
 pub(super) fn build_next_request(
-    state: &ToolLoopState,
+    state: &mut ToolLoopState,
     current_request: ResponsesRequest,
 ) -> ResponsesRequest {
-    // Every iteration is rebuilt on the loop's base input, so this copy is the
-    // one the rebuild needs; the normaliser moves it through instead of
-    // copying each item once more.
-    let mut input_items = current_input_items(state.base_input.clone());
-    input_items.extend_from_slice(&state.conversation_history);
+    let mut input_items = current_input_items(current_request.input);
+    input_items.append(&mut state.calls_to_carry);
 
     // Build new request for next iteration, moving fields from old request to avoid cloning
     ResponsesRequest {
@@ -415,8 +412,9 @@ mod namespace_tests {
     #[test]
     fn namespace_replay_preserves_structured_identity() {
         let request: ResponsesRequest = namespace_test_request();
-        let mut state = ToolLoopState::new(&request);
+        let mut state = ToolLoopState::default();
         state.record_call(
+            request.tools.as_deref(),
             "call_test".into(),
             "weather.lookup".into(),
             "{}".into(),
@@ -429,9 +427,8 @@ mod namespace_tests {
                 None,
                 "completed".into(),
             ),
-            true,
         );
-        let wire = serde_json::to_value(&state.conversation_history[0]).unwrap();
+        let wire = serde_json::to_value(&state.calls_to_carry[0]).unwrap();
 
         assert_eq!(wire["name"], "lookup");
         assert_eq!(wire["namespace"], "weather");
@@ -482,7 +479,7 @@ mod usage_tests {
 
     #[test]
     fn mcp_usage_accumulates_reasoning_and_cache_and_survives_missing_usage() {
-        let mut state = ToolLoopState::new(&ResponsesRequest::default());
+        let mut state = ToolLoopState::default();
         state.record_usage(None);
         assert!(state.usage.is_none());
         state.record_usage(Some(
@@ -560,8 +557,9 @@ mod history_tests {
             .collect();
         assert_eq!(turns, ["user", "assistant+tool_calls", "tool"]);
 
-        let mut state = ToolLoopState::new(&loaded);
+        let mut state = ToolLoopState::default();
         state.record_call(
+            loaded.tools.as_deref(),
             "call_B".to_string(),
             "search".to_string(),
             "{}".to_string(),
@@ -574,9 +572,8 @@ mod history_tests {
                 None,
                 "completed".to_string(),
             ),
-            true,
         );
-        let next = build_next_request(&state, loaded);
+        let next = build_next_request(&mut state, loaded);
 
         let ResponseInput::Items(items) = &next.input else {
             panic!("the next request's input is an item list");
@@ -592,6 +589,73 @@ mod history_tests {
         );
         assert_eq!(next.conversation, None);
         assert_eq!(next.store, Some(false));
+    }
+
+    /// The rebuild carries the loaded items themselves: the loaded message's
+    /// content buffer sits at the same address in the next request (moved,
+    /// not copied), the call this loop executed is moved in behind it, and
+    /// the state keeps no copy of the input. Pinned so the next change that
+    /// clones the input into the state, or rebuilds the request from that
+    /// copy, fails here instead of restoring a per-request copy of a whole
+    /// thread that the bed's counts would show only as drift.
+    #[test]
+    fn the_rebuild_moves_the_loaded_items_instead_of_copying_them() {
+        let loaded = ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::Message {
+                id: "msg_1".to_string(),
+                role: "user".to_string(),
+                content: vec![responses::ResponseContentPart::InputText {
+                    text: "What is 6*7?".to_string(),
+                }],
+                status: Some("completed".to_string()),
+                phase: None,
+            }]),
+            ..Default::default()
+        };
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded request's input is an item list");
+        };
+        let ResponseInputOutputItem::Message { content, .. } = &items[0] else {
+            panic!("the loaded message leads the loaded input");
+        };
+        let content_before = content.as_ptr();
+
+        let mut state = ToolLoopState::default();
+        state.record_call(
+            loaded.tools.as_deref(),
+            "call_B".to_string(),
+            "search".to_string(),
+            "{}".to_string(),
+            "found".to_string(),
+            ResponseOutputItem::new_function_tool_call(
+                "fc_B".to_string(),
+                "call_B".to_string(),
+                "search".to_string(),
+                "{}".to_string(),
+                None,
+                "completed".to_string(),
+            ),
+        );
+        let next = build_next_request(&mut state, loaded);
+
+        let ResponseInput::Items(items) = &next.input else {
+            panic!("the next request's input is an item list");
+        };
+        assert_eq!(
+            shape(items),
+            ["message:user", "function_call:call_B+output"]
+        );
+        let ResponseInputOutputItem::Message { content, .. } = &items[0] else {
+            panic!("the loaded message leads the next request's input");
+        };
+        assert!(
+            std::ptr::eq(content.as_ptr(), content_before),
+            "the loaded message's content was copied into the next request instead of moved"
+        );
+        assert!(
+            state.calls_to_carry.is_empty(),
+            "the executed call was copied into the next request instead of moved"
+        );
     }
 
     /// A chain longer than the store keeps reloads as its newest turns, and
