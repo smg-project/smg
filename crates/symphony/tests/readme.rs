@@ -1483,11 +1483,21 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "ling-3.0-flash",
         model: "inclusionAI/Ling-3.0-flash",
-        also: &["Ling-3.0-flash-fp4"],
+        also: &["Ling-3.0-flash-fp4", "Ling-3.0-flash-Sante"],
         released: "2026-08-02",
         smg: (None, None),
         table: Some(Table::Ling),
         set: Some(589_298),
+        status: Status::Replaying,
+    },
+    Group {
+        slug: "ling-3.1-flash",
+        model: "inclusionAI/Ling-3.1-flash",
+        also: &["Ling-3.1-flash-1019"],
+        released: "2026-10-13",
+        smg: (None, None),
+        table: Some(Table::Ling),
+        set: Some(28),
         status: Status::Replaying,
     },
     Group {
