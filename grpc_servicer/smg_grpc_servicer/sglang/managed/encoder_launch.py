@@ -1,14 +1,13 @@
 """Explicit SMG encoder control service with the native receiver HTTP facade."""
 
-import argparse
 import asyncio
 import json
 import logging
 import os
 import signal
+import sys
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
 
 from .plugin import INSTANCE_ENV, ROLE_ENV, WORKER_ENV
 
@@ -53,7 +52,7 @@ async def serve(config, args):
     from smg.smg_rs import ManagedEncoderProcessor
     from smg_grpc_proto.generated import sglang_managed_pb2_grpc as rpc
 
-    from .config import encoder_cpu_limit
+    from .config import encoder_cpu_limit, encoder_staging_bytes
     from .encoder_bridge import launch_runtime
     from .encoder_service import EncoderService, Rejected
 
@@ -62,6 +61,9 @@ async def serve(config, args):
     try:
         # These are ceilings, not a fixed running concurrency. The registry starts
         # small and grows only when CPU supply leaves the native scheduler idle.
+        config["max_staging_bytes_per_request"] = encoder_staging_bytes(
+            backend.encoder.model_config.hidden_size, config["embedding_dtype"]
+        )
         config["max_cpu"] = encoder_cpu_limit(config, backend.scheduler.max_batch_size)
         config["processor_options"]["max_inflight"] = config["max_cpu"]
         processor = ManagedEncoderProcessor(
@@ -186,15 +188,12 @@ async def shutdown(service, server, backend, timeout):
 
 def main():
     """Require finite deployment limits and assign a fresh instance generation at startup."""
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--managed-config", required=True)
-    managed, native = parser.parse_known_args()
     from sglang.srt.server_args import prepare_server_args
 
     from .config import complete, encoder_window
 
-    args = prepare_server_args(native)
-    config = complete(json.loads(Path(managed.managed_config).read_text()), args, "encoder")
+    args = prepare_server_args(sys.argv[1:])
+    config = complete({}, args, "encoder")
     positive = (
         "max_records",
         "max_active",

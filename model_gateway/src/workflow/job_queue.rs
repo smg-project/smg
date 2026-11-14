@@ -1199,6 +1199,11 @@ impl JobQueue {
                     .await
             }
             Job::InitializeWorkersFromConfig { router_config } => {
+                if router_config.sglang_managed_epd {
+                    return Ok(
+                        "SGLang EPD pools are owned by the managed capability registry".into(),
+                    );
+                }
                 let api_key = router_config.api_key.clone();
                 let mut worker_count = 0;
 

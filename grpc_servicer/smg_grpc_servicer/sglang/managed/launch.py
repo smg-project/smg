@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import uuid
-from pathlib import Path
 
 from .plugin import EVENTS_ENV, INSTANCE_ENV, ROLE_ENV, WORKER_ENV
 
@@ -66,17 +65,12 @@ def launcher(config):
 
 def main():
     """Load finite limits explicitly and assign a new process fence on every launch."""
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--managed-config", required=True)
-    managed, native_args = parser.parse_known_args()
     from sglang.srt.server_args import prepare_server_args
 
     from .config import complete
 
-    args = prepare_server_args(native_args)
-    config = complete(
-        json.loads(Path(managed.managed_config).read_text()), args, args.disaggregation_mode
-    )
+    args = prepare_server_args(sys.argv[1:])
+    config = complete({}, args, args.disaggregation_mode)
     if config["role"] not in ("prefill", "decode"):
         raise ValueError("managed P/D requires native --disaggregation-mode prefill or decode")
     config["generation"] = uuid.uuid4().hex

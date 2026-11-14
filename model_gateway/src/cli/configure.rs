@@ -1125,7 +1125,9 @@ impl CliArgs {
             enable_trace: self.integrations.enable_trace,
             otlp_traces_endpoint: self.integrations.otlp_traces_endpoint.clone(),
         });
-        let connection_mode = if self.routing.sglang_managed_epd.is_some() {
+        let sglang_managed_epd =
+            self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang));
+        let connection_mode = if sglang_managed_epd {
             ConnectionMode::Grpc
         } else {
             Self::determine_connection_mode(&Self::startup_worker_urls(&mode))
@@ -1155,7 +1157,7 @@ impl CliArgs {
 
         let builder = RouterConfig::builder()
             .mode(mode)
-            .sglang_managed_epd(self.routing.sglang_managed_epd.clone())
+            .sglang_managed_epd(sglang_managed_epd)
             .policy(policy)
             .cache_boundaries(self.routing.cache_boundaries.clone())
             .connection_mode(connection_mode)

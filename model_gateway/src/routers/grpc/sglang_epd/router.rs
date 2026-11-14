@@ -56,6 +56,7 @@ use crate::{
 
 pub struct ManagedRouter {
     config: Config,
+    aliases: std::collections::HashMap<String, String>,
     tokenizer: Arc<dyn Tokenizer>,
     registry: Arc<Registry>,
     executor: Executor,
@@ -97,12 +98,12 @@ impl ManagedRouter {
     }
 
     /// Build the independent planner while retaining the gateway's auth and response machinery.
-    pub async fn new(ctx: &Arc<AppContext>, path: &str) -> Result<Self, String> {
-        let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
-        if bytes.len() > 65536 {
-            return Err("managed deployment configuration exceeds 64 KiB".into());
-        }
-        let config: Config = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
+        let mut config = Config::from_router(&ctx.router_config).map_err(|e| e.to_string())?;
+        config
+            .discover_revision(&ctx.router_config)
+            .await
+            .map_err(|e| e.to_string())?;
         let config = config.resolve().map_err(|e| e.to_string())?;
         let model: Value = serde_json::from_slice(
             &tokio::fs::read(std::path::Path::new(&config.model_path).join("config.json"))
@@ -113,9 +114,14 @@ impl ManagedRouter {
         if model["model_type"].as_str() != Some("qwen3_vl") {
             return Err("managed EPD has no validated layout adapter for this model family".into());
         }
-        let tokenizer = create_tokenizer_async(&config.model_path)
-            .await
-            .map_err(|e| e.to_string())?;
+        let tokenizer = create_tokenizer_async(
+            ctx.router_config
+                .tokenizer_path
+                .as_deref()
+                .unwrap_or(&config.model_path),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let tool = ctx
             .tool_parser_factory
             .clone()
@@ -147,6 +153,7 @@ impl ManagedRouter {
         )
         .map_err(|e| e.to_string())?;
         Ok(Self {
+            aliases: ctx.router_config.model_aliases.clone(),
             config,
             tokenizer,
             registry,
@@ -166,7 +173,8 @@ impl ManagedRouter {
         reservation: &RateLimitCell,
     ) -> Result<(ExecutionResult, DispatchMetadata, ChatResponseSpec), Status> {
         let original_expiry = wall_ms()?.saturating_add(self.config.timeout_ms);
-        if body.model != self.config.model
+        if (body.model != self.config.model
+            && self.aliases.get(&body.model) != Some(&self.config.model))
             || body.n.unwrap_or(1) != 1
             || body.session_params.is_some()
             || body.declares_tools()
@@ -623,6 +631,118 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Use the existing model and E/P/D arguments; resource limits remain internal defaults.
+    pub fn from_router(router: &crate::config::RouterConfig) -> Result<Self, Status> {
+        let crate::config::RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } = &router.mode
+        else {
+            return Err(Status::invalid_argument(
+                "SGLang EPD requires E/P/D role pools",
+            ));
+        };
+        if encode_urls.len() > 64
+            || prefill_urls.is_empty()
+            || decode_urls.is_empty()
+            || prefill_urls.len().saturating_mul(decode_urls.len()) > 64
+        {
+            return Err(Status::invalid_argument("invalid managed E/P/D pools"));
+        }
+        let model_path = router
+            .model_path
+            .clone()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| Status::invalid_argument("SGLang EPD requires --model-path"))?;
+        let endpoint = |url: &str| -> Result<String, Status> {
+            let url = url
+                .strip_prefix("grpc://")
+                .map_or_else(|| url.to_owned(), |rest| format!("http://{rest}"));
+            tonic::transport::Endpoint::from_shared(url.clone())
+                .map_err(|_| Status::invalid_argument("invalid managed control endpoint"))?;
+            Ok(url)
+        };
+        Ok(Self {
+            model: model_path.clone(),
+            model_path,
+            prefill_urls: prefill_urls
+                .iter()
+                .map(|(url, _)| endpoint(url))
+                .collect::<Result<_, _>>()?,
+            decode_urls: decode_urls
+                .iter()
+                .map(|url| endpoint(url))
+                .collect::<Result<_, _>>()?,
+            encoders: encode_urls
+                .iter()
+                .map(|(url, _)| {
+                    Ok(EncoderEndpoint {
+                        endpoint: endpoint(url)?,
+                    })
+                })
+                .collect::<Result<_, Status>>()?,
+            ..Self::default()
+        })
+    }
+
+    /// Discover worker-advertised weight identity once; every pool observation must match it.
+    async fn discover_revision(
+        &mut self,
+        router: &crate::config::RouterConfig,
+    ) -> Result<(), Status> {
+        use proto::managed_sglang_client::ManagedSglangClient;
+        let deadline = Instant::now() + Duration::from_secs(router.worker_startup_timeout_secs);
+        loop {
+            let probes = self.prefill_urls.iter().map(|endpoint| async move {
+                let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?
+                    .connect_lazy();
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    ManagedSglangClient::new(channel).get_capabilities(proto::CapabilityQuery {}),
+                )
+                .await
+                .map_err(|_| Status::unavailable("managed capability probe timed out"))?
+                .map(|reply| reply.into_inner())
+            });
+            for result in futures::future::join_all(probes).await {
+                match result {
+                    Ok(capability)
+                        if capability.version == VERSION
+                            && capability.ready
+                            && capability.role == "prefill"
+                            && capability.layout_contract == LAYOUT
+                            && capability.processor_contract == self.processor_contract
+                            && !capability.model_revision.is_empty() =>
+                    {
+                        self.model_revision = capability.model_revision;
+                        return Ok(());
+                    }
+                    Err(error) if error.code() == tonic::Code::Unimplemented => {
+                        return Err(Status::failed_precondition(
+                            "SGLang EPD requires managed worker capabilities; no legacy fallback",
+                        ))
+                    }
+                    Ok(capability) if !capability.ready => {}
+                    Ok(_) => {
+                        return Err(Status::failed_precondition(
+                            "incompatible managed prefill capability",
+                        ))
+                    }
+                    Err(_) => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Status::unavailable(
+                    "no compatible managed prefill became available before startup timeout",
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     /// Resolve role pools once; candidate search remains bounded independently of pool size.
     pub fn resolve(mut self) -> Result<Self, Status> {
         if self.prefill_urls.is_empty()
@@ -649,7 +769,7 @@ impl Config {
         Ok(self)
     }
 
-    /// Invalid bounds fail startup; an absent configuration keeps this entire mode disabled.
+    /// Invalid internal bounds fail startup before any operation is admitted.
     pub fn validate(&self) -> Result<(), Status> {
         if self.model.is_empty()
             || self.model_path.is_empty()
@@ -683,6 +803,32 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ordinary role arguments normalize gRPC endpoints without deployment JSON or limit overrides.
+    #[test]
+    fn role_arguments_keep_internal_defaults_and_require_discovered_identity() {
+        let router = crate::config::RouterConfig {
+            model_path: Some("/models/qwen3".into()),
+            mode: crate::config::RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("grpc://e:1".into(), None)],
+                prefill_urls: vec![("grpc://p:1".into(), None)],
+                decode_urls: vec!["grpc://d:1".into()],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        let mut config = Config::from_router(&router).unwrap();
+        assert_eq!(config.model, "/models/qwen3");
+        assert_eq!(config.encoders[0].endpoint, "http://e:1");
+        assert_eq!(config.prefill_urls, ["http://p:1"]);
+        assert_eq!(config.decode_urls, ["http://d:1"]);
+        assert_eq!(config.timeout_ms, Config::default().timeout_ms);
+        assert!(config.clone().resolve().is_err());
+        config.model_revision = "worker-pinned-revision".into();
+        assert_eq!(config.resolve().unwrap().pairs.len(), 1);
+    }
 
     /// Ordinary deployments specify pools and model identity, without scheduler tuning fields.
     #[test]

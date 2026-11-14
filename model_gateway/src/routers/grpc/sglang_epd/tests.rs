@@ -222,11 +222,33 @@ async fn real_worker_benchmark_server() {
         },
         Ordering::Relaxed,
     );
+    // JSON is only a test-harness input, not a production deployment interface.
+    let deployment: super::router::Config = serde_json::from_slice(
+        &std::fs::read(std::env::var("SMG_MANAGED_BENCH_CONFIG").expect("benchmark fixture"))
+            .expect("read benchmark fixture"),
+    )
+    .expect("valid benchmark fixture");
     let router = crate::config::RouterConfig {
-        sglang_managed_epd: Some(
-            std::env::var("SMG_MANAGED_BENCH_CONFIG")
-                .expect("real managed deployment configuration"),
-        ),
+        sglang_managed_epd: true,
+        connection_mode: crate::worker::ConnectionMode::Grpc,
+        model_path: Some(deployment.model_path.clone()),
+        model_aliases: std::collections::HashMap::from([(deployment.model, deployment.model_path)]),
+        mode: crate::config::RoutingMode::EncodePrefillDecode {
+            encode_urls: deployment
+                .encoders
+                .into_iter()
+                .map(|e| (e.endpoint, None))
+                .collect(),
+            prefill_urls: deployment
+                .prefill_urls
+                .into_iter()
+                .map(|p| (p, None))
+                .collect(),
+            decode_urls: deployment.decode_urls,
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        },
         host: "0.0.0.0".into(),
         port: std::env::var("SMG_MANAGED_BENCH_PORT")
             .expect("explicit benchmark port")

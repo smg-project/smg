@@ -631,7 +631,6 @@ class RouterArgs:
     service_discovery: bool = False
     service_discovery_namespace: str | None = None
     service_discovery_port: int = 80
-    sglang_managed_epd: str | None = None  # Managed SGLang EPD deployment JSON
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
     shutdown_settle_secs: int | None = None

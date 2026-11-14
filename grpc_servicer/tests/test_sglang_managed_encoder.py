@@ -643,3 +643,43 @@ def test_adaptive_cpu_limit_intersects_native_memory_and_host_bounds(monkeypatch
     assert settings.encoder_cpu_limit(config, 32) == settings.encoder_window(config)[0]
     monkeypatch.setattr(settings, "available_cpus", lambda: 1)
     assert settings.encoder_cpu_limit(config, 8) == 1
+
+
+@pytest.mark.parametrize("role", ["encoder", "prefill", "decode"])
+def test_native_revision_needs_no_managed_config_file(role):
+    """Existing native identity and role arguments are sufficient for default deployment."""
+    args = native_args()
+    args.revision = "pinned-weights"
+    config = complete({}, args, role)
+    contract = config if role == "encoder" else config["contract"]
+    assert contract["model_revision"] == args.revision
+    assert contract["tp_size"] == args.tp_size
+
+
+def test_staging_budget_tracks_model_width_and_native_dtype():
+    """Larger Qwen3-VL embeddings need a larger reservation, not a deployment override."""
+    from smg_grpc_servicer.sglang.managed.config import encoder_staging_bytes
+
+    assert encoder_staging_bytes(4096, "bfloat16") == 32 * 1024**2
+    assert encoder_staging_bytes(5120, "bfloat16") == 40 * 1024**2
+    assert encoder_staging_bytes(5120, "float32") == 80 * 1024**2
+    with pytest.raises(ValueError, match="dimensions or dtype"):
+        encoder_staging_bytes(0, "bfloat16")
+
+
+@pytest.mark.parametrize("bind_host", ["0.0.0.0", "::"])
+def test_wildcard_bind_uses_native_address_discovery(monkeypatch, bind_host):
+    """Containers without resolvable hostnames reuse the native engine's route/NIC discovery."""
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.utils.network",
+        SimpleNamespace(get_local_ip_auto=lambda: "10.0.0.2"),
+    )
+    args = native_args()
+    args.host = bind_host
+    args.revision = "weights"
+    config = complete({}, args, "encoder")
+    assert config["receive_endpoint"] == "http://10.0.0.2:43000"
+    assert config["worker_id"] == "encoder-10.0.0.2:43000"

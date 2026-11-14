@@ -551,17 +551,16 @@ impl ConfigValidator {
 
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
-        if let Some(path) = &config.sglang_managed_epd {
-            if path.is_empty()
+        if config.sglang_managed_epd
+            && (config.model_path.as_ref().is_none_or(String::is_empty)
                 || config.enable_igw
                 || config.discovery.is_some()
                 || config.connection_mode != ConnectionMode::Grpc
-                || !matches!(&config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
-            {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "sglang_managed_epd requires its explicit worker configuration and cannot be combined with legacy workers, discovery or IGW".into(),
-                });
-            }
+                || !matches!(&config.mode, RoutingMode::EncodePrefillDecode { .. }))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "SGLang EPD requires --model-path and explicit E/P/D pools, and does not support discovery or IGW".into(),
+            });
         }
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;

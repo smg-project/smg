@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import ctypes
 import os
-import socket
 import sys
 from pathlib import Path
 
@@ -43,7 +42,9 @@ def complete(config, args, role):
         raise ValueError("managed workers require a pinned model_revision or native --revision")
     advertise_host = supplied.pop("advertise_host", None) or args.host
     if advertise_host in ("0.0.0.0", "::"):
-        advertise_host = socket.gethostbyname(socket.gethostname())
+        from sglang.srt.utils.network import get_local_ip_auto
+
+        advertise_host = get_local_ip_auto()
     dtype = args.dtype
     if dtype == "auto":
         from sglang.srt.configs.model_config import ModelConfig
@@ -137,6 +138,14 @@ def complete(config, args, role):
         if "max_http_connections" not in supplied:
             defaults["max_http_connections"] = receivers + 16
     return defaults
+
+
+def encoder_staging_bytes(hidden_size, dtype):
+    """Reserve the same token window across model widths using the native embedding dtype."""
+    element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(dtype)
+    if type(hidden_size) is not int or hidden_size <= 0 or element_bytes is None:
+        raise ValueError("unsupported managed embedding dimensions or dtype")
+    return 4096 * hidden_size * element_bytes
 
 
 def encoder_cpu_limit(config, batch_size):

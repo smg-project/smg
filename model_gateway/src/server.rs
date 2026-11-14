@@ -1691,7 +1691,7 @@ async fn start_observability(
     use crate::routers::grpc::sglang_epd::router::ManagedRouter;
 
     let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
-    let _readiness_maintainer = if config.router_config.sglang_managed_epd.is_some() {
+    let _readiness_maintainer = if config.router_config.sglang_managed_epd {
         let router = gateway
             .select_router_for_request(None)
             .ok_or("managed router missing during readiness initialization")?;
@@ -1846,7 +1846,9 @@ async fn start_workflow_engines(
 
     // Submit startup tokenizer job if tokenizer path is configured
     // This runs before worker initialization to ensure tokenizer is available
-    if config.router_config.disable_tokenizer_autoload {
+    if config.router_config.sglang_managed_epd {
+        debug!("SGLang EPD router owns the startup tokenizer");
+    } else if config.router_config.disable_tokenizer_autoload {
         info!("Tokenizer autoload disabled via config; skipping startup tokenizer load");
     } else if let Some(tokenizer_source) = config
         .router_config
