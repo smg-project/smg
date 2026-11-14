@@ -146,10 +146,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::RangeInclusive,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak,
-    },
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -158,7 +155,7 @@ use futures::stream;
 use smg_grpc_client::common_proto::{self as common};
 use tokio::sync::{broadcast, Notify};
 use tonic::Status;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
     DealerSocket, Endpoint, SocketOptions, SubSocket, ZmqError, ZmqMessage,
@@ -705,15 +702,21 @@ enum Live {
 /// it is and the others copy it, so with one subscriber per relay (one
 /// gateway per engine) no batch is copied on its way out. The count is exact
 /// because [`Relaying::relay`] reads it and sends under the lock in which
-/// [`KvEventRelay::subscribe`] adds a receiver; a receiver that lags past
-/// the slot or drops leaves its claim unmade, and the batch stays in the
-/// slot until the channel drops it.
+/// [`KvEventRelay::subscribe`] adds a receiver, and it moves under the
+/// slot's own lock, so the claims land in the order that lock grants them
+/// and the last of them finds the batch still there. A receiver that lags
+/// past the slot or drops leaves its claim unmade, and the batch stays in
+/// the slot until the channel drops it.
 struct LiveBatch {
     rank: Option<i32>,
     sequence: u64,
-    /// Receivers that have not claimed yet.
-    unclaimed: AtomicUsize,
-    batch: Mutex<Option<common::KvEventBatch>>,
+    slot: Mutex<Slot>,
+}
+
+/// The batch and the receivers that have not claimed it yet.
+struct Slot {
+    unclaimed: usize,
+    batch: Option<common::KvEventBatch>,
 }
 
 impl LiveBatch {
@@ -721,8 +724,10 @@ impl LiveBatch {
         Self {
             rank: batch.dp_rank,
             sequence: batch.sequence_number,
-            unclaimed: AtomicUsize::new(receivers),
-            batch: Mutex::new(Some(batch)),
+            slot: Mutex::new(Slot {
+                unclaimed: receivers,
+                batch: Some(batch),
+            }),
         }
     }
 
@@ -730,12 +735,12 @@ impl LiveBatch {
     /// counted receivers to claim, a copy for the others. `None` only for a
     /// receiver the send did not count, which the lock rules out.
     fn claim(&self) -> Option<common::KvEventBatch> {
-        let last = self.unclaimed.fetch_sub(1, Ordering::AcqRel) == 1;
-        let mut batch = self.batch.lock().unwrap_or_else(PoisonError::into_inner);
-        if last {
-            batch.take()
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.unclaimed = slot.unclaimed.saturating_sub(1);
+        if slot.unclaimed == 0 {
+            slot.batch.take()
         } else {
-            batch.clone()
+            slot.batch.clone()
         }
     }
 
@@ -743,7 +748,8 @@ impl LiveBatch {
     /// stream sent) still claims, so the last receiver that wants it finds
     /// the slot its own.
     fn pass(&self) {
-        self.unclaimed.fetch_sub(1, Ordering::AcqRel);
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.unclaimed = slot.unclaimed.saturating_sub(1);
     }
 }
 
@@ -888,7 +894,7 @@ impl KvEventRelay {
                 .position(|source| Some(source.rank) == batch.dp_rank)
                 .unwrap_or(0);
             let record = &mut shared.ranks[index];
-            record.history.push(sequence, &batch);
+            record.history.push(sequence, EncodedBatch::new(&batch));
             if record.started_at.is_none() {
                 record.started_at = Some(sequence);
             }
@@ -1418,6 +1424,11 @@ impl Subscriber {
                         continue;
                     }
                     let Some(batch) = live.claim() else {
+                        error!(
+                            rank = ?live.rank,
+                            sequence = live.sequence,
+                            "a relayed KV event batch was claimed by more streams than it was sent to; this stream goes on without it"
+                        );
                         continue;
                     };
                     self.sent.insert(live.rank, live.sequence);
@@ -1726,10 +1737,13 @@ impl Relaying<'_> {
                 true,
             ),
         };
+        // Encoded off the lock: its hold is the push of a ready value, the
+        // state's apply and the send.
+        let encoded = EncodedBatch::new(&batch);
         {
             let mut shared = lock(self.shared);
             let record = &mut shared.ranks[self.index];
-            record.history.push(sequence, &batch);
+            record.history.push(sequence, encoded);
             if record.started_at.is_none() {
                 record.started_at = Some(sequence);
             }

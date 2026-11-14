@@ -32,7 +32,7 @@ use engine_servicer::{
     kv_events::{
         KvEventRelay, RankSource, RelayConfig, DEFAULT_HISTORY_BATCHES, DEFAULT_HISTORY_BYTES,
     },
-    kv_history::History,
+    kv_history::{EncodedBatch, History},
     kv_state::LiveState,
     kv_wire::{Normalizer, WireBatch},
 };
@@ -123,7 +123,7 @@ impl Path {
         let batch = self
             .normalizer
             .normalize_batch(wire, self.seq, &mut self.event_id);
-        self.history.push(self.seq, &batch);
+        self.history.push(self.seq, EncodedBatch::new(&batch));
         if let Some(state) = &mut self.state {
             state.apply(&batch);
         }

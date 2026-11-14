@@ -171,15 +171,25 @@ impl Bed {
 type Stream =
     futures::stream::BoxStream<'static, Result<common_proto::KvEventBatch, tonic::Status>>;
 
+/// A stream that owes a batch and has not delivered it in this long fails
+/// the test instead of holding it.
+const UNTIL_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Read `stream` until the batch of sequence `seq` arrives (the history and
-/// the heartbeats before it are passed over).
+/// the heartbeats before it are passed over), within [`UNTIL_DEADLINE`].
 async fn until(stream: &mut Stream, seq: u64) {
-    loop {
-        let batch = stream.next().await.expect("stream open").expect("a batch");
-        if batch.sequence_number == seq && !batch.events.is_empty() {
-            return;
+    let wait = async {
+        loop {
+            let batch = stream.next().await.expect("stream open").expect("a batch");
+            if batch.sequence_number == seq && !batch.events.is_empty() {
+                return;
+            }
         }
-    }
+    };
+    assert!(
+        tokio::time::timeout(UNTIL_DEADLINE, wait).await.is_ok(),
+        "the batch of sequence {seq} did not arrive within {UNTIL_DEADLINE:?}"
+    );
 }
 
 /// Publish [`BATCHES`] batches and hand each to every stream; the allocation
