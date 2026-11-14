@@ -192,6 +192,7 @@
   {"model": "Qwen/Qwen3.8-27B", "also": ["JetBrains/Qwen3.8-3.6-27B-blend"], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "Qwen/Qwen3.8-Flash-Next", "also": ["nvidia/Qwen3.8-Flash-Next-FP4-Local"], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "ByteDance-Seed/Seed-OSS-36B-Instruct", "also": ["Seed-OSS-36B-Base-woSyn"], "table": "seed_oss", "opener": null, "after": null},
+  {"model": "microsoft/Sentiment-Analysis-7B", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "stepfun-ai/Step-3.5-Flash", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},
   {"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "microsoft/UserLM-2.0", "also": [], "table": "plain", "opener": null, "after": null},
