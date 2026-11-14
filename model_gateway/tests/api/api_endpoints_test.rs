@@ -2527,7 +2527,7 @@ mod validated_body_tests {
     /// refused under `text` and a body with no prompt at all as a rule over
     /// the request, in the envelope before the worker sees it.
     #[tokio::test]
-    async fn generate_takes_the_ids_over_the_text_and_an_empty_text_only_with_media() {
+    async fn generate_takes_the_ids_over_the_text_and_an_empty_text_with_ids_or_media() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18122,
             worker_type: WorkerType::Regular,
