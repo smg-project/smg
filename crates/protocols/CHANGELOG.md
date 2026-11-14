@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A web search call parses as the public API writes it: a `find_in_page` action (the crate named
+  it `find`, which still reads and is now written `find_in_page`), an `open_page` action without
+  a URL or with a null one, and the `incomplete` status. The crate refused each as an unknown
+  variant or a missing field. Breaking: `WebSearchCallStatus` gains `Incomplete`, and
+  `WebSearchAction::OpenPage.url` is `Option<String>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

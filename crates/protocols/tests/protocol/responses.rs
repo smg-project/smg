@@ -527,6 +527,44 @@ fn test_web_search_response_tool_echo_accepts_return_token_budget() {
     );
 }
 
+/// A web search call as the public API writes it: a `find_in_page` action,
+/// an `open_page` action without a URL or with a null one, and the
+/// `incomplete` status parse and are written back as the public API writes
+/// them. The `find` action this crate wrote before still reads, and is
+/// written as `find_in_page`.
+#[test]
+fn a_web_search_call_reads_the_public_apis_actions_and_statuses() {
+    let find = json!({"type": "find_in_page", "url": "https://example.com", "pattern": "price"});
+    let opened = json!({"type": "open_page", "url": "https://example.com"});
+    for (status, action, written_action) in [
+        ("completed", find.clone(), find.clone()),
+        (
+            "completed",
+            json!({"type": "find", "url": "https://example.com", "pattern": "price"}),
+            find.clone(),
+        ),
+        ("completed", opened.clone(), opened.clone()),
+        (
+            "incomplete",
+            json!({"type": "open_page"}),
+            json!({"type": "open_page"}),
+        ),
+        (
+            "completed",
+            json!({"type": "open_page", "url": null}),
+            json!({"type": "open_page"}),
+        ),
+    ] {
+        let raw =
+            json!({"type": "web_search_call", "id": "ws_1", "status": status, "action": action});
+        let item: ResponseOutputItem =
+            serde_json::from_value(raw.clone()).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        let written = serde_json::to_value(&item).expect("serialize the web search call");
+        assert_eq!(written["action"], written_action, "{raw}");
+        assert_eq!(written["status"], status, "{raw}");
+    }
+}
+
 /// Acceptance: `web_search_call` output item carries an optional typed
 /// `results` field populated when callers request `web_search_call.results`
 /// via the top-level `include[]` array. When absent, the default wire shape
