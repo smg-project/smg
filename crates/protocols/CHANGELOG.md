@@ -259,6 +259,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
   `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
   `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
+- A `/v1/tokenize` answer carries `max_model_len`, as SGLang's `/tokenize` writes it: the smallest
+  context window any of the model's workers reports, or -1, SGLang's value when there is none.
+  SGLang's own `TokenizeResponse` refused the gateway's answer without it. Breaking:
+  `TokenizeResponse` gains `max_model_len`.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a
