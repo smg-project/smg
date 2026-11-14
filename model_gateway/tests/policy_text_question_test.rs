@@ -32,13 +32,13 @@ use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     observability::metrics::Metrics,
     policies::{
-        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualPolicy,
-        PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
-        RandomPolicy, SelectWorkerInfo,
+        hash_ring::HashRing, ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy,
+        ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig,
+        PrefixHashPolicy, RandomPolicy, SelectWorkerInfo,
     },
     worker::{
         load_state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, HashRing, Worker, WorkerType,
+        BasicWorkerBuilder, Worker, WorkerType,
     },
 };
 use smg_external_router::metrics::handles::force_on_this_thread;

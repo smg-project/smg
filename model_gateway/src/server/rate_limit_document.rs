@@ -22,12 +22,14 @@ use tracing::{error, info};
 
 use super::AppState;
 use crate::{
-    admin::document::Applied,
+    admin::{
+        document::Applied,
+        json::{refusal, AdminJson},
+    },
     rate_limit::{
         DocumentOutcome, DocumentRefusal, PolicyChanges, PolicyReplacement, PolicySummary,
         RateLimitManager, RateLimitYaml,
     },
-    worker::admin_json::{refusal, AdminJson},
 };
 
 /// The resource in audit lines: the document's path under the control-plane

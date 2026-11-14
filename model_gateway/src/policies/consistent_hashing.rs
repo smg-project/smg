@@ -31,8 +31,9 @@ use rand::RngExt as _;
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
     observability::metrics::Metrics,
+    policies::hash_ring::HashRing,
     routers::common::header_utils::{extract_routing_key_hint, extract_target_worker},
-    worker::{HashRing, Worker},
+    worker::Worker,
 };
 
 /// Execution branch for metrics

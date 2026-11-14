@@ -1159,13 +1159,13 @@ mod tests {
     use super::*;
     use crate::{
         policies::{
-            test_support::headers_with_routing_key, BucketConfig, BucketPolicy, CacheAwareConfig,
-            CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
+            hash_ring::HashRing, test_support::headers_with_routing_key, BucketConfig,
+            BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
             load_state::LoadSnapshot,
             test_support::{ready_worker, worker_of},
-            HashRing, Worker, WorkerLoadGuard, WorkerType,
+            Worker, WorkerLoadGuard, WorkerType,
         },
     };
 

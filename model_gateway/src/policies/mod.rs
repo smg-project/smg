@@ -9,7 +9,8 @@ use rand::RngExt as _;
 
 use crate::{
     config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker, UNKNOWN_MODEL_ID},
+    policies::hash_ring::HashRing,
+    worker::{load_state::LoadReceiver, runtime::RoutingState, Worker, UNKNOWN_MODEL_ID},
 };
 
 mod bucket;
@@ -18,7 +19,9 @@ mod cache_namespace;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
+pub mod expected_wait;
 mod factory;
+pub mod hash_ring;
 mod least_load;
 mod manual;
 mod passthrough;

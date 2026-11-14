@@ -415,8 +415,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::test_support::make_workers,
-        worker::{HashRing, WorkerLoadGuard},
+        policies::{hash_ring::HashRing, test_support::make_workers},
+        worker::WorkerLoadGuard,
     };
 
     #[test]

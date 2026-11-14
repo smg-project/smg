@@ -32,13 +32,17 @@ use crate::{
         LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
-        common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
+        common::{
+            header_utils, overload, pd_admission,
+            prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
+            retry::mark_non_retryable,
+        },
         error,
     },
     worker::{
         overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
-        ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
-        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
+        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry, WorkerType,
     },
 };
 

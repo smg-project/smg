@@ -26,7 +26,7 @@ use super::{CompletionChunkFrame, StreamingProcessor};
 use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics},
     routers::{
-        common::sse::SseSender,
+        common::{prefill_admission::PrefillLoadGuard, sse::SseSender},
         grpc::{
             common::response_formatting::{known_spec_drafted, CompletionTokenTracker},
             context,
@@ -37,7 +37,6 @@ use crate::{
             utils,
         },
     },
-    worker::PrefillLoadGuard,
 };
 
 /// One backend stream of a `/v1/completions` request. Batched requests fan

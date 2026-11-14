@@ -27,12 +27,13 @@ use smg_auth::AuditResource;
 use tracing::{debug, error, warn};
 
 use crate::{
+    admin::json::refusal,
     app_context::AppContext,
     routers::{
         error,
         grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
     },
-    worker::{admin_json::refusal, WorkerRegistry, UNKNOWN_MODEL_ID},
+    worker::{WorkerRegistry, UNKNOWN_MODEL_ID},
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 
