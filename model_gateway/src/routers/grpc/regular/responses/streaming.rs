@@ -629,7 +629,9 @@ struct CallSite<'a> {
     session: &'a McpToolSession<'a>,
     format_registry: &'a FormatRegistry,
     original_request: &'a ResponsesRequest,
-    model: &'a str,
+    /// The loop's current request: its model labels the call's metrics, its
+    /// tools name the call's namespace.
+    request: &'a ResponsesRequest,
 }
 
 /// One MCP call's whole life on the stream: announced with its progress
@@ -762,7 +764,7 @@ async fn stream_mcp_call(
             .clone()
             .unwrap_or_else(|| output_str.clone())
     });
-    record_mcp_call(state, site.model, tool_output, output_str, output_item);
+    record_mcp_call(state, site.request, tool_output, output_str, output_item);
 
     if let Some(err_text) = failure {
         warn!("Tool execution returned error: {}", err_text);
@@ -826,7 +828,7 @@ async fn execute_tool_loop_streaming_internal(
 ) -> Result<(), String> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
-    let mut state = ToolLoopState::new(&current_request);
+    let mut state = ToolLoopState::default();
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
@@ -989,7 +991,7 @@ async fn execute_tool_loop_streaming_internal(
                 session: &session,
                 format_registry: &ctx.mcp_format_registry,
                 original_request,
-                model: &current_request.model,
+                request: &current_request,
             };
             for tool_call in mcp_tool_calls {
                 if let Err(message) =
@@ -1016,7 +1018,7 @@ async fn execute_tool_loop_streaming_internal(
             }
 
             // Build next request with conversation history
-            current_request = build_next_request(&state, current_request);
+            current_request = build_next_request(&mut state, current_request);
 
             continue;
         }

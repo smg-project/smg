@@ -13,6 +13,12 @@
 //! - both sides accept/reject every store identically;
 //! - the model itself converges under §7-scoped reordering.
 
+#![expect(
+    clippy::panic,
+    clippy::print_stdout,
+    reason = "test helpers: a diverging core ends the test; the totals are printed"
+)]
+
 mod common;
 
 use common::{
@@ -255,7 +261,7 @@ fn model_converges_within_scope() {
             ];
             for op in &ops {
                 other.apply(op);
-                for subject in subjects.iter_mut() {
+                for subject in &mut subjects {
                     subject.apply(op);
                 }
             }
@@ -276,7 +282,7 @@ fn model_converges_within_scope() {
             }
             for h in 0..wl.holders {
                 assert_eq!(reference.holder_blocks(h), other.holder_blocks(h));
-                for subject in subjects.iter() {
+                for subject in &subjects {
                     assert_eq!(subject.holder_blocks(h), reference.holder_blocks(h));
                 }
             }
@@ -297,7 +303,7 @@ fn rejected_store_applies_nothing() {
     };
     model.apply(&seeded);
     oracle.apply(&seeded);
-    for subject in subjects.iter_mut() {
+    for subject in &mut subjects {
         subject.apply(&seeded);
     }
     let before_model = model.overlap(&[101, 102]);
@@ -313,7 +319,7 @@ fn rejected_store_applies_nothing() {
     };
     assert_eq!(model.apply(&bad), Some(StoreResult::ParentNotFound));
     assert!(!oracle.apply(&bad));
-    for subject in subjects.iter_mut() {
+    for subject in &mut subjects {
         assert!(!subject.apply(&bad));
     }
     assert_eq!(model.overlap(&[101, 102]), before_model);

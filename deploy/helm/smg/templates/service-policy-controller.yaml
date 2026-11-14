@@ -1,0 +1,35 @@
+{{- if (.Values.policyController).enabled }}
+{{- /* One Service for the controller, where the router has two: the router's
+     second keeps its control plane off the Service the ingress names, and
+     the controller has no ingress. The standbys' listener is reached pod to
+     pod and gets no port here. */}}
+{{- $controller := .Values.policyController }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+  {{- with $controller.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $controller.service.type }}
+  ports:
+    - name: grpc
+      port: {{ $controller.ports.gateway }}
+      targetPort: gateway
+      protocol: TCP
+    - name: control
+      port: {{ $controller.ports.control }}
+      targetPort: control
+      protocol: TCP
+    - name: metrics
+      port: {{ $controller.ports.admin }}
+      targetPort: admin
+      protocol: TCP
+  selector:
+    {{- include "smg.policyControllerSelectorLabels" . | nindent 4 }}
+{{- end }}
