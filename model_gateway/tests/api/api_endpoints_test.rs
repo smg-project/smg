@@ -554,6 +554,7 @@ mod model_info_tests {
         ctx.shutdown().await;
     }
 
+    /// The public catalog preserves the HTTP engine owner and creation timestamp.
     #[tokio::test]
     async fn test_v1_models() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -592,7 +593,7 @@ mod model_info_tests {
         let models = data.unwrap();
         assert!(!models.is_empty());
 
-        // Model ID comes from worker registry (discovered from /get_model_info model_path)
+        // Registry identity and public metadata come from HTTP worker discovery.
         let first_model = &models[0];
         assert_eq!(
             first_model.get("id").and_then(|v| v.as_str()),
@@ -602,10 +603,10 @@ mod model_info_tests {
             first_model.get("object").and_then(|v| v.as_str()),
             Some("model")
         );
-        assert!(first_model.get("created").is_some());
+        assert!(first_model.get("created").and_then(|v| v.as_u64()).unwrap() > 0);
         assert_eq!(
             first_model.get("owned_by").and_then(|v| v.as_str()),
-            Some("self_hosted")
+            Some("organization-owner")
         );
 
         ctx.shutdown().await;

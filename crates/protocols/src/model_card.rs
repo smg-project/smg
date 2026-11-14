@@ -100,6 +100,16 @@ pub struct ModelCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 
+    /// Public model object discovered from an HTTP engine, separate from
+    /// operator metadata which must never be exposed through `/v1/models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<ModelObject>,
+
+    /// Registration received an explicit public model object from the operator.
+    /// Preserve it on refresh even when it equals the engine's initial object.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upstream_model_is_override: bool,
+
     // === Classification Support ===
     /// Classification label mapping (class index -> label name).
     /// Empty if not a classification model.
@@ -130,6 +140,8 @@ impl ModelCard {
             reasoning_parser: None,
             tool_parser: None,
             metadata: None,
+            upstream_model: None,
+            upstream_model_is_override: false,
             id2label: HashMap::new(),
             num_labels: 0,
         }
@@ -301,11 +313,21 @@ impl ModelCard {
     /// consuming `self` to avoid cloning the model ID.
     pub fn into_model_object(self) -> ModelObject {
         let owned_by = self.owned_by().to_owned();
+        if let Some(mut model) = self.upstream_model {
+            // Registry identity wins, including entries listed under an alias.
+            model.id = self.id;
+            "model".clone_into(&mut model.object);
+            for key in ["id", "object", "created", "owned_by"] {
+                model.extensions.remove(key);
+            }
+            return model;
+        }
         ModelObject {
             id: self.id,
             object: "model".to_owned(),
             created: 0,
             owned_by,
+            extensions: Default::default(),
         }
     }
 
