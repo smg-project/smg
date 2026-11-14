@@ -65,7 +65,7 @@ pub(crate) fn health(h: Health) -> wit::Health {
 }
 
 /// The health bits of the packed row: the same table as the flags.
-pub(crate) fn health_bits(h: Health) -> u8 {
+fn health_bits(h: Health) -> u8 {
     health_flags(h)
         .into_iter()
         .filter(|f| f.on)
@@ -846,7 +846,7 @@ pub(crate) fn targets(decision: &Decision, out: &mut [wit::Target; MAX_TARGETS])
     }
 }
 
-pub(crate) fn transport_class(c: TransportClass) -> wit::TransportClass {
+fn transport_class(c: TransportClass) -> wit::TransportClass {
     match c {
         TransportClass::Ok => wit::TransportClass::Ok,
         TransportClass::ClientError => wit::TransportClass::ClientError,

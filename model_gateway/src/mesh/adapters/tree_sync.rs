@@ -685,7 +685,12 @@ impl TreeSyncAdapter {
     }
 
     /// Buffer a local tree insert for the next gossip round. Hot
-    /// path — keep it cheap; the drain does the serialisation.
+    /// path — keep it cheap; the drain does the serialisation. The
+    /// model's buffer exists on every insert after its first of a
+    /// round, so the lookup borrows the id and the owned key is
+    /// built only when the buffer is missing: the model's first
+    /// insert since the last drain (a hit holds the shard through
+    /// the push, so a drain cannot take the buffer out under it).
     /// `delta.node_hash` must be non-zero: 0 is
     /// [`kv_index::GLOBAL_EVICTION_HASH`] (producers remap 0→1 to
     /// keep the space disjoint).
@@ -698,6 +703,10 @@ impl TreeSyncAdapter {
             delta.node_hash, 0,
             "TreeDelta.node_hash must be non-zero (0 is reserved for GLOBAL_EVICTION_HASH)",
         );
+        if let Some(mut pending) = self.pending_deltas.get_mut(model_id) {
+            pending.push(delta);
+            return;
+        }
         self.pending_deltas
             .entry(model_id.to_string())
             .or_default()

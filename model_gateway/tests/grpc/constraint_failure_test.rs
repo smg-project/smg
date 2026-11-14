@@ -29,8 +29,8 @@ use smg::{
     routers::RouterFactory,
     tenant::TenantKey,
     worker::{
-        circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
-        WorkerType,
+        health::circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType,
+        Worker, WorkerType,
     },
 };
 use smg_grpc_client::{constraint_failed_status, tokenspeed_scheduler::tokenspeed_proto as ts};
