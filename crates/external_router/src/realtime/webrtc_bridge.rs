@@ -1226,7 +1226,7 @@ mod tests {
     /// A data-channel packet that arrives before the far side's channel is
     /// open waits in the pending queue with its bytes and its binary flag,
     /// in both directions; the queue holds a thousand packets and drops the
-    /// next, as before.
+    /// next.
     #[tokio::test]
     async fn a_packet_buffered_before_the_far_channel_opens_keeps_its_bytes() {
         use str0m::channel::ChannelConfig;
