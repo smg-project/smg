@@ -13,7 +13,7 @@ use std::sync::Arc;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{StreamOptions, StringOrArray, Tool, ToolChoice},
+    common::{ResponseFormat, StreamOptions, StringOrArray, Tool, ToolChoice},
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
@@ -79,6 +79,8 @@ pub(crate) struct ChatResponseSpec {
     /// the client asked for ([`Wire::of`]): the stream's shape follows it.
     pub wire: Wire,
     pub separate_reasoning: bool,
+    /// Preserve JSON string data when a typed reasoning parser removes framing.
+    pub json_mode: bool,
     pub tool_choice: Option<ToolChoice>,
     /// The tools the response is read against, shared with the readers that
     /// type its calls (one per choice) rather than copied into each.
@@ -150,6 +152,10 @@ impl ChatResponseSpec {
         Self {
             wire: Wire::of(provider),
             separate_reasoning: request.separate_reasoning,
+            json_mode: matches!(
+                request.response_format,
+                Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+            ),
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included: the request's own list shared, not copied (a new list
@@ -550,5 +556,25 @@ mod tests {
             spec.length_stop_reason(u32::MAX, 64),
             ModelContextWindowExceeded
         );
+    }
+
+    #[test]
+    fn chat_spec_selects_json_mode_only_for_structured_json() {
+        for (format, expected) in [
+            (Value::Null, false),
+            (json!({"type": "text"}), false),
+            (json!({"type": "json_object"}), true),
+            (
+                json!({"type": "json_schema", "json_schema": {
+                    "name": "answer", "schema": {"type": "object"}
+                }}),
+                true,
+            ),
+        ] {
+            let request = chat_request(json!({
+                "model": "test", "messages": [], "response_format": format
+            }));
+            assert_eq!(ChatResponseSpec::from(&request).json_mode, expected);
+        }
     }
 }
