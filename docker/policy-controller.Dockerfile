@@ -45,9 +45,9 @@ COPY --from=local_src /src /opt/smg
 # crate (a package that depends on smg-policy-controller; its binary carries
 # the package's name and answers `--version`). The features are named with
 # the crate, so the one line builds either: the listeners, the WebAssembly
-# plugin host the crate turns on by default, and the Kubernetes Lease elector
-# for a controller of your own that runs it. The stock binary compiles the
-# elector in and does not elect yet.
+# plugin host the crate turns on by default, and the Kubernetes Lease
+# elector. The stock binary compiles both in and runs neither yet: they are
+# there for a controller of your own that does.
 ARG PACKAGE=smg-policy-controller
 RUN cargo build --release --locked --package "${PACKAGE}" \
         --features smg-policy-controller/controller,smg-policy-controller/kubernetes \
