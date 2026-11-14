@@ -464,10 +464,13 @@ mod tests {
     use openai_protocol::worker::WorkerType;
 
     use super::*;
-    use crate::service_discovery::testing::create_test_app_context;
+    use crate::{
+        server::http_client, service_discovery::testing::create_test_app_context,
+        worker::endpoint_key,
+    };
 
     fn key(url: &str) -> EndpointKey {
-        crate::worker::endpoint_key(url).expect(url)
+        endpoint_key(url).expect(url)
     }
 
     /// A published worker with nothing but an endpoint and an instance id.
@@ -1009,7 +1012,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
