@@ -599,6 +599,15 @@ mod tests {
             ("h2oai/h2o-lightning-4b-nemotron-nano", Table::Qwen3Tagged),
             ("inclusionAI/ZoomGain-4B", Table::Qwen3Tagged),
             ("inclusionAI/ZwZ2-4B", Table::Qwen3Tagged),
+            (
+                "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+                Table::Qwen3Tagged,
+            ),
+            ("openbmb/MiniCPM-V-4.7-1B-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-GPTQ", Table::Qwen3Tagged),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
