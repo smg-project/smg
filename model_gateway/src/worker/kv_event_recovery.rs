@@ -20,6 +20,15 @@
 //!   stores for them), a large one clears it, mirroring the servicers' own
 //!   `OUT_OF_RANGE` / `DATA_LOSS` signal.
 //!
+//! A rank that skips a replay from zero up to its cursor (a rank worker
+//! joined its engine's stream late, [`RankState::replay_from_zero`]) reads
+//! none of the restart signs below the cursor: there a restarted publisher,
+//! counting from its start again, looks like the replay. The skip is
+//! therefore kept only for the stream that follows the subscriber's own drop
+//! of a live one that had moved every cursor ([`RankState::unconfirmed`]); a
+//! stream from zero that opens after a break starts the rank over instead
+//! (the monitor resets it before the first batch).
+//!
 //! The Rust relay serves a state snapshot in band: once its history no longer
 //! starts at the publisher's first batch, a subscription from zero begins with
 //! chunks marked `KvSnapshotChunk` (chunk 0 carries the engine's clear, the
@@ -88,6 +97,14 @@ pub(crate) enum ResyncReason {
     /// The relay served a state snapshot in place of the history it no longer
     /// had: the worker's state is replaced by the live set it carries.
     Snapshot,
+    /// A rank worker joined its engine's stream after it had delivered: the
+    /// engine resubscribes from zero so the relay's history reaches that
+    /// rank too. Counted under the joining worker; the workers already on
+    /// the stream keep their state. All of them are reset, and counted,
+    /// when a whole-engine worker is on the stream or joins, and each time
+    /// a stream from zero opens after a break (its answer may be another
+    /// process's, so no cursor skips it).
+    RankJoined,
 }
 
 impl ResyncReason {
@@ -98,6 +115,7 @@ impl ResyncReason {
             Self::PublisherRestart => "publisher_restart",
             Self::GapCleared => "gap_cleared",
             Self::Snapshot => "snapshot",
+            Self::RankJoined => "rank_joined",
         }
     }
 }
@@ -111,6 +129,12 @@ pub(crate) struct RankState {
     degraded: bool,
     /// No batch received yet on the current connection.
     fresh: bool,
+    /// The stream was asked for the engine's history from zero for a rank
+    /// that joined late: a batch at or below the cursor is that replay
+    /// walking up to it, not a restarted publisher. Cleared by the first
+    /// batch past the cursor, by a round that resumes from the cursor, or
+    /// by the reset of a stream from zero that opens after a break.
+    replaying: bool,
 }
 
 impl RankState {
@@ -137,6 +161,38 @@ impl RankState {
         self.fresh = true;
     }
 
+    /// Whether the rank holds a cursor that no batch has moved on the
+    /// current connection: the publisher behind the stream may be another
+    /// one than the cursor's, and the rank's first batch will tell.
+    pub(crate) fn unconfirmed(&self) -> bool {
+        self.fresh && matches!(self.cursor, Cursor::Live(_))
+    }
+
+    /// The engine resubscribes from zero for a rank that joined late while
+    /// this rank keeps its state: the replay's batches up to the cursor are
+    /// skipped as stale, not read as a restart, and the stream goes on from
+    /// the cursor (or from wherever a relay without history starts, as
+    /// after a reconnect). Sound only on the stream that follows the
+    /// subscriber's own drop of a live one: after a break the monitor
+    /// resets the rank before the first batch, which ends the skip.
+    pub(crate) fn replay_from_zero(&mut self) {
+        self.replaying = true;
+        self.fresh = false;
+    }
+
+    /// The stream resumes from the cursor instead: a sequence at or below
+    /// it is a duplicate or a restarted publisher again, not the replay.
+    pub(crate) fn resume_from_cursor(&mut self) {
+        self.replaying = false;
+    }
+
+    /// Whether the rank is skipping a replay from zero up to its cursor:
+    /// set by `replay_from_zero`, ended by the first batch past the cursor
+    /// (or a clear) in `admit`, or by `resume_from_cursor`.
+    pub(crate) fn is_replaying(&self) -> bool {
+        self.replaying
+    }
+
     pub(crate) fn is_degraded(&self) -> bool {
         self.degraded
     }
@@ -158,6 +214,12 @@ impl RankState {
     /// it carries the engine's own cache clear.
     pub(crate) fn admit(&mut self, seq: u64, clears: bool) -> Admission {
         let fresh = std::mem::replace(&mut self.fresh, false);
+        if self.replaying {
+            match self.cursor {
+                Cursor::Live(last) if seq <= last && !clears => return Admission::Stale,
+                _ => self.replaying = false,
+            }
+        }
         match self.cursor {
             Cursor::Initial => {
                 self.cursor = Cursor::Live(seq);
@@ -220,6 +282,7 @@ impl RankState {
         self.replay = None;
         self.degraded = false;
         self.fresh = false;
+        self.replaying = false;
     }
 
     /// The relay's snapshot could not cover the engine's whole life
@@ -236,6 +299,7 @@ impl RankState {
         self.cursor = Cursor::Initial;
         self.replay = None;
         self.degraded = false;
+        self.replaying = false;
     }
 }
 

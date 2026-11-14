@@ -1,20 +1,25 @@
-//! Per-worker KV cache event subscription manager.
+//! Per-engine KV cache event subscription manager.
 //!
-//! `KvEventMonitor` spawns a background tokio task per gRPC worker that subscribes
-//! to KV cache events and feeds them into a shared [`KvIndex`] (one per model:
-//! the chain index).
-//! This enables event-driven cache-aware routing as an alternative to the approximate
-//! radix tree approach.
+//! `KvEventMonitor` spawns a background tokio task per gRPC engine address
+//! that subscribes to the engine's KV cache events and feeds them into a
+//! shared [`KvIndex`] (one per model: the chain index). A data-parallel
+//! engine registered as one worker per rank has one subscription: each rank
+//! worker joins it and takes the batches and load records of its own rank.
+//! This enables event-driven cache-aware routing as an alternative to the
+//! approximate radix tree approach.
 //!
 //! Lifecycle:
-//! - `on_worker_added` — spawns streaming task, creates indexer if needed
-//! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
+//! - `on_worker_added` — the worker joins its engine's subscription, which
+//!   is started for the engine's first worker (and the model's indexer with it)
+//! - `on_worker_removed` — the worker leaves; the task takes its blocks out
+//!   of the index; the engine's last worker ends the task
 //! - `stop` — signals shutdown to all tasks, clears state
 //!
 //! The work of a subscription is split by stage: `subscription.rs` runs the
-//! task per worker (connecting, reconnecting, the stream read loop, the
-//! pushed load records, the worker's departure); `admission.rs` keeps one
-//! stream's state (per-rank cursors, gap recovery, relay snapshots, and the
+//! task per engine (connecting, reconnecting, the stream read loop, the
+//! pushed load records, the workers joining and leaving); `admission.rs`
+//! keeps one engine's state (per-rank cursors advanced once per engine, gap
+//! recovery, relay snapshots, each rank worker's index state, and the
 //! metrics around an applied batch); `apply.rs` takes one event into the
 //! index (tiers, cache groups, namespaces, and the physical copies of a
 //! block, counted per worker).
@@ -31,11 +36,12 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
 use tokio::{
-    sync::{oneshot, watch, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
 
+use self::subscription::{EngineTask, MemberChange};
 use super::{kv_index_backend::KvIndex, monitor::WorkerMonitor, registry::WorkerRegistry};
 use crate::{
     observability::metrics::Metrics,
@@ -53,11 +59,12 @@ pub(crate) use apply::WorkerIndexState;
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
 const STATS_INTERVAL_SECS: u64 = 30;
 
-/// Manages per-worker KV cache event subscriptions.
+/// Manages per-engine KV cache event subscriptions.
 ///
-/// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
-/// KV cache event stream and feeds events into a shared [`KvIndex`]
-/// (one per `model_id`). Workers serving the same model share the same indexer.
+/// Each gRPC engine address gets a dedicated tokio task that subscribes to the
+/// backend's KV cache event stream and feeds events into a shared [`KvIndex`]
+/// (one per `model_id`). Workers serving the same model share the same indexer;
+/// the rank workers of one data-parallel engine share its one stream.
 /// A model's KV block size as the monitor knows it: provisional until a
 /// stored event names it. A provisional size (a `WorkerSpec` seed or
 /// `set_block_size`) is replaced by the first stored block; a size the
@@ -95,11 +102,11 @@ pub struct KvEventMonitor {
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
     block_sizes: Arc<DashMap<String, KvBlockSize>>,
-    /// Per-worker subscription slots: worker_url → the live subscription, or
-    /// the reservation a removal leaves until the old task has cleaned up.
-    /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
-    /// task can lift its own reservation at the end of its exit path.
-    worker_handles: Arc<Mutex<HashMap<String, Slot>>>,
+    /// The engines' subscriptions and every worker's slot on them.
+    /// Mutex matches LoadMonitor pattern for atomic add + remove; Arc so a
+    /// task can complete its members' removals and lift its own entry at
+    /// the end of its exit path.
+    subscriptions: Arc<Mutex<Subscriptions>>,
     /// Periodic index-shape publication, held so it aborts when the monitor
     /// drops. Set once by [`start_stats_task`](Self::start_stats_task); sync
     /// mutex because it is touched only at startup, never on event paths.
@@ -108,68 +115,92 @@ pub struct KvEventMonitor {
     /// the worker monitor, which treats them as polls. Weak: the monitors
     /// are peers in the app context, neither owns the other.
     load_sink: OnceLock<Weak<WorkerMonitor>>,
-    /// The registry whose object under a URL an add starts a stream for:
+    /// The registry whose object under a URL an add puts on a stream:
     /// `on_worker_added` reads it under the slot lock. Weak like the load
     /// sink, a peer in the app context. Unset in a monitor built alone (the
     /// tests), which holds every object.
     worker_registry: OnceLock<Weak<WorkerRegistry>>,
 }
 
+/// Every subscription of the monitor: one per engine address, and the slot
+/// of every worker on one.
+#[derive(Default)]
+struct Subscriptions {
+    /// engine address → the engine's one subscription, for as long as its
+    /// task runs.
+    engines: HashMap<String, EngineSubscription>,
+    /// worker URL → its place on its engine's subscription, or the
+    /// reservation a removal leaves until the task has taken its blocks out.
+    workers: HashMap<String, Slot>,
+}
+
 /// A worker URL's slot in the subscription map.
 enum Slot {
-    Active(WorkerSubscription),
-    /// The URL's old task has been told to shut down and is taking its
-    /// blocks out of the index. The index hands a URL its existing id until
-    /// that cleanup has released it, so a subscription interned in this
-    /// window would write under the old id and lose its blocks to the
-    /// cleanup; `on_worker_added` waits for the old task to end instead.
+    /// The worker is on its engine's subscription (the one with `engine`'s
+    /// id: a slot whose task has ended is stale, and the next add or removal
+    /// of the URL retires it instead of touching the engine's next task).
+    Member {
+        address: String,
+        model_id: String,
+        kind: SubscriptionKind,
+        engine: u64,
+        /// The object the membership was started for. A re-registration
+        /// replaces the object under the URL, and the records on the stream
+        /// reach the one the task holds, so an add with another object ends
+        /// this membership and starts one for it.
+        started_for: Weak<dyn Worker>,
+    },
+    /// The worker has been told to leave and the task is taking its blocks
+    /// out of the index. The index hands a URL its existing id until that
+    /// cleanup has released it, so a worker interned in this window would
+    /// write under the old id and lose its blocks to the cleanup;
+    /// `on_worker_added` waits for the cleanup to end instead.
     Removing(Reservation),
 }
 
-/// What a removal leaves in a URL's slot until the old task has ended.
+/// What a removal leaves in a URL's slot until its blocks are out.
 ///
-/// The task lifts it itself at the end of its exit path
-/// ([`KvEventMonitor::complete_removal`]), and `done` closes when the task
-/// is gone for any reason (an abort, a panic past its guard). Nothing about
-/// it depends on the `on_worker_removed` future living on: the registry's
-/// removal step runs it under a timeout, and a cleanup waiting on the
-/// removal permits can outlast that; a reservation only the remover could
-/// lift would then hold every later add of the URL for good.
+/// The engine's task lifts it itself at the end of the removal
+/// ([`KvEventMonitor::complete_member_removal`]), and `done` closes when the
+/// removal is complete or the task is gone for any reason (an abort, a panic
+/// past its guard). Nothing about it depends on the `on_worker_removed`
+/// future living on: the registry's removal step runs it under a timeout,
+/// and a cleanup waiting on the removal permits can outlast that; a
+/// reservation only the remover could lift would then hold every later add
+/// of the URL for good.
 struct Reservation {
-    /// The subscription the reservation belongs to; a task lifts only its own.
+    /// The removal the reservation belongs to; a task lifts only that one.
     id: u64,
+    /// Closes when the removal is complete.
+    done: watch::Receiver<()>,
+}
+
+/// One engine's subscription: the task that reads the engine's one stream
+/// for every worker registered under its address.
+struct EngineSubscription {
+    /// Tells this subscription from a later one under the same address.
+    id: u64,
+    handle: JoinHandle<()>,
+    kind: SubscriptionKind,
+    /// The model of the worker the subscription started for. An events
+    /// subscription feeds that model's index and no other, so a worker of
+    /// another model does not join it.
+    model_id: String,
+    /// Workers join and leave through the task's channel; the stream is not
+    /// restarted for them.
+    changes: mpsc::UnboundedSender<MemberChange>,
+    /// Workers on the subscription, joined and not yet told to leave. The
+    /// last one's removal ends the task; a worker that arrives meanwhile
+    /// waits for its end and starts the next one.
+    members: usize,
+    /// Signals the task to shut down gracefully. The task owns its members'
+    /// index states and takes their blocks out of the index on exit.
+    shutdown_tx: Option<oneshot::Sender<()>>,
     /// Closes when the task has ended.
     done: watch::Receiver<()>,
 }
 
-/// Tracks a single worker's subscription state.
-struct WorkerSubscription {
-    /// Tells this subscription from a later one under the same URL.
-    id: u64,
-    handle: JoinHandle<()>,
-    model_id: String,
-    kind: SubscriptionKind,
-    /// The object the stream was started for. A re-registration replaces
-    /// the object under the URL, and the records on the stream reach the
-    /// one the task holds, so an add with another object restarts it.
-    started_for: Weak<dyn Worker>,
-    /// Signals the subscription task to shut down gracefully. The task owns
-    /// the worker's index state and takes its blocks out of the index on exit.
-    shutdown_tx: oneshot::Sender<()>,
-    /// Closes when the task has ended; a removal moves it into the
-    /// reservation it leaves in the slot.
-    done: watch::Receiver<()>,
-}
-
-impl WorkerSubscription {
-    /// Whether the stream was started for this worker object (the address
-    /// alone: the object's vtable is no part of its identity).
-    fn streams_for(&self, worker: &Arc<dyn Worker>) -> bool {
-        std::ptr::addr_eq(self.started_for.as_ptr(), Arc::as_ptr(worker))
-    }
-}
-
-/// Ids for [`WorkerSubscription`]s, unique within the process.
+/// Ids for [`EngineSubscription`]s and removals, unique within the process.
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
 impl KvEventMonitor {
@@ -178,20 +209,20 @@ impl KvEventMonitor {
         Self {
             indexers: Arc::new(DashMap::new()),
             block_sizes: Arc::new(DashMap::new()),
-            worker_handles: Arc::new(Mutex::new(HashMap::new())),
+            subscriptions: Arc::new(Mutex::new(Subscriptions::default())),
             stats_task: parking_lot::Mutex::new(None),
             load_sink: OnceLock::new(),
             worker_registry: OnceLock::new(),
         }
     }
 
-    /// Route the load records on every worker's event stream to the worker
+    /// Route the load records on every engine's event stream to the worker
     /// monitor (once; a later call is ignored).
     pub fn set_load_sink(&self, monitor: &Arc<WorkerMonitor>) {
         let _ = self.load_sink.set(Arc::downgrade(monitor));
     }
 
-    /// Have the add read the registry before it stops or starts a stream
+    /// Have the add read the registry before it ends or starts a membership
     /// (once; a later call is ignored): a worker the registry no longer
     /// holds under its URL gets none. The app sets it where it wires the
     /// load sink; a monitor without one holds every object.
@@ -269,31 +300,49 @@ impl KvEventMonitor {
         *self.stats_task.lock() = Some(task);
     }
 
-    /// Start a worker's stream: its KV events into the model's `KvIndex`
-    /// (`Events`), or its load records alone (`Loads`), on a background task
-    /// that subscribes over server-streaming gRPC. Either way the records on
-    /// the stream reach the load sink. A second call for the object already
-    /// streaming is a no-op. A call with another object under an active URL
-    /// restarts the stream for it: a re-registration replaced the worker in
-    /// place (an upsert of a changed spec, a replacement by id, a label
-    /// refresh; the registration and update workflows' policy steps both
-    /// call this for the object the registry holds), and the records on the
-    /// stream must reach that object, since the load snapshot fences the
-    /// pushed loads of any other object out and its receipts suppress the
-    /// poll of the URL. The restart waits for the old task to end; a caller
-    /// whose timeout drops this call in that wait leaves the removal to the
-    /// old task's own exit path and the URL without a stream until the next
-    /// add, the worker's next registration or label refresh.
+    /// Put a worker on its engine's stream: its KV events into the model's
+    /// `KvIndex` (`Events`), or its load records alone (`Loads`), on the
+    /// background task that subscribes to the engine's address over
+    /// server-streaming gRPC. The engine's first worker starts the task; a
+    /// rank worker of a data-parallel engine joins the task its siblings
+    /// share and takes its own rank's batches and records. Either way the
+    /// records on the stream reach the load sink. A second call for the
+    /// object already on a stream is a no-op. A call with another object
+    /// under a URL on a stream restarts the worker's membership for it: a
+    /// re-registration replaced the worker in place (an upsert of a changed
+    /// spec, a replacement by id, a label refresh; the registration and
+    /// update workflows' policy steps both call this for the object the
+    /// registry holds), and the records on the stream must reach that
+    /// object, since the load snapshot fences the pushed loads of any other
+    /// object out and its receipts suppress the poll of the URL. The old
+    /// object leaves the stream as a removal takes it (its blocks out of
+    /// the index; the engine's last member ends the task) and the add waits
+    /// for that end; a caller whose timeout drops this call in that wait
+    /// leaves the removal to the task's own exit path and the URL without a
+    /// stream until the next add, the worker's next registration or label
+    /// refresh.
+    ///
+    /// An events subscription feeds the index of the model it started for,
+    /// and a subscription has one kind. An engine registered again in place
+    /// under another model id, or under a model whose policy reads the
+    /// other kind, has every rank replaced in the registry before the first
+    /// one is added: that add ends the memberships of the ranks the
+    /// registry no longer holds and, once the task has ended, starts the
+    /// engine's next subscription for its own model and kind, which the
+    /// other ranks join. Beside a worker the registry still holds, a worker
+    /// of another model gets no stream from an events subscription until
+    /// its next add, and a worker that differs in kind alone joins the
+    /// subscription as it is, with a warning.
     ///
     /// The add reads the registry it was given (`set_worker_registry`)
-    /// under the slot lock on every turn, before it stops a stream for
+    /// under the slot lock on every turn, before it ends a membership for
     /// another object and before it inserts the new one, so a worker the
     /// registry no longer holds (removed, or replaced again while the add
-    /// waited for an old task to end) gets no stream, and a stream another
-    /// object has under the URL is left to it. The registry's removal
-    /// changes the registry before it reaches this lock: a read here sees
-    /// the removal, or the removal finds the slot this add inserts. A
-    /// monitor without a registry holds every object.
+    /// waited) gets no stream, and a membership another object has under
+    /// the URL is left to it. The registry's removal changes the registry
+    /// before it reaches this lock: a read here sees the removal, or the
+    /// removal finds the slot this add inserts. A monitor without a
+    /// registry holds every object.
     pub async fn on_worker_added(&self, worker: &Arc<dyn Worker>, kind: SubscriptionKind) {
         let url = worker.url().to_string();
         // Normalize model_id to match routing's normalize_model_key — empty → "unknown".
@@ -306,55 +355,191 @@ impl KvEventMonitor {
             debug!(worker_url = %Endpoint::redacted_str(&url), mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
             return;
         }
+        // The engine's address: the URL without a rank suffix, which the
+        // rank workers of one engine share.
+        let address = worker.base_url().to_string();
 
-        let mut handles = loop {
-            let mut handles = self.worker_handles.lock().await;
+        let slot = |engine: u64| Slot::Member {
+            address: address.clone(),
+            model_id: model_id.clone(),
+            kind,
+            engine,
+            started_for: Arc::downgrade(worker),
+        };
+        let mut subs = loop {
+            let mut subs = self.subscriptions.lock().await;
             // Under the slot lock, on every turn: an object the registry no
-            // longer holds gets no stream, and a stream another object has
-            // under the URL is not stopped for it.
+            // longer holds gets no stream, and a membership another object
+            // has under the URL is not ended for it.
             if !self.still_held(worker) {
                 debug!(worker_url = %Endpoint::redacted_str(&url), "no KV event stream for a worker the registry no longer holds");
                 return;
             }
-            // A stream started for another object under this URL, which the
-            // registry has replaced: take it out of the slot on this same turn
-            // of the lock (a removal by URL after the lock could take a stream
-            // a concurrent add started in between; the reservation left here
-            // makes that add wait instead), stop it and await its end outside
-            // the lock, and start one for the object given, on the next turn.
-            // Dropped in that wait, this add leaves the slot to the old task
-            // (the reservation lifts itself) and starts nothing.
-            if matches!(handles.get(&url), Some(Slot::Active(sub)) if !sub.streams_for(worker)) {
-                let stale = Self::begin_removal(&mut handles, &url);
-                drop(handles);
-                info!(worker_url = %Endpoint::redacted_str(&url), "Restarting KV event subscription for a re-registered worker");
-                if let Some(sub) = stale {
-                    self.finish_removal(&url, sub).await;
+            // What the add waits for: the URL's old worker leaving the index
+            // (`false`), or the engine's old task ending (`true`).
+            // A member slot whose task still runs is the worker on its
+            // stream; one whose task ended without the worker leaving (an
+            // engine without KV events, a panic) is stale, and the worker
+            // goes on the engine's next subscription.
+            let member_of = match subs.workers.get(&url) {
+                Some(Slot::Member {
+                    engine,
+                    started_for,
+                    ..
+                }) => Some((
+                    *engine,
+                    std::ptr::addr_eq(started_for.as_ptr(), Arc::as_ptr(worker)),
+                )),
+                _ => None,
+            };
+            if let Some((engine, same_object)) = member_of {
+                if matches!(subs.engines.get(&address), Some(live) if live.id == engine) {
+                    if same_object {
+                        debug!(worker_url = %Endpoint::redacted_str(&url), "KV event subscription already active, skipping");
+                        return;
+                    }
+                    // A membership started for another object under this
+                    // URL, which the registry has replaced: the old object
+                    // leaves the stream on this same turn of the lock (a
+                    // removal by URL after the lock could take a membership
+                    // a concurrent add started in between; the reservation
+                    // left here makes that add wait instead), and the add
+                    // goes on for the object given once the removal has
+                    // ended, on a later turn. Dropped in that wait, this add
+                    // leaves the reservation to the task and starts nothing.
+                    info!(worker_url = %Endpoint::redacted_str(&url), "Restarting KV event subscription for a re-registered worker");
+                    Self::begin_member_removal(&mut subs, &self.indexers, &self.block_sizes, &url);
+                    continue;
+                }
+                subs.workers.remove(&url);
+                Metrics::set_kv_events_unavailable(&url, false);
+                continue;
+            }
+            // What keeps the worker from joining its engine's live
+            // subscription as it is, read before the engine's entry is
+            // borrowed below: the subscription feeds another model's index,
+            // or it is of another kind. `replaced` is then its members the
+            // registry no longer holds.
+            let engine = subs.engines.get(&address);
+            let other_model = engine.is_some_and(|engine| {
+                engine.kind == SubscriptionKind::Events && engine.model_id != model_id
+            });
+            let replaced = match engine {
+                Some(engine) if other_model || engine.kind != kind => {
+                    self.replaced_members_of(&subs, &address, engine.id)
+                }
+                _ => Vec::new(),
+            };
+            let (mut done, engine_ending) = match subs.workers.get(&url) {
+                Some(Slot::Member { .. }) => return,
+                Some(Slot::Removing(reservation)) => (reservation.done.clone(), false),
+                None => match subs.engines.get_mut(&address) {
+                    None => break subs,
+                    // The engine's last worker is leaving and its task is
+                    // ending: the next worker waits for the end and starts
+                    // a subscription of its own.
+                    Some(engine) if engine.members == 0 => (engine.done.clone(), true),
+                    // An events subscription feeds the index of the model it
+                    // started for, and a subscription has one kind: a worker
+                    // of another model does not join the first, and a worker
+                    // of another kind joins only beside a worker the
+                    // registry still holds (the arm below). An engine
+                    // registered again in place under another model id, or
+                    // under a model whose policy reads the other kind, has
+                    // every rank replaced in the registry and then added in
+                    // turn, so the memberships it still has for workers the
+                    // registry no longer holds end here (their own adds come
+                    // after this one in the same step and could not end them
+                    // while it waited), and the worker starts the engine's
+                    // next subscription, of its own model and kind, once the
+                    // task has ended, on a later turn. Beside a worker of
+                    // the other model that the registry still holds it gets
+                    // no stream: that worker's stream is not ended for it.
+                    Some(engine) if other_model || !replaced.is_empty() => {
+                        if replaced.is_empty() {
+                            warn!(
+                                worker_url = %Endpoint::redacted_str(&url),
+                                engine = %Endpoint::redacted_str(&address),
+                                model_id = %model_id,
+                                engine_model_id = %engine.model_id,
+                                "No KV event stream for a worker whose engine streams another model's KV events"
+                            );
+                            return;
+                        }
+                        info!(
+                            engine = %Endpoint::redacted_str(&address),
+                            model_id = %model_id,
+                            engine_model_id = %engine.model_id,
+                            ?kind,
+                            engine_kind = ?engine.kind,
+                            replaced = replaced.len(),
+                            "Replaced workers leave their engine's KV event subscription of another model or kind"
+                        );
+                        for member in &replaced {
+                            Self::begin_member_removal(
+                                &mut subs,
+                                &self.indexers,
+                                &self.block_sizes,
+                                member,
+                            );
+                        }
+                        continue;
+                    }
+                    Some(engine) => {
+                        // The engine streams already: the worker joins. The
+                        // task takes the join at its next turn (between
+                        // batches, or while a call or a backoff is pending)
+                        // without restarting the stream.
+                        if engine.kind != kind {
+                            warn!(
+                                worker_url = %Endpoint::redacted_str(&url),
+                                engine = ?engine.kind,
+                                worker = ?kind,
+                                "Worker joins its engine's KV event subscription of another kind"
+                            );
+                        }
+                        if engine
+                            .changes
+                            .send(MemberChange::Join(Arc::clone(worker)))
+                            .is_ok()
+                        {
+                            engine.members += 1;
+                            let (engine_id, members) = (engine.id, engine.members);
+                            info!(
+                                worker_url = %Endpoint::redacted_str(&url),
+                                engine = %Endpoint::redacted_str(&address),
+                                model_id = %model_id,
+                                members,
+                                "Joining the engine's KV event subscription"
+                            );
+                            self.prepare_worker(worker, &url, &model_id, kind);
+                            subs.workers.insert(url, slot(engine_id));
+                            return;
+                        }
+                        // The task is at its end (its channel is closed) and
+                        // its entry goes with it: wait for that, as below.
+                        (engine.done.clone(), true)
+                    }
+                },
+            };
+            // The URL's previous worker is still being taken out of the
+            // index, or the engine's old task is still ending: intern again
+            // only once that has ended.
+            if done.has_changed().is_err() {
+                // The task is gone without lifting its reservation or its
+                // entry (it was aborted, or panicked past its guard): nothing
+                // is left to wait for. Whatever it raised on the gauge is
+                // lowered before its successor starts, whose answer owns the
+                // gauge from here.
+                if engine_ending {
+                    subs.engines.remove(&address);
+                } else {
+                    subs.workers.remove(&url);
+                    Metrics::set_kv_events_unavailable(&url, false);
                 }
                 continue;
             }
-            let mut done = match handles.get(&url) {
-                Some(Slot::Active(_)) => {
-                    debug!(worker_url = %Endpoint::redacted_str(&url), "KV event subscription already active, skipping");
-                    return;
-                }
-                Some(Slot::Removing(reservation)) => reservation.done.clone(),
-                None => break handles,
-            };
-            // The previous subscription for this URL is still being taken
-            // out of the index: intern it again only once its task has ended.
-            if done.has_changed().is_err() {
-                // The task is gone without lifting its reservation (it ended
-                // before the removal began, was aborted, or panicked past its
-                // guard): nothing is left to wait for. Whatever it raised on
-                // the gauge is lowered before its successor starts, whose
-                // answer owns the gauge from here (the removal's own reset
-                // skips a slot that is no longer its reservation).
-                handles.remove(&url);
-                Metrics::set_kv_events_unavailable(&url, false);
-                break handles;
-            }
-            drop(handles);
+            drop(subs);
             // Nothing is ever sent on the channel; this returns at its close.
             let _ = done.changed().await;
         };
@@ -378,10 +563,113 @@ impl KvEventMonitor {
             }
             SubscriptionKind::Loads => None,
         };
-        // The worker's integrity series exist before its stream does.
-        Metrics::init_kv_event_series(&url);
-        // Seed block_size provisionally from WorkerSpec. The event stream will
-        // overwrite this with the backend's actual page size once received.
+        self.prepare_worker(worker, &url, &model_id, kind);
+
+        info!(
+            worker_url = %Endpoint::redacted_str(&url),
+            engine = %Endpoint::redacted_str(&address),
+            model_id = %model_id,
+            ?kind,
+            "Starting KV event subscription"
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (done_tx, done) = watch::channel(());
+        let (changes_tx, changes) = mpsc::unbounded_channel();
+        let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let task = EngineTask {
+            address: address.clone(),
+            model_id: model_id.clone(),
+            indexer,
+            block_sizes: Arc::clone(&self.block_sizes),
+            load_sink: self.load_sink.get().cloned(),
+            first: Arc::clone(worker),
+            changes,
+            shutdown_rx,
+            slots: Arc::clone(&self.subscriptions),
+            indexers: Arc::clone(&self.indexers),
+        };
+        let task_address = address.clone();
+        let slots = Arc::clone(&self.subscriptions);
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "KV event monitor: runs for the lifetime of the engine's workers, \
+                      handle is stored and graceful shutdown is sent on the last removal"
+        )]
+        let handle = tokio::spawn(async move {
+            // Catch panics here so they surface when they happen — a bare
+            // JoinError would only be observed at worker removal, leaving the
+            // index silently frozen for this engine until then.
+            let result = std::panic::AssertUnwindSafe(Self::subscription_loop(task))
+                .catch_unwind()
+                .await;
+            if let Err(payload) = result {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .map(String::from)
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(non-string panic)".into());
+                error!(
+                    engine = %Endpoint::redacted_str(&task_address),
+                    panic.message = %msg,
+                    ?kind,
+                    "KV event subscription task panicked; this engine's stream \
+                     no longer feeds routing"
+                );
+                // Counted under the engine's workers (the series the
+                // dashboards key on), which hold their workers. With none
+                // left on the task it is an orphan, counted on a series with
+                // no worker label: the engine's address is a worker's own URL
+                // on a plain engine, so a series keyed by it would bring a
+                // retired worker's back, and on a data-parallel engine the
+                // store would never retire it. The address is in the log line.
+                let members = {
+                    let subs = slots.lock().await;
+                    Self::members_of(&subs, &task_address, id)
+                };
+                if members.is_empty() {
+                    Metrics::record_kv_event_subscription_orphan_panic();
+                }
+                for member in &members {
+                    Metrics::record_kv_event_subscription_failure(member, "panic");
+                }
+            }
+            Self::complete_engine_removal(&slots, &task_address, id).await;
+            // Closes `done` last: an add waiting on it finds the engine free.
+            drop(done_tx);
+        });
+
+        let member = slot(id);
+        subs.engines.insert(
+            address,
+            EngineSubscription {
+                id,
+                handle,
+                kind,
+                model_id,
+                changes: changes_tx,
+                members: 1,
+                shutdown_tx: Some(shutdown_tx),
+                done,
+            },
+        );
+        subs.workers.insert(url, member);
+    }
+
+    /// What every worker gets as it goes on a stream: its integrity series,
+    /// which exist before its stream does, and the model's provisional
+    /// block size from its spec (an events subscription; the event stream
+    /// overwrites it with the backend's actual page size once received).
+    fn prepare_worker(
+        &self,
+        worker: &Arc<dyn Worker>,
+        url: &str,
+        model_id: &str,
+        kind: SubscriptionKind,
+    ) {
+        Metrics::init_kv_event_series(url);
         if let Some(bs) = worker
             .metadata()
             .spec
@@ -391,7 +679,7 @@ impl KvEventMonitor {
             if bs > 0 {
                 let known = self
                     .block_sizes
-                    .entry(model_id.clone())
+                    .entry(model_id.to_string())
                     .or_insert(KvBlockSize {
                         tokens: bs,
                         from_events: false,
@@ -399,120 +687,28 @@ impl KvEventMonitor {
                 // Under the entry's lock, as the learn site writes it, so a
                 // size a stream learns meanwhile is not overwritten on the
                 // gauge by the seed.
-                Metrics::set_kv_block_size(&model_id, known.tokens);
+                Metrics::set_kv_block_size(model_id, known.tokens);
             } else {
-                warn!(worker_url = %Endpoint::redacted_str(&url), "Worker reports kv_block_size=0, ignoring");
+                warn!(worker_url = %Endpoint::redacted_str(url), "Worker reports kv_block_size=0, ignoring");
             }
         }
-
-        let started_for = Arc::downgrade(worker);
-        let worker = Arc::clone(worker);
-        let worker_url = url.clone();
-        let block_sizes = Arc::clone(&self.block_sizes);
-
-        info!(
-            worker_url = %Endpoint::redacted_str(&url),
-            model_id = %model_id,
-            ?kind,
-            "Starting KV event subscription"
-        );
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (done_tx, done) = watch::channel(());
-        let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
-        let load_sink = self.load_sink.get().cloned();
-        let loop_model_id = model_id.clone();
-        let task_model_id = model_id.clone();
-        let slots = Arc::clone(&self.worker_handles);
-        let indexers = Arc::clone(&self.indexers);
-        let model_block_sizes = Arc::clone(&self.block_sizes);
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "KV event monitor: runs for the lifetime of the worker, \
-                      handle is stored and graceful shutdown is sent on removal"
-        )]
-        let handle = tokio::spawn(async move {
-            // The task writes for the worker after the loop has returned it
-            // (the panic counter, the gauge `complete_removal` lowers). It
-            // keeps a handle on the worker through those writes: the series
-            // store forgets a removed address once no handle on its workers
-            // is left, and a write for the address by name alone after that
-            // would recreate its series.
-            let writer = Arc::clone(&worker);
-            // Catch panics here so they surface when they happen — a bare
-            // JoinError would only be observed at worker removal, leaving the
-            // index silently frozen for this worker until then.
-            let result = std::panic::AssertUnwindSafe(Self::subscription_loop(
-                worker,
-                worker_url,
-                indexer,
-                block_sizes,
-                loop_model_id,
-                shutdown_rx,
-                load_sink,
-            ))
-            .catch_unwind()
-            .await;
-            if let Err(payload) = result {
-                let msg = payload
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .map(String::from)
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "(non-string panic)".into());
-                error!(
-                    worker_url = %Endpoint::redacted_str(writer.url()),
-                    panic.message = %msg,
-                    ?kind,
-                    "KV event subscription task panicked; this worker's stream \
-                     no longer feeds routing"
-                );
-                Metrics::record_kv_event_subscription_failure(writer.url(), "panic");
-            }
-            Self::complete_removal(
-                &slots,
-                &indexers,
-                &model_block_sizes,
-                &writer,
-                id,
-                &task_model_id,
-                kind,
-            )
-            .await;
-            // The task's last write is made: the worker may go.
-            drop(writer);
-            // Closes `done` last: an add waiting on it finds the slot free.
-            drop(done_tx);
-        });
-
-        handles.insert(
-            url,
-            Slot::Active(WorkerSubscription {
-                id,
-                handle,
-                model_id,
-                kind,
-                started_for,
-                shutdown_tx,
-                done,
-            }),
-        );
     }
 
-    /// The end of a removal, run by the subscription task once its blocks
-    /// are out of the index: lift the URL's reservation if it is this task's
-    /// (a later subscription under the URL has its own), and drop the
-    /// model's index with the model's last events subscription, zeroing the
-    /// gauges that index fed (a loads-only subscription had none to drop).
-    /// The task does this rather than `on_worker_removed`,
-    /// whose future a caller may drop before the task has ended; a slot that
-    /// is `Active` (the task ended on its own, or `stop` took the
-    /// subscription) is left as it is. `worker` is the removed worker itself,
-    /// which the task holds through the write made here (see the task in
-    /// [`Self::on_worker_added`]).
-    async fn complete_removal(
-        slots: &Mutex<HashMap<String, Slot>>,
+    /// The end of a worker's removal, run by its engine's task once the
+    /// worker's blocks are out of the index (or by the remover when the task
+    /// is gone): lift the URL's reservation if it is this removal's (a later
+    /// worker under the URL has its own), and drop the model's index with
+    /// the model's last events member, zeroing the gauges that index fed (a
+    /// loads-only member had none to drop). The task does this rather than
+    /// `on_worker_removed`, whose future a caller may drop before the
+    /// cleanup has ended; a slot that is a member (the worker was never told
+    /// to leave: the task ended on its own, or `stop` took the subscription)
+    /// is left as it is. `worker` is the removed worker itself, held through
+    /// the write made here: the series store forgets a removed address once
+    /// no handle on its workers is left, and a write for the address by name
+    /// alone after that would recreate its series.
+    async fn complete_member_removal(
+        slots: &Mutex<Subscriptions>,
         indexers: &DashMap<String, Arc<KvIndex>>,
         block_sizes: &DashMap<String, KvBlockSize>,
         worker: &Arc<dyn Worker>,
@@ -521,18 +717,38 @@ impl KvEventMonitor {
         kind: SubscriptionKind,
     ) {
         let worker_url = worker.url();
-        let mut handles = slots.lock().await;
-        if !matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
+        let mut subs = slots.lock().await;
+        Self::complete_member_removal_locked(
+            &mut subs,
+            indexers,
+            block_sizes,
+            worker_url,
+            id,
+            model_id,
+            kind,
+        );
+    }
+
+    /// [`Self::complete_member_removal`] under the lock the caller holds.
+    fn complete_member_removal_locked(
+        subs: &mut Subscriptions,
+        indexers: &DashMap<String, Arc<KvIndex>>,
+        block_sizes: &DashMap<String, KvBlockSize>,
+        worker_url: &str,
+        id: u64,
+        model_id: &str,
+        kind: SubscriptionKind,
+    ) {
+        if !matches!(subs.workers.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
             return;
         }
         // A backend without KV events is no longer a blind spot once its
-        // worker has left: lowered here, by the task that owned the
-        // subscription and under the slot lock, so a re-add of the URL that
-        // follows the removal cannot see its fresh gauge reset by a stale
-        // caller, and a caller that dropped `on_worker_removed` early does
-        // not leave it raised.
+        // worker has left: lowered here, under the slot lock, so a re-add of
+        // the URL that follows the removal cannot see its fresh gauge reset
+        // by a stale caller, and a caller that dropped `on_worker_removed`
+        // early does not leave it raised.
         Metrics::set_kv_events_unavailable(worker_url, false);
-        handles.remove(worker_url);
+        subs.workers.remove(worker_url);
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing
         // with this either keeps the index (its slot is already in) or
@@ -540,9 +756,9 @@ impl KvEventMonitor {
         if kind != SubscriptionKind::Events {
             return;
         }
-        let last_of_model = !handles.values().any(|slot| {
-            matches!(slot, Slot::Active(other)
-                if other.kind == SubscriptionKind::Events && other.model_id == model_id)
+        let last_of_model = !subs.workers.values().any(|slot| {
+            matches!(slot, Slot::Member { model_id: other, kind: SubscriptionKind::Events, .. }
+                if other == model_id)
         });
         if last_of_model {
             indexers.remove(model_id);
@@ -551,190 +767,293 @@ impl KvEventMonitor {
         }
     }
 
-    /// Stop the KV event subscription for a worker.
+    /// The worker URLs on the engine subscription `id` at `address`: the
+    /// series a failure of the task is counted under.
+    fn members_of(subs: &Subscriptions, address: &str, id: u64) -> Vec<String> {
+        subs.workers
+            .iter()
+            .filter_map(|(url, slot)| match slot {
+                Slot::Member {
+                    address: slot_address,
+                    engine,
+                    ..
+                } if slot_address == address && *engine == id => Some(url.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The worker URLs on the engine subscription `id` at `address` whose
+    /// objects the registry no longer holds: replaced by a registration or
+    /// removed, with their own adds or removals yet to end their
+    /// memberships.
+    fn replaced_members_of(&self, subs: &Subscriptions, address: &str, id: u64) -> Vec<String> {
+        subs.workers
+            .iter()
+            .filter_map(|(url, slot)| match slot {
+                Slot::Member {
+                    address: slot_address,
+                    engine,
+                    started_for,
+                    ..
+                } if slot_address == address
+                    && *engine == id
+                    && !started_for
+                        .upgrade()
+                        .is_some_and(|member| self.still_held(&member)) =>
+                {
+                    Some(url.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A worker that streams nothing, in place of one that did: the
+    /// membership a former object has under the URL ends here, as
+    /// `on_worker_added` restarts it for an object with a kind. Nothing else
+    /// on the replace path stops it, and its records would keep reaching the
+    /// replaced object. The checks are the restart's, under the slot lock: a
+    /// worker the registry no longer holds changes nothing (the URL's
+    /// membership is the business of whatever holds the URL), and a
+    /// membership started for this object stays, as it does for an add with
+    /// another kind. The wait runs outside the lock and only the removal's
+    /// own reservation is left, so an add that follows starts afresh.
+    pub async fn on_worker_added_without_stream(&self, worker: &Arc<dyn Worker>) {
+        let url = worker.url();
+        let mut done = {
+            let mut subs = self.subscriptions.lock().await;
+            if !self.still_held(worker) {
+                debug!(worker_url = %Endpoint::redacted_str(url), "no KV event stream to end for a worker the registry no longer holds");
+                return;
+            }
+            let another_object = matches!(
+                subs.workers.get(url),
+                Some(Slot::Member { started_for, .. })
+                    if !std::ptr::addr_eq(started_for.as_ptr(), Arc::as_ptr(worker))
+            );
+            if !another_object {
+                return;
+            }
+            let begun =
+                Self::begin_member_removal(&mut subs, &self.indexers, &self.block_sizes, url);
+            match begun {
+                Some(done) => done,
+                None => return,
+            }
+        };
+        info!(worker_url = %Endpoint::redacted_str(url), "Ending the KV event subscription of a replaced worker: its successor streams nothing");
+        // As `on_worker_removed` waits: the caller has the old object out of
+        // the index on return; the channel closes at that end.
+        let _ = done.changed().await;
+    }
+
+    /// The end of an engine's task: its entry leaves the map if it is still
+    /// this task's (a later subscription under the address has its own).
+    async fn complete_engine_removal(slots: &Mutex<Subscriptions>, address: &str, id: u64) {
+        let mut subs = slots.lock().await;
+        if matches!(subs.engines.get(address), Some(engine) if engine.id == id) {
+            subs.engines.remove(address);
+        }
+    }
+
+    /// Take a worker off its engine's KV event subscription.
     ///
-    /// Sends a graceful shutdown signal. The subscription task takes the
-    /// worker's blocks out of the index from its own per-worker map; that
-    /// CPU-bound cleanup runs on the bounded blocking pool rather than a Tokio
-    /// runtime worker. A write made here once the task is gone (the join
-    /// error, the gauge of a task that ended before the removal) is made
-    /// under the caller's handle on the removed worker, which the removal
-    /// step holds through this call.
+    /// The engine's task takes the worker's blocks out of the index from the
+    /// worker's own per-worker map; that CPU-bound cleanup runs on the
+    /// bounded blocking pool rather than a Tokio runtime worker. The engine's
+    /// other workers keep the stream; its last worker's removal signals the
+    /// task's graceful shutdown.
+    /// A write made here once the engine's task is gone (the gauge of a
+    /// member that left before the removal) is made under the caller's
+    /// handle on the removed worker, which the removal step holds through
+    /// this call.
     ///
     /// The step runs after the registry let the worker go. A registration
     /// under the same URL in between holds a new object, and its add may
-    /// have restarted the stream for it: that stream is the new object's
-    /// and stays, read under the slot lock as the add side reads the
-    /// registry; its own removal ends it. The stream of any other object,
-    /// the removed one's or an older one's, ends here.
+    /// have restarted the membership for it: that membership is the new
+    /// object's and stays, read under the subscriptions lock as the add
+    /// side reads the registry; its own removal ends it. The membership of
+    /// any other object, the removed one's or an older one's, ends here.
     pub async fn on_worker_removed(&self, worker_url: &str) {
-        let subscription = {
-            let mut handles = self.worker_handles.lock().await;
-            if let Some(Slot::Active(sub)) = handles.get(worker_url) {
+        let mut done = {
+            let mut subs = self.subscriptions.lock().await;
+            if let Some(Slot::Member { started_for, .. }) = subs.workers.get(worker_url) {
                 if self
                     .held_under(worker_url)
-                    .is_some_and(|held| sub.streams_for(&held))
+                    .is_some_and(|held| std::ptr::addr_eq(started_for.as_ptr(), Arc::as_ptr(&held)))
                 {
                     debug!(worker_url = %Endpoint::redacted_str(worker_url), "KV event stream left to the worker the registry holds under the URL");
                     return;
                 }
             }
-            Self::begin_removal(&mut handles, worker_url)
+            let begun = Self::begin_member_removal(
+                &mut subs,
+                &self.indexers,
+                &self.block_sizes,
+                worker_url,
+            );
+            match begun {
+                Some(done) => done,
+                None => return,
+            }
         };
-
-        let Some(sub) = subscription else {
-            return;
-        };
-        self.finish_removal(worker_url, sub).await;
+        // The task lifts the reservation and drops the model's last index on
+        // its own (`complete_member_removal`); this wait is for the caller,
+        // who has the worker out of the index on return. A caller that drops
+        // the future here loses nothing. Nothing is ever sent on the
+        // channel; this returns at its close.
+        let _ = done.changed().await;
     }
 
-    /// A worker that streams nothing, in place of one that did: the stream
-    /// a former object has under the URL ends here, as `on_worker_added`
-    /// restarts it for an object with a kind. Nothing else on the replace
-    /// path stops it, and its records would keep reaching the replaced
-    /// object. The checks are the restart's, under the slot lock: a worker
-    /// the registry no longer holds changes nothing (the URL's stream is the
-    /// business of whatever holds the URL), and a stream started for this
-    /// object stays, as it does for an add with another kind. The stop and
-    /// its wait run outside the lock, and only the removal's own reservation
-    /// is left, so an add that follows starts afresh.
-    pub async fn on_worker_added_without_stream(&self, worker: &Arc<dyn Worker>) {
-        let url = worker.url();
-        let stale = {
-            let mut handles = self.worker_handles.lock().await;
-            if !self.still_held(worker) {
-                debug!(worker_url = %Endpoint::redacted_str(url), "no KV event stream to end for a worker the registry no longer holds");
-                return;
-            }
-            if !matches!(handles.get(url), Some(Slot::Active(sub)) if !sub.streams_for(worker)) {
-                return;
-            }
-            Self::begin_removal(&mut handles, url)
-        };
-        if let Some(sub) = stale {
-            info!(worker_url = %Endpoint::redacted_str(url), "Ending the KV event subscription of a replaced worker: its successor streams nothing");
-            self.finish_removal(url, sub).await;
-        }
-    }
-
-    /// Under the slot lock: the URL's active subscription taken out, its
-    /// reservation left in the slot for the adds that come before its task
-    /// has ended; `None` for an empty slot or a removal already under way.
-    fn begin_removal(
-        handles: &mut HashMap<String, Slot>,
+    /// Under the slot lock: the URL's member told to leave its engine's
+    /// stream, its reservation left in the slot until the task has its
+    /// blocks out of the index; the receiver closes at that end. `None` when
+    /// nothing is left to wait for: an empty slot, a removal already under
+    /// way, or the member of an ended task, whose removal completes here.
+    /// `on_worker_removed` and the add that restarts a re-registered
+    /// worker's membership both begin here.
+    fn begin_member_removal(
+        subs: &mut Subscriptions,
+        indexers: &DashMap<String, Arc<KvIndex>>,
+        block_sizes: &DashMap<String, KvBlockSize>,
         worker_url: &str,
-    ) -> Option<WorkerSubscription> {
-        match handles.remove(worker_url) {
-            Some(Slot::Active(sub)) => {
-                handles.insert(
-                    worker_url.to_string(),
-                    Slot::Removing(Reservation {
-                        id: sub.id,
-                        done: sub.done.clone(),
-                    }),
-                );
-                Some(sub)
-            }
+    ) -> Option<watch::Receiver<()>> {
+        let (address, model_id, kind, on_engine) = match subs.workers.remove(worker_url) {
+            Some(Slot::Member {
+                address,
+                model_id,
+                kind,
+                engine,
+                ..
+            }) => (address, model_id, kind, engine),
             Some(removing @ Slot::Removing(_)) => {
                 // Another removal of the same URL is already under way.
-                handles.insert(worker_url.to_string(), removing);
-                None
+                subs.workers.insert(worker_url.to_string(), removing);
+                return None;
             }
-            None => None,
+            None => return None,
+        };
+        let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let (done_tx, done) = watch::channel(());
+        subs.workers.insert(
+            worker_url.to_string(),
+            Slot::Removing(Reservation {
+                id,
+                done: done.clone(),
+            }),
+        );
+        // The member leaves the task it is on; a slot of an ended task
+        // (its successor has the address now) is retired below without
+        // touching the successor's count.
+        let sent = match subs.engines.get_mut(&address) {
+            Some(engine) if engine.id == on_engine && engine.members > 0 => {
+                engine.members -= 1;
+                let sent = engine
+                    .changes
+                    .send(MemberChange::Leave {
+                        url: worker_url.to_string(),
+                        id,
+                        done: done_tx,
+                    })
+                    .is_ok();
+                if engine.members == 0 {
+                    info!(engine = %Endpoint::redacted_str(&address), "Stopping KV event subscription");
+                    if let Some(shutdown_tx) = engine.shutdown_tx.take() {
+                        let _ = shutdown_tx.send(());
+                    }
+                }
+                sent
+            }
+            _ => false,
+        };
+        if !sent {
+            // The engine's task is gone (the backend serves no KV
+            // events, or the task failed): nothing holds the worker's
+            // blocks, so its removal completes here.
+            Self::complete_member_removal_locked(
+                subs,
+                indexers,
+                block_sizes,
+                worker_url,
+                id,
+                &model_id,
+                kind,
+            );
+            return None;
         }
+        info!(worker_url = %Endpoint::redacted_str(worker_url), "Worker leaves its engine's KV event subscription");
+        Some(done)
     }
 
-    /// Outside the lock: the taken subscription told to stop and awaited to
-    /// its end; the gauge lowered while the slot still holds its reservation.
-    async fn finish_removal(&self, worker_url: &str, sub: WorkerSubscription) {
-        info!(worker_url = %Endpoint::redacted_str(worker_url), "Stopping KV event subscription");
-        // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
-        let _ = sub.shutdown_tx.send(());
-        // The task lifts the reservation and drops the model's last index on
-        // its own (`complete_removal`); this wait is for the caller, who has
-        // the worker out of the index on return. A caller that drops the
-        // future here loses nothing but the join error below.
-        // Panics are caught inside the task; a JoinError here (abort or a
-        // panic that escaped the guard) must still be surfaced, not discarded.
-        let id = sub.id;
-        if let Err(e) = sub.handle.await {
-            error!(
-                worker_url = %Endpoint::redacted_str(worker_url),
-                error = %e,
-                "KV event subscription task failed"
-            );
-            Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
-        }
-        // A task that ends on the shutdown signal lowers the gauge in its own
-        // cleanup (`complete_removal`). One that had ended before this removal
-        // began (the answer that raises the gauge ends the subscription), or
-        // that did not reach its cleanup, left the reservation in place and
-        // the gauge with it: lowered here, under the slot lock and only while
-        // the reservation is still this subscription's. A successor under the
-        // URL owns the gauge from its add on.
-        let handles = self.worker_handles.lock().await;
-        if matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
-            Metrics::set_kv_events_unavailable(worker_url, false);
+    /// The ids under a URL's slot: the engine subscription the worker is a
+    /// member of, or the reservation of a removal under way.
+    #[cfg(test)]
+    async fn slot_ids(&self, worker_url: &str) -> (Option<u64>, Option<u64>) {
+        let subs = self.subscriptions.lock().await;
+        Self::ids_under(&subs, worker_url)
+    }
+
+    /// [`Self::slot_ids`] under a lock the caller holds.
+    #[cfg(test)]
+    fn ids_under(subs: &Subscriptions, worker_url: &str) -> (Option<u64>, Option<u64>) {
+        match subs.workers.get(worker_url) {
+            Some(Slot::Member { engine, .. }) => (Some(*engine), None),
+            Some(Slot::Removing(held)) => (None, Some(held.id)),
+            None => (None, None),
         }
     }
 
     /// Stop all subscriptions and clean up.
     pub async fn stop(&self) {
-        let subscriptions: Vec<(String, WorkerSubscription)> = {
-            let mut handles = self.worker_handles.lock().await;
-            let mut active = Vec::new();
-            for (url, slot) in std::mem::take(&mut *handles) {
-                match slot {
-                    Slot::Active(sub) => active.push((url, sub)),
-                    // The task behind a removal in flight lifts its own
-                    // reservation.
-                    reserved @ Slot::Removing(_) => {
-                        handles.insert(url, reserved);
-                    }
-                }
-            }
-            active
+        let (engines, members) = {
+            let mut subs = self.subscriptions.lock().await;
+            // The workers of each engine, the series a join error is counted
+            // under once the slots are gone.
+            let members: HashMap<String, Vec<String>> = subs
+                .engines
+                .iter()
+                .map(|(address, engine)| {
+                    (address.clone(), Self::members_of(&subs, address, engine.id))
+                })
+                .collect();
+            let Subscriptions { engines, workers } = &mut *subs;
+            // A removal in flight lifts its own reservation; the members
+            // leave with their engines' tasks.
+            workers.retain(|_, slot| matches!(slot, Slot::Removing(_)));
+            let engines: Vec<(String, EngineSubscription)> = engines.drain().collect();
+            (engines, members)
         };
 
-        if !subscriptions.is_empty() {
-            info!(
-                count = subscriptions.len(),
-                "Stopping all KV event subscriptions"
-            );
-            for (url, sub) in subscriptions {
-                debug!(worker_url = %Endpoint::redacted_str(&url), "Stopping KV event subscription");
-                let _ = sub.shutdown_tx.send(());
-                if let Err(e) = sub.handle.await {
+        if !engines.is_empty() {
+            info!(count = engines.len(), "Stopping all KV event subscriptions");
+            for (address, mut engine) in engines {
+                debug!(engine = %Endpoint::redacted_str(&address), "Stopping KV event subscription");
+                if let Some(shutdown_tx) = engine.shutdown_tx.take() {
+                    let _ = shutdown_tx.send(());
+                }
+                if let Err(e) = engine.handle.await {
                     error!(
-                        worker_url = %Endpoint::redacted_str(&url),
+                        engine = %Endpoint::redacted_str(&address),
                         error = %e,
                         "KV event subscription task failed"
                     );
-                    Metrics::record_kv_event_subscription_failure(&url, "join_error");
+                    // Counted under the engine's workers (the series the
+                    // dashboards key on), or under the address when none
+                    // was left on it.
+                    let urls = members.get(&address).map(Vec::as_slice).unwrap_or_default();
+                    if urls.is_empty() {
+                        Metrics::record_kv_event_subscription_failure(&address, "join_error");
+                    }
+                    for url in urls {
+                        Metrics::record_kv_event_subscription_failure(url, "join_error");
+                    }
                 }
             }
         }
 
         self.indexers.clear();
         self.block_sizes.clear();
-    }
-
-    /// The ids under a URL's slot: the active subscription's, or the
-    /// reservation's of a removal under way.
-    #[cfg(test)]
-    async fn slot_ids(&self, worker_url: &str) -> (Option<u64>, Option<u64>) {
-        let handles = self.worker_handles.lock().await;
-        Self::ids_under(&handles, worker_url)
-    }
-
-    /// [`Self::slot_ids`] under a lock the caller holds.
-    #[cfg(test)]
-    fn ids_under(handles: &HashMap<String, Slot>, worker_url: &str) -> (Option<u64>, Option<u64>) {
-        match handles.get(worker_url) {
-            Some(Slot::Active(sub)) => (Some(sub.id), None),
-            Some(Slot::Removing(held)) => (None, Some(held.id)),
-            None => (None, None),
-        }
     }
 
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).
@@ -822,12 +1141,12 @@ pub mod bench_support {
 
 impl Drop for KvEventMonitor {
     fn drop(&mut self) {
-        if let Ok(mut handles) = self.worker_handles.try_lock() {
-            for (_, slot) in handles.drain() {
-                if let Slot::Active(sub) = slot {
-                    let _ = sub.shutdown_tx.send(());
-                    sub.handle.abort(); // Can't await in Drop, abort as fallback
+        if let Ok(mut subs) = self.subscriptions.try_lock() {
+            for (_, mut engine) in subs.engines.drain() {
+                if let Some(shutdown_tx) = engine.shutdown_tx.take() {
+                    let _ = shutdown_tx.send(());
                 }
+                engine.handle.abort(); // Can't await in Drop, abort as fallback
             }
         }
     }
@@ -904,11 +1223,28 @@ mod tests {
         )
     }
 
-    /// The subscription task writes for its worker after the loop has
-    /// returned it (the gauge `complete_removal` lowers), and it keeps a
-    /// handle on the worker through that write: the series store forgets a
-    /// removed address once no handle on its workers is left, so a late write
-    /// by name alone would recreate the address's series for good.
+    /// Rank `rank` of a two-rank data-parallel engine at [`REFUSING_URL`].
+    fn refusing_rank_worker(rank: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(REFUSING_URL)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .dp_config(rank, 2)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// A member's cleanup writes for its worker after the worker has left
+    /// the registry: it keeps a handle on the worker through that write. The
+    /// series store forgets a removed address once no handle on its workers
+    /// is left, so a late write by name alone would recreate the address's
+    /// series for good. The engine keeps a second member, so the leave runs
+    /// the member's own cleanup and not the task's exit path.
     #[test]
     fn a_removals_late_write_recreates_no_series_for_the_address() {
         use metrics_exporter_prometheus::PrometheusBuilder;
@@ -920,81 +1256,119 @@ mod tests {
             PrometheusBuilder::new().build_recorder(),
             Arc::clone(series),
         );
-        let listed = || {
-            let mut rendered = String::new();
-            series.render_into(&mut rendered);
-            rendered
-                .lines()
-                .any(|line| line.contains(&format!("worker=\"{REFUSING_URL}\"")))
-        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // The spawned task runs on this thread, under the local recorder.
+        // The spawned tasks run on this thread, under the local recorder.
         metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let monitor = KvEventMonitor::new();
-                let worker = refusing_grpc_worker();
+                // Two ranks of the refusing engine: the first leaves while the
+                // second keeps the engine's task alive.
+                let worker = refusing_rank_worker(0);
+                let other = refusing_rank_worker(1);
                 let url = worker.url().to_string();
+                let listed = || {
+                    let mut rendered = String::new();
+                    series.render_into(&mut rendered);
+                    rendered
+                        .lines()
+                        .any(|line| line.contains(&format!("worker=\"{url}\"")))
+                };
                 let witness = Arc::downgrade(&worker);
                 monitor
                     .on_worker_added(&worker, SubscriptionKind::Events)
                     .await;
-                // The task starts at this thread's first yield. From then on it
-                // holds the worker twice, in its loop and in the handle it keeps
-                // for the removal writes: three strong counts with this test's.
-                wait_until("the task holds the worker", || witness.strong_count() >= 3).await;
+                monitor
+                    .on_worker_added(&other, SubscriptionKind::Events)
+                    .await;
+                // The engine's task holds the worker from before its spawn, so
+                // the strong count says nothing about the task having run; the
+                // index does: the task interns each worker once it has taken it
+                // as a member.
+                let index = monitor
+                    .get_indexer(UNKNOWN_MODEL_ID)
+                    .expect("the model's index");
+                wait_until("the task interns both workers", || {
+                    index.worker_id(&url).is_some() && index.worker_id(other.url()).is_some()
+                })
+                .await;
                 assert!(listed(), "the subscription publishes the worker's series");
 
                 // The registry's removal retires the address with the worker's
                 // witness; from here the task alone holds the worker.
                 Metrics::remove_worker_metrics(&url, Arc::downgrade(&worker));
                 drop(worker);
-                // The removal up to its shutdown signal, as `on_worker_removed`
-                // does it, under a slot lock this test keeps: the task's
-                // cleanup waits at that lock once its loop has returned.
-                let mut handles = monitor.worker_handles.lock().await;
-                let Some(Slot::Active(sub)) = handles.remove(&url) else {
-                    panic!("an active subscription");
+                // The removal up to the member's leave, as `on_worker_removed`
+                // does it, under the slot lock this test keeps: the member's
+                // cleanup waits at that lock once its handle is the last.
+                let mut subs = monitor.subscriptions.lock().await;
+                let Some(Slot::Member {
+                    address, engine, ..
+                }) = subs.workers.remove(&url)
+                else {
+                    panic!("a member of its engine's subscription");
                 };
-                let mut done = sub.done.clone();
-                handles.insert(
+                let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+                let (done_tx, mut done) = watch::channel(());
+                subs.workers.insert(
                     url.clone(),
                     Slot::Removing(Reservation {
-                        id: sub.id,
-                        done: sub.done.clone(),
+                        id,
+                        done: done.clone(),
                     }),
                 );
-                let _ = sub.shutdown_tx.send(());
-                wait_until("the loop has returned its worker", || {
-                    witness.strong_count() <= 1
+                let sub = subs
+                    .engines
+                    .get_mut(&address)
+                    .filter(|sub| sub.id == engine)
+                    .expect("the engine's subscription");
+                sub.members -= 1;
+                assert!(
+                    sub.members > 0,
+                    "the other rank keeps the engine's task alive"
+                );
+                sub.changes
+                    .send(MemberChange::Leave {
+                        url: url.clone(),
+                        id,
+                        done: done_tx,
+                    })
+                    .expect("the engine's task takes the change");
+                // The cleanup takes the worker's blocks out of the index first,
+                // then waits at the slot lock this test holds, its handle on
+                // the worker still in hand.
+                wait_until("the cleanup took the worker out of the index", || {
+                    index.worker_id(&url).is_none()
                 })
                 .await;
                 assert_eq!(
                     witness.strong_count(),
                     1,
-                    "the task holds the worker through its removal writes"
+                    "the cleanup holds the worker through its removal writes"
                 );
                 series.run_upkeep();
                 assert!(
                     series.is_retired(&url),
-                    "the address stays retired while the task can still write"
+                    "the address stays retired while the cleanup can still write"
                 );
 
-                drop(handles);
+                drop(subs);
                 let _ = done.changed().await;
                 assert_eq!(
                     witness.strong_count(),
                     0,
-                    "the task is gone with its handle"
+                    "the cleanup is gone with its handle"
                 );
                 series.run_upkeep();
                 assert!(
                     !series.is_retired(&url),
-                    "the address is forgotten once the task is gone"
+                    "the address is forgotten once the cleanup is gone"
                 );
                 assert!(!listed(), "the removal's late write recreated no series");
+                // The engine's task ends with its last member.
+                monitor.on_worker_removed(other.url()).await;
             });
         });
     }
@@ -1166,12 +1540,12 @@ mod tests {
 
     /// A re-registration replaces the worker object under its URL (an
     /// upsert of a changed spec, a replacement by id, a label refresh) and
-    /// runs the policy step again. The stream started for the old object
-    /// must not stay: its records would reach an object the registry no
-    /// longer holds, whose pushed loads the load snapshot fences out and
-    /// whose receipts suppress the URL's poll. The add with the new object
-    /// restarts the stream for it; a second add of the same object changes
-    /// nothing.
+    /// runs the policy step again. The membership started for the old
+    /// object must not stay: the records on the stream would reach an
+    /// object the registry no longer holds, whose pushed loads the load
+    /// snapshot fences out and whose receipts suppress the URL's poll. The
+    /// add with the new object restarts the stream for it; a second add of
+    /// the same object changes nothing.
     #[traced_test]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_re_registration_under_the_url_restarts_the_stream_for_the_new_object() {
@@ -1211,6 +1585,166 @@ mod tests {
                 n => Err(format!("{n} starts for two objects under one URL")),
             }
         });
+        monitor.stop().await;
+    }
+
+    /// The removal step runs after the registry let the worker go, and a
+    /// registration under the same URL in between may hold a new object
+    /// whose add restarted the membership for it. The removal of the old
+    /// object leaves that membership: a removal by URL alone would take it
+    /// and leave the new object registered with no stream until its next add.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_leaves_the_stream_of_the_object_the_registry_holds() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        monitor.set_worker_registry(&registry);
+        let url = REPLACED_URL;
+        let first = refusing_grpc_worker_at(url);
+        let id = registry
+            .register(Arc::clone(&first))
+            .expect("the first registration under the address");
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Loads)
+            .await;
+
+        // The removal took the first out; a registration put the second in
+        // and its add restarted the membership before the removal's call here.
+        assert!(
+            registry.remove(&id).is_some(),
+            "the first leaves the registry"
+        );
+        let second = refusing_grpc_worker_at(url);
+        registry.register_or_replace(Arc::clone(&second));
+        monitor
+            .on_worker_added(&second, SubscriptionKind::Loads)
+            .await;
+        let (active, removing) = monitor.slot_ids(url).await;
+        let held = active.expect("the add of the second restarted the membership");
+        assert_eq!(removing, None);
+
+        monitor.on_worker_removed(url).await;
+        assert_eq!(
+            monitor.slot_ids(url).await,
+            (Some(held), None),
+            "the stream of the object the registry holds stays"
+        );
+        assert!(logs_contain(
+            "KV event stream left to the worker the registry holds under the URL"
+        ));
+        monitor.stop().await;
+    }
+
+    /// The registry holds a new object whose add has not run yet: the
+    /// membership under the URL is still the removed object's, and the
+    /// removal ends it. The new object's add then starts afresh.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_ends_an_old_stream_under_an_object_not_yet_added() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        monitor.set_worker_registry(&registry);
+        let url = REPLACED_URL;
+        let first = refusing_grpc_worker_at(url);
+        let id = registry
+            .register(Arc::clone(&first))
+            .expect("the first registration under the address");
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Loads)
+            .await;
+        assert!(
+            registry.remove(&id).is_some(),
+            "the first leaves the registry"
+        );
+        let second = refusing_grpc_worker_at(url);
+        registry.register_or_replace(Arc::clone(&second));
+
+        monitor.on_worker_removed(url).await;
+        assert_eq!(
+            monitor.slot_ids(url).await,
+            (None, None),
+            "the first's stream ended and its reservation was lifted"
+        );
+        assert!(logs_contain("Stopping KV event subscription"));
+        monitor.stop().await;
+    }
+
+    /// With nobody under the URL the removal ends the membership: the
+    /// registry is read, not assumed, and an unheld address keeps no stream.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_with_nobody_under_the_url_ends_the_stream() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        monitor.set_worker_registry(&registry);
+        let url = REPLACED_URL;
+        let worker = refusing_grpc_worker_at(url);
+        let id = registry
+            .register(Arc::clone(&worker))
+            .expect("the registration under the address");
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        assert!(
+            registry.remove(&id).is_some(),
+            "the worker leaves the registry"
+        );
+
+        monitor.on_worker_removed(url).await;
+        assert_eq!(
+            monitor.slot_ids(url).await,
+            (None, None),
+            "the stream ended and its reservation was lifted"
+        );
+        assert!(!logs_contain("left to the worker the registry holds"));
+        monitor.stop().await;
+    }
+
+    /// The `Events` restart takes the whole removal path: the old task
+    /// purges the URL's blocks and, as the model's only events member,
+    /// drops the model's index; the new subscription builds a fresh one and
+    /// interns its worker there.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_registration_of_an_events_worker_rebuilds_the_models_index() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let first = refusing_grpc_worker();
+        let url = first.url().to_string();
+        monitor
+            .on_worker_added(&first, SubscriptionKind::Events)
+            .await;
+        let before = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        wait_until("the first subscription interns its worker", || {
+            before.worker_id(&url).is_some()
+        })
+        .await;
+
+        let second = refusing_grpc_worker();
+        monitor
+            .on_worker_added(&second, SubscriptionKind::Events)
+            .await;
+        assert!(logs_contain(
+            "Restarting KV event subscription for a re-registered worker"
+        ));
+        let after = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the re-added worker's model has an index");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the old task dropped the model's index with its last events member; the \
+             restart built a fresh one"
+        );
+        assert!(
+            before.worker_id(&url).is_none(),
+            "the old index released the URL's id before it was dropped"
+        );
+        wait_until(
+            "the new subscription interns its worker in the fresh index",
+            || after.worker_id(&url).is_some(),
+        )
+        .await;
         monitor.stop().await;
     }
 
@@ -1328,176 +1862,17 @@ mod tests {
         monitor.stop().await;
     }
 
-    /// The removal step runs after the registry let the worker go, and a
-    /// registration under the same URL in between may hold a new object
-    /// whose add restarted the stream for it. The removal of the old object
-    /// leaves that stream: a removal by URL alone would take it and leave
-    /// the new object registered with no stream until its next add.
-    #[traced_test]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_removal_leaves_the_stream_of_the_object_the_registry_holds() {
-        let monitor = Arc::new(KvEventMonitor::new());
-        let registry = Arc::new(WorkerRegistry::new());
-        monitor.set_worker_registry(&registry);
-        let url = REPLACED_URL;
-        let first = refusing_grpc_worker_at(url);
-        let id = registry
-            .register(Arc::clone(&first))
-            .expect("the first registration under the address");
-        monitor
-            .on_worker_added(&first, SubscriptionKind::Loads)
-            .await;
-
-        // The removal took the first out; a registration put the second in
-        // and its add restarted the stream before the removal's call here.
-        assert!(
-            registry.remove(&id).is_some(),
-            "the first leaves the registry"
-        );
-        let second = refusing_grpc_worker_at(url);
-        registry.register_or_replace(Arc::clone(&second));
-        monitor
-            .on_worker_added(&second, SubscriptionKind::Loads)
-            .await;
-        let (active, removing) = monitor.slot_ids(url).await;
-        let held = active.expect("the add of the second restarted the stream");
-        assert_eq!(removing, None);
-
-        monitor.on_worker_removed(url).await;
-        assert_eq!(
-            monitor.slot_ids(url).await,
-            (Some(held), None),
-            "the stream of the object the registry holds stays"
-        );
-        assert!(logs_contain(
-            "KV event stream left to the worker the registry holds under the URL"
-        ));
-        monitor.stop().await;
-    }
-
-    /// The registry holds a new object whose add has not run yet: the
-    /// stream under the URL is still the removed object's, and the removal
-    /// ends it. The new object's add then starts afresh.
-    #[traced_test]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_removal_ends_an_old_stream_under_an_object_not_yet_added() {
-        let monitor = Arc::new(KvEventMonitor::new());
-        let registry = Arc::new(WorkerRegistry::new());
-        monitor.set_worker_registry(&registry);
-        let url = REPLACED_URL;
-        let first = refusing_grpc_worker_at(url);
-        let id = registry
-            .register(Arc::clone(&first))
-            .expect("the first registration under the address");
-        monitor
-            .on_worker_added(&first, SubscriptionKind::Loads)
-            .await;
-        assert!(
-            registry.remove(&id).is_some(),
-            "the first leaves the registry"
-        );
-        let second = refusing_grpc_worker_at(url);
-        registry.register_or_replace(Arc::clone(&second));
-
-        monitor.on_worker_removed(url).await;
-        assert_eq!(
-            monitor.slot_ids(url).await,
-            (None, None),
-            "the first's stream ended and its reservation was lifted"
-        );
-        assert!(logs_contain("Stopping KV event subscription"));
-        monitor.stop().await;
-    }
-
-    /// With nobody under the URL the removal ends the stream: the registry
-    /// is read, not assumed, and an unheld address keeps no stream.
-    #[traced_test]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_removal_with_nobody_under_the_url_ends_the_stream() {
-        let monitor = Arc::new(KvEventMonitor::new());
-        let registry = Arc::new(WorkerRegistry::new());
-        monitor.set_worker_registry(&registry);
-        let url = REPLACED_URL;
-        let worker = refusing_grpc_worker_at(url);
-        let id = registry
-            .register(Arc::clone(&worker))
-            .expect("the registration under the address");
-        monitor
-            .on_worker_added(&worker, SubscriptionKind::Loads)
-            .await;
-        assert!(
-            registry.remove(&id).is_some(),
-            "the worker leaves the registry"
-        );
-
-        monitor.on_worker_removed(url).await;
-        assert_eq!(
-            monitor.slot_ids(url).await,
-            (None, None),
-            "the stream ended and its reservation was lifted"
-        );
-        assert!(!logs_contain("left to the worker the registry holds"));
-        monitor.stop().await;
-    }
-
-    /// The `Events` restart takes the whole removal path: the old task
-    /// purges the URL's blocks and, as the model's only events subscription,
-    /// drops the model's index; the new subscription builds a fresh one and
-    /// interns its worker there.
-    #[traced_test]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_re_registration_of_an_events_worker_rebuilds_the_models_index() {
-        let monitor = Arc::new(KvEventMonitor::new());
-        let first = refusing_grpc_worker();
-        let url = first.url().to_string();
-        monitor
-            .on_worker_added(&first, SubscriptionKind::Events)
-            .await;
-        let before = monitor
-            .get_indexer(UNKNOWN_MODEL_ID)
-            .expect("the model's index");
-        wait_until("the first subscription interns its worker", || {
-            before.worker_id(&url).is_some()
-        })
-        .await;
-
-        let second = refusing_grpc_worker();
-        monitor
-            .on_worker_added(&second, SubscriptionKind::Events)
-            .await;
-        assert!(logs_contain(
-            "Restarting KV event subscription for a re-registered worker"
-        ));
-        let after = monitor
-            .get_indexer(UNKNOWN_MODEL_ID)
-            .expect("the re-added worker's model has an index");
-        assert!(
-            !Arc::ptr_eq(&before, &after),
-            "the old task dropped the model's index with its last events subscription; the \
-             restart built a fresh one"
-        );
-        assert!(
-            before.worker_id(&url).is_none(),
-            "the old index released the URL's id before it was dropped"
-        );
-        wait_until(
-            "the new subscription interns its worker in the fresh index",
-            || after.worker_id(&url).is_some(),
-        )
-        .await;
-        monitor.stop().await;
-    }
-
-    /// The restart takes the stream it found under the URL on the lock turn
-    /// that found it. Made on a later turn, by URL, the removal would take
-    /// whatever stream sat there by then, and between the two turns another
-    /// add can run. The test holds the lock when the restart is first polled
-    /// and queues a read of the slot behind the restart's turn: the lock is
-    /// fair, so the read runs the moment that turn ends, before any later
-    /// turn, and finds the reservation. The rest is the race run to its end:
-    /// a third object replaces the second and starts its stream while the
-    /// restart waits for the old task, and the resumed restart leaves that
-    /// stream to it.
+    /// The restart takes the membership it found under the URL on the lock
+    /// turn that found it. Made on a later turn, by URL, the removal would
+    /// take whatever membership sat there by then, and between the two
+    /// turns another add can run. The test holds the lock when the restart
+    /// is first polled and queues a read of the slot behind the restart's
+    /// turn: the lock is fair, so the read runs the moment that turn ends,
+    /// before any later turn, and finds the reservation. The rest is the
+    /// race run to its end: a third object replaces the second while the
+    /// restart waits for the old removal, the resumed restart reads the
+    /// registry on its next turn and takes nothing, and the third's add
+    /// starts its own membership.
     #[traced_test]
     #[tokio::test]
     async fn a_restart_reserves_the_slot_on_its_own_lock_turn() {
@@ -1513,7 +1888,7 @@ mod tests {
             .on_worker_added(&first, SubscriptionKind::Loads)
             .await;
         let (active, removing) = monitor.slot_ids(url).await;
-        let stopped = active.expect("the first add started a stream");
+        assert!(active.is_some(), "the first add put the worker on a stream");
         assert_eq!(removing, None);
         drop(first);
 
@@ -1524,8 +1899,8 @@ mod tests {
         registry.register_or_replace(Arc::clone(&second));
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
         let mut restart = std::pin::pin!(monitor.on_worker_added(&second, SubscriptionKind::Loads));
-        let mut read = std::pin::pin!(monitor.worker_handles.lock());
-        let held = monitor.worker_handles.lock().await;
+        let mut read = std::pin::pin!(monitor.subscriptions.lock());
+        let held = monitor.subscriptions.lock().await;
         assert!(
             std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
             "the restart queues for the held lock"
@@ -1537,60 +1912,60 @@ mod tests {
         drop(held);
         assert!(
             std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
-            "the restart's first turn ends in its wait for the old task"
+            "the restart's first turn ends in its wait for the old removal"
         );
         {
-            let handles = read.await;
+            let subs = read.await;
+            let (active, reserved) = KvEventMonitor::ids_under(&subs, url);
             assert_eq!(
-                KvEventMonitor::ids_under(&handles, url),
-                (None, Some(stopped)),
-                "the turn that found the stream left its reservation"
+                active, None,
+                "no membership holds the slot through the wait"
+            );
+            assert!(
+                reserved.is_some(),
+                "the turn that found the membership left its reservation"
             );
         }
         assert!(logs_contain(
             "Restarting KV event subscription for a re-registered worker"
         ));
 
-        // A third object replaces the second while the restart waits, and
-        // its add runs to its end: the old task ends on the stop it was
-        // sent, and the third's stream starts.
+        // A third object replaces the second while the restart waits. The
+        // restart's next turn (queued on the lock since its first) reads
+        // the registry first and ends with nothing taken: no stream for an
+        // object the registry no longer holds, the slot left to the third's
+        // add.
         let third = refusing_grpc_worker_at(url);
         registry.register_or_replace(Arc::clone(&third));
+        assert!(
+            std::future::Future::poll(restart.as_mut(), &mut cx).is_ready(),
+            "the resumed restart ends for an object the registry no longer holds"
+        );
+        assert!(logs_contain(
+            "no KV event stream for a worker the registry no longer holds"
+        ));
+
+        // The third's add waits out the removal under way and puts its
+        // object on a membership of its own.
         tokio::time::timeout(
             Duration::from_secs(30),
             monitor.on_worker_added(&third, SubscriptionKind::Loads),
         )
         .await
-        .expect("the third add ends once the old task has");
+        .expect("the third add ends once the old removal has");
         let (active, removing) = monitor.slot_ids(url).await;
-        let started = active.expect("the third add started a stream");
-        assert_ne!(started, stopped);
+        assert!(active.is_some(), "the third add put the worker on a stream");
         assert_eq!(removing, None);
-
-        // The restart resumes behind a task that has ended, for an object
-        // the registry no longer holds: the third's stream is not its to
-        // take.
-        tokio::time::timeout(Duration::from_secs(30), restart)
-            .await
-            .expect("the restart ends behind the ended task");
-        assert_eq!(
-            monitor.slot_ids(url).await,
-            (Some(started), None),
-            "the stream of the object the registry holds stays"
-        );
-        assert!(logs_contain(
-            "no KV event stream for a worker the registry no longer holds"
-        ));
         tokio::time::timeout(Duration::from_secs(30), monitor.stop())
             .await
             .expect("the stop ends the stream left");
     }
 
-    /// The add that restarts a stream waits for the old task to end. A
-    /// caller's timeout that drops it in that wait (the policy steps run
-    /// under one) leaves the removal to the old task's own exit path and the
-    /// URL without a stream; the next add of the new object starts one
-    /// afresh, with no second restart.
+    /// The add that restarts a membership waits for the old object's
+    /// removal and the task's end. A caller's timeout that drops it in that
+    /// wait (the policy steps run under one) leaves the removal to the task's
+    /// own exit path and the URL without a stream; the next add of the new
+    /// object starts one afresh, with no second restart.
     #[traced_test]
     #[tokio::test]
     async fn an_add_dropped_while_it_waits_for_the_old_task_leaves_the_next_add_a_fresh_start() {
@@ -1604,14 +1979,15 @@ mod tests {
 
         let second = refusing_grpc_worker();
         {
-            // One poll: the slot is found streaming for another object, the
-            // old task is told to stop, and the add waits for its end. Then
-            // the add is dropped, as a timeout around it drops it.
+            // One poll: the slot is found on a stream for another object,
+            // the old object is told to leave, and the add waits for its
+            // removal to end. Then the add is dropped, as a timeout around
+            // it drops it.
             let mut add = std::pin::pin!(monitor.on_worker_added(&second, SubscriptionKind::Loads));
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
             assert!(
                 std::future::Future::poll(add.as_mut(), &mut cx).is_pending(),
-                "the restart waits for the old task to end"
+                "the restart waits for the old object's removal to end"
             );
         }
         assert!(logs_contain(
