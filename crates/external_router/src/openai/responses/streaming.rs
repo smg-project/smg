@@ -681,12 +681,12 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
                     while let Some(raw_block) = chunk_processor.next_block() {
                         let block_cow = match rewrite_streaming_block(
-                            &raw_block,
+                            raw_block,
                             &original_request,
                             previous_response_id.as_deref(),
                         ) {
                             Some(modified) => Cow::Owned(modified),
-                            None => Cow::Borrowed(raw_block.as_str()),
+                            None => Cow::Borrowed(raw_block),
                         };
 
                         if should_store {
@@ -817,7 +817,7 @@ async fn relay_upstream_stream(
 
                 while let Some(raw_block) = chunk_processor.next_block() {
                     // Parse event
-                    let (event_name, data) = parse_sse_block(&raw_block);
+                    let (event_name, data) = parse_sse_block(raw_block);
 
                     if data.is_empty() {
                         continue;
@@ -858,7 +858,7 @@ async fn relay_upstream_stream(
                                 // Forward the event with pre-parsed value (moved, not cloned)
                                 if !forward_streaming_event(
                                     SseEventData {
-                                        raw_block: &raw_block,
+                                        raw_block,
                                         event_name,
                                         data: data.as_ref(),
                                         pre_parsed: parsed,
@@ -935,7 +935,7 @@ async fn relay_upstream_stream(
                             if forward_triggering_event
                                 && !forward_streaming_event(
                                     SseEventData {
-                                        raw_block: &raw_block,
+                                        raw_block,
                                         event_name,
                                         data: data.as_ref(),
                                         pre_parsed: parsed,

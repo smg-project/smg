@@ -67,6 +67,11 @@ pub struct LoadSample {
 /// pushed nothing since the poll began and leaves the others to the stream,
 /// whose row is the newer; a poll never counts as the stream working, so the
 /// worker stays polled until its records resume.
+///
+/// A worker's rows live exactly as long as its membership row: the write
+/// that removes or replaces the worker deletes them, and a record or a
+/// report for a worker that is not a member is dropped, so a read that lands
+/// after the removal re-creates nothing.
 pub trait LoadSink: Send + Sync {
     /// One rank's record from the stream, a relay or the scrape: the
     /// demultiplexer's per-rank delivery of one engine subscription.
