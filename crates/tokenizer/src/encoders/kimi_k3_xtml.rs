@@ -58,7 +58,7 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // No Jinja template; the native renderer defaults thinking ON (the
     // reference's `build_chat_segments(thinking=True)`).
     thinking_toggle: ThinkingToggle::DefaultOn,
-    thinking_key_name: ThinkingKeyName::Thinking,
+    thinking_key_name: Some(ThinkingKeyName::Thinking),
     // The levels the encoder renders as a `thinking-effort` directive;
     // `"none"` switches thinking off (the engine's own server maps the kwarg
     // the same way before rendering), so the reasoning parser is armed from

@@ -9,6 +9,7 @@ use std::{
 use dashmap::DashMap;
 use http::{header::HeaderName, HeaderMap};
 use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxBuildHasher;
 use smg_policy_controller::{Needs, Phase};
 use tracing::{debug, error, info, warn};
 
@@ -140,8 +141,9 @@ impl TextNeeds {
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
 pub struct PolicyRegistry {
-    /// Model ID -> Policy instance mapping (lock-free reads via DashMap)
-    model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>>>,
+    /// Model ID -> Policy instance mapping (lock-free reads via DashMap; the
+    /// Fx hasher over the operator's model ids, read on every request)
+    model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>, FxBuildHasher>>,
 
     /// The text questions' answers over the default and the per-model
     /// policies ([`TextNeeds`]), recomputed where one is added or removed
@@ -278,7 +280,7 @@ impl PolicyRegistry {
             .collect();
         let text_needs = TextNeeds::of(default_policy.as_ref());
         Self {
-            model_policies: Arc::new(DashMap::new()),
+            model_policies: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
             ring_wanted: Arc::new(AtomicBool::new(true)),
@@ -460,18 +462,41 @@ impl PolicyRegistry {
 
     /// Whether `policy` pins a keyed request itself (`manual` and
     /// `consistent_hashing`, the policies the sticky override leaves alone).
-    fn pins_its_own_key(policy: &dyn LoadBalancingPolicy) -> bool {
+    pub(crate) fn pins_its_own_key(policy: &dyn LoadBalancingPolicy) -> bool {
         !Self::routing_key_override_applies(policy.name())
     }
 
-    /// Whether `info` carries the key a key-native policy reads: the routing
-    /// key as placement derived it, else the routing-key header, else the
-    /// rid-derived key, the precedence of [`ManualPolicy`] itself.
-    fn carries_its_own_key(info: &SelectWorkerInfo<'_>) -> bool {
+    /// The key a key-native policy reads from `info`: the routing key as
+    /// placement derived it, else the routing-key header, else the
+    /// rid-derived key, the precedence of [`ManualPolicy`] itself
+    /// ([`Self::engine_session_key`] feeds a `manual` default this key).
+    pub(crate) fn own_key<'a>(info: &SelectWorkerInfo<'a>) -> Option<&'a str> {
         info.routing_key
             .or_else(|| extract_routing_key_hint(info.headers))
             .or(info.rid_key)
-            .is_some()
+    }
+
+    /// The session key the engine's binding pins a regular placement under:
+    /// a key-native default's own precedence ([`Self::own_key`]), else the
+    /// override's header-first key over the routing key placement already
+    /// resolved ([`Self::sticky_key`]). The pair arm reads [`Self::sticky_key`]
+    /// alone: a keyed request with a key-native side keeps the legacy pair
+    /// path ([`Self::pair_engine_for`]).
+    pub(crate) fn engine_session_key<'a>(
+        policy: &dyn LoadBalancingPolicy,
+        info: &SelectWorkerInfo<'a>,
+    ) -> Option<&'a str> {
+        if Self::pins_its_own_key(policy) {
+            Self::own_key(info)
+        } else {
+            info.routing_key.or(info.rid_key)
+        }
+    }
+
+    /// Whether `info` carries the key a key-native policy reads
+    /// ([`Self::own_key`]).
+    fn carries_its_own_key(info: &SelectWorkerInfo<'_>) -> bool {
+        Self::own_key(info).is_some()
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and

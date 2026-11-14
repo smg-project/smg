@@ -1,9 +1,10 @@
 //! The standalone controller's run loop (design 2, 6, 8 and 10): the store,
-//! the gRPC listeners with their scopes and the health service on each, the
-//! admin listener, readiness and the drain. The scopes' call bodies arrive
-//! with the gateway, ingestion and control scope PRs; the ingestion drivers
-//! with their move out of the gateway; the election with the electors. In
-//! the `elected` mode the gateway runs this same loop inside its process.
+//! the load driver over it, the gRPC listeners with their scopes and the
+//! health service on each, the admin listener, readiness and the drain. The
+//! scopes' call bodies arrive with the gateway, ingestion and control scope
+//! PRs; the other ingestion drivers with their move out of the gateway; the
+//! election with the electors. In the `elected` mode the gateway runs this
+//! same loop inside its process.
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -31,7 +32,13 @@ pub use self::{
     readiness::{Readiness, State},
     tls::TlsError,
 };
-use crate::store::{MemoryStore, WorkersStore};
+use crate::{
+    ingest::{
+        loads::{LoadDriver, LoadDriverConfig},
+        probe::EngineProbe,
+    },
+    store::{MemoryStore, WorkersStore},
+};
 
 /// The protobuf package of the controller's API.
 pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
@@ -47,7 +54,9 @@ pub struct Controller {
     store: Arc<MemoryStore>,
     state: watch::Sender<State>,
     readiness: Readiness,
-    metrics: metrics::Metrics,
+    metrics: Arc<metrics::Metrics>,
+    /// The engines' probe the load driver dials through.
+    probe: Arc<EngineProbe>,
     listeners: Vec<Bound>,
     admin: TcpListener,
     admin_addr: SocketAddr,
@@ -142,6 +151,9 @@ pub enum Error {
     /// The admin listener could not be bound or failed while serving.
     #[error("admin listener: {0}")]
     Admin(#[source] io::Error),
+    /// The engines' HTTP client could not be built.
+    #[error("the engines' probe: {0}")]
+    Probe(#[source] reqwest::Error),
     /// A listener returned before the shutdown signal.
     #[error("a listener stopped before the shutdown")]
     Stopped,
@@ -212,12 +224,14 @@ impl Controller {
         let admin_addr = admin.local_addr().map_err(Error::Admin)?;
         info!(controller_id = %config.controller_id, addr = %admin_addr, "admin listener bound");
         let (state, readiness) = readiness::channel();
+        let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
             config,
             store: Arc::new(MemoryStore::new()),
             state,
             readiness,
-            metrics: metrics::Metrics::new(),
+            metrics: Arc::new(metrics::Metrics::new()),
+            probe,
             listeners,
             admin,
             admin_addr,
@@ -251,7 +265,9 @@ impl Controller {
         self.readiness.clone()
     }
 
-    /// Serves until `shutdown` resolves, then drains: the state turns
+    /// Serves until `shutdown` resolves, then drains: the load driver polls
+    /// the store's engines from the first tick (idle while the store has no
+    /// rows); the state turns
     /// [`State::Draining`] and the health service's overall status
     /// `NOT_SERVING` at once; the listeners keep accepting for the settle
     /// window, stop accepting, and close within the rest of the grace
@@ -268,6 +284,7 @@ impl Controller {
             state,
             readiness,
             metrics,
+            probe,
             listeners,
             admin,
             ..
@@ -298,9 +315,24 @@ impl Controller {
             });
             reporters.push(reporter);
         }
+        let driver = Arc::new(LoadDriver::new(
+            Arc::clone(&store),
+            probe,
+            LoadDriverConfig {
+                poll_interval: config.load_poll_interval,
+                ..LoadDriverConfig::default()
+            },
+        ));
+        let loads = driver.stats();
+        let driver_stop = stop.subscribe();
+        tasks.spawn(async move {
+            driver.run(driver_stop).await;
+            Ok(())
+        });
         let app = admin::router(admin::Admin {
             readiness: readiness.clone(),
-            metrics: metrics.handle(),
+            metrics: Arc::clone(&metrics),
+            loads,
         });
         let mut admin_stop = stop.subscribe();
         tasks.spawn(async move {
