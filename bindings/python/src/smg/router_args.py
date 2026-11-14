@@ -962,8 +962,8 @@ class RouterArgs:
                 "Which implementation decides worker selection: legacy, the policies over"
                 " worker handles, or engine, the policy engine over its bounded view. Under"
                 " engine the policy must be one the engine carries: random, round_robin,"
-                " passthrough, power_of_two (expected_wait, requests, least_requests),"
-                " least_load or manual"
+                " passthrough, power_of_two (expected_wait, requests, least_requests) or"
+                " least_load"
             ),
         )
         routing_group.add_argument(

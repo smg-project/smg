@@ -520,18 +520,11 @@ impl ConfigValidator {
                     "policy_engine",
                     policy.name(),
                     "the policy engine carries random, round_robin, passthrough, power_of_two \
-                     (expected_wait, requests, least_requests), least_load and manual in this \
-                     build",
+                     (expected_wait, requests, least_requests) and least_load in this build",
                 ));
             }
         }
-        Decider::from_configs(
-            &config.policy,
-            prefill,
-            decode,
-            &config.routing_key_override,
-        )
-        .map_err(|error| {
+        Decider::from_configs(&config.policy, prefill, decode).map_err(|error| {
             let mut names = vec![config.policy.name()];
             for policy in [prefill, decode] {
                 if !names.contains(&policy.name()) {
@@ -3821,33 +3814,6 @@ mod tests {
             },
             PolicyConfig::Random,
         )
-    }
-
-    /// Under `engine` the sticky override's headers are the default
-    /// binding's sessions rule: a name repeated in another case is one
-    /// header, as under legacy; a header on the deny-list is refused at load
-    /// by name under both engines, before the engine build reads it.
-    #[test]
-    fn the_engine_switch_takes_a_repeated_routing_header_and_refuses_a_denied_one() {
-        let mut config = regular_mode_config();
-        config.policy_engine = PolicyEngineMode::Engine;
-        config.routing_key_override.enabled = true;
-        config.routing_key_override.headers =
-            vec!["X-Routing-Key".to_string(), "x-routing-key".to_string()];
-        assert!(ConfigValidator::validate(&config).is_ok());
-        for engine in [PolicyEngineMode::Engine, PolicyEngineMode::Legacy] {
-            config.policy_engine = engine;
-            config.routing_key_override.headers = vec!["x-api-key".to_string()];
-            assert!(
-                matches!(
-                    ConfigValidator::validate(&config),
-                    Err(ConfigError::ValidationFailed { ref reason })
-                        if reason.contains("routing_key_override.headers")
-                            && reason.contains("x-api-key")
-                ),
-                "{engine:?}"
-            );
-        }
     }
 
     /// A routing-key header is never a credential: every name on the shared
