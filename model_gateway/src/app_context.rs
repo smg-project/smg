@@ -1569,17 +1569,10 @@ pub(crate) mod testing {
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
             prefill_admission: None,
-            policy_registry: Arc::new(
-                crate::policies::PolicyRegistry::with_override(
-                    router_config.policy.clone(),
-                    router_config.routing_key_override.clone(),
-                )
-                .with_policy_engine(
-                    router_config.policy_engine,
-                    router_config.mode.get_prefill_policy(&router_config.policy),
-                    router_config.mode.get_decode_policy(&router_config.policy),
-                ),
-            ),
+            policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
+                router_config.policy.clone(),
+                router_config.routing_key_override.clone(),
+            )),
             reasoning_parser_factory: None,
             tool_parser_factory,
             gateway: None,

@@ -500,18 +500,6 @@ impl ConfigValidator {
         if config.policy_engine != PolicyEngineMode::Engine {
             return Ok(());
         }
-        // The decider binds the default, prefill and decode profiles; an
-        // encode side has none in this build, so an encode decision would
-        // run the default profile where the legacy path hashes content. The
-        // mode is refused by name until the encode step binds its profile.
-        if matches!(config.mode, RoutingMode::EncodePrefillDecode { .. }) {
-            return Err(ConfigError::invalid_value(
-                "policy_engine",
-                "encode-prefill-decode",
-                "the policy engine carries no encode profile in this build; \
-                 encode-prefill-decode runs under --policy-engine legacy",
-            ));
-        }
         let prefill = config.mode.get_prefill_policy(&config.policy);
         let decode = config.mode.get_decode_policy(&config.policy);
         for policy in [&config.policy, prefill, decode] {
@@ -2772,35 +2760,6 @@ mod tests {
             ConfigValidator::validate(&config),
             Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
                 if field == "policy_engine" && value == "least_load" && reason.contains("default_throughput")
-        ));
-        let legacy = RouterConfig {
-            policy_engine: PolicyEngineMode::Legacy,
-            ..config
-        };
-        assert!(ConfigValidator::validate(&legacy).is_ok());
-    }
-
-    /// Under `engine` the encode-prefill-decode mode is refused at start by
-    /// name: the decider binds no encode profile in this build, so an encode
-    /// decision would run the default profile; the legacy path takes it.
-    #[test]
-    fn the_engine_switch_refuses_encode_prefill_decode_without_an_encode_profile() {
-        let config = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            mode: RoutingMode::EncodePrefillDecode {
-                encode_urls: vec![("http://encode:8000".to_string(), None)],
-                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
-                decode_urls: vec!["http://decode:8000".to_string()],
-                encode_policy: None,
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, .. })
-                if field == "policy_engine" && value == "encode-prefill-decode"
         ));
         let legacy = RouterConfig {
             policy_engine: PolicyEngineMode::Legacy,

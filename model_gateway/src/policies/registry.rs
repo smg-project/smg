@@ -322,24 +322,6 @@ impl PolicyRegistry {
         self.decider.as_ref()
     }
 
-    /// The policy engine for a regular placement under `policy`
-    /// (`--policy-engine engine`), or `None` when the legacy path decides.
-    /// The engine is built from the default policy and serves it by name: a
-    /// model whose registration hint named another policy keeps that policy's
-    /// legacy instance, and a hint naming the default's own preset shares the
-    /// engine's one instance of it. A request the sticky routing-key override
-    /// places keeps the keyed path, whose pin moves behind the engine's view
-    /// in a later step.
-    pub(crate) fn engine_for(
-        &self,
-        policy: &dyn LoadBalancingPolicy,
-        info: &SelectWorkerInfo<'_>,
-    ) -> Option<&Arc<Decider>> {
-        let decider = self.decider.as_ref()?;
-        let served = policy.name() == self.default_policy.name();
-        (served && self.sticky_for(policy, info).is_none()).then_some(decider)
-    }
-
     /// Derive the session key from a request id: trailing `_r<n>` retry and
     /// `_t<n>` turn suffixes are stripped so every turn of a conversation
     /// shares one key. `None` when the override is disabled, there is no rid,
@@ -423,29 +405,12 @@ impl PolicyRegistry {
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
-    /// The sticky routing-key override's selector, with the request's key and
-    /// its source, when the override places this request: it is enabled,
-    /// `policy` does not honor the key itself (`manual` and
-    /// `consistent_hashing` read `rid_key` and the header themselves with the
-    /// same header-first precedence), and the request carries a key from a
-    /// configured source. The one predicate the keyed path is entered by; the
-    /// policy's name is read only when the override is enabled.
-    fn sticky_for<'a>(
-        &self,
-        policy: &dyn LoadBalancingPolicy,
-        info: &SelectWorkerInfo<'a>,
-    ) -> Option<(&Arc<ManualPolicy>, &'a str, &'static str)> {
-        let sticky = self.routing_key_sticky.as_ref()?;
-        if !Self::routing_key_override_applies(policy.name()) {
-            return None;
-        }
-        let (key, source) = self.effective_sticky_key(info)?;
-        Some((sticky, key, source))
-    }
-
-    /// Select a worker, applying the sticky routing-key override when it
-    /// places the request (`sticky_for`); otherwise delegates to
-    /// `policy`. `policy.name()` stays the real policy (for metrics).
+    /// Select a worker, applying the sticky routing-key override when it is
+    /// enabled, the request carries a key from the configured source, and the
+    /// configured policy does not already honor the key (`manual` /
+    /// `consistent_hashing`, which read `rid_key` and the header themselves
+    /// with the same header-first precedence). Otherwise delegates to `policy`.
+    /// `policy.name()` stays the real policy (for metrics).
     pub fn select_worker_for_model(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -454,8 +419,14 @@ impl PolicyRegistry {
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         cache_trace::begin_selection(workers);
-        if let Some((sticky, key, source)) = self.sticky_for(policy.as_ref(), info) {
-            return Self::select_sticky(sticky, policy, model_id, workers, info, key, source);
+        if let Some(sticky) = self.routing_key_sticky.as_ref() {
+            if Self::routing_key_override_applies(policy.name()) {
+                if let Some((key, source)) = self.effective_sticky_key(info) {
+                    return Self::select_sticky(
+                        sticky, policy, model_id, workers, info, key, source,
+                    );
+                }
+            }
         }
         let selected = policy.select_worker(workers, info);
         cache_trace::selection(policy.name(), "policy", workers, selected);
@@ -1134,27 +1105,6 @@ impl PolicyRegistry {
     /// on worker removal alongside the cache-aware cleanup above.
     pub fn remove_worker_from_policies(&self, worker_url: &str) {
         self.each_policy(|policy| policy.remove_worker(worker_url));
-    }
-
-    /// Drop what a removed worker left behind: the policies' per-worker
-    /// state by URL (`remove_worker_from_policies`) and, under
-    /// `--policy-engine engine`, its rows in the engine's accounting
-    /// (`Decider::on_worker_removed`).
-    pub fn on_worker_removed(&self, worker: &dyn Worker) {
-        self.remove_worker_from_policies(worker.url());
-        if let Some(decider) = &self.decider {
-            decider.on_worker_removed(worker);
-        }
-    }
-
-    /// A same-URL replacement keeps the policies' per-URL state (the
-    /// replacement inherits the shared runtime) and, under `--policy-engine
-    /// engine`, retires the old handle's rows in the engine's accounting
-    /// (`Decider::on_worker_replaced`).
-    pub fn on_worker_replaced(&self, old: &dyn Worker, new: &dyn Worker) {
-        if let Some(decider) = &self.decider {
-            decider.on_worker_replaced(old, new);
-        }
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
@@ -3080,52 +3030,5 @@ mod tests {
             picks, RECORDED,
             "the replay picked {picks:?}; the recorded sequence is the decision"
         );
-    }
-
-    /// The engine decides the default policy's regular placements only: a
-    /// model whose hint named another policy, and a request the sticky
-    /// routing-key override places, keep the legacy path; without the
-    /// override a key is only a fact in the view.
-    #[test]
-    fn the_engine_decides_the_default_policy_outside_the_sticky_override() {
-        let round_robin = PolicyConfig::RoundRobin;
-        let policies = PolicyRegistry::with_override(
-            round_robin.clone(),
-            RoutingKeyOverrideConfig {
-                enabled: true,
-                ..Default::default()
-            },
-        )
-        .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
-        let default = policies.get_default_policy();
-        let unkeyed = SelectWorkerInfo::default();
-        assert!(policies.engine_for(default.as_ref(), &unkeyed).is_some());
-
-        let hinted = policies.on_worker_added("hinted", Some("random"));
-        assert_eq!(hinted.name(), "random");
-        assert!(
-            policies.engine_for(hinted.as_ref(), &unkeyed).is_none(),
-            "a hinted policy keeps its legacy instance"
-        );
-
-        let headers = headers_with_routing_key("session-7");
-        let keyed = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..SelectWorkerInfo::default()
-        };
-        assert!(policies.engine_for(default.as_ref(), &keyed).is_none());
-        let by_rid = SelectWorkerInfo {
-            rid_key: Some("session-7"),
-            ..SelectWorkerInfo::default()
-        };
-        assert!(policies.engine_for(default.as_ref(), &by_rid).is_none());
-
-        let no_override = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &round_robin,
-            &round_robin,
-        );
-        let default = no_override.get_default_policy();
-        assert!(no_override.engine_for(default.as_ref(), &keyed).is_some());
     }
 }

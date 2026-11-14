@@ -391,13 +391,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 }
             };
 
-            // The rebuilt handle stands at the old one's URL: tell the policy
-            // registry, as a removal would, so the engine's rows of the
-            // retired handle do not outlive it.
-            app_context
-                .policy_registry
-                .on_worker_replaced(worker.as_ref(), new_worker.as_ref());
-
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
             // the worker does not stay stuck in a non-routable pre-update

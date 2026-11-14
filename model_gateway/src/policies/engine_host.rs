@@ -10,16 +10,11 @@
 //!
 //! The rows carry what the built-in stages read; a field no stage reads yet
 //! (wire modes, zones, labels, the index's overlap) stays at its default
-//! until the step that feeds it. The regular placement sites decide through
-//! the host (`routers::common::placement::select_from`); the pair, encode and
-//! admission paths follow in later steps. A removed worker's rows leave the
-//! engine's accounting with it ([`Decider::on_worker_removed`], from the
-//! policy registry's removal path); the rest of the membership feed (added,
-//! replaced, resized, snapshot) follows in a later step.
+//! until the step that feeds it. Nothing routes through the host yet: a
+//! placement site branches on the registry's `decider()` in the next step.
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -28,13 +23,13 @@ use std::{
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use smg_policy_controller::{
     fingerprint,
     spec::{BindingSpec, LeastLoadParams, ProfileSpec, ScoreSpec, ScoreStage},
     Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId, LeaseKind,
-    Lifecycle, LoadRow, Membership, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Role,
-    Scratch, Side, SignalSource, SpecError, Target, WorkerId,
+    Lifecycle, LoadRow, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Role, Scratch, Side,
+    SignalSource, SpecError, Target, WorkerId,
 };
 use tracing::debug;
 
@@ -42,14 +37,10 @@ use crate::{
     config::{PolicyConfig, PowerOfTwoLoadMetric},
     routers::common::pd_admission,
     worker::{
-        expected_wait::DEFAULT_MEAN_PREFILL_TOKENS,
         load_state::{LoadReceiver, LoadSnapshot},
         Worker, WorkerType,
     },
 };
-
-/// The crate's least-load scorer, the one stage that prices token-work.
-const LEAST_LOAD: &str = "least-load";
 
 /// Why the engine cannot serve a policy configuration in this build.
 #[derive(Debug, thiserror::Error)]
@@ -106,28 +97,6 @@ fn profile_of(config: &PolicyConfig) -> Result<ProfileSpec, EngineHostError> {
         .ok_or(SpecError::Empty)?;
     tune(&mut profile, config);
     Ok(profile)
-}
-
-/// The mean prefill a profile prices an unknown prompt size at: its
-/// least-load scorer's parameter, the scorer's own default when the preset
-/// runs it untuned (every `power_of_two` metric ends its chain in the
-/// expected wait), nothing when the profile prices no tokens. The crate's
-/// untuned scorer and the legacy policies share the default of 1024 tokens.
-fn mean_prefill_of(profile: &ProfileSpec) -> u32 {
-    profile
-        .score
-        .iter()
-        .find_map(|score| match score {
-            ScoreSpec::Name(name) if name == LEAST_LOAD => Some(DEFAULT_MEAN_PREFILL_TOKENS),
-            ScoreSpec::Name(_) => None,
-            ScoreSpec::Params(ScoreStage::LeastLoad(params)) => Some(
-                params
-                    .mean_prefill_tokens
-                    .unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
-            ),
-            ScoreSpec::Params(_) => None,
-        })
-        .unwrap_or(0)
 }
 
 /// Carry a configuration's tunables into its preset profile (see
@@ -211,23 +180,10 @@ pub struct HostRequest<'a> {
 pub struct Decider {
     engine: Engine,
     loads: RwLock<Option<LoadReceiver>>,
-    /// The handles the membership retired, each with the lease sequence at
-    /// its retirement; the commit reads it so a lease decided before the
-    /// retirement books nothing on the retired handle.
-    retired: Mutex<Retired>,
-    /// Test seam: runs after a commit's checks and before its bookings,
-    /// under the lock they share.
-    #[cfg(test)]
-    between_check_and_booking: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// The host's clock origin: every instant in the view is microseconds
     /// since it.
     origin: Instant,
     seq: AtomicU64,
-    /// The token-work a request of unknown size is booked at: the mean
-    /// prefill of the default profile's least-load scorer when it has one
-    /// (`least_load`'s setting, the scorer's default under `power_of_two`),
-    /// nothing otherwise.
-    mean_prompt_tokens: u32,
 }
 
 impl std::fmt::Debug for Decider {
@@ -235,7 +191,6 @@ impl std::fmt::Debug for Decider {
         f.debug_struct("Decider")
             .field("generation", &self.engine.generation())
             .field("needs", &self.engine.needs())
-            .field("decisions", &self.decisions())
             .finish_non_exhaustive()
     }
 }
@@ -269,9 +224,8 @@ impl Decider {
         if let Some(profile) = spec.profiles.get_mut("decode") {
             tune(profile, decode);
         }
-        let default_profile = profile_of(default)?;
-        let mean_prompt_tokens = mean_prefill_of(&default_profile);
-        spec.profiles.insert("default".to_string(), default_profile);
+        spec.profiles
+            .insert("default".to_string(), profile_of(default)?);
         // The pair binding covers the two pair phases; every other phase
         // resolves to the default profile.
         for binding in &mut spec.bindings {
@@ -284,66 +238,13 @@ impl Decider {
         Ok(Self {
             engine: spec.validate()?,
             loads: RwLock::new(None),
-            retired: Mutex::new(Retired::default()),
-            #[cfg(test)]
-            between_check_and_booking: Mutex::new(None),
             origin: Instant::now(),
             seq: AtomicU64::new(1),
-            mean_prompt_tokens,
         })
     }
 
     pub fn engine(&self) -> &Engine {
         &self.engine
-    }
-
-    /// A worker removed from the pool takes its rows in the engine's
-    /// accounting with it (`Membership::Removed` under its id), as the legacy
-    /// policies drop their per-worker state on removal; the policy registry's
-    /// removal path calls this beside that pruning.
-    pub fn on_worker_removed(&self, worker: &dyn Worker) {
-        let id = worker_id(worker);
-        self.retire(id);
-        self.engine.on_membership(&Membership::Removed(id));
-    }
-
-    /// A worker replaced in place (the same URL, a new handle) retires its
-    /// rows the same way: the engine keys its accounting by handle, so the
-    /// old handle's rows would otherwise stay for good under churn.
-    /// `Membership::Replaced` prunes them; the replacement starts with none.
-    pub fn on_worker_replaced(&self, old: &dyn Worker, new: &dyn Worker) {
-        let old = worker_id(old);
-        self.retire(old);
-        self.engine.on_membership(&Membership::Replaced {
-            old,
-            new: worker_id(new),
-        });
-    }
-
-    /// Record `id`'s retirement at the next lease to be issued. A lease is
-    /// numbered before its view is built, so every decision that began
-    /// before this call carries a lower sequence.
-    fn retire(&self, id: WorkerId) {
-        self.retired
-            .lock()
-            .retire(id, self.seq.load(Ordering::Relaxed));
-    }
-
-    /// Decisions taken so far, each `decide` or `decide_pair` call one; for
-    /// tests and dumps.
-    pub fn decisions(&self) -> u64 {
-        self.seq.load(Ordering::Relaxed).saturating_sub(1)
-    }
-
-    /// The prompt's token count as the host books it on a lease: the
-    /// request's tokens when the host has them, else the mean a request of
-    /// unknown size is priced at (the least-load policy's
-    /// `mean_prefill_tokens`, as the legacy policy prices it; nothing under a
-    /// policy that does not price tokens).
-    pub fn prompt_tokens(&self, tokens: Option<&[u32]>) -> u32 {
-        tokens.map_or(self.mean_prompt_tokens, |tokens| {
-            u32::try_from(tokens.len()).unwrap_or(u32::MAX)
-        })
     }
 
     /// Hand the engine the worker monitor's load feed.
@@ -424,9 +325,9 @@ impl Decider {
         }
     }
 
-    fn lease(&self, id: LeaseId, now: Instant, tokens: u32, session_key: Identity<'_>) -> Lease {
+    fn lease(&self, now: Instant, tokens: u32, session_key: Identity<'_>) -> Lease {
         Lease {
-            id,
+            id: LeaseId(self.seq.fetch_add(1, Ordering::Relaxed)),
             kind: LeaseKind::Credit,
             side: Side::Single,
             target_index: 0,
@@ -450,9 +351,6 @@ impl Decider {
         excluded: &[WorkerId],
     ) -> (Decision, Lease) {
         let now = Instant::now();
-        // Numbered before the view is built: a retirement that lands during
-        // the decision outdates this lease (see `Retired`).
-        let id = LeaseId(self.seq.fetch_add(1, Ordering::Relaxed));
         let snapshot = self.snapshot();
         let session_key = request.session_key.map_or(Identity::NONE, Identity::plain);
         let build = ViewBuild {
@@ -508,7 +406,7 @@ impl Decider {
             let decision = self.engine.decide(&facts, &pool, candidates, &cx, scratch);
             (
                 decision,
-                self.lease(id, now, request.prompt_tokens, session_key),
+                self.lease(now, request.prompt_tokens, session_key),
             )
         })
     }
@@ -530,9 +428,6 @@ impl Decider {
         excluded: &[WorkerId],
     ) -> (Decision, Lease, Vec<Arc<dyn Worker>>) {
         let now = Instant::now();
-        // Numbered before the view is built: a retirement that lands during
-        // the decision outdates this lease (see `Retired`).
-        let id = LeaseId(self.seq.fetch_add(1, Ordering::Relaxed));
         let snapshot = self.snapshot();
         let session_key = request.session_key.map_or(Identity::NONE, Identity::plain);
         let build = ViewBuild {
@@ -611,7 +506,7 @@ impl Decider {
         });
         (
             decision,
-            self.lease(id, now, request.prompt_tokens, session_key),
+            self.lease(now, request.prompt_tokens, session_key),
             decode_workers,
         )
     }
@@ -640,33 +535,15 @@ impl Decider {
                     target_index: u8::try_from(index).unwrap_or(u8::MAX),
                     ..*lease
                 };
-                // A lease decided before a side's retirement books nothing
-                // on it: the rows the retirement pruned stay gone, and the
-                // dispatch itself still goes to the handle the host holds.
-                // The check and the booking hold the lock together, so a
-                // retirement lands before both or after both.
-                {
-                    let retired = self.retired.lock();
-                    let book_target = !retired.predates(target.id, lease.id);
-                    let book_decode = target
-                        .pair
-                        .is_some_and(|pair| !retired.predates(pair.decode_id, lease.id));
-                    #[cfg(test)]
-                    if let Some(hook) = self.between_check_and_booking.lock().as_ref() {
-                        hook();
-                    }
-                    if book_target {
-                        self.engine
-                            .on_dispatched(&booked, target, side, since_decision);
-                    }
-                    if book_decode {
-                        let decode = Lease {
-                            side: Side::Decode,
-                            ..booked
-                        };
-                        self.engine
-                            .on_dispatched(&decode, target, Side::Decode, since_decision);
-                    }
+                self.engine
+                    .on_dispatched(&booked, target, side, since_decision);
+                if target.pair.is_some() {
+                    let decode = Lease {
+                        side: Side::Decode,
+                        ..booked
+                    };
+                    self.engine
+                        .on_dispatched(&decode, target, Side::Decode, since_decision);
                 }
                 return Some(*target);
             }
@@ -676,40 +553,6 @@ impl Decider {
             );
         }
         None
-    }
-}
-
-/// How many retirements the commit remembers: a lease older than that many
-/// is past every dispatch deadline.
-const RETIRED_KEPT: usize = 1024;
-
-/// The handles the membership retired (removed, or replaced at their URL),
-/// each with the lease sequence at its retirement. A commit under a lease
-/// decided before that sequence books nothing on the handle, so the rows the
-/// retirement pruned do not come back through a late dispatch; a lease
-/// decided after it books as usual, as the id may be a new handle's (the
-/// allocator reuses addresses). The oldest entry leaves at the cap.
-#[derive(Debug, Default)]
-struct Retired {
-    bound: HashMap<WorkerId, u64>,
-    order: VecDeque<WorkerId>,
-}
-
-impl Retired {
-    fn retire(&mut self, id: WorkerId, next_lease: u64) {
-        if self.bound.insert(id, next_lease).is_none() {
-            self.order.push_back(id);
-            if self.order.len() > RETIRED_KEPT {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.bound.remove(&oldest);
-                }
-            }
-        }
-    }
-
-    /// Whether `lease` was decided before `id`'s retirement.
-    fn predates(&self, id: WorkerId, lease: LeaseId) -> bool {
-        self.bound.get(&id).is_some_and(|&bound| lease.0 < bound)
     }
 }
 
@@ -796,7 +639,7 @@ fn permille(ratio: f64) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{mpsc, Arc};
+    use std::sync::Arc;
 
     use openai_protocol::worker::WorkerStatus;
     use tokio::sync::watch;
@@ -838,50 +681,6 @@ mod tests {
 
     fn decider(config: &PolicyConfig) -> Decider {
         Decider::from_configs(config, config, config).expect("a carried policy")
-    }
-
-    /// A removed worker's rows leave the engine's accounting with it: work
-    /// booked on a worker steers the next decision away from it until the
-    /// worker is removed, after which nothing booked follows its id.
-    #[test]
-    fn a_removed_workers_rows_leave_the_accounting_with_it() {
-        let decider = decider(&PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.0,
-            mean_prefill_tokens: 100,
-            default_throughput: 1000.0,
-        });
-        let (workers, _reports) = fed_pair(&decider);
-        let request = HostRequest {
-            prompt_tokens: decider.prompt_tokens(None),
-            ..request()
-        };
-        let book = |position: u32| {
-            let (decision, lease) = decider.decide(&request, &workers, &[]);
-            decider
-                .commit(&lease, &decision, Side::Single, |t| t.position == position)
-                .expect("the wanted worker is booked");
-        };
-        let leader = || {
-            let (decision, _) = decider.decide(&request, &workers, &[]);
-            decision
-                .pick()
-                .expect("a pick")
-                .targets
-                .iter()
-                .next()
-                .map(|t| t.position)
-        };
-        book(0);
-        book(0);
-        book(1);
-        assert_eq!(leader(), Some(1), "the worker with less booked work leads");
-
-        decider.on_worker_removed(workers[0].as_ref());
-        assert_eq!(
-            leader(),
-            Some(0),
-            "the removed worker's rows went with it, so it reads idle again"
-        );
     }
 
     #[test]
@@ -1082,61 +881,6 @@ mod tests {
         let b: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w:8000").build());
         assert_ne!(worker_id(a.as_ref()), worker_id(b.as_ref()));
         assert_eq!(worker_id(a.as_ref()), worker_id(a.as_ref()));
-    }
-
-    /// The legacy policy's case through the host: an idle worker whose cache
-    /// is full of reclaimable prefixes (usage 1.0, its running requests
-    /// holding none) beats a busy half-full one under the pressure term, and
-    /// a report without the split falls back to the usage it has.
-    #[test]
-    fn a_reclaimable_prefix_cache_does_not_make_an_idle_worker_busy_through_the_host() {
-        let decider = decider(&PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.15,
-            mean_prefill_tokens: 100,
-            default_throughput: 1000.0,
-        });
-        let workers = pool(2);
-        let busy = || {
-            let mut busy = one_rank_load(0, 0.5, 2000.0);
-            busy.loads[0].active_token_usage = Some(0.5);
-            busy
-        };
-        let mut idle = one_rank_load(0, 1.0, 2000.0);
-        idle.loads[0].num_running_reqs = 0;
-        idle.loads[0].active_token_usage = Some(0.0);
-        let (tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
-            (workers[0].url().to_string(), idle),
-            (workers[1].url().to_string(), busy()),
-        ]));
-        decider.set_load_receiver(Some(rx));
-        let leader = || {
-            let (decision, _) = decider.decide(&request(), &workers, &[]);
-            decision
-                .pick()
-                .expect("a pick")
-                .targets
-                .first()
-                .map(|t| t.position)
-        };
-        assert_eq!(
-            leader(),
-            Some(0),
-            "the idle worker's reclaimable cache is no pressure"
-        );
-        // Without the split the usage stands in for the share: the first
-        // worker now reads full and the half-full one leads.
-        let mut unsplit = one_rank_load(0, 1.0, 2000.0);
-        unsplit.loads[0].num_running_reqs = 0;
-        tx.send(LoadSnapshot::from_loads_for_test(vec![
-            (workers[0].url().to_string(), unsplit),
-            (workers[1].url().to_string(), busy()),
-        ]))
-        .expect("the receiver lives");
-        assert_eq!(
-            leader(),
-            Some(1),
-            "a report without the split falls back to its usage"
-        );
     }
 
     #[test]
@@ -1661,236 +1405,5 @@ mod tests {
             let first = decision.pick().expect("a pair").targets.first().copied();
             assert_eq!(first.map(|t| t.position), Some(1));
         }
-    }
-
-    /// A request of unknown size is booked at the mean prefill the default
-    /// profile's least-load scorer prices it at (the lease's contract):
-    /// `least_load`'s setting, the scorer's default of 1024 under every
-    /// `power_of_two` metric (the expected wait leads or breaks the count's
-    /// ties); a counted prompt is booked as counted; a profile that prices no
-    /// tokens books none.
-    #[test]
-    fn an_unknown_prompt_size_is_booked_at_the_mean_prefill() {
-        let least_load = decider(&PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.0,
-            mean_prefill_tokens: 100,
-            default_throughput: 1000.0,
-        });
-        assert_eq!(least_load.prompt_tokens(None), 100);
-        assert_eq!(least_load.prompt_tokens(Some(&[1, 2, 3])), 3);
-        let expected_wait = decider(&PolicyConfig::PowerOfTwo {
-            load_metric: PowerOfTwoLoadMetric::ExpectedWait,
-        });
-        assert_eq!(expected_wait.prompt_tokens(None), 1024);
-        assert_eq!(expected_wait.prompt_tokens(Some(&[7])), 1);
-        let requests = decider(&PolicyConfig::PowerOfTwo {
-            load_metric: PowerOfTwoLoadMetric::Requests,
-        });
-        assert_eq!(
-            requests.prompt_tokens(None),
-            1024,
-            "the count's ties break by expected wait, which prices tokens"
-        );
-        assert_eq!(decider(&PolicyConfig::RoundRobin).prompt_tokens(None), 0);
-    }
-    /// A commit under a lease decided before the worker's retirement books
-    /// nothing on it, whether the worker was removed or replaced at its URL:
-    /// the rows the retirement pruned do not come back through the late
-    /// dispatch. A lease decided after the retirement books as usual, since
-    /// the id may be a new handle's.
-    #[test]
-    fn a_commit_under_a_lease_older_than_the_workers_retirement_books_nothing() {
-        let config = PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.0,
-            mean_prefill_tokens: 100,
-            default_throughput: 1000.0,
-        };
-        let retire_found = [
-            |decider: &Decider, found: &dyn Worker| decider.on_worker_removed(found),
-            |decider: &Decider, found: &dyn Worker| {
-                let replacement = pool(1);
-                decider.on_worker_replaced(found, replacement[0].as_ref());
-            },
-        ];
-        for retire in retire_found {
-            let decider = decider(&config);
-            let (workers, _reports) = fed_pair(&decider);
-            let request = HostRequest {
-                prompt_tokens: decider.prompt_tokens(None),
-                ..request()
-            };
-            let book = |position: u32| {
-                let (decision, lease) = decider.decide(&request, &workers, &[]);
-                decider
-                    .commit(&lease, &decision, Side::Single, |t| t.position == position)
-                    .expect("the wanted worker is booked");
-            };
-            let leader = || {
-                let (decision, _) = decider.decide(&request, &workers, &[]);
-                decision
-                    .pick()
-                    .expect("a pick")
-                    .targets
-                    .iter()
-                    .next()
-                    .map(|t| t.position)
-            };
-            // Two leases decided while the found worker stands...
-            let stale = [
-                decider.decide(&request, &workers, &[]),
-                decider.decide(&request, &workers, &[]),
-            ];
-            // ...its retirement...
-            retire(&decider, workers[0].as_ref());
-            // ...and their commits after it: the dispatches go, nothing is booked.
-            for (decision, lease) in &stale {
-                decider
-                    .commit(lease, decision, Side::Single, |t| t.position == 0)
-                    .expect("the dispatch itself proceeds");
-            }
-            book(1);
-            assert_eq!(
-                leader(),
-                Some(0),
-                "the retired handle reads idle: the stale leases booked nothing"
-            );
-            // A lease decided after the retirement books under the same id.
-            book(0);
-            book(0);
-            assert_eq!(
-                leader(),
-                Some(1),
-                "a lease decided after the retirement books as usual"
-            );
-        }
-    }
-    /// A retirement that lands while a decision runs, after the view read
-    /// the pool and before the engine decided, outdates that lease too: the
-    /// lease is numbered before the view is built.
-    #[test]
-    fn a_commit_under_a_lease_whose_decision_saw_the_retirement_books_nothing() {
-        let config = PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.0,
-            mean_prefill_tokens: 100,
-            default_throughput: 1000.0,
-        };
-        let decider = decider(&config);
-        let (workers, _reports) = fed_pair(&decider);
-        let leader = || {
-            let (decision, _) = decider.decide(&request(), &workers, &[]);
-            decision
-                .pick()
-                .expect("a pick")
-                .targets
-                .iter()
-                .next()
-                .map(|t| t.position)
-        };
-        // The capacity check runs inside the view loop, before the engine
-        // decides: the found worker retires there, once.
-        let retired = std::cell::Cell::new(false);
-        let retire_during_the_view = |_: &Arc<dyn Worker>| {
-            if !retired.replace(true) {
-                decider.on_worker_removed(workers[0].as_ref());
-            }
-            true
-        };
-        let request_during = HostRequest {
-            prompt_tokens: decider.prompt_tokens(None),
-            has_capacity: Some(&retire_during_the_view),
-            ..request()
-        };
-        let (decision, lease) = decider.decide(&request_during, &workers, &[]);
-        assert!(retired.get(), "the retirement landed during the decision");
-        decider
-            .commit(&lease, &decision, Side::Single, |t| t.position == 0)
-            .expect("the dispatch itself proceeds");
-        // One small booking on the other worker: the retired handle, idle,
-        // still leads; the stale lease's mean-size booking would have lost it.
-        let small = HostRequest {
-            prompt_tokens: 1,
-            ..request()
-        };
-        let (decision, lease) = decider.decide(&small, &workers, &[]);
-        decider
-            .commit(&lease, &decision, Side::Single, |t| t.position == 1)
-            .expect("the other worker is booked");
-        assert_eq!(
-            leader(),
-            Some(0),
-            "the retired handle reads idle: a lease numbered before the view booked nothing"
-        );
-    }
-    /// A retirement that lands while a commit runs, after its check and
-    /// before its booking, waits for the booking: the check and the booking
-    /// hold the retirement record's lock together, so the row the booking
-    /// adds is the row the retirement then prunes.
-    #[test]
-    fn a_retirement_during_a_commits_booking_waits_for_it() {
-        let config = PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.0,
-            mean_prefill_tokens: 100,
-            default_throughput: 1000.0,
-        };
-        let decider = Arc::new(decider(&config));
-        let (workers, _reports) = fed_pair(&decider);
-        let leader = || {
-            let (decision, _) = decider.decide(&request(), &workers, &[]);
-            decision
-                .pick()
-                .expect("a pick")
-                .targets
-                .iter()
-                .next()
-                .map(|t| t.position)
-        };
-        // One small booking on the other worker: the found handle leads
-        // while it is idle and loses the lead with one mean-size row.
-        let small = HostRequest {
-            prompt_tokens: 1,
-            ..request()
-        };
-        let (decision, lease) = decider.decide(&small, &workers, &[]);
-        decider
-            .commit(&lease, &decision, Side::Single, |t| t.position == 1)
-            .expect("the other worker is booked");
-        assert_eq!(leader(), Some(0), "the found handle leads while idle");
-        let request = HostRequest {
-            prompt_tokens: decider.prompt_tokens(None),
-            ..request()
-        };
-        let (decision, lease) = decider.decide(&request, &workers, &[]);
-        // From between the check and the booking: the found worker's removal
-        // on another thread, waited for briefly. Under the shared lock it
-        // waits for the booking instead; released early, it lands first.
-        let removal: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-        {
-            let hooked = Arc::clone(&decider);
-            let found = Arc::clone(&workers[0]);
-            let removal = Arc::clone(&removal);
-            *decider.between_check_and_booking.lock() = Some(Box::new(move || {
-                let (done, landed) = mpsc::channel();
-                let decider = Arc::clone(&hooked);
-                let found = Arc::clone(&found);
-                let handle = std::thread::spawn(move || {
-                    decider.on_worker_removed(found.as_ref());
-                    let _ = done.send(());
-                });
-                let _ = landed.recv_timeout(std::time::Duration::from_millis(200));
-                *removal.lock() = Some(handle);
-            }));
-        }
-        decider
-            .commit(&lease, &decision, Side::Single, |t| t.position == 0)
-            .expect("the dispatch itself proceeds");
-        *decider.between_check_and_booking.lock() = None;
-        if let Some(handle) = removal.lock().take() {
-            handle.join().expect("the removal thread");
-        }
-        assert_eq!(
-            leader(),
-            Some(0),
-            "the retired handle reads idle: the retirement waited for the booking it then pruned"
-        );
     }
 }
