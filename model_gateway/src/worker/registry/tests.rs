@@ -1260,7 +1260,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh))
+            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
             .is_none(),
         "removal must abort when the origin no longer matches"
     );
@@ -3642,4 +3642,43 @@ fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
             "the upkeep forgets the address once the replaced instance is gone"
         );
     });
+}
+
+/// `remove_if` reads its condition of the worker as it stands and removes
+/// the worker in the same step under its lock: a condition that reads false
+/// leaves the worker, one that reads true takes it, and a worker gone reads
+/// `None`.
+#[test]
+fn remove_if_removes_the_worker_only_while_its_condition_holds() {
+    let registry = WorkerRegistry::new();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w1:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    let id = registry
+        .register(Arc::clone(&worker))
+        .expect("the worker registers");
+    let revision = worker.revision();
+
+    assert!(
+        registry
+            .remove_if(&id, |w| w.revision() == revision + 1)
+            .is_none(),
+        "a condition that reads false leaves the worker"
+    );
+    assert!(registry.get(&id).is_some(), "the worker stands");
+    let removed = registry
+        .remove_if(&id, |w| w.revision() == revision)
+        .expect("a condition that reads true takes the worker");
+    assert!(
+        Arc::ptr_eq(&removed, &worker),
+        "the worker removed is the one registered"
+    );
+    assert!(registry.get(&id).is_none(), "the worker is gone");
+    assert!(
+        registry.remove_if(&id, |_| true).is_none(),
+        "a worker gone reads None"
+    );
 }
