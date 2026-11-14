@@ -61,12 +61,14 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
+pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
 pub mod sse_rechunk;
+pub mod stream;
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot
