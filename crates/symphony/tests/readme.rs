@@ -2791,6 +2791,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "qwen3.8-27b-w4a16-autoround-rtx3090",
+        model: "grevinden/qwen3.8-27b-w4a16-autoround-rtx3090",
+        also: &[],
+        released: "2026-09-14",
+        smg: (Some("qwen_xml"), Some("qwen3")),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "qwen3.8-flash-next",
         model: "Qwen/Qwen3.8-Flash-Next",
         also: &["nvidia/Qwen3.8-Flash-Next-FP4-Local"],
