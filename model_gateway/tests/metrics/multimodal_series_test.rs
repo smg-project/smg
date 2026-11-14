@@ -9,6 +9,8 @@ use std::time::Duration;
 use llm_multimodal::{FetchOutcome, FetchReport, FetchSourceKind, Modality};
 use smg::observability::metrics::Metrics;
 
+use crate::metrics::recorder;
+
 /// The lines of one family.
 fn family<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
     body.lines().filter(|line| line.contains(name)).collect()
@@ -35,7 +37,7 @@ fn sample(lines: &[&str], labels: &[&str]) -> f64 {
 
 #[test]
 fn the_media_pipeline_families_render_as_histograms_with_their_values() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     Metrics::record_mm_processing_stage("mm-series-model", "preprocess", 0.004);
     Metrics::record_mm_processing_stage("mm-series-model", "total", 0.3);
     Metrics::record_mm_request_media(
