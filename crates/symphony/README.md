@@ -287,6 +287,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-03 | [colgrep-agent-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/colgrep-agent-2b) | lightonai/colgrep-agent-2B |  | `minicpm5` | 28 | replaying the set | none |
 | 2026-10-02 | [flora-rewarder](https://github.com/smg-project/bellwether/tree/main/fixtures/flora-rewarder) | nvidia/Flora-Rewarder |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-02 | [h2o-lightning-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/h2o-lightning-4b) | h2oai/h2o-lightning-4b |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
+| 2026-10-02 | [kolibri-1](https://github.com/smg-project/bellwether/tree/main/fixtures/kolibri-1) | Aleph-Alpha/Kolibri-1 |  | `qwen3` | 28 | replaying the set | none |
 | 2026-10-01 | [flora-captioner](https://github.com/smg-project/bellwether/tree/main/fixtures/flora-captioner) | nvidia/Flora-Captioner |  | `plain` | 2 | replaying the set | none |
 | 2026-10-01 | [granite-4.1-3b-llmon-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-4.1-3b-llmon-preview) | ibm-granite/granite-4.1-3b-llmon-preview |  | `plain` | — | awaiting fixtures | none |
 | 2026-10-01 | [userlm-2.0](https://github.com/smg-project/bellwether/tree/main/fixtures/userlm-2.0) | microsoft/UserLM-2.0 |  | `plain` | — | awaiting fixtures | none |

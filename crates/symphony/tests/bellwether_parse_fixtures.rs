@@ -307,6 +307,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "glm5.3-flash-e192-dgx-spark",
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    // Kolibri-1 writes Qwen 3's JSON calls under ChatML; its prompt ends bare (the model writes its
+    // own thought); thinking off closes it in the prompt as the empty `<think>` block.
+    ("kolibri-1", GenerationPrompt::ModelWritesTheThought),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
