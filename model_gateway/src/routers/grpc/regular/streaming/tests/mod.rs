@@ -41,23 +41,37 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
             logprobs: None,
             finish_reason: Some("stop".to_string()),
         };
-        let frame = CompletionChunkFrame::new("cmpl-1", "model-x", 1_700_000_000, fingerprint);
-        let mut buffer = BytesMut::new();
-        frame.write_chunk(&mut buffer, &choice);
         let whole = CompletionStreamResponse {
             id: "cmpl-1".to_string(),
             object: "text_completion".to_string(),
             created: 1_700_000_000,
-            choices: vec![choice],
+            choices: vec![choice.clone()],
             model: "model-x".to_string(),
             system_fingerprint: fingerprint.map(str::to_string),
             usage: None,
         };
-        assert_eq!(
-            event(&buffer),
-            serde_json::to_vec(&whole).unwrap(),
-            "completion, fingerprint {fingerprint:?}"
-        );
+        for usage_null_placeholder in [false, true] {
+            let frame = CompletionChunkFrame::new(
+                "cmpl-1",
+                "model-x",
+                1_700_000_000,
+                fingerprint,
+                usage_null_placeholder,
+            );
+            let mut buffer = BytesMut::new();
+            frame.write_chunk(&mut buffer, &choice);
+            // The placeholder goes where a serialized `usage` would: last.
+            let mut expected = serde_json::to_vec(&whole).unwrap();
+            if usage_null_placeholder {
+                expected.pop();
+                expected.extend_from_slice(b",\"usage\":null}");
+            }
+            assert_eq!(
+                event(&buffer),
+                expected,
+                "completion, fingerprint {fingerprint:?}, placeholder {usage_null_placeholder}"
+            );
+        }
 
         let choice = assistant_choice(0, Some("tok".to_string()), None, None);
         let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, fingerprint);
