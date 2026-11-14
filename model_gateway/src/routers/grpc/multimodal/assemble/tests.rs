@@ -564,7 +564,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
         TokenSpeedAssemblyOptions {
             shm_enabled: false,
             shm_min_bytes: 0,
-            encoder_input_dtype: "bfloat16".to_string(),
+            encoder_input_dtype: "bfloat16".into(),
             skip_pixel_values: false,
         },
         None,
@@ -686,7 +686,7 @@ fn a_qwen3_vl_video_batch_assembles_with_its_own_sizes_key() {
     let assembled = assemble_vllm(
         intermediate,
         &VllmAssembly {
-            encoder_dtype: "bfloat16".to_string(),
+            encoder_dtype: "bfloat16".into(),
             device_normalizes: false,
             shm_enabled: false,
             shm_min_bytes: 0,
@@ -1416,7 +1416,7 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
         }
     };
     let normalizes_on_device = VllmAssembly {
-        encoder_dtype: "bfloat16".to_string(),
+        encoder_dtype: "bfloat16".into(),
         device_normalizes: true,
         shm_enabled: false,
         shm_min_bytes: 0,
