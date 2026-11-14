@@ -1,6 +1,6 @@
 //! The `/metrics` read's response shape: a ratio-only snapshot, a snapshot with capacity and a
-//! fleet rollup against the rank cache. The parser and the gauge tables are the controller crate's
-//! (`smg_policy_controller::ingest::scrape`), tested there.
+//! fleet rollup against the rank cache. The parser and the gauge tables are the monitor's `scrape`
+//! module, tested there.
 
 use super::super::*;
 
