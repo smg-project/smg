@@ -21,6 +21,7 @@ use crate::{
     dialer::Dialer,
     gossip_controller::GossipController,
     gossip_service::{GossipService, PreparedGossipServer},
+    kv::MeshKV,
     mtls::{MTLSConfig, MTLSManager},
     partition::PartitionDetector,
 };
@@ -50,7 +51,7 @@ pub struct MeshServerHandler {
     /// Shared with the MeshServer so adapters can subscribe to stream
     /// namespaces (broadcast/targeted) and publish values that reach
     /// peers via the gossip loop.
-    mesh_kv: Arc<crate::kv::MeshKV>,
+    mesh_kv: Arc<MeshKV>,
     /// The node's dials, shared with the gossip loop: the `Leaving` broadcast
     /// goes through the channels the probes keep, with the node's TLS
     /// identity when the mesh has one.
@@ -147,7 +148,7 @@ impl MeshServerHandler {
     /// Shared MeshKV handle — adapters subscribe to stream namespaces
     /// and publish values through this. The handle is Arc-cloned, so
     /// subscribers created here see the same events as the gossip loop.
-    pub fn mesh_kv(&self) -> &Arc<crate::kv::MeshKV> {
+    pub fn mesh_kv(&self) -> &Arc<MeshKV> {
         &self.mesh_kv
     }
 }
@@ -196,7 +197,7 @@ impl MeshServerBuilder {
     pub fn build(&self) -> (MeshServer, MeshServerHandler) {
         let (signal_tx, signal_rx) = watch::channel(false);
         let partition_detector = Arc::new(PartitionDetector::default());
-        let mesh_kv = Arc::new(crate::kv::MeshKV::new(self.self_name.clone()));
+        let mesh_kv = Arc::new(MeshKV::new(self.self_name.clone()));
         // One dialer for the server, its gossip loop and the handler: every
         // dial to a peer, from any of them, goes through the same channel.
         let dialer = Dialer::new(self.mtls_manager.clone());
@@ -251,7 +252,7 @@ pub struct MeshServer {
     /// the handler.
     dialer: Arc<Dialer>,
     /// Node-wide MeshKV handle shared by the gossip controller and service.
-    mesh_kv: Arc<crate::kv::MeshKV>,
+    mesh_kv: Arc<MeshKV>,
 }
 
 impl MeshServer {
