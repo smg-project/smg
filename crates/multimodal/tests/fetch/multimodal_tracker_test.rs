@@ -90,7 +90,10 @@ async fn fetch_image_from_data_url() {
     );
 
     let frame = connector
-        .fetch_image(MediaSource::DataUrl(data_url), ImageFetchConfig::default())
+        .fetch_image(
+            MediaSource::DataUrl(data_url.into()),
+            ImageFetchConfig::default(),
+        )
         .await
         .expect("data url");
     assert_eq!(frame.size().width, 1);

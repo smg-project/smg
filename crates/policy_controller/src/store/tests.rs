@@ -350,6 +350,124 @@ fn a_replaced_incarnation_leaves_the_health_tables_with_its_row() {
     assert_eq!(store.health_entries(), 0, "and the new id starts clean");
 }
 
+/// A worker's load rows live exactly as long as its row: the removal deletes
+/// them, and a record or a report that lands later (a poll that was out, a
+/// stream's last frame) writes nothing.
+#[test]
+fn a_removed_worker_leaves_no_load_row_and_a_late_record_or_report_writes_none() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://d:8000");
+    let loads: &dyn LoadSink = &store;
+    let t0 = Instant::now();
+    loads.record(id, 0, row(0), t0, LoadSource::Stream);
+    loads.report(id, &[(1, row(0))], t0, LoadSource::Poll);
+    assert_eq!(loads.ranks(id), 2);
+    assert_eq!(store.load_entries(), 1);
+
+    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+    store.remove(id, revision).expect("removed");
+    assert_eq!(loads.ranks(id), 0, "the rows left with the row");
+    assert_eq!(store.load_entries(), 0, "and the entry with them");
+
+    let later = t0 + Duration::from_secs(1);
+    loads.record(id, 0, row(0), later, LoadSource::Stream);
+    loads.record(id, 0, row(0), later, LoadSource::Relay(GatewayId(4)));
+    loads.report(id, &[(0, row(0)), (1, row(0))], later, LoadSource::Poll);
+    assert_eq!(loads.ranks(id), 0, "a late write re-creates nothing");
+    assert!(loads.load(id, 0).is_none());
+    assert_eq!(store.load_entries(), 0);
+    assert_eq!(
+        loads.poll_mode(id, later, Duration::from_secs(10)),
+        PollMode::Poll
+    );
+}
+
+#[test]
+fn a_replaced_incarnation_leaves_the_old_id_without_rows_and_the_new_id_starts_empty() {
+    let store = MemoryStore::new();
+    let old = ready(&store, "http://w:8000");
+    let loads: &dyn LoadSink = &store;
+    let t0 = Instant::now();
+    loads.record(old, 0, row(0), t0, LoadSource::Stream);
+    assert_eq!(loads.ranks(old), 1);
+
+    let new = store.upsert(facts("http://w:8000", 2)).id();
+    assert_ne!(old, new, "a new incarnation under the key");
+    assert_eq!(
+        loads.ranks(old),
+        0,
+        "the old incarnation's rows left with its row"
+    );
+    assert_eq!(
+        loads.ranks(new),
+        0,
+        "nothing the old one reported is the new one's"
+    );
+    assert_eq!(store.load_entries(), 1, "one entry, the new member's");
+
+    // The old incarnation's stream is still draining: its record is dropped,
+    // the new one's is written.
+    loads.record(old, 0, row(0), t0, LoadSource::Stream);
+    loads.record(new, 0, row(0), t0, LoadSource::Stream);
+    assert_eq!((loads.ranks(old), loads.ranks(new)), (0, 1));
+    assert_eq!(store.load_entries(), 1);
+}
+
+#[test]
+fn a_load_write_for_an_id_that_never_registered_is_dropped() {
+    let store = MemoryStore::new();
+    let loads: &dyn LoadSink = &store;
+    let stranger = WorkerId(77);
+    let t0 = Instant::now();
+    loads.record(stranger, 0, row(0), t0, LoadSource::Scrape);
+    loads.report(stranger, &[(0, row(0))], t0, LoadSource::Poll);
+    assert_eq!(loads.ranks(stranger), 0);
+    assert_eq!(store.load_entries(), 0);
+}
+
+/// The removal and a writer racing it: whichever takes the table first, no
+/// row is on file once the removal has returned.
+#[test]
+fn a_writer_racing_the_removal_finds_no_row_after_it_returns() {
+    for _ in 0..200 {
+        let store = MemoryStore::new();
+        let id = ready(&store, "http://r:8000");
+        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        let t0 = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..50 {
+                    store.record(id, 0, row(0), t0, LoadSource::Stream);
+                    store.report(id, &[(1, row(0))], t0, LoadSource::Poll);
+                }
+            });
+            scope.spawn(|| {
+                store.remove(id, revision).expect("removed");
+            });
+        });
+        assert_eq!(LoadSink::ranks(&store, id), 0);
+        assert_eq!(store.load_entries(), 0);
+    }
+}
+
+#[test]
+fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://w:8000");
+    let loads: &dyn LoadSink = &store;
+    let t0 = Instant::now();
+    loads.record(id, 0, row(0), t0, LoadSource::Stream);
+    loads.evict(id);
+    assert_eq!(loads.ranks(id), 0);
+    assert_eq!(
+        loads.poll_mode(id, t0, Duration::from_secs(10)),
+        PollMode::Poll,
+        "its receipts went too"
+    );
+    loads.report(id, &[(0, row(0))], t0, LoadSource::Poll);
+    assert_eq!(loads.ranks(id), 1, "a member's next report is written");
+}
+
 /// A poll's row stands in for a silent rank's sample but never for its
 /// receipt: the poll decision keeps asking while that rank stays silent,
 /// whatever its neighbour pushes.
@@ -357,7 +475,7 @@ fn a_replaced_incarnation_leaves_the_health_tables_with_its_row() {
 fn fallback_polling_stays_while_a_silent_rank_stays_silent() {
     let store = MemoryStore::new();
     let sink: &dyn LoadSink = &store;
-    let id = WorkerId(12);
+    let id = ready(&store, "http://w:8000");
     let interval = Duration::from_secs(10);
     let t0 = Instant::now();
     let row = LoadRow::default();
@@ -421,7 +539,7 @@ fn the_store_formats_without_holding_a_table_twice() {
 fn a_record_replaces_its_rank_alone_and_a_poll_fills_only_the_ranks_that_stayed_quiet() {
     let store = MemoryStore::new();
     let loads: &dyn LoadSink = &store;
-    let id = WorkerId(3);
+    let id = ready(&store, "http://w:8000");
     let t0 = Instant::now();
     loads.record(id, 0, row(10), t0, LoadSource::Stream);
     loads.record(id, 1, row(0), t0, LoadSource::Stream);
@@ -479,7 +597,7 @@ fn a_record_replaces_its_rank_alone_and_a_poll_fills_only_the_ranks_that_stayed_
 fn the_poll_mode_reads_the_receipts_of_the_pushing_ranks_alone() {
     let store = MemoryStore::new();
     let loads: &dyn LoadSink = &store;
-    let id = WorkerId(3);
+    let id = ready(&store, "http://w:8000");
     let interval = Duration::from_secs(10);
     let t0 = Instant::now();
     assert_eq!(loads.poll_mode(id, t0, interval), PollMode::Poll);
@@ -515,7 +633,7 @@ fn the_poll_mode_reads_the_receipts_of_the_pushing_ranks_alone() {
 fn a_scrape_writes_no_receipt_so_the_poll_stays() {
     let store = MemoryStore::new();
     let loads: &dyn LoadSink = &store;
-    let id = WorkerId(3);
+    let id = ready(&store, "http://w:8000");
     let interval = Duration::from_secs(10);
     let t0 = Instant::now();
     loads.record(id, 0, row(4), t0, LoadSource::Scrape);

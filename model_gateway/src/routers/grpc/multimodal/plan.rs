@@ -35,13 +35,13 @@ impl MediaPlan {
         let mut plan = Self::default();
         for part in parts {
             let modality = match &part {
-                MediaContentPart::ImageUrl { .. } | MediaContentPart::ImageData { .. } => {
-                    Some(Modality::Image)
-                }
+                MediaContentPart::ImageUrl { .. }
+                | MediaContentPart::ImageBase64 { .. }
+                | MediaContentPart::ImageData { .. } => Some(Modality::Image),
                 MediaContentPart::ImageEmbeds { .. } => Some(Modality::ImageEmbeds),
-                MediaContentPart::AudioUrl { .. } | MediaContentPart::AudioData { .. } => {
-                    Some(Modality::Audio)
-                }
+                MediaContentPart::AudioUrl { .. }
+                | MediaContentPart::AudioBase64 { .. }
+                | MediaContentPart::AudioData { .. } => Some(Modality::Audio),
                 MediaContentPart::VideoUrl { .. } | MediaContentPart::VideoData { .. } => {
                     Some(Modality::Video)
                 }
@@ -71,9 +71,11 @@ impl MediaPlan {
         for part in &self.parts {
             let (of, source) = match part {
                 MediaContentPart::ImageUrl { url, .. } => (Modality::Image, url_source(url)),
+                MediaContentPart::ImageBase64 { .. } => (Modality::Image, BASE64_SOURCE),
                 MediaContentPart::ImageData { .. } => (Modality::Image, 2),
                 MediaContentPart::ImageEmbeds { .. } => (Modality::ImageEmbeds, 2),
                 MediaContentPart::AudioUrl { url, .. } => (Modality::Audio, url_source(url)),
+                MediaContentPart::AudioBase64 { .. } => (Modality::Audio, BASE64_SOURCE),
                 MediaContentPart::AudioData { .. } => (Modality::Audio, 2),
                 MediaContentPart::VideoUrl { url, .. } => (Modality::Video, url_source(url)),
                 MediaContentPart::VideoData { .. } => (Modality::Video, 2),
@@ -115,7 +117,11 @@ impl MediaPlan {
                 MediaContentPart::ImageUrl {
                     max_long_side_pixel: None,
                     ..
+                } | MediaContentPart::ImageBase64 {
+                    max_long_side_pixel: None,
+                    ..
                 } | MediaContentPart::AudioUrl { .. }
+                    | MediaContentPart::AudioBase64 { .. }
                     | MediaContentPart::VideoUrl {
                         fps: None,
                         max_long_side_pixel: None,
@@ -274,6 +280,19 @@ async fn prepare_placeholder_tokens_with_env(
         );
         return Ok(PlaceholderTokens::worker_only());
     };
+    // Reject request overrides before the media connector can resize pixels.
+    if spec.name() == "inkling2" {
+        anyhow::ensure!(
+            !plan.parts.iter().any(|part| matches!(
+                part,
+                MediaContentPart::ImageUrl {
+                    max_long_side_pixel: Some(_),
+                    ..
+                }
+            )),
+            "Inkling2 requires original image dimensions. max_long_side_pixel is unsupported"
+        );
+    }
     let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
         anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
     })?;
@@ -417,6 +436,9 @@ fn url_source(url: &str) -> usize {
     usize::from(FetchSourceKind::of_url(url) == FetchSourceKind::DataUrl)
 }
 
+/// The source index of a base64 part: the data URL it stands for.
+const BASE64_SOURCE: usize = 1;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Arc;
@@ -441,7 +463,7 @@ pub(crate) mod tests {
     /// `count` image parts, each at its own URL.
     pub(crate) fn image_urls(count: usize) -> MediaPlan {
         MediaPlan::new((0..count).map(|i| MediaContentPart::ImageUrl {
-            url: format!("https://example.com/{i}.png"),
+            url: format!("https://example.com/{i}.png").into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
@@ -452,13 +474,13 @@ pub(crate) mod tests {
     fn media_urls(modality: Modality, count: usize) -> MediaPlan {
         match modality {
             Modality::Video => MediaPlan::new((0..count).map(|i| MediaContentPart::VideoUrl {
-                url: format!("https://example.com/{i}.mp4"),
+                url: format!("https://example.com/{i}.mp4").into(),
                 uuid: None,
                 fps: None,
                 max_long_side_pixel: None,
             })),
             Modality::Audio => MediaPlan::new((0..count).map(|i| MediaContentPart::AudioUrl {
-                url: format!("https://example.com/{i}.wav"),
+                url: format!("https://example.com/{i}.wav").into(),
                 uuid: None,
             })),
             Modality::Image | Modality::ImageEmbeds => image_urls(count),
@@ -926,17 +948,17 @@ pub(crate) mod tests {
                 text: "ignored".to_string(),
             },
             MediaContentPart::AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
                 uuid: None,
             },
             MediaContentPart::ImageUrl {
-                url: "image".to_string(),
+                url: "image".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
-                url: "audio-2".to_string(),
+                url: "audio-2".to_string().into(),
                 uuid: None,
             },
         ]);
@@ -949,15 +971,15 @@ pub(crate) mod tests {
         assert_eq!(parts.len(), 3);
         assert!(matches!(
             &parts[0],
-            MediaContentPart::AudioUrl { url, .. } if url == "audio"
+            MediaContentPart::AudioUrl { url, .. } if url.as_str() == "audio"
         ));
         assert!(matches!(
             &parts[1],
-            MediaContentPart::ImageUrl { url, .. } if url == "image"
+            MediaContentPart::ImageUrl { url, .. } if url.as_str() == "image"
         ));
         assert!(matches!(
             &parts[2],
-            MediaContentPart::AudioUrl { url, .. } if url == "audio-2"
+            MediaContentPart::AudioUrl { url, .. } if url.as_str() == "audio-2"
         ));
     }
 
@@ -965,13 +987,13 @@ pub(crate) mod tests {
     fn rendered_anchor_validation_is_exact_per_modality() {
         let plan = MediaPlan::new([
             MediaContentPart::ImageUrl {
-                url: "image".to_string(),
+                url: "image".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
                 uuid: None,
             },
         ]);
@@ -1079,19 +1101,19 @@ pub(crate) mod tests {
         ]);
         let plan = MediaPlan::new([
             MediaContentPart::ImageUrl {
-                url: "https://a/1.png".to_string(),
+                url: "https://a/1.png".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::VideoUrl {
-                url: "https://a/v.mp4".to_string(),
+                url: "https://a/v.mp4".to_string().into(),
                 uuid: None,
                 fps: None,
                 max_long_side_pixel: None,
             },
             MediaContentPart::AudioUrl {
-                url: "https://a/a.wav".to_string(),
+                url: "https://a/a.wav".to_string().into(),
                 uuid: None,
             },
         ]);
@@ -1155,7 +1177,7 @@ pub(crate) mod tests {
         let source = dir.path().to_str().unwrap();
         let tokenizer = MockTokenizer::default();
         let plan = MediaPlan::new([MediaContentPart::ImageUrl {
-            url: "https://a/1.png".to_string(),
+            url: "https://a/1.png".to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
@@ -1204,5 +1226,151 @@ pub(crate) mod tests {
         );
         assert!(message.contains("no media spec"), "{message}");
         assert!(message.contains("--mm-processing worker"), "{message}");
+    }
+
+    /// A chat request with one image part, its `max_long_side_pixel` as `cap`.
+    fn image_chat_plan(cap: Option<serde_json::Value>) -> MediaPlan {
+        let mut image_url = serde_json::json!({"url": "https://invalid.example/image.png"});
+        if let Some(cap) = cap {
+            image_url["max_long_side_pixel"] = cap;
+        }
+        let request: openai_protocol::chat::ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "checkpoint",
+                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": image_url}]}]
+            }))
+            .unwrap();
+        super::super::media_plan_chat(&request.messages)
+    }
+
+    fn image_components(config: serde_json::Value) -> MultimodalComponents {
+        let components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        components.config_registry.insert(
+            "image-plan-test".to_string(),
+            Arc::new(MultimodalModelConfig::new(
+                config,
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        components
+    }
+
+    fn image_tokenizer() -> (
+        tempfile::TempDir,
+        llm_tokenizer::huggingface::HuggingFaceTokenizer,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"<|image_pad|>":1,"<|unused_200054|>":200054},"unk_token":"[UNK]"}}"#,
+        )
+        .unwrap();
+        let tokenizer =
+            llm_tokenizer::huggingface::HuggingFaceTokenizer::from_file(path.to_str().unwrap())
+                .unwrap();
+        (dir, tokenizer)
+    }
+
+    async fn image_placeholders(
+        plan: &MediaPlan,
+        model_id: &str,
+        tokenizer: &dyn TokenizerTrait,
+        components: &MultimodalComponents,
+    ) -> Result<PlaceholderTokens> {
+        prepare_placeholder_tokens_with_env(
+            plan,
+            model_id,
+            tokenizer,
+            components,
+            "image-plan-test",
+            "unused-local-source",
+            &HashMap::new(),
+            |_| true,
+            |_| None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn inkling2_image_plan_rejects_request_resize_before_fetch() {
+        let tokenizer = MockTokenizer::new();
+        for config in [
+            serde_json::json!({"model_type": "inkling2"}),
+            serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+        ] {
+            let components = image_components(config);
+            for cap in [0, 504, u32::MAX] {
+                let plan = image_chat_plan(Some(serde_json::json!(cap)));
+                let error = image_placeholders(&plan, "checkpoint", &tokenizer, &components)
+                    .await
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("max_long_side_pixel is unsupported"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inkling2_image_plan_accepts_missing_or_null_resize() {
+        let (_dir, tokenizer) = image_tokenizer();
+        for config in [
+            serde_json::json!({"model_type": "inkling2"}),
+            serde_json::json!({"architectures": ["Inkling2ForConditionalGeneration"]}),
+        ] {
+            let components = image_components(config);
+            for cap in [None, Some(serde_json::Value::Null)] {
+                let placeholders = image_placeholders(
+                    &image_chat_plan(cap),
+                    "checkpoint",
+                    &tokenizer,
+                    &components,
+                )
+                .await
+                .unwrap();
+                assert_eq!(placeholders.get(Modality::Image), Some("<|unused_200054|>"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn image_plan_preserves_resize_for_other_model_specs() {
+        let (_dir, tokenizer) = image_tokenizer();
+        for (model_id, config, placeholder) in [
+            (
+                "org/inkling2-name-only",
+                serde_json::json!({"model_type": "inkling_mm_model", "vision_config": {"decoder_dmodel": 1}}),
+                "<|unused_200054|>",
+            ),
+            (
+                "org/inkling2-name-only",
+                serde_json::json!({"architectures": ["Inkling2ForConditionalGenerationSuffix"], "vision_config": {"decoder_dmodel": 1}}),
+                "<|unused_200054|>",
+            ),
+            (
+                "qwen2-vl",
+                serde_json::json!({"model_type": "qwen2_vl"}),
+                "<|image_pad|>",
+            ),
+        ] {
+            let components = image_components(config);
+            let placeholders = image_placeholders(
+                &image_chat_plan(Some(serde_json::json!(504))),
+                model_id,
+                &tokenizer,
+                &components,
+            )
+            .await
+            .unwrap();
+            assert_eq!(placeholders.get(Modality::Image), Some(placeholder));
+        }
     }
 }

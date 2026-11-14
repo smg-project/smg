@@ -10,7 +10,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 #[cfg(test)]
 use super::create_worker::labels_for_rank;
 use super::create_worker::{
-    model_card_for_labels, report_for_rank, validate_parser_overrides,
+    kv_transfer_value, model_card_for_labels, report_for_rank, validate_parser_overrides,
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
@@ -432,9 +432,10 @@ struct EngineKvMetadata {
 }
 
 impl EngineKvMetadata {
-    /// Takes the three keys out of the report; an empty value is none.
+    /// Takes the three keys out of the report, an empty value being none
+    /// (`kv_transfer_value`, the registration's reading of the same keys).
     fn take(report: &mut HashMap<String, String>) -> Self {
-        let mut take = |key: &str| report.remove(key).filter(|value| !value.is_empty());
+        let mut take = |key: &str| kv_transfer_value(report.remove(key));
         Self {
             connector: take("kv_connector"),
             role: take("kv_role"),

@@ -338,7 +338,9 @@ pub(crate) fn select_from(
             request: HostRequest {
                 model: model_id,
                 prompt_tokens: decider.prompt_tokens(inputs.tokens),
-                session_key: info.routing_key.or(inputs.rid_key),
+                // A key-native default's own key, else the override's
+                // (`PolicyRegistry::engine_session_key`).
+                session_key: PolicyRegistry::engine_session_key(policy.as_ref(), &info),
                 tried: inputs.tried,
                 overload_lifted: info.overload_lifted,
                 phase: Phase::Single,
@@ -1660,9 +1662,7 @@ pub(crate) fn decide_pair(
     let request = HostRequest {
         model: model_id,
         prompt_tokens: decider.prefill_prompt_tokens(inputs.tokens),
-        session_key: policies
-            .sticky_header_key(inputs.headers)
-            .or(inputs.rid_key),
+        session_key: policies.sticky_key(inputs.headers, inputs.rid_key),
         tried: inputs.tried,
         overload_lifted: live.lift_prefill,
         phase: Phase::Prefill,
@@ -5123,6 +5123,81 @@ mod tests {
         }
     }
 
+    /// Under the switch the manual policy reads the `x-smg-routing-key`
+    /// hint the legacy manual policy reads second, under an override whose
+    /// configured list names other headers: a conversation keyed by the
+    /// hint alone keeps its owner across turns with fresh request ids, and
+    /// across a turn with none, under both switch values.
+    #[test]
+    fn with_the_engine_switch_the_manual_policy_reads_the_hint_under_a_configured_list() {
+        let manual = || PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let hinted = keyed_headers();
+        for mode in [PolicyEngineMode::Legacy, PolicyEngineMode::Engine] {
+            let policies = PolicyRegistry::with_override(
+                manual(),
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    headers: vec!["x-session-id".into()],
+                    ..Default::default()
+                },
+            )
+            .with_policy_engine(mode, &manual(), &manual());
+            assert_eq!(
+                policies.decider().is_some(),
+                mode == PolicyEngineMode::Engine
+            );
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let turn = |rid_key: Option<&'static str>| PlacementInputs {
+                headers: Some(&hinted),
+                rid_key,
+                ..Default::default()
+            };
+            let owner = pick(&registry, &policies, turn(Some("request-1")));
+            // A vacant key would go to a lighter worker.
+            owner.increment_load();
+            for rid_key in [Some("request-2"), Some("request-3"), None] {
+                assert_eq!(
+                    pick(&registry, &policies, turn(rid_key)).url(),
+                    owner.url(),
+                    "{mode:?}: the turn keyed {rid_key:?} left the owner of the hint"
+                );
+            }
+        }
+    }
+    /// Under the switch the hint keys nothing for a default the override
+    /// places: with the override's configured list naming other headers, a
+    /// round-robin request carrying the hint alone rotates under both switch
+    /// values, as the legacy override has no hint fallback.
+    #[test]
+    fn with_the_engine_switch_the_hint_keys_nothing_under_the_override() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let hinted = keyed_headers();
+        for mode in [PolicyEngineMode::Legacy, PolicyEngineMode::Engine] {
+            let policies = PolicyRegistry::with_override(
+                round_robin.clone(),
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    headers: vec!["x-session-id".into()],
+                    ..Default::default()
+                },
+            )
+            .with_policy_engine(mode, &round_robin, &round_robin);
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..3 {
+                seen.insert(
+                    pick(&registry, &policies, with_headers(&hinted))
+                        .url()
+                        .to_string(),
+                );
+            }
+            assert_eq!(seen.len(), 3, "{mode:?}: the hint alone rotates: {seen:?}");
+        }
+    }
     /// Under the switch a key whose owner is not ready takes a failover and
     /// returns to its first owner once that worker is back under the manual
     /// policy, as under legacy; under the override it stays on the failover,
