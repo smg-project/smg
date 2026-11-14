@@ -108,6 +108,21 @@ where
     Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
+/// Deserialize a map that also accepts JSON `null` (mapped to the empty map).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_map")]`
+/// on always-present maps an upstream may write as `null`.
+pub fn deserialize_null_as_empty_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<HashMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    Option::<HashMap<K, V>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
 ///
 /// Use with `#[serde(default = "default_true", deserialize_with = "deserialize_null_as_true")]`

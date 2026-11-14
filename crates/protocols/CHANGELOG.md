@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A `ResponsesResponse` whose `metadata` is `null`, or whose `incomplete_details.reason` is
+  `max_messages` or `steered`, as the public API writes them, parses; it refused all three.
+  `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
+  `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
+  `MaxMessages` and `Steered`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
