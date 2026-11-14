@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use crate::{
     channel::Channel,
+    framed::{call_with_frames, sglang_frames},
     request_fields::{
         body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
         stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
@@ -797,7 +798,7 @@ impl SglangSchedulerClient {
         req: proto::GenerateRequest,
     ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
         let request_id = req.request_id.clone();
-        let frames = crate::framed::sglang_frames(req);
+        let frames = sglang_frames(req);
         async move {
             let frames = frames?;
             let mut carrier = Request::new(());
@@ -805,7 +806,7 @@ impl SglangSchedulerClient {
                 warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = crate::framed::call_with_frames::<proto::GenerateResponse>(
+            let stream = call_with_frames::<proto::GenerateResponse>(
                 self.channel(),
                 "/sglang.grpc.scheduler.SglangScheduler/Generate",
                 metadata.into_headers(),
