@@ -264,7 +264,9 @@ impl std::fmt::Debug for JobQueue {
 
 /// The jobs kept for one URL while another job holds it
 /// ([`JobQueue::submit_or_defer`]): at most one removal and one job of any
-/// other kind, the latest of each. The removal runs first: a refresh kept
+/// other kind, the latest of the other kind and one removal for all the
+/// removals kept (`place` merges their pins). The removal runs first: a
+/// refresh kept
 /// beside it would refresh what the removal takes out, and when the removal
 /// leaves its worker standing (a guarded removal that skipped a worker
 /// registered since its `DELETE`) the refresh runs after it, so neither a
@@ -292,11 +294,60 @@ impl Kept {
     fn take_next(&mut self) -> Option<Job> {
         self.removal.take().or_else(|| self.other.take())
     }
+
+    /// Puts `job` in the slot of its kind, under the entry's lock. Two
+    /// removals meet as one: unguarded when either is (a removal without
+    /// pins takes whatever stands under the URL), otherwise the union of
+    /// their pins, an id pinned `None` on either side (the id as it stands,
+    /// the wider pin) staying `None`. Of two jobs of the other kind the
+    /// newer stays when `newer_wins`, else the one held.
+    fn place(&mut self, job: Job, newer_wins: bool) {
+        let slot = self.slot(&job);
+        *slot = Some(match (slot.take(), job) {
+            (
+                Some(Job::RemoveWorker {
+                    url,
+                    expected_revisions: held,
+                }),
+                Job::RemoveWorker {
+                    expected_revisions: other,
+                    ..
+                },
+            ) => Job::RemoveWorker {
+                url,
+                expected_revisions: Self::merge_pins(held, other),
+            },
+            (Some(held), job) => {
+                if newer_wins {
+                    job
+                } else {
+                    held
+                }
+            }
+            (None, job) => job,
+        });
+    }
+
+    fn merge_pins(
+        held: Option<HashMap<String, Option<u64>>>,
+        other: Option<HashMap<String, Option<u64>>>,
+    ) -> Option<HashMap<String, Option<u64>>> {
+        let (Some(mut pins), Some(other)) = (held, other) else {
+            return None;
+        };
+        for (id, revision) in other {
+            let pin = pins.entry(id).or_insert(revision);
+            if revision.is_none() {
+                *pin = None;
+            }
+        }
+        Some(pins)
+    }
 }
 
 /// How a failed registration's cleanup removal went in: queued as the URL's
 /// own job, or behind a removal in flight at the URL (kept to run on its
-/// heels, or its entries joined to the removal already kept there).
+/// heels, merged with a removal kept there already).
 #[derive(Debug, PartialEq, Eq)]
 enum CleanupRemoval {
     Queued,
@@ -544,11 +595,10 @@ impl JobQueue {
     }
 
     /// Keeps `job` for `url` in the slot of its kind: the latest of a kind
-    /// takes that slot, and the other kind's slot is left as it is.
+    /// takes that slot, a removal merging with a removal kept there
+    /// (`Kept::place`), and the other kind's slot is left as it is.
     fn keep(kept: &DashMap<String, Kept>, url: &str, job: Job) {
-        let mut entry = kept.entry(url.to_string()).or_default();
-        let slot = entry.slot(&job);
-        *slot = Some(job);
+        kept.entry(url.to_string()).or_default().place(job, true);
     }
 
     /// The next job kept for `url` in the run order (the removal, then the
@@ -564,38 +614,12 @@ impl JobQueue {
         job
     }
 
-    /// Joins `pins` to the removal kept for `url`, when one is kept: the one
-    /// removal that runs on the in-flight removal's heels then takes both
-    /// sets. A pin already there stays as it is (`None`, the id as it
-    /// stands, is the wider of the two), and a kept removal without pins
-    /// takes whatever stands under the URL, these included. False when no
-    /// removal is kept for the URL.
-    fn extend_kept_removal(&self, url: &str, pins: &HashMap<String, Option<u64>>) -> bool {
-        let Some(mut entry) = self.kept.get_mut(url) else {
-            return false;
-        };
-        let Some(Job::RemoveWorker {
-            expected_revisions, ..
-        }) = entry.removal.as_mut()
-        else {
-            return false;
-        };
-        if let Some(kept) = expected_revisions {
-            for (id, revision) in pins {
-                kept.entry(id.clone()).or_insert(*revision);
-            }
-        }
-        true
-    }
-
     /// `job` goes back to the slot of its kind (`run_kept`, its claim
-    /// refused): a job of that kind kept there since is the newer and stays.
+    /// refused): a job of that kind kept there since is the newer and stays,
+    /// a removal kept since taking the pins of the one going back
+    /// (`Kept::place`).
     fn put_back(kept: &DashMap<String, Kept>, url: &str, job: Job) {
-        let mut entry = kept.entry(url.to_string()).or_default();
-        let slot = entry.slot(&job);
-        if slot.is_none() {
-            *slot = Some(job);
-        }
+        kept.entry(url.to_string()).or_default().place(job, false);
     }
 
     /// The jobs kept for `worker_url` (`submit_or_defer`), run in turn on the
@@ -1072,8 +1096,8 @@ impl JobQueue {
     /// it runs on that one's heels, as a `DELETE`'s does: that one takes the
     /// workers it was queued for and leaves these standing when they are
     /// not among its pins, so a second is needed, and finds nothing left
-    /// when they were. These entries join the pins of a removal already
-    /// kept for the URL rather than displacing it.
+    /// when they were. Kept for the URL, these entries merge with those of a
+    /// removal kept there already (`Kept::place`), displacing nothing.
     async fn queue_removal(
         context: &Arc<AppContext>,
         url: &str,
@@ -1083,22 +1107,20 @@ impl JobQueue {
             .worker_job_queue
             .get()
             .ok_or_else(|| "Worker job queue not initialized".to_string())?;
-        let pins: HashMap<String, Option<u64>> = entries
-            .into_iter()
-            .map(|(id, revision)| (id, Some(revision)))
-            .collect();
         let job = Job::RemoveWorker {
             url: url.to_string(),
-            expected_revisions: Some(pins.clone()),
+            expected_revisions: Some(
+                entries
+                    .into_iter()
+                    .map(|(id, revision)| (id, Some(revision)))
+                    .collect(),
+            ),
         };
         if queue.claim_if_idle(&job) {
             return queue
                 .submit_claimed(job)
                 .await
                 .map(|()| CleanupRemoval::Queued);
-        }
-        if queue.extend_kept_removal(url, &pins) {
-            return Ok(CleanupRemoval::Behind);
         }
         let submitted = queue.submit_or_defer(job).await?;
         Ok(if submitted {
@@ -2663,11 +2685,11 @@ mod tests {
     }
 
     /// A kept job whose claim the runner could not take goes back to the
-    /// slot of its kind: a job of that kind kept meanwhile is the newer and
-    /// stays; a job of the other kind kept meanwhile keeps its own slot. The
-    /// URL's entry goes with its last job.
+    /// slot of its kind: a job of the other kind kept meanwhile keeps its own
+    /// slot, and a removal kept meanwhile merges with the one going back (an
+    /// unguarded side wins). The URL's entry goes with its last job.
     #[test]
-    fn a_kept_job_put_back_yields_to_a_newer_one_of_its_kind() {
+    fn a_kept_job_put_back_merges_with_the_removal_kept_meanwhile() {
         let url = "http://w:8004";
         let removal = || Job::RemoveWorker {
             url: url.to_string(),
@@ -2713,11 +2735,11 @@ mod tests {
             kept.get(url).is_some_and(|slots| matches!(
                 slots.removal,
                 Some(Job::RemoveWorker {
-                    expected_revisions: Some(_),
+                    expected_revisions: None,
                     ..
                 })
             )),
-            "a removal yields to the removal kept meanwhile"
+            "a removal put back merges with the removal kept meanwhile, the unguarded side winning"
         );
         assert_eq!(
             kinds(&kept).1,
@@ -3479,6 +3501,90 @@ mod tests {
         assert!(
             Arc::ptr_eq(&standing, &fresh),
             "the worker standing is the fresh registration"
+        );
+    }
+
+    fn removal(url: &str, pins: Option<&[(&str, Option<u64>)]>) -> Job {
+        Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: pins.map(|pins| {
+                pins.iter()
+                    .map(|(id, revision)| (id.to_string(), *revision))
+                    .collect()
+            }),
+        }
+    }
+
+    fn pins(pins: &[(&str, Option<u64>)]) -> HashMap<String, Option<u64>> {
+        pins.iter()
+            .map(|(id, revision)| (id.to_string(), *revision))
+            .collect()
+    }
+
+    fn kept_removal_pins(
+        kept: &DashMap<String, Kept>,
+        url: &str,
+    ) -> Option<HashMap<String, Option<u64>>> {
+        let slots = kept.get(url).expect("an entry kept for the URL");
+        let Some(Job::RemoveWorker {
+            expected_revisions, ..
+        }) = &slots.removal
+        else {
+            panic!("a removal kept for the URL");
+        };
+        expected_revisions.clone()
+    }
+
+    #[test]
+    fn a_removal_kept_over_a_kept_removal_merges_the_pins_the_wider_pin_staying() {
+        let kept = DashMap::new();
+        let url = "http://w:8000";
+        JobQueue::keep(
+            &kept,
+            url,
+            removal(url, Some(&[("a", Some(1)), ("b", None)])),
+        );
+        JobQueue::keep(
+            &kept,
+            url,
+            removal(url, Some(&[("b", Some(2)), ("c", Some(3))])),
+        );
+        assert_eq!(
+            kept_removal_pins(&kept, url),
+            Some(pins(&[("a", Some(1)), ("b", None), ("c", Some(3))]))
+        );
+        // A `None` pin on the newer side widens the held one.
+        JobQueue::keep(&kept, url, removal(url, Some(&[("a", None)])));
+        assert_eq!(
+            kept_removal_pins(&kept, url),
+            Some(pins(&[("a", None), ("b", None), ("c", Some(3))]))
+        );
+    }
+
+    #[test]
+    fn an_unguarded_removal_kept_in_either_order_leaves_the_kept_removal_unguarded() {
+        let url = "http://w:8000";
+        // The `DELETE`'s unguarded removal first, the cleanup's pins over it.
+        let kept = DashMap::new();
+        JobQueue::keep(&kept, url, removal(url, None));
+        JobQueue::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        assert_eq!(kept_removal_pins(&kept, url), None);
+        // The cleanup's pins first, the `DELETE`'s unguarded removal over them.
+        let kept = DashMap::new();
+        JobQueue::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        JobQueue::keep(&kept, url, removal(url, None));
+        assert_eq!(kept_removal_pins(&kept, url), None);
+    }
+
+    #[test]
+    fn a_removal_put_back_merges_with_the_removal_kept_since() {
+        let kept = DashMap::new();
+        let url = "http://w:8000";
+        JobQueue::keep(&kept, url, removal(url, Some(&[("b", Some(2))])));
+        JobQueue::put_back(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        assert_eq!(
+            kept_removal_pins(&kept, url),
+            Some(pins(&[("a", Some(1)), ("b", Some(2))]))
         );
     }
 }
