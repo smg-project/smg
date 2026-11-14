@@ -34,6 +34,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
+            prefill_admission::PrefillLoadGuard,
             sse::{SseEncoder, SseSender},
         },
         grpc::{
@@ -57,7 +58,6 @@ use crate::{
             utils,
         },
     },
-    worker::PrefillLoadGuard,
 };
 
 /// Whether a tool call of this `ResponseFormat` streams its arguments via

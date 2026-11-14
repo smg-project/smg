@@ -48,10 +48,11 @@ use crate::{
     middleware::TenantRequestMeta,
     rate_limit::{RateLimitManager, ReservationAttachment, UsageSettlement},
     routers::{
-        common::{rate_limit_cell::RateLimitCell, retry::mark_non_retryable},
+        common::{
+            rate_limit_cell::RateLimitCell, retry::mark_non_retryable, stream::GuardedStream,
+        },
         error,
     },
-    worker::GuardedStream,
 };
 
 /// Estimated tokens per whitespace-separated word of a request's text.
