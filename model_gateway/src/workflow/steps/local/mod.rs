@@ -97,13 +97,18 @@ pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<A
 ///         drain_workers
 ///              │
 ///     remove_from_worker_registry
-///              │
-///     remove_from_policy_registry
-///              │
-///       release_tokenizer
+///                  │
+///       +----------+----------+
+///       │                     │
+///       v                     v
+///  remove_from_policy_registry   release_tokenizer
 /// ```
 /// Cache cleanup removes only departed tenants, so surviving workers do not
-/// need the previous full-policy reinitialization pass.
+/// need the previous full-policy reinitialization pass. The tokenizer release
+/// waits on the registry step alone: it reads the worker registry and the
+/// record of worker-loaded entries, both settled there, and a policy cleanup
+/// that fails or times out must not keep a departed model's tokenizer
+/// resident (a failed step's dependents are never scheduled).
 pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
     WorkflowDefinition::new("worker_removal", "Remove worker from router")
         .add_step(
@@ -175,7 +180,10 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 max_attempts: 1,
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
             })
-            .depends_on(&["remove_from_policy_registry"]),
+            // On the registry step, not the policy cleanup: the release reads
+            // what that step settled, and a cleanup that fails or times out
+            // must not hold it back (a failed step's dependents never run).
+            .depends_on(&["remove_from_worker_registry"]),
         )
 }
 
@@ -546,5 +554,20 @@ mod tests {
             .steps
             .iter()
             .all(|step| step.id != StepId::new("update_remaining_policies")));
+    }
+
+    #[test]
+    fn the_tokenizer_release_waits_on_the_registry_step_alone() {
+        let workflow = create_worker_removal_workflow();
+        let release_step = workflow
+            .steps
+            .iter()
+            .find(|step| step.id == StepId::new("release_tokenizer"))
+            .unwrap();
+
+        assert_eq!(
+            release_step.depends_on,
+            vec![StepId::new("remove_from_worker_registry")]
+        );
     }
 }
