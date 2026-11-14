@@ -94,6 +94,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An Interactions input of steps reads its `user_input` and `model_output` steps, as the public API
+  takes them and as the SDK sends every content list it builds: each keeps its type and content
+  and is forwarded as written, its text counts for routing and the tenant charge, and a replayed
+  conversation that also holds thought or tool steps validates. A list with such a step read as
+  role-less turns, which dropped each step's type, and a replay was refused as having empty turns.
+  Breaking: `interactions::Content` gains `UserInput` and `ModelOutput`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
