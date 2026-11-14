@@ -27,6 +27,8 @@ use super::{
     normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
     PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
+#[cfg(test)]
+use crate::worker::UNKNOWN_MODEL_ID;
 use crate::{
     config::types::{
         ManualAssignmentMode, PdPairingMode, PolicyConfig, PolicyEngineMode,
@@ -631,7 +633,7 @@ impl PolicyRegistry {
         let model_id = workers
             .first()
             .map(|worker| worker.model_id())
-            .unwrap_or(crate::worker::UNKNOWN_MODEL_ID);
+            .unwrap_or(UNKNOWN_MODEL_ID);
         self.select_worker_for_model(policy, model_id, workers, info)
     }
 

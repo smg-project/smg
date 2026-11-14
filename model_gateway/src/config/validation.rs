@@ -15,7 +15,8 @@ use crate::{
         cost as selection_cost,
         engine_host::{encode_preset_name, preset_name, unsupported_form, Decider},
     },
-    worker::endpoint::Endpoint,
+    tenant::MAX_TENANT_ID_LEN,
+    worker::{endpoint::Endpoint, ConnectionMode},
 };
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
@@ -78,7 +79,7 @@ fn names_a_local_path(source: &str) -> bool {
 /// register); or a start-up URL names a gRPC worker itself. The connection
 /// mode alone misses the middle two: it follows the start-up URLs only.
 fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
-    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+    if config.connection_mode == ConnectionMode::Grpc
         || config.enable_igw
         || config.discovery.is_some()
     {
@@ -905,12 +906,11 @@ impl ConfigValidator {
             }
             // The canonical key is stored with every response and
             // conversation, in a 255-byte column on the SQL backends.
-            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+            if entry.tenant_id.len() > MAX_TENANT_ID_LEN {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "tenant_api_keys tenant_id '{}' is longer than {} bytes",
-                        entry.tenant_id,
-                        crate::tenant::MAX_TENANT_ID_LEN
+                        entry.tenant_id, MAX_TENANT_ID_LEN
                     ),
                 });
             }
@@ -2550,7 +2550,6 @@ impl ConfigValidator {
 mod tests {
 
     use super::*;
-    use crate::worker::ConnectionMode;
 
     /// Serialized thresholds survive round trips and reject invalid values for either role.
     #[test]
