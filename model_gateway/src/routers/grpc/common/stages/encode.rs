@@ -500,10 +500,10 @@ fn backend_name(client: &BackendClient) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routers::grpc::context::EncodeWorkerAssignment;
+    use crate::{routers::grpc::context::EncodeWorkerAssignment, worker::BasicWorkerBuilder};
 
     fn ec_worker(url: &str, role: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-        let mut builder = crate::worker::BasicWorkerBuilder::new(url)
+        let mut builder = BasicWorkerBuilder::new(url)
             .runtime_type(RuntimeType::Vllm)
             .label("ec_role", role)
             .label("ec_connector", "ECMooncakeConnector");

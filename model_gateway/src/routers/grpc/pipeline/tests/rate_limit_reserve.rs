@@ -16,8 +16,8 @@ use crate::{
     config::types::RouterConfig,
     rate_limit::{RateLimitManager, Reservation, ReserveRequest},
     routers::grpc::{
-        regular::symphony::template::Templates, spec::TranscriptionResponseFormat,
-        ProcessedMessages,
+        context::EmbeddingInput, regular::symphony::template::Templates,
+        spec::TranscriptionResponseFormat, ProcessedMessages,
     },
     tenant::TenantKey,
 };
@@ -354,8 +354,10 @@ fn embedding_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> Reques
     let mut ctx =
         RequestContext::for_embedding(Arc::new(request), None, MODEL.to_string(), components);
     ctx.state.preparation = Some(PreparationOutput::Embedding {
-        original_text: "Hello".to_string(),
-        token_ids: vec![0; num_tokens],
+        inputs: vec![EmbeddingInput {
+            text: Some("Hello".to_string()),
+            token_ids: vec![0; num_tokens],
+        }],
     });
     with_tenant_and_cell(ctx)
 }
@@ -368,8 +370,10 @@ fn classify_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> Request
     let mut ctx =
         RequestContext::for_classify(Arc::new(request), None, MODEL.to_string(), components);
     ctx.state.preparation = Some(PreparationOutput::Embedding {
-        original_text: "Hello".to_string(),
-        token_ids: vec![0; num_tokens],
+        inputs: vec![EmbeddingInput {
+            text: Some("Hello".to_string()),
+            token_ids: vec![0; num_tokens],
+        }],
     });
     with_tenant_and_cell(ctx)
 }
