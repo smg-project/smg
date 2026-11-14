@@ -31,7 +31,7 @@ struct Group {
     released: &'static str,
     /// What SMG resolves for the primary's id today, before Symphony is wired in: the
     /// `--tool-call-parser` and `--reasoning-parser` names its two registries pick
-    /// (`crates/tool_parser`, `crates/reasoning_parser`, read at main 0d0808f2); none is
+    /// (`crates/tool_parser`, `crates/reasoning_parser`, read at main 1b141d03b); none is
     /// passthrough, the output read as content.
     smg: (Option<&'static str>, Option<&'static str>),
     /// The table under `formats` that reads the group's output, once one is written; the
@@ -1065,7 +1065,7 @@ const GROUPS: &[Group] = &[
         model: "google/gemma-4-E4B-it",
         also: &["gemma-4-E2B-it"],
         released: "2026-03-02",
-        smg: (Some("json"), None),
+        smg: (Some("gemma4"), Some("gemma4")),
         table: Some(Table::Gemma4),
         set: Some(478_253),
         status: Status::Replaying,
@@ -1834,7 +1834,7 @@ const GROUPS: &[Group] = &[
         model: "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B",
         also: &[],
         released: "2026-09-21",
-        smg: (None, None),
+        smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3TaggedDirect),
         set: Some(589_298),
         status: Status::Replaying,
