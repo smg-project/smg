@@ -41,6 +41,12 @@ const CHANGE_LOG: usize = 1_024;
 pub struct MemoryStore {
     workers: Mutex<Workers>,
     health: Mutex<HealthTables>,
+    /// The load rows, one entry per member: an entry is created with its
+    /// worker's row and deleted with it, both under the workers lock (taken
+    /// first, as the health writers take it). A load write goes into its
+    /// worker's entry or is dropped, under this lock alone: the entry is the
+    /// membership test, so a read that lands after a removal re-creates
+    /// nothing and a replaced incarnation starts empty.
     loads: Mutex<FxHashMap<WorkerId, Ranks>>,
     kv: Mutex<Kv>,
     reservations: Mutex<Reservations>,
@@ -76,6 +82,24 @@ impl MemoryStore {
     pub(super) fn health_entries(&self) -> usize {
         let health = self.health.lock();
         health.vetoes.len() + health.ok_at.len()
+    }
+
+    /// How many workers the load table holds an entry for.
+    #[cfg(test)]
+    pub(super) fn load_entries(&self) -> usize {
+        self.loads.lock().len()
+    }
+
+    /// A worker's row is gone (removed, or replaced by a new incarnation):
+    /// the tables that live exactly as long as the row leave with it, here
+    /// and nowhere else. The health tables and the load rows today; the KV
+    /// tables join with their first writer. Called under the workers lock:
+    /// the health writers take it first and a load write goes into its
+    /// worker's entry or nowhere, so a write racing the removal finds the
+    /// row gone or lands before the tables are cleared.
+    fn forget_worker(&self, id: WorkerId) {
+        self.health.lock().forget(id);
+        self.loads.lock().remove(&id);
     }
 
     /// How many resyncs were recorded for `reason`.
@@ -209,10 +233,13 @@ impl WorkersStore for MemoryStore {
                 old: old_id,
                 new: new_id,
             });
-            // The old incarnation's health leaves with its row, as on a
-            // removal and under the same lock: a veto or a completed dispatch
-            // keyed by the old id would outlive it for good.
-            self.health.lock().forget(old_id);
+            // The old incarnation's tables leave with its row, as on a
+            // removal and under the same lock: a veto, a completed dispatch
+            // or a load row keyed by the old id would outlive it for good.
+            // The new incarnation starts with an empty load entry: nothing
+            // the old one reported is the new one's.
+            self.forget_worker(old_id);
+            self.loads.lock().insert(new_id, Ranks::default());
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -230,6 +257,9 @@ impl WorkersStore for MemoryStore {
                 probes: Probes::default(),
             },
         );
+        // The row's load entry, created with it: what a member's load
+        // writes go into.
+        self.loads.lock().insert(id, Ranks::default());
         workers.record(MembershipChange::Registered { id })
     }
 
@@ -255,12 +285,12 @@ impl WorkersStore for MemoryStore {
         let row = workers.rows.remove(&id)?;
         workers.by_key.remove(&row.row.facts.key);
         let change = workers.record(MembershipChange::Removed { id });
-        // The health tables forget the worker with its row, under the workers
-        // lock: a veto or a completed dispatch keyed by an id that is gone
-        // would stay for good, the next incarnation having a new id, and the
-        // writers take the same lock first, so one racing the removal finds
-        // the row gone or writes before the tables are cleared.
-        self.health.lock().forget(id);
+        // The worker's tables leave with its row, under the workers lock: a
+        // veto, a completed dispatch or a load row keyed by an id that is
+        // gone would stay for good, the next incarnation having a new id. A
+        // poll or a record that lands later finds no load entry and writes
+        // nothing.
+        self.forget_worker(id);
         Some(change)
     }
 
@@ -504,7 +534,11 @@ impl LoadSink for MemoryStore {
             source,
         };
         let mut loads = self.loads.lock();
-        let ranks = loads.entry(id).or_default();
+        // No entry, no member: the worker left (or never registered) and
+        // the record is dropped, never an entry of its own.
+        let Some(ranks) = loads.get_mut(&id) else {
+            return;
+        };
         if source.pushes() {
             ranks.pushed_at.insert(rank, received_at);
         }
@@ -519,7 +553,11 @@ impl LoadSink for MemoryStore {
         source: LoadSource,
     ) {
         let mut loads = self.loads.lock();
-        let ranks = loads.entry(id).or_default();
+        // A report that lands after its worker left (the poll was out when
+        // the row went) finds no entry and is dropped.
+        let Some(ranks) = loads.get_mut(&id) else {
+            return;
+        };
         for &(rank, row) in rows {
             let pushed_since = ranks
                 .pushed_at
@@ -572,8 +610,14 @@ impl LoadSink for MemoryStore {
             .map_or(0, |ranks| ranks.samples.len())
     }
 
+    /// A member's rows and receipts go and its entry stays, empty: the entry
+    /// is what its next report goes into, and it leaves with the worker's
+    /// row alone (`remove`, a replacing `upsert`). A worker that left has no
+    /// entry and nothing on file already.
     fn evict(&self, id: WorkerId) {
-        self.loads.lock().remove(&id);
+        if let Some(ranks) = self.loads.lock().get_mut(&id) {
+            *ranks = Ranks::default();
+        }
     }
 }
 

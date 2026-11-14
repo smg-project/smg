@@ -1863,6 +1863,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "nanbeige4.3-33b",
+        model: "Nanbeige/Nanbeige4.3-33B",
+        also: &[],
+        released: "2026-10-24",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "nemotron-cascade-14b-thinking",
         model: "nvidia/Nemotron-Cascade-14B-Thinking",
         also: &["Nemotron-Cascade-8B", "Nemotron-Cascade-8B-Thinking"],
