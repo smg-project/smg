@@ -484,7 +484,7 @@ mod tests {
     };
 
     use super::{
-        super::{pattern::Pattern, Pieces, Stage},
+        super::{pattern::Pattern, Pieces, Stage, Walk},
         *,
     };
 
@@ -532,17 +532,34 @@ mod tests {
                 out.push((offset, offset + text.len()));
                 return;
             };
+            let (gaps, matches) = match stage.pieces.walk() {
+                Walk::Merged => {
+                    let mut merged = None;
+                    for (start, _) in stage.pattern.find_iter(text) {
+                        match merged {
+                            Some(from) => walk(rest, &text[from..start], offset + from, out),
+                            None if start > 0 => walk(rest, &text[..start], offset, out),
+                            None => {}
+                        }
+                        merged = Some(start);
+                    }
+                    let from = merged.unwrap_or(0);
+                    walk(rest, &text[from..], offset + from, out);
+                    return;
+                }
+                Walk::Apart { gaps, matches } => (gaps, matches),
+            };
             let mut cursor = 0;
             for (start, end) in stage.pattern.find_iter(text) {
-                if stage.pieces.gaps() && cursor < start {
+                if gaps && cursor < start {
                     walk(rest, &text[cursor..start], offset + cursor, out);
                 }
-                if stage.pieces.matches() {
+                if matches {
                     walk(rest, &text[start..end], offset + start, out);
                 }
                 cursor = end;
             }
-            if stage.pieces.gaps() && cursor < text.len() {
+            if gaps && cursor < text.len() {
                 walk(rest, &text[cursor..], offset + cursor, out);
             }
         }
@@ -553,17 +570,23 @@ mod tests {
 
     /// The pieces of the engine: a `Sequence` of `Split`s over the text.
     fn engine(patterns: &[&str], text: &str) -> Vec<(usize, usize)> {
+        let stages: Vec<(&str, SplitDelimiterBehavior)> = patterns
+            .iter()
+            .map(|p| (*p, SplitDelimiterBehavior::Isolated))
+            .collect();
+        engine_with(&stages, text)
+    }
+
+    /// The pieces of the engine: a `Sequence` of `Split`s over the text,
+    /// each with its behavior.
+    fn engine_with(stages: &[(&str, SplitDelimiterBehavior)], text: &str) -> Vec<(usize, usize)> {
         let sequence = Sequence::new(
-            patterns
+            stages
                 .iter()
-                .map(|p| {
+                .map(|(p, behavior)| {
                     PreTokenizerWrapper::Split(
-                        Split::new(
-                            SplitPattern::Regex((*p).to_owned()),
-                            SplitDelimiterBehavior::Isolated,
-                            false,
-                        )
-                        .expect("split"),
+                        Split::new(SplitPattern::Regex((*p).to_owned()), *behavior, false)
+                            .expect("split"),
                     )
                 })
                 .collect(),
@@ -577,6 +600,43 @@ mod tests {
             .into_iter()
             .map(|(_, (start, end), _)| (start, end))
             .collect()
+    }
+
+    /// The walk of a `MergedWithNext` stage glues each match to the text
+    /// after it as the engine does: a run of line breaks before the byte-level
+    /// regex, on texts with runs between words, at both ends, adjacent, and
+    /// none.
+    #[test]
+    fn a_merged_stage_walks_as_the_engine_glues() {
+        const LINE_BREAKS: &str = r"(?:\r?\n)+(?!\r?\n)";
+        let stages = [
+            stage(LINE_BREAKS, Pieces::MatchesWithNextGap),
+            stage(GPT4, Pieces::MatchesAndGaps),
+        ];
+        let patterns = [
+            (LINE_BREAKS, SplitDelimiterBehavior::MergedWithNext),
+            (GPT4, SplitDelimiterBehavior::Isolated),
+        ];
+        for text in [
+            "one\ntwo\r\nthree\rfour",
+            "\n\nlead and trail\n",
+            "\r\n\r\n\n",
+            "a\n1\r\nb 22\n\n33 x",
+            "    indented\n\tcode\n\n",
+            "no break at all",
+            "\n",
+        ] {
+            assert_eq!(
+                staged(&stages, text),
+                engine_with(&patterns, text),
+                "text {text:?}"
+            );
+            assert_eq!(
+                staged(&stages[..1], text),
+                engine_with(&patterns[..1], text),
+                "the stage alone; text {text:?}"
+            );
+        }
     }
 
     fn pseudo_random(state: &mut u64) -> u64 {

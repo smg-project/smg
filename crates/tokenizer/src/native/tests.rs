@@ -51,6 +51,10 @@ const DIGITS: &str = r"\p{N}{1,3}";
 /// A parse family's punctuation stage: a bracket, or a capturing group of one
 /// punctuation character read back at once (a run of it).
 const PUNCTUATION_RUNS: &str = r#"[\(\)\[\]\{\}]|([!"\#\$%\&'\*\+,\-\./:;<=>\?\\\^_`\|\~])\1*"#;
+
+/// A line-break stage: runs of `\n` or `\r\n`, each taken whole with the text
+/// after it under `MergedWithNext`.
+const LINE_BREAK_RUNS: &str = r"(?:\r?\n)+(?!\r?\n)";
 const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
 const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -401,6 +405,47 @@ fn shapes() -> Vec<Shape> {
             pre_tokenizers: vec![byte_level(true)],
             ignore_merges: false,
             special: &["<|endoftext|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // A line-break stage with `MergedWithNext` (each run of line breaks
+        // glued to the text after it), the cl100k-style regex, and the
+        // `ByteLevel` without its regex: the chain of a code family's files.
+        Shape {
+            name: "merged-line-breaks-then-cl100k",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(
+                    LINE_BREAK_RUNS,
+                    SplitDelimiterBehavior::MergedWithNext,
+                    false,
+                ),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|fim_prefix|>"],
+            added: &[],
+            stripped: &[],
+        },
+        // The same chain with a `Digits` split after the map: the
+        // merged-with-next stage walks the raw text, the digit stage the
+        // byte-level image of each piece.
+        Shape {
+            name: "merged-line-breaks-then-cl100k-then-digits-over-the-image",
+            normalizer: Normalizer::None,
+            pre_tokenizers: vec![
+                split(
+                    LINE_BREAK_RUNS,
+                    SplitDelimiterBehavior::MergedWithNext,
+                    false,
+                ),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|fim_prefix|>"],
             added: &[],
             stripped: &[],
         },
@@ -881,13 +926,13 @@ fn shapes_outside_the_path_are_declined() {
     // A split behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
-        split(QWEN35, SplitDelimiterBehavior::MergedWithNext, false),
+        split(QWEN35, SplitDelimiterBehavior::MergedWithPrevious, false),
         byte_level(false),
     ]))));
     assert_eq!(
         declined(&tokenizer),
-        "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, \
-             Removed, or Removed inverted)"
+        "Split behavior Some(\"MergedWithPrevious\") with invert Some(false) (only Isolated, \
+             Removed, Removed inverted, or MergedWithNext)"
     );
     // A punctuation behaviour the path does not reproduce.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -981,6 +1026,21 @@ fn shapes_outside_the_path_are_declined() {
     assert_eq!(
         declined(&tokenizer),
         r"a split pattern anchored to its text (\A, \z or \G) without a Digits split before it"
+    );
+    // A two-character lookahead after a class run: it would read past the
+    // end of a pool unit where the whole text reads on.
+    let mut tokenizer = tokenizer_of(base, &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        split(
+            r"[a]+(?![ ][b])| [a-z]+",
+            SplitDelimiterBehavior::Isolated,
+            false,
+        ),
+        byte_level(false),
+    ]))));
+    assert_eq!(
+        declined(&tokenizer),
+        r"a split pattern outside the supported regex subset: [a]+(?![ ][b])| [a-z]+"
     );
     // A post-processor of another kind, and a model that is not BPE.
     let mut tokenizer = tokenizer_of(base, &mut state);
@@ -1558,6 +1618,37 @@ fn a_removed_split_drops_its_matches_as_the_library_does() {
         "a-1-b 22-33\n-<tool_call>-x",
         "<|endoftext|>-",
         "no match at all",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(Some(tokenizer.get_model()), text, false),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_merged_with_next_split_glues_each_match_to_the_text_after_it() {
+    // The merged-line-breaks shape on texts with line breaks between words,
+    // runs of them, a lone `\r` (no match), breaks at both ends, alone,
+    // next to digits, indentation and an added token, and absent.
+    let mut state = 0x4D45_5247_4544_4E01u64;
+    let shape = shapes()
+        .into_iter()
+        .find(|shape| shape.name == "merged-line-breaks-then-cl100k")
+        .expect("the shape");
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = seeded(&tokenizer);
+    for text in [
+        "one\ntwo\r\nthree\rfour",
+        "\n\nlead and trail\n",
+        "\r\n\r\n\n",
+        "\r",
+        "a\n1\r\nb 22\n\n33 <|fim_prefix|>\nx",
+        "<|endoftext|>\r\n",
+        "    indented\n\tcode\n\n",
+        "no break at all",
     ] {
         let reference = tokenizer.encode(text, false).expect("encode");
         assert_eq!(
@@ -4784,17 +4875,34 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
             out.push((offset, offset + text.len()));
             return;
         };
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(from) => walk(rest, &text[from..start], offset + from, out),
+                        None if start > 0 => walk(rest, &text[..start], offset, out),
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                let from = merged.unwrap_or(0);
+                walk(rest, &text[from..], offset + from, out);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.pieces.gaps() && cursor < start {
+            if gaps && cursor < start {
                 walk(rest, &text[cursor..start], offset + cursor, out);
             }
-            if stage.pieces.matches() {
+            if matches {
                 walk(rest, &text[start..end], offset + start, out);
             }
             cursor = end;
         }
-        if stage.pieces.gaps() && cursor < text.len() {
+        if gaps && cursor < text.len() {
             walk(rest, &text[cursor..], offset + cursor, out);
         }
     }
@@ -5421,12 +5529,16 @@ fn image_stages_whose_pattern_rescans_a_run_are_declined() {
         added: &[],
         stripped: &[],
     };
+    // The last two open with a unit run, which no start skip covers: one
+    // that falls short of its minimum is rescanned from every start.
     for pattern in [
         r" ?\p{L}+!",
         r"\p{L}+!|\p{N}+",
         r"\p{L}\p{L}*!",
         r"[a-z]\p{L}+!",
         r"\p{L}*\p{N}+!",
+        r"(?:[!]?\p{L}){3,}",
+        r"(?:[!]?\p{L}){100000,}",
     ] {
         let stage = || split(pattern, SplitDelimiterBehavior::Isolated, false);
         let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
@@ -5454,4 +5566,54 @@ fn image_stages_whose_pattern_rescans_a_run_are_declined() {
         NativeEncoder::from_tokenizer(&leading).is_ok(),
         "a leading run after the map"
     );
+}
+
+#[test]
+fn a_merged_with_next_stage_over_the_image_is_declined() {
+    let mut state = 0x4D45_5247_4544_0001u64;
+    let shape_of = |pre_tokenizers: Vec<PreTokenizerWrapper>| Shape {
+        name: "merged-with-next-over-the-image",
+        normalizer: Normalizer::None,
+        pre_tokenizers,
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let stage = || split(r"\p{N}+", SplitDelimiterBehavior::MergedWithNext, false);
+    let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
+    assert_eq!(
+        NativeEncoder::from_tokenizer(&after)
+            .expect_err("declined")
+            .to_string(),
+        "a merged-with-next pre-tokenizer stage over the byte-level image"
+    );
+    let before = tokenizer_of(&shape_of(vec![stage(), byte_level(false)]), &mut state);
+    assert!(
+        NativeEncoder::from_tokenizer(&before).is_ok(),
+        "a merged-with-next stage before the map"
+    );
+    // Within printable ASCII after the map the stage loads: no stage reads
+    // outside the image's alphabet, so the stages run over the raw text,
+    // where the merged pieces are the reference's.
+    let loads = tokenizer_of(
+        &shape_of(vec![
+            byte_level(false),
+            split("[!]+", SplitDelimiterBehavior::MergedWithNext, false),
+        ]),
+        &mut state,
+    );
+    let native = NativeEncoder::from_tokenizer(&loads)
+        .expect("a merged-with-next stage within printable ASCII after the map");
+    for text in ["a! b!!c", "!a!", "ab", "! !"] {
+        assert_eq!(
+            native.encode(Some(loads.get_model()), text, false),
+            Ok(loads
+                .encode(text, false)
+                .expect("encode")
+                .get_ids()
+                .to_vec()),
+            "{text:?} through the merged pieces over the raw text"
+        );
+    }
 }
