@@ -43,6 +43,7 @@ use super::{
         responses, stages::decisions::supports_worker as supports_decisions_worker,
         streaming::StreamingProcessor,
     },
+    spec::MessagesTools,
     utils::{message_utils, missing_tokenizer_response, ParserResolver},
 };
 use crate::{
@@ -53,6 +54,7 @@ use crate::{
     routers::{
         common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
     },
+    tenant::storage_tenant,
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -475,7 +477,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ResponsesRequest,
+        mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         let (Some(responses_context), Some(harmony_responses_context)) =
@@ -504,8 +506,8 @@ impl GrpcRouter {
             return error_response;
         }
 
-        let (body, canonical_model_id) =
-            canonicalize_responses_request(&self.worker_registry, &body, model_id);
+        let canonical_model_id =
+            canonicalize_responses_request(&self.worker_registry, &mut body, model_id);
         let model_id = canonical_model_id.as_ref();
 
         // Choose implementation based on Harmony model detection (checks worker metadata)
@@ -515,7 +517,6 @@ impl GrpcRouter {
         // `background: true` answers the queued object at once and runs the
         // work behind the response id; with the mode switched off such a
         // request runs in the foreground, and its object says so.
-        let mut body = body.into_owned();
         if body.background == Some(true) {
             if responses_context.background.enabled() {
                 let request_context = smg_data_connector::current_request_context();
@@ -627,7 +628,7 @@ impl GrpcRouter {
             &ctx.response_storage,
             &queued,
             &request,
-            crate::tenant::storage_tenant(tenant_meta).as_deref(),
+            storage_tenant(tenant_meta).as_deref(),
             ctx.request_context.clone(),
         )
         .await
@@ -761,7 +762,7 @@ impl GrpcRouter {
         &self,
         body: CreateMessageRequest,
         model_id: &str,
-    ) -> (Arc<CreateMessageRequest>, String) {
+    ) -> (Arc<CreateMessageRequest>, String, MessagesTools) {
         debug!("Processing messages request for model: {}", model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
@@ -770,7 +771,12 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model.clone_from(&model_id_cloned);
-        (Arc::new(canonical_body), model_id_cloned)
+        // The tools leave the request here, while it is still owned: converted
+        // once, by value, into the chat tools the pipeline carries beside the
+        // request; the request's own `tools` reads `None` from here on, and
+        // whether it was set travels with them.
+        let tools = MessagesTools::take_from(&mut canonical_body);
+        (Arc::new(canonical_body), model_id_cloned, tools)
     }
 
     /// Main route_messages implementation, over the request
@@ -781,6 +787,7 @@ impl GrpcRouter {
         tenant_meta: &TenantRequestMeta,
         canonical_body: Arc<CreateMessageRequest>,
         model_id_cloned: String,
+        tools: MessagesTools,
     ) -> Response {
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
@@ -796,7 +803,7 @@ impl GrpcRouter {
                 canonical_body.stream.unwrap_or(false),
             );
             let response = self
-                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
+                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned, &tools)
                 .await;
             if !response.status().is_success() {
                 self.messages_pipeline
@@ -811,6 +818,7 @@ impl GrpcRouter {
                 self.messages_pipeline
                     .execute_messages(
                         canonical_body,
+                        tools,
                         headers.cloned(),
                         model_id,
                         self.shared_components.clone(),
@@ -945,12 +953,13 @@ impl GrpcRouter {
         tenant_meta: &TenantRequestMeta,
         body: Arc<CreateMessageRequest>,
         model_id: &str,
+        tools: &MessagesTools,
     ) -> Response {
         let input_tokens = match self
             .count_prompt_tokens(
                 model_id,
                 message_utils::MessagesPrompt::from(&*body),
-                &body.chat_tools(),
+                &tools.chat_tools,
                 body.tool_choice.as_ref(),
                 true,
             )
@@ -1231,7 +1240,7 @@ impl RouterTrait for GrpcRouter {
                 "Cancel response not implemented",
             );
         };
-        let tenant = crate::tenant::storage_tenant(tenant_meta);
+        let tenant = storage_tenant(tenant_meta);
         cancel_response_impl(responses_context, tenant.as_deref(), response_id).await
     }
 
@@ -1323,8 +1332,8 @@ impl RouterTrait for GrpcRouter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        let (body, model_id) = self.messages_request_for_pipeline(body, model_id);
-        self.route_messages_impl(headers, tenant_meta, body, model_id)
+        let (body, model_id, tools) = self.messages_request_for_pipeline(body, model_id);
+        self.route_messages_impl(headers, tenant_meta, body, model_id, tools)
             .await
     }
 
@@ -1351,24 +1360,21 @@ impl RouterTrait for GrpcRouter {
 /// gone before dispatch. Otherwise a plain answer reports the canonical ID
 /// while a tool call answer reports the alias.
 ///
-/// Returns both halves together so a caller cannot take the canonical model ID
-/// and forget the body, or the reverse. The common path borrows both untouched
+/// The id is rewritten on the body the router already owns, so neither the
+/// alias nor the canonical case copies the request. Returns the canonical
+/// model ID the workers are selected by; the common path borrows it untouched
 /// and allocates nothing.
 fn canonicalize_responses_request<'a>(
     worker_registry: &WorkerRegistry,
-    body: &'a ResponsesRequest,
+    body: &mut ResponsesRequest,
     model_id: &'a str,
-) -> (Cow<'a, ResponsesRequest>, Cow<'a, str>) {
+) -> Cow<'a, str> {
     let Some(canonical_model) = worker_registry.resolve_model_alias(model_id) else {
-        return (Cow::Borrowed(body), Cow::Borrowed(model_id));
+        return Cow::Borrowed(model_id);
     };
-    let mut canonical_body = body.clone();
-    canonical_body.model.clear();
-    canonical_body.model.push_str(&canonical_model);
-    (
-        Cow::Owned(canonical_body),
-        Cow::Owned(canonical_model.to_string()),
-    )
+    body.model.clear();
+    body.model.push_str(&canonical_model);
+    Cow::Owned(canonical_model.to_string())
 }
 
 #[cfg(test)]

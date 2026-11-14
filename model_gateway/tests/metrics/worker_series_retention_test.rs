@@ -18,7 +18,7 @@ use smg::{
     worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
 };
 
-use crate::common::test_app::scrape;
+use crate::{common::test_app::scrape, metrics::recorder};
 
 const URL: &str = "grpc://[fd00::1]:50051";
 
@@ -42,7 +42,7 @@ fn worker() -> Arc<dyn Worker> {
 
 #[tokio::test]
 async fn removed_worker_series_leave_the_scrape() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

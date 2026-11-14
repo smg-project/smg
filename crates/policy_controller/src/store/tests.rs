@@ -10,8 +10,8 @@ use super::{
     SessionsStore, SnapshotChunk, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
 };
 use crate::{
-    lease::{Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
-    view::{fingerprint, LoadRow, SignalSource, WorkerId},
+    lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -99,7 +99,7 @@ fn a_registration_is_keyed_and_a_new_incarnation_replaces_it_under_a_new_id() {
     assert_eq!(workers.by_key("http://w:8000").map(|row| row.id), Some(new));
     assert_eq!(
         replaced.as_lifecycle(),
-        Some(crate::lease::Membership::Replaced { old, new })
+        Some(Membership::Replaced { old, new })
     );
 }
 
@@ -113,7 +113,7 @@ fn a_replacement_carries_a_matching_registrations_status_and_a_changed_one_start
         WorkerStatus::Ready
     );
     let mut other_role = facts("http://w:8000", 3);
-    other_role.role = crate::view::Role::Prefill;
+    other_role.role = Role::Prefill;
     let changed = store.upsert(other_role).id();
     assert_eq!(
         WorkersStore::get(&store, changed).expect("the row").status,
