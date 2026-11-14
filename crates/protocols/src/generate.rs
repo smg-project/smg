@@ -228,9 +228,10 @@ impl Normalizable for GenerateRequest {
 /// ids the engine serves the ids without reading the text; a media-only
 /// prompt is sent with an empty `text`, as the engine reads it; a body with
 /// two of `text`, `input_ids` and `input_embeds` is served, the engine taking
-/// the ids over the text and the embeds only without a text), an empty
-/// `input_ids` is refused as the chat route refuses an empty `messages`, and
-/// a negative id in `input_ids` is refused.
+/// the ids over the text and the embeds only without a text), an empty batch
+/// of texts with no ids is refused, an empty `input_ids` is refused as the
+/// chat route refuses an empty `messages`, and a negative id in `input_ids` is
+/// refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
     // A body with no prompt at all is refused. `input_embeds` is a prompt on
     // the paths that forward the body as-is.
@@ -257,7 +258,10 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
     }
 
     // An empty batch of texts is no prompt, as an empty list of ids is none.
-    if matches!(&req.text, Some(StringOrArray::Array(texts)) if texts.is_empty()) {
+    // Beside ids it is not read, as an empty text beside ids is not.
+    if matches!(&req.text, Some(StringOrArray::Array(texts)) if texts.is_empty())
+        && req.input_ids.is_none()
+    {
         return Err(invalid_at(
             "text",
             "empty_array",
@@ -736,7 +740,8 @@ mod tests {
     /// SGLang's `text` takes a batch of prompts (`Union[List[str], str]`):
     /// one is read and written back as a list, and routes on its texts
     /// joined, as a batch of ids routes on its ids. An empty batch is no
-    /// prompt, refused as an empty `input_ids` is.
+    /// prompt, refused as an empty `input_ids` is; beside ids it is not read,
+    /// as an empty text beside ids is not.
     #[test]
     fn a_generate_request_takes_a_batch_of_texts() {
         use validator::ValidationErrorsKind;
@@ -770,6 +775,15 @@ mod tests {
         };
         assert_eq!(found[0].code, "empty_array");
         assert_eq!(found[0].params["field"], "text");
+
+        let beside_ids: GenerateRequest = serde_json::from_value(
+            serde_json::json!({"model": "m", "text": [], "input_ids": [1, 2]}),
+        )
+        .expect("an empty batch beside ids parses");
+        assert!(
+            beside_ids.validate().is_ok(),
+            "beside ids an empty batch is not read"
+        );
     }
 
     /// A body names media when one of the three fields carries something; a
