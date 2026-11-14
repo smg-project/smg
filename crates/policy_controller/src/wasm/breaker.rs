@@ -5,8 +5,9 @@
 //! calls whatever ended them and a lazy `init` the decision paid, over the
 //! decision's budget) counts as slowness; either opens the breaker for a
 //! cool-down, during which every stage of the plugin takes its fallback
-//! without a call. A report made during the cool-down, by a call admitted
-//! before the open, is dropped: one incident is one opening. One breaker
+//! without a call. A report stamped during the cool-down, by a call admitted
+//! before the open, is dropped whenever it arrives: one incident is one
+//! opening. One breaker
 //! per plugin, shared by its instances; the latency ring is per thread,
 //! kept across the thread's rebuilds (no shared write per call).
 
@@ -32,8 +33,11 @@ pub(crate) struct Breaker {
     /// starts a window and one that counts in it never interleave. A failure
     /// is a fault, rare beside a call, and a call reads `open_until` alone.
     window: Mutex<Window>,
-    /// Microseconds on the runtime's clock until which the breaker is open;
-    /// `0` when closed.
+    /// Microseconds on the runtime's clock at which the last opening ends:
+    /// the breaker is open before it, and a report stamped before it is
+    /// dropped. It stays there once the cool-down has passed (zero before
+    /// the first opening), so no read of the breaker hides it from a report
+    /// that was stamped inside the cool-down and arrives after its end.
     open_until: AtomicU64,
     opens: AtomicU64,
 }
@@ -48,27 +52,17 @@ impl Breaker {
         }
     }
 
-    /// Whether the plugin is bypassed at `now`. A cool-down that has passed
-    /// closes the breaker on this read: the calls resume, and the failure
-    /// window counts afresh from the next failure.
+    /// Whether the plugin is bypassed at `now`: before the last opening's
+    /// end. Past it the calls resume, and the failure window counts afresh
+    /// from the next failure (the opening forgot its count).
     pub(crate) fn is_open(&self, now_micros: u64) -> bool {
-        let until = self.open_until.load(Ordering::Relaxed);
-        if until == 0 {
-            return false;
-        }
-        if now_micros < until {
-            return true;
-        }
-        let _ = self
-            .open_until
-            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed);
-        false
+        now_micros < self.open_until.load(Ordering::Relaxed)
     }
 
     /// One failure at `now`: opens the breaker at the window's threshold,
-    /// and says whether this one opened it. A failure reported while the
-    /// breaker is open, by a call admitted before it opened, is dropped: it
-    /// counts in no window and opens nothing again.
+    /// and says whether this one opened it. A failure stamped while the
+    /// breaker was open, by a call admitted before it opened, is dropped
+    /// whenever it arrives: it counts in no window and opens nothing again.
     pub(crate) fn failure(&self, now_micros: u64) -> bool {
         let mut window = self.window.lock();
         if now_micros < self.open_until.load(Ordering::Relaxed) {
@@ -110,7 +104,7 @@ impl Breaker {
     /// one crossing of the threshold is one open.
     fn open(&self, window: &mut Window, now_micros: u64) {
         self.open_until.store(
-            now_micros.saturating_add(self.spec.cooldown_micros).max(1),
+            now_micros.saturating_add(self.spec.cooldown_micros),
             Ordering::Relaxed,
         );
         window.failures = 0;
@@ -134,11 +128,19 @@ impl Breaker {
 /// a p99 past it is slow. The p99 of a window is its second-slowest sample,
 /// so one outlier does not open the breaker, and a window that read slow is
 /// forgotten, so it does not open it twice.
+///
+/// The ring also says whether its thread reads its CPU clock at the start of
+/// the plugin's calls ([`Latency::arm`]): the sample of a late call no
+/// reading covers is the time the call took, which a hold of the host makes
+/// slow, so the ring that is about to take one is armed until that sample
+/// has left it, and at most one of them is ever in a window.
 #[derive(Debug)]
 pub(crate) struct Latency {
     ring: [u32; Self::SAMPLES],
     next: usize,
     filled: usize,
+    /// The samples the ring still takes armed.
+    armed: usize,
 }
 
 impl Latency {
@@ -152,7 +154,20 @@ impl Latency {
             ring: [0; Self::SAMPLES],
             next: 0,
             filled: 0,
+            armed: 0,
         }
+    }
+
+    /// Arms the ring's thread for the ring's length in samples: the sample
+    /// of the decision in flight and the [`Latency::SAMPLES`] - 1 after it.
+    /// The sample that follows those overwrites this decision's.
+    pub(crate) fn arm(&mut self) {
+        self.armed = Self::SAMPLES;
+    }
+
+    /// Whether the thread reads its CPU clock at the start of a call.
+    pub(crate) fn armed(&self) -> bool {
+        self.armed != 0
     }
 
     /// Records one call of `micros` under a frame of `frame_micros` (a call
@@ -166,6 +181,9 @@ impl Latency {
         self.ring[self.next] = u32::try_from(share).unwrap_or(u32::MAX);
         self.next = (self.next + 1) % Self::SAMPLES;
         self.filled = (self.filled + 1).min(Self::SAMPLES);
+        // The arm falls by one where a sample is written, so it is counted
+        // in the ring's own unit.
+        self.armed = self.armed.saturating_sub(1);
         if !self.next.is_multiple_of(Self::EVERY) || self.filled < 2 {
             return false;
         }
@@ -323,6 +341,31 @@ mod tests {
         b.slow(2_000);
         assert_eq!(b.opens(), 1);
         assert!(!b.is_open(5_100), "the cool-down was not restarted");
+    }
+
+    /// A report stamped inside a cool-down is dropped whenever it arrives:
+    /// after the cool-down's end too, and after another thread read the
+    /// breaker closed there. The opening's end stays where it was, so the
+    /// guard still finds it.
+    #[test]
+    fn a_report_stamped_inside_the_cooldown_is_dropped_after_a_closed_read() {
+        let b = Breaker::new(BreakerSpec {
+            failures: 1,
+            window_micros: 1_000,
+            cooldown_micros: 100,
+        });
+        assert!(b.failure(100), "the threshold of one opens until 200");
+        // Another thread reads the breaker closed at the cool-down's end;
+        // then a call that was in flight at the opening reports, with the
+        // instant it read before that end.
+        assert!(!b.is_open(200));
+        assert!(!b.failure(199), "stamped inside the cool-down: dropped");
+        assert!(!b.slow(199), "and a slow window stamped there");
+        assert_eq!(b.opens(), 1, "nothing opened again");
+        assert!(!b.is_open(200), "and the breaker reads closed");
+        // A report stamped at the end is counted.
+        assert!(b.failure(200));
+        assert_eq!(b.opens(), 2);
     }
 
     #[test]
@@ -483,5 +526,52 @@ mod tests {
 
         let mut unbudgeted = Latency::new();
         assert!(!(0..Latency::SAMPLES).any(|_| unbudgeted.record(1_000, 0)));
+    }
+
+    /// An armed ring stays armed for its own length in samples and no
+    /// longer: through the sample of the decision that armed it and the 127
+    /// after it, so the next sample a late call can leave unread overwrites
+    /// the first one's. A decision that records nothing does not count.
+    #[test]
+    fn an_armed_ring_stays_armed_for_its_length_in_samples() {
+        let mut ring = Latency::new();
+        assert!(!ring.armed(), "a new ring is not armed");
+        ring.arm();
+        for sample in 0..Latency::SAMPLES - 1 {
+            assert!(ring.armed(), "armed before sample {sample}");
+            assert!(!ring.record(10, 0), "no frame: not a sample");
+            assert!(
+                ring.armed(),
+                "a decision that records nothing does not count"
+            );
+            ring.record(10, 100);
+        }
+        assert!(
+            ring.armed(),
+            "the call 127 samples after the first is still read"
+        );
+        ring.record(10, 100);
+        assert!(!ring.armed(), "the arm fell with the ring's length");
+    }
+
+    /// One slow sample a window is never its p99. A ring armed by each late
+    /// call no reading covers takes such a sample once a length at most, so
+    /// those samples alone never read slow.
+    #[test]
+    fn one_unread_sample_a_ring_length_never_reads_slow() {
+        let mut ring = Latency::new();
+        let mut tripped = false;
+        for round in 0..4 {
+            assert!(!ring.armed(), "round {round}: the last arm has fallen");
+            // The unread call's decision: its sample is the time the call
+            // took, five hundred times its budget. It arms the ring.
+            ring.arm();
+            tripped |= ring.record(50_000, 100);
+            // Armed, a late call is read: its sample is the plugin's own.
+            for _ in 1..Latency::SAMPLES {
+                tripped |= ring.record(10, 100);
+            }
+        }
+        assert!(!tripped, "one slow sample in every window of the ring");
     }
 }
