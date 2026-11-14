@@ -84,7 +84,7 @@ mod frames;
 use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
-        assistant_choice, forces_tool_call, opening_choice, text_delta, ChatChunkFrame,
+        assistant_choice, forces_tool_call, opening_choice, push_json, text_delta, ChatChunkFrame,
         CompletionChunkFrame, EscapedText, FrameSink, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
@@ -287,7 +287,8 @@ struct GenerateEvent<'a> {
 impl GenerateEvent<'_> {
     /// Append the event's JSON to `buffer`: the bytes serde writes for the
     /// struct (its keys as literals, the text's literal from the choice, the
-    /// ids, the `meta_info` and the index through serde), pinned by
+    /// ids and the index through serde, the `meta_info` in one pass by
+    /// [`GenerateMetaInfo::write_into`]), pinned by
     /// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`.
     fn write_into(&self, buffer: &mut BytesMut) -> serde_json::Result<()> {
         // Matched field by field with no rest pattern, so a field added to the
@@ -303,7 +304,7 @@ impl GenerateEvent<'_> {
         buffer.extend_from_slice(b",\"output_ids\":");
         serde_json::to_writer(FrameSink(buffer), output_ids)?;
         buffer.extend_from_slice(b",\"meta_info\":");
-        serde_json::to_writer(FrameSink(buffer), meta_info)?;
+        meta_info.write_into(buffer)?;
         buffer.extend_from_slice(b",\"index\":");
         serde_json::to_writer(FrameSink(buffer), index)?;
         buffer.extend_from_slice(b"}");
@@ -313,7 +314,9 @@ impl GenerateEvent<'_> {
 
 /// The `meta_info` of a generate event: the logprob fields on the stream that
 /// carries logprobs only (`null` there when it has none), `e2e_latency` on the
-/// finish event only, as the events always had them.
+/// finish event only, as the events always had them. The `Serialize` derive
+/// is the shape serde writes, the oracle of the frame test; an event writes
+/// it through [`Self::write_into`].
 #[derive(Serialize)]
 struct GenerateMetaInfo<'a> {
     id: &'a str,
@@ -327,6 +330,66 @@ struct GenerateMetaInfo<'a> {
     reasoning_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     e2e_latency: Option<f64>,
+}
+
+impl GenerateMetaInfo<'_> {
+    /// Append the object's JSON to `buffer`: the bytes serde writes for the
+    /// struct, its keys and brackets as literals and its values through the
+    /// calls serde makes for them (the two strings escaped, the counters in
+    /// decimal, the finish reason, the logprob lists and the latency as it
+    /// writes those values), the logprob pair and the latency present where
+    /// the derive writes them. Walked as a struct, the object cost an escape
+    /// scan and three writes per key on every event (seven keys a token, nine
+    /// with the logprob pair) and the flattened field's map dispatch: about a
+    /// quarter of a generate stream request's user instructions. Pinned by
+    /// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`.
+    fn write_into(&self, buffer: &mut BytesMut) -> serde_json::Result<()> {
+        // Matched field by field with no rest pattern, so a field added to the
+        // object is a compile error here until this write says where it goes.
+        let Self {
+            id,
+            finish_reason,
+            prompt_tokens,
+            weight_version,
+            logprobs,
+            completion_tokens,
+            cached_tokens,
+            reasoning_tokens,
+            e2e_latency,
+        } = self;
+        buffer.extend_from_slice(b"{\"id\":");
+        push_json(FrameSink(buffer), id);
+        buffer.extend_from_slice(b",\"finish_reason\":");
+        // The finish reason's `Serialize` lives in another crate, so its write
+        // keeps the fallible path rather than the infallible one.
+        serde_json::to_writer(FrameSink(buffer), finish_reason)?;
+        buffer.extend_from_slice(b",\"prompt_tokens\":");
+        push_json(FrameSink(buffer), prompt_tokens);
+        buffer.extend_from_slice(b",\"weight_version\":");
+        push_json(FrameSink(buffer), weight_version);
+        if let Some(GenerateLogprobs {
+            input_token_logprobs,
+            output_token_logprobs,
+        }) = logprobs
+        {
+            buffer.extend_from_slice(b",\"input_token_logprobs\":");
+            push_json(FrameSink(buffer), input_token_logprobs);
+            buffer.extend_from_slice(b",\"output_token_logprobs\":");
+            push_json(FrameSink(buffer), output_token_logprobs);
+        }
+        buffer.extend_from_slice(b",\"completion_tokens\":");
+        push_json(FrameSink(buffer), completion_tokens);
+        buffer.extend_from_slice(b",\"cached_tokens\":");
+        push_json(FrameSink(buffer), cached_tokens);
+        buffer.extend_from_slice(b",\"reasoning_tokens\":");
+        push_json(FrameSink(buffer), reasoning_tokens);
+        if let Some(e2e_latency) = e2e_latency {
+            buffer.extend_from_slice(b",\"e2e_latency\":");
+            push_json(FrameSink(buffer), e2e_latency);
+        }
+        buffer.extend_from_slice(b"}");
+        Ok(())
+    }
 }
 
 /// The logprob fields of a generate event on the stream that carries them.
