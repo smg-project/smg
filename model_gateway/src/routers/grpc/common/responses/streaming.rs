@@ -792,23 +792,33 @@ impl ResponseStreamEventEmitter {
     // MCP Event Emission Methods
     // ========================================================================
 
-    pub fn emit_mcp_list_tools_in_progress(&mut self, output_index: usize) -> serde_json::Value {
+    /// The list item's events carry the item's id after the output index,
+    /// as the call events do: a client joins them to the item's
+    /// `output_item.added` by `item_id`.
+    pub fn emit_mcp_list_tools_in_progress(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+    ) -> serde_json::Value {
         json!({
             "type": McpEvent::LIST_TOOLS_IN_PROGRESS,
             "sequence_number": self.next_sequence(),
-            "output_index": output_index
+            "output_index": output_index,
+            "item_id": item_id
         })
     }
 
     pub fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
+        item_id: &str,
         tool_items: &[serde_json::Value],
     ) -> serde_json::Value {
         json!({
             "type": McpEvent::LIST_TOOLS_COMPLETED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
+            "item_id": item_id,
             "tools": tool_items
         })
     }
@@ -816,12 +826,14 @@ impl ResponseStreamEventEmitter {
     pub fn emit_mcp_list_tools_failed(
         &mut self,
         output_index: usize,
+        item_id: &str,
         error: &str,
     ) -> serde_json::Value {
         json!({
             "type": McpEvent::LIST_TOOLS_FAILED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
+            "item_id": item_id,
             "error": error
         })
     }
@@ -1906,7 +1918,8 @@ impl ResponseStreamEventEmitter {
     /// The list-tools item's events: `output_item.added`, `in_progress`, then
     /// `completed` with the tools or, when the server's listing failed
     /// (`error`), `failed` with the failure, and `output_item.done` with the
-    /// item as the completed response carries it (the error on it).
+    /// item as the completed response carries it (the error on it); every
+    /// event carries the item's id.
     pub async fn emit_mcp_list_tools_sequence(
         &mut self,
         server_label: &str,
@@ -1936,13 +1949,13 @@ impl ResponseStreamEventEmitter {
             .await?;
 
         // Emit mcp_list_tools.in_progress
-        let event = self.emit_mcp_list_tools_in_progress(output_index);
+        let event = self.emit_mcp_list_tools_in_progress(output_index, &item_id);
         self.send_event(&event, tx).await?;
 
         // Emit mcp_list_tools.completed, or .failed when the listing failed
         let event = match error {
-            Some(error) => self.emit_mcp_list_tools_failed(output_index, error),
-            None => self.emit_mcp_list_tools_completed(output_index, &tool_items),
+            Some(error) => self.emit_mcp_list_tools_failed(output_index, &item_id, error),
+            None => self.emit_mcp_list_tools_completed(output_index, &item_id, &tool_items),
         };
         self.send_event(&event, tx).await?;
 
@@ -2089,31 +2102,55 @@ mod tests {
         assert_responses_api_usage, responses_api_test_usage,
     };
 
+    /// The events of one list-tools sequence for a server with no tools whose
+    /// listing failed with `error` (or succeeded, `None`), read back from the
+    /// stream in order.
+    async fn list_tools_sequence_events(error: Option<&str>) -> Vec<serde_json::Value> {
+        let (tx, mut rx) = sse_channel();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter
+            .emit_mcp_list_tools_sequence("conf", &[], error, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let frame = String::from_utf8(bytes.to_vec()).unwrap();
+            let data = frame.split("data: ").nth(1).unwrap().trim();
+            events.push(serde_json::from_str::<serde_json::Value>(data).unwrap());
+        }
+        events
+    }
+
+    /// The list item's `in_progress` and `completed` (or `failed`) events
+    /// carry the item's id and output index, as the call events do: a
+    /// client joins them to the item's `output_item.added` by `item_id`.
+    #[tokio::test]
+    async fn the_list_tools_events_carry_the_items_id() {
+        for error in [None, Some("Mcp error: -32603: tools/list refused")] {
+            let events = list_tools_sequence_events(error).await;
+            assert_eq!(events.len(), 4);
+            let item_id = events[0]["item"]["id"]
+                .as_str()
+                .expect("the added item's id");
+            assert!(!item_id.is_empty());
+            for event in &events[1..3] {
+                assert_eq!(event["item_id"], item_id, "{}", event["type"]);
+                assert_eq!(event["output_index"], 0, "{}", event["type"]);
+            }
+            assert_eq!(events[3]["item"]["id"], item_id);
+        }
+    }
+
     /// A server whose listing failed streams its list item as `added`,
     /// `mcp_list_tools.in_progress`, `mcp_list_tools.failed` with the failure,
     /// then `output_item.done` whose item carries the error and no tools;
     /// a listed server streams `completed` and an item without an error.
     #[tokio::test]
     async fn a_failed_listing_streams_the_failed_event_and_the_items_error() {
-        let events = |error: Option<&'static str>| async move {
-            let (tx, mut rx) = sse_channel();
-            let mut emitter =
-                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
-            emitter
-                .emit_mcp_list_tools_sequence("conf", &[], error, &tx)
-                .await
-                .unwrap();
-            drop(tx);
-            let mut events = Vec::new();
-            while let Some(Ok(bytes)) = rx.recv().await {
-                let frame = String::from_utf8(bytes.to_vec()).unwrap();
-                let data = frame.split("data: ").nth(1).unwrap().trim();
-                events.push(serde_json::from_str::<serde_json::Value>(data).unwrap());
-            }
-            events
-        };
-
-        let failed = events(Some("Mcp error: -32603: tools/list refused")).await;
+        let failed =
+            list_tools_sequence_events(Some("Mcp error: -32603: tools/list refused")).await;
         assert_eq!(
             failed
                 .iter()
@@ -2135,7 +2172,7 @@ mod tests {
         assert_eq!(item["error"], "Mcp error: -32603: tools/list refused");
         assert_eq!(item["tools"], json!([]));
 
-        let listed = events(None).await;
+        let listed = list_tools_sequence_events(None).await;
         assert_eq!(
             listed
                 .iter()
