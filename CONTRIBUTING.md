@@ -192,8 +192,9 @@ CI run must establish its actual native and measurement qualification. It does
 not establish prior qualification or a security boundary. Main integration and
 weekly performance acceptance remain separate.
 
-The six SGLang caller opt-ins above add no variables or new runner labels. All use
-same-source prepared/final cohort verification and the existing original GPTOSS
+The six SGLang caller opt-ins above use separate variables that default to
+`false` and reuse the existing runner labels. All use same-source prepared/final
+cohort verification and the existing original GPTOSS
 numeric preflight in the fixed image, with full tier-1 model acquisition. The
 Python-servicer row keeps its original 40-minute job / 32-minute tests; single
 ZMQ keeps 60/48 minutes. The completions, embeddings and gateway rows use 60/45
