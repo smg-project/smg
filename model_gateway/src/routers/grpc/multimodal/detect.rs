@@ -4,6 +4,8 @@
 //! pipeline (`InputMessage`) funnel into the shared processing core; only the
 //! detection and extraction differ, because the input message types differ.
 
+use std::sync::Arc;
+
 use llm_multimodal::{ImageDetail, MediaContentPart};
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
@@ -14,8 +16,9 @@ use openai_protocol::{
 use super::plan::MediaPlan;
 use crate::routers::grpc::utils::message_utils::tool_result_image_blocks;
 
-/// Extract media parts from OpenAI chat messages,
-/// converting protocol `ContentPart` to multimodal crate `MediaContentPart`.
+/// Extract media parts from OpenAI chat messages, converting protocol
+/// `ContentPart` to multimodal crate `MediaContentPart`; a part's text (a URL,
+/// a data URL, base64 audio) is shared with the request, not copied.
 fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
     let mut parts = Vec::new();
 
@@ -35,7 +38,7 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                     ContentPart::ImageUrl { image_url } => {
                         let detail = image_url.detail.as_deref().and_then(parse_detail);
                         parts.push(MediaContentPart::ImageUrl {
-                            url: image_url.url.clone(),
+                            url: Arc::clone(&image_url.url),
                             detail,
                             uuid: None,
                             max_long_side_pixel: image_url.max_long_side_pixel,
@@ -43,22 +46,31 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                     }
                     ContentPart::AudioUrl { audio_url } => {
                         parts.push(MediaContentPart::AudioUrl {
-                            url: audio_url.url.clone(),
+                            url: Arc::clone(&audio_url.url),
+                            uuid: None,
+                        });
+                    }
+                    ContentPart::InputAudio { input_audio }
+                        if media_type_is_plain(&input_audio.format) =>
+                    {
+                        parts.push(MediaContentPart::AudioBase64 {
+                            media_type: format!("audio/{}", input_audio.format),
+                            data: Arc::clone(&input_audio.data),
                             uuid: None,
                         });
                     }
                     ContentPart::InputAudio { input_audio } => {
                         parts.push(MediaContentPart::AudioUrl {
-                            url: format!(
+                            url: Arc::new(format!(
                                 "data:audio/{};base64,{}",
                                 input_audio.format, input_audio.data
-                            ),
+                            )),
                             uuid: None,
                         });
                     }
                     ContentPart::VideoUrl { video_url } => {
                         parts.push(MediaContentPart::VideoUrl {
-                            url: video_url.url.clone(),
+                            url: Arc::clone(&video_url.url),
                             uuid: None,
                             fps: video_url.fps,
                             max_long_side_pixel: video_url.max_long_side_pixel,
@@ -126,18 +138,39 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
     parts
 }
 
-/// Convert a Messages API image block to a media part for the connector,
-/// turning a base64 source into a data URL.
+/// Whether a base64 part may stand for the data URL `data:<media_type>;base64,<data>`:
+/// a `,` in the media type would move the delimiter a data URL parser splits
+/// on, so such a type keeps the data URL form and its parsing.
+fn media_type_is_plain(media_type: &str) -> bool {
+    !media_type.contains(',')
+}
+
+/// Convert a Messages API image block to a media part for the connector: a
+/// base64 source travels as its media type and its text, shared with the
+/// request; a URL is shared the same way.
 fn image_media_part(image_block: &ImageBlock) -> MediaContentPart {
-    let url = match &image_block.source {
-        ImageSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
-        ImageSource::Url { url } => url.clone(),
-    };
-    MediaContentPart::ImageUrl {
-        url,
-        detail: None,
-        uuid: None,
-        max_long_side_pixel: None,
+    match &image_block.source {
+        ImageSource::Base64 { media_type, data } if media_type_is_plain(media_type) => {
+            MediaContentPart::ImageBase64 {
+                media_type: media_type.clone(),
+                data: Arc::clone(data),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            }
+        }
+        ImageSource::Base64 { media_type, data } => MediaContentPart::ImageUrl {
+            url: Arc::new(format!("data:{media_type};base64,{data}")),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        },
+        ImageSource::Url { url } => MediaContentPart::ImageUrl {
+            url: Arc::clone(url),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        },
     }
 }
 
@@ -163,7 +196,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/cat.jpg".to_string(),
+                        url: "https://example.com/cat.jpg".to_string().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -181,7 +214,7 @@ mod tests {
             ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "https://example.com/clip.mp4".to_string(),
+                    url: "https://example.com/clip.mp4".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
@@ -198,7 +231,7 @@ mod tests {
             ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "https://example.com/clip.wav".to_string(),
+                    url: "https://example.com/clip.wav".to_string().into(),
                 },
             }]),
             name: None,
@@ -247,7 +280,7 @@ mod tests {
                     },
                     ContentPart::ImageUrl {
                         image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
+                            url: "https://example.com/image.jpg".to_string().into(),
                             detail: Some("high".to_string()),
                             max_long_side_pixel: None,
                         },
@@ -262,7 +295,7 @@ mod tests {
 
         match &parts[0] {
             MediaContentPart::ImageUrl { url, detail, .. } => {
-                assert_eq!(url, "https://example.com/image.jpg");
+                assert_eq!(url.as_str(), "https://example.com/image.jpg");
                 assert_eq!(*detail, Some(ImageDetail::High));
             }
             _ => panic!("Expected ImageUrl part"),
@@ -275,7 +308,7 @@ mod tests {
             ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "https://example.com/video.mp4".to_string(),
+                    url: "https://example.com/video.mp4".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
@@ -287,7 +320,7 @@ mod tests {
         assert_eq!(parts.len(), 1);
         match &parts[0] {
             MediaContentPart::VideoUrl { url, .. } => {
-                assert_eq!(url, "https://example.com/video.mp4");
+                assert_eq!(url.as_str(), "https://example.com/video.mp4");
             }
             _ => panic!("Expected VideoUrl part"),
         }
@@ -299,7 +332,7 @@ mod tests {
             ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "https://example.com/audio.wav".to_string(),
+                    url: "https://example.com/audio.wav".to_string().into(),
                 },
             }]),
             name: None,
@@ -309,34 +342,126 @@ mod tests {
         assert_eq!(parts.len(), 1);
         match &parts[0] {
             MediaContentPart::AudioUrl { url, .. } => {
-                assert_eq!(url, "https://example.com/audio.wav");
+                assert_eq!(url.as_str(), "https://example.com/audio.wav");
             }
             _ => panic!("Expected AudioUrl part"),
         }
     }
 
     #[test]
-    fn extracts_inline_audio_as_data_url() {
+    fn extracts_inline_audio_as_a_shared_base64_source() {
         let messages = vec![ChatMessage::User {
             ext: Default::default(),
             content: MessageContent::Parts(vec![ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             }]),
             name: None,
         }];
+        let request_data = request_text(&messages);
 
         assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Audio]);
 
         let parts = extract_media_parts(&messages);
         assert_eq!(parts.len(), 1);
         match &parts[0] {
-            MediaContentPart::AudioUrl { url, .. } => {
-                assert_eq!(url, "data:audio/wav;base64,UklGRg==");
+            MediaContentPart::AudioBase64 {
+                media_type, data, ..
+            } => {
+                assert_eq!(media_type, "audio/wav");
+                assert_eq!(data.as_str(), "UklGRg==");
+                assert!(
+                    std::ptr::eq(data.as_ptr(), request_data),
+                    "the plan copied the audio text"
+                );
             }
-            _ => panic!("Expected AudioUrl part"),
+            _ => panic!("Expected AudioBase64 part"),
+        }
+    }
+
+    /// The start of the text the first part of the first message carries:
+    /// its url, or its base64 data.
+    fn request_text(messages: &[ChatMessage]) -> *const u8 {
+        let ChatMessage::User {
+            content: MessageContent::Parts(parts),
+            ..
+        } = &messages[0]
+        else {
+            panic!("a user message with parts")
+        };
+        match &parts[0] {
+            ContentPart::ImageUrl { image_url } => image_url.url.as_ptr(),
+            ContentPart::InputAudio { input_audio } => input_audio.data.as_ptr(),
+            _ => panic!("an image or audio part"),
+        }
+    }
+
+    #[test]
+    fn the_plan_shares_the_request_image_text() {
+        let data_url = format!("data:image/png;base64,{}", "A".repeat(4096));
+        let messages = vec![ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: data_url.into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            }]),
+            name: None,
+        }];
+        let request_url = request_text(&messages);
+
+        let plan = media_plan_chat(&messages);
+        match &plan.parts()[0] {
+            MediaContentPart::ImageUrl { url, .. } => assert!(
+                std::ptr::eq(url.as_ptr(), request_url),
+                "the plan copied the payload"
+            ),
+            _ => panic!("Expected ImageUrl part"),
+        }
+    }
+
+    #[test]
+    fn the_plan_shares_a_messages_base64_image_text() {
+        let payload = "A".repeat(4096);
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![InputContentBlock::Image(ImageBlock {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: payload.into(),
+                },
+                cache_control: None,
+                transformations: None,
+            })]),
+        }];
+        let InputContent::Blocks(blocks) = &messages[0].content else {
+            panic!("blocks")
+        };
+        let InputContentBlock::Image(ImageBlock {
+            source: ImageSource::Base64 { data, .. },
+            ..
+        }) = &blocks[0]
+        else {
+            panic!("a base64 image block")
+        };
+        let request_data = data.as_ptr();
+
+        let plan = media_plan_messages(&messages);
+        match &plan.parts()[0] {
+            MediaContentPart::ImageBase64 {
+                media_type, data, ..
+            } => {
+                assert_eq!(media_type, "image/png");
+                assert!(
+                    std::ptr::eq(data.as_ptr(), request_data),
+                    "the plan re-encoded the payload"
+                );
+            }
+            _ => panic!("Expected ImageBase64 part"),
         }
     }
 
@@ -358,7 +483,7 @@ mod tests {
         let image = |data: &str| ImageBlock {
             source: ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: data.to_string(),
+                data: data.to_string().into(),
             },
             cache_control: None,
             transformations: None,
@@ -387,18 +512,15 @@ mod tests {
         assert_eq!(plan.modalities(), &[Modality::Image]);
         assert_eq!(plan.count(Modality::Image), 2);
         // Block order: the tool result's image comes before the top-level one.
-        let urls: Vec<&str> = plan
+        let payloads: Vec<&str> = plan
             .parts()
             .iter()
             .map(|part| match part {
-                MediaContentPart::ImageUrl { url, .. } => url.as_str(),
-                _ => panic!("tool result images are image parts"),
+                MediaContentPart::ImageBase64 { data, .. } => data.as_str(),
+                _ => panic!("tool result images are base64 image parts"),
             })
             .collect();
-        assert_eq!(
-            urls,
-            ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
-        );
+        assert_eq!(payloads, ["AAAA", "BBBB"]);
     }
 
     #[test]
@@ -416,5 +538,42 @@ mod tests {
         }];
 
         assert!(media_plan_messages(&messages).is_empty());
+    }
+
+    #[test]
+    fn a_media_type_with_a_comma_keeps_the_data_url_form() {
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![InputContentBlock::Image(ImageBlock {
+                source: ImageSource::Base64 {
+                    media_type: "image/png,x".to_string(),
+                    data: "AAAA".to_string().into(),
+                },
+                cache_control: None,
+                transformations: None,
+            })]),
+        }];
+        match &media_plan_messages(&messages).parts()[0] {
+            MediaContentPart::ImageUrl { url, .. } => {
+                assert_eq!(url.as_str(), "data:image/png,x;base64,AAAA");
+            }
+            _ => panic!("expected the data URL form"),
+        }
+        let messages = vec![ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Parts(vec![ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "UklGRg==".to_string().into(),
+                    format: "wav,x".to_string(),
+                },
+            }]),
+            name: None,
+        }];
+        match &extract_media_parts(&messages)[0] {
+            MediaContentPart::AudioUrl { url, .. } => {
+                assert_eq!(url.as_str(), "data:audio/wav,x;base64,UklGRg==");
+            }
+            _ => panic!("expected the data URL form"),
+        }
     }
 }

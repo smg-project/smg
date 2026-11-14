@@ -48,7 +48,7 @@
 
 use super::{
     pattern::{concat, plain_class, previous_boundary, repeat, Class, Node},
-    scan::{Bits, Roles},
+    scan::{Bits, Roles, WordScan},
     Pieces, Stage,
 };
 
@@ -200,6 +200,10 @@ pub(super) struct Scanner {
     roles: Roles,
     /// The most characters of the digit class one group holds.
     digits: u32,
+    /// Whether the letter and white-space runs may take the word scans
+    /// (`Roles::run_end_as_in`): no stop class holds an ASCII character of
+    /// the scanned sets, so a word of members never hides a stop.
+    word_scans: bool,
 }
 
 impl Scanner {
@@ -242,16 +246,31 @@ impl Scanner {
             debug_assert_eq!(*role as usize, classes.len());
             classes.push(&third.pattern.classes()[*class]);
         }
+        let roles = Roles::build(&classes);
+        let word_scans = roles.ascii_members(STAGE_STOP) & WordScan::MEMBERS == 0;
+        tracing::debug!(word_scans, "the native encode path takes the chain scanner");
         Some(Self {
-            roles: Roles::build(&classes),
+            roles,
             digits: *digits,
+            word_scans,
         })
     }
 
     /// Calls `f` with each piece of `text` as its byte range, in order; the
     /// pieces tile the text, as three `Split` stages that keep their gaps
-    /// leave no character out.
-    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
+    /// leave no character out. `words` says the run loops take their word
+    /// scans (a long input; see the encoder's `WORD_SCAN_MIN_BYTES`): the
+    /// walk is compiled both ways and the choice is made once per call.
+    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, f: &mut F) {
+        if words {
+            self.pieces_as::<true, F>(text, f);
+        } else {
+            self.pieces_as::<false, F>(text, f);
+        }
+    }
+
+    /// [`Self::pieces`] with the word scans on or off.
+    fn pieces_as<const WORDS: bool, F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
         let mut pos = 0;
         while let Some((c, len)) = self.roles.at(text, pos) {
             let after = pos + len;
@@ -269,7 +288,7 @@ impl Scanner {
                         _ => break,
                     }
                 }
-                self.group_pieces(text, pos, end, f);
+                self.group_pieces::<WORDS, F>(text, pos, end, f);
                 end
             } else if c & Role::Run.bit() != 0 {
                 // The second stage, inside a gap of the first: a run that
@@ -281,11 +300,11 @@ impl Scanner {
                     }
                     end += n;
                 }
-                self.template_pieces(text, pos, end, 0, f)
+                self.template_pieces::<WORDS, F>(text, pos, end, 0, f)
             } else {
                 // A gap of both: the stretch to the next digit or run
                 // character, which the template cuts as it reads it.
-                self.template_pieces(text, pos, text.len(), STAGE_STOP, f)
+                self.template_pieces::<WORDS, F>(text, pos, text.len(), STAGE_STOP, f)
             };
         }
     }
@@ -296,7 +315,7 @@ impl Scanner {
     /// class the template cuts nothing and the group is one piece; the
     /// stages are applied all the same, so the pieces are theirs for any
     /// classes.
-    fn group_pieces<F: FnMut(usize, usize)>(
+    fn group_pieces<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
         text: &str,
         start: usize,
@@ -316,7 +335,7 @@ impl Scanner {
                     _ => break,
                 }
             }
-            self.template_pieces(text, pos, piece_end, 0, f);
+            self.template_pieces::<WORDS, F>(text, pos, piece_end, 0, f);
             pos = piece_end;
         }
     }
@@ -327,7 +346,7 @@ impl Scanner {
     /// stages' pieces, which the template cuts with that character as the
     /// end of the text): its matches, and the text between them as pieces
     /// of their own. Answers where the piece ended.
-    fn template_pieces<F: FnMut(usize, usize)>(
+    fn template_pieces<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
         text: &str,
         start: usize,
@@ -339,7 +358,7 @@ impl Scanner {
         let mut gap = 0;
         let mut pos = 0;
         while let Some((c, len)) = self.at_in(piece, pos, stop) {
-            match self.template_match(piece, pos, c, len, stop) {
+            match self.template_match::<WORDS>(piece, pos, c, len, stop) {
                 Some(matched) => {
                     if gap < pos {
                         f(start + gap, start + pos);
@@ -367,23 +386,37 @@ impl Scanner {
     }
 
     /// The end of the run of characters holding `bit` that starts at `pos`,
-    /// a character holding one of `stop` ending it as the text's end would.
+    /// a character holding one of `stop` ending it as the text's end would
+    /// ([`Roles::run_end_in`], the one byte loop with stop bits).
     #[inline(always)]
-    fn run_end_in(&self, text: &str, mut pos: usize, bit: Bits, stop: Bits) -> usize {
-        while let Some((bits, len)) = self.at_in(text, pos, stop) {
-            if bits & bit == 0 {
-                break;
-            }
-            pos += len;
+    fn run_end_in(&self, text: &str, pos: usize, bit: Bits, stop: Bits) -> usize {
+        self.roles.run_end_in(text, pos, bit, stop)
+    }
+
+    /// [`Self::run_end_in`] through the word scan `SCAN` of the role's ASCII
+    /// members, eight bytes at a time, when no stop class has a character
+    /// among them (read at recognition) and the unit is long (`WORDS`); byte
+    /// by byte otherwise.
+    #[inline(always)]
+    fn run<const SCAN: u8, const WORDS: bool>(
+        &self,
+        text: &str,
+        pos: usize,
+        bit: Bits,
+        stop: Bits,
+    ) -> usize {
+        if WORDS && self.word_scans {
+            self.roles.run_end_as_in::<SCAN>(text, pos, bit, stop)
+        } else {
+            self.run_end_in(text, pos, bit, stop)
         }
-        pos
     }
 
     /// The end of the template's match that starts at `pos`, where a
     /// character with the role bits `c` of `len` bytes stands, if one does:
     /// the first of the six alternatives that matches there, as the engine
     /// picks it; a character holding one of `stop` is the end of the text.
-    fn template_match(
+    fn template_match<const WORDS: bool>(
         &self,
         text: &str,
         pos: usize,
@@ -396,7 +429,12 @@ impl Scanner {
         if c & Role::PunctLead.bit() != 0 {
             if let Some((d, n)) = self.at_in(text, after, stop) {
                 if d & Role::PunctLetter.bit() != 0 {
-                    return Some(self.run_end_in(text, after + n, Role::PunctLetter.bit(), stop));
+                    return Some(self.run::<{ WordScan::LETTERS }, WORDS>(
+                        text,
+                        after + n,
+                        Role::PunctLetter.bit(),
+                        stop,
+                    ));
                 }
             }
         }
@@ -404,12 +442,22 @@ impl Scanner {
         if c & Role::Lead.bit() != 0 {
             if let Some((d, n)) = self.at_in(text, after, stop) {
                 if d & Role::Word.bit() != 0 {
-                    return Some(self.run_end_in(text, after + n, Role::Word.bit(), stop));
+                    return Some(self.run::<{ WordScan::LETTERS }, WORDS>(
+                        text,
+                        after + n,
+                        Role::Word.bit(),
+                        stop,
+                    ));
                 }
             }
         }
         if c & Role::Word.bit() != 0 {
-            return Some(self.run_end_in(text, after, Role::Word.bit(), stop));
+            return Some(self.run::<{ WordScan::LETTERS }, WORDS>(
+                text,
+                after,
+                Role::Word.bit(),
+                stop,
+            ));
         }
         // 3. A punctuation run, with the space when punctuation follows it,
         //    and the line breaks after the run.
@@ -451,7 +499,8 @@ impl Scanner {
         // 5. Whitespace before a non-space: the greedy run gives back its
         //    last character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.run_end_in(text, after, Role::TrailSpace.bit(), stop);
+            let mut end =
+                self.run::<{ WordScan::SPACES }, WORDS>(text, after, Role::TrailSpace.bit(), stop);
             loop {
                 match self.at_in(text, end, stop) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
@@ -466,7 +515,12 @@ impl Scanner {
         }
         // 6. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.run_end_in(text, after, Role::Space.bit(), stop));
+            return Some(self.run::<{ WordScan::SPACES }, WORDS>(
+                text,
+                after,
+                Role::Space.bit(),
+                stop,
+            ));
         }
         None
     }
@@ -484,7 +538,7 @@ mod tests {
     };
 
     use super::{
-        super::{pattern::Pattern, Pieces, Stage},
+        super::{pattern::Pattern, Pieces, Stage, Walk},
         *,
     };
 
@@ -503,6 +557,7 @@ mod tests {
         Stage {
             pattern: Pattern::parse(pattern).expect("parses"),
             pieces,
+            digits: false,
         }
     }
 
@@ -516,7 +571,13 @@ mod tests {
     /// The pieces of the scanner, as byte ranges of `text`.
     fn scanned(scanner: &Scanner, text: &str) -> Vec<(usize, usize)> {
         let mut pieces = Vec::new();
-        scanner.pieces(text, &mut |start, end| pieces.push((start, end)));
+        scanner.pieces(text, true, &mut |start, end| pieces.push((start, end)));
+        let mut bytewise = Vec::new();
+        scanner.pieces(text, false, &mut |start, end| bytewise.push((start, end)));
+        assert_eq!(
+            pieces, bytewise,
+            "the word scans and the byte loop cut {text:?} alike"
+        );
         pieces
     }
 
@@ -531,17 +592,34 @@ mod tests {
                 out.push((offset, offset + text.len()));
                 return;
             };
+            let (gaps, matches) = match stage.pieces.walk() {
+                Walk::Merged => {
+                    let mut merged = None;
+                    for (start, _) in stage.pattern.find_iter(text) {
+                        match merged {
+                            Some(from) => walk(rest, &text[from..start], offset + from, out),
+                            None if start > 0 => walk(rest, &text[..start], offset, out),
+                            None => {}
+                        }
+                        merged = Some(start);
+                    }
+                    let from = merged.unwrap_or(0);
+                    walk(rest, &text[from..], offset + from, out);
+                    return;
+                }
+                Walk::Apart { gaps, matches } => (gaps, matches),
+            };
             let mut cursor = 0;
             for (start, end) in stage.pattern.find_iter(text) {
-                if stage.pieces.gaps() && cursor < start {
+                if gaps && cursor < start {
                     walk(rest, &text[cursor..start], offset + cursor, out);
                 }
-                if stage.pieces.matches() {
+                if matches {
                     walk(rest, &text[start..end], offset + start, out);
                 }
                 cursor = end;
             }
-            if stage.pieces.gaps() && cursor < text.len() {
+            if gaps && cursor < text.len() {
                 walk(rest, &text[cursor..], offset + cursor, out);
             }
         }
@@ -552,17 +630,23 @@ mod tests {
 
     /// The pieces of the engine: a `Sequence` of `Split`s over the text.
     fn engine(patterns: &[&str], text: &str) -> Vec<(usize, usize)> {
+        let stages: Vec<(&str, SplitDelimiterBehavior)> = patterns
+            .iter()
+            .map(|p| (*p, SplitDelimiterBehavior::Isolated))
+            .collect();
+        engine_with(&stages, text)
+    }
+
+    /// The pieces of the engine: a `Sequence` of `Split`s over the text,
+    /// each with its behavior.
+    fn engine_with(stages: &[(&str, SplitDelimiterBehavior)], text: &str) -> Vec<(usize, usize)> {
         let sequence = Sequence::new(
-            patterns
+            stages
                 .iter()
-                .map(|p| {
+                .map(|(p, behavior)| {
                     PreTokenizerWrapper::Split(
-                        Split::new(
-                            SplitPattern::Regex((*p).to_owned()),
-                            SplitDelimiterBehavior::Isolated,
-                            false,
-                        )
-                        .expect("split"),
+                        Split::new(SplitPattern::Regex((*p).to_owned()), *behavior, false)
+                            .expect("split"),
                     )
                 })
                 .collect(),
@@ -576,6 +660,43 @@ mod tests {
             .into_iter()
             .map(|(_, (start, end), _)| (start, end))
             .collect()
+    }
+
+    /// The walk of a `MergedWithNext` stage glues each match to the text
+    /// after it as the engine does: a run of line breaks before the byte-level
+    /// regex, on texts with runs between words, at both ends, adjacent, and
+    /// none.
+    #[test]
+    fn a_merged_stage_walks_as_the_engine_glues() {
+        const LINE_BREAKS: &str = r"(?:\r?\n)+(?!\r?\n)";
+        let stages = [
+            stage(LINE_BREAKS, Pieces::MatchesWithNextGap),
+            stage(GPT4, Pieces::MatchesAndGaps),
+        ];
+        let patterns = [
+            (LINE_BREAKS, SplitDelimiterBehavior::MergedWithNext),
+            (GPT4, SplitDelimiterBehavior::Isolated),
+        ];
+        for text in [
+            "one\ntwo\r\nthree\rfour",
+            "\n\nlead and trail\n",
+            "\r\n\r\n\n",
+            "a\n1\r\nb 22\n\n33 x",
+            "    indented\n\tcode\n\n",
+            "no break at all",
+            "\n",
+        ] {
+            assert_eq!(
+                staged(&stages, text),
+                engine_with(&patterns, text),
+                "text {text:?}"
+            );
+            assert_eq!(
+                staged(&stages[..1], text),
+                engine_with(&patterns[..1], text),
+                "the stage alone; text {text:?}"
+            );
+        }
     }
 
     fn pseudo_random(state: &mut u64) -> u64 {
@@ -690,6 +811,27 @@ mod tests {
         let overlapping = Scanner::recognize(&chain(&[HEX, LETTERS, TEMPLATE]))
             .expect("overlapping classes take the scanner");
         assert_eq!(overlapping.digits, 3);
+        // The gain of the word scans rests on these: a class change that
+        // kept the ids and lost the scans fails here, not in a benchmark.
+        assert!(scanner.word_scans, "the shipped shape takes the word scans");
+        assert!(
+            !overlapping.word_scans,
+            "a digit class holding a-f keeps the byte loop"
+        );
+        for role in [Role::PunctLetter, Role::Word] {
+            assert_eq!(
+                scanner.roles.scan_of(role.bit()),
+                WordScan::LETTERS,
+                "{role:?}"
+            );
+        }
+        for role in [Role::TrailSpace, Role::Space] {
+            assert_eq!(
+                scanner.roles.scan_of(role.bit()),
+                WordScan::SPACES,
+                "{role:?}"
+            );
+        }
         // Fewer or more stages, the stages in another order, the GPT-4
         // family's template as the third stage, a bounded second stage, a
         // stage that drops its gaps, a stage that drops its matches.
