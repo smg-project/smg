@@ -121,6 +121,17 @@ impl Job {
         }
     }
 
+    /// The name a worker job's workflow goes by: the worker's address with a
+    /// userinfo in it masked, as the job's own lines write it. The engine
+    /// writes the name into the text a wait ends with (completed, cancelled,
+    /// timed out), and that text is the job's result: its log line and its
+    /// status. Nothing finds a workflow by its name, so two workers whose
+    /// addresses differ in the userinfo alone go by one, each tracked under
+    /// its own address.
+    fn workflow_label(worker_url: &str) -> String {
+        Endpoint::redacted_str(worker_url)
+    }
+
     /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
     pub fn worker_url(&self) -> &str {
         match self {
@@ -1014,7 +1025,11 @@ impl JobQueue {
 
                 engines
                     .worker_registration
-                    .wait_for_completion(instance_id, &config.url, timeout_duration)
+                    .wait_for_completion(
+                        instance_id,
+                        &Job::workflow_label(&config.url),
+                        timeout_duration,
+                    )
                     .await
             }
             Job::UpdateWorker { url, update } => {
@@ -1045,7 +1060,7 @@ impl JobQueue {
 
                 engines
                     .worker_update
-                    .wait_for_completion(instance_id, url, timeout_duration)
+                    .wait_for_completion(instance_id, &Job::workflow_label(url), timeout_duration)
                     .await
             }
             Job::RefreshWorkerLabels { url } => {
@@ -1081,7 +1096,11 @@ impl JobQueue {
 
                 engines
                     .worker_update
-                    .wait_for_completion(instance_id, url, Duration::from_secs(30))
+                    .wait_for_completion(
+                        instance_id,
+                        &Job::workflow_label(url),
+                        Duration::from_secs(30),
+                    )
                     .await
             }
             Job::RemoveWorker {
@@ -1128,7 +1147,7 @@ impl JobQueue {
 
                 let result = engines
                     .worker_removal
-                    .wait_for_completion(instance_id, url, timeout_duration)
+                    .wait_for_completion(instance_id, &Job::workflow_label(url), timeout_duration)
                     .await;
 
                 // Clean up job status when removing worker
@@ -1721,6 +1740,223 @@ mod tests {
                 "{} failed-job lines, wanted two; those that do not name their worker masked: \
                  {unmasked:#?}",
                 failed.len()
+            ))
+        });
+    }
+
+    /// The engine the registrations of the next case reach: the health probe
+    /// and the metadata a registration reads, a 404 elsewhere. Its
+    /// `host:port`.
+    async fn a_registering_engine() -> String {
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+        let base = serve_json_routes(vec![
+            ("/health", StatusCode::OK, json!({"status": "ok"})),
+            (
+                "/model_info",
+                StatusCode::OK,
+                json!({"model_path": "m", "is_generation": true}),
+            ),
+            ("/server_info", StatusCode::OK, json!({"version": "test"})),
+        ])
+        .await;
+        base.trim_start_matches("http://").to_string()
+    }
+
+    /// The text a worker job's wait ends with names the worker by its address
+    /// masked: the engine builds it with the workflow's label, and it is the
+    /// job's result, in its line and in its status. One job of each kind that
+    /// waits under a worker's address. Two workers whose addresses differ in
+    /// the userinfo alone register side by side and go by one label; each is
+    /// found under its own address, so the update, the label refresh and the
+    /// removal of the first leave the second registered.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_worker_jobs_result_names_its_worker_masked() {
+        use crate::service_discovery::testing::live_app_context;
+        let host = a_registering_engine().await;
+        let first = format!("http://alice:s3cret-a@{host}");
+        let second = format!("http://bob:s3cret-b@{host}");
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        let add = |url: &str| Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: WorkerRegistrationMode::Upsert,
+        };
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(serde_json::json!({"labels": {"tier": "a"}}))
+                .expect("an update");
+        let jobs = [
+            add(&first),
+            add(&second),
+            Job::UpdateWorker {
+                url: first.clone(),
+                update: Box::new(update),
+            },
+            Job::RefreshWorkerLabels { url: first.clone() },
+            Job::RemoveWorker {
+                url: first.clone(),
+                expected_revisions: None,
+            },
+        ];
+        let done = format!("http://***@{host} completed successfully via workflow");
+        let marks = DashSet::new();
+        let statuses = Arc::new(DashMap::new());
+        for job in &jobs {
+            if matches!(job, Job::UpdateWorker { .. }) {
+                assert!(
+                    registry.get_by_url(&first).is_some() && registry.get_by_url(&second).is_some(),
+                    "both registered, each under its own address"
+                );
+            }
+            let result = JobQueue::execute_job(job, &context, &marks, None).await;
+            assert_eq!(result.as_deref(), Ok(done.as_str()), "{}", job.job_type());
+            JobQueue::record_job_completion(
+                job.job_type(),
+                job.worker_url(),
+                Duration::ZERO,
+                &result,
+                &statuses,
+            );
+        }
+        assert!(
+            registry.get_by_url(&first).is_none(),
+            "the removal found the first worker by its address"
+        );
+        assert!(
+            registry.get_by_url(&second).is_some(),
+            "the second worker, apart by its userinfo alone, stays registered"
+        );
+        logs_assert(|lines: &[&str]| {
+            let completed = lines
+                .iter()
+                .filter(|line| line.contains("Completed job:"))
+                .count();
+            let masked = lines
+                .iter()
+                .filter(|line| line.contains(&format!("result={done}")))
+                .count();
+            let credentialed: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("s3cret"))
+                .collect();
+            if completed == 5 && masked == 5 && credentialed.is_empty() {
+                return Ok(());
+            }
+            Err(format!(
+                "{completed} completed-job lines, {masked} with the masked result, wanted five \
+                 of five; the lines with a credential: {credentialed:#?}"
+            ))
+        });
+    }
+
+    /// The registration workflows the store holds that have not ended.
+    async fn registrations_running(context: &AppContext) -> usize {
+        context
+            .workflow_engines
+            .get()
+            .expect("the engines")
+            .worker_registration
+            .state_store()
+            .list_all()
+            .await
+            .expect("the registration states")
+            .iter()
+            .filter(|state| {
+                matches!(
+                    state.status,
+                    WorkflowStatus::Pending | WorkflowStatus::Running
+                )
+            })
+            .count()
+    }
+
+    /// A registration cancelled in its wait ends with a text that names its
+    /// worker masked: the failed job's warning, at the default level, and the
+    /// message of the status the worker API answers. The cancel finds a
+    /// registration by its address, not by its label: of two whose addresses
+    /// differ in the userinfo alone, on a port nothing answers, the first
+    /// cancel ends one and leaves the other running, and each ends under its
+    /// own status.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_cancelled_registrations_warning_and_status_name_its_worker_masked() {
+        use crate::service_discovery::testing::live_app_context;
+        let port = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a loopback port")
+            .local_addr()
+            .expect("the bound address")
+            .port();
+        let first = format!("http://alice:s3cret-a@127.0.0.1:{port}");
+        let second = format!("http://bob:s3cret-b@127.0.0.1:{port}");
+        let context = live_app_context();
+        let add = |url: &str| Job::AddWorker {
+            config: Box::new(WorkerSpec::new(url)),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        };
+        let jobs = [add(&first), add(&second)];
+        let marks = DashSet::new();
+        let cancel_one_then_the_other = async {
+            while registrations_running(&context).await < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let ended = JobQueue::cancel_registration_states(&context, &first).await;
+            assert_eq!(ended, Ok((1, false)), "the first address ends its own");
+            assert_eq!(
+                registrations_running(&context).await,
+                1,
+                "the second, apart by its userinfo alone, still runs"
+            );
+            let ended = JobQueue::cancel_registration_states(&context, &second).await;
+            assert_eq!(ended, Ok((1, false)), "the second address ends its own");
+        };
+        let [job_a, job_b] = &jobs;
+        let (result_a, result_b, ()) = tokio::join!(
+            JobQueue::execute_job(job_a, &context, &marks, None),
+            JobQueue::execute_job(job_b, &context, &marks, None),
+            cancel_one_then_the_other,
+        );
+
+        let cancelled = format!("Workflow cancelled for http://***@127.0.0.1:{port}");
+        let statuses = Arc::new(DashMap::new());
+        for (job, result) in [(job_a, &result_a), (job_b, &result_b)] {
+            assert_eq!(result.as_ref().err(), Some(&cancelled));
+            JobQueue::record_job_completion(
+                job.job_type(),
+                job.worker_url(),
+                Duration::ZERO,
+                result,
+                &statuses,
+            );
+            let status = statuses
+                .get(job.worker_url())
+                .expect("each registration ends under its own status");
+            assert_eq!(status.status, "failed");
+            assert_eq!(status.message.as_deref(), Some(cancelled.as_str()));
+        }
+        assert_eq!(statuses.len(), 2, "one status an address");
+        logs_assert(|lines: &[&str]| {
+            let failed = lines
+                .iter()
+                .filter(|line| line.contains("Failed job:"))
+                .count();
+            let masked = lines
+                .iter()
+                .filter(|line| line.contains(&format!("error={cancelled}")))
+                .count();
+            let credentialed: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("s3cret"))
+                .collect();
+            if failed == 2 && masked == 2 && credentialed.is_empty() {
+                return Ok(());
+            }
+            Err(format!(
+                "{failed} failed-job lines, {masked} with the masked text, wanted two of two; \
+                 the lines with a credential: {credentialed:#?}"
             ))
         });
     }
