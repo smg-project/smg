@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use smg_grpc_client::sglang_managed::{
     clock,
@@ -20,99 +19,9 @@ use tonic::{transport::Channel, Status};
 
 use super::{
     executor::AttemptObserver,
-    load_tracker::LoadTracker,
-    planner::{Contract, EncodeCost, EncoderCandidate, PdCandidate, Worker},
+    planner::{Contract, EncodeCost, EncoderCandidate, PdCandidate, PdCost, Worker},
+    router::Config,
 };
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EncoderEndpoint {
-    pub endpoint: String,
-    /// Conservative cold/unknown-media prior, calibrated for the deployment's model and links.
-    pub prior: EncodeCost,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PdEndpoints {
-    pub prefill: String,
-    pub decode: String,
-    pub prior: PdCost,
-}
-
-/// Conservative measured deployment priors, in milliseconds from dispatch.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PdCost {
-    pub layout_ms: u64,
-    pub manifest_delivery_ms: u64,
-    pub decode_registration_ms: u64,
-    pub bind_submit_ms: u64,
-    pub native_pd_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    pub model: String,
-    pub model_path: String,
-    pub model_revision: String,
-    pub processor_contract: String,
-    pub pairs: Vec<PdEndpoints>,
-    pub encoders: Vec<EncoderEndpoint>,
-    pub max_attempts: usize,
-    pub max_records: usize,
-    pub timeout_ms: u64,
-    pub max_clock_error_ms: u64,
-    pub probe_timeout_ms: u64,
-    pub snapshot_max_age_ms: u64,
-    pub max_images: usize,
-    #[serde(default = "default_candidates")]
-    pub max_pd_candidates: usize,
-    #[serde(default = "default_candidates")]
-    pub max_encoder_candidates: usize,
-}
-
-/// Bound the default search independently of pool size.
-fn default_candidates() -> usize {
-    4
-}
-
-impl Config {
-    /// Invalid bounds fail startup; an absent configuration keeps this entire mode disabled.
-    pub fn validate(&self) -> Result<(), Status> {
-        if self.model.is_empty()
-            || self.model_path.is_empty()
-            || self.model_revision.is_empty()
-            || self.processor_contract.is_empty()
-            || self.pairs.is_empty()
-            || self.pairs.len() > 64
-            || self.encoders.len() > 64
-            || !(1..=64).contains(&self.max_pd_candidates)
-            || !(1..=64).contains(&self.max_encoder_candidates)
-            || self.max_attempts == 0
-            || self.max_attempts > 1024
-            || self.max_records < self.max_attempts.saturating_mul(3)
-            || self.max_records > 65536
-            || self.timeout_ms == 0
-            || self.timeout_ms > 120_000
-            || self.probe_timeout_ms == 0
-            || self.max_clock_error_ms == 0
-            || self.snapshot_max_age_ms == 0
-            || self.max_images == 0
-            || self.max_images > 32
-            || self.encoders.iter().any(|encoder| {
-                encoder.prior.media_ready_ms().is_none()
-                    || encoder.prior.verified_cache_saving_ms != 0
-            })
-        {
-            return Err(Status::invalid_argument(
-                "invalid managed gateway deployment bounds",
-            ));
-        }
-        Ok(())
-    }
-}
 
 struct Reservation {
     operation: proto::OperationRef,
@@ -131,14 +40,27 @@ struct State {
 pub struct Registry {
     config: Config,
     state: Mutex<State>,
+    channels: HashMap<String, Channel>,
 }
 
 impl Registry {
     /// This registry never mutates worker objects or any legacy policy during candidate scoring.
-    pub fn new(config: Config) -> Arc<Self> {
+    pub fn new(config: Config) -> Result<Arc<Self>, Status> {
+        let channels = config
+            .encoders
+            .iter()
+            .map(|e| &e.endpoint)
+            .chain(config.pairs.iter().flat_map(|p| [&p.prefill, &p.decode]))
+            .map(|endpoint| {
+                Channel::from_shared(endpoint.clone())
+                    .map(|channel| (endpoint.clone(), channel.connect_lazy()))
+                    .map_err(|error| Status::invalid_argument(error.to_string()))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
         let registry = Arc::new(Self {
             config,
             state: Mutex::new(State::default()),
+            channels,
         });
         let endpoints =
             registry
@@ -162,7 +84,79 @@ impl Registry {
                 watch_worker(weak, endpoint, role).await;
             });
         }
-        registry
+        Ok(registry)
+    }
+
+    /// Readiness follows compatible live pools, independently of temporary admission saturation.
+    pub(crate) fn readiness(&self) -> crate::health::ReadinessSnapshot {
+        self.readiness_with_clock(clock::check(self.config.max_clock_error_ms).is_ok())
+    }
+
+    /// Clock health is sampled once for the entire pool snapshot.
+    fn readiness_with_clock(&self, clock_healthy: bool) -> crate::health::ReadinessSnapshot {
+        use crate::health::{ModelReadiness, ReadinessSnapshot};
+        let now = Instant::now();
+        let age = Duration::from_millis(self.config.snapshot_max_age_ms);
+        let endpoints: std::collections::HashSet<_> = self
+            .config
+            .pairs
+            .iter()
+            .flat_map(|pair| [&pair.prefill, &pair.decode])
+            .chain(self.config.encoders.iter().map(|encoder| &encoder.endpoint))
+            .collect();
+        let total_workers = endpoints.len();
+        let Ok(state) = self.state.lock() else {
+            return ReadinessSnapshot::default();
+        };
+        let live = |endpoint: &str| {
+            state
+                .watched
+                .get(endpoint)
+                .filter(|(_, observed)| now.saturating_duration_since(*observed) <= age)
+                .map(|(capability, _)| capability)
+        };
+        let healthy_workers = endpoints
+            .iter()
+            .filter(|endpoint| live(endpoint).is_some())
+            .count();
+        let ready = clock_healthy
+            && self.config.pairs.iter().any(|pair| {
+                let Some(p) = live(&pair.prefill).and_then(|cap| worker(&pair.prefill, cap).ok())
+                else {
+                    return false;
+                };
+                let Some(d) = live(&pair.decode).and_then(|cap| worker(&pair.decode, cap).ok())
+                else {
+                    return false;
+                };
+                p.contract.accepts_decode(&d.contract)
+                    && (self.config.encoders.is_empty()
+                        || self.config.encoders.iter().any(|encoder| {
+                            live(&encoder.endpoint)
+                                .and_then(|cap| worker(&encoder.endpoint, cap).ok())
+                                .is_some_and(|e| {
+                                    p.contract.accepts_encoder(&e.contract)
+                                        && state
+                                            .encoders
+                                            .get(&instance_key(&e.instance))
+                                            .is_some_and(|tracker| tracker.is_available(now, age))
+                                })
+                        }))
+            });
+        ReadinessSnapshot {
+            workers_ready: ready,
+            tokenizers_ready: true,
+            healthy_workers,
+            total_workers,
+            models: vec![ModelReadiness {
+                model: self.config.model.clone(),
+                ready,
+                reason: (!ready).then_some("no_compatible_managed_pipeline"),
+                healthy_workers,
+                total_workers,
+            }],
+            ..ReadinessSnapshot::default()
+        }
     }
 
     /// Read pool-level observations; requests never open per-encoder load streams.
@@ -201,7 +195,7 @@ impl Registry {
                 .entry(key)
                 .or_insert_with(|| LoadTracker::new(instance, self.config.max_records));
 
-            let mut cost = configured.prior;
+            let mut cost = EncodeCost::cold();
             // Stages overlap: GPU occupancy must never become serial CPU waiting.
             let load = tracker.stage_work(now, age);
             let (cpu, gpu, send_bytes) = load.unwrap_or((u64::MAX, u64::MAX, u64::MAX));
@@ -225,14 +219,6 @@ impl Registry {
                 ),
             });
         }
-        encoders.sort_by_key(|e| {
-            (
-                !e.has_capacity,
-                e.cost.media_ready_ms().unwrap_or(u64::MAX),
-                e.stable_tie_break,
-            )
-        });
-        encoders.truncate(self.config.max_encoder_candidates);
         let mut candidates = Vec::new();
         let mut prefills = Vec::new();
         for configured in &self.config.pairs {
@@ -264,29 +250,49 @@ impl Registry {
             }
             let has_capacity = active(&state, &p.instance) < prefill.capacity
                 && active(&state, &d.instance) < decode.capacity;
+            let prior = PdCost::default();
             candidates.push(PdCandidate {
                 prefill: p,
                 decode: d,
-                encoders: encoders.clone(),
+                encoders: Vec::new(),
                 has_capacity,
-                layout_ms: configured.prior.layout_ms,
-                manifest_delivery_ms: configured.prior.manifest_delivery_ms,
-                decode_registration_ms: configured.prior.decode_registration_ms,
-                bind_submit_ms: configured.prior.bind_submit_ms,
-                native_pd_ms: configured.prior.native_pd_ms,
+                layout_ms: prior.layout_ms,
+                manifest_delivery_ms: prior.manifest_delivery_ms,
+                decode_registration_ms: prior.decode_registration_ms,
+                bind_submit_ms: prior.bind_submit_ms,
+                native_pd_ms: prior.native_pd_ms,
             });
             prefills.push(prefill);
         }
         let mut ranked: Vec<_> = candidates.into_iter().zip(prefills).collect();
-        ranked.sort_by_key(|(pair, _)| {
+        ranked.sort_by_cached_key(|(pair, _)| {
             (
                 !pair.has_capacity,
                 active(&state, &pair.prefill.instance)
                     .saturating_add(active(&state, &pair.decode.instance)),
-                stable_tie(request_id, &instance_key(&pair.prefill.instance)),
+                stable_tie(
+                    request_id,
+                    &format!(
+                        "{}\0{}",
+                        instance_key(&pair.prefill.instance),
+                        instance_key(&pair.decode.instance)
+                    ),
+                ),
             )
         });
         ranked.truncate(self.config.max_pd_candidates);
+        // Rank E candidates only for shortlisted P/D pairs, never the complete E×P×D product.
+        for (pair, _) in &mut ranked {
+            pair.encoders.clone_from(&encoders);
+            pair.encoders.sort_by_key(|e| {
+                (
+                    !e.has_capacity,
+                    e.cost.media_ready_ms().unwrap_or(u64::MAX),
+                    e.stable_tie_break,
+                )
+            });
+            pair.encoders.truncate(self.config.max_encoder_candidates);
+        }
         let (candidates, prefills) = ranked.into_iter().unzip();
         Ok((candidates, prefills, state.generation))
     }
@@ -403,11 +409,7 @@ impl Registry {
     ) -> Result<(proto::Capabilities, Option<proto::LoadSnapshot>), Status> {
         let started = wall_ms()?;
         let query = async {
-            let channel = Channel::from_shared(endpoint.to_string())
-                .map_err(|e| Status::invalid_argument(e.to_string()))?
-                .connect()
-                .await
-                .map_err(|e| Status::unavailable(e.to_string()))?;
+            let channel = self.channel(endpoint)?;
             let (capability, snapshot) = if role == "encoder" {
                 let mut client = ManagedEncoderClient::new(channel);
                 let capability = client
@@ -473,13 +475,12 @@ async fn watch_worker(registry: std::sync::Weak<Registry>, endpoint: String, rol
         let result = owner.probe(&endpoint, role).await;
         let capability = match result {
             Ok((capability, snapshot)) => {
-                if owner
-                    .publish(&endpoint, capability.clone(), snapshot)
-                    .is_err()
-                {
-                    return;
+                if let Err(error) = owner.publish(&endpoint, capability.clone(), snapshot) {
+                    tracing::warn!(role, %error, "managed pool publication refused; retrying");
+                    None
+                } else {
+                    Some(capability)
                 }
-                Some(capability)
             }
             Err(error) => {
                 tracing::debug!(role, %error, "managed pool probe unavailable");
@@ -489,11 +490,10 @@ async fn watch_worker(registry: std::sync::Weak<Registry>, endpoint: String, rol
         drop(owner);
         if let Some(capability) = capability.clone().filter(|_| role == "encoder") {
             let follow = async {
-                let channel = Channel::from_shared(endpoint.clone())
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?
-                    .connect()
-                    .await
-                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                let channel = registry
+                    .upgrade()
+                    .ok_or_else(|| Status::cancelled("managed registry dropped"))?
+                    .channel(&endpoint)?;
                 let mut client = ManagedEncoderClient::new(channel);
                 let mut stream = client
                     .watch_load(
@@ -533,6 +533,13 @@ async fn watch_worker(registry: std::sync::Weak<Registry>, endpoint: String, rol
 }
 
 impl AttemptObserver for Registry {
+    fn channel(&self, endpoint: &str) -> Result<Channel, Status> {
+        self.channels
+            .get(endpoint)
+            .cloned()
+            .ok_or_else(|| Status::failed_precondition("endpoint is outside managed deployment"))
+    }
+
     /// Reconcile ordered acknowledgements against snapshot coverage without releasing unknown work.
     fn event(&self, event: &proto::ControlEvent) -> Result<(), Status> {
         let operation = event
@@ -646,4 +653,221 @@ fn stable_tie(request: &str, worker: &str) -> u64 {
     let mut bytes = [0; 8];
     bytes.copy_from_slice(&digest[..8]);
     u64::from_be_bytes(bytes)
+}
+
+struct Pending {
+    work: u64,
+    admission_seq: Option<u64>,
+}
+
+pub struct LoadTracker {
+    instance: proto::Instance,
+    snapshot: Option<(proto::LoadSnapshot, Instant)>,
+    pending: HashMap<String, Pending>,
+    max_pending: usize,
+}
+
+impl LoadTracker {
+    /// A restarted worker gets a new tracker; old unknown work belongs to its old instance.
+    pub fn new(instance: proto::Instance, max_pending: usize) -> Self {
+        Self {
+            instance,
+            snapshot: None,
+            pending: HashMap::new(),
+            max_pending,
+        }
+    }
+
+    /// Register in-flight work before sending Encode, including unknown acceptance outcomes.
+    pub fn reserve(&mut self, operation_id: String, work: u64) -> Result<(), Status> {
+        if self.pending.contains_key(&operation_id) {
+            return Err(Status::already_exists("encode reservation exists"));
+        }
+        if self.pending.len() >= self.max_pending {
+            return Err(Status::resource_exhausted("encode reservations full"));
+        }
+        self.pending.insert(
+            operation_id,
+            Pending {
+                work,
+                admission_seq: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Accepted/GetOperation reconcile with an already-arrived covering snapshot too.
+    pub fn accepted(
+        &mut self,
+        operation_id: &str,
+        instance: &proto::Instance,
+        seq: u64,
+    ) -> Result<(), Status> {
+        if instance != &self.instance || seq == 0 {
+            return Err(Status::failed_precondition(
+                "stale admission acknowledgement",
+            ));
+        }
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|(s, _)| seq <= s.covered_admission_seq)
+        {
+            self.pending.remove(operation_id);
+            return Ok(());
+        }
+        let pending = self
+            .pending
+            .get_mut(operation_id)
+            .ok_or_else(|| Status::not_found("unknown encode reservation"))?;
+        if pending.admission_seq.is_some_and(|old| old != seq) {
+            return Err(Status::failed_precondition("admission sequence changed"));
+        }
+        pending.admission_seq = Some(seq);
+        Ok(())
+    }
+
+    /// Snapshot order and admission coverage cannot regress within an instance.
+    pub fn observe(&mut self, snapshot: proto::LoadSnapshot, now: Instant) -> Result<bool, Status> {
+        if snapshot.instance.as_ref() != Some(&self.instance) {
+            return Err(Status::failed_precondition("stale load instance"));
+        }
+        if let Some((old, _)) = &self.snapshot {
+            if snapshot.snapshot_seq <= old.snapshot_seq {
+                return Ok(false);
+            }
+            if snapshot.covered_admission_seq < old.covered_admission_seq {
+                return Err(Status::failed_precondition("load coverage regressed"));
+            }
+        }
+        self.pending.retain(|_, p| {
+            p.admission_seq
+                .is_none_or(|seq| seq > snapshot.covered_admission_seq)
+        });
+        self.snapshot = Some((snapshot, now));
+        Ok(true)
+    }
+
+    /// Unknown acceptance stays charged; cancellation alone must never call this.
+    pub fn rejected_or_quiesced(&mut self, operation_id: &str) {
+        self.pending.remove(operation_id);
+    }
+
+    /// Keep CPU/GPU availability separate; unknown admissions conservatively charge both.
+    /// No fresh snapshot means no normal candidate, including a just-restarted instance.
+    pub fn stage_work(&self, now: Instant, max_age: Duration) -> Option<(u64, u64, u64)> {
+        let (snapshot, observed) = self.snapshot.as_ref()?;
+        if now.saturating_duration_since(*observed) > max_age {
+            return None;
+        }
+        let pending = self
+            .pending
+            .values()
+            .try_fold(0u64, |total, p| total.checked_add(p.work))?;
+        Some((
+            snapshot.cpu_work.checked_add(pending)?,
+            snapshot.gpu_work.checked_add(pending)?,
+            snapshot.send_bytes,
+        ))
+    }
+
+    /// A draining or clock-unhealthy encoder publishes zero admission capacity.
+    pub fn is_available(&self, now: Instant, max_age: Duration) -> bool {
+        self.snapshot.as_ref().is_some_and(|(snapshot, observed)| {
+            snapshot.capacity > 0 && now.saturating_duration_since(*observed) <= max_age
+        })
+    }
+
+    /// Count only local operations not covered by the same instance's snapshot.
+    pub fn has_capacity(&self, now: Instant, max_age: Duration) -> bool {
+        self.snapshot.as_ref().is_some_and(|(snapshot, observed)| {
+            now.saturating_duration_since(*observed) <= max_age
+                && snapshot.active.saturating_add(self.pending.len() as u64) < snapshot.capacity
+        })
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    /// Saturation is an admission outcome; stale or incompatible workers remove readiness.
+    #[test]
+    fn readiness_requires_fresh_compatible_pools_but_not_free_slots() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "model": "m", "model_path": "/model", "model_revision": "m", "processor_contract": "p",
+            "prefill_urls": ["http://p:1"], "decode_urls": ["http://d:1"],
+            "encoders": [{"endpoint": "http://e:1"}]
+        }))
+        .unwrap();
+        let config = config.resolve().unwrap();
+        let registry = Registry {
+            config,
+            state: Mutex::new(State::default()),
+            channels: HashMap::new(),
+        };
+        assert!(!registry.readiness_with_clock(true).workers_ready);
+        let now = Instant::now();
+        {
+            let mut state = registry.state.lock().unwrap();
+            for (endpoint, role) in [
+                ("http://e:1", "encoder"),
+                ("http://p:1", "prefill"),
+                ("http://d:1", "decode"),
+            ] {
+                let instance = proto::Instance {
+                    worker_id: role.into(),
+                    generation: "g".into(),
+                };
+                state.watched.insert(
+                    endpoint.into(),
+                    (
+                        proto::Capabilities {
+                            instance: Some(instance.clone()),
+                            ready: true,
+                            capacity: 1,
+                            model_revision: "m".into(),
+                            processor_contract: "p".into(),
+                            layout_contract: LAYOUT.into(),
+                            ..Default::default()
+                        },
+                        now,
+                    ),
+                );
+                if role == "encoder" {
+                    let mut load = LoadTracker::new(instance.clone(), 3);
+                    load.observe(
+                        proto::LoadSnapshot {
+                            instance: Some(instance.clone()),
+                            snapshot_seq: 1,
+                            capacity: 1,
+                            active: 1,
+                            ..Default::default()
+                        },
+                        now,
+                    )
+                    .unwrap();
+                    state.encoders.insert(instance_key(&instance), load);
+                }
+            }
+        }
+        assert!(registry.readiness_with_clock(true).workers_ready);
+        assert_eq!(registry.readiness_with_clock(true).healthy_workers, 3);
+        assert!(!registry.readiness_with_clock(false).workers_ready);
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .watched
+            .get_mut("http://d:1")
+            .unwrap()
+            .1 = now - Duration::from_millis(registry.config.snapshot_max_age_ms + 1);
+        assert!(!registry.readiness_with_clock(true).workers_ready);
+        let mut state = registry.state.lock().unwrap();
+        let (decode, observed) = state.watched.get_mut("http://d:1").unwrap();
+        *observed = now;
+        decode.model_revision = "different".into();
+        drop(state);
+        assert!(!registry.readiness_with_clock(true).workers_ready);
+    }
 }

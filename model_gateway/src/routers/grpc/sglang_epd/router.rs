@@ -17,6 +17,7 @@ use llm_tokenizer::{
 };
 use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
 use prost::Message;
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use smg_grpc_client::{
@@ -29,12 +30,14 @@ use uuid::Uuid;
 use super::{
     executor::{AttemptObserver, Executor},
     planner::Planner,
-    registry::{wall_ms, Config, Registry},
+    registry::{wall_ms, Registry},
 };
 use crate::{
     app_context::AppContext,
     middleware::TenantRequestMeta,
+    rate_limit::RateLimitManager,
     routers::{
+        common::rate_limit_cell::RateLimitCell,
         error,
         grpc::{
             context::{DispatchMetadata, ExecutionResult},
@@ -58,6 +61,7 @@ pub struct ManagedRouter {
     executor: Executor,
     processor: ResponseProcessor,
     streaming: Arc<StreamingProcessor>,
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
 }
 
 impl fmt::Debug for ManagedRouter {
@@ -70,6 +74,28 @@ impl fmt::Debug for ManagedRouter {
 }
 
 impl ManagedRouter {
+    /// Keep probe reads constant-time while managed workers use their own capability registry.
+    pub(crate) fn maintain_readiness(
+        &self,
+        probe: Arc<crate::health::ProbeState>,
+    ) -> tokio::task::JoinHandle<()> {
+        let registry = Arc::downgrade(&self.registry);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "one weakly owned readiness monitor per managed router"
+        )]
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let Some(registry) = registry.upgrade() else {
+                    break;
+                };
+                probe.publish_managed(registry.readiness());
+            }
+        })
+    }
+
     /// Build the independent planner while retaining the gateway's auth and response machinery.
     pub async fn new(ctx: &Arc<AppContext>, path: &str) -> Result<Self, String> {
         let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
@@ -77,7 +103,7 @@ impl ManagedRouter {
             return Err("managed deployment configuration exceeds 64 KiB".into());
         }
         let config: Config = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        config.validate().map_err(|e| e.to_string())?;
+        let config = config.resolve().map_err(|e| e.to_string())?;
         let model: Value = serde_json::from_slice(
             &tokio::fs::read(std::path::Path::new(&config.model_path).join("config.json"))
                 .await
@@ -113,7 +139,7 @@ impl ManagedRouter {
             resolver,
             "sglang_managed_epd",
         ));
-        let registry = Registry::new(config.clone());
+        let registry = Registry::new(config.clone()).map_err(|e| e.to_string())?;
         let executor = Executor::new(
             config.max_attempts,
             Limits::default(),
@@ -127,15 +153,17 @@ impl ManagedRouter {
             executor,
             processor,
             streaming,
+            rate_limit_manager: ctx.rate_limit_manager.clone(),
         })
     }
 
     /// Render references and text only: this gateway never fetches or preprocesses media.
-    fn execute_chat(
+    async fn execute_chat(
         &self,
         body: &ChatCompletionRequest,
         tenant: &TenantRequestMeta,
         started: Instant,
+        reservation: &RateLimitCell,
     ) -> Result<(ExecutionResult, DispatchMetadata, ChatResponseSpec), Status> {
         let original_expiry = wall_ms()?.saturating_add(self.config.timeout_ms);
         if body.model != self.config.model
@@ -182,6 +210,23 @@ impl ManagedRouter {
             return Err(Status::invalid_argument(
                 "managed prompt length exceeds capability",
             ));
+        }
+        if let Some(manager) = &self.rate_limit_manager {
+            reservation
+                .reserve(manager, tenant, &body.model, tokens.len() as u32)
+                .await
+                .map_err(|response| {
+                    let mut status = Status::resource_exhausted("tenant rate limit exceeded");
+                    if let Some(value) = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse().ok())
+                    {
+                        status.metadata_mut().insert("retry-after", value);
+                    }
+                    status
+                })?;
         }
         let attempt = Uuid::now_v7().to_string();
         let request_id = format!("chatcmpl-{}", Uuid::now_v7());
@@ -388,16 +433,38 @@ impl RouterTrait for ManagedRouter {
         body: ChatCompletionRequest,
         _model_id: &str,
     ) -> Response {
-        let (execution, dispatch, spec) = match self.execute_chat(&body, tenant, Instant::now()) {
+        let reservation = RateLimitCell::new();
+        let (execution, dispatch, spec) = match self
+            .execute_chat(&body, tenant, Instant::now(), &reservation)
+            .await
+        {
             Ok(value) => value,
             Err(status) => {
-                return if status.code() == tonic::Code::InvalidArgument
-                    || status.code() == tonic::Code::Unimplemented
+                reservation.close_unsettled().await;
+                let mut response = match status.code() {
+                    tonic::Code::InvalidArgument | tonic::Code::Unimplemented => {
+                        error::bad_request("managed_capability_refused", status.message())
+                    }
+                    tonic::Code::ResourceExhausted => {
+                        error::too_many_requests("managed_capacity_exhausted", status.message())
+                    }
+                    tonic::Code::DeadlineExceeded => {
+                        error::gateway_timeout("managed_deadline_exceeded", status.message())
+                    }
+                    tonic::Code::Internal | tonic::Code::DataLoss => {
+                        error::internal_error("managed_internal_error", status.message())
+                    }
+                    _ => error::service_unavailable("managed_epd_unavailable", status.message()),
+                };
+                if let Some(value) = status
+                    .metadata()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse().ok())
                 {
-                    error::bad_request("managed_capability_refused", status.message())
-                } else {
-                    error::service_unavailable("managed_epd_unavailable", status.message())
+                    response.headers_mut().insert("retry-after", value);
                 }
+                return response;
             }
         };
         if body.stream {
@@ -410,7 +477,7 @@ impl RouterTrait for ManagedRouter {
                     dispatch,
                     self.tokenizer.clone(),
                     body.skip_special_tokens,
-                    None,
+                    reservation.take_for_streaming_handoff(),
                     None,
                     source,
                 )
@@ -436,8 +503,14 @@ impl RouterTrait for ManagedRouter {
                 )
                 .await
             {
-                Ok((response, _)) => Json(response).into_response(),
-                Err(response) => response,
+                Ok((response, counts)) => {
+                    reservation.settle(counts.settlement()).await;
+                    Json(response).into_response()
+                }
+                Err(response) => {
+                    reservation.close_unsettled().await;
+                    response
+                }
             }
         }
     }
@@ -488,4 +561,144 @@ fn image_references(body: &ChatCompletionRequest) -> Result<Vec<String>, Status>
         }
     }
     Ok(images)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncoderEndpoint {
+    pub endpoint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PdEndpoints {
+    pub prefill: String,
+    pub decode: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub model: String,
+    pub model_path: String,
+    pub model_revision: String,
+    pub processor_contract: String,
+    #[serde(skip)]
+    pub pairs: Vec<PdEndpoints>,
+    pub prefill_urls: Vec<String>,
+    pub decode_urls: Vec<String>,
+    pub encoders: Vec<EncoderEndpoint>,
+    pub max_attempts: usize,
+    pub max_records: usize,
+    pub timeout_ms: u64,
+    pub max_clock_error_ms: u64,
+    pub probe_timeout_ms: u64,
+    pub snapshot_max_age_ms: u64,
+    pub max_images: usize,
+    pub max_pd_candidates: usize,
+    pub max_encoder_candidates: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            model_path: String::new(),
+            model_revision: String::new(),
+            processor_contract: "smg-qwen3-vl-f32-v1".into(),
+            pairs: Vec::new(),
+            prefill_urls: Vec::new(),
+            decode_urls: Vec::new(),
+            encoders: Vec::new(),
+            max_attempts: 64,
+            max_records: 1024,
+            timeout_ms: 120_000,
+            max_clock_error_ms: 1000,
+            probe_timeout_ms: 3000,
+            snapshot_max_age_ms: 3000,
+            max_images: 32,
+            max_pd_candidates: 4,
+            max_encoder_candidates: 4,
+        }
+    }
+}
+
+impl Config {
+    /// Resolve role pools once; candidate search remains bounded independently of pool size.
+    pub fn resolve(mut self) -> Result<Self, Status> {
+        if self.prefill_urls.is_empty()
+            || self.decode_urls.is_empty()
+            || self
+                .prefill_urls
+                .len()
+                .saturating_mul(self.decode_urls.len())
+                > 64
+        {
+            return Err(Status::invalid_argument("invalid managed P/D pools"));
+        }
+        self.pairs = self
+            .prefill_urls
+            .iter()
+            .flat_map(|prefill| {
+                self.decode_urls.iter().map(move |decode| PdEndpoints {
+                    prefill: prefill.clone(),
+                    decode: decode.clone(),
+                })
+            })
+            .collect();
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Invalid bounds fail startup; an absent configuration keeps this entire mode disabled.
+    pub fn validate(&self) -> Result<(), Status> {
+        if self.model.is_empty()
+            || self.model_path.is_empty()
+            || self.model_revision.is_empty()
+            || self.processor_contract.is_empty()
+            || self.pairs.is_empty()
+            || self.pairs.len() > 64
+            || self.encoders.len() > 64
+            || !(1..=64).contains(&self.max_pd_candidates)
+            || !(1..=64).contains(&self.max_encoder_candidates)
+            || self.max_attempts == 0
+            || self.max_attempts > 1024
+            || self.max_records < self.max_attempts.saturating_mul(3)
+            || self.max_records > 65536
+            || self.timeout_ms == 0
+            || self.timeout_ms > 120_000
+            || self.probe_timeout_ms == 0
+            || self.max_clock_error_ms == 0
+            || self.snapshot_max_age_ms == 0
+            || self.max_images == 0
+            || self.max_images > 32
+        {
+            return Err(Status::invalid_argument(
+                "invalid managed gateway deployment bounds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ordinary deployments specify pools and model identity, without scheduler tuning fields.
+    #[test]
+    fn minimal_pools_derive_bounded_defaults() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "model": "qwen3", "model_path": "/models/qwen3", "model_revision": "weights",
+            "prefill_urls": ["http://p1:1", "http://p2:1"],
+            "decode_urls": ["http://d1:1", "http://d2:1"],
+            "encoders": [{"endpoint": "http://e:1"}]
+        }))
+        .unwrap();
+        let config = config.resolve().unwrap();
+        assert_eq!(config.pairs.len(), 4);
+        assert_eq!(config.max_pd_candidates, 4);
+        assert_eq!(config.max_encoder_candidates, 4);
+        assert_eq!(config.processor_contract, "smg-qwen3-vl-f32-v1");
+        assert!(config.max_records >= config.max_attempts * 3);
+    }
 }

@@ -65,6 +65,8 @@ pub struct Executor {
 
 /// Local reservations reconcile with worker coverage and actual termination receipts.
 pub trait AttemptObserver: Send + Sync {
+    /// Clone the configured endpoint's multiplexed channel without connecting on the caller path.
+    fn channel(&self, endpoint: &str) -> Result<Channel, Status>;
     /// An event has already passed its operation fence and monotonic sequence check.
     fn event(&self, event: &proto::ControlEvent) -> Result<(), Status>;
     /// False or missing receipts remain charged; a cancellation acknowledgement is insufficient.
@@ -152,51 +154,50 @@ impl Executor {
             .await;
             token.cancel();
             if let Err(error) = result {
-                let _ = output.try_send(Err(error));
+                let _ = timeout(Duration::from_secs(1), output.send(Err(error))).await;
             }
-            // A failed cleanup is unknown, never Quiesced. Worker deadlines remain authoritative.
-            let cleanup = futures::future::join_all(terminations.into_iter().map(
+            // HTTP completion must not wait for the independent remote cleanup owner.
+            drop(output);
+            // The bounded supervisor remains the reconciliation owner until every
+            // instance acknowledges safe release. A network timeout is never a receipt.
+            futures::future::join_all(terminations.into_iter().map(
                 |(role, endpoint, request)| {
                     let observer = Arc::clone(&observer);
                     async move {
-                        let operation = request
-                            .operation
-                            .clone()
-                            .ok_or_else(|| Status::internal("missing termination operation"))?;
-                        let channel = Channel::from_shared(endpoint)
-                            .map_err(|e| Status::invalid_argument(e.to_string()))?
-                            .connect()
-                            .await
-                            .map_err(|e| Status::unavailable(e.to_string()))?;
-                        loop {
-                            // Recorded cancellation is not safe release. Reconcile the
-                            // same operation until its real owners have quiesced.
-                            let quiesced = if role == Role::Encode {
-                                ManagedEncoderClient::new(channel.clone())
-                                    .cancel(request.clone())
-                                    .await?
-                                    .into_inner()
-                                    .quiesced
-                            } else {
-                                ManagedSglangClient::new(channel.clone())
-                                    .terminate(request.clone())
-                                    .await?
-                                    .into_inner()
-                                    .quiesced
-                            };
-                            observer.termination(&operation, quiesced);
-                            if quiesced {
-                                break Ok::<bool, Status>(true);
+                        let Some(operation) = request.operation.clone() else { return; };
+                        let channel = match observer.channel(&endpoint) {
+                            Ok(channel) => channel,
+                            Err(error) => {
+                                tracing::error!(%error, "invalid frozen cleanup endpoint");
+                                return;
                             }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        };
+                        let mut backoff = Duration::from_millis(50);
+                        loop {
+                            let reconcile = async {
+                                if role == Role::Encode {
+                                    ManagedEncoderClient::new(channel.clone())
+                                        .cancel(request.clone()).await.map(|reply| reply.into_inner().quiesced)
+                                } else {
+                                    ManagedSglangClient::new(channel.clone())
+                                        .terminate(request.clone()).await.map(|reply| reply.into_inner().quiesced)
+                                }
+                            };
+                            match timeout(cleanup_timeout, reconcile).await {
+                                Ok(Ok(true)) => {
+                                    observer.termination(&operation, true);
+                                    break;
+                                }
+                                Ok(Ok(false)) => {}
+                                outcome => tracing::warn!(?outcome, operation_id = operation.operation_id,
+                                    "managed cleanup unconfirmed; retaining bounded reconciliation owner"),
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(5));
                         }
                     }
                 },
-            ));
-            match timeout(cleanup_timeout, cleanup).await {
-                Ok(results) if results.iter().all(|result| matches!(result, Ok(true))) => {}
-                other => tracing::warn!(?other, "managed EPD remote cleanup is unconfirmed"),
-            }
+            )).await;
         });
         Ok(ResponseStream {
             responses: ReceiverStream::new(responses),
@@ -265,15 +266,6 @@ fn termination_requests(
     result
 }
 
-/// Connect and dispatch within a role task, so a slow connection cannot delay another role.
-async fn channel(endpoint: String) -> Result<Channel, Status> {
-    Channel::from_shared(endpoint)
-        .map_err(|e| Status::invalid_argument(e.to_string()))?
-        .connect()
-        .await
-        .map_err(|e| Status::unavailable(e.to_string()))
-}
-
 /// Validate source-local ordering before events reach the supervisor.
 async fn forward(
     role: Role,
@@ -337,20 +329,20 @@ async fn supervise(
             command: Some(Command::Start(decode.clone())),
         })
         .map_err(|_| Status::internal("managed Start queue failed"))?;
-    let endpoint = plan.decode().control_endpoint.clone();
+    let channel = observer.channel(&plan.decode().control_endpoint)?;
     let sender = events_tx.clone();
     let operation = plan.binding().decode.clone();
     tasks.spawn(async move {
-        let mut client = ManagedSglangClient::new(channel(endpoint).await?);
+        let mut client = ManagedSglangClient::new(channel);
         let mut request = Request::new(ReceiverStream::new(command_rx));
         request.set_timeout(deadline.saturating_duration_since(Instant::now()));
         let stream = client.generate_decode(request).await?.into_inner();
         forward(Role::Decode, operation, stream, sender).await
     });
-    let endpoint = plan.prefill().control_endpoint.clone();
+    let channel = observer.channel(&plan.prefill().control_endpoint)?;
     let sender = events_tx.clone();
     tasks.spawn(async move {
-        let mut client = ManagedSglangClient::new(channel(endpoint).await?);
+        let mut client = ManagedSglangClient::new(channel);
         let operation = prefill.operation.clone();
         let mut request = Request::new(prefill);
         request.set_timeout(deadline.saturating_duration_since(Instant::now()));
@@ -358,10 +350,10 @@ async fn supervise(
         forward(Role::Prefill, operation, stream, sender).await
     });
     if let (Some(worker), Some(request)) = (plan.encoder(), encode) {
-        let endpoint = worker.control_endpoint.clone();
+        let channel = observer.channel(&worker.control_endpoint)?;
         let sender = events_tx.clone();
         tasks.spawn(async move {
-            let mut client = ManagedEncoderClient::new(channel(endpoint).await?);
+            let mut client = ManagedEncoderClient::new(channel);
             let operation = request.operation.clone();
             let mut request = Request::new(request);
             request.set_timeout(deadline.saturating_duration_since(Instant::now()));

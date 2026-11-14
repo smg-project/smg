@@ -27,6 +27,21 @@ class RustPreprocessorBridge:
         return self.original.get_num_patches(grid, modality)
 
     async def process_batch_mm_items(self, requests, modality):
+        """Keep artifact materialization off the control loop; native dispatch still awaits it."""
+        # Reuse the native preprocessor owner and its pool; unrelated control/send tasks
+        # must not scatter large CPU tensor allocations across the default executor.
+        work = asyncio.get_running_loop().run_in_executor(
+            self.original.preproc_executor, self._materialize_batch, requests, modality
+        )
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            # CPU tensors and immutable artifacts remain owned until the worker exits.
+            # In particular, shutdown must not release the enclosing native batch early.
+            await work
+            raise
+
+    def _materialize_batch(self, requests, modality):
         """Merge Rust artifacts in native batch order without CPU decoding or normalization."""
         import torch
         from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessResult
@@ -109,7 +124,11 @@ def _tensor(value):
 def install_bridge(encoder, processor_contract, max_artifact_bytes):
     """Install before serving on every rank; preserve native forward, TP, cache and sends."""
     required = ("process_batch_mm_items", "get_num_patches", "supports_modality")
-    if any(not callable(getattr(encoder.preprocessor, name, None)) for name in required):
+    if any(
+        not callable(getattr(encoder.preprocessor, name, None)) for name in required
+    ) or not callable(
+        getattr(getattr(encoder.preprocessor, "preproc_executor", None), "submit", None)
+    ):
         raise ValueError("native encoder preprocessor component contract changed")
     if not processor_contract or max_artifact_bytes <= 0:
         raise ValueError("managed Rust processor requires a contract and byte limit")
@@ -152,3 +171,62 @@ class NativeReferences:
         if not self.cancelled:
             raise RuntimeError("cannot declare an open encoder operation quiescent")
         await self.idle.wait()
+
+
+def launch_managed_rank(server_args, schedule_path, dist_init_method, rank):
+    """Spawn target loads the SMG component hook before native MMEncoder construction."""
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+    from sglang.srt.disaggregation.encoder.server import launch_encoder
+
+    launch_encoder(server_args, schedule_path, dist_init_method, rank)
+
+
+def launch_runtime(server_args, max_active):
+    """Reuse native TP assembly with an explicit SMG follower initialization target."""
+    from sglang.srt.disaggregation.encoder import runtime
+    from sglang.srt.runtime_context import publish
+
+    if server_args.dp_size != 1 or server_args.nnodes != 1:
+        raise ValueError("managed E currently requires one host and one native DP unit")
+    if max_active <= 0:
+        raise ValueError("managed E requires a finite native queue")
+    publish(server_args, role="encoder")
+    # launch_local_runtime resolves this imported component when creating Process objects.
+    # The target itself has a stable SMG module path, so spawn imports and runs our hook.
+    original_target = runtime.launch_encoder
+    runtime.launch_encoder = launch_managed_rank
+    try:
+        backend = runtime.launch_local_runtime(server_args)
+    finally:
+        runtime.launch_encoder = original_target
+    backend.scheduler.pending_queue = asyncio.Queue(maxsize=max_active)
+    if not hasattr(backend.encoder.preprocessor, "max_artifact_bytes"):
+        raise RuntimeError("native rank zero did not install the managed Rust bridge")
+    return backend
+
+
+class OwnedBatchSubmitter:
+    """Keep native batch completion alive beyond request cancellation and RPC deadlines.
+
+    Native submit() applies wait_for to PendingRequest.future. Its timeout can retire
+    that future while the batch still owns CUDA/TP resources. This adapter supplies
+    the existing native queue with a future that only its native batch owner resolves.
+    Admission and deadlines belong to the managed registry surrounding this adapter.
+    """
+
+    def __init__(self, scheduler, on_encoded):
+        self.scheduler = scheduler
+        self.on_encoded = on_encoded
+
+    async def submit(self, request):
+        """Enqueue once and await real batch completion; never cancel its shared future."""
+        from sglang.srt.disaggregation.encoder.runtime import PendingRequest
+
+        pending = PendingRequest(request, asyncio.get_running_loop())
+        self.scheduler.pending_queue.put_nowait(pending)
+        result = await asyncio.shield(pending.future)
+        if result[3] is None:
+            await self.on_encoded(request["req_id"])
+        return result

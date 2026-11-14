@@ -52,20 +52,6 @@ def launcher(config):
                 raise ValueError("managed P/D requires --language-only")
             if os.environ.get("SMG_SGLANG_MM_PROCESSOR"):
                 raise ValueError("managed P/D refuses legacy media preprocessing")
-            contract = config["contract"]
-            actual = {
-                "tp_size": args.tp_size,
-                "kv_backend": args.disaggregation_transfer_backend,
-                "embedding_backend": args.encoder_transfer_backend,
-            }
-            for key, value in actual.items():
-                if contract[key] != value:
-                    raise ValueError(f"managed contract {key} differs from native runtime")
-            if (
-                config["role"] == "prefill"
-                and contract["bootstrap_port"] != args.disaggregation_bootstrap_port
-            ):
-                raise ValueError("managed bootstrap port differs from native prefill")
             return {"sglang_managed_epd": json.dumps(config)}
 
         def launch(self, args, handshake_port, facts):
@@ -83,9 +69,16 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--managed-config", required=True)
     managed, native_args = parser.parse_known_args()
-    config = json.loads(Path(managed.managed_config).read_text())
-    if config.get("role") not in ("prefill", "decode") or not config.get("worker_id"):
-        raise ValueError("managed config requires worker_id and role=prefill|decode")
+    from sglang.srt.server_args import prepare_server_args
+
+    from .config import complete
+
+    args = prepare_server_args(native_args)
+    config = complete(
+        json.loads(Path(managed.managed_config).read_text()), args, args.disaggregation_mode
+    )
+    if config["role"] not in ("prefill", "decode"):
+        raise ValueError("managed P/D requires native --disaggregation-mode prefill or decode")
     config["generation"] = uuid.uuid4().hex
     os.environ[ROLE_ENV] = config["role"]
     os.environ[WORKER_ENV] = config["worker_id"]
@@ -97,10 +90,8 @@ def main():
         if endpoint:
             os.environ[EVENTS_ENV] = endpoint
         from sglang.srt.plugins import load_plugins
-        from sglang.srt.server_args import prepare_server_args
 
         load_plugins()
-        args = prepare_server_args(native_args)
         raise SystemExit(asyncio.run(launcher(config).serve(args)))
 
 

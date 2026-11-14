@@ -793,6 +793,8 @@ class MsgpackSendSocket:
         # Requests whose outputs this side could not relay: SMG was told, the
         # scheduler was not; the receiver's next drain aborts them there.
         self.pending_aborts: deque[str] = deque()
+        # Enabled only by the managed launcher: synthetic errors are not native release receipts.
+        self.managed_native_receipts = False
         self._relay_failures_logged: set[tuple[str, str]] = set()
         # The traces of the requests in flight (started by the receiver from
         # the caller's context, ended here on the terminal output).
@@ -879,7 +881,14 @@ class MsgpackSendSocket:
                 )
             else:
                 logger.warning("zmq msgpack: could not relay a %s for %s: %s", kind, rids, exc)
-            for rid in rids:
+            reasons = getattr(output, "finished_reasons", None) or []
+            for index, rid in enumerate(rids):
+                if self.managed_native_receipts and not (
+                    (index < len(reasons) and reasons[index] is not None)
+                    or type(output).__name__ == "AbortReq"
+                ):
+                    self.pending_aborts.append(rid)
+                    continue
                 try:
                     self.send_terminal_abort(
                         rid, f"the scheduler's output could not be relayed: {exc}", status=None

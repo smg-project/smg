@@ -628,6 +628,7 @@ class RouterArgs:
     service_discovery: bool = False
     service_discovery_namespace: str | None = None
     service_discovery_port: int = 80
+    sglang_managed_epd: str | None = None  # Managed SGLang EPD deployment JSON
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
     shutdown_settle_secs: int | None = None
@@ -1571,6 +1572,12 @@ class RouterArgs:
         )
 
         # PD/EPD-specific arguments
+        pd_group.add_argument(
+            f"--{prefix}sglang-managed-epd",
+            type=str,
+            default=None,
+            help="Enable managed SGLang EPD using a deployment JSON file",
+        )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
             action="store_true",

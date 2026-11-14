@@ -365,6 +365,16 @@ async fn native_abort_receipt_waits_for_scheduler_terminal_output() {
             .await
             .is_err()
     );
+    // A delayed scheduler receipt must remain observable past the former 30s cutoff.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut termination)
+            .await
+            .is_err()
+    );
     let acknowledged = BatchTokenIDSlimOutput {
         rids: vec!["op".into()],
         output_ids: vec![vec![]],

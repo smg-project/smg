@@ -135,6 +135,7 @@ fn rejects_foreign_instances_branches_and_self_consistent_but_incomplete_layout(
     }
     let mut input = original.clone();
     input.padded_ids[0] += 1;
+    input.integrity_digest = manifest_digest(&input);
     assert!(validate_manifest(
         &input,
         original.binding.as_ref().unwrap(),

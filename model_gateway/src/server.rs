@@ -1750,14 +1750,28 @@ async fn start_observability(
     config: &ServerConfig,
     app_context: &Arc<AppContext>,
     metrics_handle: Option<PrometheusHandle>,
+    gateway: &Gateway,
 ) -> Result<Arc<crate::health::ProbeState>, Box<dyn std::error::Error>> {
+    use crate::routers::grpc::sglang_epd::router::ManagedRouter;
+
     let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
-    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
-        probe_state.clone(),
-        app_context.worker_registry.clone(),
-        app_context.tokenizer_registry.clone(),
-        config.router_config.clone(),
-    );
+    let _readiness_maintainer = if config.router_config.sglang_managed_epd.is_some() {
+        let router = gateway
+            .select_router_for_request(None)
+            .ok_or("managed router missing during readiness initialization")?;
+        router
+            .as_any()
+            .downcast_ref::<ManagedRouter>()
+            .ok_or("managed readiness router type mismatch")?
+            .maintain_readiness(probe_state.clone())
+    } else {
+        crate::health::spawn_readiness_maintainer(
+            probe_state.clone(),
+            app_context.worker_registry.clone(),
+            app_context.tokenizer_registry.clone(),
+            config.router_config.clone(),
+        )
+    };
 
     if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
         let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
@@ -2552,7 +2566,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // among them bind now, before the admin and HTTP listeners; the mesh TLS
     // material, the apps and the listener addresses can still fail the start
     // after this point, with these two bound.
-    let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
+    let probe_state = start_observability(&config, &app_context, metrics_handle, &gateway).await?;
 
     // Initialize control plane authentication if configured
     let control_plane_auth_state =

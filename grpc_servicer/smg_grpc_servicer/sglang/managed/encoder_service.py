@@ -14,9 +14,8 @@ import grpc
 from smg_grpc_proto.generated import sglang_managed_pb2 as pb
 from smg_grpc_proto.generated import sglang_managed_pb2_grpc as rpc
 
-from .clock import healthy
-from .encoder_bridge import ARTIFACT_KEY, NativeReferences
-from .encoder_runtime import OwnedBatchSubmitter
+from .config import encoder_window, healthy
+from .encoder_bridge import ARTIFACT_KEY, NativeReferences, OwnedBatchSubmitter
 
 
 class Rejected(Exception):
@@ -47,6 +46,9 @@ class Entry:
     deadline: float
     rid: str
     admission: int = 0
+    created_ns: int = field(default_factory=time.monotonic_ns)
+    cpu_started_ns: int = 0
+    embedding_bytes: int = 0
     request: object = None
     request_digest: bytes = b""
     cancelled: bool = False
@@ -116,6 +118,18 @@ class FairQueue:
                 return result
             self.queues.move_to_end(tenant)
 
+    def remove(self, entry):
+        """A queued cancellation removes only its own work, preserving every sibling's order."""
+        for tenant, queue in list(self.queues.items()):
+            for queued in queue:
+                if queued[1] is entry:
+                    queue.remove(queued)
+                    if not queue:
+                        del self.queues[tenant]
+                        del self.deficits[tenant]
+                    return True
+        return False
+
     def _take(self, tenant):
         """Remove empty tenant state so historical tenant labels cannot grow memory."""
         _, entry = self.queues[tenant].popleft()
@@ -130,6 +144,11 @@ class EncoderService(rpc.ManagedEncoderServicer):
 
     def __init__(self, config, backend, processor):
         self.config, self.backend, self.processor = config, backend, processor
+        self.capacity = config["max_active"]
+        # Waiting requests own bounded controls, not yet materialized tensors. Reserve
+        # room for every queued control, then bound the CPU/native/send window separately.
+        self.execution_capacity, self.execution_bytes = encoder_window(config)
+        self.execution = asyncio.BoundedSemaphore(self.execution_capacity)
         self.instance = pb.Instance(worker_id=config["worker_id"], generation=config["generation"])
         self.entries, self.parts, self.early = {}, {}, {}
         self.admission_seq = self.snapshot_seq = 0
@@ -139,12 +158,26 @@ class EncoderService(rpc.ManagedEncoderServicer):
         )
         self.queued = asyncio.Event()
         self.cpu = asyncio.Semaphore(config["max_cpu"])
+        self.cpu_target = min(2, config["max_cpu"])
+        self.cpu_active = 0
+        self.cpu_changed = asyncio.Event()
         self.dispatcher = None
         self.early_count = 0
         self.submitter = OwnedBatchSubmitter(backend.scheduler, self._encoded)
 
     async def _encoded(self, rid):
         """Record GPU completion before native delivery starts, including ZMQ inline sends."""
+        # Native completion is the feedback boundary. Pending native work or an
+        # occupied dispatch lock means more CPU producers cannot feed this GPU.
+        if (
+            self.queue.queues
+            and self.cpu_active >= self.cpu_target
+            and self.cpu_target < self.config["max_cpu"]
+            and self.backend.scheduler.pending_queue.empty()
+            and not self.backend.encoder.encode_dispatch_lock.locked()
+        ):
+            self.cpu_target += 1
+            self.cpu_changed.set()
         self.parts[rid].gpu_work = 0
         await self._event(self.parts[rid], stage=pb.ENCODED)
 
@@ -198,7 +231,7 @@ class EncoderService(rpc.ManagedEncoderServicer):
         return time.monotonic() + remaining / 1000
 
     def _admit(self, request):
-        """Reserve CPU artifacts and ledger state before media IO or native submission."""
+        """Admit bounded controls; the execution window reserves tensors before media IO."""
         self._operation(request.operation)
         require(request.version == 1, "unsupported managed version")
         deadline = self._budget(request.budget)
@@ -278,13 +311,11 @@ class EncoderService(rpc.ManagedEncoderServicer):
             )
             return previous
         active = [entry for entry in self.entries.values() if not entry.quiesced]
-        staging = self.config["max_staging_bytes_per_request"]
-        send = staging * self.config["max_receivers"]
-        reserve = self.config["max_artifact_bytes"] + len(encoded) + staging + send
+        reserve = len(encoded)
         require(
             not self.draining
             and len(self.entries) < self.config["max_records"]
-            and len(active) < self.config["max_active"],
+            and len(active) < self.capacity,
             "E admission full",
             grpc.StatusCode.RESOURCE_EXHAUSTED,
         )
@@ -316,13 +347,13 @@ class EncoderService(rpc.ManagedEncoderServicer):
             request_digest=digest,
             work=request.budget.estimated_work,
             context_bytes=reserve,
-            staging_bytes=staging,
-            send_bytes=send,
         )
         self.entries[request.operation.operation_id] = entry
         self.parts[entry.rid] = entry
-        entry.artifact_bytes = reserve - staging - send
+        entry.artifact_bytes = reserve
         entry.cpu_work = entry.work
+        # Accepted CPU work will also consume GPU capacity; do not hide it until preprocess ends.
+        entry.gpu_work = entry.work
         waiter = self.early.get(entry.rid)
         if waiter is not None:
             waiter[0].set()
@@ -343,11 +374,19 @@ class EncoderService(rpc.ManagedEncoderServicer):
         else:
             event.stage = stage
         logging.getLogger(__name__).info(
-            "managed E event operation=%s seq=%s stage=%s refs=%s",
+            "managed E event operation=%s seq=%s stage=%s refs=%s "
+            "rid=%s elapsed_us=%s admission_queue_us=%s embedding_bytes=%s "
+            "cpu_active=%s cpu_target=%s",
             entry.operation.operation_id,
             event.event_seq,
             pb.Stage.Name(stage) if error is None else "FAILED",
             entry.refs.count,
+            entry.rid,
+            (time.monotonic_ns() - entry.created_ns) // 1000,
+            (entry.cpu_started_ns - entry.created_ns) // 1000 if entry.cpu_started_ns else None,
+            entry.embedding_bytes,
+            self.cpu_active,
+            self.cpu_target,
         )
         async with entry.changed:
             require(
@@ -358,38 +397,69 @@ class EncoderService(rpc.ManagedEncoderServicer):
             entry.events.append(event)
             entry.changed.notify_all()
 
+    def _release_cpu(self):
+        """Release only completed CPU owners; backpressure never cancels running work."""
+        self.cpu_active -= 1
+        self.cpu.release()
+        if self.cpu_target > min(
+            2, self.config["max_cpu"]
+        ) and self.backend.scheduler.pending_queue.qsize() >= min(
+            self.backend.scheduler.max_batch_size, max(1, self.execution_capacity // 2)
+        ):
+            self.cpu_target -= 1
+        self.cpu_changed.set()
+
     async def _dispatch(self):
-        """Grant CPU slots in DRR order while completed preprocessing overlaps GPU/send."""
+        """Grant tensor and CPU slots in DRR order while completed CPU work overlaps GPU/send."""
         while True:
             await self.queued.wait()
+            await self.execution.acquire()
+            while self.cpu_active >= self.cpu_target:
+                self.cpu_changed.clear()
+                await self.cpu_changed.wait()
             await self.cpu.acquire()
+            self.cpu_active += 1
             if not self.queue.queues:
-                self.cpu.release()
+                self._release_cpu()
+                self.execution.release()
                 self.queued.clear()
                 continue
             entry = self.queue.pop()
-            entry.task = asyncio.create_task(self._run(entry))
+            entry.context_bytes += self.execution_bytes
+            entry.artifact_bytes += self.config["max_artifact_bytes"]
+            entry.staging_bytes = self.config["max_staging_bytes_per_request"]
+            entry.send_bytes = entry.staging_bytes * self.config["max_receivers"]
+            entry.task = asyncio.create_task(self._run(entry, execution_held=True))
             if not self.queue.queues:
                 self.queued.clear()
 
-    async def _run(self, entry):
+    async def _run(self, entry, *, cpu_held=True, execution_held=False):
         """Do not cancel CPU, a native batch or a zero-copy send when the request expires."""
         from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
 
-        cpu_held = True
+        native_started = False
+
+        async def abandon_cancelled_native():
+            """Wake missing-destination waits through the native lifecycle owner, never cancel CUDA."""
+            await entry.cancellation.wait()
+            if native_started and entry.cancelled:
+                await self.backend.encoder.abandon_request(entry.rid)
+
+        cancellation = asyncio.create_task(abandon_cancelled_native())
         try:
             require(
                 not entry.cancelled and time.monotonic() < entry.deadline,
                 "Encode cancelled before CPU",
                 grpc.StatusCode.CANCELLED,
             )
+            entry.cpu_started_ns = time.monotonic_ns()
             async with entry.refs.retain():
                 artifact = await asyncio.to_thread(
                     self.processor.prepare,
                     list(entry.request.image_references),
                     self.config["image_token_id"],
                 )
-            self.cpu.release()
+            self._release_cpu()
             cpu_held = False
             entry.cpu_work = 0
             entry.gpu_work = entry.work
@@ -418,6 +488,7 @@ class EncoderService(rpc.ManagedEncoderServicer):
                 "embedding exceeds reserved staging budget",
                 grpc.StatusCode.RESOURCE_EXHAUSTED,
             )
+            entry.embedding_bytes = native_bytes
             del prepared
             native = {
                 "req_id": entry.rid,
@@ -428,6 +499,7 @@ class EncoderService(rpc.ManagedEncoderServicer):
                 ARTIFACT_KEY: artifact,
             }
             async with entry.refs.retain():
+                native_started = True
                 await execute_encode_pipeline(self.backend.encoder, self.submitter, native)
             if self.backend.encoder.transfer_backend == "mooncake":
                 delivered = asyncio.create_task(entry.delivered.wait())
@@ -447,26 +519,53 @@ class EncoderService(rpc.ManagedEncoderServicer):
                     "Encode delivery cancelled or expired",
                     grpc.StatusCode.CANCELLED,
                 )
+            require(
+                not entry.cancelled,
+                "Encode delivery cancelled",
+                grpc.StatusCode.CANCELLED,
+            )
             await self._event(entry, stage=pb.DELIVERED)
         except Exception as error:
             await self._event(entry, error=error)
+            if not native_started:
+                # A P metadata waiter may already hold a reference to this queued
+                # request. Publish failure before waiting for that reader to leave.
+                from sglang.srt.disaggregation.encoder.server import meta_registry
+
+                try:
+                    await meta_registry.publish(entry.rid, 0, 0, 0, error=str(error)[:1024])
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "native metadata failure publication failed"
+                    )
         finally:
             if cpu_held:
-                self.cpu.release()
+                self._release_cpu()
             entry.refs.cancel()
             entry.cancellation.set()
-            # All actual CPU/batch/send scopes must exit before the last native release.
+            # Native abandonment wakes ZMQ destination waits but retains active encode/send
+            # owners. Their scopes still have to finish before SMG removes any charges.
+            await cancellation
             await entry.refs.wait_quiesced()
             try:
                 await self.backend.encoder.release_request(entry.rid)
+                if native_started:
+                    self.backend.encoder.clear_abandoned_request(entry.rid)
             except Exception as error:
                 await self._event(entry, error=error)
             else:
+                # Retain only the replay fence and bounded events after native owners exit.
+                entry.request = None
+                # Failed send tasks retain traceback frames holding native embeddings.
+                # Closed parts cannot replay these tasks after quiescence.
+                entry.sends.clear()
                 entry.quiesced = True
                 entry.cpu_work = entry.gpu_work = 0
                 entry.context_bytes = entry.artifact_bytes = entry.work = entry.staging_bytes = (
                     entry.send_bytes
                 ) = 0
+                if execution_held:
+                    self.execution.release()
                 await self._event(entry, stage=pb.QUIESCED)
             async with entry.changed:
                 entry.terminal = True
@@ -504,6 +603,10 @@ class EncoderService(rpc.ManagedEncoderServicer):
         entry.cancelled = True
         entry.refs.cancel()
         entry.cancellation.set()
+        if entry.task is None and self.queue.remove(entry):
+            # There is no CPU/native execution permit to release. Any early receiver
+            # still owns its references until the same normal cleanup confirms safety.
+            entry.task = asyncio.create_task(self._run(entry, cpu_held=False))
 
     async def Cancel(self, request, context):
         """Install a bounded pre-Encode tombstone or close an existing operation."""
@@ -578,7 +681,7 @@ class EncoderService(rpc.ManagedEncoderServicer):
                 instance=self.instance,
                 snapshot_seq=self.snapshot_seq,
                 covered_admission_seq=self.admission_seq,
-                capacity=self.config["max_active"]
+                capacity=self.capacity
                 if not self.draining and healthy(self.config["max_clock_error_ms"])
                 else 0,
                 active=len(active),
@@ -605,7 +708,7 @@ class EncoderService(rpc.ManagedEncoderServicer):
             embedding_backend=self.backend.encoder.transfer_backend,
             topology_contract=self.config["topology_contract"],
             receive_endpoint=self.config["receive_endpoint"],
-            capacity=self.config["max_active"],
+            capacity=self.capacity,
             tp_size=self.config["tp_size"],
             wall_time_unix_ms=int(time.time() * 1000),
             ready=not self.draining and healthy(self.config["max_clock_error_ms"]),
@@ -648,6 +751,24 @@ class EncoderService(rpc.ManagedEncoderServicer):
         )
         return entry
 
+    async def _receiver_control(self, entry, operation):
+        """Cancel only metadata/registration waits; these own no GPU or transport buffers."""
+        work = asyncio.create_task(operation)
+        cancelled = asyncio.create_task(entry.cancellation.wait())
+        try:
+            done, _ = await asyncio.wait((work, cancelled), return_when=asyncio.FIRST_COMPLETED)
+            require(
+                work in done and not entry.cancelled,
+                "native receiver control cancelled",
+                grpc.StatusCode.CANCELLED,
+            )
+            return await work
+        finally:
+            for waiter in (work, cancelled):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(work, cancelled, return_exceptions=True)
+
     async def facade(self, kind, request):
         """Native receive calls and Encode resolve the exact same E operation and buffer owner."""
         from sglang.srt.disaggregation.encoder import server as native
@@ -657,8 +778,12 @@ class EncoderService(rpc.ManagedEncoderServicer):
         if kind == "metadata":
             require(request.get("part_idx") == 0, "invalid part index")
             async with entry.refs.retain():
-                metadata = await asyncio.wait_for(
-                    native.meta_registry.wait(entry.rid), max(0, entry.deadline - time.monotonic())
+                metadata = await self._receiver_control(
+                    entry,
+                    asyncio.wait_for(
+                        native.meta_registry.wait(entry.rid),
+                        max(0, entry.deadline - time.monotonic()),
+                    ),
                 )
             require(
                 metadata and not metadata.get("error"),
@@ -733,8 +858,11 @@ class EncoderService(rpc.ManagedEncoderServicer):
             """Retain the actual send even if its HTTP response consumer disconnects."""
             async with entry.refs.retain():
                 if kind == "register":
-                    await self.backend.encoder.register_embedding_destinations(
-                        entry.rid, count, [destination]
+                    await self._receiver_control(
+                        entry,
+                        self.backend.encoder.register_embedding_destinations(
+                            entry.rid, count, [destination]
+                        ),
                     )
                 else:
                     sent = await send_staged_embedding(

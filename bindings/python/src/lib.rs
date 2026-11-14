@@ -579,6 +579,7 @@ struct Router {
     encode_urls: Option<Vec<(String, Option<u16>)>>,
     engine_metrics: bool,
     epd_disaggregation: bool,
+    sglang_managed_epd: Option<String>,
     eviction_interval_secs: u64,
     grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
@@ -1560,6 +1561,7 @@ impl Router {
             })
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
+            .sglang_managed_epd(self.sglang_managed_epd.clone())
             .igw(self.enable_igw)
             .rl(smg_rl::RlConfig {
                 enabled: self.enable_rl,
@@ -1648,6 +1650,7 @@ impl Router {
         encode_urls = None,
         engine_metrics = false,
         epd_disaggregation = false,
+        sglang_managed_epd = None,
         eviction_interval_secs = 120,
         grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
@@ -1875,6 +1878,7 @@ impl Router {
         encode_urls: Option<Vec<(String, Option<u16>)>>,
         engine_metrics: bool,
         epd_disaggregation: bool,
+        sglang_managed_epd: Option<String>,
         eviction_interval_secs: u64,
         grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
@@ -2089,7 +2093,11 @@ impl Router {
             all_urls.extend(decode_urls.clone());
         }
 
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let connection_mode = if sglang_managed_epd.is_some() {
+            worker::ConnectionMode::Grpc
+        } else {
+            Self::determine_connection_mode(&all_urls)
+        };
 
         Ok(Router {
             worker_urls,
@@ -2153,6 +2161,7 @@ impl Router {
             encode_urls,
             engine_metrics,
             epd_disaggregation,
+            sglang_managed_epd,
             eviction_interval_secs,
             grpc_request_timeout_secs,
             header_read_timeout_secs,

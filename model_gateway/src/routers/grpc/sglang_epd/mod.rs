@@ -1,7 +1,6 @@
 //! Explicit managed SGLang EPD. Legacy EPD never enters this executor.
 
 pub mod executor;
-pub mod load_tracker;
 pub mod planner;
 pub mod registry;
 pub mod router;

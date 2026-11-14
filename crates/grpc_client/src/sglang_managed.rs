@@ -4,8 +4,115 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use tonic::Status;
 
-pub mod budget;
-pub mod clock;
+pub mod budget {
+    //! Original-expiry admission and a local monotonic budget.
+
+    use std::time::{Duration, Instant};
+
+    use tonic::Status;
+
+    use super::proto;
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct Deadline {
+        expiry_unix_ms: u64,
+        local: Instant,
+    }
+
+    impl Deadline {
+        /// Remote timestamps never lengthen the caller's remaining budget.
+        pub fn admit(
+            budget: &proto::Budget,
+            wall_now_ms: u64,
+            monotonic_now: Instant,
+            clock_offset_ms: i64,
+            max_clock_skew_ms: u64,
+            max_duration_ms: u64,
+        ) -> Result<Self, Status> {
+            if clock_offset_ms.unsigned_abs() > max_clock_skew_ms {
+                return Err(Status::unavailable(
+                    "managed worker clock is outside tolerance",
+                ));
+            }
+            let remaining = budget
+                .original_expiry_unix_ms
+                .saturating_sub(wall_now_ms)
+                .min(budget.remaining_timeout_ms);
+            if remaining == 0 {
+                return Err(Status::deadline_exceeded("managed operation expired"));
+            }
+            if remaining > max_duration_ms
+                || budget.original_expiry_unix_ms.saturating_sub(wall_now_ms) > max_duration_ms
+            {
+                return Err(Status::invalid_argument(
+                    "managed deadline exceeds retention bound",
+                ));
+            }
+            let local = monotonic_now
+                .checked_add(Duration::from_millis(remaining))
+                .ok_or_else(|| Status::invalid_argument("managed deadline overflow"))?;
+            Ok(Self {
+                expiry_unix_ms: budget.original_expiry_unix_ms,
+                local,
+            })
+        }
+
+        /// Bind, query and reconnect use this same deadline, never a fresh timeout.
+        pub fn remaining(self, now: Instant) -> Result<Duration, Status> {
+            self.local
+                .checked_duration_since(now)
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| Status::deadline_exceeded("managed operation expired"))
+        }
+
+        /// Tombstones remain until the latest legitimate start could arrive.
+        pub fn expiry_unix_ms(self) -> u64 {
+            self.expiry_unix_ms
+        }
+    }
+}
+
+pub mod clock {
+    //! Read-only kernel synchronization health for absolute managed admission deadlines.
+
+    use tonic::Status;
+
+    /// Fail closed when the OS cannot bound wall-clock error; this never adjusts the clock.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "read-only adjtimex query with modes=0 and owned initialized storage"
+    )]
+    pub fn check(max_error_ms: u64) -> Result<(), Status> {
+        // SAFETY: all-zero timex has modes=0 (query only). The syscall receives writable
+        // storage of the platform libc ABI size; no pointer or storage escapes the call.
+        let (state, sample) = unsafe {
+            let mut sample: libc::timex = std::mem::zeroed();
+            let state = libc::adjtimex(&raw mut sample);
+            (state, sample)
+        };
+        if max_error_ms == 0
+            || state < 0
+            || state == libc::TIME_ERROR
+            || sample.status & libc::STA_UNSYNC != 0
+            || sample.maxerror < 0
+            || sample.maxerror as u64 > max_error_ms.saturating_mul(1000)
+        {
+            return Err(Status::unavailable(
+                "managed clock synchronization outside configured tolerance",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Managed absolute deadlines require an implemented synchronization health source.
+    #[cfg(not(target_os = "linux"))]
+    pub fn check(_max_error_ms: u64) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "managed clock health currently requires Linux",
+        ))
+    }
+}
 
 #[expect(
     clippy::allow_attributes,
@@ -219,8 +326,28 @@ pub fn validate_manifest(
                     "invalid managed image offset/padding",
                 ));
             }
+            let text_start = last_end.map_or(0, |end| end + 1);
+            if !manifest.unpadded_ids[text_start..start]
+                .iter()
+                .map(|&id| i64::from(id))
+                .eq(manifest.padded_ids[text_start..start].iter().copied())
+            {
+                return Err(Status::invalid_argument(
+                    "managed layout changed a non-image token",
+                ));
+            }
             last_end = Some(end);
         }
+    }
+    let text_start = last_end.map_or(0, |end| end + 1);
+    if !manifest.unpadded_ids[text_start..]
+        .iter()
+        .map(|&id| i64::from(id))
+        .eq(manifest.padded_ids[text_start..].iter().copied())
+    {
+        return Err(Status::invalid_argument(
+            "managed layout changed a non-image token",
+        ));
     }
     let positions = manifest
         .mrope_positions

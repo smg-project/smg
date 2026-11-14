@@ -49,6 +49,7 @@ def verify_contract(model_type, item_type, output_type, scheduler_type):
     for method in (
         "handle_generate_request",
         "_add_request_to_queue",
+        "_get_multimodal_inputs",
         "_maybe_compute_mrope_positions",
     ):
         if not callable(getattr(scheduler_type, method, None)):
@@ -215,7 +216,14 @@ def validate_layout(manifest, binding):
                 raise ValueError("invalid managed image offsets")
             if any(v not in pads for v in manifest.padded_ids[offset.start : offset.end + 1]):
                 raise ValueError("managed image sentinel mismatch")
+            if (
+                manifest.unpadded_ids[previous_end + 1 : offset.start]
+                != manifest.padded_ids[previous_end + 1 : offset.start]
+            ):
+                raise ValueError("managed layout changed a non-image token")
             previous_end = offset.end
+    if manifest.unpadded_ids[previous_end + 1 :] != manifest.padded_ids[previous_end + 1 :]:
+        raise ValueError("managed layout changed a non-image token")
 
 
 def decode_input(manifest, binding):

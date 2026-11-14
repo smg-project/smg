@@ -173,7 +173,7 @@ impl<R: NativeRuntime> ManagedService<R> {
     }
 }
 
-/// Bound native cleanup, retaining unknown ledger occupancy if the engine cannot confirm release.
+/// Keep this bounded admission owner's completion observer until native cleanup resolves.
 async fn cleanup<R: NativeRuntime>(
     runtime: &R,
     registry: &Mutex<Registry>,
@@ -181,14 +181,7 @@ async fn cleanup<R: NativeRuntime>(
     native: bool,
 ) {
     let safe = if native {
-        matches!(
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                runtime.terminate(operation.clone())
-            )
-            .await,
-            Ok(Ok(true))
-        )
+        matches!(runtime.terminate(operation.clone()).await, Ok(true))
     } else {
         true
     };
@@ -532,15 +525,19 @@ impl<R: NativeRuntime> ManagedSglang for ManagedService<R> {
             .registry
             .lock()
             .map_err(|_| Status::internal("managed registry poisoned"))?;
-        registry.ledger.cancel(
-            operation.clone(),
-            request.original_expiry_unix_ms,
-            wall_time_ms()?,
-        )?;
+        let now = wall_time_ms()?;
+        registry
+            .ledger
+            .cancel(operation.clone(), request.original_expiry_unix_ms, now)?;
         if let Some(sender) = registry.cancellation.get(&operation.operation_id) {
             let _ = sender.send(true);
         }
-        let quiesced = registry.ledger.get(&operation).is_ok_and(|r| r.quiesced);
+        let quiesced = match registry.ledger.get(&operation) {
+            Ok(record) => record.quiesced,
+            Err(error) => {
+                error.code() == tonic::Code::NotFound && request.original_expiry_unix_ms <= now
+            }
+        };
         Ok(Response::new(proto::TerminationReceipt {
             recorded: true,
             quiesced,

@@ -284,6 +284,11 @@ impl ProbeState {
         self.readiness.load_full()
     }
 
+    /// Publish readiness from the independent managed worker registry.
+    pub(crate) fn publish_managed(&self, snapshot: ReadinessSnapshot) {
+        self.readiness.store(Arc::new(snapshot));
+    }
+
     /// Re-derive the readiness snapshot from live state.
     ///
     /// This is the exact computation the `/readiness` handler used to run

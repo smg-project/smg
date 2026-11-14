@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from . import native
 
@@ -50,6 +51,9 @@ def register():
         HookType.AFTER,
     )
     if role == "prefill":
+        HookRegistry.register(
+            f"{_SCHEDULER}._get_multimodal_inputs", retain_receiver_owner, HookType.AROUND
+        )
         HookRegistry.register(f"{_SCHEDULER}._add_request_to_queue", before_queue, HookType.AROUND)
     else:
         # A metadata-only D has no legitimate processor path. Fail closed even
@@ -112,6 +116,8 @@ def initialized(result, scheduler, *args, **kwargs):
     # The existing SMG ingress determines actual I/O ownership, including nonzero DP ranks.
     from smg_grpc_servicer.sglang.zmq_plugin import _state
 
+    if _state.sender is not None:
+        _state.sender.managed_native_receipts = True
     if os.environ[ROLE_ENV] == "prefill" and _state.sender is not None:
         import zmq
 
@@ -147,52 +153,88 @@ def _envelope(req):
 
 def prepare_request(original, scheduler, recv_req, *args, **kwargs):
     """Apply only validated D metadata before the native handler; no placeholder Generate."""
-    envelope, binding = _envelope(recv_req)
-    if envelope["role"] == "prefill":
-        recv_req.mm_routing_labels = {"image": list(binding.media_routing_labels)}
-    if envelope["role"] == "decode" and envelope.get("manifest"):
-        raw = envelope["manifest"]
-        if len(raw) > native.MAX_MANIFEST_BYTES * 2:
-            raise ValueError("managed manifest exceeds byte bound")
-        manifest = native._proto().PreparedDecodeInput()
-        manifest.ParseFromString(bytes.fromhex(raw))
-        if recv_req.mm_inputs is not None or recv_req.need_wait_for_mm_inputs:
-            raise ValueError("managed D refuses raw media or encoder dispatch")
-        recv_req.mm_inputs = native.decode_input(manifest, binding)
-        recv_req.input_ids = list(manifest.unpadded_ids)
-        recv_req.input_text = None
-        logging.getLogger(__name__).info(
-            "managed D metadata bound rid=%s room=%s images=%s digest=%s",
-            recv_req.rid,
-            binding.bootstrap.room,
-            len(manifest.images),
-            manifest.integrity_digest.hex(),
-        )
+    try:
+        envelope, binding = _envelope(recv_req)
+        if envelope["role"] == "prefill":
+            recv_req.mm_routing_labels = {"image": list(binding.media_routing_labels)}
+        if envelope["role"] == "decode" and envelope.get("manifest"):
+            raw = envelope["manifest"]
+            if len(raw) > native.MAX_MANIFEST_BYTES * 2:
+                raise ValueError("managed manifest exceeds byte bound")
+            manifest = native._proto().PreparedDecodeInput()
+            manifest.ParseFromString(bytes.fromhex(raw))
+            if recv_req.mm_inputs is not None or recv_req.need_wait_for_mm_inputs:
+                raise ValueError("managed D refuses raw media or encoder dispatch")
+            recv_req.mm_inputs = native.decode_input(manifest, binding)
+            recv_req.input_ids = list(manifest.unpadded_ids)
+            recv_req.input_text = None
+            logging.getLogger(__name__).info(
+                "managed D metadata bound rid=%s room=%s images=%s digest=%s",
+                recv_req.rid,
+                binding.bootstrap.room,
+                len(manifest.images),
+                manifest.integrity_digest.hex(),
+            )
+    except Exception as error:
+        # Native intake retires this unadmitted request on every TP rank and
+        # emits the existing abort response; no GPU work or raw-media fallback.
+        logging.getLogger(__name__).warning("managed input refused rid=%s: %s", recv_req.rid, error)
+        kwargs["mm_input_error"] = f"managed input refused: {error}"
     return original(scheduler, recv_req, *args, **kwargs)
+
+
+def retain_receiver_owner(original, scheduler, received, *args, **kwargs):
+    """Keep native pool ownership alive with the normalized P input, without copying embeddings."""
+    prepared = original(scheduler, received, *args, **kwargs)
+    if prepared is not None and prepared is not received:
+        # Native pool release is tied to the processor output's GC, while normalization
+        # retains only its tensor views. P owns that output until its input is retired.
+        # Attach after native TP processing so the local owner never enters a collective.
+        prepared._smg_managed_receiver_owner = received
+    return prepared
 
 
 def before_queue(original, scheduler, req, *args, **kwargs):
     """Export once after receiver/TP/layout preparation and before native PD bootstrap."""
     if req.to_finish is not None or getattr(req, "_smg_managed_exported", False):
         return original(scheduler, req, *args, **kwargs)
-    envelope, binding = _envelope(req)
-    if envelope.get("text_only"):
+    try:
+        envelope, binding = _envelope(req)
+        if envelope.get("text_only"):
+            return original(scheduler, req, *args, **kwargs)
+        # Deterministic validation on all ranks; no new TP collective or embedding copy.
+        export_started = time.monotonic_ns()
+        manifest = native.export_layout(req, binding)
+        export_us = (time.monotonic_ns() - export_started) // 1000
+    except Exception as error:
+        req.set_finish_with_abort(f"managed layout refused: {error}")
         return original(scheduler, req, *args, **kwargs)
-    # Validate on every rank, without adding a TP collective or copying embeddings.
-    manifest = native.export_layout(req, binding)
     req._smg_managed_exported = True
     if _sender is not None:
         import zmq
 
-        # A full/broken output channel is a worker error, never a silently lost layout.
-        _sender.send_multipart(
-            [req.rid.encode(), manifest.SerializeToString(deterministic=True)], flags=zmq.NOBLOCK
-        )
+        publish_started = time.monotonic_ns()
+        try:
+            _sender.send_multipart(
+                [req.rid.encode(), manifest.SerializeToString(deterministic=True)],
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.ZMQError:
+            # Do not abort only the I/O rank or crash its unrelated requests.
+            # No manifest reaches D: the existing bounded managed deadline
+            # orders native Abort through the normal TP-synchronized ingress.
+            logging.getLogger(__name__).exception(
+                "managed metadata publication failed rid=%s", req.rid
+            )
+            return original(scheduler, req, *args, **kwargs)
         logging.getLogger(__name__).info(
-            "managed P metadata exported before bootstrap rid=%s room=%s images=%s digest=%s",
+            "managed P metadata exported before bootstrap rid=%s room=%s images=%s digest=%s "
+            "layout_export_us=%s metadata_publish_us=%s",
             req.rid,
             binding.bootstrap.room,
             len(manifest.images),
             manifest.integrity_digest.hex(),
+            export_us,
+            (time.monotonic_ns() - publish_started) // 1000,
         )
     return original(scheduler, req, *args, **kwargs)

@@ -256,7 +256,21 @@ impl NativeRuntime for ManagedNativeRuntime {
         };
         let result = self.submit(operation, binding, generation, None, manifest, deadline);
         Box::pin(async move {
-            let stream = result?.filter_map(|event| async move {
+            let mut stream = result?;
+            // Registration of the owner is not native submission. Wait for the
+            // ordered transport write; dropping this wait never drops that owner.
+            let submitted =
+                tokio::time::timeout(deadline.remaining(Instant::now())?, stream.next())
+                    .await
+                    .map_err(|_| Status::deadline_exceeded("native D submission expired"))?
+                    .ok_or_else(|| Status::cancelled("native D closed before submission"))??;
+            if !matches!(submitted.event, Some(proto::control_event::Event::Stage(stage)) if stage == proto::Stage::NativeSubmitted as i32)
+            {
+                return Err(Status::data_loss(
+                    "native D output preceded submission acknowledgement",
+                ));
+            }
+            let stream = stream.filter_map(|event| async move {
                 match event {
                     Ok(proto::ControlEvent {
                         event: Some(proto::control_event::Event::Generation(value)),
@@ -277,19 +291,23 @@ impl NativeRuntime for ManagedNativeRuntime {
                 .entries
                 .lock()
                 .map_err(|_| Status::internal("native registry poisoned"))?;
-            let entry = entries
-                .get(&operation.operation_id)
-                .ok_or_else(|| Status::not_found("native operation not registered"))?;
+            // This owner registers synchronously before sending, and only collects
+            // confirmed terminal entries. Absence therefore proves no live native owner.
+            let Some(entry) = entries.get(&operation.operation_id) else {
+                return Ok(None);
+            };
             if entry.operation != operation {
                 return Err(Status::failed_precondition(
                     "native operation fence mismatch",
                 ));
             }
             let _ = entry.cancel.send(true);
-            Ok(entry.completion.clone())
+            Ok(Some(entry.completion.clone()))
         })();
         Box::pin(async move {
-            let mut completion = result?;
+            let Some(mut completion) = result? else {
+                return Ok(true);
+            };
             loop {
                 if let Some(safe) = *completion.borrow_and_update() {
                     return Ok(safe);
@@ -329,8 +347,16 @@ async fn run_native(
     {
         Ok(stream) => stream,
         Err(error) => {
+            // These refusals originate in adapter validation before client.submit.
+            // Transport failures stay unknown because a write may have reached native.
+            let unsubmitted = matches!(
+                error.code(),
+                tonic::Code::InvalidArgument
+                    | tonic::Code::FailedPrecondition
+                    | tonic::Code::Unimplemented
+            );
             let _ = output.try_send(Err(error));
-            return false;
+            return unsubmitted;
         }
     };
     let rid = native.request_id().to_owned();
@@ -338,7 +364,19 @@ async fn run_native(
     let mut aborting = false;
     let mut abort_until = Instant::now();
     let mut layout_sent = false;
-    let mut stalled = false;
+    // This event acknowledges the actual Generate write, not task creation or GPU execution.
+    let mut stalled = !send_owned_event(
+        output,
+        proto::ControlEvent {
+            event: Some(proto::control_event::Event::Stage(
+                proto::Stage::NativeSubmitted as i32,
+            )),
+            ..Default::default()
+        },
+        &mut cancel,
+        &deadline,
+    )
+    .await;
     let needs_layout = external.as_ref().is_some_and(|plan| !plan.parts.is_empty());
     let mut native_finished = false;
     loop {
@@ -362,7 +400,10 @@ async fn run_native(
                 .await,
                 Ok(Ok(()))
             ) {
-                return false;
+                tracing::warn!(
+                    rid,
+                    "managed Abort write unconfirmed; retaining native terminal observer"
+                );
             }
         }
         let remaining = if aborting {
@@ -374,11 +415,18 @@ async fn run_native(
             biased;
             _ = cancel.changed(), if !aborting => {}
             () = output.closed(), if !aborting => {}
-            () = tokio::time::sleep(remaining) => { if aborting { return false; } }
+            () = tokio::time::sleep(remaining) => {
+                if aborting {
+                    // Keep the bounded native registration: a late terminal output
+                    // must still release admission, without replaying Generate/Abort.
+                    tracing::warn!(rid, "managed native abort acknowledgement still pending");
+                    abort_until = Instant::now() + Duration::from_secs(30);
+                }
+            }
             layout = layouts.recv(), if needs_layout && !layout_sent && !aborting => {
                 if let Some(layout) = layout {
                     layout_sent = true;
-                    if output.try_send(Ok(proto::ControlEvent { event: Some(proto::control_event::Event::MediaPrepared(layout)), ..Default::default() })).is_err() {
+                    if !send_owned_event(output, proto::ControlEvent { event: Some(proto::control_event::Event::MediaPrepared(layout)), ..Default::default() }, &mut cancel, &deadline).await {
                         // Force the owned task into ordered abort without releasing its stream.
                         let _ = output.try_send(Err(Status::resource_exhausted("managed output stalled")));
                         stalled = true;
@@ -391,7 +439,7 @@ async fn run_native(
                 match item {
                     Some(Ok(response)) if !aborting => {
                         let response = native.to_sglang_response(&rid, response);
-                        if output.try_send(Ok(proto::ControlEvent { event: Some(proto::control_event::Event::Generation(response)), ..Default::default() })).is_err() {
+                        if !send_owned_event(output, proto::ControlEvent { event: Some(proto::control_event::Event::Generation(response)), ..Default::default() }, &mut cancel, &deadline).await {
                             stalled = true;
                         }
                     }
@@ -405,6 +453,27 @@ async fn run_native(
     }
 }
 
+/// Backpressure transient output bursts while preserving cancellation and the original deadline.
+async fn send_owned_event(
+    output: &mpsc::Sender<Result<proto::ControlEvent, Status>>,
+    event: proto::ControlEvent,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: &Deadline,
+) -> bool {
+    if *cancel.borrow() {
+        return false;
+    }
+    let Ok(remaining) = deadline.remaining(Instant::now()) else {
+        return false;
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => false,
+        () = tokio::time::sleep(remaining) => false,
+        result = output.send(Ok(event)) => result.is_ok(),
+    }
+}
+
 /// Reject clocks outside the wire timestamp range instead of wrapping expiry.
 fn wall_time_ms() -> Result<u64, Status> {
     u64::try_from(
@@ -414,4 +483,58 @@ fn wall_time_ms() -> Result<u64, Status> {
             .as_millis(),
     )
     .map_err(|_| Status::unavailable("native clock overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transiently full channel waits for its consumer; cancellation still interrupts that wait.
+    #[tokio::test]
+    async fn output_burst_backpressures_without_cancelling_native_work() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(proto::ControlEvent::default()))
+            .await
+            .unwrap();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let deadline = Deadline::admit(
+            &proto::Budget {
+                original_expiry_unix_ms: 2000,
+                remaining_timeout_ms: 1000,
+                ..Default::default()
+            },
+            1000,
+            Instant::now(),
+            0,
+            0,
+            1000,
+        )
+        .unwrap();
+        let pending = send_owned_event(
+            &sender,
+            proto::ControlEvent::default(),
+            &mut cancelled,
+            &deadline,
+        );
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(receiver.recv().await.is_some());
+        assert!(pending.await);
+        let mut cancelled = cancel.subscribe();
+        cancel.send(true).unwrap();
+        assert!(
+            !send_owned_event(
+                &sender,
+                proto::ControlEvent::default(),
+                &mut cancelled,
+                &deadline
+            )
+            .await
+        );
+    }
 }
