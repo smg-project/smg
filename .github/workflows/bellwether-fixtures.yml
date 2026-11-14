@@ -71,12 +71,17 @@ on:
 permissions:
   contents: read
 
-# One group per pull request and one per branch: a newer push cancels the
-# superseded run. Keep the pull request form in sync with
+# One group per pull request and one per branch. A pull request's newer push
+# cancels its superseded run. A run on a branch (a push to `main`, a
+# dispatch) runs to its end: the run on `main` is the one that saves the
+# tokenizer files, once its tests passed, and a run that finds no entry
+# fetches every file first, for longer than the time between two pushes to
+# `main`. The newest push waits behind the run in progress, and a later push
+# takes the waiting run's place. Keep the pull request form in sync with
 # cancel-pr-workflows.yml.
 concurrency:
   group: bellwether-fixtures-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fixture-tests:
