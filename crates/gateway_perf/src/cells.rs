@@ -448,6 +448,21 @@ pub fn per_request(c: &CellRecord, idle: Option<&CellRecord>) -> BTreeMap<String
     let kb = |key: &str| c.status_1.get(key).copied().unwrap_or(0) as f64 / 1024.0;
     out.insert("rss_mb_after_window".to_string(), kb("VmRSS"));
     out.insert("hwm_mb".to_string(), kb("VmHWM"));
+    // The anonymous and the file part of the resident set, where the kernel reports them
+    // (the whole set is these two and shared memory). The anonymous part is what the
+    // gateway allocated. The file part is the file pages the kernel has mapped, mostly
+    // the gateway's own binary (and its shared libraries): a fault maps the cached
+    // neighbours inside the 64 KB window around it, so the part follows how much of the
+    // measured file is cached and where the linker put the code that runs, and two
+    // copies of one binary read apart. The gate judges the anonymous part.
+    for (field, metric) in [
+        ("RssAnon", "rss_anon_mb_after_window"),
+        ("RssFile", "rss_file_mb_after_window"),
+    ] {
+        if let Some(kib) = c.status_1.get(field) {
+            out.insert(metric.to_string(), *kib as f64 / 1024.0);
+        }
+    }
     let perf_per_request = |key: &str, divisor: f64| {
         c.perf
             .get(key)
@@ -1235,6 +1250,22 @@ pub(crate) mod tests {
         assert!(close(r["cpu_us_per_request"], 700.0));
         cell.sent = 0;
         assert!(per_request(&cell, None).is_empty());
+    }
+
+    #[test]
+    fn the_resident_set_is_reported_whole_and_in_its_anonymous_and_file_parts() {
+        let mut cell = loaded_cell("base", "r1");
+        cell.status_1.insert("RssAnon".to_string(), 40_960);
+        cell.status_1.insert("RssFile".to_string(), 61_440);
+        let r = per_request(&cell, None);
+        assert_eq!(r["rss_mb_after_window"], 100.0);
+        assert_eq!(r["rss_anon_mb_after_window"], 40.0);
+        assert_eq!(r["rss_file_mb_after_window"], 60.0);
+        // One part alone is reported alone: a missing part is no zero.
+        cell.status_1.remove("RssFile");
+        let r = per_request(&cell, None);
+        assert_eq!(r["rss_anon_mb_after_window"], 40.0);
+        assert!(!r.contains_key("rss_file_mb_after_window"));
     }
 
     #[test]
