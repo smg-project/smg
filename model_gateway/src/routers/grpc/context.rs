@@ -113,7 +113,21 @@ pub(crate) enum RequestType {
     },
 }
 
+fn openai_response_model(model: &str, adapter: Option<&str>) -> String {
+    adapter.map_or_else(|| model.to_string(), |adapter| format!("{model}:{adapter}"))
+}
+
 impl RequestType {
+    /// Adapter selection forwarded by the SGLang gRPC request builders.
+    pub fn lora_adapter(&self) -> Option<&str> {
+        match self {
+            Self::Chat(request) => request.lora_path.as_deref(),
+            Self::Generate(request) => request.lora_path.as_deref().or(request.lora_id.as_deref()),
+            Self::Completion(request) => request.lora_path.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Overwrite the request's own `model` field.
     ///
     /// `Arc::make_mut` copies the request when another handle is still
@@ -1155,8 +1169,10 @@ impl RequestContext {
         // name. Native `/generate` callers may leave the field empty, so
         // prefer the resolved id there.
         let dispatch_model = match &request_type {
-            RequestType::Chat(req) => req.model.clone(),
-            RequestType::Completion(req) => req.model.clone(),
+            RequestType::Chat(req) => openai_response_model(&req.model, req.lora_path.as_deref()),
+            RequestType::Completion(req) => {
+                openai_response_model(&req.model, req.lora_path.as_deref())
+            }
             RequestType::Generate(_) => model_id.clone(),
             RequestType::Responses(req) => req.model.clone(),
             RequestType::Embedding(req) => req.model.clone(),

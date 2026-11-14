@@ -36,8 +36,8 @@ use crate::{
     },
     encode_path::{self, EncodePath},
     encoders::{
-        deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, marks,
-        PromptSegment, RendererProfile, TemplateAnswers,
+        deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, inkling2,
+        marks, PromptSegment, RendererProfile, TemplateAnswers,
     },
     native::{Added, AddedTokens, NativeEncoder},
     token_text::TokenTextTable,
@@ -59,6 +59,7 @@ enum Renderer {
     DeepseekV4,
     DeepseekV41(deepseek_v41::EffortTable),
     Glm53(glm53::Template),
+    Inkling2,
 }
 
 impl Renderer {
@@ -71,6 +72,7 @@ impl Renderer {
             Self::DeepseekV32 => Some(deepseek_v32::PROFILE),
             Self::DeepseekV4 => Some(deepseek_v4::PROFILE),
             Self::DeepseekV41(_) => Some(deepseek_v41::PROFILE),
+            Self::Inkling2 => Some(inkling2::PROFILE),
         }
     }
 }
@@ -871,6 +873,17 @@ impl HuggingFaceTokenizer {
             .parent()
             .map(|dir| detect_renderer_from_config(dir, chat_template_str.is_some()))
             .unwrap_or(Renderer::Jinja);
+
+        if matches!(renderer, Renderer::Inkling2) {
+            let added = tokenizer.get_added_tokens_decoder();
+            for &(token, id) in inkling2::SPECIAL_TOKENS {
+                if tokenizer.token_to_id(token) != Some(id)
+                    || !added.get(&id).is_some_and(|token| token.special)
+                {
+                    anyhow::bail!("Inkling2 requires checkpoint special token {token} at ID {id}");
+                }
+            }
+        }
 
         let mut encoders = DirectEncoders::choose(&tokenizer);
         // The bound rides on the file's model into the built tokenizer: no
@@ -2292,8 +2305,8 @@ impl HuggingFaceTokenizer {
             // The template compiled marked: whether it continued the final
             // message comes with the render.
             Renderer::Jinja if self.chat_template.marked() => self.apply_jinja(messages, params),
-            Renderer::Jinja | Renderer::Glm53(_) => Err(Error::msg(
-                "the Jinja and GLM renderers render no marked prompt",
+            Renderer::Jinja | Renderer::Glm53(_) | Renderer::Inkling2 => Err(Error::msg(
+                "the Jinja, GLM and Inkling2 renderers render no marked prompt",
             )),
             Renderer::DeepseekV32 => {
                 apply_deepseek_v32(messages, &params).map(|marked| (marked, false))
@@ -2334,7 +2347,7 @@ impl HuggingFaceTokenizer {
             // The template's header is the flag it rendered under.
             Renderer::Jinja => generation_prompt_unless_continued && !continued_final_message,
             // No marked prompt: `render_marked` refused above.
-            Renderer::Glm53(_) => false,
+            Renderer::Glm53(_) | Renderer::Inkling2 => false,
         };
         if let Some(prefix) = assistant_prefix {
             // Request text: a mark a client wrote into it is no mark.
@@ -2361,6 +2374,43 @@ impl HuggingFaceTokenizer {
 }
 
 impl HuggingFaceTokenizer {
+    /// The Inkling2 prompt, encoded by its typed segments: each structural
+    /// token as its checkpoint ID, each text payload as ordinary text in which
+    /// a structural spelling stays text. The returned text is diagnostic only:
+    /// a flat re-encode cannot tell caller text from structural tokens.
+    fn apply_inkling2_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        let continued_final_message =
+            inkling2::continues_final_message(messages, &params, assistant_prefix)?;
+        let segments = inkling2::render(messages, &params, assistant_prefix)?;
+        let text = segments.iter().map(inkling2::Segment::text).collect();
+        // Text payloads always sit between two structural tokens, so the
+        // segment encode never joins two payloads into one text.
+        let segments: Vec<PromptSegment> = segments
+            .into_iter()
+            .map(|segment| match segment {
+                inkling2::Segment::Special(text, _) => PromptSegment::control(text),
+                inkling2::Segment::Text(text) => PromptSegment::text(text),
+            })
+            .collect();
+        let core = Arc::clone(&self.core);
+        Ok(ChatTemplateOutput {
+            text,
+            encoding: PromptEncoding::Deferred(EncodeJob::new(move || {
+                core.encode_segments(&segments).map(Encoding::Plain)
+            })),
+            unbilled_prompt_tokens: 0,
+            continued_final_message,
+            // The renderer writes no generation header: every rendered prompt
+            // is ready for generation unless it continues the final message.
+            generation_prompt: !continued_final_message,
+        })
+    }
+
     /// The template questions, answered by the profile or by the template.
     fn template_answers(&self) -> TemplateAnswers<'_> {
         TemplateAnswers {
@@ -2435,6 +2485,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             Renderer::Glm53(template) => self
                 .apply_glm53(messages, params, template)
                 .map(|(text, _)| text),
+            Renderer::Inkling2 => Ok(inkling2::render(messages, &params, None)?
+                .iter()
+                .map(inkling2::Segment::text)
+                .collect()),
             _ => self
                 .render_marked(messages, params)
                 .map(|(marked, _)| marks::strip(&marked).into_owned()),
@@ -2467,6 +2521,9 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 self.apply_jinja(messages, params)?
             }
             Renderer::Glm53(template) => self.apply_glm53(messages, params, template)?,
+            Renderer::Inkling2 => {
+                return self.apply_inkling2_with_encoding(messages, params, assistant_prefix)
+            }
             _ => return self.apply_marked_with_encoding(messages, params, assistant_prefix),
         };
         if let Some(prefix) = assistant_prefix {
@@ -2629,6 +2686,10 @@ fn detect_renderer_from_config(dir: &Path, has_chat_template: bool) -> Renderer 
     // Checked before the V4 arm below: V4.1 ships its own architecture name,
     // but some checkpoints identify themselves only via `model_type`.
     let model_type = value.get("model_type").and_then(|v| v.as_str());
+    if arch_strs.contains(&"Inkling2ForConditionalGeneration") || model_type == Some("inkling2") {
+        debug!(?path, "selected Inkling2 typed renderer");
+        return Renderer::Inkling2;
+    }
     if arch_strs.contains(&"DeepseekV41ForCausalLM") || model_type == Some("deepseek_v41") {
         let table = detect_dsv41_effort_table(dir);
         debug!(?path, ?table, "selected DeepseekV41 chat-template renderer");

@@ -677,8 +677,9 @@ async fn stream_mcp_call(
     );
 
     // Emit output_item.added
-    let event = emitter.emit_output_item_added(output_index, &item);
-    emitter.send_event(&event, tx).await?;
+    emitter
+        .send_output_item_added(output_index, &item, tx)
+        .await?;
 
     // Emit tool_call.in_progress
     let event = emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
@@ -753,7 +754,7 @@ async fn stream_mcp_call(
     // that follow, so a client who left during the call changes neither the
     // record nor the counts; `output_item.done` is still sent after the
     // completion event, in order.
-    emitter.store_output_item_data(output_index, item_done.clone());
+    emitter.keep_output_item(output_index, item_done);
     emitter.complete_output_item(output_index);
     let failure = (!success).then(|| {
         tool_output
@@ -783,8 +784,7 @@ async fn stream_mcp_call(
         emitter.send_event(&event, tx).await?;
     }
 
-    let event = emitter.emit_output_item_done(output_index, &item_done);
-    emitter.send_event(&event, tx).await?;
+    emitter.send_kept_output_item_done(output_index, tx).await?;
     Ok(())
 }
 

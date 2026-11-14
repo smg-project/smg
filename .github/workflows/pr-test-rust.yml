@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main, release/** ]
     paths-ignore:
-      - "docs/**"
       - "*.md"
   pull_request:
     branches: [ main, release/** ]
@@ -960,6 +959,13 @@ jobs:
               - 'crates/mm_rdma/**'
               - 'crates/policy_controller/**'
               - 'crates/radix_tree/**'
+              - 'crates/grpc_client/**'
+              - 'crates/engine_zmq_client/**'
+              - 'crates/engine_zmq_adapter/**'
+              - 'crates/engine_servicer/**'
+              - 'crates/mock_worker/**'
+              - 'crates/protocols/**'
+              - 'crates/tokenizer/**'
             rust-radix:
               - *rust-infra
               - 'crates/radix_tree/**'
@@ -1114,7 +1120,6 @@ jobs:
               # documentation, licences, assets, lint and format configuration
               ("**/*.md",                                        NONE),
               ("**/LICENSE",                                     NONE),
-              ("docs/**",                                        NONE),
               ("assets/**",                                      NONE),
               (".gitignore",                                     NONE),
               (".dockerignore",                                  NONE),
@@ -1260,9 +1265,11 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
-              # the policy controller crate: linked by no binary yet (its gateway host is
-              # a later change, which moves this row to the core)
-              ("crates/policy_controller/**",                    NONE),
+              # the policy controller crate: linked by the gateway (the placement and
+              # selection types on every request, the load monitor's scrape reading); its
+              # engine decides behind --policy-engine engine alone, which no lane sets:
+              # the core
+              ("crates/policy_controller/**",                    CORE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path
