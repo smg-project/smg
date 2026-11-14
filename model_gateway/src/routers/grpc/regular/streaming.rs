@@ -2067,7 +2067,6 @@ impl StreamingProcessor {
         flushed: Option<String>,
         finish: EngineFinish,
         who: Who<'_>,
-        thinking_text: bool,
         thinking_tokens: &mut u32,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut events: Events<'_> = std::mem::take(spare);
@@ -2076,22 +2075,16 @@ impl StreamingProcessor {
         }
         reader.end(finish, who, &mut events)?;
         *thinking_tokens += reasoning_text_tokens(events.as_slice());
-        let stop = Self::send_symphony_blocks(
-            tx,
-            buffer,
-            (machine, blocks),
-            events.as_slice(),
-            thinking_text,
-        )
-        .await;
+        let stop =
+            Self::send_symphony_blocks(tx, buffer, (machine, blocks), events.as_slice()).await;
         *spare = events.recycle();
         stop
     }
 
     /// Feeds Symphony's `events` to the content-block `machine` and writes the stream events it
-    /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
-    /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
-    /// when a `Finish` was among the events. The machine writes into the stream's `blocks`
+    /// gives, in order (the machine knows the request's `thinking.display`: under `omitted` it
+    /// keeps the thinking block, its start, its signature and its stop, and no text); the stop
+    /// reason when a `Finish` was among the events. The machine writes into the stream's `blocks`
     /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
     /// A step that is one text delta into the open text block, the steady state of a streamed
     /// answer, goes straight from the borrowed text into the buffer ([`Self::write_text_delta`])
@@ -2102,7 +2095,6 @@ impl StreamingProcessor {
         buffer: &mut BytesMut,
         (machine, blocks): (&mut adapt::messages::Stream, &mut Vec<MessageStreamEvent>),
         events: &[Event<'_>],
-        thinking_text: bool,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         if let [Event::Content(text)] = events {
             if let Some(index) = machine.direct_text_index(&text.text) {
@@ -2116,16 +2108,6 @@ impl StreamingProcessor {
             stop = machine.feed(event, blocks).or(stop);
         }
         for block in blocks.iter() {
-            let thinking_delta = matches!(
-                block,
-                MessageStreamEvent::ContentBlockDelta {
-                    delta: ContentBlockDelta::ThinkingDelta { .. },
-                    ..
-                }
-            );
-            if thinking_delta && !thinking_text {
-                continue;
-            }
             Self::write_messages_event(tx, buffer, block).await?;
         }
         Ok(stop)
@@ -2197,13 +2179,15 @@ impl StreamingProcessor {
             .map_err(|()| "Client disconnected".to_string())
     }
 
-    /// Stop the open content block, if any, so the next block gets the next
-    /// index: reasoning, text and tool calls can alternate.
+    /// Stop the open text or `tool_use` block, if any, so the next block gets
+    /// the next index: reasoning, text and tool calls can alternate. A
+    /// thinking block closes through [`ContentBlocks::stop_open`], with its
+    /// signature.
     async fn stop_open_block(
         tx: &SseSender,
         buffer: &mut BytesMut,
         index: &mut u32,
-        open: [&mut bool; 3],
+        open: [&mut bool; 2],
     ) -> Result<(), String> {
         if open
             .into_iter()
@@ -4665,23 +4649,45 @@ struct ContentBlocks {
     thinking_open: bool,
     text_open: bool,
     tool_open: bool,
+    /// The request's `thinking.display` withholds the thinking text
+    /// (`omitted`): a thinking block closes with one empty `thinking_delta`
+    /// before its signature.
+    thinking_text_withheld: bool,
 }
 
 impl ContentBlocks {
+    /// The machine of a stream whose display withholds the thinking text
+    /// when `thinking_text_withheld`.
+    fn new(thinking_text_withheld: bool) -> Self {
+        Self {
+            thinking_text_withheld,
+            ..Self::default()
+        }
+    }
+
     /// Stop the open content block, if any, so the next block gets the next
-    /// index.
+    /// index. The one exit of a thinking block: it closes as the public API
+    /// closes one ([`MessageStreamEvent::thinking_block_close`]), the
+    /// signature just before the stop, and one empty `thinking_delta` first
+    /// when the display withheld the text.
     async fn stop_open(&mut self, tx: &SseSender, buffer: &mut BytesMut) -> Result<(), String> {
-        StreamingProcessor::stop_open_block(
-            tx,
-            buffer,
-            &mut self.index,
-            [
-                &mut self.thinking_open,
-                &mut self.text_open,
-                &mut self.tool_open,
-            ],
-        )
-        .await
+        if std::mem::take(&mut self.thinking_open) {
+            for event in
+                MessageStreamEvent::thinking_block_close(self.index, self.thinking_text_withheld)
+            {
+                StreamingProcessor::write_messages_event(tx, buffer, &event).await?;
+            }
+            self.index += 1;
+            Ok(())
+        } else {
+            StreamingProcessor::stop_open_block(
+                tx,
+                buffer,
+                &mut self.index,
+                [&mut self.text_open, &mut self.tool_open],
+            )
+            .await
+        }
     }
 
     /// Start `content_block` at the current index, after stopping the open
@@ -5020,7 +5026,16 @@ impl<'a> MessagesStream<'a> {
                     .map(|reader| reader.first_call_only(spec.first_tool_call_only))
             })
             .transpose()?
-            .map(|reader| (reader, adapt::messages::Stream::new()));
+            .map(|reader| {
+                let machine = adapt::messages::Stream::new();
+                let machine = if spec.thinking_text_returned {
+                    machine
+                } else {
+                    machine.withholding_thinking_text()
+                };
+                (reader, machine)
+            });
+        let blocks = ContentBlocks::new(!spec.thinking_text_returned);
 
         Ok(Self {
             processor,
@@ -5032,7 +5047,7 @@ impl<'a> MessagesStream<'a> {
             first_token_time: None,
             first_token_out: false,
             sse_buffer: BytesMut::with_capacity(MESSAGES_FIRST_BLOCK),
-            blocks: ContentBlocks::default(),
+            blocks,
             has_tool_calls: false,
             reasoning_parser: None,
             streaming_tool_parser,
@@ -5280,7 +5295,6 @@ impl<'a> MessagesStream<'a> {
                 &mut self.sse_buffer,
                 (machine, &mut self.machine_blocks),
                 events.as_slice(),
-                self.spec.thinking_text_returned,
             )
             .await?
             .or_else(|| self.symphony_stop.take());
@@ -5366,7 +5380,6 @@ impl<'a> MessagesStream<'a> {
                     model: &self.dispatch.model,
                     choice: 0,
                 },
-                self.spec.thinking_text_returned,
                 &mut self.parsed_thinking_tokens,
             )
             .await?
@@ -5422,7 +5435,6 @@ impl<'a> MessagesStream<'a> {
                     model: &self.dispatch.model,
                     choice: 0,
                 },
-                self.spec.thinking_text_returned,
                 &mut self.parsed_thinking_tokens,
             )
             .await?
@@ -5500,16 +5512,7 @@ impl<'a> MessagesStream<'a> {
 
         // Transition: reasoning ended, close thinking block
         if self.blocks.thinking_open && !in_reasoning && !normal_text.is_empty() {
-            StreamingProcessor::write_messages_event(
-                self.tx,
-                &mut self.sse_buffer,
-                &MessageStreamEvent::ContentBlockStop {
-                    index: self.blocks.index,
-                },
-            )
-            .await?;
-            self.blocks.thinking_open = false;
-            self.blocks.index += 1;
+            self.blocks.stop_open(self.tx, &mut self.sse_buffer).await?;
         }
 
         // Tool call handling: incremental streaming parser
@@ -5676,15 +5679,7 @@ impl<'a> MessagesStream<'a> {
     /// Phase 3.5: close any open content blocks.
     async fn close_open_blocks(&mut self) -> Result<(), utils::StreamFailure> {
         if self.blocks.thinking_open {
-            StreamingProcessor::write_messages_event(
-                self.tx,
-                &mut self.sse_buffer,
-                &MessageStreamEvent::ContentBlockStop {
-                    index: self.blocks.index,
-                },
-            )
-            .await?;
-            self.blocks.index += 1;
+            self.blocks.stop_open(self.tx, &mut self.sse_buffer).await?;
         }
 
         if self.blocks.text_open {
