@@ -136,14 +136,19 @@ pub enum MessageThread {
 /// The betas a Messages request names in its `anthropic-beta` header, read
 /// once per request. The public API names a beta in its dated form,
 /// `name-YYYY-MM-DD`; the header may repeat, and each value may list several
-/// betas, comma separated. The set keeps the names: the rules that read it
-/// ([`validate_with_betas`]) ask whether a beta is named, and the request's
-/// raw headers reach the backend unchanged, dates and all. A token without
-/// the dated suffix names no beta, and a longer name that begins with a
-/// known one is another beta, not that one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// betas, comma separated. The set keeps the two betas the request rules
+/// ([`validate_with_betas`]) read, as flags filled in one pass over the
+/// values (no allocation per request); the request's raw headers reach the
+/// backend unchanged, dates and all, and another name is asked of the raw
+/// values through [`MessagesBetas::values_name`]. A token without the dated
+/// suffix names no beta, and a longer name that begins with a known one is
+/// another beta, not that one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MessagesBetas {
-    names: Vec<String>,
+    /// `interleaved-thinking` is named.
+    interleaved_thinking: bool,
+    /// `message-threads` is named.
+    message_threads: bool,
 }
 
 impl MessagesBetas {
@@ -154,30 +159,31 @@ impl MessagesBetas {
 
     /// The set named by the header's values, each a comma-separated list.
     pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
-        Self {
-            names: dated_beta_names(values).map(str::to_owned).collect(),
+        let mut betas = Self::default();
+        for name in dated_beta_names(values) {
+            match name {
+                Self::INTERLEAVED_THINKING => betas.interleaved_thinking = true,
+                Self::MESSAGE_THREADS => betas.message_threads = true,
+                _ => {}
+            }
         }
+        betas
     }
 
-    /// Whether the header's values name `name` in its dated form, read
-    /// without building the set.
+    /// Whether the header's values name `name` in its dated form: the
+    /// reading for a name the set does not keep.
     pub fn values_name<'a>(values: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
         dated_beta_names(values).any(|named| named == name)
     }
 
-    /// Whether the request names the beta `name`.
-    pub fn names(&self, name: &str) -> bool {
-        self.names.iter().any(|named| named == name)
-    }
-
     /// Whether the interleaved-thinking beta is named.
-    pub fn interleaved_thinking(&self) -> bool {
-        self.names(Self::INTERLEAVED_THINKING)
+    pub fn interleaved_thinking(self) -> bool {
+        self.interleaved_thinking
     }
 
     /// Whether the message-threads beta is named.
-    pub fn message_threads(&self) -> bool {
-        self.names(Self::MESSAGE_THREADS)
+    pub fn message_threads(self) -> bool {
+        self.message_threads
     }
 }
 
