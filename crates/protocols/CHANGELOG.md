@@ -225,6 +225,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   route's (`validate_embedding_input`), which also takes the serving engine's array of objects, a
   structured member each, forwarded with no field of them read. The rule reads shape only: a
   batch's length, the `encoding_format` and the objects' fields are the serving engine's to bound.
+- A `ResponsesResponse` whose `metadata` is `null`, or whose `incomplete_details.reason` is
+  `max_messages` or `steered`, as the public API writes them, parses; it refused all three.
+  `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
+  `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
+  `MaxMessages` and `Steered`.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
