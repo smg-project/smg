@@ -1206,7 +1206,8 @@ async fn execute_embed(
     .await;
     // One breaker sample for the request, read from every answer: a worker
     // failure on any input counts whatever its place in the batch.
-    if let Some(status) = batch_breaker_status(&answers, worker.map(AsRef::as_ref)) {
+    if let Some(status) = worker.and_then(|worker| batch_breaker_status(&answers, worker.as_ref()))
+    {
         workers.record_outcome(ledger, status);
     }
     let result: Result<Vec<_>, _> = answers.into_iter().collect();
@@ -1236,21 +1237,19 @@ async fn execute_embed(
 /// request's own fault (a rejection of one input) over the successes, so a
 /// worker failure counts whatever its place in the batch and a rejection
 /// ahead of it hides nothing; `None` when no answer says anything about the
-/// worker. Without the worker's reading the status class ranks the same way.
+/// worker (a media fault, a constraint the engine could not continue under).
 fn batch_breaker_status<T>(
     answers: &[Result<T, tonic::Status>],
-    worker: Option<&dyn Worker>,
+    worker: &dyn Worker,
 ) -> Option<u16> {
-    let rank = |status: u16| match worker {
-        Some(worker) if worker.is_breaker_failure(status) => 3,
-        Some(worker) if worker.resilience().capacity_status_codes.contains(&status) => 2,
-        Some(_) => u8::from(status >= 400),
-        None => match status {
-            code if code >= 500 => 3,
-            429 => 2,
-            code if code >= 400 => 1,
-            _ => 0,
-        },
+    let rank = |status: u16| {
+        if worker.is_breaker_failure(status) {
+            3
+        } else if worker.resilience().capacity_status_codes.contains(&status) {
+            2
+        } else {
+            u8::from(status >= 400)
+        }
     };
     answers
         .iter()
@@ -2451,7 +2450,7 @@ pub(crate) mod tests {
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
         worker::{
             test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
-            ConnectionMode, RuntimeType, Worker, WorkerType,
+            ConnectionMode, ResolvedResilience, RuntimeType, Worker, WorkerType,
         },
     };
 
@@ -5001,5 +5000,60 @@ pub(crate) mod tests {
             assert_eq!(residue, None, "{minted_rooms:?}");
             assert_eq!(rooms(&mut plan), minted_rooms, "left as minted");
         }
+    }
+
+    /// The batch's one breaker sample is the worst answer by the worker's own
+    /// reading, whatever the answers' order: a failure the worker charges over
+    /// its capacity pushback over the request's own fault over a success; an
+    /// answer that says nothing about the worker (a media fault) is not in
+    /// the running, so a success beside it is credited; an operator's
+    /// capacity set moves a status out of the failure rank.
+    #[test]
+    fn the_batch_breaker_sample_is_the_worst_answer_by_the_workers_reading() {
+        use tonic::{Code, Status};
+        let worker_with = |resilience: ResolvedResilience| {
+            BasicWorkerBuilder::new("grpc://worker:30000")
+                .connection_mode(ConnectionMode::Grpc)
+                .resilience(resilience)
+                .build()
+        };
+        let default = worker_with(ResolvedResilience::default());
+        let err = |code: Code| Err::<(), _>(Status::new(code, "the stub's answer"));
+        let sample = |answers: &[Result<(), Status>]| batch_breaker_status(answers, &default);
+
+        assert_eq!(sample(&[Ok(()), err(Code::ResourceExhausted)]), Some(429));
+        assert_eq!(
+            sample(&[err(Code::ResourceExhausted), err(Code::Unavailable)]),
+            Some(503)
+        );
+        assert_eq!(
+            sample(&[err(Code::InvalidArgument), err(Code::ResourceExhausted)]),
+            Some(429)
+        );
+        assert_eq!(
+            sample(&[err(Code::InvalidArgument), Ok(()), err(Code::Unavailable)]),
+            Some(503)
+        );
+        assert_eq!(
+            sample(&[err(Code::Unavailable), Ok(()), err(Code::InvalidArgument)]),
+            Some(503)
+        );
+        assert_eq!(sample(&[Ok(()), Ok(())]), Some(200));
+        assert_eq!(sample(&[]), None);
+        let media_fault = Err::<(), _>(Status::unavailable(
+            "HTTP error while fetching media: 404 Not Found",
+        ));
+        assert_eq!(sample(&[media_fault, Ok(())]), Some(200));
+
+        let capacity_503 = worker_with(ResolvedResilience {
+            capacity_status_codes: [503].into_iter().collect(),
+            ..ResolvedResilience::default()
+        });
+        let answers = [err(Code::Internal), err(Code::Unavailable)];
+        assert!(matches!(
+            batch_breaker_status(&answers, &default),
+            Some(500 | 503)
+        ));
+        assert_eq!(batch_breaker_status(&answers, &capacity_503), Some(500));
     }
 }

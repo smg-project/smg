@@ -518,10 +518,17 @@ async fn a_failed_call_fails_the_whole_request() {
 /// read from every answer: a worker failure on one input charges the worker
 /// whatever its place in the batch, so a rejection of an earlier input (the
 /// request's own fault, which the breaker does not charge) hides nothing and
-/// the successes beside it credit nothing. One request, one sample.
+/// the successes beside it credit nothing. One request, one sample. The
+/// client's answer stays the first failing input's in input order (the
+/// rejection, a 400, with the refused input first; the failure, a 5xx, with
+/// the failed one first), so the sample and the answer come from different
+/// inputs.
 #[tokio::test]
 async fn a_mixed_batch_is_one_breaker_sample_and_it_is_the_worker_failure() {
-    for input in [json!([[1], [3], [5]]), json!([[3], [1], [5]])] {
+    for (input, client_fault) in [
+        (json!([[1], [3], [5]]), true),
+        (json!([[3], [1], [5]]), false),
+    ] {
         let stub = EmbedStub {
             reject_ids: Some(vec![1]),
             fail_ids: Some(vec![3]),
@@ -531,7 +538,16 @@ async fn a_mixed_batch_is_one_breaker_sample_and_it_is_the_worker_failure() {
 
         let (status, body) = bed.embed(json!({"model": MODEL, "input": input})).await;
 
-        assert!(!status.is_success(), "{input}: {status}: {body}");
+        assert_eq!(
+            status.is_client_error(),
+            client_fault,
+            "{input}: {status}: {body}"
+        );
+        assert_eq!(
+            status.is_server_error(),
+            !client_fault,
+            "{input}: {status}: {body}"
+        );
         assert_eq!(
             bed.breaker_counts(),
             (1, 0),
