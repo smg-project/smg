@@ -260,7 +260,12 @@ fn part_reason_at(index: usize, error: &serde_json::Error) -> String {
     if let Some(field) = reason.strip_prefix("missing field `") {
         return format!("missing field `content[{index}].{field}");
     }
-    match reason.rsplit_once(", in `") {
+    // The suffix a known part appends ends in a backtick; serde's own tail (`expected ...`) never
+    // does, so a value the client sent that happens to hold ", in `" cannot move the split.
+    match reason
+        .rsplit_once(", in `")
+        .filter(|(_, body)| body.ends_with('`'))
+    {
         Some((head, body)) => format!("{head}, in `content[{index}].{body}"),
         None => format!("{reason}, in `content[{index}]`"),
     }
@@ -2588,6 +2593,11 @@ mod content_tests {
             (
                 json!([5]),
                 "invalid type: integer `5`, expected a map, in `content[0]`",
+            ),
+            // A value the client sent that holds ", in `" does not move the place.
+            (
+                json!(["see, in `x"]),
+                "invalid type: string \"see, in `x\", expected a map, in `content[0]`",
             ),
             (
                 json!(5),

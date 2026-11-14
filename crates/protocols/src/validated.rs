@@ -1502,7 +1502,6 @@ mod tests {
         assert_eq!(json["error"]["param"], "name", "{json}");
     }
 
-    /// The Chat Completions rules checked across fields name their field;
     /// A content part whose `type` the gateway knows but whose body does not
     /// fit it is refused at serde's reason for the field: the code is the
     /// reason's, the param the message serde's path stops at, with the part's
@@ -1544,6 +1543,7 @@ mod tests {
         }
     }
 
+    /// The Chat Completions rules checked across fields name their field;
     /// a provider profile's rule keeps its code and message with nothing in
     /// front; the Messages rules print the public API's words alone.
     #[tokio::test]
