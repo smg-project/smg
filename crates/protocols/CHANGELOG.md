@@ -206,6 +206,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
+- A replayed `computer_call_output` input item with `acknowledged_safety_checks: null`, which the
+  public API allows (`ComputerCallOutputItemParam`), parses as none acknowledged. The crate refused
+  the request whole, as matching no variant of `ResponseInput`.
 - `EmbeddingRequest`, `ClassifyRequest`, `TokenizeRequest`, `DetokenizeRequest` and
   `V1RerankReqInput` implement `Validate` and `Normalizable`, so the gateway reads
   `/v1/embeddings`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize` and `/v1/rerank` through its
