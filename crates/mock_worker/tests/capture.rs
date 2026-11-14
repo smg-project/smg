@@ -3,6 +3,11 @@
 //! tests serve the real TokenSpeed service on a free port and drive it with
 //! the gateway's own client.
 
+#![expect(
+    clippy::expect_used,
+    reason = "a test binary: a failed step panics with what failed"
+)]
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,

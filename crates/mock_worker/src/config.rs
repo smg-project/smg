@@ -423,11 +423,11 @@ impl Config {
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-step-ms" => cfg.zmq_step_ms = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
-                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--zmq-lockstep" => cfg.zmq_lockstep = true,
                 "--zmq-add-delay-ms" => {
-                    cfg.zmq_add_delay_ms = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.zmq_add_delay_ms = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--model" => cfg.model_id = value(&mut args, &flag)?,
                 "--tokenizer" => cfg.tokenizer_path = value(&mut args, &flag)?,
@@ -457,7 +457,7 @@ impl Config {
                     timing.decode_poly = Some(parse_poly(value(&mut args, &flag)?, &flag)?);
                 }
                 "--prefill-tps" => {
-                    timing.prefill_tps = Some(parse(value(&mut args, &flag)?, &flag)?)
+                    timing.prefill_tps = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
                 "--decode-base-ms" => {
                     timing.decode_base_ms = Some(parse(value(&mut args, &flag)?, &flag)?);
@@ -533,7 +533,7 @@ impl Config {
                         Duration::try_from_secs_f64(secs).map_err(|e| format!("{flag}: {e}"))?;
                 }
                 "--prefix-cache" => {
-                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
@@ -541,7 +541,7 @@ impl Config {
         }
 
         if cfg.tokenizer_path.is_empty() {
-            cfg.tokenizer_path = cfg.model_id.clone();
+            cfg.tokenizer_path.clone_from(&cfg.model_id);
         }
         cfg.default_sampling_params_json = sampling_defaults_json(Path::new(&cfg.model_id));
         let (model, calibration) = timing.resolve()?;

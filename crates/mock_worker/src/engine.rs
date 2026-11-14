@@ -23,7 +23,7 @@
 //! which makes it deterministically unit-testable with no real timers.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -34,7 +34,7 @@ use std::{
 
 use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::common_proto as common;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tonic::Status;
 
 // ---------------------------------------------------------------------------
@@ -842,7 +842,7 @@ enum EngineMsg {
     Reset,
     /// The publisher restarts: sequence numbers start over, the replay
     /// buffer is emptied, the cache is kept. Acknowledged once applied.
-    RestartPublisher(tokio::sync::oneshot::Sender<()>),
+    RestartPublisher(oneshot::Sender<()>),
 }
 
 /// One admitted request as seen by the engine: the ground truth for routing
@@ -1101,7 +1101,7 @@ impl Engine {
     /// (after its current pass, at most), so a status read right after sees
     /// the new generation.
     pub(crate) async fn restart_publisher(&self) {
-        let (ack, applied) = tokio::sync::oneshot::channel();
+        let (ack, applied) = oneshot::channel();
         if self.tx.send(EngineMsg::RestartPublisher(ack)).is_ok() {
             let _ = tokio::time::timeout(Duration::from_secs(2), applied).await;
         }
@@ -1403,7 +1403,7 @@ async fn run(
         // them (`Engine::output_silence`).
         while shared.faults.paused.load(Ordering::Relaxed) {
             tokio::select! {
-                _ = shared.resume.notified() => {}
+                () = shared.resume.notified() => {}
                 msg = rx.recv() => match msg {
                     Some(msg) => handle_msg(&mut state, &shared, &params, msg),
                     None => return,
@@ -1797,12 +1797,12 @@ impl BlockPool {
     /// already exists the anonymous block is given back and a reference taken.
     fn register(&mut self, h: u64) -> bool {
         match self.refs.entry(h) {
-            std::collections::hash_map::Entry::Occupied(_) => {
+            Entry::Occupied(_) => {
                 self.hit(h);
                 self.release_anonymous(1);
                 false
             }
-            std::collections::hash_map::Entry::Vacant(slot) => {
+            Entry::Vacant(slot) => {
                 slot.insert(1);
                 true
             }
@@ -2245,7 +2245,9 @@ impl SchedulerState {
             }
             let running_at_admit = self.running.len() as u32;
             let waiting_at_admit = self.waiting.len() as u32;
-            let w = self.waiting.pop_front().expect("front exists");
+            let Some(w) = self.waiting.pop_front() else {
+                break;
+            };
             let NewRequest {
                 request_id,
                 prompt_token_ids,
@@ -2697,17 +2699,19 @@ impl SchedulerState {
                 });
             }
             last_index = Some(c.index);
-            runs.last_mut().expect("run exists").blocks.push((
-                c.index,
-                common::KvBlock {
-                    block_hash: c.key as i64,
-                    token_ids: c.tokens,
-                    block_size: p.block_size as i32,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                },
-            ));
+            if let Some(run) = runs.last_mut() {
+                run.blocks.push((
+                    c.index,
+                    common::KvBlock {
+                        block_hash: c.key as i64,
+                        token_ids: c.tokens,
+                        block_size: p.block_size as i32,
+                        lora_id: None,
+                        cache_level: None,
+                        ..Default::default()
+                    },
+                ));
+            }
         }
         let groups = p.kv_cache_groups.iter().take(8).enumerate();
         for CompletedRun { parent, blocks } in runs {

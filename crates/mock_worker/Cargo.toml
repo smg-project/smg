@@ -52,3 +52,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tempfile = "3"
 engine-servicer = { path = "../engine_servicer" }
 rmp-serde.workspace = true
+
+[lints]
+workspace = true

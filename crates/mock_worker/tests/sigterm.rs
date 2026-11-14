@@ -3,6 +3,12 @@
 //! new connection is accepted, the requests in flight finish up to the drain
 //! deadline, the exit code is 0, and the log says what was drained.
 #![cfg(unix)]
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test binary: a failed step panics with what failed"
+)]
+#![expect(clippy::print_stderr, reason = "integration tests: diagnostic output")]
 
 use std::{
     io::Read,

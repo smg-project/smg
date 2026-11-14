@@ -438,6 +438,7 @@ mod tests {
     use serde_json::json;
     use sg::sglang_scheduler_client::SglangSchedulerClient;
     use smg_grpc_client::tokenspeed_proto as ts;
+    use tokio::sync::watch;
     use tonic::{transport::Channel, Code};
     use tonic_health::pb::{
         health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
@@ -942,7 +943,7 @@ mod tests {
         }
     }
 
-    fn media_service(port: u16) -> (MockScheduler, tokio::sync::watch::Sender<bool>) {
+    fn media_service(port: u16) -> (MockScheduler, watch::Sender<bool>) {
         MockScheduler::for_tests(
             Config {
                 grpc_wire: SchedulerWire::Sglang,

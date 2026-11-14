@@ -4,6 +4,10 @@
     clippy::allow_attributes,
     reason = "each test binary reads the helpers it needs; the others are unused there"
 )]
+#![expect(
+    clippy::expect_used,
+    reason = "a test binary: a failed step panics with what failed"
+)]
 
 use std::sync::Arc;
 
