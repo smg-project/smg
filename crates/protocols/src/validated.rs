@@ -829,6 +829,7 @@ mod tests {
     use crate::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{invalid, invalid_at},
+        responses::ResponsesRequest,
     };
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
@@ -1722,6 +1723,131 @@ mod tests {
             json["error"]["message"], "temperature: range: 0..1",
             "{json}"
         );
+    }
+
+    /// A refusal inside a Responses `input` item names the item, the part
+    /// and the field under the route's own code, as every other field's
+    /// refusal on this door does: a message with or without its `type` or
+    /// its `id`, a part inside a typed item, a field inside a part's own
+    /// array; the accepted shapes are unchanged.
+    #[tokio::test]
+    async fn a_responses_input_part_refusal_names_the_part_and_its_field() {
+        let image = |part: &str| {
+            format!(
+                r#"{{"model":"m","input":[{{"role":"user","content":[{{"type":"input_text","text":"describe"}},{{"type":"input_image","image_url":"data:image/png;base64,AQ==",{part}}}]}}],"max_output_tokens":2}}"#
+            )
+        };
+        for (body, code, param, message) in [
+            (
+                image(r#""detail":"LOW""#),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                image(r#""detail":"bogus""#),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `bogus`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":{"url":"data:image/png;base64,AQ=="}}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[1].image_url",
+                "input[0].content[1].image_url: invalid type: map, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_video","video_url":"http://127.0.0.1/clip.mp4"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].type",
+                "input[0].content[1].type: unknown variant `input_video`, expected one of `output_text`, `input_text`, `input_image`, `input_file`, `refusal`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].content[0].text",
+                "input[0].content[0]: missing field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,AQ==","detail":"LOW"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,AQ==","detail":"LOW"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":7,"text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].type",
+                "input[0].content[0].type: invalid type: integer `7`, expected variant identifier",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"output_text","text":"hi","annotations":[{"type":"file_citation","index":0}]}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].content[0].annotations[0].file_id",
+                "input[0].content[0].annotations[0]: missing field `file_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"output_text","text":"hi","annotations":[{"type":"url_citation","url":5}]}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].annotations[0]",
+                "input[0].content[0].annotations[0]: invalid type: integer `5`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].output[0].text",
+                "input[0].output[0]: missing field `text`",
+            ),
+            // A typed item's own missing field keeps the derived reader's
+            // words: its fallback to the untagged shapes drops the tagged
+            // reading's reason (the limit of the reader).
+            (
+                r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0]",
+                "input[0]: data did not match any variant of untagged enum ResponseInputOutputItem",
+            ),
+            (
+                r#"{"model":"m","input":[{"content":"hi"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].role",
+                "input[0]: missing field `role`",
+            ),
+            (
+                r#"{"model":"m","input":7,"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input",
+                "input: invalid type: integer `7`, expected a string or an array of input items",
+            ),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(&body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+        for body in [
+            image(r#""detail":"low""#),
+            r#"{"model":"m","input":"hi","max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(&body).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {json}");
+        }
     }
 
     #[test]

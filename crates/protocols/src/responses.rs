@@ -4835,6 +4835,35 @@ mod tests {
         assert!(FunctionTool::FIELDS.ends_with(FunctionTool::TOOL_KEYS));
     }
 
+    /// A twelve-turn conversation input (text turns and part turns, an
+    /// image, a function call and its output), read two hundred times: the
+    /// readers' cost on a representative request, for the measurement of a
+    /// change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_input_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut items = Vec::new();
+        for _ in 0..5 {
+            items.push(serde_json::json!({"role": "user", "content": [
+                {"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"},
+            ]}));
+            items.push(serde_json::json!({"role": "assistant", "content": text}));
+        }
+        items.push(serde_json::json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}", "status": "completed"}));
+        items.push(serde_json::json!({"type": "function_call_output", "call_id": "call_1", "output": text}));
+        let body =
+            serde_json::json!({"model": "m", "input": items, "max_output_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ResponsesRequest = serde_json::from_str(&body).expect("the body reads");
+            let ResponseInput::Items(items) = &request.input else {
+                panic!("the input is the items")
+            };
+            assert_eq!(items.len(), 12);
+        }
+    }
+
     /// The three sampling knobs the request keeps as plain values read as set
     /// only off their serde defaults: absent is unset, a value is set, and a
     /// knob written as the default's own value reads as unset (the limit of a
