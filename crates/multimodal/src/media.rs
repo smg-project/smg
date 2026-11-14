@@ -741,13 +741,13 @@ impl MediaConnector {
     /// in either phase (before the headers, or while the body arrives) is
     /// reported as the timeout it is, with the URL and the budget.
     ///
-    /// Every hop is admitted under the host policy before it is connected:
-    /// the URL the request named and each redirect target, by name against
-    /// the allow-list and by address against the address policy, with the
-    /// checked addresses pinned for the client's resolver while the hop
-    /// connects. A redirect the policy refuses is reported with its target;
-    /// the chain is followed at most [`MAX_REDIRECTS`] times, under the one
-    /// budget.
+    /// Every hop is held to the connector's scheme rule and admitted under
+    /// the host policy before it is connected: the URL the request named and
+    /// each redirect target, by name against the allow-list and by address
+    /// against the address policy, with the checked addresses pinned for the
+    /// client's resolver while the hop connects. A redirect the policy
+    /// refuses is reported with its target; the chain is followed at most
+    /// [`MAX_REDIRECTS`] times, under the one budget.
     async fn fetch_http_bytes(
         &self,
         url: &Url,
@@ -755,6 +755,14 @@ impl MediaConnector {
         limit: usize,
         media: &'static str,
     ) -> Result<Bytes, MediaConnectorError> {
+        // The scheme rule before any client is built for the URL: a scheme
+        // the connector does not fetch is refused in its own words, as a
+        // redirect to one is, not in the client library's.
+        if !fetched_scheme(url.scheme()) {
+            return Err(MediaConnectorError::UnsupportedScheme(
+                url.scheme().to_string(),
+            ));
+        }
         let started = Instant::now();
         let timed_out = || MediaConnectorError::Timeout {
             url: url.to_string(),
@@ -1009,7 +1017,7 @@ fn redirect_target(response: &reqwest::Response) -> Option<Result<Url, RefusedRe
             reason: "the redirect location is not a URL".to_string(),
         }));
     };
-    if !matches!(target.scheme(), "http" | "https") {
+    if !fetched_scheme(target.scheme()) {
         return Some(Err(RefusedRedirect {
             reason: format!("unsupported media scheme: {}", target.scheme()),
             target: target.to_string(),
@@ -1093,6 +1101,12 @@ async fn collect_http_body_with_limit(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+/// Whether the connector fetches URLs of `scheme`: the request's own URL and
+/// every redirect target are held to the same two.
+fn fetched_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https")
 }
 
 fn checked_payload_length(

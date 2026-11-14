@@ -1099,3 +1099,33 @@ async fn decode_video_rejects_an_invalid_long_side_cap() {
         );
     }
 }
+
+/// A URL of a scheme the connector does not fetch is refused in the
+/// connector's own words before any client is built for it, as a redirect to
+/// such a scheme is; the client library's builder error (its words, repeated
+/// through the error chain) never reaches the caller.
+#[tokio::test]
+async fn a_url_scheme_the_connector_does_not_fetch_is_refused_before_the_client() {
+    let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+        .expect("default connector");
+    for (url, scheme) in [
+        ("ftp://media.example/a.jpg", "ftp"),
+        ("file:///etc/hostname", "file"),
+    ] {
+        let error = connector
+            .fetch_image(
+                MediaSource::Url(std::sync::Arc::new(url.to_string())),
+                ImageFetchConfig::default(),
+            )
+            .await
+            .expect_err("a scheme the connector does not fetch");
+        assert!(
+            matches!(&error, MediaConnectorError::UnsupportedScheme(got) if got == scheme),
+            "{url}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("unsupported media scheme: {scheme}")
+        );
+    }
+}
