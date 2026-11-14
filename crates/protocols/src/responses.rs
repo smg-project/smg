@@ -9,12 +9,12 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, json_type_name, strict_schema_missing_additional_properties,
-        validate_json_schema_shape, validate_stop, ChatLogProbs, ContextManagementEntry,
-        ConversationRef, Detail, Function, FunctionChoice, GenerationRequest, PromptCacheRetention,
-        PromptTokenUsageInfo, ResponsePrompt, StreamOptions, StringOrArray,
-        ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage,
-        UsageInfo,
+        default_true, deserialize_null_as_empty_vec, json_type_name,
+        strict_schema_missing_additional_properties, validate_json_schema_shape, validate_stop,
+        ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
+        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
+        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -105,7 +105,11 @@ pub enum BuiltInToolChoiceType {
     #[serde(rename = "web_search_preview_2025_03_11")]
     WebSearchPreview20250311,
     ImageGeneration,
+    /// The GA computer tool; `computer_use` names it too, and
+    /// `computer_use_preview` the preview tool.
+    Computer,
     ComputerUsePreview,
+    ComputerUse,
     CodeInterpreter,
 }
 
@@ -197,10 +201,8 @@ pub enum ResponsesToolChoice {
     /// `"none"` | `"auto"` | `"required"`.
     Options(ToolChoiceOptions),
 
-    /// `{"type": "file_search" | "web_search" | "web_search_preview" |
-    /// "web_search_preview_2025_03_11" | "image_generation" |
-    /// "computer_use_preview" | "code_interpreter"}` — select a built-in
-    /// hosted tool by type alone (no additional payload).
+    /// `{"type": "<hosted tool>"}`, a type [`BuiltInToolChoiceType`] names:
+    /// select a built-in hosted tool by type alone (no additional payload).
     Types {
         #[serde(rename = "type")]
         tool_type: BuiltInToolChoiceType,
@@ -355,8 +357,10 @@ pub enum ResponseTool {
     #[serde(rename = "function")]
     Function(FunctionTool),
 
-    /// Built-in tool.
-    #[serde(rename = "web_search_preview")]
+    /// Built-in preview web search tool. The public API also names it by its
+    /// dated type, `web_search_preview_2025_03_11`, which reads as this tool
+    /// and is written under the canonical `web_search_preview`.
+    #[serde(rename = "web_search_preview", alias = "web_search_preview_2025_03_11")]
     WebSearchPreview(WebSearchPreviewTool),
 
     /// Built-in non-preview hosted web search tool.
@@ -1293,6 +1297,9 @@ pub enum McpConnectorId {
 pub struct WebSearchPreviewTool {
     pub search_context_size: Option<String>,
     pub user_location: Option<Value>,
+    /// The kinds of content the search returns, `text` and `image` in the
+    /// public API (`SearchContentType`).
+    pub search_content_types: Option<Vec<String>>,
 }
 
 /// Non-preview hosted web search tool configuration.
@@ -1643,6 +1650,36 @@ pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
+    /// The reasoning execution mode (`ReasoningModeEnum`: `standard`, `pro`,
+    /// or another string the upstream takes), forwarded as given.
+    pub mode: Option<String>,
+    /// Which reasoning items are rendered back to the model on later turns.
+    pub context: Option<ReasoningContext>,
+    /// The deprecated spelling of `summary`, forwarded as given. It is a field
+    /// of its own rather than an alias, so a body that sends both spellings
+    /// still parses.
+    pub generate_summary: Option<ReasoningSummary>,
+}
+
+/// Which reasoning items are rendered back to the model on later turns
+/// (`Reasoning.context` in the spec); `auto` lets the model decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContext {
+    Auto,
+    CurrentTurn,
+    AllTurns,
+}
+
+impl ReasoningContext {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CurrentTurn => "current_turn",
+            Self::AllTurns => "all_turns",
+        }
+    }
 }
 
 #[expect(
@@ -1951,7 +1988,13 @@ pub enum ResponseInputOutputItem {
         id: Option<String>,
         call_id: String,
         output: ComputerCallOutputContent,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// The safety checks the developer acknowledged. The public API's
+        /// input item takes an array or `null`; `null` reads as none.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_null_as_empty_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
         acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ComputerCallStatus>,
@@ -2215,13 +2258,15 @@ pub enum SimpleInputMessageTypeTag {
     Message,
 }
 
-/// Detail level for [`ResponseContentPart::InputFile`]. Spec restricts this
-/// to `"low" | "high"` (defaults to `low`); it is narrower than [`Detail`]
-/// used for images which also admits `auto` / `original`.
+/// Detail level for [`ResponseContentPart::InputFile`] (`FileInputDetail`
+/// in the spec): `auto`, the public API's default, lets the system choose;
+/// `low` and `high` pick a level. It is narrower than [`Detail`], used for
+/// images, which also admits `original`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FileDetail {
     #[default]
+    Auto,
     Low,
     High,
 }
@@ -2742,7 +2787,7 @@ pub enum ResponseOutputItem {
 // Built-in Tool Call Types
 // ============================================================================
 
-/// Status for web search tool calls.
+/// Status for web search tool calls (`WebSearchCallStatus` in the spec).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchCallStatus {
@@ -2750,6 +2795,7 @@ pub enum WebSearchCallStatus {
     Searching,
     Completed,
     Failed,
+    Incomplete,
 }
 
 /// Action performed during a web search.
@@ -2764,13 +2810,16 @@ pub enum WebSearchAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sources: Vec<WebSearchSource>,
     },
+    /// The page the model opened. The public API does not require the URL,
+    /// and may write it as `null`.
     OpenPage {
-        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
-    Find {
-        url: String,
-        pattern: String,
-    },
+    /// A search for a pattern in a page. The public API names the action
+    /// `find_in_page`; `find`, the name this crate wrote before, still reads.
+    #[serde(rename = "find_in_page", alias = "find")]
+    Find { url: String, pattern: String },
 }
 
 /// A source returned from web search.
@@ -2968,12 +3017,20 @@ pub struct IncompleteDetails {
 }
 
 /// The `reasoning` block of a Response object. The public API returns it on
-/// every response, both keys present (`null` when the request set none), so
-/// neither key is skipped here.
+/// every response with `effort` and `summary` present (`null` when the request
+/// set none), so neither is skipped here. `mode`, `context` and
+/// `generate_summary` echo the request's when it set them, and are left out
+/// otherwise.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReasoningInfo {
     pub effort: Option<String>,
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
 }
 
 impl From<&ResponseReasoningParam> for ReasoningInfo {
@@ -2981,6 +3038,11 @@ impl From<&ResponseReasoningParam> for ReasoningInfo {
         Self {
             effort: param.effort.map(|effort| effort.as_str().to_string()),
             summary: param.summary.map(|summary| summary.as_str().to_string()),
+            mode: param.mode.clone(),
+            context: param.context.map(|context| context.as_str().to_string()),
+            generate_summary: param
+                .generate_summary
+                .map(|summary| summary.as_str().to_string()),
         }
     }
 }
@@ -4389,6 +4451,50 @@ pub fn generate_id(prefix: &str) -> String {
     id
 }
 
+/// `Response.conversation` on the wire. The public API writes the linked
+/// conversation as an object, `{"id": "conv_..."}` (`ResponseConversation`);
+/// the field keeps the id alone. This module writes that object and reads it,
+/// or a bare id, the shape the crate wrote before, which stored responses
+/// keep.
+mod response_conversation {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::common::ConversationRef;
+
+    /// The object the public API writes.
+    #[derive(Serialize)]
+    struct ResponseConversation<'a> {
+        /// The id of the conversation the response is linked to.
+        id: &'a str,
+    }
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's `with` hands the field to its serializer by reference"
+    )]
+    pub(super) fn serialize<S: Serializer>(
+        conversation: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match conversation {
+            Some(id) => ResponseConversation { id }.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        Ok(
+            Option::<ConversationRef>::deserialize(deserializer)?.map(
+                |reference| match reference {
+                    ConversationRef::Id(id) | ConversationRef::Object { id } => id,
+                },
+            ),
+        )
+    }
+}
+
 /// The Response object of `POST /v1/responses`.
 ///
 /// The public API returns every field of this object on every response
@@ -4423,8 +4529,14 @@ pub struct ResponsesResponse {
     #[serialize_always]
     pub background: Option<bool>,
 
-    /// Conversation this response is linked to, if any.
-    #[serde(default)]
+    /// Conversation this response is linked to, if any, by its id. Written
+    /// as the public API writes it, `{"id": ...}`; a bare id, as the crate
+    /// wrote it before, still reads. The schema takes both shapes, as the
+    /// reader does: a response stored before the object was written is
+    /// served back with the bare id, and a client generated from the schema
+    /// reads it too.
+    #[serde(default, with = "response_conversation")]
+    #[schemars(with = "Option<ConversationRef>")]
     pub conversation: Option<String>,
 
     /// Response status

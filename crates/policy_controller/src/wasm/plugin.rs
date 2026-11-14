@@ -1575,6 +1575,25 @@ impl Bound {
         Ok(bit(&open.mask, position))
     }
 
+    /// One guest call of the open decision on this thread's instance, under
+    /// the decision's fuel frame: `call` gets the instance and the decision's
+    /// live resource. The slot's guard comes back with the answer, for the
+    /// caller's own reading of an invalid one; a decision whose resource is
+    /// not live falls back with no call made.
+    fn ask<T>(
+        &self,
+        open: &mut Open,
+        call: impl FnOnce(&mut Instance, ResourceAny) -> wasmtime::Result<Result<T, wit::Decline>>,
+    ) -> Result<(Call<T>, RefMut<'_, Option<Instance>>), Fallback> {
+        let plugin = &self.plugin;
+        let mut guard = plugin.slot().borrow_mut();
+        let resource = open.live(guard.as_ref())?;
+        let mut budget = plugin.runtime.budgets.get_or_default().borrow_mut();
+        let frame = open.frame(&mut budget, plugin.frame.fuel_per_micro);
+        let answer = plugin.call(&mut guard, frame, |inst| call(inst, resource));
+        Ok((answer, guard))
+    }
+
     fn ensure_mask(&self, open: &mut Open) -> Result<(), Fallback> {
         if open.mask_set {
             return Ok(());
@@ -1582,13 +1601,8 @@ impl Bound {
         if open.filter_declined {
             return Err(Fallback);
         }
-        let plugin = &self.plugin;
         let count = open.count;
-        let mut guard = plugin.slot().borrow_mut();
-        let resource = open.live(guard.as_ref())?;
-        let mut budget = plugin.runtime.budgets.get_or_default().borrow_mut();
-        let frame = open.frame(&mut budget, plugin.frame.fuel_per_micro);
-        let answer = plugin.call(&mut guard, frame, |inst| match &inst.exports {
+        let (answer, mut guard) = self.ask(open, |inst, resource| match &inst.exports {
             Exports::Record(b) => b
                 .smg_policy_plugin()
                 .decision()
@@ -1597,7 +1611,7 @@ impl Bound {
                 .smg_policy_plugin_packed()
                 .decision()
                 .call_filter(&mut inst.store, resource),
-        });
+        })?;
         open.filter_declined = matches!(answer, Call::Declined);
         let positions = open.answered(answer)?;
         // Unique and in range, else the answer is invalid.
@@ -1605,7 +1619,7 @@ impl Bound {
         open.mask.resize((count as usize).div_ceil(64), 0);
         for &p in &positions {
             if p >= count || bit(&open.mask, p) {
-                return Err(open.invalid(plugin, &mut guard));
+                return Err(open.invalid(&self.plugin, &mut guard));
             }
             open.mask[(p / 64) as usize] |= 1 << (p % 64);
         }
@@ -1626,27 +1640,23 @@ impl Bound {
             if open.score_declined {
                 return Err(Fallback);
             }
-            let plugin = &self.plugin;
             let count = open.count;
-            let mut guard = plugin.slot().borrow_mut();
-            let resource = open.live(guard.as_ref())?;
-            let mut budget = plugin.runtime.budgets.get_or_default().borrow_mut();
-            let frame = open.frame(&mut budget, plugin.frame.fuel_per_micro);
-            let answer = plugin.call(&mut guard, frame, |inst| match &inst.exports {
-                Exports::Record(b) => b
-                    .smg_policy_plugin()
-                    .decision()
-                    .call_score(&mut inst.store, resource),
-                Exports::Packed(b) => b
-                    .smg_policy_plugin_packed()
-                    .decision()
-                    .call_score(&mut inst.store, resource),
-            });
+            let (answer, mut guard) =
+                self.ask(&mut open, |inst, resource| match &inst.exports {
+                    Exports::Record(b) => b
+                        .smg_policy_plugin()
+                        .decision()
+                        .call_score(&mut inst.store, resource),
+                    Exports::Packed(b) => b
+                        .smg_policy_plugin_packed()
+                        .decision()
+                        .call_score(&mut inst.store, resource),
+                })?;
             open.score_declined = matches!(answer, Call::Declined);
             let mut scores = open.answered(answer)?;
             // One finite value per candidate, clamped by the host.
             if scores.len() != count as usize || scores.iter().any(|s| !s.is_finite()) {
-                return Err(open.invalid(plugin, &mut guard));
+                return Err(open.invalid(&self.plugin, &mut guard));
             }
             for s in &mut scores {
                 *s = s.clamp(0.0, 1.0);
@@ -1672,10 +1682,11 @@ impl Bound {
         scores: &[f32],
     ) -> Result<u32, Fallback> {
         let mut open = self.state(facts.phase);
-        let plugin = &self.plugin;
         let count = open.count;
-        let mut guard = plugin.slot().borrow_mut();
-        let resource = open.live(guard.as_ref())?;
+        // A bypassed decision falls back before the buffer is built.
+        if open.bypass {
+            return Err(Fallback);
+        }
         let mut scores_in = std::mem::take(&mut open.scores_in);
         scores_in.clear();
         scores_in.resize(count as usize, -1.0);
@@ -1684,9 +1695,7 @@ impl Bound {
                 *slot = s;
             }
         }
-        let mut budget = plugin.runtime.budgets.get_or_default().borrow_mut();
-        let frame = open.frame(&mut budget, plugin.frame.fuel_per_micro);
-        let answer = plugin.call(&mut guard, frame, |inst| {
+        let asked = self.ask(&mut open, |inst, resource| {
             let picked = match &inst.exports {
                 Exports::Record(b) => b.smg_policy_plugin().decision().call_pick(
                     &mut inst.store,
@@ -1705,6 +1714,14 @@ impl Bound {
                 Err(decline) => Err(decline),
             })
         });
+        let (answer, mut guard) = match asked {
+            Ok(asked) => asked,
+            Err(fallback) => {
+                // The buffer stays with the decision when no call is made.
+                open.scores_in = scores_in;
+                return Err(fallback);
+            }
+        };
         // Within the surviving set, else the answer is invalid.
         let within = match &answer {
             Call::Answered(p) => scores_in.get(*p as usize).is_some_and(|s| *s >= 0.0),
@@ -1713,7 +1730,7 @@ impl Bound {
         open.scores_in = scores_in;
         let picked = open.answered(answer)?;
         if !within {
-            return Err(open.invalid(plugin, &mut guard));
+            return Err(open.invalid(&self.plugin, &mut guard));
         }
         Ok(picked)
     }
