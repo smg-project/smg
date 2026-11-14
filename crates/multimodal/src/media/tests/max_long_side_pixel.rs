@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::hasher::{hash_image, hash_image_with_resolution_cap, hash_image_with_transparency};
 
 fn image(width: u32, height: u32) -> image::DynamicImage {
     image::DynamicImage::new_rgb8(width, height)
@@ -73,14 +74,10 @@ fn a_fetched_frame_carries_its_policy_in_its_hash() {
     let white = frame(TransparencyPolicy::CompositeOverWhite);
     assert_eq!(keep.transparency(), TransparencyPolicy::KeepAlpha);
     assert_eq!(white.transparency(), TransparencyPolicy::CompositeOverWhite);
-    assert_eq!(keep.hash, crate::hasher::hash_image(&png));
+    assert_eq!(keep.hash, hash_image(&png));
     assert_eq!(
         white.hash,
-        crate::hasher::hash_image_with_transparency(
-            &png,
-            None,
-            TransparencyPolicy::CompositeOverWhite
-        )
+        hash_image_with_transparency(&png, None, TransparencyPolicy::CompositeOverWhite)
     );
     assert_ne!(keep.hash, white.hash);
     assert!(keep.image().expect("decode").color().has_alpha());
@@ -95,8 +92,8 @@ fn different_caps_hash_differently() {
     // The pixel cache and the backend's mm cache key off this hash; two
     // tiers of the same bytes must not collide.
     let bytes = b"fake-encoded-image-bytes";
-    let low = crate::hasher::hash_image_with_resolution_cap(bytes, Some(252));
-    let high = crate::hasher::hash_image_with_resolution_cap(bytes, Some(1008));
+    let low = hash_image_with_resolution_cap(bytes, Some(252));
+    let high = hash_image_with_resolution_cap(bytes, Some(1008));
     assert_ne!(low, high);
 }
 
@@ -106,8 +103,8 @@ fn absent_cap_keeps_the_plain_byte_hash() {
     // stay valid.
     let bytes = b"fake-encoded-image-bytes";
     assert_eq!(
-        crate::hasher::hash_image_with_resolution_cap(bytes, None),
-        crate::hasher::hash_image(bytes)
+        hash_image_with_resolution_cap(bytes, None),
+        hash_image(bytes)
     );
 }
 
@@ -115,8 +112,8 @@ fn absent_cap_keeps_the_plain_byte_hash() {
 fn same_cap_hashes_stably() {
     let bytes = b"fake-encoded-image-bytes";
     assert_eq!(
-        crate::hasher::hash_image_with_resolution_cap(bytes, Some(504)),
-        crate::hasher::hash_image_with_resolution_cap(bytes, Some(504))
+        hash_image_with_resolution_cap(bytes, Some(504)),
+        hash_image_with_resolution_cap(bytes, Some(504))
     );
 }
 

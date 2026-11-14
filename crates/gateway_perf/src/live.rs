@@ -365,6 +365,7 @@ pub fn live_markdown(spec: &PathSpec, ramp: &Ramp, report: &[(&str, Capacity)]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::path_named;
 
     fn slo() -> Slo {
         Slo {
@@ -463,7 +464,7 @@ mod tests {
             step_warmup: 3,
             slo: slo(),
         };
-        let spec = crate::paths::path_named("chat").unwrap();
+        let spec = path_named("chat").unwrap();
         let cap = capacity(vec![step(200.0, 5.0, None, 0), step(400.0, 500.0, None, 0)]);
         let text = live_markdown(spec, &ramp, &[("pr", cap)]);
         assert!(
