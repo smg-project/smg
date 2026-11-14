@@ -54,10 +54,10 @@ use crate::{
     openai::{
         context::{RequestContext, StreamingEventContext, StreamingRequest},
         mcp::{
-            execute_streaming_tool_calls, inject_mcp_metadata_last, inject_mcp_metadata_streaming,
-            prepare_mcp_tools_as_functions, resume_payload_in_place, retained_output_items,
-            send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
-            StreamingToolHandler, ToolLoopState, TOOL_CALL_LIMIT_REASON,
+            execute_streaming_tool_calls, inject_mcp_metadata_last, prepare_mcp_tools_as_functions,
+            resume_payload_in_place, retained_output_items, send_mcp_list_tools_events,
+            skip_streaming_tool_calls, StreamAction, StreamingToolHandler, ToolLoopState,
+            TOOL_CALL_LIMIT_REASON,
         },
     },
     persistence_utils::persist_conversation_items,
@@ -544,65 +544,68 @@ fn end_at_tool_call_limit(response: &mut Value, original_request: &ResponsesRequ
     );
 }
 
-/// Send the `response.completed` event that ends the tool loop's stream:
-/// the final response built from the handler's snapshot, the loop's items
-/// in place, the client's view of the tools, the request's metadata, and
-/// the note of a loop stopped at its tool-call allowance.
-/// Returns false if client disconnected
-pub(super) async fn send_final_response_event(
-    handler: &StreamingToolHandler,
-    tx: &SseSender,
-    enc: &mut SseEncoder,
-    sequence_number: &mut u64,
+/// The loop's final response shaped once, for the wire and the record alike:
+/// the preserved response id written back, the loop's items in place (the
+/// kept `mcp_list_tools` items move in; nothing reads them afterwards), the
+/// client's view of the tools, the request's metadata, and the note of a
+/// loop stopped at its tool-call allowance.
+pub(super) fn shape_final_response(
+    final_response: &mut Value,
+    preserved_response_id: Option<&str>,
     state: &mut ToolLoopState,
     ctx: &StreamingEventContext<'_>,
     end: ToolLoopEnd,
-) -> bool {
-    let mut final_response = match handler.snapshot_final_response() {
-        Some(resp) => resp,
-        None => {
-            warn!("Final response snapshot unavailable; skipping synthetic completion event");
-            return true;
-        }
-    };
-
-    if let Some(original_id) = handler.original_response_id() {
+) {
+    if let Some(original_id) = preserved_response_id {
         if let Some(obj) = final_response.as_object_mut() {
             obj.insert("id".to_string(), Value::String(original_id.to_string()));
         }
     }
 
     if let Some(session) = ctx.session {
-        inject_mcp_metadata_streaming(&mut final_response, state, session);
+        inject_mcp_metadata_last(final_response, state, session);
     }
 
     // With the session, the wire hides what the record hides: the internal
     // servers' items and the calls to their tools. The asks for the session's
     // exposed tools that a limit stop leaves beside their not-executed items
     // are dropped by `end_at_tool_call_limit` below.
-    restore_original_tools(&mut final_response, ctx.original_request, ctx.session);
+    restore_original_tools(final_response, ctx.original_request, ctx.session);
     patch_response_with_request_metadata(
-        &mut final_response,
+        final_response,
         ctx.original_request,
         ctx.previous_response_id,
     );
 
-    if let Some(obj) = final_response.as_object_mut() {
-        obj.insert("status".to_string(), Value::String("completed".to_string()));
-    }
     if end == ToolLoopEnd::ToolCallLimit {
-        end_at_tool_call_limit(&mut final_response, ctx.original_request);
+        end_at_tool_call_limit(final_response, ctx.original_request);
     }
+}
+
+/// Send the `response.completed` event that ends the tool loop's stream with
+/// the shaped final response. The event's response reads `completed` for
+/// either end of the loop; the value keeps the status it carried afterwards,
+/// so the record stores what the upstream said. Returns false if the client
+/// disconnected.
+pub(super) async fn send_final_response_event(
+    final_response: &mut Value,
+    tx: &SseSender,
+    enc: &mut SseEncoder,
+    sequence_number: &mut u64,
+) -> bool {
+    let upstream_status = final_response
+        .as_object_mut()
+        .map(|obj| obj.insert("status".to_string(), Value::String("completed".to_string())));
 
     let sequence = *sequence_number;
     *sequence_number += 1;
     let completed_payload = CompletedEventPayload {
         event_type: ResponseEvent::COMPLETED,
         sequence_number: sequence,
-        response: &final_response,
+        response: final_response,
     };
 
-    match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
+    let sent = match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
         Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
         Err(e) => {
             warn!("failed to encode response.completed via SseEncoder, falling back: {e}");
@@ -617,7 +620,19 @@ pub(super) async fn send_final_response_event(
             );
             tx.send(Ok(Bytes::from(completed_event))).await.is_ok()
         }
+    };
+
+    if let (Some(previous), Some(obj)) = (upstream_status, final_response.as_object_mut()) {
+        match previous {
+            Some(status) => {
+                obj.insert("status".to_string(), status);
+            }
+            None => {
+                obj.remove("status");
+            }
+        }
     }
+    sent
 }
 
 /// The `response.completed` event's payload, serialised onto the wire from
@@ -1189,51 +1204,41 @@ pub(super) fn handle_streaming_with_tool_interception(
         };
 
         // The loop's end, answered or stopped at the tool-call allowance: the
-        // terminal event, the record, the sentinel.
-        if !send_final_response_event(
-            &handler,
-            &tx,
-            &mut sse_encoder,
-            &mut sequence_number,
+        // final response once, shaped once, the terminal event from it, the
+        // same value the record, the sentinel.
+        let mut final_response = match handler.accumulator.into_final_response() {
+            Some(resp) => resp,
+            None => {
+                warn!("Final response unavailable; skipping synthetic completion event");
+                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
+                return;
+            }
+        };
+        shape_final_response(
+            &mut final_response,
+            preserved_response_id.as_deref(),
             &mut state,
             &streaming_ctx,
             end,
+        );
+        if !send_final_response_event(
+            &mut final_response,
+            &tx,
+            &mut sse_encoder,
+            &mut sequence_number,
         )
         .await
         {
             return;
         }
 
-        let final_response_json = if should_store {
-            handler.accumulator.into_final_response()
-        } else {
-            None
-        };
-
-        if let Some(mut response_json) = final_response_json {
-            if let Some(ref id) = preserved_response_id {
-                if let Some(obj) = response_json.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.clone()));
-                }
-            }
-            inject_mcp_metadata_last(&mut response_json, &mut state, &session);
-
-            restore_original_tools(&mut response_json, &original_request, Some(&session));
-            patch_response_with_request_metadata(
-                &mut response_json,
-                &original_request,
-                previous_response_id.as_deref(),
-            );
-            if end == ToolLoopEnd::ToolCallLimit {
-                end_at_tool_call_limit(&mut response_json, &original_request);
-            }
-
+        if should_store {
             // Always persist conversation items and response (even without conversation)
             if let Err(err) = persist_conversation_items(
                 storage.conversation.clone(),
                 storage.conversation_item.clone(),
                 storage.response.clone(),
-                &response_json,
+                &final_response,
                 &original_request,
                 storage.tenant.as_deref(),
                 storage.request_context.clone(),
@@ -1330,6 +1335,48 @@ mod tests {
 
     use super::*;
 
+    /// The terminal event says `completed` on the wire whatever the shaped
+    /// value carries, and the value is left as it was once the event is out:
+    /// an upstream `incomplete` stays `incomplete` for the record, a value
+    /// without a status gets none.
+    #[tokio::test]
+    async fn the_terminal_event_writes_completed_on_the_wire_and_leaves_the_value_its_own_status() {
+        for (own_status, expected_after) in [
+            (Some("incomplete"), Some(json!("incomplete"))),
+            (None, None),
+        ] {
+            let mut final_response = json!({"id": "resp_1", "object": "response", "output": []});
+            if let Some(status) = own_status {
+                final_response["status"] = json!(status);
+            }
+            let (tx, mut rx) = sse_channel();
+            let mut enc = SseEncoder::new();
+            let mut sequence_number = 3;
+            assert!(
+                send_final_response_event(&mut final_response, &tx, &mut enc, &mut sequence_number)
+                    .await
+            );
+            drop(tx);
+            let frame = rx.recv().await.expect("the terminal").expect("a frame");
+            let frame = String::from_utf8(frame.to_vec()).expect("utf-8");
+            let data = frame
+                .strip_prefix("event: response.completed\ndata: ")
+                .expect("the completed event");
+            let event: Value = serde_json::from_str(data.trim_end()).expect("json");
+            assert_eq!(
+                event["response"]["status"],
+                json!("completed"),
+                "{own_status:?}"
+            );
+            assert_eq!(sequence_number, 4, "{own_status:?}");
+            assert_eq!(
+                final_response.get("status").cloned(),
+                expected_after,
+                "the value keeps its own status once the event is out"
+            );
+        }
+    }
+
     /// The terminal of a loop stopped at the request's tool-call allowance
     /// is the terminal of an answered loop, `response.completed` with the
     /// response `completed` at the stream's own sequence number, plus the
@@ -1350,27 +1397,36 @@ mod tests {
             mcp_format_registry: None,
         };
         let mut state = ToolLoopState::new(Vec::new());
-        let mut handler = StreamingToolHandler::with_starting_index(0);
-        handler.accumulator.ingest_block(
+        let created =
             "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\
              \"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\
-             \"model\":\"m\",\"status\":\"in_progress\",\"output\":[]}}",
-        );
+             \"model\":\"m\",\"status\":\"in_progress\",\"output\":[]}}";
 
         let mut frames = Vec::new();
         for end in [ToolLoopEnd::Answered, ToolLoopEnd::ToolCallLimit] {
             let (tx, mut rx) = sse_channel();
             let mut enc = SseEncoder::new();
             let mut sequence_number = 7;
+            let mut handler = StreamingToolHandler::with_starting_index(0);
+            handler.accumulator.ingest_block(created);
+            let preserved_id = handler.original_response_id().map(str::to_string);
+            let mut final_response = handler
+                .accumulator
+                .into_final_response()
+                .expect("the final response");
+            shape_final_response(
+                &mut final_response,
+                preserved_id.as_deref(),
+                &mut state,
+                &ctx,
+                end,
+            );
             assert!(
                 send_final_response_event(
-                    &handler,
+                    &mut final_response,
                     &tx,
                     &mut enc,
                     &mut sequence_number,
-                    &mut state,
-                    &ctx,
-                    end,
                 )
                 .await
             );
@@ -2102,7 +2158,7 @@ mod tests {
                 "type": "response.completed", "sequence_number": 3,
                 "response": {
                     "id": "resp_1", "object": "response", "created_at": 1, "model": "m",
-                    "status": "completed", "output": items
+                    "status": "incomplete", "output": items
                 }
             })
         );
@@ -2200,7 +2256,11 @@ mod tests {
             stored.raw_response["output"], on_the_wire["output"],
             "the record and the wire carry the same items"
         );
-        assert_eq!(stored.raw_response["status"], json!("completed"));
+        assert_eq!(
+            stored.raw_response["status"],
+            json!("incomplete"),
+            "the record keeps the status the upstream reported; the wire said completed"
+        );
         assert!(stream.ends_with("data: [DONE]\n\n"), "{stream}");
     }
 }
