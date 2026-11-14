@@ -20,7 +20,7 @@ mod thinking_display;
 mod usage;
 mod usage_chunk;
 
-use super::*;
+use super::{frames::TextDelta, *};
 
 /// The frames write exactly the bytes of the serialized whole chunk
 /// structs, so a field added to a struct turns up here, not on the wire
@@ -628,5 +628,77 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
     assert_eq!(
         formatted(&stop),
         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"
+    );
+}
+
+/// The chat writer stops at the flush bound and resumes: a step of many
+/// events (content and reasoning in turns, since consecutive content events
+/// merge on push) is written by calls that each return at the bound, the
+/// caller splitting the frame off between them, and the frames hold every
+/// event's text in order, each frame at most the bound plus the event that
+/// crossed it.
+#[test]
+fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
+    const EVENTS: usize = 600;
+    const ONE_EVENT: usize = 1024;
+    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
+    let texts: Vec<String> = (0..EVENTS)
+        .map(|i| {
+            format!(
+                "{}{i:04}-{}",
+                if i % 2 == 0 { 'c' } else { 'r' },
+                "x".repeat(40)
+            )
+        })
+        .collect();
+    let mut events = Events::new();
+    for (i, text) in texts.iter().enumerate() {
+        let text = symphony::event::Text::new(text.as_str(), 1);
+        if i % 2 == 0 {
+            events.push(Event::Content(text));
+        } else {
+            events.push(Event::Reasoning(text));
+        }
+    }
+    let mut buffer = BytesMut::new();
+    let mut logprobs = None;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut pending = events.consume();
+    while StreamingProcessor::write_events(
+        &mut buffer,
+        &frame,
+        0,
+        &mut pending,
+        &mut logprobs,
+        None,
+        false,
+    ) {
+        assert!(
+            buffer.len() >= CHUNK_FLUSH_BYTES && buffer.len() < CHUNK_FLUSH_BYTES + ONE_EVENT,
+            "the writer returned at the bound: {} bytes",
+            buffer.len()
+        );
+        frames.push(buffer.split().to_vec());
+    }
+    drop(pending);
+    frames.push(buffer.split().to_vec());
+    assert!(
+        frames.len() > 2,
+        "the step left in more than two frames: {}",
+        frames.len()
+    );
+    let all: Vec<u8> = frames.concat();
+    let mut at = 0;
+    for text in &texts {
+        let found = all[at..]
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .unwrap_or_else(|| panic!("{text} missing or out of order"));
+        at += found + text.len();
+    }
+    assert_eq!(
+        all.windows(6).filter(|&window| window == b"data: ").count(),
+        EVENTS,
+        "every event left exactly once across the flushes"
     );
 }
