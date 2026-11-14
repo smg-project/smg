@@ -159,6 +159,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the ids without a word. The
   request's media read (`GenerateRequest::media_fields`, `carries_media`) is one definition here,
   read by the gRPC path's media refusal as well.
+- A built-in `range` or `length` rule that carries no message of its own answers a sentence in the
+  routes' form (`Invalid 'dimensions': integer below minimum value. Expected an integer >= 1, but got 0
+  instead.`) instead of the validation library's rendering of the rule's name and parameters
+  (`Validation error: range [{"min": Number(1), "value": Number(0)}]`); the code and param are
+  unchanged. Every such rule of the crate (`dimensions`, the sampling parameters, ...) answers this way.
 - Interactions content takes every MIME type the public API names: audio in `audio/mpeg`, `m4a`,
   `l16`, `opus`, `alaw`, `mulaw` and `webm`; images in `gif`, `bmp` and `tiff`; documents in
   `text/csv` and the Office and OpenDocument formats beside PDF. Each was an unknown variant that
