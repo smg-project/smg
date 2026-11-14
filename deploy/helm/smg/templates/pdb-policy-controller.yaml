@@ -1,0 +1,16 @@
+{{- if (.Values.policyController).enabled }}
+{{- if .Values.policyController.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+spec:
+  minAvailable: {{ .Values.policyController.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "smg.policyControllerSelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- end }}

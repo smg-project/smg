@@ -61,6 +61,7 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 | `global` | Image registry, pull secrets |
 | `router` | Router deployment, routing policy, networking, observability |
 | `workers` | Worker (inference engine) deployments |
+| `policyController` | The standalone policy controller: its Deployment and Service, off by default |
 | `huggingface` | HuggingFace token for gated model downloads |
 | `auth` | API key authentication, control-plane keys, rate limiting |
 | `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL or credentials come from |
@@ -386,6 +387,28 @@ workers:
 
 Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over. The worker Deployment's rollout deadline follows the budget (`initialDelaySeconds + failureThreshold * periodSeconds`, plus 600 s for what runs on the rollout's clock before the probe's starts: the node's provisioning, the image pull, the container start), so `kubectl rollout status`, Argo CD, Flux and `helm --wait` do not report a worker still loading within its budget as a failed rollout. On an autoscaled GPU pool or with a cold image cache, where the node and a multi-GB pull can take longer than that margin, set `progressDeadlineSeconds` on the worker entry past them; it overrides the default.
 
+#### Policy Controller
+
+`policyController.enabled` deploys the standalone policy controller (`smg-policy-controller`) beside the router: a Deployment and one Service, `<fullname>-policy-controller`. The controller runs on its own today: it serves its probes and its metrics and runs the load path, and nothing in the chart points the router at it. The specification document's mount, the election's Lease with its Role, and replication join the chart with the controller release that reads each.
+
+No controller image is published yet. Build the `smg-policy-controller` binary into an image of your own and name it: `policyController.image.repository` and `policyController.image.tag` have no default, and the chart refuses to render the controller without them. `policyController.image.registry` falls back to `global.image.registry`. A `null` removes a value's default, so with the controller on the schema refuses it for the values the templates need (the four ports, `logging.level`, the probes' paths, `shutdownGracePeriodSeconds` and `podDisruptionBudget.minAvailable`) and for `securityContext`. With the controller off the block is not read, so `helm upgrade --reuse-values` on a release from before the block renders as before. To turn the controller on in such an upgrade, use `--reset-then-reuse-values` (Helm 3.14 and later) or pass the chart's whole `policyController` block in a values file: reused values hold none of the block's defaults, and an upgrade that only answers the schema runs without four of them: the replica count, the worker threads, the grace margin and the probes' timings.
+
+| Value | Default | What it sets |
+|-------|---------|--------------|
+| `policyController.replicas` | `1` | Replicas. The controller does not elect a leader yet, so every replica is a controller of its own: keep one. |
+| `policyController.ports.gateway`, `.control`, `.replication`, `.admin` | `30100`, `30101`, `30102`, `30103` | The listeners' container ports, passed as `--gateway-listen`, `--control-listen`, `--replication-listen` and `--admin-listen`. |
+| `policyController.service.type`, `.annotations` | `ClusterIP`, `{}` | The Service, with three ports on the listeners' own numbers: `grpc` (the gateways' listener), `control` (the operators') and `metrics` (the admin listener). The standbys' listener has no Service. |
+| `policyController.logging.level`, `.json` | `info`, `false` | `--log-level` (`debug`, `info`, `warn` or `error`) and `--log-json`. |
+| `policyController.runtimeWorkerThreads` | `2` | `--runtime-worker-threads`. The controller's own default is one worker thread for every CPU it may use, which with no CPU limit is every core of the node. Raise it with the CPU limit; `null` leaves the flag out, so the count follows the limit. |
+| `policyController.shutdownGracePeriodSeconds` | `30` | `--shutdown-grace-period-secs`. The pod's `terminationGracePeriodSeconds` is this plus `policyController.terminationGraceMarginSeconds` (10). |
+| `policyController.shutdownSettleSeconds` | `null` | `--shutdown-settle-secs`; `null` keeps the controller's default of 5 seconds. |
+| `policyController.podDisruptionBudget.enabled`, `.minAvailable` | `false`, `1` | A PodDisruptionBudget over the controller's pods. With one replica, `minAvailable: 1` lets no pod be evicted and a node drain waits on it for ever, as with the router's budget: run two replicas or more, or leave the budget off. |
+| `policyController.livenessProbe`, `.readinessProbe` | `/liveness`, `/readiness` | `httpGet` probes on the admin port, with `initialDelaySeconds` and `periodSeconds`. |
+| `policyController.securityContext` | the router's | The container's security context. With the controller on the schema refuses a `null` here: to run with none, set each member to `null`. |
+| `policyController.resources`, `.nodeSelector`, `.tolerations`, `.affinity`, `.podAnnotations`, `.podLabels`, `.extraArgs`, `.extraEnv` | | As the router's values of the same names. |
+
+With `router.metrics.serviceMonitor.enabled`, a third ServiceMonitor scrapes the Service's `metrics` port under the same interval and labels. With more than one replica and no `policyController.affinity`, the chart prefers one replica a node. The pod mounts no service account token: the controller calls no Kubernetes API yet. The chart refuses at render what the controller refuses at start: two listeners on one port, and a settle window over half the grace period. See [`with-policy-controller.yaml`](examples/with-policy-controller.yaml).
+
 ## Examples
 
 | File | Scenario |
@@ -402,6 +425,7 @@ Size the budget past the longest load you expect: a startup probe that fails for
 | [`with-slurm-discovery.yaml`](examples/with-slurm-discovery.yaml) | Workers on Slurm job nodes (custom image) |
 | [`with-ingress.yaml`](examples/with-ingress.yaml) | Ingress with TLS |
 | [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard + PrometheusRule |
+| [`with-policy-controller.yaml`](examples/with-policy-controller.yaml) | The standalone policy controller beside the router |
 
 ## Testing
 

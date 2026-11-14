@@ -978,3 +978,87 @@ Used by smg.routerArgs when workers are defined but workerUrls is empty.
 - "{{ $scheme }}://{{ include "smg.fullname" $ }}-worker-{{ $worker.name }}:{{ $port }}"
 {{- end }}
 {{- end }}
+
+{{/*
+Policy controller name -- its Deployment, its Service, its budget and its
+ServiceMonitor.
+*/}}
+{{- define "smg.policyControllerName" -}}
+{{- printf "%s-policy-controller" (include "smg.fullname" .) -}}
+{{- end }}
+
+{{/*
+Policy controller selector labels -- the release's selector labels with the
+controller's own component, so no router or worker selector takes its pods.
+*/}}
+{{- define "smg.policyControllerSelectorLabels" -}}
+{{ include "smg.selectorLabels" . }}
+app.kubernetes.io/component: policy-controller
+{{- end }}
+
+{{/*
+Policy controller image -- policyController.image, its registry falling back
+to the global one. The repository and the tag have no default: no controller
+image is published yet.
+*/}}
+{{- define "smg.policyControllerImage" -}}
+{{- $image := .Values.policyController.image -}}
+{{- if or (not $image.repository) (not $image.tag) -}}
+{{- fail "policyController.enabled needs policyController.image.repository and policyController.image.tag: no controller image is published yet, so neither has a default" -}}
+{{- end -}}
+{{- printf "%s/%s:%s" ($image.registry | default .Values.global.image.registry) $image.repository $image.tag -}}
+{{- end }}
+
+{{/*
+Policy controller CLI arguments -- every argument is a flag of
+smg-policy-controller, each from a value. The controller's id is not here:
+the flag reads HOSTNAME, the pod's name. What the controller refuses at
+start is refused at render: two listeners on one port, and a settle window
+over half the grace period (the controller's own default of 5 seconds when
+shutdownSettleSeconds is null).
+*/}}
+{{- define "smg.policyControllerArgs" -}}
+{{- $controller := .Values.policyController -}}
+{{- $seen := dict -}}
+{{- range $listener := list "gateway" "control" "replication" "admin" -}}
+{{- $port := index $controller.ports $listener | int | toString -}}
+{{- with index $seen $port -}}
+{{- fail (printf "policyController.ports.%s %s equals policyController.ports.%s: the controller refuses two listeners on one port" $listener $port .) -}}
+{{- end -}}
+{{- $_ := set $seen $port $listener -}}
+{{- end -}}
+{{- $grace := int $controller.shutdownGracePeriodSeconds -}}
+{{- $settle := 5 -}}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) -}}
+{{- $settle = int $controller.shutdownSettleSeconds -}}
+{{- end -}}
+{{- if gt (mul $settle 2) $grace -}}
+{{- fail (printf "policyController: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
+{{- end -}}
+- "--gateway-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.gateway) | quote }}
+- "--control-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.control) | quote }}
+- "--replication-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.replication) | quote }}
+- "--admin-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.admin) | quote }}
+- "--shutdown-grace-period-secs"
+- {{ $grace | quote }}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) }}
+- "--shutdown-settle-secs"
+- {{ $settle | quote }}
+{{- end }}
+{{- with $controller.runtimeWorkerThreads }}
+- "--runtime-worker-threads"
+- {{ . | quote }}
+{{- end }}
+- "--log-level"
+- {{ $controller.logging.level | quote }}
+{{- if $controller.logging.json }}
+- "--log-json"
+{{- end }}
+{{- range $controller.extraArgs }}
+- {{ . | quote }}
+{{- end }}
+{{- end }}
