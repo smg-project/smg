@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use zeromq::{PubSocket, RouterSocket, SocketEvent};
 
 use super::{golden, *};
-use crate::kv_wire::WireBatch;
+use crate::{kv_state::CHUNK_BLOCKS, kv_wire::WireBatch};
 
 /// A state the relay reads loads from: one rank's fixed record and a
 /// fresh engine link (nothing reported yet).
@@ -2297,7 +2297,7 @@ async fn a_676k_block_snapshot_is_cut_atomically_and_does_not_stall_the_live_str
     let count = u32::try_from(chunks.len()).unwrap();
     assert_eq!(
         count as usize,
-        (blocks_at_cut as usize).div_ceil(crate::kv_state::CHUNK_BLOCKS)
+        (blocks_at_cut as usize).div_ceil(CHUNK_BLOCKS)
     );
     for (index, chunk) in chunks.iter().enumerate() {
         assert_eq!(
