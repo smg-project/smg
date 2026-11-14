@@ -298,6 +298,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // directly, nothing after the close); its prompt ends bare (the model writes its own thought),
     // and thinking off closes it in the prompt as `<think></think>`.
     ("naive-n0.5-flash", GenerationPrompt::ModelWritesTheThought),
+    // flint writes GLM's keyed calls with nothing between the tags under a bare marker frame; its
+    // prompt ends bare at `<|assistant|>` under every kwarg (the model writes the thought or not).
+    ("flint", GenerationPrompt::ModelDecides),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
