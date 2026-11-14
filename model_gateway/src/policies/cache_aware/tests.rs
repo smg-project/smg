@@ -5,7 +5,14 @@ use tokio::sync::watch;
 use tracing_test::traced_test;
 
 use super::*;
-use crate::{policies::test_support::make_workers, worker::load_state::TestFeed};
+use crate::{
+    config::{PolicyConfig, PowerOfTwoLoadMetric},
+    policies::{
+        test_support::{make_worker, make_workers},
+        PolicyRegistry, PowerOfTwoPolicy,
+    },
+    worker::load_state::TestFeed,
+};
 
 #[test]
 fn text_is_wanted_only_without_token_ids() {
@@ -3500,6 +3507,140 @@ fn event_spill_credits_only_expected_wait_final_worker() {
     let selected = route_tokens(&policy, &workers, &tokens);
     assert_only_final_worker_credited(&policy, &workers, 2, 4);
     assert_eq!(selected, 2, "spill must use expected wait over the fleet");
+}
+
+/// The password and the query token in the addresses the trace pin
+/// registers.
+const ADDRESS_SECRET: &str = "s3cret";
+
+/// Workers registered with a credential in the address, one a host: a
+/// password in the userinfo and a token in the query.
+fn workers_with_a_credential(hosts: &[&str]) -> Vec<Arc<dyn Worker>> {
+    hosts
+        .iter()
+        .map(|host| {
+            make_worker(&format!(
+                "http://user:{ADDRESS_SECRET}@{host}:8000/v1?token={ADDRESS_SECRET}"
+            ))
+        })
+        .collect()
+}
+
+/// No row of the cache trace carries a worker's registered address whole.
+/// The workers are registered with a password and a query token, and every
+/// row kind is written: a row's candidates and its selected worker, a score
+/// row of each of the four sources, and both gate rows. Each names its
+/// worker masked, the host and the port kept; the credential is in no row
+/// and not in the response header.
+#[tokio::test]
+async fn no_row_of_the_cache_trace_carries_a_registered_address_whole() {
+    let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+    let select = |policy: Arc<dyn LoadBalancingPolicy>,
+                  workers: &[Arc<dyn Worker>],
+                  info: &SelectWorkerInfo| {
+        registry
+            .select_worker_for_model(&policy, "unknown", workers, info)
+            .expect("a worker is selected");
+    };
+    let (rows, header) = cache_trace::scope(true, async {
+        // Least load: an expected-wait score row a candidate.
+        let workers = workers_with_a_credential(&["a", "b"]);
+        let plain = SelectWorkerInfo::default();
+        select(Arc::new(LeastLoadPolicy::new()), &workers, &plain);
+        // Power of two over resident tokens: a resident-work score row a
+        // candidate.
+        let resident = PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 1 };
+        let power_of_two = PowerOfTwoPolicy::with_load_metric(resident);
+        select(Arc::new(power_of_two), &workers, &plain);
+        // Cache aware over the string tree: `w4` is overloaded (the
+        // eligibility gate), `w1` holds the prefix under a load that spills
+        // it (the spill gate), and the scores of the tree and of the
+        // selection policy are written before the expected wait picks.
+        let policy = Arc::new(CacheAwarePolicy::with_config(test_config()));
+        let workers = workers_with_a_credential(&["w1", "w2", "w3", "w4"]);
+        workers[3].set_overloaded(true);
+        let text = "shared string prefix that must spill";
+        seed_string_tenants(&policy, &workers, text, &[workers[0].url()]);
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+        for _ in 0..10 {
+            workers[2].increment_load();
+        }
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..Default::default()
+        };
+        select(policy, &workers, &info);
+
+        let rows = cache_trace::captured_selections();
+        let header = cache_trace::dispatch(Some("root"), 1, Vec::new(), true, "regular");
+        (rows, header)
+    })
+    .await;
+
+    // What each row kind names as its worker.
+    let mut named = Vec::new();
+    for row in &rows {
+        named.push(("selected".to_string(), &row["worker"]));
+        for candidate in row["candidates"].as_array().into_iter().flatten() {
+            named.push(("candidate".to_string(), &candidate["worker"]));
+        }
+        for score in row["scores"].as_array().into_iter().flatten() {
+            let source = score["source"].as_str().unwrap_or_default();
+            named.push((format!("score {source}"), &score["worker"]));
+        }
+        for gate in row["gates"].as_array().into_iter().flatten() {
+            let kind = if gate["phase"] == "eligibility" {
+                "gate eligibility"
+            } else {
+                "gate spill"
+            };
+            named.push((kind.to_string(), &gate["worker"]));
+        }
+    }
+    let mut unmasked: Vec<String> = named
+        .iter()
+        .filter(|(_, worker)| {
+            let worker = worker.as_str().unwrap_or_default();
+            !(worker.starts_with("http://***@") && worker.ends_with(":8000/v1"))
+        })
+        .map(|(kind, worker)| format!("{kind}: {worker}"))
+        .collect();
+    unmasked.sort_unstable();
+    unmasked.dedup();
+    assert!(
+        unmasked.is_empty(),
+        "rows that do not name their worker masked, with its host and port: {unmasked:#?}"
+    );
+    let mut kinds: Vec<&str> = named.iter().map(|(kind, _)| kind.as_str()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        [
+            "candidate",
+            "gate eligibility",
+            "gate spill",
+            "score approximate_tree",
+            "score expected_wait",
+            "score policy_affinity",
+            "score resident_work",
+            "selected",
+        ],
+        "the row kinds the selections wrote"
+    );
+    let written = serde_json::to_string(&rows).expect("the rows are JSON");
+    assert!(
+        !written.contains(ADDRESS_SECRET),
+        "a trace row carries the credential: {written}"
+    );
+    let header = header.expect("the request asked for its header");
+    assert!(
+        !header.contains(ADDRESS_SECRET),
+        "the trace header carries the credential: {header}"
+    );
 }
 
 #[test]
