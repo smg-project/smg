@@ -1511,7 +1511,7 @@ fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
     assert!(kept.for_worker("http://w").is_empty(), "a removal");
     kept.for_worker("http://w")
         .insert(Arc::from("m"), metrics::Counter::noop());
-    Metrics::worker_registered("http://new");
+    Metrics::worker_registered("http://new", "id-new");
     assert!(kept.for_worker("http://w").is_empty(), "a registration");
 }
 

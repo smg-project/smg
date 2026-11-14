@@ -2237,7 +2237,7 @@ impl WorkerRegistry {
         // writes for health, HTTP/2 and breaker state preceded this
         // registration and were dropped if the address was retired by an
         // earlier removal, so they are repeated here.
-        Metrics::worker_registered(worker.url());
+        Metrics::worker_registered(worker.url(), worker_id.as_str());
         Metrics::set_worker_health(worker.url(), worker.is_healthy());
         Metrics::set_worker_http2(worker.url(), worker.http2());
         Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
