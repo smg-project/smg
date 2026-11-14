@@ -24,9 +24,19 @@ use super::{frames::TextDelta, *};
 
 /// The frames write exactly the bytes of the serialized whole chunk
 /// structs, so a field added to a struct turns up here, not on the wire
-/// of the per-token chunks alone.
+/// of the per-token chunks alone. The completion choice, written in one
+/// pass, is pinned over the shapes the stream writes: texts that need
+/// escaping (quotes, a backslash, control bytes, a tab, a newline, a
+/// carriage return, characters of two, three and four bytes, a line
+/// separator, an empty text, a JSON-looking text), four indices, the
+/// logprobs absent and present (a missing and a non-finite value among
+/// them; a top-logprobs entry present, missing and empty) and the finish
+/// reason absent, `stop` and `length`, with and without the fingerprint and
+/// the usage placeholder.
 #[test]
 fn chunk_frames_write_the_bytes_of_the_whole_structs() {
+    use openai_protocol::common::LogProbs;
+
     fn event(frame: &BytesMut) -> Vec<u8> {
         frame
             .strip_prefix(b"data: ")
@@ -34,22 +44,32 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
             .expect("one SSE data event")
             .to_vec()
     }
+    let texts = [
+        "",
+        "a",
+        " ",
+        "hello world",
+        "he said \"hi\" \\ done",
+        "\ttab\nnewline\rreturn",
+        "\u{0}\u{1f}\u{7f}",
+        " caf\u{e9}",
+        " \u{65e5}\u{672c}\u{8a9e}",
+        " \u{1f600}",
+        " \u{2028}",
+        "<|im_end|>",
+        "{\"json\":[1,2]}",
+    ];
+    let logprobs = LogProbs {
+        tokens: vec!["he".to_string(), " said".to_string(), " \"hi\"".to_string()],
+        token_logprobs: vec![Some(-0.25), None, Some(f32::NEG_INFINITY)],
+        top_logprobs: vec![
+            Some(HashMap::from([("he".to_string(), -0.25)])),
+            None,
+            Some(HashMap::new()),
+        ],
+        text_offset: vec![0, 2, 7],
+    };
     for fingerprint in [None, Some("v7")] {
-        let choice = CompletionStreamChoice {
-            text: "he said \"hi\"\n".to_string(),
-            index: 1,
-            logprobs: None,
-            finish_reason: Some("stop".to_string()),
-        };
-        let whole = CompletionStreamResponse {
-            id: "cmpl-1".to_string(),
-            object: "text_completion".to_string(),
-            created: 1_700_000_000,
-            choices: vec![choice.clone()],
-            model: "model-x".to_string(),
-            system_fingerprint: fingerprint.map(str::to_string),
-            usage: None,
-        };
         for usage_null_placeholder in [false, true] {
             let frame = CompletionChunkFrame::new(
                 "cmpl-1",
@@ -58,19 +78,42 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
                 fingerprint,
                 usage_null_placeholder,
             );
-            let mut buffer = BytesMut::new();
-            frame.write_chunk(&mut buffer, &choice);
-            // The placeholder goes where a serialized `usage` would: last.
-            let mut expected = serde_json::to_vec(&whole).unwrap();
-            if usage_null_placeholder {
-                expected.pop();
-                expected.extend_from_slice(b",\"usage\":null}");
+            for text in texts {
+                for index in [0u32, 1, 7, u32::MAX] {
+                    for with_logprobs in [false, true] {
+                        for finish_reason in [None, Some("stop"), Some("length")] {
+                            let choice = CompletionStreamChoice {
+                                text: text.to_string(),
+                                index,
+                                logprobs: with_logprobs.then(|| logprobs.clone()),
+                                finish_reason: finish_reason.map(str::to_string),
+                            };
+                            let whole = CompletionStreamResponse {
+                                id: "cmpl-1".to_string(),
+                                object: "text_completion".to_string(),
+                                created: 1_700_000_000,
+                                choices: vec![choice.clone()],
+                                model: "model-x".to_string(),
+                                system_fingerprint: fingerprint.map(str::to_string),
+                                usage: None,
+                            };
+                            let mut buffer = BytesMut::new();
+                            frame.write_chunk(&mut buffer, &choice);
+                            // The placeholder goes where a serialized `usage` would: last.
+                            let mut expected = serde_json::to_vec(&whole).unwrap();
+                            if usage_null_placeholder {
+                                expected.pop();
+                                expected.extend_from_slice(b",\"usage\":null}");
+                            }
+                            assert_eq!(
+                                event(&buffer),
+                                expected,
+                                "completion {text:?} index {index} logprobs {with_logprobs} finish {finish_reason:?}, fingerprint {fingerprint:?}, placeholder {usage_null_placeholder}"
+                            );
+                        }
+                    }
+                }
             }
-            assert_eq!(
-                event(&buffer),
-                expected,
-                "completion, fingerprint {fingerprint:?}, placeholder {usage_null_placeholder}"
-            );
         }
 
         let choice = assistant_choice(0, Some("tok".to_string()), None, None);
