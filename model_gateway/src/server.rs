@@ -2687,9 +2687,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         // then a second for propagation, then the gossip loop stops), so
         // they know as soon as this member stops serving, instead of finding
         // out from failed probes once it is gone. The leave gets the window
-        // and no more (with no window, what the grace allows); cut short, its
-        // broadcast tasks run on and the gossip loop is stopped by
-        // `stop_mesh`.
+        // and no more (with no window, what the grace allows); cut short, the
+        // pings it still had pending are dropped with it (no dial outlives
+        // the call) and the gossip loop is stopped by `stop_mesh`.
         let leave_mesh = async {
             if let Some(mesh) = &mesh_handler {
                 if let Err(e) = mesh.graceful_shutdown().await {
@@ -2699,7 +2699,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         };
         // The leave's own stop of the gossip loop did not run: stop it as a
         // finished leave would have, so both paths end the same way; the
-        // broadcast tasks the leave spawned run on.
+        // pings the leave still had pending went with it.
         let stop_mesh = || {
             if let Some(mesh) = &mesh_handler {
                 mesh.shutdown();
@@ -2838,8 +2838,8 @@ async fn graceful_shutdown(
         stop_mesh();
         if !budget.grace.is_zero() {
             info!(
-                "Leaving the mesh was cut short by the settle window; its broadcast runs on \
-                 and the gossip loop is stopped now"
+                "Leaving the mesh was cut short by the settle window; its pending pings were \
+                 dropped and the gossip loop is stopped now"
             );
         }
     }
