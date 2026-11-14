@@ -182,6 +182,45 @@ pub(crate) async fn ensure_mcp_connection(
     Ok((false, Vec::new()))
 }
 
+/// Refuse a Responses request with a function or custom tool, alone or in a
+/// namespace, that only code may call (`allowed_callers` without `direct`).
+/// This router runs no programmatic tool calls, and its chat template offers
+/// the model every function tool it is handed, so it could serve such a tool
+/// only as one the model calls directly, which the request forbids.
+pub(crate) fn refuse_tools_without_a_direct_caller(
+    tools: Option<&[ResponseTool]>,
+) -> Option<Response> {
+    let refused_at = |idx: usize, tool: &ResponseTool| match tool {
+        ResponseTool::Function(ft) => (!ft.allows_direct_calls()).then(|| format!("tools[{idx}]")),
+        ResponseTool::Custom(ct) => (!ct.allows_direct_calls()).then(|| format!("tools[{idx}]")),
+        ResponseTool::Namespace(namespace) => {
+            namespace
+                .tools
+                .iter()
+                .enumerate()
+                .find_map(|(member_idx, member)| {
+                    let direct = match member {
+                        NamespaceTool::Function(ft) => ft.allows_direct_calls(),
+                        NamespaceTool::Custom(ct) => ct.allows_direct_calls(),
+                    };
+                    (!direct).then(|| format!("tools[{idx}].tools[{member_idx}]"))
+                })
+        }
+        _ => None,
+    };
+    let at = tools
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, tool)| refused_at(idx, tool))?;
+    Some(error::bad_request(
+        "tool_not_supported",
+        format!(
+            "Invalid '{at}.allowed_callers': this backend runs no programmatic tool calls, so a tool must allow the 'direct' caller."
+        ),
+    ))
+}
+
 /// Validate that workers are available for the requested model.
 ///
 /// Runs on the client-supplied name, before the pipeline canonicalizes it, so
@@ -225,7 +264,7 @@ pub(crate) fn extract_tools_from_response_tools(
         .flat_map(|tool| match tool {
             ResponseTool::Function(ft) => vec![Tool {
                 tool_type: "function".to_string(),
-                function: ft.function.clone(),
+                function: ft.chat_function(),
             }],
             ResponseTool::Custom(ct) => vec![Tool {
                 tool_type: "function".to_string(),
@@ -236,7 +275,7 @@ pub(crate) fn extract_tools_from_response_tools(
                 .iter()
                 .map(|member| {
                     let mut function = match member {
-                        NamespaceTool::Function(ft) => ft.function.clone(),
+                        NamespaceTool::Function(ft) => ft.chat_function(),
                         NamespaceTool::Custom(ct) => custom_tool_as_function(ct),
                     };
                     function.name = format!("{}.{}", namespace.name, function.name);
@@ -1154,6 +1193,89 @@ mod tests {
             .expect("alias must stop resolving with no workers behind it");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    /// The public API's function-tool keys say how the API calls a tool, not
+    /// what the model calls, so the chat template's copy of a function tool,
+    /// alone or in a namespace, carries none of them.
+    #[test]
+    fn the_chat_templates_function_tools_leave_out_the_apis_tool_keys() {
+        let function = serde_json::json!({
+            "type": "function", "name": "lookup", "parameters": {},
+            "async": true, "defer_loading": true,
+            "output_schema": {"type": "object"}, "allowed_callers": ["direct"]
+        });
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                function.clone(),
+                {"type": "namespace", "name": "weather", "description": "Weather tools",
+                 "tools": [function]}
+            ]
+        }))
+        .unwrap();
+        let tools = extract_tools_from_response_tools(request.tools.as_deref());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lookup", "weather.lookup"]
+        );
+        for tool in &tools {
+            assert!(
+                tool.function.extra.is_empty(),
+                "{}: {:?}",
+                tool.function.name,
+                tool.function.extra
+            );
+        }
+    }
+
+    /// A tool only code may call (`allowed_callers` without `direct`) is
+    /// refused, whether a function or custom tool, alone or in a namespace,
+    /// and a tool the model may call directly is served.
+    #[test]
+    fn a_tool_without_a_direct_caller_is_refused() {
+        let request = |tools: Value| -> ResponsesRequest {
+            serde_json::from_value(json!({"model": "m", "input": "hi", "tools": tools})).unwrap()
+        };
+        let function = |callers: Value| json!({"type": "function", "name": "lookup", "parameters": {}, "allowed_callers": callers});
+        let custom =
+            |callers: Value| json!({"type": "custom", "name": "run", "allowed_callers": callers});
+        for (tools, at) in [
+            (json!([function(json!(["programmatic"]))]), "tools[0]"),
+            (json!([function(json!([]))]), "tools[0]"),
+            (
+                json!([{"type": "function", "name": "a", "parameters": {}}, custom(json!(["programmatic"]))]),
+                "tools[1]",
+            ),
+            (
+                json!([{"type": "namespace", "name": "weather", "description": "Weather tools",
+                        "tools": [function(json!(["direct"])), custom(json!(["programmatic"]))]}]),
+                "tools[0].tools[1]",
+            ),
+        ] {
+            let request = request(tools);
+            let response = refuse_tools_without_a_direct_caller(request.tools.as_deref())
+                .unwrap_or_else(|| panic!("{at} has no direct caller"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{at}");
+        }
+        for tools in [
+            json!([function(json!(["direct"]))]),
+            json!([function(json!(["direct", "programmatic"]))]),
+            json!([function(Value::Null), custom(json!(["direct"]))]),
+            json!([{"type": "function", "name": "a", "parameters": {}}, {"type": "custom", "name": "b"}]),
+        ] {
+            let request = request(tools.clone());
+            assert!(
+                refuse_tools_without_a_direct_caller(request.tools.as_deref()).is_none(),
+                "{tools}"
+            );
+        }
+        assert!(refuse_tools_without_a_direct_caller(None).is_none());
+    }
+
     #[test]
     fn namespace_function_identity_roundtrips_and_preserves_literal_names() {
         let mut request: ResponsesRequest = namespace_test_request();

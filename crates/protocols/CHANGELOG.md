@@ -94,6 +94,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses function tool declared with `async`, `defer_loading`, `output_schema` or
+  `allowed_callers`, and a custom tool declared with `async` or `allowed_callers`, as the public
+  API's tools take them, parse and are forwarded as given. The crate refused each as an unknown
+  field. The function tool's four keys are validated for shape as the custom tool's typed fields
+  are (`invalid_type` otherwise). `FunctionTool::chat_function` leaves the four keys out of the
+  copy a chat template renders, and `FunctionTool::allows_direct_calls` and
+  `CustomTool::allows_direct_calls` say whether the model may call a tool itself. Breaking:
+  `CustomTool` gains `r#async: Option<bool>` and `allowed_callers: Option<Vec<String>>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
