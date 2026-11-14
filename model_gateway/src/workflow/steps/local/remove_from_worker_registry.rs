@@ -120,6 +120,17 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
                     }
                 }
             };
+            // A pinned removal that took nothing: a worker standing under the
+            // URL now (the pinned id gone and a registration under the URL
+            // since, inside the window between the lookup above and the
+            // removal) is not this job's, and the URL leaves the job with it.
+            if outcome.is_none()
+                && pins.is_some()
+                && standing.last().copied() != Some(worker_url.as_str())
+                && registry.get_by_url(worker_url).is_some()
+            {
+                standing.push(worker_url);
+            }
             removed.extend(outcome);
         }
         let removed_count = removed.len();
