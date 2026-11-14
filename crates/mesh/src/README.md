@@ -42,7 +42,7 @@ the same values without coordination.
 
 ```
 model_gateway (model_gateway/src/mesh): adapters that bridge MeshKV
-namespaces to the worker registry, the rate limiter and the prefix tree
+namespaces to the worker registry and the prefix tree
         │
         ▼
 service.rs        MeshServerBuilder / MeshServer / MeshServerHandler:
@@ -115,7 +115,7 @@ The gateway wires these (`model_gateway/src/mesh/wiring.rs`):
 | Prefix | Kind, merge | Content | Gateway adapter |
 |---|---|---|---|
 | `worker:` | CRDT, last writer wins | `WorkerState` of every worker a member registered locally (id, model, URL, health, load, spec, owner); a tombstone when it is removed. Peers import them into their worker registry. | `adapters/worker_sync.rs` |
-| `rl:` | CRDT, epoch-max-wins | One rate-limit shard per member and counter (`rl:<counter>:<node>`): a window epoch and a count; totals are the sum of the shards at the newest epoch. | `adapters/rate_limit_sync.rs` |
+| `rl:` | CRDT, epoch-max-wins | One rate-limit shard per member and counter (`rl:<counter>:<node>`): a window epoch and a count; totals are the sum of the shards at the newest epoch. The engine is available to the embedding application; the gateway registers no `rl:` namespace today (its rate limits are per gateway). | — |
 | `config:` | CRDT, last writer wins | Built into every `MeshKV` for the embedding application; the gateway writes nothing there today. | — |
 | `td:` | stream, broadcast | Per-model deltas of the cache-aware prefix tree, one entry per model and round. | `adapters/tree_sync.rs` |
 | `tree:req:`, `tree:page:` | stream, targeted | Repair requests for a prefix a member does not know, and the pages answering them, each sent to one peer. | `adapters/tree_sync.rs` |
@@ -200,9 +200,10 @@ window it broadcasts `Leaving` to the live members
 (`MeshServerHandler::graceful_shutdown` in `service.rs`, bounded by the
 window), so they see the member leave within seconds; the broadcast dials
 the members with the node's TLS identity when the mesh has one, so it
-reaches them under mTLS too. A member that dies without that is noticed
-through the probes, `Suspected` after the first failed probe round and
-`Down` after the next.
+reaches them under mTLS too. A gateway that stops because a listener failed
+leaves the same way, from the failure. A member that dies without that is
+noticed through the probes, `Suspected` after the first failed probe round
+and `Down` after the next.
 
 Only the owner of a `worker:` key tombstones it. Without `--mesh-server-name`
 a restarted gateway comes back under a fresh random name, so the old name

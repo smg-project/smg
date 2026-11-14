@@ -17,6 +17,9 @@ use serde::{
 use serde_json::{Map, Value};
 use validator::Validate;
 
+/// The request rules that read the betas of the request beside its body
+/// ([`MessagesBetas`]), applied by the gateway's Messages handler.
+pub use crate::messages_validation::validate_with_betas;
 use crate::{
     chat::deserialize_reasoning_effort,
     common::{self, invalid, CachePartition, GenerationRequest},
@@ -128,6 +131,88 @@ impl Normalizable for CreateMessageRequest {
 pub enum MessageThread {
     Create,
     Continue { previous_message_id: String },
+}
+
+/// The betas a Messages request names in its `anthropic-beta` header, read
+/// once per request. The public API names a beta in its dated form,
+/// `name-YYYY-MM-DD`; the header may repeat, and each value may list several
+/// betas, comma separated. The set keeps the two betas the request rules
+/// ([`validate_with_betas`]) read, as flags filled in one pass over the
+/// values (no allocation per request); the request's raw headers reach the
+/// backend unchanged, dates and all, and another name is asked of the raw
+/// values through [`MessagesBetas::values_name`]. A token without the dated
+/// suffix names no beta, and a longer name that begins with a known one is
+/// another beta, not that one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessagesBetas {
+    /// `interleaved-thinking` is named.
+    interleaved_thinking: bool,
+    /// `message-threads` is named.
+    message_threads: bool,
+}
+
+impl MessagesBetas {
+    /// The beta under which `thinking.budget_tokens` may reach `max_tokens`.
+    pub const INTERLEAVED_THINKING: &'static str = "interleaved-thinking";
+    /// The beta a `thread` field needs.
+    pub const MESSAGE_THREADS: &'static str = "message-threads";
+
+    /// The set named by the header's values, each a comma-separated list.
+    pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut betas = Self::default();
+        for name in dated_beta_names(values) {
+            match name {
+                Self::INTERLEAVED_THINKING => betas.interleaved_thinking = true,
+                Self::MESSAGE_THREADS => betas.message_threads = true,
+                _ => {}
+            }
+        }
+        betas
+    }
+
+    /// Whether the header's values name `name` in its dated form: the
+    /// reading for a name the set does not keep.
+    pub fn values_name<'a>(values: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+        dated_beta_names(values).any(|named| named == name)
+    }
+
+    /// Whether the interleaved-thinking beta is named.
+    pub fn interleaved_thinking(self) -> bool {
+        self.interleaved_thinking
+    }
+
+    /// Whether the message-threads beta is named.
+    pub fn message_threads(self) -> bool {
+        self.message_threads
+    }
+}
+
+/// `-YYYY-MM-DD`, the suffix a public beta's name ends with.
+const DATED_SUFFIX_LEN: usize = 11;
+
+/// The names of the dated betas in `values`, in their order.
+fn dated_beta_names<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> impl Iterator<Item = &'a str> {
+    values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| dated_beta_name(token.trim()))
+}
+
+/// `token` as `name-YYYY-MM-DD`: its name, or `None` when the token does not
+/// end with the dated suffix (the shape alone, not the calendar).
+fn dated_beta_name(token: &str) -> Option<&str> {
+    let bytes = token.as_bytes();
+    let at = bytes.len().checked_sub(DATED_SUFFIX_LEN)?;
+    let dated = bytes[at..].iter().enumerate().all(|(i, b)| {
+        if i == 0 || i == 5 || i == 8 {
+            *b == b'-'
+        } else {
+            b.is_ascii_digit()
+        }
+    });
+    (dated && at > 0 && token.is_char_boundary(at)).then(|| &token[..at])
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
@@ -1011,7 +1096,9 @@ pub enum Tool {
     /// it and falls through, while CustomTool JSON with "type" would incorrectly
     /// match ToolSearchTool's less-restrictive shape if tried first)
     Custom(CustomTool),
-    /// Tool search tool
+    /// Tool search tool, and every other Anthropic-defined tool: a tool with a
+    /// `type` and a `name` and no `input_schema` that reads as one reads here,
+    /// its configuration kept in [`ToolSearchTool::extra`].
     ToolSearch(ToolSearchTool),
     /// Bash tool (computer use)
     Bash(BashTool),
@@ -1069,47 +1156,67 @@ pub struct InputSchema {
     pub additional: Map<String, Value>,
 }
 
-impl From<&InputSchema> for Value {
-    /// The schema as the JSON object a chat tool's `parameters` holds.
-    fn from(schema: &InputSchema) -> Self {
+impl From<InputSchema> for Value {
+    /// The schema as the JSON object a chat tool's `parameters` holds: the
+    /// properties and the additional fields move in, the `type` and the
+    /// `required` names are written as the strings they are.
+    fn from(schema: InputSchema) -> Self {
         let mut object = Map::new();
-        object.insert(
-            "type".to_string(),
-            Value::String(schema.schema_type.clone()),
-        );
-        if let Some(properties) = &schema.properties {
-            object.insert("properties".to_string(), Value::Object(properties.clone()));
+        object.insert("type".to_string(), Value::String(schema.schema_type));
+        if let Some(properties) = schema.properties {
+            object.insert("properties".to_string(), Value::Object(properties));
         }
-        if let Some(required) = &schema.required {
+        if let Some(required) = schema.required {
             object.insert(
                 "required".to_string(),
-                Value::Array(required.iter().cloned().map(Value::String).collect()),
+                Value::Array(required.into_iter().map(Value::String).collect()),
             );
         }
-        object.extend(
-            schema
-                .additional
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        object.extend(schema.additional);
         Value::Object(object)
     }
 }
 
-impl From<&CustomTool> for common::Tool {
+impl From<&InputSchema> for Value {
+    /// The same object from a borrowed schema: its fields are copied once, as
+    /// a caller that keeps its schema must.
+    fn from(schema: &InputSchema) -> Self {
+        Self::from(schema.clone())
+    }
+}
+
+impl From<CustomTool> for common::Tool {
     /// The chat tool a custom tool reads as: a function with the input
-    /// schema as its parameters.
-    fn from(tool: &CustomTool) -> Self {
+    /// schema as its parameters; the name, the description and the schema
+    /// move in.
+    fn from(tool: CustomTool) -> Self {
         Self {
             tool_type: "function".to_string(),
             function: common::Function {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: Some(Value::from(&tool.input_schema)),
+                name: tool.name,
+                description: tool.description,
+                parameters: Some(Value::from(tool.input_schema)),
                 strict: None,
                 extra: Default::default(),
             },
         }
+    }
+}
+
+impl From<&CustomTool> for common::Tool {
+    /// The same tool from a borrowed custom tool: the name, the description
+    /// and the schema are copied once; the fields a chat tool does not carry
+    /// (`extra`, `cache_control`, ...) are not.
+    fn from(tool: &CustomTool) -> Self {
+        Self::from(CustomTool {
+            name: tool.name.clone(),
+            tool_type: None,
+            description: tool.description.clone(),
+            input_schema: tool.input_schema.clone(),
+            defer_loading: None,
+            cache_control: None,
+            extra: Map::new(),
+        })
     }
 }
 
@@ -1118,6 +1225,19 @@ impl From<&CustomTool> for common::Tool {
 pub fn chat_tools(tools: &[Tool]) -> Vec<common::Tool> {
     tools
         .iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The custom tools among the owned `tools` as chat tools, in order: their
+/// names, descriptions and schemas move into the chat tools instead of being
+/// copied; the other kinds are dropped here, as [`chat_tools`] leaves them out.
+pub fn into_chat_tools(tools: Vec<Tool>) -> Vec<common::Tool> {
+    tools
+        .into_iter()
         .filter_map(|tool| match tool {
             Tool::Custom(custom) => Some(common::Tool::from(custom)),
             _ => None,
@@ -2683,7 +2803,10 @@ pub enum WebFetchToolResultErrorCode {
 // Beta Features - Tool Search Types
 // ============================================================================
 
-/// Tool search tool (beta)
+/// Tool search tool (beta). The untagged [`Tool`] reads every
+/// Anthropic-defined tool (web search, web fetch, computer use, bash, the text
+/// editor, ...) as this one, so the keys those tools take beyond `type` and
+/// `name` ride in [`Self::extra`].
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolSearchTool {
@@ -2697,6 +2820,12 @@ pub struct ToolSearchTool {
 
     /// Cache control for this tool
     pub cache_control: Option<CacheControl>,
+
+    /// The tool's other keys (a web search tool's domain filters and use cap,
+    /// a computer tool's display size, `defer_loading`, `strict`, ...),
+    /// forwarded as written.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Tool reference block (beta) - returned by tool search
@@ -3643,6 +3772,44 @@ mod tests {
                 "Expected McpToolset, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    /// An Anthropic-defined tool reads as `ToolSearch` and is written back as
+    /// the client sent it, its configuration included: a web search tool's
+    /// domain filters, use cap and location, a web fetch tool's, a computer
+    /// tool's display size, a text editor's `max_characters`, and a bash
+    /// tool's `defer_loading`, `strict` and `input_examples`.
+    #[test]
+    fn an_anthropic_defined_tool_keeps_its_configuration() {
+        for tool in [
+            json!({
+                "type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["example.com"], "max_uses": 3,
+                "user_location": {"type": "approximate", "city": "Paris", "country": "FR"}
+            }),
+            json!({
+                "type": "web_fetch_20250910", "name": "web_fetch",
+                "blocked_domains": ["example.org"], "max_uses": 2,
+                "max_content_tokens": 1000, "citations": {"enabled": true}
+            }),
+            json!({
+                "type": "computer_20250124", "name": "computer",
+                "display_width_px": 1024, "display_height_px": 768, "display_number": 1
+            }),
+            json!({
+                "type": "text_editor_20250728", "name": "str_replace_based_edit_tool",
+                "max_characters": 10000
+            }),
+            json!({
+                "type": "bash_20250124", "name": "bash", "defer_loading": true,
+                "strict": true, "input_examples": [{"command": "ls"}]
+            }),
+        ] {
+            let parsed: Tool =
+                serde_json::from_value(tool.clone()).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(matches!(parsed, Tool::ToolSearch(_)), "{tool}");
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), tool);
         }
     }
 
@@ -4642,6 +4809,43 @@ mod tests {
                 .expect_err("no such entry")
                 .as_str(),
             "after_id: no model \"nope\" in the list"
+        );
+    }
+
+    /// The owned conversion and the borrowed one read the same chat tools: the
+    /// custom tools in order, each a function whose parameters are the input
+    /// schema with the client's keys in their order, the other kinds left out.
+    #[test]
+    fn into_chat_tools_moves_what_chat_tools_copies() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([
+            {"name": "weather", "description": "Get weather", "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "unit": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": false
+            }},
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "calc", "input_schema": {"type": "object"}}
+        ]))
+        .expect("the tools deserialize");
+        let borrowed = serde_json::to_value(chat_tools(&tools)).unwrap();
+        let owned = serde_json::to_value(into_chat_tools(tools)).unwrap();
+        assert_eq!(owned, borrowed);
+        assert_eq!(
+            owned.as_array().map(Vec::len),
+            Some(2),
+            "the server tool is left out"
+        );
+        let keys: Vec<&str> = owned[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city", "unit"], "the client's key order is kept");
+        assert_eq!(
+            owned[0]["function"]["parameters"]["additionalProperties"],
+            json!(false)
         );
     }
 }

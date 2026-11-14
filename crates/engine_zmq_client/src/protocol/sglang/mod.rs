@@ -252,6 +252,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::decode_msgpack,
+        mock_engine::default_ready_response,
         protocol::{
             sglang::{
                 output::{
@@ -435,9 +436,8 @@ mod tests {
     fn check_layouts_accepts_the_recorded_releases_and_names_a_moved_field() {
         use std::collections::BTreeMap;
 
-        use crate::{
-            mock_engine::default_ready_response,
-            protocol::sglang::{request::recorded as request, sampling::recorded as sampling},
+        use crate::protocol::sglang::{
+            request::recorded as request, sampling::recorded as sampling,
         };
         let names = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
         let ready = |params: &[&str], generate: &[&str], embed: &[&str]| EngineCoreReadyResponse {
@@ -511,10 +511,7 @@ mod tests {
     fn check_layouts_reads_the_multimodal_structs_as_sent() {
         use std::collections::BTreeMap;
 
-        use crate::{
-            mock_engine::default_ready_response,
-            protocol::sglang::multimodal::recorded as multimodal,
-        };
+        use crate::protocol::sglang::multimodal::recorded as multimodal;
         let names = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
         let ready = |output: &[&str], item: &[&str]| EngineCoreReadyResponse {
             positional_layouts: BTreeMap::from([
@@ -704,7 +701,7 @@ mod tests {
         assert!(payload.len() > 4 * TENSOR_AUX_MIN_BYTES);
         let ready = EngineCoreReadyResponse {
             tensor_aux_frames: true,
-            ..crate::mock_engine::default_ready_response()
+            ..default_ready_response()
         };
         assert_eq!(
             SglangProtocol::read_layout(&ready),
@@ -713,7 +710,7 @@ mod tests {
             }
         );
         assert_eq!(
-            SglangProtocol::read_layout(&crate::mock_engine::default_ready_response()),
+            SglangProtocol::read_layout(&default_ready_response()),
             SglangLayout::default()
         );
     }

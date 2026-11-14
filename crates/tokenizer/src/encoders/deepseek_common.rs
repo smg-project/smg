@@ -24,6 +24,7 @@ use super::{
     marks::{self, control},
     truthy,
 };
+use crate::json_dumps;
 
 // ---------------------------------------------------------------------------
 // The family's special tokens, shared by the V3.2, V4 and V4.1 renderers (each
@@ -463,7 +464,7 @@ pub(super) fn encode_arguments_to_dsml(arguments: &Value, tags: &DsmlTags) -> St
 /// separators and raw UTF-8. Compact `serde_json::to_string` would change the
 /// prompt bytes the model was trained on.
 pub(super) fn to_json(value: &Value) -> String {
-    crate::json_dumps::to_string(value)
+    json_dumps::to_string(value)
 }
 
 /// `[tool["function"] for tool in tools]`
