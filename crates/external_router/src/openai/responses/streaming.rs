@@ -2059,4 +2059,148 @@ mod tests {
             "the call's allocation grew by {growth} bytes for a {large_body}-byte body (small request {small} bytes, large {large}): the payload was copied, not moved"
         );
     }
+
+    /// A tool loop whose upstream answers with a large final response (64
+    /// message items of 2 KiB) ends with the same items on the wire, in the
+    /// `response.completed` event, and in the stored record, the record
+    /// carrying the upstream's status. The allocation count of the whole
+    /// exchange is printed for the measurement of the loop's end.
+    #[tokio::test]
+    async fn a_large_final_response_is_streamed_and_stored_with_the_same_items() {
+        use std::sync::Arc;
+
+        use axum::{
+            http::{header::CONTENT_TYPE, StatusCode},
+            routing::any,
+            Router,
+        };
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+            ResponseId,
+        };
+        use smg_mcp::McpConfig;
+
+        use crate::{
+            openai::context::StorageHandles,
+            openai_bridge::FormatRegistry,
+            test_support::{counting_alloc, http_client},
+        };
+
+        let text = "x".repeat(2048);
+        let items: Vec<Value> = (0..64)
+            .map(|i| {
+                json!({
+                    "type": "message", "id": format!("msg_{i}"), "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}]
+                })
+            })
+            .collect();
+        let completed = format!(
+            "event: response.completed\ndata: {}",
+            json!({
+                "type": "response.completed", "sequence_number": 3,
+                "response": {
+                    "id": "resp_1", "object": "response", "created_at": 1, "model": "m",
+                    "status": "completed", "output": items
+                }
+            })
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("an address").port();
+        let body = [CREATED, IN_PROGRESS, completed.as_str()].join("\n\n") + "\n\n";
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub upstream answering one event stream per request; aborted at the test's end"
+        )]
+        let upstream = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move || {
+                let body = body.clone();
+                async move { ([(CONTENT_TYPE, "text/event-stream")], body) }
+            }));
+            axum::serve(listener, app).await.expect("the stub serves");
+        });
+        let orchestrator = Arc::new(
+            McpOrchestrator::new(McpConfig::default())
+                .await
+                .expect("an orchestrator with no servers"),
+        );
+        let client = http_client();
+        let storage = StorageHandles {
+            response: Arc::new(MemoryResponseStorage::new()),
+            conversation: Arc::new(MemoryConversationStorage::new()),
+            conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+            request_context: None,
+            tenant: None,
+        };
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("http://127.0.0.1:{port}/v1/responses"),
+            payload: json!({"model": "m", "input": "hi", "stream": true}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::clone(&storage.response),
+                conversation: Arc::clone(&storage.conversation),
+                conversation_item: Arc::clone(&storage.conversation_item),
+                request_context: None,
+                tenant: None,
+            },
+        };
+
+        let allocations_before = counting_alloc::calls();
+        let response = handle_streaming_with_tool_interception(
+            &client,
+            None,
+            None,
+            req,
+            &orchestrator,
+            FormatRegistry::new(),
+            Vec::new(),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the stream to its end");
+        let stored = storage
+            .response
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .expect("the storage answers")
+            .expect("the record");
+        let allocations = counting_alloc::calls() - allocations_before;
+        #[expect(
+            clippy::print_stderr,
+            reason = "the exchange's allocation count, read from the test's output by the measurement of the loop's end"
+        )]
+        {
+            eprintln!("allocations during the streamed loop with 64 items: {allocations}");
+        }
+        upstream.abort();
+
+        let stream = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        let completed_frame = stream
+            .split("\n\n")
+            .find(|frame| frame.starts_with("event: response.completed\n"))
+            .expect("the terminal event");
+        let data = completed_frame
+            .strip_prefix("event: response.completed\ndata: ")
+            .expect("the terminal's data");
+        let event: Value = serde_json::from_str(data).expect("the terminal's JSON");
+        let on_the_wire = &event["response"];
+        assert_eq!(on_the_wire["id"], json!("resp_1"));
+        assert_eq!(on_the_wire["status"], json!("completed"));
+        assert_eq!(on_the_wire["output"].as_array().map(Vec::len), Some(64));
+        assert_eq!(
+            stored.raw_response["output"], on_the_wire["output"],
+            "the record and the wire carry the same items"
+        );
+        assert_eq!(stored.raw_response["status"], json!("completed"));
+        assert!(stream.ends_with("data: [DONE]\n\n"), "{stream}");
+    }
 }
