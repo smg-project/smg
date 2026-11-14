@@ -224,7 +224,11 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
-/// most. A thread reads its share at the start of every encode call and keeps
+/// most (a thread's long tier keeps its map's slots through a clear, four
+/// times its share at most; a share that fell below a quarter of what the
+/// tier holds empties it at the thread's next call or eviction, and the map
+/// is made anew when its slots alone are more than four times the share). A
+/// thread reads its share at the start of every encode call and keeps
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
 /// miss), so after threads join it is within the smaller share from its next
@@ -395,6 +399,26 @@ impl PieceCache {
             unit_ascii: false,
             share,
         }
+    }
+
+    /// Bytes the long tier holds, used or not: its entries' pieces, ids and
+    /// slots (`long_bytes`) and the empty slots of its map, which a clear
+    /// keeps.
+    fn long_held_bytes(&self) -> usize {
+        self.long_bytes + (self.long.capacity() - self.long.len()) * LONG_PIECE_ENTRY_BYTES
+    }
+
+    /// Empties the long tier for a share of `share` bytes: in place when its
+    /// map's slots fit four times the share (the next misses fill them again
+    /// without a growth), anew when they do not (a map grown under a wider
+    /// share gives its slots back).
+    fn clear_long_within(&mut self, share: usize) {
+        if self.long.capacity() * LONG_PIECE_ENTRY_BYTES > 4 * share {
+            self.long = PieceIds::default();
+        } else {
+            self.long.clear();
+        }
+        self.long_bytes = 0;
     }
 
     /// Entries of the tiers bounded by count, `packed` and `short`.
@@ -3251,8 +3275,7 @@ impl NativeEncoder {
             let share = self.long_piece_bytes_share();
             if entry <= share {
                 if cache.long_bytes + entry > share {
-                    cache.long.clear();
-                    cache.long_bytes = 0;
+                    cache.clear_long_within(share);
                 }
                 cache.long_bytes += entry;
                 cache.long.insert(piece.into(), ids[start..].into());
@@ -3403,13 +3426,15 @@ impl NativeEncoder {
     /// the capacity of its map (arrays grown for the earlier share keep
     /// their size through a clear at the bound; here the map is made anew for
     /// the share and the packed table is cut back to the share's slots inside
-    /// its reservation, see `ShortPieceTable::clear`), so every thread that
-    /// still encodes is within the share
+    /// its reservation, see `ShortPieceTable::clear`), and empties its long
+    /// tier when it holds more than four times the long share, anew when the
+    /// map's slots alone are more (see `PieceCache::clear_long_within`), so
+    /// every thread that still encodes is within the share
     /// from its next call on (the share is read here once and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
-    /// never encodes again holds what it had until it exits). One relaxed
-    /// load, one store and three compares per call.
+    /// never encodes again holds what it had until it exits). Two relaxed
+    /// loads, one store and four compares per call.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
@@ -3420,6 +3445,10 @@ impl NativeEncoder {
             || cache.map_capacity() > 2 * share
         {
             cache.clear_short(share);
+        }
+        let long_share = self.long_piece_bytes_share();
+        if cache.long_held_bytes() > 4 * long_share {
+            cache.clear_long_within(long_share);
         }
         cache
     }

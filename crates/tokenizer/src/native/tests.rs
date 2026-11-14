@@ -4213,6 +4213,51 @@ fn long_pieces_stay_within_their_byte_share() {
     assert!(!cache.long.is_empty());
 }
 
+/// A thread's long tier grown under an earlier share keeps its map's slots
+/// through an eviction at the bound (four times the share at most); once
+/// the share fell below a quarter of what the tier holds (threads joined)
+/// the thread's next encode call makes the tier anew.
+#[test]
+fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode() {
+    let mut state = 0x1D1D_3C3C_5B5B_7A7Au64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let held = |native: &NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow()
+            .long_held_bytes()
+    };
+    let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
+    let text: String = (0..16_000)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect();
+    let before = native.encode(Some(model), &head, false).expect("ids");
+    native.encode(Some(model), &text, false).expect("ids");
+    let share = native.long_piece_bytes_share();
+    let grown = held(&native);
+    assert!(grown <= 4 * share, "{grown} for a share of {share}");
+    // Threads join: the share falls far below a quarter of what the tier
+    // holds (its slots alone are more); the next call makes the tier anew,
+    // the ids as before.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.long_piece_bytes_share();
+    assert!(grown > 4 * share, "{grown} for a share of {share}");
+    // A call that meets no long piece: only the check at the call's start
+    // can make the tier anew (a miss would, through the eviction).
+    native.encode(Some(model), &word(1), false).expect("ids");
+    let kept = held(&native);
+    assert!(kept <= 4 * share, "{kept} for a share of {share}");
+    assert_eq!(
+        native.encode(Some(model), &head, false).expect("ids"),
+        before
+    );
+}
+
 #[test]
 fn text_in_nfc_takes_the_native_path_when_the_quick_check_is_unsure() {
     let mut state = 0x6666_7777_8888_9999u64;
