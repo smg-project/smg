@@ -4,7 +4,9 @@
 //! own 400 before the body is read; the betas feed the request rules that
 //! read a header beside the body ([`validate_with_betas`]). The handlers keep
 //! the raw [`HeaderMap`] they forward: nothing here changes what the backend
-//! receives.
+//! receives. The extractor runs where the handlers run, on the buffered body
+//! path; a request the stream layer forwards whole reaches no handler and
+//! none of these checks, as before this module.
 
 use std::borrow::Cow;
 
@@ -57,7 +59,7 @@ impl MessagesHeaders {
     /// The request rules that read the betas beside the body, refused with
     /// the public API's own 400 (the code and the message of the rule).
     pub(crate) fn validate(&self, body: &CreateMessageRequest) -> Result<(), Response> {
-        validate_with_betas(body, &self.betas).map_err(|refusal| {
+        validate_with_betas(body, self.betas).map_err(|refusal| {
             route_error::bad_request(
                 refusal.code.into_owned(),
                 refusal.message.map(Cow::into_owned).unwrap_or_default(),
