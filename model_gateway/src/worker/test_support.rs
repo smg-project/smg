@@ -16,7 +16,7 @@ use openai_protocol::{
     worker::{HealthCheckConfig, RuntimeType, WorkerStatus, WorkerType},
 };
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
-use tokio::net::TcpSocket;
+use tokio::net::{TcpListener, TcpSocket};
 
 use crate::worker::{
     prefill_admission::{PrefillAdmissionAttempt, PrefillSelectionContext},
@@ -120,15 +120,20 @@ pub fn kv_cache_cleared() -> KvCacheEvent {
 /// expected, or a request held until the test's bound.
 ///
 /// Keep the value in a named binding for the whole case: a `_` pattern or a
-/// temporary drops it, and the port is free again.
+/// temporary drops it, and the port is free again. A case whose dead worker
+/// comes up later starts it on [`RefusedAddress::listen`]: the same socket,
+/// so the port is never free in between. A case whose worker comes up, dies
+/// and comes up again reserves with [`RefusedAddress::reserve_shared`].
 #[must_use = "the address is refused only while this value lives"]
 pub struct RefusedAddress {
-    _reservation: TcpSocket,
+    reservation: TcpSocket,
     addr: SocketAddr,
 }
 
 impl RefusedAddress {
-    /// Reserve a loopback port of the system's choice, and refuse it.
+    /// Reserve a loopback port of the system's choice, and refuse it. For a
+    /// port nothing answers at, or one a worker comes up on once: its only
+    /// socket is the one [`RefusedAddress::listen`] hands over.
     #[expect(
         clippy::expect_used,
         reason = "a test fixture: a loopback socket the system cannot give is a test failure"
@@ -140,9 +145,22 @@ impl RefusedAddress {
             .expect("a loopback port of the system's choice");
         let addr = socket.local_addr().expect("the bound address");
         Self {
-            _reservation: socket,
+            reservation: socket,
             addr,
         }
+    }
+
+    /// Stop refusing and listen on the reserved socket itself, as a dead
+    /// worker's port does when the worker comes up. No other test can bind
+    /// the port, or be handed it, before the caller's server is on it.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test fixture: a reserved socket that cannot listen is a test failure"
+    )]
+    pub fn listen(self) -> TcpListener {
+        self.reservation
+            .listen(1024)
+            .expect("the reserved socket listens")
     }
 
     /// The address, `127.0.0.1:<port>`.
@@ -158,6 +176,61 @@ impl RefusedAddress {
     /// The address as a plain HTTP URL, `http://127.0.0.1:<port>`.
     pub fn http_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+}
+
+// A reservation shares its port with its listeners through `SO_REUSEPORT`, a
+// Unix socket option.
+#[cfg(unix)]
+impl RefusedAddress {
+    /// Reserve a loopback port of the system's choice for a worker that
+    /// comes up on it more than once, and refuse it. The reservation shares
+    /// the port with the listeners of [`RefusedAddress::listen_shared`], one
+    /// for each life of the worker, and outlives them: the port is refused
+    /// again when a listener is gone, and stays taken between two lives.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test fixture: a loopback socket the system cannot give is a test failure"
+    )]
+    pub fn reserve_shared() -> Self {
+        let socket = Self::sharing_socket();
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("a loopback port of the system's choice");
+        let addr = socket.local_addr().expect("the bound address");
+        Self {
+            reservation: socket,
+            addr,
+        }
+    }
+
+    /// A listener beside the reservation, for one life of the worker:
+    /// connections are answered while it lives and refused again after it.
+    /// Only a reservation of [`RefusedAddress::reserve_shared`] shares its
+    /// port: on any other the bind is refused, and the test fails here.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test fixture: a shared port that takes no listener is a test failure"
+    )]
+    pub fn listen_shared(&self) -> TcpListener {
+        let socket = Self::sharing_socket();
+        socket
+            .bind(self.addr)
+            .expect("a port reserved by `reserve_shared`");
+        socket.listen(1024).expect("the sharing socket listens")
+    }
+
+    /// A socket that shares the port it binds with every socket made here.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test fixture: a socket the system cannot give is a test failure"
+    )]
+    fn sharing_socket() -> TcpSocket {
+        let socket = TcpSocket::new_v4().expect("a TCP socket");
+        socket
+            .set_reuseport(true)
+            .expect("a socket that shares its port");
+        socket
     }
 }
 
@@ -181,6 +254,79 @@ mod tests {
         assert_eq!(
             refused.http_url(),
             format!("http://127.0.0.1:{}", refused.port())
+        );
+    }
+
+    /// The reservation becomes the listener: the same address, refused until
+    /// the hand-over and answered after it.
+    #[tokio::test]
+    async fn the_reserved_socket_listens_on_its_own_address() {
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
+        let error = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect_err("nothing answers there yet");
+        assert_eq!(error.kind(), ErrorKind::ConnectionRefused, "{error}");
+
+        let listener = refused.listen();
+        assert_eq!(listener.local_addr().expect("the listener's address"), addr);
+        let (accepted, connected) =
+            tokio::join!(listener.accept(), tokio::net::TcpStream::connect(addr));
+        accepted.expect("the listener accepts");
+        connected.expect("the connection is answered");
+    }
+
+    /// A shared reservation takes a listener twice over: refused, and no
+    /// plain bind's, before each of them, answered while one is up, and
+    /// refused again after the last.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shared_reservation_is_refused_between_its_listeners() {
+        let reserved = RefusedAddress::reserve_shared();
+        let addr = reserved.addr();
+        for life in 0..2 {
+            let error = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect_err("nothing listens there");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::ConnectionRefused,
+                "before life {life}: {error}"
+            );
+            let taken = std::net::TcpListener::bind(addr).expect_err("the port is held");
+            assert_eq!(
+                taken.kind(),
+                ErrorKind::AddrInUse,
+                "before life {life}: {taken}"
+            );
+
+            let listener = reserved.listen_shared();
+            assert_eq!(listener.local_addr().expect("the listener's address"), addr);
+            let (accepted, connected) =
+                tokio::join!(listener.accept(), tokio::net::TcpStream::connect(addr));
+            accepted.expect("the listener accepts");
+            connected.expect("the connection is answered");
+        }
+        let error = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect_err("nothing listens there");
+        assert_eq!(error.kind(), ErrorKind::ConnectionRefused, "{error}");
+    }
+
+    /// Shared reservations alive together hold a port each: a port is shared
+    /// with its own reservation's listeners, never handed to a second
+    /// reservation, so two cases of one binary never serve each other.
+    #[cfg(unix)]
+    #[test]
+    fn shared_reservations_alive_together_hold_distinct_ports() {
+        let reserved: Vec<RefusedAddress> =
+            (0..256).map(|_| RefusedAddress::reserve_shared()).collect();
+        let ports: std::collections::HashSet<u16> =
+            reserved.iter().map(RefusedAddress::port).collect();
+        assert_eq!(
+            ports.len(),
+            reserved.len(),
+            "two reservations hold one port"
         );
     }
 }
