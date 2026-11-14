@@ -464,41 +464,18 @@ impl PolicyRegistry {
 
     /// Whether `policy` pins a keyed request itself (`manual` and
     /// `consistent_hashing`, the policies the sticky override leaves alone).
-    pub(crate) fn pins_its_own_key(policy: &dyn LoadBalancingPolicy) -> bool {
+    fn pins_its_own_key(policy: &dyn LoadBalancingPolicy) -> bool {
         !Self::routing_key_override_applies(policy.name())
     }
 
-    /// The key a key-native policy reads from `info`: the routing key as
-    /// placement derived it, else the routing-key header, else the
-    /// rid-derived key, the precedence of [`ManualPolicy`] itself
-    /// ([`Self::engine_session_key`] feeds a `manual` default this key).
-    pub(crate) fn own_key<'a>(info: &SelectWorkerInfo<'a>) -> Option<&'a str> {
+    /// Whether `info` carries the key a key-native policy reads: the routing
+    /// key as placement derived it, else the routing-key header, else the
+    /// rid-derived key, the precedence of [`ManualPolicy`] itself.
+    fn carries_its_own_key(info: &SelectWorkerInfo<'_>) -> bool {
         info.routing_key
             .or_else(|| extract_routing_key_hint(info.headers))
             .or(info.rid_key)
-    }
-
-    /// The session key the engine's binding pins a regular placement under:
-    /// a key-native default's own precedence ([`Self::own_key`]), else the
-    /// override's header-first key over the routing key placement already
-    /// resolved ([`Self::sticky_key`]). The pair arm reads [`Self::sticky_key`]
-    /// alone: a keyed request with a key-native side keeps the legacy pair
-    /// path ([`Self::pair_engine_for`]).
-    pub(crate) fn engine_session_key<'a>(
-        policy: &dyn LoadBalancingPolicy,
-        info: &SelectWorkerInfo<'a>,
-    ) -> Option<&'a str> {
-        if Self::pins_its_own_key(policy) {
-            Self::own_key(info)
-        } else {
-            info.routing_key.or(info.rid_key)
-        }
-    }
-
-    /// Whether `info` carries the key a key-native policy reads
-    /// ([`Self::own_key`]).
-    fn carries_its_own_key(info: &SelectWorkerInfo<'_>) -> bool {
-        Self::own_key(info).is_some()
+            .is_some()
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and

@@ -26,17 +26,16 @@
 //! rest of the membership feed (added, resized, snapshot) follow in a later
 //! step.
 //!
-//! A session (the routing-key header, else the rid-derived key; under a
-//! `manual` default the `x-smg-routing-key` hint between them, as the legacy
-//! policy reads it) is a binding's `sessions` rule in the engine: the
-//! `manual` policy pins every key, and the sticky routing-key override
-//! attaches the same rule to the default policy's binding. The host hands
-//! the engine the key under the model and phase it is for, as the legacy
-//! keyed paths namespace their pins, and the engine's session table learns
-//! the pin at the commit from the decision's own verdict, which the commit
-//! copies from the pick onto the lease (a fresh key is claimed at its
-//! decision). The in-flight cap reads the host's per-key count on each
-//! worker, the one the load guard keeps under the raw key.
+//! A session (the routing-key header, else the rid-derived key) is a
+//! binding's `sessions` rule in the engine: the `manual` policy pins every
+//! key, and the sticky routing-key override attaches the same rule to the
+//! default policy's binding. The host hands the engine the key under the
+//! model and phase it is for, as the legacy keyed paths namespace their pins,
+//! and the engine's session table learns the pin at the commit from the
+//! decision's own verdict, which the commit copies from the pick onto the
+//! lease (a fresh key is claimed at its decision). The in-flight cap reads
+//! the host's per-key count on each worker, the one the load guard keeps
+//! under the raw key.
 //!
 //! A cache-aware decision reads its affinity through the legacy policy that
 //! holds the model's event index and approximate trees ([`Affinity`]): the
