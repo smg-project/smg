@@ -988,6 +988,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "flint",
+        model: "RecursiveSI/flint",
+        also: &[],
+        released: "2026-10-21",
+        smg: (None, None),
+        table: Some(Table::Glm),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "flora-captioner",
         model: "nvidia/Flora-Captioner",
         also: &[],

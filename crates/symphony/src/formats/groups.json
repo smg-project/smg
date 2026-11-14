@@ -57,6 +57,7 @@
   {"model": "tiiuae/Falcon-H1R-7B", "also": [], "table": "qwen3", "opener": null, "after": null},
   {"model": "microsoft/Fara1.5-27B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "microsoft/Fara1.5-9B", "also": ["Fara1.5-4B"], "table": "qwen3_tagged", "opener": null, "after": null},
+  {"model": "RecursiveSI/flint", "also": [], "table": "glm", "opener": null, "after": null},
   {"model": "nvidia/Flora-Captioner", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "nvidia/Flora-Rewarder", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "google/functiongemma-270m-it", "also": [], "table": "function_gemma", "opener": null, "after": null},
