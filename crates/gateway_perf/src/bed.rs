@@ -14,7 +14,10 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{http, paths::DEFAULT_GW_ARGS};
+use crate::{
+    http,
+    paths::{DEFAULT_GW_ARGS, DEFAULT_PATHS},
+};
 
 /// Whether a loopback port can be bound right now.
 pub fn port_free(port: u16) -> bool {
@@ -69,7 +72,7 @@ impl Fleet {
     /// the Messages route.
     pub fn default_paths(self) -> &'static str {
         match self {
-            Self::Grpc | Self::PrefillDecode | Self::Http => crate::paths::DEFAULT_PATHS,
+            Self::Grpc | Self::PrefillDecode | Self::Http => DEFAULT_PATHS,
         }
     }
 }
@@ -852,12 +855,9 @@ mod tests {
         assert!(Fleet::Http.serves("chat") && Fleet::Http.serves("completion_stream"));
         assert!(Fleet::Http.serves("messages") && !Fleet::Http.serves("generate_stream_spaced"));
         assert!(Fleet::Grpc.serves("messages") && Fleet::PrefillDecode.serves("messages_stream"));
-        assert_eq!(Fleet::Http.default_paths(), crate::paths::DEFAULT_PATHS);
-        assert_eq!(Fleet::Grpc.default_paths(), crate::paths::DEFAULT_PATHS);
-        assert_eq!(
-            Fleet::PrefillDecode.default_paths(),
-            crate::paths::DEFAULT_PATHS
-        );
+        assert_eq!(Fleet::Http.default_paths(), DEFAULT_PATHS);
+        assert_eq!(Fleet::Grpc.default_paths(), DEFAULT_PATHS);
+        assert_eq!(Fleet::PrefillDecode.default_paths(), DEFAULT_PATHS);
         let bed = Bed::new(&cfg, Path::new("/h"), Path::new("/run"), true);
         let env: BTreeMap<String, String> = bed.env().into_iter().collect();
         assert_eq!(env["FLEET"], "http");

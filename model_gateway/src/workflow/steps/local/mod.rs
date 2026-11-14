@@ -9,6 +9,7 @@ mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod find_workers_to_remove;
 mod rediscover_labels;
+mod release_tokenizer;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
@@ -31,6 +32,7 @@ pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 use openai_protocol::worker::WorkerUpdateRequest;
 pub use rediscover_labels::RediscoverLabelsStep;
+pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
@@ -97,6 +99,8 @@ pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<A
 ///     remove_from_worker_registry
 ///              │
 ///     remove_from_policy_registry
+///              │
+///       release_tokenizer
 /// ```
 /// Cache cleanup removes only departed tenants, so surviving workers do not
 /// need the previous full-policy reinitialization pass.
@@ -159,6 +163,19 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
             })
             .depends_on(&["remove_from_worker_registry"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "release_tokenizer",
+                "Release the tokenizers of the models no worker serves any more",
+                Arc::new(ReleaseTokenizerStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
+            })
+            .depends_on(&["remove_from_policy_registry"]),
         )
 }
 
@@ -424,9 +441,86 @@ mod dp_removal_tests {
 
 #[cfg(test)]
 mod tests {
-    use wfaas::StepId;
+    use llm_tokenizer::TokenizerRegistry;
+    use wfaas::{StepExecutor, StepId, WorkflowContext, WorkflowInstanceId};
 
     use super::*;
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
+        workflow::tokenizer_registration::{
+            create_tokenizer_workflow_data, test_support::tokenizer_dir, LoadTokenizerStep,
+            TokenizerConfigRequest,
+        },
+    };
+
+    /// The removal workflow as a whole, its steps run in the definition's
+    /// order, on a tokenizer the registration step loaded for a worker: it
+    /// stays while a worker of the model remains and leaves the registry
+    /// with the model's last worker.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_models_last_worker_releases_its_tokenizer() {
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("m"))
+                    .label("tokenizer_path", "/tok/m")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+        let dir = tokenizer_dir();
+        let mut registration = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_tokenizer_workflow_data(
+                TokenizerConfigRequest {
+                    id: TokenizerRegistry::generate_id(),
+                    name: "m".to_string(),
+                    source: dir.path().to_str().unwrap().to_string(),
+                    chat_template_path: None,
+                    cache_config: None,
+                    fail_on_duplicate: false,
+                    for_worker: true,
+                },
+                Arc::clone(&app_context),
+            ),
+        );
+        LoadTokenizerStep.execute(&mut registration).await.unwrap();
+
+        for (url, remaining) in [("http://w1:8000", true), ("http://w2:8000", false)] {
+            let workflow = create_worker_removal_workflow();
+            let mut context = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_worker_removal_workflow_data(
+                    url.to_string(),
+                    None,
+                    Arc::clone(&app_context),
+                ),
+            );
+            for step in &workflow.steps {
+                step.executor.execute(&mut context).await.unwrap();
+            }
+            assert_eq!(
+                app_context.worker_registry.contains_model("m"),
+                remaining,
+                "a worker of the model after removing {url}"
+            );
+            assert_eq!(
+                app_context.tokenizer_registry.contains("m"),
+                remaining,
+                "the model's tokenizer after removing {url}"
+            );
+        }
+    }
 
     #[test]
     fn worker_removal_deregisters_before_policy_cleanup() {
