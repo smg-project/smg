@@ -333,7 +333,6 @@ pub mod bench_support {
                     &self.model,
                     &self.pairs,
                     None,
-                    true,
                     None,
                     inputs,
                 )

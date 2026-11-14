@@ -1566,8 +1566,8 @@ pub(crate) mod testing {
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory
     /// storage, a generous rate limiter, no gateway, worker monitor or WASM
-    /// manager, the policy registry the configuration's policy and routing-key
-    /// override select, the given tool parsers (a parser override is validated
+    /// manager, the policy registry the configuration's policy, routing-key
+    /// override and pairing mode select, the given tool parsers (a parser override is validated
     /// against them when they are given), and an uninitialized worker job
     /// queue: submitted jobs are accepted and queued but never processed, so a
     /// test observes what a step or a pass submits without spawning workflow
@@ -1587,10 +1587,13 @@ pub(crate) mod testing {
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
             prefill_admission: None,
-            policy_registry: Arc::new(PolicyRegistry::with_override(
-                router_config.policy.clone(),
-                router_config.routing_key_override.clone(),
-            )),
+            policy_registry: Arc::new(
+                PolicyRegistry::with_override(
+                    router_config.policy.clone(),
+                    router_config.routing_key_override.clone(),
+                )
+                .with_pd_pairing_mode(router_config.pd_pairing_mode),
+            ),
             reasoning_parser_factory: None,
             tool_parser_factory,
             gateway: None,
