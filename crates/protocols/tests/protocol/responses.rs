@@ -768,6 +768,50 @@ fn content_part_input_file_roundtrip() {
     assert_eq!(roundtripped, raw);
 }
 
+/// `auto` is the public API's default file detail (`FileInputDetail`): an
+/// input file part carrying it parses and writes it back, and so does a
+/// request whose message holds such a part.
+#[test]
+fn an_input_file_with_detail_auto_round_trips() {
+    let raw = json!({"type": "input_file", "detail": "auto", "file_id": "file_1"});
+    let part: ResponseContentPart =
+        serde_json::from_value(raw.clone()).expect("an input_file with detail auto parses");
+    assert!(
+        matches!(
+            &part,
+            ResponseContentPart::InputFile {
+                detail: Some(FileDetail::Auto),
+                ..
+            }
+        ),
+        "{part:?}"
+    );
+    assert_eq!(serde_json::to_value(&part).unwrap(), raw);
+
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": [{"type": "message", "role": "user", "content": [raw.clone()]}]
+    }))
+    .expect("a request with an auto-detail file part parses");
+    let written = serde_json::to_value(&request).unwrap();
+    assert_eq!(written["input"][0]["content"][0], raw);
+}
+
+/// A prompt's file variable keeps its detail level when the request is
+/// written back for an upstream, as an input file part does.
+#[test]
+fn a_prompt_file_variable_keeps_its_detail() {
+    let variable = json!({"type": "input_file", "file_id": "file_1", "detail": "high"});
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": "summarize the document",
+        "prompt": {"id": "pmpt_1", "variables": {"doc": variable.clone()}}
+    }))
+    .expect("a request with a file prompt variable parses");
+    let written = serde_json::to_value(&request).unwrap();
+    assert_eq!(written["prompt"]["variables"]["doc"], variable);
+}
+
 #[test]
 fn content_part_refusal_roundtrip() {
     let raw = json!({ "type": "refusal", "refusal": "I cannot help with that." });

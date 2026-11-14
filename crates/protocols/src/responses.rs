@@ -2150,13 +2150,15 @@ pub enum SimpleInputMessageTypeTag {
     Message,
 }
 
-/// Detail level for [`ResponseContentPart::InputFile`]. Spec restricts this
-/// to `"low" | "high"` (defaults to `low`); it is narrower than [`Detail`]
-/// used for images which also admits `auto` / `original`.
+/// Detail level for [`ResponseContentPart::InputFile`] (`FileInputDetail`
+/// in the spec): `auto`, the public API's default, lets the system choose;
+/// `low` and `high` pick a level. It is narrower than [`Detail`], used for
+/// images, which also admits `original`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FileDetail {
     #[default]
+    Auto,
     Low,
     High,
 }

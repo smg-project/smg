@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses input file part with `detail: "auto"`, the public API's default (`FileInputDetail`),
+  parses, and a prompt's file variable keeps its `detail` when the request is written back for an
+  upstream. The crate refused the request with ``unknown variant `auto`, expected `low` or
+  `high` `` and dropped the variable's detail. Breaking: `FileDetail` gains `Auto`, now its default,
+  and `PromptVariableTyped::ResponseInputFile` gains `detail: Option<FileDetail>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
