@@ -166,17 +166,10 @@ class TestResponsesInputValidation:
         with no untagged fallback, so ``{"type": "input_video"}`` inside a
         message's content array cannot silently deserialize to any variant.
 
-        The audit §E7 case calls for the rejected ``type`` being echoed in
-        the error message, but the outer ``ResponseInput`` is
-        ``#[serde(untagged)]`` (responses.rs:2051-2056): when the ``Items``
-        variant fails for any nested reason, serde collapses the error to
-        ``"data did not match any variant of untagged enum ResponseInput"``
-        and the inner tag name is not preserved on the wire. We therefore
-        pin the invariants that are observable — the 400 envelope and the
-        canonical ``input``-path reference in the message — rather than
-        asserting the specific rejected tag. Tightening beyond this
-        would require P5.5 (flattening ``ResponseInput`` away from
-        ``#[serde(untagged)]``), which is out of scope for E7.
+        The refusal names the part and its ``type`` (``input`` is read by
+        its JSON type and an item's part by its field, so the rejected tag
+        and the accepted ones reach the wire): ``invalid_value`` on
+        ``input[0].content[0].type``.
         """
         _, model_path, _, gw = setup_backend
         body = {
@@ -189,16 +182,13 @@ class TestResponsesInputValidation:
             ],
         }
         resp = _post_responses(gw, body)
-        # ``input`` is an untagged enum, so a part no variant accepts is
-        # serde's "data did not match any variant": a wrong type.
-        err = _assert_validation_400(resp, code="invalid_type")
-        message = err["error"]["message"].lower()
-        # Minimal observable invariant: the error must surface at the
-        # ``input`` field (the only field that can carry content parts),
-        # proving serde actually drove into the input structure rather
-        # than failing at an unrelated key.
-        assert "input" in message, (
-            f"expected error to name the input field, got message={message!r}"
+        # A part of a type no variant accepts is an unknown variant of the
+        # part's ``type``: a wrong value, named with the accepted ones.
+        err = _assert_validation_400(resp, code="invalid_value")
+        assert err["error"]["param"] == "input[0].content[0].type", err
+        message = err["error"]["message"]
+        assert "input[0].content[0].type: unknown variant `input_video`" in message, (
+            f"expected the part's type to be named, got message={message!r}"
         )
 
     def test_input_file_with_unknown_field_accepted(self, setup_backend):
@@ -303,5 +293,7 @@ class TestResponsesInputValidation:
             ],
         }
         resp = _post_responses(gw, body)
-        # The same untagged ``input``: the empty ``type`` matches no variant.
-        _assert_validation_400(resp, code="invalid_type")
+        # The empty ``type`` matches no variant: a wrong value, named at the
+        # second part's ``type``.
+        err = _assert_validation_400(resp, code="invalid_value")
+        assert err["error"]["param"] == "input[0].content[1].type", err
