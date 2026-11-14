@@ -154,6 +154,10 @@ impl RadixTree {
         }
         self.clear(id);
         let slot = &mut self.slots[id.parts().0 as usize];
+        #[expect(
+            clippy::expect_used,
+            reason = "checked live at the call's entry, and `clear` leaves the state in place"
+        )]
         let state = slot.state.take().expect("checked live");
         self.by_name.remove(&state.name);
         slot.generation = slot.generation.wrapping_add(1);
@@ -221,7 +225,7 @@ impl RadixTree {
                 None => lineage_root(content),
                 Some(prev) => lineage_step(prev, content),
             };
-            let landed = self.place_block(holder, key, content, next_lineage, &mut cursor)?;
+            let landed = self.place_block(holder, key, content, next_lineage, &mut cursor);
             match landed {
                 Placed::Applied => applied += 1,
                 Placed::Duplicate => duplicates += 1,
@@ -243,7 +247,7 @@ impl RadixTree {
         content: ContentHash,
         lineage: u64,
         cursor: &mut Option<(u32, u32)>,
-    ) -> Result<Placed, StoreError> {
+    ) -> Placed {
         // Resolve the target (chain, pos) for this block canonically.
         let target: (u32, u32) = match *cursor {
             None => {
@@ -332,7 +336,7 @@ impl RadixTree {
         // plain duplicate, an alias (their other key), or a refused
         // move — all observably identical, all non-destructive.
         if self.chains[chain as usize].covered(pos, holder) {
-            return Ok(Placed::Duplicate);
+            return Placed::Duplicate;
         }
         // Not covered: a move relocates the key first, then join.
         // Key BEFORE membership: the invariant every key map entry is
@@ -349,7 +353,7 @@ impl RadixTree {
         }
         self.add_membership(holder, chain, pos);
         self.state_of_mut(holder).keys.insert(key, (chain, pos));
-        Ok(Placed::Applied)
+        Placed::Applied
     }
 
     /// Read-only no-op predicate: true iff `store(id, parent, blocks)`
@@ -517,7 +521,9 @@ impl RadixTree {
         ordered.sort_unstable();
         let mut dropped = 0u64;
         while self.state_of(holder).keys.len() as u64 > keep {
-            let (_, key) = ordered.pop().expect("non-empty");
+            let Some((_, key)) = ordered.pop() else {
+                break;
+            };
             let (chain, pos) = self.state_of(holder).keys[&key];
             self.state_of_mut(holder).keys.remove(&key);
             self.remove_membership(holder, (chain, pos));
@@ -753,9 +759,19 @@ impl RadixTree {
 
     // ---- internals ----
 
+    /// The state of a holder the caller checked live.
+    #[expect(
+        clippy::expect_used,
+        reason = "checked live at the call's entry; a missing state is a broken index invariant"
+    )]
     fn state_of(&self, holder: u32) -> &HolderState3 {
         self.slots[holder as usize].state.as_ref().expect("live")
     }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "checked live at the call's entry; a missing state is a broken index invariant"
+    )]
     fn state_of_mut(&mut self, holder: u32) -> &mut HolderState3 {
         self.slots[holder as usize].state.as_mut().expect("live")
     }
@@ -798,6 +814,10 @@ impl RadixTree {
             children: Vec::new(),
         });
         let pd = &mut self.chains[parent as usize];
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a new child has no sibling at (fork position, content): the search's Err side"
+        )]
         let at = pd
             .children
             .binary_search_by_key(&(fork_pos, content), |&(p, cc, _)| (p, cc))
@@ -954,7 +974,9 @@ impl RadixTree {
     fn put_position_membership(&mut self, chain: u32, pos: u32, m: PosSet) {
         let cd = &mut self.chains[chain as usize];
         if let PosSet::Set(set) = m {
-            if !set.is_empty() {
+            if set.is_empty() {
+                self.interner.release(set);
+            } else {
                 let at = cd.spans.partition_point(|s| s.start < pos);
                 cd.spans.insert(
                     at,
@@ -964,8 +986,6 @@ impl RadixTree {
                         holders: set,
                     },
                 );
-            } else {
-                self.interner.release(set);
             }
         }
         // Renormalize around pos: merge adjacent spans with identical
@@ -1007,9 +1027,9 @@ impl RadixTree {
             let cd = &self.chains[chain as usize];
             // Already freed (double-GC guard: reachable via a remove on
             // one path racing a parent-walk free on another).
-            if cd.contents.is_empty() {
+            let Some(&first_content) = cd.contents.first() else {
                 return;
-            }
+            };
             if !cd.spans.is_empty() || !cd.children.is_empty() {
                 return;
             }
@@ -1028,7 +1048,6 @@ impl RadixTree {
             );
             let parent = cd.parent;
             let start_lineage = cd.start_lineage;
-            let first_content = cd.contents.first().copied();
             self.chains[chain as usize] = ChainData::default();
             self.free_chains.push(chain);
             match parent {
@@ -1042,11 +1061,10 @@ impl RadixTree {
                     return;
                 }
                 Some((p, fork_pos)) => {
-                    let content = first_content.expect("chains are non-empty");
                     let pd = &mut self.chains[p as usize];
                     if let Ok(idx) = pd
                         .children
-                        .binary_search_by_key(&(fork_pos, content), |&(fp, c, _)| (fp, c))
+                        .binary_search_by_key(&(fork_pos, first_content), |&(fp, c, _)| (fp, c))
                     {
                         pd.children.remove(idx);
                     }
