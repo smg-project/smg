@@ -38,7 +38,7 @@ use crate::{
         },
         MultimodalData,
     },
-    worker::{RuntimeType, Worker},
+    worker::{endpoint::Endpoint, RuntimeType, Worker},
 };
 
 /// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore,
@@ -473,19 +473,21 @@ pub(crate) async fn send_tokenspeed_encode_frame(
     rendezvous: &EncodeRendezvous,
     request: tokenspeed_encoder::EncodeRequest,
 ) -> Result<(), String> {
-    let url = worker.url();
+    // A failure's text is the dispatch's error line: it names the worker by
+    // its masked address.
+    let shown = worker.redacted_url();
     let client = worker
         .get_backend_client()
         .await
-        .map_err(|e| format!("encode worker {url} is not connected: {e}"))?
-        .ok_or_else(|| format!("encode worker {url} has no ZMQ connection"))?;
+        .map_err(|e| format!("encode worker {shown} is not connected: {e}"))?
+        .ok_or_else(|| format!("encode worker {shown} has no ZMQ connection"))?;
     let BackendClient::Zmq(client) = client.as_ref() else {
-        return Err(format!("encode worker {url} is not a direct-ZMQ worker"));
+        return Err(format!("encode worker {shown} is not a direct-ZMQ worker"));
     };
     client
         .encode_tokenspeed(request, rendezvous)
         .await
-        .map_err(|status| format!("encode request to {url} failed: {}", status.message()))
+        .map_err(|status| format!("encode request to {shown} failed: {}", status.message()))
 }
 
 /// Hand an encode request to a gRPC encode worker over its cached encoder
@@ -495,16 +497,21 @@ pub(crate) async fn send_tokenspeed_encode_rpc(
     endpoint: String,
     request: tokenspeed_encoder::EncodeRequest,
 ) -> Result<(), String> {
+    // The endpoint is the worker's registered address. A failure's text is
+    // the dispatch's error line: it names the address masked, rendered only
+    // when a send fails.
+    let shown = || Endpoint::redacted_url(&endpoint);
     let client = TokenSpeedEncoderClient::connect_cached(&endpoint)
         .await
-        .map_err(|e| format!("connect to encode worker {endpoint} failed: {e}"))?;
+        .map_err(|e| format!("connect to encode worker {} failed: {e}", shown()))?;
     let response = client
         .encode(request)
         .await
-        .map_err(|e| format!("encode RPC to {endpoint} failed: {}", e.message()))?;
+        .map_err(|e| format!("encode RPC to {} failed: {}", shown(), e.message()))?;
     if !response.accepted {
         return Err(format!(
-            "encode worker {endpoint} did not accept the request"
+            "encode worker {} did not accept the request",
+            shown()
         ));
     }
     Ok(())

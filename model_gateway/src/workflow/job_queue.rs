@@ -1285,7 +1285,8 @@ impl JobQueue {
                     if let Some(queue) = context.worker_job_queue.get() {
                         queue.submit(job).await.map_err(|e| {
                             format!(
-                                "Failed to submit AddWorker job for {worker_type} worker {url_for_error}: {e}"
+                                "Failed to submit AddWorker job for {worker_type} worker {}: {e}",
+                                Endpoint::redacted_str(&url_for_error)
                             )
                         })?;
                         worker_count += 1;
@@ -1595,7 +1596,10 @@ async fn submit_external_worker_jobs(
 
         if let Some(queue) = context.worker_job_queue.get() {
             queue.submit(job).await.map_err(|e| {
-                format!("Failed to submit AddWorker job for {provider_name} endpoint {url_for_error}: {e}")
+                format!(
+                    "Failed to submit AddWorker job for {provider_name} endpoint {}: {e}",
+                    Endpoint::redacted_str(&url_for_error)
+                )
             })?;
             submitted_count += 1;
         } else {
@@ -1664,6 +1668,61 @@ mod tests {
         ] {
             assert_eq!(Job::shown_worker(job_type, name), name, "{job_type}");
         }
+    }
+
+    /// A start-up registration the queue refuses names its worker with the
+    /// address masked: the refusal's text is the failed job's warning. A
+    /// queue whose context is gone refuses every submission; both fleets are
+    /// submitted, the local workers and an external provider's endpoints.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_refused_start_up_submission_names_its_worker_masked() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let refusing = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        assert!(context.worker_job_queue.set(refusing).is_ok());
+        let worker_urls = vec!["http://user:s3cret@10.0.0.7:8000/?token=s3cret".to_string()];
+        let marks = DashSet::new();
+        let statuses = Arc::new(DashMap::new());
+        for mode in [
+            RoutingMode::Regular {
+                worker_urls: worker_urls.clone(),
+            },
+            RoutingMode::OpenAI { worker_urls },
+        ] {
+            let job = Job::InitializeWorkersFromConfig {
+                router_config: Box::new(RouterConfig::builder().mode(mode).build_unchecked()),
+            };
+            let result = JobQueue::execute_job(&job, &context, &marks, None).await;
+            assert!(result.is_err(), "the queue took the submission: {result:?}");
+            JobQueue::record_job_completion(
+                job.job_type(),
+                job.worker_url(),
+                Duration::ZERO,
+                &result,
+                &statuses,
+            );
+        }
+        logs_assert(|lines: &[&str]| {
+            let failed: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("Failed job:"))
+                .collect();
+            let unmasked: Vec<_> = failed
+                .iter()
+                .filter(|line| {
+                    line.contains("s3cret") || !line.contains("http://***@10.0.0.7:8000")
+                })
+                .collect();
+            if failed.len() == 2 && unmasked.is_empty() {
+                return Ok(());
+            }
+            Err(format!(
+                "{} failed-job lines, wanted two; those that do not name their worker masked: \
+                 {unmasked:#?}",
+                failed.len()
+            ))
+        });
     }
 
     /// A wasm module job's key is the uuid the submitter assigned (the
