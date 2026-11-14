@@ -33,6 +33,7 @@ use crate::{
             },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
+            prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
@@ -58,7 +59,7 @@ use crate::{
     worker::{
         basic::WorkerTypeExt,
         liveness::{self, SideReprieve},
-        ConnectionModeExt, PrefillLoadGuard, Worker,
+        ConnectionModeExt, Worker,
     },
 };
 
