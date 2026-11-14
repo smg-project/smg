@@ -398,6 +398,16 @@ pub(crate) fn failure(root_id: Option<&str>, status: u16) {
     }
 }
 
+/// The rows the capture in scope holds, each as the evidence line lists it
+/// (its candidates, scores and gates included), for a test that reads what
+/// a selection observed; empty outside a capture.
+#[cfg(test)]
+pub(crate) fn captured_selections() -> Vec<Value> {
+    CAPTURE
+        .try_with(|capture| capture.borrow().selections.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
