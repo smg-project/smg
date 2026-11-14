@@ -20,7 +20,7 @@ use std::{
 };
 
 use super::ImageFetchConfig;
-use crate::test_support::{skip_for, video_tools_available};
+use crate::test_support::{http_client_builder, skip_for, video_tools_available};
 
 /// Whether this ffmpeg build carries `encoder`. `ffmpeg -h encoder=<name>`
 /// exits 0 for a name it does not know as well, so the answer is what it
@@ -1078,11 +1078,8 @@ fn decoder_threads_share_cpu_budget_across_active_decodes() {
 /// spends a decode on the clip, exactly as the image decoder does.
 #[tokio::test]
 async fn decode_video_rejects_an_invalid_long_side_cap() {
-    let connector = MediaConnector::new(
-        crate::test_support::http_client_builder(),
-        MediaConnectorConfig::default(),
-    )
-    .expect("default connector");
+    let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+        .expect("default connector");
     for value in [0, 505] {
         let cfg = VideoFetchConfig {
             max_long_side_pixel: Some(value),
