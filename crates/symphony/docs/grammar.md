@@ -207,3 +207,25 @@ with that refusal follows what the request asked: a forced call, the response te
 and the whole turn are refused by the backend's name; under `auto`, and for a registry table's
 answer, the grammar counts as a tag the table does not have, and the request goes out as it
 did before the table constrained it.
+
+The llguidance backend takes the same tree as one Lark text (`Grammar::to_lark`), spelled for the
+worker's vocabulary (`AddedTokens`: its added tokens by text, and its end-of-sequence token). That
+backend reads every added token as a special token, which no byte literal and no text lexeme
+matches, so the spelling names them: a fixed word the vocabulary has as a token is the token beside
+its bytes, `(<tool_call> | "<tool_call>")`; free text is a text lexeme interleaved with the added
+tokens it may hold (every added token except one equal to, holding or standing inside a word the
+text may not hold), and a token that begins or ends such a word spelled across several tokens gets
+one transition in every state of the text, after a text that may not end with the word's leading
+bytes (nor, in the state of the token the word begins with, be the bytes between the two tokens) and
+into a text that may not start with its remaining bytes (a later token of the word read as its
+bytes); a token the text leaves out is read as bytes wherever a word holds it; the words a text may
+not hold are the `& ~` operators of its lexeme's regex. A fixed word that follows free text is
+folded into the text's head, since the lexer takes the longest match and a greedy lexeme would run
+past the word: the text ends at the word's bytes through a lazy lexeme or at the word's leading
+token by itself; a token node that follows the text is reached by the token alone, never by its
+bytes, so a vocabulary without the token refuses the grammar. A JSON schema is `%json {...}`, its
+whitespace bound the backend's `whitespace_pattern`; a
+schema in an XML style, a schema that accepts nothing, an embedded EBNF grammar and a token the
+vocabulary lacks have no Lark spelling and refuse the grammar by name (`Inexpressible`). The one
+loosening is named in the text's notes (`Lark::notes`): a schema's excluded words are not held out
+of its strings, which the backend's JSON cannot do.
