@@ -94,17 +94,20 @@ pub struct TokenizerRegistry {
 }
 
 /// RAII guard that removes the loading lock entry on drop.
-/// Ensures cleanup happens on normal completion, early return, or panic.
+/// Ensures cleanup happens on normal completion, early return, cancellation
+/// or panic.
 ///
-/// The entry stays while a waiter holds a clone of the lock: the waiter
-/// takes the mutex next, and a load that arrives meanwhile (a failed load's
+/// The entry stays while another load holds a reference to the lock (a
+/// waiter, or a holder whose own reference is not yet gone): the waiter
+/// takes the mutex next, a load that arrives meanwhile (a failed load's
 /// retry) joins the same lock instead of making a second one, so two loads
-/// of one name never run together and publish two entries under it. The
-/// references counted are the map's and the one the holder's mutex guard
-/// owns in [`TokenizerRegistry::load`] (released with the mutex, as one),
-/// so a waiter that takes the mutex never counts the holder before it;
-/// `remove_if` and `entry` take the same shard lock, so no clone slips in
-/// between the count and the removal.
+/// of one name never run together and publish two entries under it, and
+/// the last load out removes the entry. Declared before the mutex guard in
+/// [`TokenizerRegistry::load`] and so dropped after it (and after the
+/// pending lock future of a load cancelled while it waits), the guard
+/// counts once this load's own reference is gone and removes the entry when
+/// the map's reference is the last; `remove_if` and `entry` take the same
+/// shard lock, so no clone slips in between the count and the removal.
 struct LoadingLockGuard<'a> {
     locks: &'a DashMap<String, Arc<Mutex<()>>>,
     key: String,
@@ -113,7 +116,7 @@ struct LoadingLockGuard<'a> {
 impl Drop for LoadingLockGuard<'_> {
     fn drop(&mut self) {
         self.locks
-            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) <= 2);
+            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
     }
 }
 
@@ -183,15 +186,16 @@ impl TokenizerRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
-        // The mutex guard owns this load's reference to the lock: the mutex
-        // is released and the reference dropped as one, so the guard below,
-        // declared after it and dropped before it, counts this load while it
-        // holds the mutex and never a holder that has let go of it.
-        let _mutex_guard = lock.lock_owned().await;
+        // Declared before the mutex guard and so dropped after it (and after
+        // the pending lock future of a load cancelled while it waits): each
+        // load counts once its own reference is gone, and the last one out
+        // removes the entry.
         let _lock_cleanup = LoadingLockGuard {
             locks: &self.loading_locks,
             key: name.to_string(),
         };
+        // The mutex guard owns this load's reference to the lock.
+        let _mutex_guard = lock.lock_owned().await;
 
         // Double-check after acquiring lock (another thread may have loaded it)
         if let Some(existing_id) = self.name_to_id.get(name) {
@@ -400,10 +404,12 @@ impl Default for TokenizerRegistry {
 )]
 mod tests {
     use std::{
+        future::Future,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
+        task::{Context, Waker},
         time::Duration,
     };
 
@@ -1018,5 +1024,55 @@ mod tests {
         assert_eq!(removal.await.unwrap().unwrap().id, old);
         assert!(!registry.contains_id(&old));
         assert_eq!(registry.get_by_name("model1").unwrap().id, replacement);
+    }
+
+    /// A waiter cancelled before it takes the mutex (a registration step
+    /// that times out) leaves no lock behind: its reference goes with its
+    /// pending lock future, its guard counts after that, and the last load
+    /// out, whichever it is, removes the entry.
+    #[tokio::test]
+    async fn test_a_waiter_cancelled_before_the_mutex_leaves_no_lock() {
+        let registry = Arc::new(TokenizerRegistry::new());
+        let (a_started_tx, a_started_rx) = oneshot::channel();
+        let (a_finish_tx, a_finish_rx) = oneshot::channel();
+        let a = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let id = TokenizerRegistry::generate_id();
+                registry
+                    .load(&id, "model1", "source1", || async move {
+                        a_started_tx.send(()).unwrap();
+                        a_finish_rx.await.unwrap();
+                        Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+                    })
+                    .await
+            })
+        };
+        a_started_rx.await.unwrap();
+
+        // B, polled once by hand: it clones the lock and waits on the mutex.
+        let id_b = TokenizerRegistry::generate_id();
+        let mut b = Box::pin(registry.load(&id_b, "model1", "source1", || async {
+            panic!("the cancelled waiter loads nothing");
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        wait_for_lock_clones(&registry, "model1", 3).await;
+
+        // A publishes and leaves: the entry stays for the waiter.
+        a_finish_tx.send(()).unwrap();
+        assert!(a.await.unwrap().unwrap().is_newly_loaded());
+        assert!(
+            registry.loading_locks.contains_key("model1"),
+            "the lock stays for the waiter"
+        );
+
+        // B is dropped before it is polled again: the last load out.
+        drop(b);
+        assert!(
+            registry.loading_locks.is_empty(),
+            "the cancelled waiter removes the entry"
+        );
+        assert_eq!(registry.len(), 1);
     }
 }
