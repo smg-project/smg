@@ -131,7 +131,12 @@ pub async fn connect_mcp_servers(
             .await
             {
                 Ok(connected) => {
-                    if !mcp_servers.iter().any(|b| b.server_key == server_key) {
+                    // One binding per label: a server named under two labels
+                    // shares its pooled client and lists under each label.
+                    if !mcp_servers
+                        .iter()
+                        .any(|b| b.server_key == server_key && b.label == input.label)
+                    {
                         mcp_servers.push(McpServerBinding {
                             label: input.label.clone(),
                             server_key,
@@ -445,7 +450,7 @@ pub fn prepare_hosted_dispatch_args(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -955,6 +960,78 @@ mod tests {
         assert!(
             item_error(next).is_some_and(|error| error.is_string()),
             "the evicted connection's listing is not the pooled connection's record"
+        );
+    }
+
+    /// One server URL named under two labels is two bindings, each with its
+    /// own allowlist (the pooled client shared), and two `mcp_list_tools`
+    /// items in the response, each listing its label's own tools.
+    #[tokio::test]
+    async fn a_server_url_bound_under_two_labels_is_two_bindings_and_two_list_items() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo", "big"]),
+            ..Default::default()
+        })
+        .await;
+        let inputs = [
+            McpServerInput {
+                label: "conf".to_string(),
+                url: Some(url.clone()),
+                authorization: None,
+                headers: HashMap::new(),
+                allowed_tools: None,
+            },
+            McpServerInput {
+                label: "conf-b".to_string(),
+                url: Some(url),
+                authorization: None,
+                headers: HashMap::new(),
+                allowed_tools: Some(vec!["echo".to_string()]),
+            },
+        ];
+
+        let bindings = connect_mcp_servers(&orchestrator, &format_registry, &inputs).await;
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|b| b.label.as_str())
+                .collect::<Vec<_>>(),
+            ["conf", "conf-b"],
+            "one binding per label"
+        );
+        assert_eq!(bindings[0].server_key, bindings[1].server_key);
+        assert_eq!(
+            bindings[1].allowed_tools.as_deref(),
+            Some(&["echo".to_string()][..])
+        );
+
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let mut output = Vec::new();
+        openai_bridge::inject_client_visible_mcp_output_items(
+            &session,
+            &mut output,
+            Vec::new(),
+            &HashSet::new(),
+        );
+        let lists: Vec<(&str, Vec<&str>)> = output
+            .iter()
+            .filter_map(|item| match item {
+                ResponseOutputItem::McpListTools {
+                    server_label,
+                    tools,
+                    ..
+                } => {
+                    let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+                    names.sort_unstable();
+                    Some((server_label.as_str(), names))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lists,
+            [("conf", vec!["big", "echo"]), ("conf-b", vec!["echo"])]
         );
     }
 
