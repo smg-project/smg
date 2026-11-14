@@ -77,7 +77,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::{ReadinessRoleConfig, RouterConfig, RoutingMode},
+    config::{bind_socket_addr, ReadinessRoleConfig, RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
     routers::grpc::multimodal::{mm_settings, models_without_media_processing},
@@ -677,8 +677,7 @@ pub fn start_probe_listener(
     // 0.0.0.0 (which would hide a config typo and widen exposure). `port` may
     // be 0 here on purpose — the ephemeral-port tests bind through this path;
     // the config-sourced value is rejected for 0 at the validation layer.
-    let addr = crate::config::bind_socket_addr(host, port)
-        .map_err(|err| format!("probe listener: {err}"))?;
+    let addr = bind_socket_addr(host, port).map_err(|err| format!("probe listener: {err}"))?;
 
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|err| format!("failed to bind probe listener on {addr}: {err}"))?;
@@ -735,6 +734,7 @@ mod tests {
     use crate::{
         config::PdReadinessConfig,
         middleware::test_support::json_of,
+        server::http_client,
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker},
     };
 
@@ -1676,7 +1676,7 @@ mod tests {
         let addr = start_probe_listener("127.0.0.1", 0, state.clone()).unwrap();
         let base = format!("http://{addr}");
 
-        let client = crate::server::http_client();
+        let client = http_client();
         let resp = client.get(format!("{base}/liveness")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "OK");

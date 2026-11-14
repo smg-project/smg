@@ -2,6 +2,8 @@
 //!
 //! Provides version information including version number, build time, and Git metadata.
 
+use crate::config::bind_socket_addr;
+
 macro_rules! build_env {
     ($name:ident) => {
         env!(concat!("SMG_", stringify!($name)))
@@ -65,7 +67,7 @@ pub fn print_banner(host: &str, port: u16, mode: &str) {
         ("version", VERSION.to_string()),
         (
             "listening",
-            crate::config::bind_socket_addr(host, port)
+            bind_socket_addr(host, port)
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|_| format!("{host}:{port}")),
         ),

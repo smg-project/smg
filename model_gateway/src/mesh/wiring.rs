@@ -308,7 +308,9 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         policies::SelectWorkerInfo,
-        worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
+        worker::{
+            test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType, UNKNOWN_MODEL_ID,
+        },
     };
 
     fn empty_cluster_state() -> ClusterState {
@@ -521,8 +523,6 @@ mod tests {
     /// exercised branch), which is the regression guard we lacked.
     #[tokio::test]
     async fn producer_hook_publishes_delta_on_select_worker() {
-        use crate::worker::UNKNOWN_MODEL_ID;
-
         let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
         let mesh = MeshKV::new("node-a".into());
         let adapters = MeshAdapters::start(
@@ -659,7 +659,7 @@ mod tests {
         let path_hash = hash_node_path(text);
         let seed = TreeRepairPage {
             session_id: uuid::Uuid::nil(),
-            model_id: crate::worker::UNKNOWN_MODEL_ID.into(),
+            model_id: UNKNOWN_MODEL_ID.into(),
             tree_kind: TreeKind::String,
             page_index: 0,
             entries: vec![RepairEntry::String {
@@ -674,7 +674,7 @@ mod tests {
         let handle = PolicyRegistryTreeHandle::new(policy_registry);
         assert!(
             handle.apply_known_remote_insert(
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
                 TreeKind::String,
                 path_hash,
                 "http://w1:8000",
@@ -688,7 +688,7 @@ mod tests {
         // proves the chain walked.
         let page = TreeRepairPage {
             session_id: uuid::Uuid::nil(),
-            model_id: crate::worker::UNKNOWN_MODEL_ID.into(),
+            model_id: UNKNOWN_MODEL_ID.into(),
             tree_kind: TreeKind::String,
             page_index: 0,
             entries: Vec::new(),
