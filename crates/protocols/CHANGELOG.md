@@ -199,6 +199,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   template reads that key, its own `thinking_mode` switch sent in `chat_template_kwargs` says so
   (the gateway applies the switch under the template's detected thinking key, as it does for the
   mode itself; `ProviderProfile::thinking_from_template_kwargs` is the reading).
+- A web search call parses as the public API writes it: a `find_in_page` action (the crate named
+  it `find`, which still reads and is now written `find_in_page`), an `open_page` action without
+  a URL or with a null one, and the `incomplete` status. The crate refused each as an unknown
+  variant or a missing field. Breaking: `WebSearchCallStatus` gains `Incomplete`, and
+  `WebSearchAction::OpenPage.url` is `Option<String>`.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
