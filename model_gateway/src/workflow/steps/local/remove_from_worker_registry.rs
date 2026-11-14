@@ -397,9 +397,9 @@ mod tests {
                 .unwrap();
 
             assert_eq!(result, StepResult::Success);
-            let standing = registry
-                .get_by_url(url)
-                .expect("the replacement stays under the URL ({drained:?} -> {after:?})");
+            let standing = registry.get_by_url(url).unwrap_or_else(|| {
+                panic!("the replacement stays under the URL ({drained:?} -> {after:?})")
+            });
             assert!(
                 Arc::ptr_eq(&standing, &replacement),
                 "the worker under the URL is the replacement"
