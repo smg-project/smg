@@ -5,7 +5,14 @@ use tokio::sync::watch;
 use tracing_test::traced_test;
 
 use super::*;
-use crate::{policies::test_support::make_workers, worker::load_state::TestFeed};
+use crate::{
+    config::{PolicyConfig, PowerOfTwoLoadMetric},
+    policies::{
+        test_support::{make_worker, make_workers},
+        PolicyRegistry, PowerOfTwoPolicy,
+    },
+    worker::load_state::TestFeed,
+};
 
 #[test]
 fn text_is_wanted_only_without_token_ids() {
@@ -3168,16 +3175,21 @@ fn fleet_with_holders(holders: usize) -> HolderFleet {
 /// Eight workers; the first `holders` hold `blocks` blocks each of their
 /// own sequence, the rest nothing.
 fn fleet_with_holders_of(holders: usize, blocks: usize) -> HolderFleet {
-    let policy = CacheAwarePolicy::with_config(test_config());
     let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
     let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
-    let workers = make_workers(&refs);
+    fleet_of(make_workers(&refs), holders, blocks)
+}
+
+/// A fleet of `workers`, eight of them; the first `holders` hold `blocks`
+/// blocks each of their own sequence, the rest nothing.
+fn fleet_of(workers: Vec<Arc<dyn Worker>>, holders: usize, blocks: usize) -> HolderFleet {
+    let policy = CacheAwarePolicy::with_config(test_config());
     policy.init_workers(&workers);
     update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 0, 0, 0]);
     let indexer = Arc::new(KvIndex::chain());
     let mut prefixes = Vec::new();
-    for (h, url) in urls.iter().enumerate() {
-        let id = indexer.intern_worker(url).unwrap();
+    for (h, worker) in workers.iter().enumerate() {
+        let id = indexer.intern_worker(worker.url()).unwrap();
         if h >= holders {
             continue;
         }
@@ -3500,6 +3512,286 @@ fn event_spill_credits_only_expected_wait_final_worker() {
     let selected = route_tokens(&policy, &workers, &tokens);
     assert_only_final_worker_credited(&policy, &workers, 2, 4);
     assert_eq!(selected, 2, "spill must use expected wait over the fleet");
+}
+
+/// The password and the query token in the addresses the trace pin
+/// registers.
+const ADDRESS_SECRET: &str = "s3cret";
+
+/// Workers registered with a credential in the address, one a host: a
+/// password in the userinfo and a token in the query.
+fn workers_with_a_credential(hosts: &[&str]) -> Vec<Arc<dyn Worker>> {
+    hosts
+        .iter()
+        .map(|host| {
+            make_worker(&format!(
+                "http://user:{ADDRESS_SECRET}@{host}:8000/v1?token={ADDRESS_SECRET}"
+            ))
+        })
+        .collect()
+}
+
+/// No row of the cache trace carries a worker's registered address whole.
+/// The workers are registered with a password and a query token, and every
+/// row kind is written: a row's candidates and its selected worker, a score
+/// row of each of the four sources, and both gate rows. Each names its
+/// worker masked, the host and the port kept; the credential is in no row
+/// and not in the response header.
+#[tokio::test]
+async fn no_row_of_the_cache_trace_carries_a_registered_address_whole() {
+    let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+    let select = |policy: Arc<dyn LoadBalancingPolicy>,
+                  workers: &[Arc<dyn Worker>],
+                  info: &SelectWorkerInfo| {
+        registry
+            .select_worker_for_model(&policy, "unknown", workers, info)
+            .expect("a worker is selected");
+    };
+    let (rows, header) = cache_trace::scope(true, async {
+        // Least load: an expected-wait score row a candidate.
+        let workers = workers_with_a_credential(&["a", "b"]);
+        let plain = SelectWorkerInfo::default();
+        select(Arc::new(LeastLoadPolicy::new()), &workers, &plain);
+        // Power of two over resident tokens: a resident-work score row a
+        // candidate.
+        let resident = PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 1 };
+        let power_of_two = PowerOfTwoPolicy::with_load_metric(resident);
+        select(Arc::new(power_of_two), &workers, &plain);
+        // Cache aware over the string tree: `w4` is overloaded (the
+        // eligibility gate), `w1` holds the prefix under a load that spills
+        // it (the spill gate), and the scores of the tree and of the
+        // selection policy are written before the expected wait picks.
+        let policy = Arc::new(CacheAwarePolicy::with_config(test_config()));
+        let workers = workers_with_a_credential(&["w1", "w2", "w3", "w4"]);
+        workers[3].set_overloaded(true);
+        let text = "shared string prefix that must spill";
+        seed_string_tenants(&policy, &workers, text, &[workers[0].url()]);
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+        for _ in 0..10 {
+            workers[2].increment_load();
+        }
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..Default::default()
+        };
+        select(policy, &workers, &info);
+
+        let rows = cache_trace::captured_selections();
+        let header = cache_trace::dispatch(Some("root"), 1, Vec::new(), true, "regular");
+        (rows, header)
+    })
+    .await;
+
+    // What each row kind names as its worker.
+    let mut named = Vec::new();
+    for row in &rows {
+        named.push(("selected".to_string(), &row["worker"]));
+        for candidate in row["candidates"].as_array().into_iter().flatten() {
+            named.push(("candidate".to_string(), &candidate["worker"]));
+        }
+        for score in row["scores"].as_array().into_iter().flatten() {
+            let source = score["source"].as_str().unwrap_or_default();
+            named.push((format!("score {source}"), &score["worker"]));
+        }
+        for gate in row["gates"].as_array().into_iter().flatten() {
+            let kind = if gate["phase"] == "eligibility" {
+                "gate eligibility"
+            } else {
+                "gate spill"
+            };
+            named.push((kind.to_string(), &gate["worker"]));
+        }
+    }
+    let mut unmasked: Vec<String> = named
+        .iter()
+        .filter(|(_, worker)| {
+            let worker = worker.as_str().unwrap_or_default();
+            !(worker.starts_with("http://***@") && worker.ends_with(":8000/v1"))
+        })
+        .map(|(kind, worker)| format!("{kind}: {worker}"))
+        .collect();
+    unmasked.sort_unstable();
+    unmasked.dedup();
+    assert!(
+        unmasked.is_empty(),
+        "rows that do not name their worker masked, with its host and port: {unmasked:#?}"
+    );
+    let mut kinds: Vec<&str> = named.iter().map(|(kind, _)| kind.as_str()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        [
+            "candidate",
+            "gate eligibility",
+            "gate spill",
+            "score approximate_tree",
+            "score expected_wait",
+            "score policy_affinity",
+            "score resident_work",
+            "selected",
+        ],
+        "the row kinds the selections wrote"
+    );
+    let written = serde_json::to_string(&rows).expect("the rows are JSON");
+    assert!(
+        !written.contains(ADDRESS_SECRET),
+        "a trace row carries the credential: {written}"
+    );
+    let header = header.expect("the request asked for its header");
+    assert!(
+        !header.contains(ADDRESS_SECRET),
+        "the trace header carries the credential: {header}"
+    );
+}
+
+/// No debug line of a cache-aware decision carries a worker's registered
+/// address whole. The workers are registered with a password and a query
+/// token, and every line that names a worker is written by a decision of its
+/// own: the fallback under KV pressure, the released bookings, the tree
+/// decision, the event-driven decision, the warm-up slice and diversion, and
+/// both hash decisions. Each names its worker masked.
+#[test]
+#[traced_test]
+fn no_debug_line_of_a_decision_carries_a_registered_address_whole() {
+    // What tells each line among the test's lines.
+    const LINES: [(&str, &[&str]); 8] = [
+        (
+            "the fallback under KV pressure",
+            &["kv_pressure_expected_wait"],
+        ),
+        ("the released bookings", &["Released bookings"]),
+        ("the tree decision", &["tree_match"]),
+        ("the event-driven decision", &["Event-driven routing"]),
+        ("the warm-up slice", &["warmup_slice"]),
+        ("the warm-up diversion", &["warmup_divert"]),
+        ("the hash hit", &["hash_hit"]),
+        ("the hash fallback", &["hash", "expected_wait_fallback"]),
+    ];
+
+    // KV pressure abandons the affinity of `w1`: the expected-wait fallback.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        block_size: 4,
+        ..kv_only_config(0.3, 0.95)
+    });
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    let tokens: Vec<u32> = (0..32).collect();
+    seed_token_tenants(&policy, &workers, &tokens, &[workers[0].url()]);
+    workers[0].increment_load();
+    let _tx = inject_kv(&policy, &workers, &[0.9, 0.1]);
+    route_tokens(&policy, &workers, &tokens);
+
+    // A booking whose completion never arrived is released.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        selection_accounting_ttl_ms: 60_000,
+        ..test_config()
+    });
+    let accounting = policy.accounting.as_ref().expect("accounting enabled");
+    accounting.record_dispatch(workers[0].url(), 100, &[]);
+    accounting.record_dispatch(workers[0].url(), 200, &[]);
+    policy.reconcile_in_flight(workers[0].url(), 1);
+
+    // The string tree: `w1` holds the prefix and takes the request.
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    let text = "a prefix the tree holds for one worker";
+    seed_string_tenants(&policy, &workers, text, &[workers[0].url()]);
+    route_text(&policy, &workers, text);
+
+    // The event index: `w1` holds a fleet-sized cache and `w2` nothing, so
+    // requests with a thin overlap are decided by the events, and `w2` gets
+    // its warm-up slice of them.
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    policy.init_workers(&workers);
+    update_expected_wait_loads(&policy, &workers, &[0, 0]);
+    let held: Vec<u32> = (1..=4_400).collect();
+    let indexer = Arc::new(KvIndex::chain());
+    let holder = indexer.intern_worker(workers[0].url()).unwrap();
+    indexer.intern_worker(workers[1].url()).unwrap();
+    store_blocks(&indexer, holder, &held, 4, 1);
+    let monitor = Arc::new(KvEventMonitor::new());
+    monitor.indexers.insert("unknown".to_string(), indexer);
+    policy.set_kv_event_monitor(Some(monitor));
+    let mut request: Vec<u32> = (1..=4).collect();
+    request.extend(90_000..90_044);
+    for _ in 0..8 {
+        route_tokens(&policy, &workers, &request);
+    }
+
+    // Seven busy holders and an emptied worker: a deep hit is diverted to it.
+    let hosts = ["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7"];
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_of(workers_with_a_credential(&hosts), 7, 1_100);
+    for holder in &workers[..7] {
+        holder.increment_load();
+    }
+    for i in 0..8 {
+        let mut tokens = heads[i % 7].clone();
+        tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+        route_tokens(&policy, &workers, &tokens);
+    }
+
+    // The hash index: a hit on the holder of the head, then a miss.
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    let model = normalize_model_key(workers[0].model_id());
+    let cached: Vec<u32> = (0..16).collect();
+    policy.record_placement(
+        model,
+        None,
+        &cached,
+        &[16],
+        workers[0].url(),
+        Instant::now(),
+    );
+    update_expected_wait_loads(&policy, &workers, &[0, 0]);
+    route_tokens(&policy, &workers, &cached);
+    let novel: Vec<u32> = (100..116).collect();
+    route_tokens(&policy, &workers, &novel);
+
+    logs_assert(|lines: &[&str]| {
+        let written = |told_by: &[&str]| -> Vec<&str> {
+            lines
+                .iter()
+                .copied()
+                .filter(|line| told_by.iter().all(|part| line.contains(part)))
+                .collect()
+        };
+        let unwritten: Vec<&str> = LINES
+            .iter()
+            .filter(|(_, told_by)| written(told_by).is_empty())
+            .map(|(line, _)| *line)
+            .collect();
+        if !unwritten.is_empty() {
+            return Err(format!("lines no decision wrote: {unwritten:#?}"));
+        }
+        let whole: Vec<&str> = LINES
+            .iter()
+            .filter(|(_, told_by)| {
+                written(told_by)
+                    .iter()
+                    .any(|line| !line.contains("http://***@") || line.contains(ADDRESS_SECRET))
+            })
+            .map(|(line, _)| *line)
+            .collect();
+        if !whole.is_empty() {
+            return Err(format!(
+                "lines that do not name their worker masked: {whole:#?}"
+            ));
+        }
+        match lines.iter().find(|line| line.contains(ADDRESS_SECRET)) {
+            Some(line) => Err(format!("another line carries the credential: {line}")),
+            None => Ok(()),
+        }
+    });
 }
 
 #[test]

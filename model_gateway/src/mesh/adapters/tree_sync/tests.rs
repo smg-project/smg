@@ -339,6 +339,51 @@ async fn handle_incoming_batch_applies_known_and_skips_unknown() {
     );
 }
 
+/// A remote delta's lines name its worker masked, applied or not: the
+/// address is the one the publishing gateway registered. The tree is still
+/// given it whole, as the key its tenants are held under.
+#[tokio::test]
+#[traced_test]
+async fn a_remote_deltas_lines_name_its_worker_masked() {
+    let mesh = MeshKV::new("node-a".into());
+    let tree = Arc::new(MockTreeHandle::default());
+    tree.mark_known("model-1", TreeKind::String, 42);
+    let adapter = adapter_over(&mesh, tree.clone(), MockPeerList::with(&["node-b"]));
+    let worker = "http://user:s3cret@w1:8000/v1?token=s3cret";
+
+    let batch = vec![delta(42, worker), delta(99, worker)];
+    let bytes = Bytes::from(bincode::serialize(&batch).unwrap());
+    adapter.handle_incoming_batch("model-1", &[bytes]);
+
+    assert_eq!(
+        tree.applied_calls(),
+        vec![(
+            "model-1".to_string(),
+            TreeKind::String,
+            42,
+            worker.to_string()
+        )]
+    );
+    logs_assert(|lines: &[&str]| {
+        for message in [
+            "applied remote tenant delta against local tree",
+            "unknown remote tenant delta hash, requesting repair",
+        ] {
+            let line = lines
+                .iter()
+                .find(|line| line.contains(message))
+                .ok_or_else(|| format!("no line: {message}"))?;
+            if !line.contains("worker_url=http://***@w1:8000/v1 ") {
+                return Err(format!("the worker is not named masked: {line}"));
+            }
+        }
+        match lines.iter().find(|line| line.contains("s3cret")) {
+            Some(line) => Err(format!("a line carries the secret: {line}")),
+            None => Ok(()),
+        }
+    });
+}
+
 #[tokio::test]
 async fn handle_incoming_batch_ignores_malformed_payload() {
     // Corrupt batch → no propagation, no panic.

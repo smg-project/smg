@@ -2211,6 +2211,58 @@ mod tests {
         );
     }
 
+    /// The banner names the worker nodes of the two disaggregated modes with
+    /// each address masked: a userinfo whole, a query cut, and an address the
+    /// parser refuses as its marker. An address with none of them reads as it
+    /// was given, so the lines of a fleet with no credential keep their
+    /// bytes. A mode with no node list prints no node line.
+    #[test]
+    fn the_banners_node_lines_mask_every_address() {
+        let node = |url: &str, port: Option<u16>| (url.to_string(), port);
+        let plain = cli_args_from(&["--pd-disaggregation", "--decode", "http://d1:5/"]);
+        assert_eq!(
+            plain.node_lines(
+                &[node("http://p1:1", Some(9001)), node("http://p2:2/", None)],
+                &[]
+            ),
+            [
+                r#"Prefill nodes: [("http://p1:1", Some(9001)), ("http://p2:2/", None)]"#,
+                r#"Decode nodes: ["http://d1:5/"]"#,
+            ]
+        );
+        assert!(plain.node_lines(&[], &[]).is_empty());
+
+        let prefill = [
+            node("http://user:s3cret@10.0.0.7:9", Some(9001)),
+            node("http://p2:2/v1?token=s3cret", None),
+        ];
+        let decode = [
+            "--decode",
+            "http://user:s3cret@10.0.0.7:10",
+            "--decode",
+            "http://user:s3cret@10.0.0.7:port",
+        ];
+        let pd = cli_args_from(&[&["--pd-disaggregation"], &decode[..]].concat());
+        assert_eq!(
+            pd.node_lines(&prefill, &[]),
+            [
+                r#"Prefill nodes: [("http://***@10.0.0.7:9", Some(9001)), ("http://p2:2/v1", None)]"#,
+                r#"Decode nodes: ["http://***@10.0.0.7:10", "<unparsable address>"]"#,
+            ]
+        );
+        let epd = cli_args_from(&[&["--epd-disaggregation"], &decode[..]].concat());
+        assert_eq!(
+            epd.node_lines(&prefill, &[node("http://user:s3cret@10.0.0.7:8", None)]),
+            [
+                r#"Encode nodes: [("http://***@10.0.0.7:8", None)]"#,
+                r#"Prefill nodes: [("http://***@10.0.0.7:9", Some(9001)), ("http://p2:2/v1", None)]"#,
+                r#"Decode nodes: ["http://***@10.0.0.7:10", "<unparsable address>"]"#,
+            ]
+        );
+        let regular = cli_args_from(&["--worker-urls", "http://user:s3cret@10.0.0.7:9"]);
+        assert!(regular.node_lines(&prefill, &[]).is_empty());
+    }
+
     /// A flag whose value has a required shape is refused by name when the
     /// shape is wrong, where it used to be dropped or passed on in silence;
     /// the well-formed spellings pass.

@@ -1519,6 +1519,9 @@ impl WorkerManager {
     /// Workers the monitor has no load for are left out rather than reported
     /// as idle, so a gateway that has not polled yet answers with an empty
     /// `loads` array.
+    ///
+    /// A rank names its worker by the masked address: the route is public,
+    /// and a registered address may carry a password or a token.
     pub(crate) fn fleet_loads(
         worker_registry: &WorkerRegistry,
         snapshot: &LoadSnapshot,
@@ -1537,7 +1540,7 @@ impl WorkerManager {
             };
             let worker_type = worker.worker_type().to_string();
             loads.extend(report.loads.iter().map(|rank| SchedulerLoadSnapshot {
-                worker: Some(worker.url().to_string()),
+                worker: Some(worker.redacted_url().to_string()),
                 worker_type: Some(worker_type.clone()),
                 ..rank.clone()
             }));

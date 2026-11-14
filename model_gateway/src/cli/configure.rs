@@ -29,7 +29,7 @@ use smg::{
     },
     service_discovery::RuntimeDiscoveryConfig,
     version,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{endpoint::Endpoint, ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
@@ -1449,15 +1449,46 @@ impl CliArgs {
             return;
         }
         println!("Policy: {}", self.routing.policy);
+        for line in self.node_lines(prefill_urls, encode_urls) {
+            println!("{line}");
+        }
+    }
+
+    /// The banner's lines that name the worker nodes of the two
+    /// disaggregated modes. Each address is written through
+    /// [`Endpoint::redacted_url`]: one with no userinfo, query or fragment
+    /// reads as it was given, byte for byte, a userinfo is masked whole and a
+    /// query or fragment is cut, and one the address parser refuses reads as
+    /// its marker. An address on the command line may carry a credential;
+    /// what every start prints may not.
+    pub(crate) fn node_lines(
+        &self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) -> Vec<String> {
+        let shown = |nodes: &[(String, Option<u16>)]| -> Vec<(String, Option<u16>)> {
+            nodes
+                .iter()
+                .map(|(url, port)| (Endpoint::redacted_url(url), *port))
+                .collect()
+        };
+        let decode: Vec<String> = self
+            .workers
+            .decode
+            .iter()
+            .map(|url| Endpoint::redacted_url(url))
+            .collect();
+        let mut lines = Vec::new();
         if self.workers.pd_disaggregation && !prefill_urls.is_empty() {
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
+            lines.push(format!("Prefill nodes: {:?}", shown(prefill_urls)));
+            lines.push(format!("Decode nodes: {decode:?}"));
         }
         if self.workers.epd_disaggregation {
-            println!("Encode nodes: {encode_urls:?}");
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
+            lines.push(format!("Encode nodes: {:?}", shown(encode_urls)));
+            lines.push(format!("Prefill nodes: {:?}", shown(prefill_urls)));
+            lines.push(format!("Decode nodes: {decode:?}"));
         }
+        lines
     }
 
     /// Phase 3, configure: the router configuration, validated once by the

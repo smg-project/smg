@@ -517,6 +517,173 @@ fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> smg_
     }
 }
 
+/// The address a masked-line case registers: a password in its userinfo.
+const ADDRESS_WITH_A_PASSWORD: &str = "http://user:s3cret@remote:8080";
+
+/// Every captured line that says one of `messages` names the address masked,
+/// each message is said at least once, and the password is in no line.
+fn assert_the_lines_name_the_address_masked(
+    lines: &[&str],
+    messages: &[&str],
+) -> Result<(), String> {
+    if let Some(line) = lines.iter().find(|line| line.contains("s3cret")) {
+        return Err(format!("a line carries the password: {line}"));
+    }
+    for message in messages {
+        let mut said = lines
+            .iter()
+            .filter(|line| line.contains(message))
+            .peekable();
+        if said.peek().is_none() {
+            return Err(format!("no line says: {message}"));
+        }
+        if let Some(line) = said.find(|line| !line.contains("://***@remote:8080")) {
+            return Err(format!("a line does not name the address masked: {line}"));
+        }
+    }
+    Ok(())
+}
+
+/// A mesh import's lines name the address masked, at every level: each
+/// branch of the import that names the address is taken once with a state
+/// whose address carries a password.
+#[test]
+#[tracing_test::traced_test]
+fn a_mesh_imports_lines_name_the_address_masked() {
+    let url = ADDRESS_WITH_A_PASSWORD;
+    let spec = |model: &str| spec_bytes(url, model, WorkerType::Regular);
+    let undecodable = || b"not a worker spec".to_vec();
+    let state = |version: u64, health: bool, spec: Vec<u8>| smg_mesh::WorkerState {
+        version,
+        ..remote_state("peer-w1", url, health, spec)
+    };
+
+    // A first import from a spec, its health hint, its owner's replacement,
+    // and a replacement whose spec does not decode here.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, false, spec("llama-3")));
+    registry.on_remote_worker_state(&state(1, true, spec("llama-3")));
+    registry.on_remote_worker_state(&state(2, true, spec("llama-4")));
+    registry.on_remote_worker_state(&state(3, true, undecodable()));
+
+    // A first import whose spec does not decode, and its owner's
+    // replacement with no spec at all.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, true, undecodable()));
+    registry.on_remote_worker_state(&state(2, true, Vec::new()));
+
+    // A spec that declares the same-host transport.
+    let registry = WorkerRegistry::new();
+    let same_host = serde_json::json!({ "url": url, "connection_mode": "zmq" });
+    registry.on_remote_worker_state(&state(1, true, serde_json::to_vec(&same_host).unwrap()));
+
+    // An address of the same-host transport itself.
+    let registry = WorkerRegistry::new();
+    let same_host_address = "tcp://user:s3cret@remote:8080";
+    registry.on_remote_worker_state(&remote_state(
+        "peer-w2",
+        same_host_address,
+        true,
+        Vec::new(),
+    ));
+
+    // A peer's echo of a worker this node owns.
+    let registry = WorkerRegistry::new();
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .build(),
+    );
+    registry.register(local).unwrap();
+    registry.on_remote_worker_state(&state(1, false, Vec::new()));
+
+    logs_assert(|lines: &[&str]| {
+        assert_the_lines_name_the_address_masked(
+            lines,
+            &[
+                "Registered mesh-synced worker into local registry",
+                "Updated health for existing mesh-synced worker",
+                "Rebuilt mesh-synced worker from its owner's replacement",
+                "carries a spec this node cannot decode",
+                "undecodable WorkerSpec in mesh state; importing minimal worker",
+                "Rebuilt the minimal mesh-synced worker from its owner's replacement",
+                "Ignoring mesh state for host-local ZMQ worker",
+                "Ignoring mesh state for locally-owned worker",
+            ],
+        )?;
+        if lines
+            .iter()
+            .any(|line| line.contains("url=tcp://***@remote:8080"))
+        {
+            Ok(())
+        } else {
+            Err("no line names the same-host address masked".to_string())
+        }
+    });
+}
+
+/// The lines of a refused replacement and of divergent sampling defaults
+/// name the address masked.
+#[test]
+#[tracing_test::traced_test]
+fn a_replacements_lines_name_the_address_masked() {
+    let url = ADDRESS_WITH_A_PASSWORD;
+    let at = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let id = registry.register(at(url)).unwrap();
+    let revision = registry.get(&id).unwrap().revision();
+    assert!(
+        !registry.replace_claiming_local(&id, at(url), revision + 1),
+        "a replacement at a revision the worker is not at is refused"
+    );
+    assert!(
+        !registry.replace(&id, at("http://user:s3cret@remote:8081")),
+        "a replacement at another address is refused"
+    );
+
+    // Two gRPC workers of one routing group whose sampling defaults differ.
+    let registry = WorkerRegistry::new();
+    for (url, defaults) in [
+        (url, r#"{"temperature":0.1}"#),
+        ("grpc://user:s3cret@remote:8081", r#"{"temperature":0.9}"#),
+    ] {
+        registry.register(worker_with_sampling_defaults(
+            url,
+            "m",
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            Some(defaults),
+        ));
+    }
+
+    logs_assert(|lines: &[&str]| {
+        if let Some(line) = lines.iter().find(|line| line.contains("s3cret")) {
+            return Err(format!("a line carries the password: {line}"));
+        }
+        for message in [
+            "Aborting replacement: worker was replaced before the lock was acquired",
+            "replace() does not support URL changes",
+            "Divergent default sampling params reported by workers in the same routing group",
+        ] {
+            let said = lines.iter().find(|line| line.contains(message));
+            match said {
+                None => return Err(format!("no line says: {message}")),
+                Some(line) if !line.contains("://***@remote:808") => {
+                    return Err(format!("a line does not name the address masked: {line}"));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    });
+}
+
 #[test]
 fn mesh_import_adopts_publisher_worker_id() {
     let registry = WorkerRegistry::new();

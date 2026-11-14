@@ -1595,9 +1595,9 @@ impl PDRouter {
         if prefill_endpoint.transfer != decode_endpoint.transfer {
             return Err(misconfigured(format!(
                 "prefill {} runs {:?} but decode {} runs {:?}",
-                prefill.url(),
+                prefill.redacted_url(),
                 prefill_endpoint.transfer,
-                decode.url(),
+                decode.redacted_url(),
                 decode_endpoint.transfer
             )));
         }
@@ -2773,12 +2773,19 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Prefill {} returned status {}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     res.status()
                 ));
             }
+            // The client's error names the request's address, its query
+            // kept: the answer carries its cause without the address, and
+            // the masked address beside it names the side.
             Err(e) => {
-                errors.push(format!("Prefill {} error: {}", prefill.url(), e));
+                errors.push(format!(
+                    "Prefill {} error: {}",
+                    prefill.redacted_url(),
+                    cause(&e)
+                ));
             }
         }
 
@@ -2792,12 +2799,16 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Decode {} returned status {}",
-                    decode.url(),
+                    decode.redacted_url(),
                     res.status()
                 ));
             }
             Err(e) => {
-                errors.push(format!("Decode {} error: {}", decode.url(), e));
+                errors.push(format!(
+                    "Decode {} error: {}",
+                    decode.redacted_url(),
+                    cause(&e)
+                ));
             }
         }
 
@@ -2806,8 +2817,8 @@ impl RouterTrait for PDRouter {
                 StatusCode::OK,
                 format!(
                     "Health generate passed on selected pair: prefill={}, decode={}",
-                    prefill.url(),
-                    decode.url()
+                    prefill.redacted_url(),
+                    decode.redacted_url()
                 ),
             )
                 .into_response()
@@ -4645,6 +4656,87 @@ mod tests {
         }
     }
 
+    /// The health-generate probe names the pair it tried with each address
+    /// masked, whether a side answers, answers an error or refuses the
+    /// connection: a worker registered with a password and a token in its
+    /// query is named by its scheme, host and port, and a refused
+    /// connection's entry carries the transport's reason without the
+    /// request's address. The route is public. The stubs answer every path:
+    /// the probe's route joins such an address after its query.
+    #[tokio::test]
+    async fn health_generate_names_the_pair_it_tried_with_masked_addresses() {
+        async fn probe(prefill: &str, decode: &str) -> (StatusCode, String) {
+            let with_secrets = |url: &str| {
+                let with_password = url.replacen("http://", "http://user:s3cret@", 1);
+                format!("{with_password}/?token=s3cret")
+            };
+            let router = create_test_pd_router();
+            register_pd_pair(&router, with_secrets(prefill), with_secrets(decode));
+            let request = Request::builder().body(Body::empty()).unwrap();
+            let response = tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+                .await
+                .expect("the probe answers");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+        let answering = |status: StatusCode| {
+            spawn_stub(axum::Router::new().fallback(move || async move { status }))
+        };
+        let (healthy_prefill, healthy_decode) = (
+            answering(StatusCode::OK).await,
+            answering(StatusCode::OK).await,
+        );
+        let (failing_prefill, failing_decode) = (
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+        );
+        let (refused_prefill, refused_decode) =
+            (RefusedAddress::reserve(), RefusedAddress::reserve());
+        let (refused_prefill, refused_decode) =
+            (refused_prefill.http_url(), refused_decode.http_url());
+
+        let mut carrying = Vec::new();
+        for (prefill, decode, wanted) in [
+            (&healthy_prefill, &healthy_decode, StatusCode::OK),
+            (
+                &failing_prefill,
+                &refused_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                &refused_prefill,
+                &failing_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (status, body) = probe(prefill, decode).await;
+            assert_eq!(status, wanted, "{body}");
+            if body.contains("s3cret") {
+                carrying.push(body);
+                continue;
+            }
+            for side in [prefill, decode] {
+                let masked = side.replacen("http://", "http://***@", 1);
+                assert!(body.contains(&masked), "{masked} is not named in: {body}");
+            }
+            // The side that refused the connection is answered with the
+            // transport's reason after the client's own words.
+            if wanted == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(
+                    body.contains(" error: error sending request: "),
+                    "the refused side is answered without its reason: {body}"
+                );
+            }
+        }
+        assert!(
+            carrying.is_empty(),
+            "bodies of the probe that carry the secret: {carrying:#?}"
+        );
+    }
+
     fn streaming_chat() -> ChatCompletionRequest {
         serde_json::from_value(json!({
             "model": "m",
@@ -5833,6 +5925,36 @@ mod tests {
         assert_eq!(error_code(&response), Some("moriio_pair_misconfigured"));
         assert!(taken(&prefill_seen).is_empty());
         assert!(taken(&decode_seen).is_empty());
+    }
+
+    /// A pair refused for running two transfer modes is named in the warning
+    /// by masked addresses.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_pair_refused_for_its_transfer_modes_is_named_masked() {
+        let worker = |url: &str, worker_type, mode: &str| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", mode)
+                .build()
+        };
+        let prefill = worker(
+            "http://user:s3cret@10.0.0.1:8100",
+            WorkerType::Prefill,
+            "read",
+        );
+        let decode = worker(
+            "http://user:s3cret@10.0.0.2:8200",
+            WorkerType::Decode,
+            "write",
+        );
+        assert!(PDRouter::moriio_pair(&prefill, &decode).is_err());
+        assert!(logs_contain(
+            "prefill http://***@10.0.0.1:8100 runs Read but decode http://***@10.0.0.2:8200 runs Write"
+        ));
+        assert!(!logs_contain("s3cret"));
     }
 
     #[test]
