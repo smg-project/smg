@@ -2376,10 +2376,18 @@ mod tests {
         let (w, mut rx) = signalling_worker();
         set(&w, Some(StallReason::Unreachable), "test");
         w.set_status(WorkerStatus::NotReady);
+        // The proof bounds the age by the time elapsed on the same clock
+        // since just before the probe: a contact stamps at or after that
+        // read, so the age cannot exceed the elapsed time whatever the
+        // scheduling stall between the probe and the read; without a
+        // contact the age is the sleep on top of it.
         thread::sleep(Duration::from_millis(15));
-        let before = w.contact_age();
+        let probed_at = now_ms();
         on_probe_passed(&w);
-        assert!(w.contact_age() < before, "a passing probe is a contact");
+        assert!(
+            w.contact_age() <= Duration::from_millis(now_ms() - probed_at),
+            "a passing probe is a contact"
+        );
         assert!(w.stall_reason().is_none(), "and ends an unreachable veto");
         assert!(
             rx.try_recv().is_err(),
