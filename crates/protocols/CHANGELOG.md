@@ -94,6 +94,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An Interactions response modality takes `video` and `document`, and each modality reads its
+  uppercase name too (`"IMAGE"`), as the public API takes them and as the SDK's own examples send
+  `response_modalities`. Each is written in lowercase, and a modality this build does not name is
+  kept as written, as the SDK keeps the set open. An uppercase or a new modality refused the whole
+  request, and a usage entry that counted a new one failed the answer's parse. Breaking:
+  `ResponseModality` gains `Video`, `Document` and `Other`, and is `#[non_exhaustive]`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

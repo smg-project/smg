@@ -1066,12 +1066,29 @@ pub struct InteractionsUsage {
     pub total_tokens: Option<u32>,
 }
 
+/// A modality of the response, as the public API names them. Each also
+/// reads its uppercase name, which the SDK's own examples send
+/// (`response_modalities=["IMAGE"]`), and is written in lowercase. The SDK
+/// keeps the set open, so a modality this build does not name is kept as
+/// written (`Other`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResponseModality {
+    #[serde(alias = "TEXT")]
     Text,
+    #[serde(alias = "IMAGE")]
     Image,
+    #[serde(alias = "AUDIO")]
     Audio,
+    #[serde(alias = "VIDEO")]
+    Video,
+    #[serde(alias = "DOCUMENT")]
+    Document,
+    /// A modality this build does not name, kept as the client or upstream
+    /// wrote it
+    #[serde(untagged)]
+    Other(String),
 }
 
 fn is_option_blank(v: Option<&String>) -> bool {
@@ -1235,6 +1252,55 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A response modality reads in lowercase and in the uppercase the SDK's
+    /// own examples send, video and document among them, and is written in
+    /// lowercase. A usage entry counts a document modality's tokens.
+    #[test]
+    fn a_response_modality_reads_in_either_case_and_writes_lowercase() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Generate an image of a futuristic city.",
+            "store": false,
+            "response_modalities": ["IMAGE", "text", "VIDEO", "document", "AUDIO"]
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(
+            written["response_modalities"],
+            serde_json::json!(["image", "text", "video", "document", "audio"])
+        );
+
+        let usage: InteractionsUsage = serde_json::from_value(serde_json::json!({
+            "total_input_tokens": 12,
+            "input_tokens_by_modality": [
+                {"modality": "text", "tokens": 4},
+                {"modality": "document", "tokens": 8}
+            ]
+        }))
+        .unwrap();
+        let by_modality = usage.input_tokens_by_modality.unwrap();
+        assert_eq!(by_modality[1].modality, Some(ResponseModality::Document));
+
+        let unknown: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Hello",
+            "store": false,
+            "response_modalities": ["a_modality_of_no_api"]
+        }))
+        .unwrap();
+        assert_eq!(
+            unknown.response_modalities,
+            Some(vec![ResponseModality::Other(
+                "a_modality_of_no_api".to_string()
+            )])
+        );
+        let written = crate::common::to_value_exact(&unknown).unwrap();
+        assert_eq!(
+            written["response_modalities"],
+            serde_json::json!(["a_modality_of_no_api"])
+        );
+    }
 
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {
         let err = result.expect_err("a refusal");
