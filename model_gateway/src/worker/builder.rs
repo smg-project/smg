@@ -137,13 +137,6 @@ impl BasicWorkerBuilder {
         builder
     }
 
-    /// The engine's KV block size in tokens as a registration states it;
-    /// `None` leaves it to what the engine's streams report.
-    pub fn kv_block_size(mut self, tokens: Option<usize>) -> Self {
-        self.spec.kv_block_size = tokens;
-        self
-    }
-
     /// Set the bootstrap port (for prefill workers in PD disaggregation)
     pub fn bootstrap_port(mut self, port: Option<u16>) -> Self {
         self.spec.bootstrap_port = port;
@@ -516,7 +509,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::worker::basic::Worker;
+    use crate::{server::http_client, worker::basic::Worker};
 
     /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
     /// worker, every default written once.
@@ -597,7 +590,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(crate::server::http_client()))
+            .http_client(Arc::new(http_client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }
