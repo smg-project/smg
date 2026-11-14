@@ -836,3 +836,415 @@ mod answer_tests {
         }
     }
 }
+
+/// A JSON answer (a `json_object` or `json_schema` response format), read with
+/// [`Engine::reads_json_answer`]: a marker's spelling inside one of the answer's strings is the
+/// answer's text, as the family's own parsers read it in their JSON mode, and a frame outside the
+/// strings still reads. The cases are the family's parsers' own, rendered through the table.
+#[cfg(test)]
+mod json_answer_tests {
+    use super::*;
+    use crate::{
+        engine::Engine,
+        event::{DropReason, Event, FinishReason, Text},
+        testing::{bytes, content, drive, malformed, reasoning, said, the_same_at_every_cut, Said},
+        Declared,
+    };
+
+    /// The generation prompt's tail: the turn's first message opened, and nothing more.
+    const PROMPT: &str = "<|message_model|>";
+
+    /// Every spelling the table reads as a marker, the ignored one and the call's own included.
+    const SPELLINGS: [&str; 6] = [
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "<|content_text|>",
+        "<|end_message|>",
+        "<|content_model_end_sampling|>",
+        INVOKE_JSON,
+    ];
+
+    /// One turn through `format` as a JSON answer, from the prompt.
+    fn read(format: &Format, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::new(format.clone(), Declared::default()).reads_json_answer(),
+            PROMPT,
+            pieces,
+        )
+    }
+
+    /// `output` read whole, one character at a time and at every two-way cut, with every byte in
+    /// one event and nothing malformed; what the table said.
+    fn read_at_every_cut(format: &Format, output: &str) -> Said {
+        let events = read(format, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(malformed(&events), [], "{events:?}");
+        the_same_at_every_cut(|pieces| read(format, pieces), output)
+    }
+
+    /// The table, and the variant a request without tools reads with.
+    fn tables() -> [Format; 2] {
+        [inkling(), inkling().without_calls()]
+    }
+
+    #[test]
+    fn a_spelling_inside_a_string_of_the_answer_is_the_answers_text() {
+        let payload = r#"{"literal":"<|content_thinking|>quoted<|end_message|>"}"#;
+        let output = format!("<|content_text|>{payload}<|end_message|>");
+        for format in tables() {
+            let said = read_at_every_cut(&format, &output);
+            assert_eq!(said.content, payload);
+            assert_eq!(said.reasoning, "");
+            assert_eq!(said.calls, []);
+            assert!(matches!(said.finish, Some((FinishReason::Stop, 0))));
+        }
+    }
+
+    #[test]
+    fn without_the_option_the_spellings_move_the_table_as_before() {
+        // The table alone reads the quoted spellings as its markers: the thought's opener starts a
+        // thought inside the answer, and the quoted close ends the message early. The option is
+        // what a JSON answer needs, and nothing else changes.
+        let output = r#"<|content_text|>{"literal":"<|content_thinking|>quoted<|end_message|>"}<|end_message|>"#;
+        let events = drive(
+            &mut Engine::new(inkling(), Declared::default()),
+            PROMPT,
+            &[output],
+        );
+        assert_eq!(bytes(&events), output);
+        assert_eq!(content(&events), r#"{"literal":""#);
+        assert_eq!(reasoning(&events), "quoted");
+    }
+
+    #[test]
+    fn every_spelling_survives_as_a_key_and_in_a_value_with_escapes_at_every_cut() {
+        // After a thought that holds an unmatched quote (a thought is not JSON: its close still
+        // moves), the answer spells every marker as a key and inside a value between an escaped
+        // quote, a doubled backslash and text outside ASCII, and the turn's end token follows the
+        // message's close outside the strings, dropped as ever.
+        for spelling in SPELLINGS {
+            let payload = format!(r#"{{"{spelling}":"α\"{spelling}\\\\終"}}"#);
+            let output = format!(
+                "<|content_thinking|>unmatched quote: \"<|end_message|><|message_model|>\
+                 <|content_text|>{payload}<|end_message|><|content_model_end_sampling|>"
+            );
+            for format in tables() {
+                let said = read_at_every_cut(&format, &output);
+                assert_eq!(said.reasoning, "unmatched quote: \"", "{spelling}");
+                assert_eq!(said.content, payload, "{spelling}");
+                assert_eq!(said.calls, [], "{spelling}");
+                let events = read(&format, &[&output]);
+                assert!(
+                    events.contains(&Event::Dropped {
+                        text: Text::uncounted("<|content_model_end_sampling|>"),
+                        why: DropReason::Wrapper,
+                    }),
+                    "{spelling}: the end token outside the strings is still dropped: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalars_lists_and_strings_the_end_leaves_open_read_as_written() {
+        // A JSON answer that is a list, a bare string, a number, a word, and strings the stream's
+        // end leaves open (a cut spelling held by the scanner, an escaped quote before a close):
+        // every byte is the answer's text, at the end as in the middle.
+        for payload in [
+            r#"["<|message_model|>","<|end_message|>"]"#,
+            r#""<|content_thinking|>""#,
+            "42",
+            "null",
+            "true",
+            r#"{"value":"<|content_thinking|>unfinished<|end_mes"#,
+            r#"{"value":"escaped quote: \"<|end_message|>"#,
+        ] {
+            let output = format!("<|content_text|>{payload}");
+            for format in tables() {
+                let said = read_at_every_cut(&format, &output);
+                assert_eq!(said.content, payload, "{payload}");
+                assert_eq!(said.reasoning, "", "{payload}");
+                assert_eq!(said.calls, [], "{payload}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_quoted_call_frame_starts_no_call_and_a_frame_outside_the_strings_does() {
+        // Tools offered: the answer's value spells a whole call frame, the tool's name, the call
+        // marker, the object and the message's close; none of it is a call or a close. The real
+        // frame in the next message is the call, as under any other answer.
+        let quoted = concat!(
+            "{\"note\":\"get_weather<|content_invoke_tool_json|>",
+            "{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":{}}<|end_message|>\"}"
+        );
+        let frame = concat!(
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>"
+        );
+        let output = format!("<|content_text|>{quoted}<|end_message|>{frame}");
+        let table = inkling();
+        let said = read_at_every_cut(&table, &output);
+        assert_eq!(said.content, quoted);
+        assert_eq!(
+            said.calls,
+            [(
+                "get_weather".to_string(),
+                "{\"city\":\"Paris\"}".to_string()
+            )]
+        );
+        assert!(matches!(said.finish, Some((FinishReason::Stop, 1))));
+        // Without tools the same output is the answer and then the frame as content between the
+        // dropped framing, as a request without tools reads a call the model writes anyway.
+        let said = read_at_every_cut(&inkling().without_calls(), &output);
+        assert_eq!(
+            said.content,
+            format!(
+                "{quoted}get_weather<|content_invoke_tool_json|>\
+                 {{\"name\":\"get_weather\",\"args\":{{\"city\":\"Paris\"}}}}"
+            )
+        );
+        assert_eq!(said.calls, []);
+    }
+
+    #[test]
+    fn a_quoted_close_inside_a_calls_arguments_is_the_arguments_text() {
+        // The group's recorded case: the answer quotes the close, and the real call that follows
+        // quotes it again inside its arguments, after an escaped quote. The family's parser keeps
+        // the arguments whole under its JSON mode (a named-JSON call is one JSON value), and so
+        // does the table under the option; the table alone ends the call at the quoted close and
+        // reads the rest as content.
+        let answer = "{\"note\":\"<|end_message|>\"}";
+        let frame = concat!(
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            "{\"name\":\"get_weather\",\"args\":{\"city\":\"\\\"<|end_message|>\"}}<|end_message|>"
+        );
+        let output = format!("<|content_text|>{answer}<|end_message|>{frame}");
+        let whole = read_at_every_cut(&inkling(), &output);
+        assert_eq!(whole.content, answer);
+        assert_eq!(
+            whole.calls,
+            [(
+                "get_weather".to_string(),
+                "{\"city\":\"\\\"<|end_message|>\"}".to_string()
+            )]
+        );
+        assert!(matches!(whole.finish, Some((FinishReason::Stop, 1))));
+        let events = drive(
+            &mut Engine::new(inkling(), Declared::default()),
+            PROMPT,
+            &[output.as_str()],
+        );
+        let alone = said(&events);
+        assert_eq!(alone.calls.len(), 1, "{alone:?}");
+        assert_ne!(
+            alone.calls[0].1, whole.calls[0].1,
+            "the table alone ends the call at the quoted close"
+        );
+    }
+
+    #[test]
+    fn an_unmatched_quote_in_a_kept_thought_moves_nothing() {
+        // A request that keeps the reasoning in the content: the thought is content for the
+        // client but still a thought for the quote state (the variant remade its state), so its
+        // odd quote opens no string, and the answer and the real call after it read as under any
+        // JSON answer; without tools the frame is content between the dropped framing.
+        let frame = concat!(
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            "{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\"}}<|end_message|>"
+        );
+        let output = format!(
+            "<|content_thinking|>say \"hi<|end_message|><|message_model|>\
+             <|content_text|>{{\"a\":\"<|end_message|>\"}}<|end_message|>{frame}"
+        );
+        let said = read_at_every_cut(&inkling().without_reasoning(), &output);
+        assert_eq!(said.content, "say \"hi{\"a\":\"<|end_message|>\"}");
+        assert_eq!(
+            said.calls,
+            [("get_weather".to_string(), "{\"city\":\"Oslo\"}".to_string())]
+        );
+        assert!(matches!(said.finish, Some((FinishReason::Stop, 1))));
+        let said = read_at_every_cut(&inkling().without_calls().without_reasoning(), &output);
+        assert_eq!(
+            said.content,
+            "say \"hi{\"a\":\"<|end_message|>\"}get_weather<|content_invoke_tool_json|>\
+             {\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\"}}"
+        );
+        assert_eq!(said.calls, []);
+    }
+
+    #[test]
+    fn a_stray_quote_after_the_calls_object_reads_as_without_the_option() {
+        // Bytes after the call's object closed are no JSON value: a stray quote among them is the
+        // surplus's text (one malformed run, as without the option), the close still ends the
+        // call, and the next message reads as before.
+        let output = concat!(
+            "<|content_text|>{\"a\":1}<|end_message|>",
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            "{\"name\":\"get_weather\",\"args\":{}} \"<|end_message|>",
+            "<|message_model|><|content_text|>after<|end_message|>"
+        );
+        let events = read(&inkling(), &[output]);
+        assert_eq!(bytes(&events), output);
+        let with = said(&events);
+        let without = said(&drive(
+            &mut Engine::new(inkling(), Declared::default()),
+            PROMPT,
+            &[output],
+        ));
+        assert_eq!(with, without);
+        assert_eq!(with.content, "{\"a\":1}after");
+        assert_eq!(with.calls.len(), 1, "{with:?}");
+        assert_eq!(
+            the_same_at_every_cut(|pieces| read(&inkling(), pieces), output),
+            with
+        );
+    }
+
+    #[test]
+    fn a_quote_in_a_malformed_header_moves_nothing() {
+        // The tool's name before the marker is no JSON: a quote the model writes in a header that
+        // never comes to its marker is the header's text, the close still ends the malformed
+        // message, and the answer in the next message is content, as without the option.
+        let output = concat!(
+            "say \"hi<|end_message|>",
+            "<|message_model|><|content_text|>{\"a\":1}<|end_message|>"
+        );
+        let events = read(&inkling(), &[output]);
+        assert_eq!(bytes(&events), output);
+        let with = said(&events);
+        let without = said(&drive(
+            &mut Engine::new(inkling(), Declared::default()),
+            PROMPT,
+            &[output],
+        ));
+        assert_eq!(with, without);
+        assert_eq!(with.content, "{\"a\":1}");
+        assert!(with.calls.is_empty(), "{with:?}");
+        assert_eq!(
+            the_same_at_every_cut(|pieces| read(&inkling(), pieces), output),
+            with
+        );
+    }
+
+    #[test]
+    fn a_quote_in_a_calls_header_that_reaches_its_marker_moves_nothing() {
+        // A quote in the name before the marker is the header's, not a string's: the object
+        // after the marker reads with its own quotes, its close ends the call, and the next
+        // message is content, as without the option.
+        let output = concat!(
+            "get\"weather<|content_invoke_tool_json|>",
+            "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
+            "<|message_model|><|content_text|>after<|end_message|>"
+        );
+        let events = read(&inkling(), &[output]);
+        assert_eq!(bytes(&events), output);
+        let with = said(&events);
+        let without = said(&drive(
+            &mut Engine::new(inkling(), Declared::default()),
+            PROMPT,
+            &[output],
+        ));
+        assert_eq!(with, without);
+        assert_eq!(with.content, "after");
+        assert_eq!(with.calls.len(), 1, "{with:?}");
+        assert_eq!(
+            the_same_at_every_cut(|pieces| read(&inkling(), pieces), output),
+            with
+        );
+    }
+
+    #[test]
+    fn a_quote_after_a_lists_close_or_where_the_list_should_be_moves_nothing() {
+        // A table whose calls are one JSON list between markers: the text after the `]` and the
+        // text where the list should be are no JSON value, so a quote in either is that text's, the
+        // closing marker ends the region, and the content after it reads as without the option.
+        let table = crate::formats::llama_nemotron();
+        let prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        for output in [
+            concat!(
+                "<TOOLCALL>[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}] \"",
+                "</TOOLCALL>after"
+            ),
+            "<TOOLCALL>say \"hi</TOOLCALL>after",
+        ] {
+            let under = |pieces: &[&str]| {
+                drive(
+                    &mut Engine::new(table.clone(), Declared::default()).reads_json_answer(),
+                    prompt,
+                    pieces,
+                )
+            };
+            let events = under(&[output]);
+            assert_eq!(bytes(&events), output);
+            let with = said(&events);
+            let without = said(&drive(
+                &mut Engine::new(table.clone(), Declared::default()),
+                prompt,
+                &[output],
+            ));
+            assert_eq!(with, without, "{output}");
+            assert_eq!(with.content, "after", "{output}");
+            assert_eq!(the_same_at_every_cut(|pieces| under(pieces), output), with);
+        }
+    }
+
+    #[test]
+    fn outside_the_strings_the_rows_move_as_before() {
+        // The answer's kind said again before the JSON (an engine that starts the grammar after
+        // the model's own marker), the template's whitespace before it, a thought's opener inside
+        // the answer before any string opens: the rows read them as without the option.
+        let output =
+            "<|content_text|>\n<|content_text|>{\"a\":\"<|content_text|>\"}<|end_message|>";
+        for format in tables() {
+            let said = read_at_every_cut(&format, output);
+            assert_eq!(said.content, "{\"a\":\"<|content_text|>\"}");
+            let events = read(&format, &[output]);
+            let dropped = Event::Dropped {
+                text: Text::uncounted("<|content_text|>"),
+                why: DropReason::Wrapper,
+            };
+            assert_eq!(
+                events.iter().filter(|event| **event == dropped).count(),
+                2,
+                "{events:?}"
+            );
+        }
+        let output =
+            "<|content_text|>{\"a\":1}<|content_thinking|>a thought after all<|end_message|>";
+        for format in tables() {
+            let said = read_at_every_cut(&format, output);
+            assert_eq!(said.content, "{\"a\":1}");
+            assert_eq!(said.reasoning, "a thought after all");
+        }
+    }
+
+    #[test]
+    fn a_thought_is_not_json_and_its_quote_moves_nothing() {
+        // The quote state is the content's: a quote in the thought leaves the thought's markers
+        // their rows (the answer's marker inside the thought starts the answer), and the answer's
+        // own quote state starts fresh at the row into the content.
+        let output = "<|content_thinking|>say \"hi<|content_text|>{\"a\":\"<|end_message|>\"}<|end_message|>";
+        for format in tables() {
+            let said = read_at_every_cut(&format, output);
+            assert_eq!(said.reasoning, "say \"hi");
+            assert_eq!(said.content, "{\"a\":\"<|end_message|>\"}");
+        }
+    }
+
+    #[test]
+    fn the_variant_without_the_thought_reads_the_quoted_spellings_too() {
+        // A request that keeps the reasoning in the content and asks for a JSON answer: the
+        // thought's text is content and the four markers stay dropped, the quoted ones text.
+        let output = "<|content_thinking|>plan<|end_message|><|message_model|>\
+                      <|content_text|>{\"a\":\"<|content_thinking|>\"}<|end_message|>";
+        for format in [
+            inkling().without_reasoning(),
+            inkling().without_calls().without_reasoning(),
+        ] {
+            let said = read_at_every_cut(&format, output);
+            assert_eq!(said.reasoning, "");
+            assert_eq!(said.content, "plan{\"a\":\"<|content_thinking|>\"}");
+        }
+    }
+}

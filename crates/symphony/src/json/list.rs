@@ -96,6 +96,11 @@ pub struct Assembler {
     /// Whether a `;` followed the lone object: it is held with the whitespace around it until the
     /// next byte decides whether an object follows it, and a `;` nothing follows is text.
     separated: bool,
+    /// Which of the last piece's bytes were the list's own: from its `[` through its `]`, or the
+    /// prose of an output that is no list. The JSON-answer option's quote state steps over these
+    /// alone ([`CallAssembler::value_bytes`](crate::engine::CallAssembler::value_bytes)): the text
+    /// after the `]` and the text where a malformed list should be are no JSON value.
+    value: std::ops::Range<usize>,
 }
 
 /// What frames the calls: how the first byte that is not whitespace reads, and what text in place
@@ -170,6 +175,7 @@ impl Assembler {
             released: false,
             opener: framing.opener(),
             separated: false,
+            value: 0..0,
         }
     }
 
@@ -177,8 +183,32 @@ impl Assembler {
     /// object's argument fragment that lies within `bytes` borrows them (`'d`, the delta's life).
     pub fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) {
         let mut rest = bytes;
+        let mut began = None;
+        self.value = 0..0;
         while !rest.is_empty() {
+            let at = bytes.len() - rest.len();
+            let before = self.in_value();
             rest = self.take(rest, out);
+            // The bytes a take consumed are the value's when it began inside the list or in prose,
+            // or when it began before the decision and did not end after the list or in its place.
+            let counted = match before {
+                Some(inside) => inside,
+                None => self.in_value() != Some(false),
+            };
+            if counted {
+                let start = *began.get_or_insert(at);
+                self.value = start..bytes.len() - rest.len();
+            }
+        }
+    }
+
+    /// Whether the stage's bytes are the value's: inside the list or in prose they are, after the
+    /// list or in a malformed list's place they are not, and before the decision it is not known.
+    fn in_value(&self) -> Option<bool> {
+        match self.stage {
+            Stage::Object(_) | Stage::Between | Stage::Content => Some(true),
+            Stage::After | Stage::Malformed => Some(false),
+            Stage::Deciding | Stage::Opening { .. } => None,
         }
     }
 
@@ -445,6 +475,11 @@ impl crate::engine::CallAssembler for Assembler {
     ) -> usize {
         self.feed(text, out);
         text.len()
+    }
+
+    /// The list's own bytes: nothing after its `]`, nothing where a malformed list should be.
+    fn value_bytes(&self, taken: usize) -> std::ops::Range<usize> {
+        self.value.start.min(taken)..self.value.end.min(taken)
     }
 
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {

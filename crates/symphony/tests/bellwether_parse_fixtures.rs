@@ -1715,16 +1715,27 @@ struct Fixture {
 }
 
 /// The parts of the case's request the replay needs: the tools, which type a tagged call's values,
-/// and whether the request turned thinking off, which decides the prompt's tail.
+/// whether the request turned thinking off, which decides the prompt's tail, and whether it asked
+/// for a JSON answer, which the engine reads with its JSON-answer option.
 #[derive(Default, Deserialize)]
 struct Request {
     #[serde(default)]
     tools: Vec<Tool>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
 }
 
 impl Request {
+    /// Whether the request asked for a JSON answer (`json_object` or `json_schema`), as the
+    /// gateway reads the same field: the engine then takes `Engine::reads_json_answer`.
+    fn json_answer(&self) -> bool {
+        self.response_format
+            .as_ref()
+            .is_some_and(|format| matches!(format.kind.as_str(), "json_object" | "json_schema"))
+    }
+
     fn thinking_off(&self) -> bool {
         self.enable_thinking() == Some(false)
     }
@@ -1765,6 +1776,14 @@ struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
     thinking: Option<bool>,
     reasoning_effort: Option<String>,
+}
+
+/// The request's `response_format`, by its `type` alone: the schema of a `json_schema` answer is
+/// the engine's constraint, not the reader's.
+#[derive(Deserialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -1970,7 +1989,7 @@ fn qwen3_parse_fixtures_match_the_reference() {
     } = parity(
         &fixtures,
         &ids,
-        &|fixture| Engine::new(format.clone(), Declared::of(&fixture.request.tools)),
+        &|fixture| engine_for(&format, fixture),
         &|_| String::new(),
         Rules {
             known_differences: KNOWN_DIFFERENCES,
@@ -2172,7 +2191,7 @@ fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) ->
     } = parity(
         &fixtures,
         &ids,
-        &|fixture| Engine::new(format.clone(), Declared::of(&fixture.request.tools)),
+        &|fixture| engine_for(&format, fixture),
         &|fixture| prompt.text(fixture, &format, table),
         Rules {
             known_differences: &known_differences,
@@ -2846,6 +2865,17 @@ fn python_spelling(value: &serde_json::Value) -> String {
         serde_json::Value::Bool(false) => "False".to_string(),
         serde_json::Value::Null => "None".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// The engine for a case: the table with the request's tools, and the JSON-answer option where the
+/// request asked for a JSON answer, as the gateway builds it.
+fn engine_for(format: &Format, fixture: &Fixture) -> Engine {
+    let engine = Engine::new(format.clone(), Declared::of(&fixture.request.tools));
+    if fixture.request.json_answer() {
+        engine.reads_json_answer()
+    } else {
+        engine
     }
 }
 
@@ -3558,7 +3588,7 @@ fn corrupt_model(
             outputs += 1;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_corrupted(
-                    &|| Engine::new(format.clone(), Declared::of(&fixture.request.tools)),
+                    &|| engine_for(&format, fixture),
                     &prompt_text,
                     &text,
                     &finish,

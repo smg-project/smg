@@ -36,7 +36,21 @@ What the engine decides for every format, and what it leaves open:
 - A terminal with no transition from the current state is text, as the model wrote it:
   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
-  argument's text ends the call there. Bellwether #16 is where that policy is judged.
+  argument's text ends the call there. Bellwether #16 is where that policy is judged. A JSON
+  answer is the one exception: under `Engine::reads_json_answer`, the option the gateway sets
+  for a `json_object` or `json_schema` response format, the engine reads the quote state over
+  the text of a content state and over the arguments of a call whose syntax is JSON (fresh at
+  every row into one, never in a thought, a thought the request keeps in the content included,
+  a tagged or shaped call or the template's wrapping; in a call's arguments over the bytes of
+  the call's JSON value alone: not a named call's header before its marker, not the text after
+  a list's `]` or where a malformed list should be, not the surplus after an object),
+  and a terminal that arrives inside one of the answer's strings takes no row, counts no marker
+  out of place and is the answer's text, the terminals the table ignores and a tail the end
+  would cut included; a model held to a JSON answer may spell a marker in a key or a value, in
+  the answer and in a call's arguments alike, which the family's own parsers keep under their
+  JSON mode. The scanner's
+  hold-back of a half-arrived marker is unchanged, so a stream reads as the whole does. Without
+  the option a request pays one branch per text piece and reads as before.
 - A terminal the table ignores (MiniMax M3's separator token, Inkling's end-of-sampling token)
   is `Dropped { Wrapper }` wherever it stands and moves nothing. Inside a call whose assembler
   holds bytes (a header until its marker, a word until it is spelled) it is placed where it

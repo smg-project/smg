@@ -12,7 +12,8 @@
 //! `Dropped { Whitespace }` when no text follows it in the stay (the template's spacing after a
 //! thought's close, between two calls, or after a thought nothing follows, held until what
 //! follows says whose it is) unless the table keeps the state's text as written, and the rest as
-//! content, reasoning, or the call's events.
+//! content, reasoning, or the call's events. Under a JSON answer ([`Engine::reads_json_answer`])
+//! a terminal inside one of the answer's strings is the answer's text, not a marker.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
@@ -85,6 +86,12 @@ pub struct Engine {
     /// placed ([`Self::push_call_events`]): kept between pieces with its room, as a stream's
     /// caller keeps its event buffer, so a piece inside a call costs no list of its own.
     scratch: Events<'static>,
+    /// Whether the answer is JSON ([`Self::reads_json_answer`]): the quote state of a content
+    /// stay, and of a JSON call's arguments, is read, and a terminal inside one of the answer's
+    /// strings is the state's text.
+    json_answer: bool,
+    /// Where the stay stands in the answer's JSON, read while `json_answer` is set.
+    quoted: Quoted,
 }
 
 /// The bytes of the call region being assembled: how many the assembler took, how many its events
@@ -139,6 +146,36 @@ enum Held {
     Ignored(String),
 }
 
+/// Where a stay in a JSON answer's text (a content state's, a JSON call's arguments) stands
+/// ([`Engine::reads_json_answer`]): inside a string,
+/// and right after the backslash that escapes the next character. A stay starts outside a
+/// string. The two bytes that move it are ASCII, so stepping over UTF-8 bytes never misreads part
+/// of a multibyte character.
+#[derive(Clone, Copy, Debug, Default)]
+struct Quoted {
+    in_string: bool,
+    escaped: bool,
+}
+
+impl Quoted {
+    /// Steps over `text`, the next bytes of the stay.
+    fn advance(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+            } else if byte == b'"' {
+                self.in_string = true;
+            }
+        }
+    }
+}
+
 /// A text event of `like`'s kind carrying `text`, uncounted: the piece of a split text event.
 fn text_event_like<'d>(like: &Event<'_>, text: Cow<'d, str>) -> Event<'d> {
     let text = Text::uncounted(text);
@@ -189,6 +226,17 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// borrow `text` for the life of `out` (`'d`): a JSON syntax's argument fragment that lies
     /// within the bytes is a slice of them, as a text event is a slice of its delta.
     fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize;
+
+    /// Which of the `taken` bytes of the last piece fed were the call's JSON value: all of them
+    /// for a syntax whose region is its value; for a call named before its marker, those after
+    /// the marker alone, since the tool's name is no JSON; for a list, those from its `[` through
+    /// its `]`, since the text after the list or in a malformed list's place is none either. The
+    /// JSON-answer option's quote state steps over these and no others
+    /// ([`Engine::reads_json_answer`]), so a quote in a malformed header or after a list moves
+    /// nothing.
+    fn value_bytes(&self, taken: usize) -> Range<usize> {
+        0..taken
+    }
 
     /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
     /// ([`Region`]): dropped where it stands when the assembler holds nothing, else placed where
@@ -432,6 +480,8 @@ impl Engine {
             pending: None,
             region: Region::default(),
             scratch: Events::new(),
+            json_answer: false,
+            quoted: Quoted::default(),
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -439,6 +489,66 @@ impl Engine {
             engine.open_call();
         }
         engine
+    }
+
+    /// The engine for a request whose answer is JSON (a `json_object` or `json_schema` response
+    /// format): inside one of the answer's strings the table's markers are the answer's text. A
+    /// JSON answer may spell a marker in a key or a value, which the table would otherwise read
+    /// as the marker: a row taken and the bytes dropped (the answer's own kind said again, the
+    /// message closed early, a call ended inside its arguments), or a marker out of place
+    /// counted. With the option the engine reads the quote state over the text of a content state
+    /// and over the arguments of a call whose syntax is JSON (the object is the call, as the
+    /// family's parsers read it under their JSON mode), fresh from the row that enters the state
+    /// (a stay starts outside a string), and a terminal that arrives inside a string takes no
+    /// row, counts nothing and is the state's text, the terminals the table ignores included; the
+    /// scanner still holds back a half-arrived terminal and releases it as text at the next piece
+    /// or at the end of the stream, where a tail inside a string is never a tag the end cut short.
+    /// Reasoning and wrapper states read as before (a thought is not JSON, a thought the request
+    /// keeps in the content included: its state is remade by [`Format::without_reasoning`], and no quote in
+    /// it moves the state), and so do the arguments of a tagged, keyed, XML, pythonic, Gemma or
+    /// shaped call, whose text is not one JSON value; in a JSON call's arguments the state follows
+    /// the bytes the call's object took, not the surplus after it. Without the option a request
+    /// pays one branch per text piece. Set per request, from the request's response format, as
+    /// the gateway does.
+    #[must_use]
+    pub fn reads_json_answer(mut self) -> Self {
+        self.json_answer = true;
+        self
+    }
+
+    /// Whether a terminal arriving now stands inside a string of the JSON answer: the state's
+    /// text, not the table's marker ([`Self::reads_json_answer`]).
+    fn quoted(&self) -> bool {
+        self.json_answer && self.quoted.in_string && self.in_json()
+    }
+
+    /// Whether the state's text is the JSON answer's: a content state the request's variant did
+    /// not remake (a thought kept in the content is still a thought, a call read as content still
+    /// a call: [`Format::is_remade`]), or the arguments of a call whose syntax is JSON
+    /// ([`Self::json_syntax`]). Read under the option alone.
+    fn in_json(&self) -> bool {
+        match self.emits() {
+            Emits::Content => !self.format.is_remade(self.state),
+            Emits::Arguments => self.json_syntax(),
+            Emits::Reasoning | Emits::Wrapper => false,
+        }
+    }
+
+    /// Whether the table's calls are one JSON value each (the object is the call), so that a
+    /// quoted spelling inside their arguments is a string's text under the JSON-answer option;
+    /// the tagged, keyed, XML, pythonic, Gemma and shaped syntaxes carry their values otherwise.
+    fn json_syntax(&self) -> bool {
+        matches!(
+            self.format.call_syntax(),
+            None | Some(
+                CallSyntax::Json
+                    | CallSyntax::NamedJson(_)
+                    | CallSyntax::NamedArguments { .. }
+                    | CallSyntax::JsonList
+                    | CallSyntax::JsonAlone(_)
+                    | CallSyntax::ForcedArguments
+            )
+        )
     }
 
     fn emits(&self) -> Emits {
@@ -539,6 +649,12 @@ impl Engine {
                     self.read_header(format.terminal_text(index), out)
                 }
             };
+        }
+        if matches!(piece, Piece::Marker(_)) && self.quoted() {
+            // Inside a string of the JSON answer the marker is the answer's text, whatever row
+            // or header it would take outside one ([`Self::reads_json_answer`]).
+            self.place(piece, out);
+            return None;
         }
         if let Piece::Marker(index) = piece {
             let leaves = self.format.next(self.state, index).is_some();
@@ -707,6 +823,9 @@ impl Engine {
     /// Text of the state the engine is in: borrowed from the delta when it came whole or the scan
     /// cut it from the delta alone, owned when the engine held, joined or re-scanned it.
     fn text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
+        if self.json_answer && self.emits() == Emits::Content && self.in_json() {
+            self.quoted.advance(&text);
+        }
         if self.format.is_framing(self.state) {
             self.end_stay(out);
             out.push(Event::Dropped {
@@ -742,26 +861,34 @@ impl Engine {
                 // counted and placed. A piece the delta carries, whole or cut from it, is fed as the
                 // delta's bytes, so a fragment within it borrows them; one the engine held or merged is its own,
                 // and the events that borrow it are taken owned.
-                let taken = match &text {
+                let (taken, value) = match &text {
                     Cow::Borrowed(piece) => {
                         let mut assembled: Events<'d> = std::mem::take(&mut self.scratch);
                         let taken = call.feed(piece, &self.declared, &mut assembled);
+                        let value = call.value_bytes(taken);
                         self.push_call_events(assembled.consume(), out);
                         self.scratch = assembled.recycle();
-                        taken
+                        (taken, value)
                     }
                     Cow::Owned(piece) => {
                         let mut assembled: Events<'_> = std::mem::take(&mut self.scratch);
                         let taken = call.feed(piece, &self.declared, &mut assembled);
+                        let value = call.value_bytes(taken);
                         let owned = assembled
                             .consume()
                             .map(|event| -> Event<'d> { event.into_owned() });
                         self.push_call_events(owned, out);
                         self.scratch = assembled.recycle();
-                        taken
+                        (taken, value)
                     }
                 };
+                // The quote state follows the bytes of the call's JSON value alone: neither the
+                // header before a named call's marker nor the surplus after the object closed is
+                // a JSON value, and a quote in either moves nothing.
                 self.region.fed += taken;
+                if self.json_answer && self.json_syntax() {
+                    self.quoted.advance(&text[value]);
+                }
                 if taken < text.len() {
                     let rest = part(&text, taken..text.len());
                     self.wrapping(rest, MalformedReason::TextAfterTheArguments, out);
@@ -954,6 +1081,13 @@ impl Engine {
     /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead, the
     /// run a wrapping stay holds after its text) it keeps its place among them.
     fn terminal(&mut self, index: usize, out: &mut Events) {
+        if self.quoted() {
+            // Inside a string of the JSON answer: the answer's text, no row and no count, a
+            // terminal the table ignores included ([`Self::reads_json_answer`]).
+            let text = self.format.terminal_text(index).to_string();
+            self.text(Cow::Owned(text), out);
+            return;
+        }
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
             if self.emits() == Emits::Arguments {
@@ -1080,6 +1214,9 @@ impl Engine {
         if to == Emits::Arguments {
             self.region = Region::default();
             self.call = Some(call.unwrap_or_else(|| self.new_call()));
+        }
+        if to == Emits::Content || (to == Emits::Arguments && self.json_syntax()) {
+            self.quoted = Quoted::default();
         }
         self.state = next;
         self.stay = Stay::default();
@@ -1327,9 +1464,12 @@ impl Engine {
     /// Whether `text`, a piece at the end of the output, is a tag the end cut short: one that
     /// begins with a whole structural token and is the beginning of a terminal the state has a
     /// row for (`<|close|>message` with no `<|sep|>` after it), which the model cannot have
-    /// written as text. A shaped call's header still being read takes every byte.
+    /// written as text. A shaped call's header still being read takes every byte, and a tail
+    /// inside a string of a JSON answer is the answer's text ([`Self::reads_json_answer`]).
     fn cut_tag(&self, text: &str) -> bool {
-        self.pending.is_none() && self.format.is_cut_tag(self.state, text, self.stay.begun)
+        self.pending.is_none()
+            && !self.quoted()
+            && self.format.is_cut_tag(self.state, text, self.stay.begun)
     }
 
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
