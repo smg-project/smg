@@ -221,7 +221,10 @@ pub(crate) const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|
 
 #[derive(Deserialize)]
 struct AddedTokenConfig {
-    content: String,
+    /// Missing or null in the file is the empty text: no token, as the
+    /// reference's binding reads it.
+    #[serde(default)]
+    content: Option<String>,
     #[serde(default)]
     single_word: bool,
     #[serde(default)]
@@ -498,6 +501,20 @@ impl EncoderCore {
     }
 }
 
+/// What a configured token the pipeline cannot place on its declared id
+/// means to the loader (the rule is on `add_config_tokens`).
+#[derive(Clone, Copy)]
+enum MisplacedToken {
+    /// The configuration is the only source of the added tokens
+    /// (vocab.json + merges.txt): the load fails, as it always has.
+    RefusesTheLoad,
+    /// tokenizer.json holds the model's added tokens; the configuration's
+    /// extras ride along where they fit, and one that does not is left out
+    /// with a warning, as every configured token was before this path read
+    /// the configuration.
+    IsLeftOut,
+}
+
 impl HuggingFaceTokenizer {
     /// The path this tokenizer's encodes take, chosen at load (see
     /// [`EncodePath`]).
@@ -661,6 +678,27 @@ impl HuggingFaceTokenizer {
         tokenizer.with_decoder(Some(ByteLevel::default()));
         tokenizer.with_post_processor(Some(ByteLevel::default().trim_offsets(false)));
 
+        let added_tokens = Self::config_added_tokens(&config, &config_path)?;
+        Self::add_config_tokens(
+            &mut tokenizer,
+            &added_tokens,
+            MisplacedToken::RefusesTheLoad,
+        )?;
+
+        Ok(tokenizer)
+    }
+
+    /// The added tokens `tokenizer_config.json` declares (`added_tokens_decoder`:
+    /// the id, the content and the matching flags of each), sorted by id. The
+    /// file names a token's normalization or leaves it to the `transformers`
+    /// default (a special token raw, any other normalized). A key that is not
+    /// an id, or an entry that does not read, refuses the load on both paths:
+    /// the file is wrong, the reference stack refuses it too, and a quiet
+    /// skip would load a vocabulary other than the one the files declare.
+    fn config_added_tokens(
+        config: &serde_json::Value,
+        config_path: &Path,
+    ) -> Result<Vec<(u32, AddedToken)>> {
         let mut added_tokens = Vec::new();
         if let Some(decoder) = config
             .get("added_tokens_decoder")
@@ -669,19 +707,29 @@ impl HuggingFaceTokenizer {
             for (raw_id, raw_token) in decoder {
                 let id = raw_id.parse::<u32>().map_err(|error| {
                     Error::msg(format!(
-                        "Invalid added token ID '{raw_id}' in {}: {error}",
+                        "{}: added_tokens_decoder key '{raw_id}' is not a token id ({error}); every key of that block is the id of the token it describes",
                         config_path.display()
                     ))
                 })?;
                 let entry: AddedTokenConfig =
                     serde_json::from_value(raw_token.clone()).map_err(|error| {
                         Error::msg(format!(
-                            "Invalid added token {raw_id} in {}: {error}",
+                            "{}: added_tokens_decoder entry {raw_id} does not read ({error}); an entry holds the token's content and its flags",
                             config_path.display()
                         ))
                     })?;
+                let content = entry.content.unwrap_or_default();
+                if content.is_empty() {
+                    // No text is no token: the pipeline's add ignores it, and so
+                    // does the placement below.
+                    warn!(
+                        config_id = id,
+                        "tokenizer_config.json declares an added token without text; ignored"
+                    );
+                    continue;
+                }
                 let normalized = entry.normalized.unwrap_or(!entry.special);
-                let token = AddedToken::from(entry.content, entry.special)
+                let token = AddedToken::from(content, entry.special)
                     .single_word(entry.single_word)
                     .lstrip(entry.lstrip)
                     .rstrip(entry.rstrip)
@@ -690,21 +738,116 @@ impl HuggingFaceTokenizer {
             }
         }
         added_tokens.sort_unstable_by_key(|(id, _)| *id);
+        Ok(added_tokens)
+    }
 
+    /// Adds the configuration's tokens the pipeline lacks, each on the id the
+    /// configuration names. `transformers` and the engine's tokenizer read
+    /// `tokenizer_config.json`'s tokens on top of `tokenizer.json`'s, so a
+    /// token only the configuration declares (a checkpoint's audio or
+    /// speech controls, say) is a token of the model: without it the text
+    /// encodes as plain pieces, its id decodes to nothing, and the gateway's
+    /// bound reads the id as unknown. The configuration is read against the
+    /// pipeline's added tokens, as `transformers` reads it, not against the
+    /// model's table: a token already added on its id is left as it is; one
+    /// added under another id keeps the pipeline's id (the two files
+    /// disagree: the file wins, as it does for `transformers`, whose adds
+    /// reuse an existing id) and is noted; a token the table holds as a plain
+    /// piece goes through the add and keeps the table's id, which makes it
+    /// an added token (matched whole, dropped by a skip-special decode) as
+    /// the configuration says. The pipeline assigns new ids in order past
+    /// the highest it holds (or from the table's size), so where a token
+    /// would land is known before the add; one that would land elsewhere
+    /// than declared is what `misplaced` says: refused where the
+    /// configuration is the only source of the ids, left out with a
+    /// warning on the tokenizer.json path, where the file's tokens stand
+    /// and the configuration's extras ride along where they fit (a
+    /// checkpoint that declares `</think>` on an id the table holds for
+    /// another piece loads as it always did, that token as text). Returns
+    /// how many tokens were added.
+    fn add_config_tokens<M: Model>(
+        tokenizer: &mut TokenizerOf<M>,
+        config_tokens: &[(u32, AddedToken)],
+        misplaced: MisplacedToken,
+    ) -> Result<usize> {
+        let table = u32::try_from(tokenizer.get_vocab_size(false))
+            .map_err(|_| Error::msg("the model's table exceeds the u32 id range"))?;
+        let added = tokenizer.get_added_vocabulary();
+        let mut next_id = added
+            .get_added_tokens_decoder()
+            .keys()
+            .max()
+            .map_or(table, |max| if *max >= table { max + 1 } else { table });
+        let mut missing: Vec<(u32, AddedToken)> = Vec::new();
+        // The contents queued for the add so far, on the ids they will take: the
+        // pipeline's add reads its own map token by token, so a content declared
+        // twice is held on the first id by the time the second is added.
+        let mut queued: HashMap<&str, u32> = HashMap::new();
+        for (id, token) in config_tokens {
+            match added.get_vocab().get(&token.content) {
+                Some(held) if held == id => {}
+                Some(held) => {
+                    warn!(
+                        token = %token.content,
+                        config_id = id,
+                        pipeline_id = held,
+                        "tokenizer_config.json and the pipeline disagree on an added token's id; the pipeline's id stands"
+                    );
+                }
+                None => {
+                    // A piece the table holds keeps the table's id, a content queued
+                    // earlier keeps the id it was queued under, a new token takes
+                    // the next one.
+                    let table_id = tokenizer.token_to_id(&token.content);
+                    let queued_id = queued.get(token.content.as_str()).copied();
+                    let lands_on = queued_id.or(table_id).unwrap_or(next_id);
+                    if lands_on != *id {
+                        match misplaced {
+                            MisplacedToken::RefusesTheLoad => {
+                                return Err(Error::msg(format!(
+                                    "Added token '{}' expected ID {id}, got Some({lands_on}): tokenizer_config.json declares an id the pipeline cannot place (a new token takes the next id past the ones held; a piece the model holds keeps the model's id)",
+                                    token.content
+                                )));
+                            }
+                            MisplacedToken::IsLeftOut => {
+                                warn!(
+                                    token = %token.content,
+                                    config_id = id,
+                                    would_land_on = lands_on,
+                                    "tokenizer_config.json declares an added token on an id the pipeline cannot place; the token is left out, as tokenizer.json alone reads it"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    if table_id.is_none() && queued_id.is_none() {
+                        next_id += 1;
+                    }
+                    queued.insert(token.content.as_str(), lands_on);
+                    missing.push((*id, token.clone()));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(0);
+        }
         tokenizer
-            .add_tokens(added_tokens.iter().map(|(_, token)| token.clone()))
+            .add_tokens(missing.iter().map(|(_, token)| token.clone()))
             .map_err(|error| Error::msg(format!("Failed to add configured tokens: {error}")))?;
-        for (expected_id, token) in &added_tokens {
+        for (expected_id, token) in &missing {
             let actual_id = tokenizer.token_to_id(&token.content);
             if actual_id != Some(*expected_id) {
                 return Err(Error::msg(format!(
-                    "Added token '{}' expected ID {expected_id}, got {actual_id:?}; non-contiguous explicit added-token IDs are unsupported",
+                    "Added token '{}' expected ID {expected_id}, got {actual_id:?}: the pipeline placed it elsewhere than the loader's placement rule says",
                     token.content
                 )));
             }
         }
-
-        Ok(tokenizer)
+        info!(
+            added = missing.len(),
+            "added the tokens tokenizer_config.json declares that the pipeline did not hold"
+        );
+        Ok(missing.len())
     }
 
     /// Settles the added tokens matched after normalization whose normalized
@@ -802,10 +945,23 @@ impl HuggingFaceTokenizer {
         tokenizer.with_padding(None);
 
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
-        let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
+        let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy())?;
         // The class the configuration names decides the pipeline of a
         // Llama-class checkpoint (the rule is on `llama_class_pipeline`).
         Self::llama_class_pipeline(&mut tokenizer, tokenizer_path.parent(), &config_result);
+        // The configuration's added tokens the file lacks join the pipeline
+        // before the ties settle and the encode path is chosen (the rule is
+        // on `add_config_tokens`).
+        Self::add_config_tokens(
+            &mut tokenizer,
+            &config_result.added_tokens,
+            MisplacedToken::IsLeftOut,
+        )
+        .map_err(|error| {
+            Error::msg(format!(
+                "Failed to load tokenizer: the configuration's added tokens did not apply: {error}"
+            ))
+        })?;
         // Two added tokens matched after normalization can share one
         // normalized spelling, and which of them `tokenizers` matches changes
         // from process to process. Settled before the encode path is chosen
@@ -1349,8 +1505,11 @@ impl HuggingFaceTokenizer {
 
     /// Load chat template, special token settings, and token strings from tokenizer_config.json.
     /// Reads the file once and extracts everything needed by the tokenizer constructor.
-    fn load_chat_template_and_config(tokenizer_path: &str) -> TokenizerConfigResult {
-        (|| {
+    /// Absent, or not JSON, the configuration is the default; an
+    /// `added_tokens_decoder` entry that does not read refuses the load (the
+    /// rule is on `config_added_tokens`).
+    fn load_chat_template_and_config(tokenizer_path: &str) -> Result<TokenizerConfigResult> {
+        (|| -> Option<Result<TokenizerConfigResult>> {
             let path = Path::new(tokenizer_path);
             let config_path = path.parent()?.join("tokenizer_config.json");
 
@@ -1381,8 +1540,12 @@ impl HuggingFaceTokenizer {
                 unk_token: ConfigToken::read(&config, "unk_token"),
                 pad_token: ConfigToken::read(&config, "pad_token"),
             };
+            let added_tokens = match Self::config_added_tokens(&config, &config_path) {
+                Ok(added_tokens) => added_tokens,
+                Err(error) => return Some(Err(error)),
+            };
 
-            Some(TokenizerConfigResult {
+            Some(Ok(TokenizerConfigResult {
                 chat_template: templates.default,
                 tool_use_chat_template: templates.tool_use,
                 response_template,
@@ -1392,9 +1555,11 @@ impl HuggingFaceTokenizer {
                 legacy,
                 add_prefix_space,
                 config_tokens,
-            })
+                added_tokens,
+            }))
         })()
-        .unwrap_or_default()
+        .transpose()
+        .map(Option::unwrap_or_default)
     }
 
     /// The Jinja renderer, with this tokenizer's special tokens unless the
@@ -1519,6 +1684,8 @@ struct TokenizerConfigResult {
     /// `add_prefix_space`, when the configuration sets it.
     add_prefix_space: Option<bool>,
     config_tokens: ConfigTokens,
+    /// The `added_tokens_decoder` block, by id (see `config_added_tokens`).
+    added_tokens: Vec<(u32, AddedToken)>,
 }
 
 /// `model_type` of the checkpoint's `config.json` in `dir`, if the file is
