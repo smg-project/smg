@@ -69,7 +69,9 @@ pub(crate) async fn load_input_history(
         let conv_id = ConversationId::from(conv_id_str);
         check_conversation_visible(components, &conv_id, tenant, model).await?;
         let mut items = conversation_window_items(components, &conv_id, model).await?;
-        append_current_input(&mut items, &request_body.input, conv_id_str);
+        let own_input =
+            std::mem::replace(&mut request_body.input, ResponseInput::Items(Vec::new()));
+        append_current_input(&mut items, own_input, conv_id_str);
         request_body.input = ResponseInput::Items(items);
     }
 
@@ -79,7 +81,9 @@ pub(crate) async fn load_input_history(
     // conversation branch above never both modify request_body.input.
     if let Some(mut items) = chain_items {
         let id_suffix = previous_response_id.as_deref().unwrap_or("new");
-        append_current_input(&mut items, &request_body.input, id_suffix);
+        let own_input =
+            std::mem::replace(&mut request_body.input, ResponseInput::Items(Vec::new()));
+        append_current_input(&mut items, own_input, id_suffix);
         request_body.input = ResponseInput::Items(items);
     }
 
@@ -344,10 +348,11 @@ fn extract_mcp_list_tools_labels(array: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Append current request input to items list, creating a user message if needed
+/// Append current request input to items list, creating a user message if needed.
+/// The input is taken by value: its text or its items move into the list.
 fn append_current_input(
     items: &mut Vec<ResponseInputOutputItem>,
-    input: &ResponseInput,
+    input: ResponseInput,
     id_suffix: &str,
 ) {
     match input {
@@ -355,15 +360,17 @@ fn append_current_input(
             items.push(ResponseInputOutputItem::Message {
                 id: format!("msg_u_{id_suffix}"),
                 role: "user".to_string(),
-                content: vec![ResponseContentPart::InputText { text: text.clone() }],
+                content: vec![ResponseContentPart::InputText { text }],
                 status: Some("completed".to_string()),
                 phase: None,
             });
         }
         ResponseInput::Items(current_items) => {
-            for item in current_items {
-                items.push(openai_protocol::responses::normalize_input_item(item));
-            }
+            items.extend(
+                current_items
+                    .into_iter()
+                    .map(openai_protocol::responses::normalize_input_item),
+            );
         }
     }
 }

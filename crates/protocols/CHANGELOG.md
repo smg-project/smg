@@ -34,6 +34,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- Breaking: `normalize_input_item` takes the item by value. A bare `{role, content}` message moves
+  its content and role into the message item built from it, and every other item comes back as it
+  was passed, so a caller that owns its input no longer copies each item; a caller holding a
+  reference passes `item.clone()`, which costs what the old signature did.
 - `ValidatedJson` refuses a body under a `Content-Encoding` the gateway does not decode (any but
   `identity`, in whichever field of a repeated header or position of a comma-separated list it
   stands) before it reads the body, as a `415` in the gateway's JSON error envelope (`error.code`
