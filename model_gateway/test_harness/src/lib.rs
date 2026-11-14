@@ -477,7 +477,11 @@ async fn build_test_app_context(
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(
         PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
-            .with_policy_engine_for(config.policy_engine, &config.mode, &config.policy),
+            .with_policy_engine(
+                config.policy_engine,
+                config.mode.get_prefill_policy(&config.policy),
+                config.mode.get_decode_policy(&config.policy),
+            ),
     );
 
     // Initialize storage backends (Memory for tests, unless the caller brought

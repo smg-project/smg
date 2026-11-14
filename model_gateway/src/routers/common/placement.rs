@@ -462,7 +462,7 @@ fn select_from_decided(rd: RegularDecision<'_>) -> Option<Arc<dyn Worker>> {
 
 /// The ids of a decision's targets, for the one re-decision after every one
 /// of them missed its commit; none for a shed.
-pub(crate) fn target_ids(decision: &Decision) -> ([WorkerId; MAX_TARGETS], usize) {
+fn target_ids(decision: &Decision) -> ([WorkerId; MAX_TARGETS], usize) {
     let targets = decision
         .pick()
         .map_or(&[][..], |pick| pick.targets.as_slice());

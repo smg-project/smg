@@ -32,7 +32,7 @@ use crate::worker::UNKNOWN_MODEL_ID;
 use crate::{
     config::types::{
         ManualAssignmentMode, PdPairingMode, PolicyConfig, PolicyEngineMode,
-        RoutingKeyOverrideConfig, RoutingMode, DEFAULT_ENCODE_POLICY,
+        RoutingKeyOverrideConfig,
     },
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
@@ -322,49 +322,16 @@ impl PolicyRegistry {
     /// says so at error level.
     #[must_use]
     pub fn with_policy_engine(
-        self,
-        mode: PolicyEngineMode,
-        prefill: &PolicyConfig,
-        decode: &PolicyConfig,
-    ) -> Self {
-        self.with_policy_engines(mode, prefill, decode, None)
-    }
-
-    /// [`Self::with_policy_engine`] for a routing mode: the pair sides as
-    /// the mode resolves them over `default` and, under
-    /// encode-prefill-decode, the mode's encode policy (the one default when
-    /// unset), so the engine binds the encode profile the encode items are
-    /// decided through.
-    #[must_use]
-    pub fn with_policy_engine_for(
-        self,
-        mode: PolicyEngineMode,
-        routing: &RoutingMode,
-        default: &PolicyConfig,
-    ) -> Self {
-        let encode = matches!(routing, RoutingMode::EncodePrefillDecode { .. })
-            .then(|| routing.get_encode_policy(&DEFAULT_ENCODE_POLICY));
-        self.with_policy_engines(
-            mode,
-            routing.get_prefill_policy(default),
-            routing.get_decode_policy(default),
-            encode,
-        )
-    }
-
-    fn with_policy_engines(
         mut self,
         mode: PolicyEngineMode,
         prefill: &PolicyConfig,
         decode: &PolicyConfig,
-        encode: Option<&PolicyConfig>,
     ) -> Self {
         if mode == PolicyEngineMode::Engine {
-            match Decider::from_configs_with_encode(
+            match Decider::from_configs(
                 &self.default_policy_config,
                 prefill,
                 decode,
-                encode,
                 &self.routing_key_override,
             ) {
                 Ok(decider) => self.host(decider),
@@ -406,21 +373,17 @@ impl PolicyRegistry {
     }
 
     /// Whether the engine, when it decides, stands for `policy`: the default
-    /// policy by name (what [`Self::engine_for`] serves) and the plan's
+    /// policy by name (what [`Self::engine_for`] serves) and the two pair
     /// sides, whose profiles the engine was built from. A model whose
     /// registration hint named another policy keeps that policy's legacy
     /// instance, and the static needs are answered for it by the trait.
     fn served_by_engine(&self, policy: &dyn LoadBalancingPolicy) -> bool {
         self.decider.is_some()
             && (policy.name() == self.default_policy.name()
-                || [
-                    &self.prefill_policy,
-                    &self.decode_policy,
-                    &self.encode_policy,
-                ]
-                .into_iter()
-                .filter_map(|side| side.get())
-                .any(|side| std::ptr::addr_eq(Arc::as_ptr(side), policy)))
+                || [&self.prefill_policy, &self.decode_policy]
+                    .into_iter()
+                    .filter_map(|side| side.get())
+                    .any(|side| std::ptr::addr_eq(Arc::as_ptr(side), policy)))
     }
 
     /// The policy engine for a regular placement under `policy`
@@ -1092,16 +1055,7 @@ impl PolicyRegistry {
         self.encode_policy
             .get()
             .map(Arc::clone)
-            .unwrap_or_else(|| PolicyFactory::create_from_config(&DEFAULT_ENCODE_POLICY))
-    }
-
-    /// The policy engine for the encode items of an encode-prefill-decode
-    /// request (`--policy-engine engine` with the encode profile bound), or
-    /// `None` when the legacy encode policy decides them.
-    pub(crate) fn encode_engine_for(&self) -> Option<&Arc<Decider>> {
-        self.decider
-            .as_ref()
-            .filter(|decider| decider.serves_encode())
+            .unwrap_or_else(|| PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing))
     }
 
     /// Whether any registered policy (default or per-model) routes on
@@ -3377,115 +3331,5 @@ mod tests {
             &round_robin,
         );
         assert!(!pins(&no_override), "without the override a key is a fact");
-    }
-
-    /// Under encode-prefill-decode the engine binds the mode's encode policy
-    /// (consistent hashing when unset, the one default the legacy fallback
-    /// reads too) and serves the encode items; under another mode, and under
-    /// `legacy`, nothing but the legacy encode policy decides them.
-    #[test]
-    fn the_engine_serves_the_encode_items_of_an_encode_prefill_decode_deployment() {
-        let round_robin = PolicyConfig::RoundRobin;
-        let epd = |encode_policy: Option<PolicyConfig>| RoutingMode::EncodePrefillDecode {
-            encode_urls: vec![],
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            encode_policy,
-            prefill_policy: None,
-            decode_policy: None,
-        };
-        let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine_for(
-            PolicyEngineMode::Engine,
-            &epd(None),
-            &round_robin,
-        );
-        let decider = policies
-            .encode_engine_for()
-            .expect("the encode items are the engine's");
-        assert!(decider.serves_encode());
-        assert_eq!(policies.get_encode_policy().name(), "consistent_hashing");
-        let explicit = PolicyRegistry::new(round_robin.clone()).with_policy_engine_for(
-            PolicyEngineMode::Engine,
-            &epd(Some(PolicyConfig::Random)),
-            &round_robin,
-        );
-        assert!(explicit.encode_engine_for().is_some());
-        let regular = PolicyRegistry::new(round_robin.clone()).with_policy_engine_for(
-            PolicyEngineMode::Engine,
-            &RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            &round_robin,
-        );
-        assert!(regular.decider().is_some());
-        assert!(
-            regular.encode_engine_for().is_none(),
-            "no encode side to serve"
-        );
-        let legacy = PolicyRegistry::new(round_robin).with_policy_engine_for(
-            PolicyEngineMode::Legacy,
-            &epd(None),
-            &PolicyConfig::RoundRobin,
-        );
-        assert!(legacy.encode_engine_for().is_none());
-    }
-
-    /// Under encode-prefill-decode the engine is built from the encode side
-    /// too, so an encode worker's static needs are the engine's answer for
-    /// its Encode phase: the encode policy is served by the engine and the
-    /// worker's KV-event question reads the engine, not the legacy policy.
-    /// Under `legacy` the encode policy's own answer stands.
-    #[test]
-    fn an_encode_workers_static_needs_are_the_engines_under_encode_prefill_decode() {
-        use crate::worker::test_support::worker_of;
-
-        let round_robin = PolicyConfig::RoundRobin;
-        let epd = RoutingMode::EncodePrefillDecode {
-            encode_urls: vec![],
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            encode_policy: None,
-            prefill_policy: None,
-            decode_policy: None,
-        };
-        let worker = worker_of("grpc://encode:9000", WorkerType::Encode);
-        let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine_for(
-            PolicyEngineMode::Engine,
-            &epd,
-            &round_robin,
-        );
-        // The encode router publishes the mode's encode policy at start-up.
-        policies.set_encode_policy(PolicyFactory::create_from_config(
-            &PolicyConfig::ConsistentHashing,
-        ));
-        let encode = policies.get_encode_policy();
-        assert!(
-            policies.served_by_engine(encode.as_ref()),
-            "the encode side is the engine's"
-        );
-        let decider = policies
-            .encode_engine_for()
-            .expect("the encode items are the engine's");
-        assert_eq!(
-            policies.worker_needs_kv_events(worker.as_ref()),
-            decider
-                .engine()
-                .needs_for(worker.model_id(), Phase::Encode)
-                .events
-        );
-        let legacy = PolicyRegistry::new(round_robin).with_policy_engine_for(
-            PolicyEngineMode::Legacy,
-            &epd,
-            &PolicyConfig::RoundRobin,
-        );
-        legacy.set_encode_policy(PolicyFactory::create_from_config(
-            &PolicyConfig::ConsistentHashing,
-        ));
-        let encode = legacy.get_encode_policy();
-        assert!(!legacy.served_by_engine(encode.as_ref()));
-        assert_eq!(
-            legacy.worker_needs_kv_events(worker.as_ref()),
-            encode.needs_kv_events()
-        );
     }
 }
