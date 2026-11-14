@@ -1761,7 +1761,8 @@ impl StreamingProcessor {
     /// out of the buffer, which keeps its room for the next step: what an event
     /// owns moves into its chunk, and a text the event borrows from the delta
     /// is written from there, with no copy of its own. A bare text delta, the
-    /// per-token case, is written in one pass ([`ChatChunkFrame::write_text_delta`]);
+    /// per-token case, is written in one pass ([`ChatChunkFrame::write_text_delta`];
+    /// with the token's logprobs, [`ChatChunkFrame::write_text_delta_logprobs`]);
     /// every other chunk goes through serde.
     ///
     /// Returns whether the buffer reached its flush size, checked after every
@@ -1788,9 +1789,18 @@ impl StreamingProcessor {
             }
             choice.logprobs = logprobs.take();
             match text_delta(&choice) {
-                Some((field, text)) => {
+                Some((field, text, None)) => {
                     frame.write_text_delta(buffer, index, field, text, usage, emit_usage_null);
                 }
+                Some((field, text, Some(logprobs))) => frame.write_text_delta_logprobs(
+                    buffer,
+                    index,
+                    field,
+                    text,
+                    logprobs,
+                    usage,
+                    emit_usage_null,
+                ),
                 None => frame.write_chunk(buffer, &choice, usage, emit_usage_null),
             }
             if buffer.len() >= CHUNK_FLUSH_BYTES {

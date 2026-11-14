@@ -879,6 +879,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::factory::ParserFactory;
 
     fn _arg(key: &str, typ: &str, value: &str) -> String {
         format!(r#"{OPEN}argument key="{key}" type="{typ}"{SEP}{value}{CLOSE}argument{SEP}"#)
@@ -1126,7 +1127,7 @@ mod tests {
 
     #[test]
     fn test_factory_resolves_moonshot_kimi_k3() {
-        let factory = crate::factory::ParserFactory::new();
+        let factory = ParserFactory::new();
         assert_eq!(
             factory
                 .registry()
@@ -1137,7 +1138,7 @@ mod tests {
 
     #[test]
     fn test_factory_resolves_underscore_kimi_k3() {
-        let factory = crate::factory::ParserFactory::new();
+        let factory = ParserFactory::new();
         for id in ["kimi_k3", "Kimi_K3", "moonshotai/Kimi_K3"] {
             assert_eq!(
                 factory.registry().resolve_model_to_parser(id),
@@ -1149,7 +1150,7 @@ mod tests {
 
     #[test]
     fn test_factory_registers_kimi_k3_structural_tag() {
-        let factory = crate::factory::ParserFactory::new();
+        let factory = ParserFactory::new();
         assert!(factory.registry().has_structural_tag("kimi_k3"));
     }
 

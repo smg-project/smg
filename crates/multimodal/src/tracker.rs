@@ -12,7 +12,11 @@ use super::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
 };
-use crate::types::TransparencyPolicy;
+use crate::{
+    error::{MediaErrorCode, MediaFault},
+    minimax_resize,
+    types::TransparencyPolicy,
+};
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
 
@@ -184,9 +188,9 @@ impl FetchOutcome {
         match result {
             Ok(_) => Self::Ok,
             Err(MultiModalError::Media(error)) => {
-                if error.code() == crate::error::MediaErrorCode::TooLarge {
+                if error.code() == MediaErrorCode::TooLarge {
                     Self::TooLarge
-                } else if error.fault() == crate::error::MediaFault::Client {
+                } else if error.fault() == MediaFault::Client {
                     Self::ClientFault
                 } else {
                     Self::HostFault
@@ -501,9 +505,8 @@ impl AsyncMultiModalTracker {
         max_long_side_pixel: Option<u32>,
     ) {
         let sglang = self.minimax_sglang_resize;
-        let minimax_cap = (self.minimax_image_resize || sglang).then_some(
-            max_long_side_pixel.unwrap_or(crate::minimax_resize::IMAGE_DEFAULT_LONG_SIDE),
-        );
+        let minimax_cap = (self.minimax_image_resize || sglang)
+            .then_some(max_long_side_pixel.unwrap_or(minimax_resize::IMAGE_DEFAULT_LONG_SIDE));
         let config = ImageFetchConfig {
             detail,
             max_long_side_pixel: if minimax_cap.is_some() {
@@ -526,9 +529,9 @@ impl AsyncMultiModalTracker {
                 let frame = connector.fetch_image_from(&source, config).await?;
                 let frame = if let Some(cap) = minimax_cap {
                     if sglang {
-                        crate::minimax_resize::image_for_runtime(frame, cap, true)?
+                        minimax_resize::image_for_runtime(frame, cap, true)?
                     } else {
-                        crate::minimax_resize::image(frame, cap)?
+                        minimax_resize::image(frame, cap)?
                     }
                 } else {
                     frame
@@ -836,7 +839,11 @@ mod video_param_tests {
 mod repeat_tests {
 
     use super::*;
-    use crate::media::MediaConnectorConfig;
+    use crate::{
+        hasher::{hash_image, hash_image_with_transparency, hash_video_with_sampling},
+        media::MediaConnectorConfig,
+        test_support::{http_client_builder, video_tools_available},
+    };
 
     const TINY_PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
 
@@ -892,11 +899,8 @@ mod repeat_tests {
     }
 
     fn tracker() -> AsyncMultiModalTracker {
-        let connector = MediaConnector::new(
-            crate::test_support::http_client_builder(),
-            MediaConnectorConfig::default(),
-        )
-        .expect("default connector");
+        let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+            .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
     }
 
@@ -1032,7 +1036,7 @@ mod repeat_tests {
     #[tokio::test]
     async fn minimax_video_cap_is_deferred_only_for_sglang() {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        if !crate::test_support::video_tools_available() {
+        if !video_tools_available() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1083,12 +1087,7 @@ mod repeat_tests {
                 if !sglang {
                     assert_eq!(
                         clip.hash,
-                        crate::hasher::hash_video_with_sampling(
-                            &bytes,
-                            1.0,
-                            cap,
-                            FrameSampling::default()
-                        )
+                        hash_video_with_sampling(&bytes, 1.0, cap, FrameSampling::default())
                     );
                 }
                 let frame = &clip.rgb_video().unwrap().frames[0];
@@ -1141,7 +1140,7 @@ mod repeat_tests {
             assert_eq!(frame.transparency(), policy);
             assert_eq!(
                 frame.hash,
-                crate::hasher::hash_image_with_transparency(&png, None, policy),
+                hash_image_with_transparency(&png, None, policy),
                 "{policy:?}"
             );
         }
@@ -1152,7 +1151,7 @@ mod repeat_tests {
             panic!("the slot must hold an image");
         };
         assert_eq!(frame.transparency(), TransparencyPolicy::KeepAlpha);
-        assert_eq!(frame.hash, crate::hasher::hash_image(&png));
+        assert_eq!(frame.hash, hash_image(&png));
     }
 
     #[tokio::test]

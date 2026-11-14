@@ -175,8 +175,9 @@ mod tests {
     use super::*;
     use crate::{
         config::RlConfig,
+        router,
         state::RlState,
-        testing::{worker, FakeView},
+        testing::{worker, zmq_worker, FakeCalls, FakeView},
     };
 
     fn state(workers: Vec<RlWorkerInfo>) -> Arc<RlState> {
@@ -220,7 +221,7 @@ mod tests {
         assert_eq!(rows[1].0.id, "r0");
         assert_eq!(rows[1].1, 2);
 
-        let app = crate::router::<()>(state(ws));
+        let app = router::<()>(state(ws));
 
         let resp = app
             .clone()
@@ -260,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_reports_the_protocol_version() {
-        let app = crate::router::<()>(state(vec![worker("w1", "http://a:1", RuntimeType::Sglang)]));
+        let app = router::<()>(state(vec![worker("w1", "http://a:1", RuntimeType::Sglang)]));
         let resp = app
             .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
             .await
@@ -275,7 +276,7 @@ mod tests {
         let mut w = worker("w1", "http://a:1", RuntimeType::Sglang);
         w.labels.insert("tp_size".to_string(), "x".to_string());
         w.labels.insert("version".to_string(), "0.5.15".to_string());
-        let app = crate::router::<()>(state(vec![w]));
+        let app = router::<()>(state(vec![w]));
 
         let resp = app
             .clone()
@@ -320,8 +321,8 @@ mod tests {
         let mut n = worker("n1", "grpc://b:1", RuntimeType::TokenSpeed);
         n.connection_mode = ConnectionMode::Grpc;
         n.control_url = None;
-        let z = crate::testing::zmq_worker("z1", crate::testing::FakeCalls::succeeding(1));
-        let app = crate::router::<()>(state(vec![g, n, z]));
+        let z = zmq_worker("z1", FakeCalls::succeeding(1));
+        let app = router::<()>(state(vec![g, n, z]));
         let resp = app
             .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
             .await

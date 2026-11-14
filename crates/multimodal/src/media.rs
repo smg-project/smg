@@ -27,12 +27,17 @@ use tokio::{fs, io::AsyncReadExt, process::Command, task, time};
 use tracing::{info, warn};
 use url::Url;
 
+#[cfg(feature = "opencv-video")]
+use crate::opencv_buffer::{open_capture, BufferedCapture, RgbOutputBuffer};
 use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
-    types::TransparencyPolicy,
+    hasher::{hash_audio, hash_image_with_transparency, hash_video_with_sampling},
+    jpeg_turbo::{decode_jpeg_rgb, end_is_served, is_jpeg},
+    types::{ImageSize, TransparencyPolicy},
     video_seek::{FrameTable, SeekPlan, SeekSegment},
     vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
+    webp_native::decode_webp,
 };
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -881,8 +886,7 @@ impl MediaConnector {
         // The cap and the transparency policy change the decoded pixels, so
         // both are part of the identity the pixel cache and the backend's mm
         // cache key off.
-        let hash =
-            crate::hasher::hash_image_with_transparency(&bytes, max_long_side_pixel, transparency);
+        let hash = hash_image_with_transparency(&bytes, max_long_side_pixel, transparency);
         // The header is enough to plan the request by; the pixels are decoded
         // when preprocessing first asks for them, which a pixel-cache hit
         // never does.
@@ -900,7 +904,7 @@ impl MediaConnector {
         source: AudioSource,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         ensure_input_byte_limit(bytes.len(), audio_max_input_bytes(), "audio")?;
-        let hash = crate::hasher::hash_audio(&bytes);
+        let hash = hash_audio(&bytes);
         let decoded = decode_audio_mono_f32(bytes.clone()).await?;
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
@@ -936,7 +940,7 @@ impl MediaConnector {
 
         // The sampling rate and the per-frame cap both change the decoded
         // frames, so they belong in the identity the caches key off.
-        let hash = crate::hasher::hash_video_with_sampling(
+        let hash = hash_video_with_sampling(
             &bytes,
             cfg.sample_fps,
             cfg.max_long_side_pixel,
@@ -1609,7 +1613,7 @@ impl OpenCvCaptureOwner for videoio::VideoCapture {
 }
 
 #[cfg(feature = "opencv-video")]
-impl OpenCvCaptureOwner for crate::opencv_buffer::BufferedCapture {
+impl OpenCvCaptureOwner for BufferedCapture {
     fn capture_mut(&mut self) -> &mut videoio::VideoCapture {
         self.capture_mut()
     }
@@ -1738,7 +1742,7 @@ where
             })?;
             ensure_decoded_byte_limit(decoded_bytes)?;
             rgb_output = Some(
-                crate::opencv_buffer::RgbOutputBuffer::with_capacity(decoded_bytes)
+                RgbOutputBuffer::with_capacity(decoded_bytes)
                     .map_err(MediaConnectorError::VideoDecode)?,
             );
         }
@@ -1807,8 +1811,8 @@ where
 fn open_opencv_video_capture_from_buffer(
     bytes: Bytes,
     decoder_threads: i32,
-) -> Result<crate::opencv_buffer::BufferedCapture, MediaConnectorError> {
-    crate::opencv_buffer::open_capture(bytes, decoder_threads).map_err(|error| {
+) -> Result<BufferedCapture, MediaConnectorError> {
+    open_capture(bytes, decoder_threads).map_err(|error| {
         MediaConnectorError::VideoDecode(format!("OpenCV could not open video buffer: {error}"))
     })
 }
@@ -5010,7 +5014,7 @@ pub(crate) fn decode_image_bytes(
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
-    let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
+    let mut image = match decode_jpeg_rgb(bytes) {
         Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
             oriented(image, jpeg_orientation(bytes))
@@ -5030,7 +5034,7 @@ pub(crate) fn decode_image_bytes(
             // on its own. The reading waits until here: a file the library
             // decoded clean reached a real end marker and pays no walk over
             // its data.
-            if crate::jpeg_turbo::is_jpeg(bytes) && !crate::jpeg_turbo::end_is_served(bytes) {
+            if is_jpeg(bytes) && !end_is_served(bytes) {
                 return Err(MediaConnectorError::Image(image::ImageError::Decoding(
                     image::error::DecodingError::new(
                         image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg),
@@ -5038,7 +5042,7 @@ pub(crate) fn decode_image_bytes(
                     ),
                 )));
             }
-            match crate::webp_native::decode_webp(bytes) {
+            match decode_webp(bytes) {
                 Some(image) => {
                     // libwebp yields pixels only; the tag comes from the file's
                     // metadata chunk, read as the fallback decoder reads it.
@@ -5317,7 +5321,7 @@ fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
 pub(crate) fn encoded_image_size(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
-) -> Result<crate::types::ImageSize, MediaConnectorError> {
+) -> Result<ImageSize, MediaConnectorError> {
     // The same entry the decode reads, so the two agree on an icon.
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -5336,7 +5340,7 @@ pub(crate) fn encoded_image_size(
     let (width, height) = max_long_side_pixel
         .and_then(|cap| capped_dimensions(width, height, cap))
         .unwrap_or((width, height));
-    Ok(crate::types::ImageSize::new(width, height))
+    Ok(ImageSize::new(width, height))
 }
 
 /// The EXIF orientation of a JPEG, from its header alone; absent or

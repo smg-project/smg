@@ -942,7 +942,7 @@ mod tests {
     use super::*;
     use crate::{
         encoder_inputs::EncoderDtype,
-        test_support::{create_test_image, hex, lcg_rgb_image},
+        test_support::{create_test_image, gradient_rgb, hex, lcg_rgb_image},
     };
 
     #[test]
@@ -1111,7 +1111,7 @@ mod tests {
         RgbImage::from_raw(
             width,
             height,
-            crate::test_support::gradient_rgb(width as usize, height as usize, seed),
+            gradient_rgb(width as usize, height as usize, seed),
         )
         .expect("gradient size")
     }
