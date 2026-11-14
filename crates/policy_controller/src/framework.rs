@@ -27,6 +27,11 @@ pub trait Filter: Send + Sync + Debug {
         false
     }
 
+    /// The per-decision scope this stage reads, if it holds one.
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
+
     /// Drops from `kept` (positions into `candidates`, in order) the rows this
     /// filter refuses, in place: one call per decision, with [`Filter::keep`]
     /// inlined into the loop. A filter that answers for the whole pool at
@@ -80,6 +85,11 @@ pub trait Scorer: Lifecycle + Debug {
     fn needs(&self) -> Needs {
         Needs::default()
     }
+
+    /// The per-decision scope this stage reads, if it holds one.
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
 }
 
 /// Turns the scored survivors into ordered targets. `scores[i]` belongs to
@@ -97,6 +107,24 @@ pub trait Picker: Lifecycle + Debug {
         band: TieBand,
         out: &mut Targets,
     );
+
+    /// The per-decision scope this stage reads, if it holds one.
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
+}
+
+/// Per-decision state a stage set keeps across the stages of one profile
+/// (a plugin's `decision` resource over the view): the engine opens it once
+/// before the profile's first stage of a decision reads it and closes it
+/// after the last, on every path out, so a stage set used by several stages
+/// of one profile, or asked row by row, reads one state. A built-in stage
+/// holds none; the profile's flag ([`Profile::scoped`]) is read once in the
+/// engine, so a profile without one pays nothing per decision.
+pub trait DecisionScope: Send + Sync + Debug {
+    fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>);
+
+    fn close(&self);
 }
 
 /// A scorer with its weight in the profile's combination.
@@ -123,6 +151,53 @@ impl Profile {
         self.scorers
             .iter()
             .fold(Needs::default(), |needs, w| needs.or(w.scorer.needs()))
+    }
+
+    /// Whether any stage holds a [`DecisionScope`].
+    pub fn scoped(&self) -> bool {
+        self.scopes().next().is_some()
+    }
+
+    fn scopes(&self) -> impl Iterator<Item = &dyn DecisionScope> {
+        self.filters
+            .iter()
+            .filter_map(|f| f.scope())
+            .chain(self.scorers.iter().filter_map(|w| w.scorer.scope()))
+            .chain(self.picker.scope())
+    }
+
+    /// Opens every stage's scope over the view; the guard closes them. Out
+    /// of line, so a profile without a scope keeps the engine's decision path
+    /// as it was.
+    #[cold]
+    #[inline(never)]
+    fn open<'a>(
+        &'a self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        pool: &PoolFacts<'_>,
+    ) -> Opened<'a> {
+        for scope in self.scopes() {
+            scope.open(facts, candidates, pool);
+        }
+        Opened(self)
+    }
+}
+
+/// The open scopes of one profile for one decision, closed on drop.
+struct Opened<'a>(&'a Profile);
+
+impl Drop for Opened<'_> {
+    fn drop(&mut self) {
+        close_scopes(self.0);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn close_scopes(profile: &Profile) {
+    for scope in profile.scopes() {
+        scope.close();
     }
 }
 
@@ -468,14 +543,17 @@ pub struct Engine {
     phase_needs: [Needs; PHASES.len()],
     sessions: SessionTable,
     assignment: AssignmentStages,
+    /// Per profile, whether a stage holds a [`DecisionScope`] to open.
+    scoped: Vec<bool>,
 }
 
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
 const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
 
-/// A phase's slot in [`Engine::phase_needs`]: total, so no read falls back
-/// to another phase's needs; [`PHASES`] lists the phases in this order.
-const fn slot(phase: Phase) -> usize {
+/// A phase's slot in [`Engine::phase_needs`] (and in a plugin's open
+/// decisions, one per side of a pair): total, so no read falls back to
+/// another phase's; [`PHASES`] lists the phases in this order.
+pub(crate) const fn slot(phase: Phase) -> usize {
     match phase {
         Phase::Single => 0,
         Phase::Prefill => 1,
@@ -591,6 +669,7 @@ impl Engine {
             }
         }
         let sessions = SessionTable::new(shortest_sweep(&bindings));
+        let scoped = profiles.iter().map(Profile::scoped).collect();
         Self {
             profiles,
             bindings,
@@ -599,6 +678,7 @@ impl Engine {
             phase_needs,
             sessions,
             assignment: AssignmentStages::default(),
+            scoped,
         }
     }
 
@@ -702,6 +782,8 @@ impl Engine {
                 },
             );
         };
+        let _opened =
+            self.scoped[usize::from(index)].then(|| profile.open(facts, candidates, pool));
         if let Some(rule) = binding.sessions {
             if binding.plan == Plan::Single && !facts.session_key.is_none() {
                 return self
@@ -967,6 +1049,13 @@ impl Engine {
             seed: Draw::new(facts.seed).next_u64(),
             ..*facts
         };
+        // One scope per side: the WIT view has one candidate list, so the
+        // prefill stages read the prefill pool and the decode stages the
+        // decode pool, through every decode run and the partner passes.
+        let _prefill_opened = self.scoped[usize::from(binding.profile)]
+            .then(|| prefill_profile.open(&prefill_facts, prefills, pool));
+        let _decode_opened = self.scoped[usize::from(decode_index)]
+            .then(|| decode_profile.open(&decode_facts, decodes, pool));
         // The prefill pool narrows to the prefills with a partner the decode
         // profile's hard filters keep, before the prefill picker truncates to
         // its targets: a pair that exists is found. A decode of class 0 is

@@ -41,6 +41,10 @@
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`elector::Fence`] a shard thread reads before every decision it sends.
 //!
+//! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
+//!   feature): user policies as components of the committed `smg:policy`
+//!   package, one kept instance per deciding thread, every call under fuel,
+//!   bound to a profile as the framework's own stages.
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
@@ -55,8 +59,8 @@
 //!   over them. The scopes' calls and the election arrive in the step's
 //!   later PRs.
 //!
-//! What this step does not hold: the plugin hosts, the operator calls, the
-//! other ingestion drivers and the gRPC API; they arrive in later
+//! What this step does not hold: the gRPC plugin service, the operator calls,
+//! the other ingestion drivers and the gRPC API; they arrive in later
 //! steps and build on these types. The
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
@@ -76,12 +80,15 @@ pub mod sessions;
 pub mod spec;
 pub mod store;
 pub mod view;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch, TieBand, Weighted,
+    Binding, DecisionScope, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch,
+    TieBand, Weighted,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,

@@ -8108,12 +8108,16 @@ dependencies = [
  "smg-grpc-client",
  "tempfile",
  "thiserror 2.0.21",
+ "thread_local",
  "tokio",
  "tonic",
  "tonic-health",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "wasmtime",
+ "wat",
+ "wit-component",
  "wit-parser",
 ]
 
