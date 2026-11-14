@@ -4,13 +4,19 @@
 //! and processing responses. These functions are composed by the
 //! streaming and non-streaming processors.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use axum::{
-    http::{HeaderMap, HeaderValue},
+    body::Body,
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
 };
 use openai_protocol::messages::{CreateMessageRequest, Message};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use tracing::{debug, error, info, warn};
 
 use super::utils::should_propagate_header;
@@ -131,7 +137,12 @@ pub(crate) async fn parse_response(
                 message_id = %message.id,
                 "Successfully parsed response"
             );
-            record_success_metrics(model_id, &message, start_time);
+            record_success_metrics(
+                model_id,
+                u64::from(message.usage.input_tokens),
+                u64::from(message.usage.output_tokens),
+                start_time,
+            );
             info!(
                 model = %model_id,
                 message_id = %message.id,
@@ -155,6 +166,98 @@ pub(crate) async fn parse_response(
             ))
         }
     }
+}
+
+/// Relay a successful non-streaming answer as the provider wrote it, for the
+/// plain path, which reads nothing of it. The body must be a JSON object: one
+/// that is not is the 502 `parse_error`, as when the answer was read typed. A
+/// body that stops coming is sorted as a send that fails (`send_request`): the
+/// request's timeout running out mid-body is the 504 under
+/// `timeout`/`deadline`, any other read failure the 502 under
+/// `backend_error`/`transport_disconnect`. The answer's usage counts go to the
+/// token metrics, and its bytes leave under the upstream's status and content
+/// type, so a key or a block this build does not model reaches the client as
+/// sent.
+pub(crate) async fn relay_response(
+    response: reqwest::Response,
+    model_id: &str,
+    start_time: Instant,
+) -> Response {
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(model = %model_id, error = %e, "Reading the response body failed");
+            if e.is_timeout() {
+                record_failure_metrics(
+                    model_id,
+                    start_time,
+                    metrics_labels::ERROR_TIMEOUT,
+                    metrics_labels::REASON_DEADLINE,
+                );
+                return error::gateway_timeout("timeout", format!("Request timeout: {e}"));
+            }
+            record_failure_metrics(
+                model_id,
+                start_time,
+                metrics_labels::ERROR_BACKEND,
+                metrics_labels::REASON_TRANSPORT_DISCONNECT,
+            );
+            return error::bad_gateway("request_failed", format!("Request failed: {e}"));
+        }
+    };
+    // The top-level keys alone, each value left as written: a map refuses an
+    // answer that is no JSON object, and the rest of the document is scanned
+    // past, not built.
+    let answer = match serde_json::from_slice::<HashMap<String, &RawValue>>(&body) {
+        Ok(answer) => answer,
+        Err(e) => {
+            error!(model = %model_id, error = %e, "Failed to parse response");
+            record_failure_metrics(
+                model_id,
+                start_time,
+                "parse_error",
+                metrics_labels::REASON_BAD_RESPONSE,
+            );
+            return error::bad_gateway("parse_error", "Invalid response from backend");
+        }
+    };
+    #[derive(Default, Deserialize)]
+    struct Counts {
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: u64,
+    }
+    let counts = answer
+        .get("usage")
+        .and_then(|usage| serde_json::from_str::<Counts>(usage.get()).ok())
+        .unwrap_or_default();
+    let message_id = answer
+        .get("id")
+        .and_then(|id| serde_json::from_str::<String>(id.get()).ok())
+        .unwrap_or_default();
+    record_success_metrics(
+        model_id,
+        counts.input_tokens,
+        counts.output_tokens,
+        start_time,
+    );
+    info!(
+        model = %model_id,
+        message_id = %message_id,
+        input_tokens = %counts.input_tokens,
+        output_tokens = %counts.output_tokens,
+        "Completed non-streaming request"
+    );
+    let mut relayed = Response::new(Body::from(body));
+    *relayed.status_mut() = status;
+    relayed.headers_mut().insert(
+        CONTENT_TYPE,
+        content_type.unwrap_or_else(|| HeaderValue::from_static("application/json")),
+    );
+    relayed
 }
 
 /// Handle a non-success response: read body (limited) and record metrics.
@@ -217,7 +320,12 @@ pub(crate) fn record_router_request(model_id: &str, streaming: bool) {
     );
 }
 
-fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant) {
+fn record_success_metrics(
+    model_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    start_time: Instant,
+) {
     Metrics::record_router_duration(
         metrics_labels::ROUTER_HTTP,
         metrics_labels::BACKEND_EXTERNAL,
@@ -232,7 +340,7 @@ fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant
         model_id,
         "messages",
         metrics_labels::TOKEN_INPUT,
-        message.usage.input_tokens as u64,
+        input_tokens,
     );
     Metrics::record_router_tokens(
         metrics_labels::ROUTER_HTTP,
@@ -240,7 +348,7 @@ fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant
         model_id,
         "messages",
         metrics_labels::TOKEN_OUTPUT,
-        message.usage.output_tokens as u64,
+        output_tokens,
     );
 }
 
@@ -335,6 +443,90 @@ mod tests {
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
 
+    /// A provider's answer with what this build does not model: a web fetch
+    /// result block, the diagnostics, and usage keys beyond the two counts.
+    const UPSTREAM_ANSWER: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"web_fetch_result","url":"https://example.com","content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"page"}}}},{"type":"text","text":"done"}],"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"diagnostics":{"cache_miss_reason":null},"usage":{"input_tokens":7,"output_tokens":3,"speed":"fast","server_tool_use":{"web_search_requests":0,"web_fetch_requests":1}},"container":null}"#;
+
+    /// The rendered `smg_router_tokens_total` line of `model` for one token type.
+    fn tokens_line(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        model: &str,
+        token_type: &str,
+    ) -> Option<String> {
+        let model = format!("model=\"{model}\"");
+        let token_type = format!("token_type=\"{token_type}\"");
+        handle
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_tokens_total{")
+                    && line.contains(&model)
+                    && line.contains(&token_type)
+            })
+            .map(str::to_string)
+    }
+
+    /// A plain answer leaves as the provider wrote it, under its status and
+    /// content type, what this build does not model included, and its token
+    /// counts are counted.
+    #[tokio::test]
+    async fn a_plain_answer_leaves_as_the_provider_wrote_it() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let answer = upstream(200, Some("application/json"), UPSTREAM_ANSWER);
+
+        let response = relay_response(answer, "relayed", Instant::now()).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("a content type"),
+            "application/json"
+        );
+        assert_eq!(text_of(response).await, UPSTREAM_ANSWER);
+        let input = tokens_line(&handle, "relayed", "input").expect("input tokens counted");
+        let output = tokens_line(&handle, "relayed", "output").expect("output tokens counted");
+        assert!(input.ends_with(" 7"), "{input}");
+        assert!(output.ends_with(" 3"), "{output}");
+    }
+
+    /// A plain answer that is no JSON object is still the 502 `parse_error`,
+    /// counted as a bad response.
+    #[tokio::test]
+    async fn a_plain_answer_that_is_no_json_object_is_still_a_parse_error() {
+        for body in ["not json", "[1, 2]"] {
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let answer = upstream(200, Some("application/json"), body);
+
+            let response = relay_response(answer, "broken", Instant::now()).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{body}");
+            assert!(text_of(response).await.contains("parse_error"), "{body}");
+            let (error_type, _, count, _) = counted_failure(&handle, "broken");
+            assert_eq!((error_type.as_str(), count), ("parse_error", 1), "{body}");
+        }
+    }
+
+    /// An answer without a content type is relayed as JSON, which it was
+    /// checked to be.
+    #[tokio::test]
+    async fn a_plain_answer_without_a_content_type_is_relayed_as_json() {
+        let response =
+            relay_response(upstream(200, None, UPSTREAM_ANSWER), "m", Instant::now()).await;
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("a content type"),
+            "application/json"
+        );
+    }
+
     /// A provider's refusal reaches the Messages caller under its status with
     /// the operator's organization and project gone.
     #[tokio::test]
@@ -402,6 +594,64 @@ mod tests {
         assert!(logs_contain("Request built"));
         assert!(logs_contain("Request to worker failed"));
         assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/messages")));
+    }
+
+    /// An upstream that sends its headers and then stalls past the request's
+    /// timeout is the 504 counted under `timeout`/`deadline`, as a send that
+    /// times out is, not a `parse_error`.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's stalled upstream, aborted before the test ends"
+    )]
+    async fn a_plain_answer_whose_body_stalls_is_a_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let url = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().expect("an address")
+        );
+        let stalled = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("a connection");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"id\":",
+                )
+                .await
+                .expect("the headers");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(socket);
+        });
+        let budget = Duration::from_millis(200);
+        let start = Instant::now();
+
+        let response = send_request(
+            &client_with_timeout(budget),
+            &url,
+            &HeaderMap::new(),
+            &request(),
+            budget,
+            "stalled-upstream",
+            start,
+        )
+        .await
+        .expect("the headers arrive");
+        let relayed = relay_response(response, "stalled-upstream", start).await;
+
+        assert_eq!(relayed.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            counted_failure(&handle, "stalled-upstream"),
+            ("timeout".to_string(), "deadline".to_string(), 1, 1)
+        );
+        stalled.abort();
     }
 
     /// A send the request timeout cuts is the caller's 504 and one error
