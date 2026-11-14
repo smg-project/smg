@@ -3859,7 +3859,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
-        let rows: Vec<(usize, f32)> = rerank.results.iter().map(|r| (r.index, r.score)).collect();
+        let rows: Vec<(usize, f64)> = rerank.results.iter().map(|r| (r.index, r.score)).collect();
         assert_eq!(rows, [(1, 0.9)], "top_k keeps the best row, not the first");
     }
 
