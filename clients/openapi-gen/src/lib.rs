@@ -128,6 +128,26 @@ struct Parameter {
 struct ParameterSchema {
     #[serde(rename = "type")]
     schema_type: String,
+    /// The item schema of an `array` parameter: a query key the route reads repeated, one
+    /// value per occurrence (OpenAPI's default `form` style with `explode`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Box<ParameterSchema>>,
+}
+
+impl ParameterSchema {
+    fn of(schema_type: &str) -> Self {
+        Self {
+            schema_type: schema_type.to_string(),
+            items: None,
+        }
+    }
+
+    fn array_of(item_type: &str) -> Self {
+        Self {
+            schema_type: "array".to_string(),
+            items: Some(Box::new(Self::of(item_type))),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -316,20 +336,21 @@ fn path_param(name: &str) -> Parameter {
         name: name.to_string(),
         location: "path".to_string(),
         required: true,
-        schema: ParameterSchema {
-            schema_type: "string".to_string(),
-        },
+        schema: ParameterSchema::of("string"),
     }
 }
 
 fn optional_query_param(name: &str) -> Parameter {
+    typed_query_param(name, ParameterSchema::of("string"))
+}
+
+/// An optional query parameter with the schema the route parses it by.
+fn typed_query_param(name: &str, schema: ParameterSchema) -> Parameter {
     Parameter {
         name: name.to_string(),
         location: "query".to_string(),
         required: false,
-        schema: ParameterSchema {
-            schema_type: "string".to_string(),
-        },
+        schema,
     }
 }
 
@@ -581,7 +602,17 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             get: Some(operation(
                 "listResponseInputItems",
                 "List input items for a response",
-                Some(response_id_param),
+                Some(
+                    response_id_param
+                        .into_iter()
+                        .chain([
+                            typed_query_param("limit", ParameterSchema::of("integer")),
+                            optional_query_param("order"),
+                            optional_query_param("after"),
+                            typed_query_param("include", ParameterSchema::array_of("string")),
+                        ])
+                        .collect(),
+                ),
                 None,
                 input_items_responses,
             )),
@@ -1107,17 +1138,13 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                         name: "If-Match".to_string(),
                         location: "header".to_string(),
                         required: true,
-                        schema: ParameterSchema {
-                            schema_type: "string".to_string(),
-                        },
+                        schema: ParameterSchema::of("string"),
                     },
                     Parameter {
                         name: "dry_run".to_string(),
                         location: "query".to_string(),
                         required: false,
-                        schema: ParameterSchema {
-                            schema_type: "boolean".to_string(),
-                        },
+                        schema: ParameterSchema::of("boolean"),
                     },
                 ]),
                 Some(RequestBody {
@@ -1388,9 +1415,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             name: "selector".to_string(),
             location: "query".to_string(),
             required: true,
-            schema: ParameterSchema {
-                schema_type: "string".to_string(),
-            },
+            schema: ParameterSchema::of("string"),
         };
         operation(
             op_id,
@@ -1633,6 +1658,36 @@ mod tests {
         assert_eq!(
             doc["paths"]["/workers"]["get"]["parameters"][0]["name"],
             json!("model")
+        );
+    }
+
+    #[test]
+    fn the_input_items_list_names_its_paging_parameters() {
+        let doc = document_value();
+        let parameters: Vec<_> = doc["paths"]["/v1/responses/{response_id}/input_items"]["get"]
+            ["parameters"]
+            .as_array()
+            .expect("the parameters")
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter["name"].as_str().unwrap_or(""),
+                    parameter["in"].as_str().unwrap_or(""),
+                    parameter["required"].as_bool(),
+                    parameter["schema"]["type"].as_str().unwrap_or(""),
+                    parameter["schema"]["items"]["type"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            parameters,
+            vec![
+                ("response_id", "path", Some(true), "string", None),
+                ("limit", "query", Some(false), "integer", None),
+                ("order", "query", Some(false), "string", None),
+                ("after", "query", Some(false), "string", None),
+                ("include", "query", Some(false), "array", Some("string")),
+            ]
         );
     }
 
