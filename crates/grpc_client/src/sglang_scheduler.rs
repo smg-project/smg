@@ -52,6 +52,20 @@ pub struct SglangGenerateRequestOptions {
 
 crate::impl_abort_for_drop_with_reason!(SglangSchedulerClient);
 
+/// The worker resolves a preloaded adapter's name or internal ID. Never turn
+/// an explicitly empty or conflicting selection into base-model inference.
+fn lora_selector(path: Option<&str>, id: Option<&str>) -> Result<String, String> {
+    if path.is_some_and(|value| value.trim().is_empty())
+        || id.is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("lora_path and lora_id must be non-empty when provided".to_string());
+    }
+    if matches!((path, id), (Some(path), Some(id)) if path != id) {
+        return Err("Specify only one of lora_path or lora_id".to_string());
+    }
+    Ok(path.or(id).unwrap_or_default().to_string())
+}
+
 impl SglangSchedulerClient {
     crate::impl_engine_client_basics!(
         proto,
@@ -213,6 +227,7 @@ impl SglangSchedulerClient {
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
             require_reasoning: options.require_reasoning,
+            lora_id: lora_selector(body.lora_path.as_deref(), None)?,
             ..Default::default()
         };
 
@@ -264,6 +279,7 @@ impl SglangSchedulerClient {
             stream: body.stream,
             log_metrics: body.log_metrics,
             require_reasoning,
+            lora_id: lora_selector(body.lora_path.as_deref(), body.lora_id.as_deref())?,
             ..Default::default()
         };
 
@@ -598,6 +614,7 @@ impl SglangSchedulerClient {
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
             require_reasoning: false,
+            lora_id: lora_selector(body.lora_path.as_deref(), None)?,
             ..Default::default()
         };
 
@@ -829,6 +846,82 @@ mod tests {
         assert_eq!(params.repetition_penalty, 1.0);
         assert_eq!(params.n, 1);
         assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
+
+    #[test]
+    fn lora_selection_reaches_chat_completion_and_native_generate() {
+        for stream in [false, true] {
+            let chat = serde_json::from_value(json!({
+                "model": "base", "messages": [], "lora_path": "adapter", "stream": stream
+            }))
+            .unwrap();
+            let req = SglangSchedulerClient::build_generate_request_from_chat_parts(
+                "chat".into(),
+                &chat,
+                "hi".into(),
+                vec![1],
+                Default::default(),
+            )
+            .unwrap();
+            assert_eq!(req.lora_id, "adapter");
+            assert_eq!(req.stream, stream);
+
+            let completion = serde_json::from_value(json!({
+                "model": "base", "prompt": "hi", "lora_path": "adapter", "stream": stream
+            }))
+            .unwrap();
+            let req = SglangSchedulerClient::build_generate_request_from_completion_parts(
+                "completion".into(),
+                &completion,
+                "hi".into(),
+                vec![1],
+            )
+            .unwrap();
+            assert_eq!(req.lora_id, "adapter");
+            assert_eq!(req.stream, stream);
+
+            for field in ["lora_path", "lora_id"] {
+                let mut body = json!({"text": "hi", "stream": stream});
+                body[field] = json!("adapter");
+                let req = SglangSchedulerClient::build_plain_generate_request_parts(
+                    "native".into(),
+                    &serde_json::from_value(body).unwrap(),
+                    None,
+                    vec![1],
+                )
+                .unwrap();
+                assert_eq!(req.lora_id, "adapter");
+                assert_eq!(req.stream, stream);
+            }
+        }
+    }
+
+    #[test]
+    fn native_generate_refuses_empty_or_conflicting_lora_selection() {
+        for selection in [
+            json!({"lora_path": ""}),
+            json!({"lora_id": " "}),
+            json!({"lora_path": "adapter", "lora_id": "different"}),
+        ] {
+            let body = serde_json::from_value(selection).unwrap();
+            assert!(SglangSchedulerClient::build_plain_generate_request_parts(
+                "native".into(),
+                &body,
+                None,
+                vec![1],
+            )
+            .is_err());
+        }
+        let body = serde_json::from_value(json!({"text": "hi"})).unwrap();
+        assert!(SglangSchedulerClient::build_plain_generate_request_parts(
+            "base".into(),
+            &body,
+            None,
+            vec![1],
+        )
+        .unwrap()
+        .lora_id
+        .is_empty());
     }
 
     /// A chat or completion request's `logit_bias` reaches the proto keyed by

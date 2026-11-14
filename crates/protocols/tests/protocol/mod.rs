@@ -5,6 +5,7 @@ mod chat;
 mod completion;
 mod decisions;
 mod deepseek_profile;
+mod embedding;
 mod provider_ext;
 mod realtime;
 mod responses;

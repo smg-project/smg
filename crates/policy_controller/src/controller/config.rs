@@ -107,6 +107,10 @@ pub struct Config {
     /// streams reconnect on a drain, so the default is far below the
     /// gateway's, which waits for generations to finish.
     pub shutdown_grace: Duration,
+    /// How often the load driver polls an engine whose stream is not
+    /// serving it, and the freshness bound a pushed record must meet to
+    /// stand in for the poll: the gateway's `--load-monitor-interval`.
+    pub load_poll_interval: Duration,
 }
 
 impl Config {
@@ -114,6 +118,8 @@ impl Config {
     pub const DEFAULT_SHUTDOWN_SETTLE: Duration = Duration::from_secs(5);
     /// The default grace period.
     pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+    /// The default load poll interval, the gateway's.
+    pub const DEFAULT_LOAD_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
     /// Refuses the configuration by the first field that is wrong.
     ///
@@ -180,6 +186,9 @@ impl Config {
                 grace: self.shutdown_grace,
             });
         }
+        if self.load_poll_interval.is_zero() {
+            return Err(ConfigError::ZeroLoadPollInterval);
+        }
         Ok(())
     }
 }
@@ -228,6 +237,9 @@ pub enum ConfigError {
     /// A grace period of zero: a drain needs a bound above zero.
     #[error("the shutdown grace period is zero")]
     ZeroShutdownGrace,
+    /// The load poll interval is zero.
+    #[error("the load poll interval is zero")]
+    ZeroLoadPollInterval,
     /// A settle window the grace period cannot hold twice.
     #[error("the shutdown settle window of {settle:?} is over half the grace period of {grace:?}")]
     SettleOverHalfTheGrace {
@@ -309,6 +321,7 @@ mod tests {
             admin: loopback(0),
             shutdown_settle: Duration::from_millis(100),
             shutdown_grace: Duration::from_secs(2),
+            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         }
     }
 

@@ -108,6 +108,7 @@ use kv_index::{
 };
 use parking_lot::RwLock;
 use rand::RngExt;
+use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 use smg_policy_controller::HashKind;
 use tracing::{debug, error, warn};
@@ -223,9 +224,9 @@ pub struct CacheAwarePolicy {
     /// reported; `None` unless `selection_accounting_ttl_ms > 0`.
     accounting: Option<OptimisticAccounting>,
     /// String-based trees for HTTP connections (text input)
-    string_trees: Arc<DashMap<String, Arc<Tree>>>,
+    string_trees: Arc<DashMap<String, Arc<Tree>, FxBuildHasher>>,
     /// Token-based trees for gRPC connections (pre-tokenized input)
-    token_trees: Arc<DashMap<String, Arc<TokenTree>>>,
+    token_trees: Arc<DashMap<String, Arc<TokenTree>, FxBuildHasher>>,
     _eviction_task: Option<PeriodicTask>,
     /// Event-driven KV cache monitor for overlap scoring (gRPC workers only).
     kv_monitor: RwLock<Option<Arc<KvEventMonitor>>>,
@@ -266,7 +267,7 @@ pub struct CacheAwarePolicy {
     /// Inner maps are Arc'd and model entries are never removed, so a
     /// cloned inner handle stays canonical and walking it never holds
     /// an outer-shard guard.
-    placement_index: Arc<DashMap<String, Arc<PlacementMap>>>,
+    placement_index: Arc<DashMap<String, Arc<PlacementMap>, FxBuildHasher>>,
 }
 
 /// Hash-mode per-model placement map: (boundary position, xxh3 of the token
@@ -323,7 +324,7 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
 /// read plus an `Arc` clone is uncontended; only a model's first request pays
 /// for the insert.
 fn tree_for_model<V>(
-    trees: &DashMap<String, Arc<V>>,
+    trees: &DashMap<String, Arc<V>, FxBuildHasher>,
     model_id: &str,
     new_tree: impl FnOnce() -> V,
 ) -> Arc<V> {
@@ -348,9 +349,16 @@ impl CacheAwarePolicy {
         config.cache_boundaries.sort_unstable();
         config.cache_boundaries.dedup();
 
-        let string_trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
-        let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
-        let placement_index = Arc::new(DashMap::<String, Arc<PlacementMap>>::new());
+        // Keyed by the operator's model ids and read on every request: the Fx
+        // hasher, as the model registry's maps.
+        let string_trees = Arc::new(DashMap::<String, Arc<Tree>, FxBuildHasher>::with_hasher(
+            FxBuildHasher,
+        ));
+        let token_trees =
+            Arc::new(DashMap::<String, Arc<TokenTree>, FxBuildHasher>::with_hasher(FxBuildHasher));
+        let placement_index = Arc::new(
+            DashMap::<String, Arc<PlacementMap>, FxBuildHasher>::with_hasher(FxBuildHasher),
+        );
 
         // Start background eviction thread if configured
         let eviction_task = if config.cache_index == CacheIndexKind::Hash {
@@ -3272,7 +3280,7 @@ impl CacheAwarePolicy {
     /// Drop expired holders and empty keys; refresh the per-model entry
     /// gauge. Returns total live entries across models.
     fn sweep_placement_index(
-        index: &DashMap<String, Arc<PlacementMap>>,
+        index: &DashMap<String, Arc<PlacementMap>, FxBuildHasher>,
         ttl: Duration,
         now: Instant,
     ) -> usize {

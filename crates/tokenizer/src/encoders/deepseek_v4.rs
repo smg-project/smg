@@ -46,7 +46,7 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // Thinking defaults ON like the engine's own server: `thinking: false`,
     // its `enable_thinking` alias or `reasoning_effort: "none"` turns it off.
     thinking_toggle: ThinkingToggle::DefaultOn,
-    thinking_key_name: ThinkingKeyName::Thinking,
+    thinking_key_name: Some(ThinkingKeyName::Thinking),
     native_effort_values: NATIVE_EFFORT_VALUES,
     // `reasoning_effort` is read as the engine's own server reads it:
     // `"none"` is chat mode, every other value (`"minimal"` included, which
