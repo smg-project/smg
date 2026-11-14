@@ -3454,8 +3454,8 @@ fn a_thread_whose_packed_table_outgrew_its_share_cuts_it_back_at_its_next_encode
 }
 
 /// A thread's map of the 16-to-64-byte pieces grown for an earlier share
-/// keeps its buckets through a clear at the bound (the map's own clear
-/// keeps the allocation); once the share fell below half its capacity
+/// keeps its slots and slabs through a clear at the bound (the map's own
+/// clear keeps them); once the share fell below half its capacity
 /// (threads joined) the thread's next encode call makes the map anew for
 /// the share, entries within it or not.
 #[test]
@@ -3494,7 +3494,7 @@ fn a_thread_whose_map_outgrew_its_share_remakes_it_at_its_next_encode() {
     let grown = capacity(&mut native);
     assert!(grown >= 20_000, "{grown}");
     // Threads join: the share falls below the entries; the clear at the
-    // start of the next call keeps the buckets, which still serve the share.
+    // start of the next call keeps the slots, which still serve the share.
     native.threads.store(256, Ordering::Relaxed);
     let share = native.piece_cache_share();
     assert!(grown <= 2 * share, "{grown} for a share of {share}");
@@ -3506,7 +3506,7 @@ fn a_thread_whose_map_outgrew_its_share_remakes_it_at_its_next_encode() {
     );
     assert!(entries(&mut native) <= share);
     assert_eq!(capacity(&mut native), grown);
-    // More threads join: the entries are within the new share, the buckets
+    // More threads join: the entries are within the new share, the slots
     // are more than twice it; the next call makes the map anew for the share.
     native.threads.store(1_024, Ordering::Relaxed);
     let share = native.piece_cache_share();
@@ -3560,19 +3560,19 @@ fn long_pieces_are_cached_by_their_bytes() {
             .get()
             .expect("this thread's cache")
             .borrow();
-        assert!(cache.short.contains_key(short.as_bytes()));
-        assert!(!cache.long.contains_key(short.as_bytes()));
-        assert!(cache.long.contains_key(long.as_bytes()));
-        assert!(cache.long.contains_key(longest.as_bytes()));
-        assert!(!cache.long.contains_key(beyond.as_bytes()));
-        assert!(!cache.short.contains_key(beyond.as_bytes()));
+        assert!(cache.short.get(short.as_bytes()).is_some());
+        assert!(cache.long.get(short.as_bytes()).is_none());
+        assert!(cache.long.get(long.as_bytes()).is_some());
+        assert!(cache.long.get(longest.as_bytes()).is_some());
+        assert!(cache.long.get(beyond.as_bytes()).is_none());
+        assert!(cache.short.get(beyond.as_bytes()).is_none());
         assert_eq!(cache.long.len(), 2);
         let accounted: usize = cache
             .long
-            .iter()
+            .entries()
             .map(|(piece, ids)| long_entry_bytes(piece, ids))
             .sum();
-        assert_eq!(cache.long_bytes, accounted);
+        assert_eq!(cache.long.bytes(), accounted);
     }
     // The second encode is answered from the cache: the same ids, and
     // the cache as it was.
@@ -3585,9 +3585,14 @@ fn long_pieces_are_cached_by_their_bytes() {
         .borrow();
     assert_eq!(cache.long.len(), 2);
     assert_eq!(
-        cache.long_bytes,
-        long_entry_bytes(long.as_bytes(), &cache.long[long.as_bytes()])
-            + long_entry_bytes(longest.as_bytes(), &cache.long[longest.as_bytes()])
+        cache.long.bytes(),
+        long_entry_bytes(
+            long.as_bytes(),
+            cache.long.get(long.as_bytes()).expect("cached")
+        ) + long_entry_bytes(
+            longest.as_bytes(),
+            cache.long.get(longest.as_bytes()).expect("cached")
+        )
     );
 }
 
@@ -3614,13 +3619,63 @@ fn long_pieces_stay_within_their_byte_share() {
         .borrow();
     let accounted: usize = cache
         .long
-        .iter()
+        .entries()
         .map(|(piece, ids)| long_entry_bytes(piece, ids))
         .sum();
-    assert_eq!(cache.long_bytes, accounted);
-    assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
+    assert_eq!(cache.long.bytes(), accounted);
+    assert!(
+        cache.long.bytes() <= share,
+        "{} > {share}",
+        cache.long.bytes()
+    );
     assert!(cache.long.len() < words as usize, "{}", cache.long.len());
     assert!(!cache.long.is_empty());
+}
+
+/// A thread's long tier grown under an earlier share keeps its arrays
+/// through an eviction at the bound (four times the share at most); once
+/// the share fell below a quarter of them (threads joined) the thread's
+/// next encode call makes the tier anew.
+#[test]
+fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode() {
+    let mut state = 0x1D1D_3C3C_5B5B_7A7Au64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let held = |native: &NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow()
+            .long
+            .held_bytes()
+    };
+    let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
+    let text: String = (0..16_000)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect();
+    let before = native.encode(Some(model), &head, false).expect("ids");
+    native.encode(Some(model), &text, false).expect("ids");
+    let share = native.long_piece_bytes_share();
+    let grown = held(&native);
+    assert!(grown > share / 2, "{grown} for a share of {share}");
+    assert!(grown <= 4 * share, "{grown} for a share of {share}");
+    // Threads join: the share falls to a thirty-second of the arrays; the
+    // next call makes the tier anew, the ids as before.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.long_piece_bytes_share();
+    assert!(grown > 4 * share, "{grown} for a share of {share}");
+    // A call that meets no long piece: only the check at the call's start
+    // can make the tier anew (a miss would, through the eviction).
+    native.encode(Some(model), &word(1), false).expect("ids");
+    let kept = held(&native);
+    assert!(kept <= 4 * share, "{kept} for a share of {share}");
+    assert_eq!(
+        native.encode(Some(model), &head, false).expect("ids"),
+        before
+    );
 }
 
 #[test]
