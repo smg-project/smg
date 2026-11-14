@@ -75,27 +75,24 @@ use crate::{
 };
 
 /// A server's tools as inventory entries under `category`: the listing and
-/// the entries; `None`, after one warning, when the server cannot be listed.
+/// the entries; the failure's message, after one warning, when the server
+/// cannot be listed (the inventory keeps it as the server's listing error).
 async fn tools_of<S: rmcp::service::Service<RoleClient>>(
     client: &RunningService<RoleClient, S>,
     server_key: &str,
     category: ToolCategory,
-) -> Option<Vec<ToolEntry>> {
+) -> Result<Vec<ToolEntry>, String> {
     match client.peer().list_all_tools().await {
         Ok(tools) => {
             info!("Discovered {} tools from '{}'", tools.len(), server_key);
-            Some(
-                tools
-                    .into_iter()
-                    .map(|tool| {
-                        ToolEntry::from_server_tool(server_key, tool).with_category(category)
-                    })
-                    .collect(),
-            )
+            Ok(tools
+                .into_iter()
+                .map(|tool| ToolEntry::from_server_tool(server_key, tool).with_category(category))
+                .collect())
         }
         Err(e) => {
             warn!("Failed to list tools from '{}': {}", server_key, e);
-            None
+            Err(e.to_string())
         }
     }
 }
@@ -760,11 +757,14 @@ impl McpOrchestrator {
 
     /// Load tools, prompts, and resources from a server into the inventory.
     async fn load_server_inventory(&self, server_key: &str, client: &Arc<McpClientWithHandler>) {
-        for entry in tools_of(client.as_ref(), server_key, ToolCategory::Static)
-            .await
-            .unwrap_or_default()
-        {
-            self.tool_inventory.insert_entry(entry);
+        match tools_of(client.as_ref(), server_key, ToolCategory::Static).await {
+            Ok(entries) => {
+                self.tool_inventory.clear_list_error(server_key);
+                for entry in entries {
+                    self.tool_inventory.insert_entry(entry);
+                }
+            }
+            Err(message) => self.tool_inventory.set_list_error(server_key, message),
         }
         if let Some(prompts) = prompts_of(client.as_ref(), server_key).await {
             install_prompts(&self.tool_inventory, server_key, prompts);
@@ -813,14 +813,18 @@ impl McpOrchestrator {
                             // does: the tools, then the config's aliases and
                             // argument mappings.
                             let key = request.server_key.as_str();
-                            let Some(tools) =
-                                tools_of(client.as_ref(), key, ToolCategory::Static).await
-                            else {
-                                continue;
-                            };
+                            let tools =
+                                match tools_of(client.as_ref(), key, ToolCategory::Static).await {
+                                    Ok(tools) => tools,
+                                    Err(message) => {
+                                        tool_inventory.set_list_error(key, message);
+                                        continue;
+                                    }
+                                };
                             let prompts = prompts_of(client.as_ref(), key).await;
                             let resources = resources_of(client.as_ref(), key).await;
                             tool_inventory.clear_server_tool_entries(key);
+                            tool_inventory.clear_list_error(key);
                             for entry in tools {
                                 tool_inventory.insert_entry(entry);
                             }
@@ -1695,11 +1699,14 @@ impl McpOrchestrator {
             .await?;
 
         // Pooled connections are keyed by URL.
-        for entry in tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic)
-            .await
-            .unwrap_or_default()
-        {
-            inventory_clone.insert_entry(entry);
+        match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
+            Ok(entries) => {
+                inventory_clone.clear_list_error(&server_key);
+                for entry in entries {
+                    inventory_clone.insert_entry(entry);
+                }
+            }
+            Err(message) => inventory_clone.set_list_error(&server_key, message),
         }
 
         self.metrics.record_connection_opened();
@@ -1767,6 +1774,11 @@ impl McpOrchestrator {
     /// Get the tool inventory.
     pub fn tool_inventory(&self) -> Arc<ToolInventory> {
         Arc::clone(&self.tool_inventory)
+    }
+
+    /// Why a server's tools could not be listed, when its last listing failed.
+    pub fn list_error_for_server(&self, server_key: &str) -> Option<String> {
+        self.tool_inventory.list_error(server_key)
     }
 
     /// Get the approval manager.

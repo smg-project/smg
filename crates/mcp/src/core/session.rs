@@ -407,6 +407,12 @@ impl<'a> McpToolSession<'a> {
             .collect()
     }
 
+    /// The failure of a server's last tool listing, for its `mcp_list_tools`
+    /// item's `error`; `None` when the listing succeeded.
+    pub fn list_error_for_server(&self, server_key: &str) -> Option<String> {
+        self.orchestrator.list_error_for_server(server_key)
+    }
+
     /// Resolve an exposed tool name (post-alias) to its `QualifiedToolName`.
     pub fn qualified_name_for_exposed(&self, tool_name: &str) -> Option<QualifiedToolName> {
         let binding = self.exposed_name_map.get(tool_name)?;

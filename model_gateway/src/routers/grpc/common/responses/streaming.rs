@@ -813,6 +813,19 @@ impl ResponseStreamEventEmitter {
         })
     }
 
+    pub fn emit_mcp_list_tools_failed(
+        &mut self,
+        output_index: usize,
+        error: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": McpEvent::LIST_TOOLS_FAILED,
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "error": error
+        })
+    }
+
     pub fn emit_mcp_call_arguments_delta(
         &mut self,
         output_index: usize,
@@ -1890,10 +1903,15 @@ impl ResponseStreamEventEmitter {
     ///
     /// `server_label` is taken as an explicit parameter so callers can iterate
     /// over multiple MCP servers without mutating the emitter's own label.
+    /// The list-tools item's events: `output_item.added`, `in_progress`, then
+    /// `completed` with the tools or, when the server's listing failed
+    /// (`error`), `failed` with the failure, and `output_item.done` with the
+    /// item as the completed response carries it (the error on it).
     pub async fn emit_mcp_list_tools_sequence(
         &mut self,
         server_label: &str,
         tools: &[mcp::ToolEntry],
+        error: Option<&str>,
         tx: &SseSender,
     ) -> Result<(), String> {
         let (output_index, item_id) = self.allocate_output_index(OutputItemKind::McpListTools);
@@ -1921,18 +1939,24 @@ impl ResponseStreamEventEmitter {
         let event = self.emit_mcp_list_tools_in_progress(output_index);
         self.send_event(&event, tx).await?;
 
-        // Emit mcp_list_tools.completed
-        let event = self.emit_mcp_list_tools_completed(output_index, &tool_items);
+        // Emit mcp_list_tools.completed, or .failed when the listing failed
+        let event = match error {
+            Some(error) => self.emit_mcp_list_tools_failed(output_index, error),
+            None => self.emit_mcp_list_tools_completed(output_index, &tool_items),
+        };
         self.send_event(&event, tx).await?;
 
-        // Completed item (with tools populated)
-        let item_done = json!({
+        // The done item: the tools, and the listing's failure as its error
+        let mut item_done = json!({
             "id": item_id,
             "type": "mcp_list_tools",
             "server_label": server_label,
-            "status": "completed",
+            "status": if error.is_some() { "failed" } else { "completed" },
             "tools": tool_items
         });
+        if let Some(error) = error {
+            item_done["error"] = json!(error);
+        }
 
         // Emit output_item.done (the emitter keeps the item)
         self.send_output_item_done(output_index, item_done, tx)
@@ -2064,6 +2088,69 @@ mod tests {
     use crate::routers::grpc::common::responses::utils::{
         assert_responses_api_usage, responses_api_test_usage,
     };
+
+    /// A server whose listing failed streams its list item as `added`,
+    /// `mcp_list_tools.in_progress`, `mcp_list_tools.failed` with the failure,
+    /// then `output_item.done` whose item carries the error and no tools;
+    /// a listed server streams `completed` and an item without an error.
+    #[tokio::test]
+    async fn a_failed_listing_streams_the_failed_event_and_the_items_error() {
+        let events = |error: Option<&'static str>| async move {
+            let (tx, mut rx) = sse_channel();
+            let mut emitter =
+                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+            emitter
+                .emit_mcp_list_tools_sequence("conf", &[], error, &tx)
+                .await
+                .unwrap();
+            drop(tx);
+            let mut events = Vec::new();
+            while let Some(Ok(bytes)) = rx.recv().await {
+                let frame = String::from_utf8(bytes.to_vec()).unwrap();
+                let data = frame.split("data: ").nth(1).unwrap().trim();
+                events.push(serde_json::from_str::<serde_json::Value>(data).unwrap());
+            }
+            events
+        };
+
+        let failed = events(Some("Mcp error: -32603: tools/list refused")).await;
+        assert_eq!(
+            failed
+                .iter()
+                .map(|e| e["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "response.output_item.added",
+                "response.mcp_list_tools.in_progress",
+                "response.mcp_list_tools.failed",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(failed[2]["error"], "Mcp error: -32603: tools/list refused");
+        assert_eq!(failed[2]["output_index"], 0);
+        let item = &failed[3]["item"];
+        assert_eq!(item["type"], "mcp_list_tools");
+        assert_eq!(item["server_label"], "conf");
+        assert_eq!(item["status"], "failed");
+        assert_eq!(item["error"], "Mcp error: -32603: tools/list refused");
+        assert_eq!(item["tools"], json!([]));
+
+        let listed = events(None).await;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|e| e["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "response.output_item.added",
+                "response.mcp_list_tools.in_progress",
+                "response.mcp_list_tools.completed",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(listed[3]["item"].get("error"), None);
+        assert_eq!(listed[3]["item"]["status"], "completed");
+    }
 
     /// The typed text-delta event writes the frame the `json!` event wrote,
     /// byte for byte (the same keys in the same order, the same escaping, the

@@ -37,6 +37,10 @@ pub struct ToolInventory {
     aliases: DashMap<String, QualifiedToolName>,
     prompts: DashMap<String, CachedPrompt>,
     resources: DashMap<String, CachedResource>,
+    /// Why a server's last tool listing failed, by server key: the entry
+    /// stands until a listing of that server succeeds, and is what the
+    /// server's `mcp_list_tools` item reports as its `error`.
+    list_errors: DashMap<String, String>,
 }
 
 impl ToolInventory {
@@ -49,6 +53,7 @@ impl ToolInventory {
             aliases: DashMap::new(),
             prompts: DashMap::new(),
             resources: DashMap::new(),
+            list_errors: DashMap::new(),
         }
     }
 }
@@ -394,6 +399,24 @@ impl ToolInventory {
             .remove_if(&tool_name, |_, v| v.is_empty());
     }
 
+    /// Record why a server's tools could not be listed; the record stands
+    /// until a listing of that server succeeds (`clear_list_error`).
+    pub fn set_list_error(&self, server_key: &str, message: String) {
+        self.list_errors.insert(server_key.to_string(), message);
+    }
+
+    /// Forget a server's listing failure: its listing succeeded.
+    pub fn clear_list_error(&self, server_key: &str) {
+        self.list_errors.remove(server_key);
+    }
+
+    /// The failure of a server's last tool listing, when it failed.
+    pub fn list_error(&self, server_key: &str) -> Option<String> {
+        self.list_errors
+            .get(server_key)
+            .map(|entry| entry.value().clone())
+    }
+
     /// Returns (total_tools, prompts, resources). Total includes collision duplicates.
     pub fn counts(&self) -> (usize, usize, usize) {
         (
@@ -416,6 +439,7 @@ impl ToolInventory {
         self.aliases.clear();
         self.prompts.clear();
         self.resources.clear();
+        self.list_errors.clear();
     }
 
     pub fn index_counts(&self) -> IndexCounts {
@@ -1018,6 +1042,38 @@ mod tests {
         assert_eq!(entry.tool_name(), "my_tool");
 
         assert!(inventory.get_entry("other", "my_tool").is_none());
+    }
+
+    /// A server's listing failure is kept by its key, read back as the
+    /// item's error, replaced by a later failure, and dropped by a listing
+    /// that succeeds; another server's record is untouched.
+    #[test]
+    fn a_listing_failure_is_kept_per_server_until_a_listing_succeeds() {
+        let inventory = ToolInventory::new();
+        assert_eq!(inventory.list_error("http://a/mcp"), None);
+
+        inventory.set_list_error("http://a/mcp", "Mcp error: -32603: refused".to_string());
+        inventory.set_list_error("http://b/mcp", "timed out".to_string());
+        assert_eq!(
+            inventory.list_error("http://a/mcp").as_deref(),
+            Some("Mcp error: -32603: refused")
+        );
+
+        inventory.set_list_error("http://a/mcp", "refused again".to_string());
+        assert_eq!(
+            inventory.list_error("http://a/mcp").as_deref(),
+            Some("refused again")
+        );
+
+        inventory.clear_list_error("http://a/mcp");
+        assert_eq!(inventory.list_error("http://a/mcp"), None);
+        assert_eq!(
+            inventory.list_error("http://b/mcp").as_deref(),
+            Some("timed out")
+        );
+
+        inventory.clear_all();
+        assert_eq!(inventory.list_error("http://b/mcp"), None);
     }
 
     #[test]

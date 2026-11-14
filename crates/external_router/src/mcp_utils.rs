@@ -445,12 +445,12 @@ mod tests {
     use openai_protocol::{
         common::Function,
         responses::{
-            CodeInterpreterTool, FunctionTool, ImageGenerationTool, McpTool, ResponseTool,
-            WebSearchPreviewTool,
+            CodeInterpreterTool, FunctionTool, ImageGenerationTool, McpTool, ResponseOutputItem,
+            ResponseTool, WebSearchPreviewTool,
         },
     };
     use serde_json::json;
-    use smg_mcp::{McpConfig, ResponseFormatConfig, ToolConfig};
+    use smg_mcp::{McpConfig, McpToolSession, ResponseFormatConfig, ToolConfig};
 
     use super::*;
 
@@ -516,6 +516,100 @@ mod tests {
             Arc::new(McpOrchestrator::new(config).await.unwrap()),
             FormatRegistry::new(),
         )
+    }
+
+    /// A local MCP server over HTTP that initializes but answers `tools/list`
+    /// with a JSON-RPC error; the URL it serves on.
+    async fn serve_a_server_whose_listing_fails() -> String {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::post,
+            Json, Router,
+        };
+
+        async fn mcp(_headers: HeaderMap, Json(message): Json<Value>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            match message.get("method").and_then(Value::as_str) {
+                Some("initialize") => Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": message["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "listing-fails", "version": "1"}
+                    }
+                }))
+                .into_response(),
+                Some("tools/list") => Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32603, "message": "tools/list refused by the server"}
+                }))
+                .into_response(),
+                Some(method) if method.starts_with("notifications/") => {
+                    StatusCode::ACCEPTED.into_response()
+                }
+                _ => Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}
+                }))
+                .into_response(),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port of the system's choice");
+        let port = listener.local_addr().expect("the bound address").port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test server that lives as long as the test's runtime; nothing waits for it"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/mcp", post(mcp)))
+                .await
+                .expect("the local MCP server serves");
+        });
+        format!("http://127.0.0.1:{port}/mcp")
+    }
+
+    /// A server that connects but cannot list its tools is a binding whose
+    /// `mcp_list_tools` item carries the listing's failure as its `error`,
+    /// in the typed item and in the JSON form alike, with no tools; the
+    /// request is not refused (the server is reachable) and the model is
+    /// told nothing of tools that could not be listed.
+    #[tokio::test]
+    async fn a_failed_tools_list_is_the_list_items_error() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let url = serve_a_server_whose_listing_fails().await;
+        let inputs = [McpServerInput {
+            label: "conf".to_string(),
+            url: Some(url),
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        }];
+
+        let bindings = connect_mcp_servers(&orchestrator, &format_registry, &inputs).await;
+        assert_eq!(bindings.len(), 1, "a reachable server is bound");
+        let server_key = bindings[0].server_key.clone();
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+
+        let item = openai_bridge::mcp_list_tools_item(&session, "conf", &server_key);
+        let ResponseOutputItem::McpListTools { tools, error, .. } = &item else {
+            panic!("a list-tools item, got {item:?}");
+        };
+        assert!(tools.is_empty());
+        let error = error
+            .as_deref()
+            .expect("the listing's failure is the item's error");
+        assert!(
+            error.contains("tools/list refused by the server"),
+            "the error names the server's message: {error}"
+        );
+
+        let json = openai_bridge::mcp_list_tools_json(&session, "conf", &server_key);
+        assert_eq!(json["error"].as_str(), Some(error));
+        assert_eq!(json["tools"], json!([]));
     }
 
     /// A server URL of a scheme the connector does not take is refused with
