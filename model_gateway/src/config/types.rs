@@ -104,11 +104,6 @@ pub struct RouterConfig {
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
     pub pd_pairing_mode: PdPairingMode,
-    /// Which implementation decides worker selection (`--policy-engine`):
-    /// the policies over worker handles, or the policy engine over its
-    /// bounded view. The switch of the migration and its rollback.
-    #[serde(default)]
-    pub policy_engine: PolicyEngineMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -1222,30 +1217,6 @@ pub enum ManualAssignmentMode {
     Delegate,
 }
 
-/// Which implementation decides worker selection (`--policy-engine`): the
-/// policies over worker handles, or the policy engine over its bounded
-/// view. `legacy` until the migration flips the default; the flag is the
-/// rollback. Under `engine` the validator refuses a policy whose stages the
-/// engine does not carry in this build.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PolicyEngineMode {
-    #[default]
-    Legacy,
-    Engine,
-}
-
-impl PolicyEngineMode {
-    /// Parse the CLI spelling (`legacy` / `engine`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "legacy" => Some(Self::Legacy),
-            "engine" => Some(Self::Engine),
-            _ => None,
-        }
-    }
-}
-
 /// How strictly PD placement pairs a prefill with a decode on their KV
 /// transfer protocol (#2483). A descriptor component an engine does not report
 /// is "unknown".
@@ -2257,7 +2228,6 @@ impl Default for RouterConfig {
             routing_key_override: RoutingKeyOverrideConfig::default(),
             grouped_dp_sticky: GroupedDpSticky::default(),
             pd_pairing_mode: PdPairingMode::default(),
-            policy_engine: PolicyEngineMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             pd_readiness: None,
@@ -2456,28 +2426,6 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The switch reads the CLI's two spellings, any case, and nothing else;
-    /// a configuration without the field is the legacy path.
-    #[test]
-    fn policy_engine_mode_parses_its_two_spellings_and_defaults_to_legacy() {
-        assert_eq!(
-            PolicyEngineMode::parse("engine"),
-            Some(PolicyEngineMode::Engine)
-        );
-        assert_eq!(
-            PolicyEngineMode::parse(" Legacy "),
-            Some(PolicyEngineMode::Legacy)
-        );
-        assert_eq!(PolicyEngineMode::parse("remote"), None);
-        assert_eq!(
-            RouterConfig::default().policy_engine,
-            PolicyEngineMode::Legacy
-        );
-        let parsed: RouterConfig =
-            serde_json::from_value(serde_json::to_value(RouterConfig::default()).unwrap()).unwrap();
-        assert_eq!(parsed.policy_engine, PolicyEngineMode::Legacy);
-    }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is
     /// never written there, the rest of the derive's form is kept.

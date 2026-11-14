@@ -620,7 +620,6 @@ class TestKeywordOnlyParametersOfTheCliFlags:
         for name in (
             "engine_metrics",
             "pd_pairing_mode",
-            "policy_engine",
             "runtime_worker_threads",
             "webrtc_bind_addr",
             "webrtc_stun_server",
@@ -634,10 +633,6 @@ class TestKeywordOnlyParametersOfTheCliFlags:
     def test_an_unknown_pairing_mode_is_refused(self):
         with pytest.raises(ValueError, match="pd_pairing_mode"):
             _Router(worker_urls=["http://w:8000"], pd_pairing_mode="sideways").start()
-
-    def test_an_unknown_policy_engine_is_refused(self):
-        with pytest.raises(ValueError, match="policy_engine"):
-            _Router(worker_urls=["http://w:8000"], policy_engine="remote").start()
 
     def test_zero_runtime_threads_is_refused(self):
         with pytest.raises(ValueError, match="runtime_worker_threads"):

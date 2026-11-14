@@ -540,9 +540,6 @@ class RouterArgs:
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
     policy: str = "cache_aware"
-    # Which implementation decides worker selection: legacy (the policies over
-    # worker handles) or engine (the policy engine over its bounded view)
-    policy_engine: str = "legacy"
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
     # operation included)
@@ -951,19 +948,6 @@ class RouterArgs:
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}policy-engine",
-            type=str,
-            choices=["legacy", "engine"],
-            default=RouterArgs.policy_engine,
-            help=(
-                "Which implementation decides worker selection: legacy, the policies over"
-                " worker handles, or engine, the policy engine over its bounded view. Under"
-                " engine the policy must be one the engine carries: random, round_robin,"
-                " passthrough, power_of_two (expected_wait, requests, least_requests) or"
-                " least_load"
             ),
         )
         routing_group.add_argument(

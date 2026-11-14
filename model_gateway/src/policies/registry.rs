@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use http::{header::HeaderName, HeaderMap};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
 ///
@@ -19,9 +19,7 @@ use tracing::{debug, error, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    as_bucket, as_cache_aware,
-    engine_host::Decider,
-    get_healthy_worker_indices,
+    as_bucket, as_cache_aware, get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
     normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
     PolicyFactory, SelectWorkerInfo, WorkerRole,
@@ -29,10 +27,7 @@ use super::{
 #[cfg(test)]
 use crate::worker::UNKNOWN_MODEL_ID;
 use crate::{
-    config::types::{
-        ManualAssignmentMode, PdPairingMode, PolicyConfig, PolicyEngineMode,
-        RoutingKeyOverrideConfig,
-    },
+    config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     routers::common::header_utils::{
@@ -185,11 +180,6 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
-    /// The policy engine, when `--policy-engine engine` selected it: the one
-    /// handle a placement site decides through (none does yet). A later
-    /// step's remote mode puts the controller client and the local fallback
-    /// engine behind this same handle.
-    decider: Option<Arc<Decider>>,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -270,7 +260,6 @@ impl PolicyRegistry {
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
-            decider: None,
         }
     }
 
@@ -284,42 +273,6 @@ impl PolicyRegistry {
     /// How strictly PD placement pairs prefill and decode descriptors.
     pub fn pd_pairing_mode(&self) -> PdPairingMode {
         self.pd_pairing_mode
-    }
-
-    /// Select the implementation that decides (`--policy-engine`): under
-    /// `engine` the policy engine is built from the default policy and the
-    /// two pair-side policies. The validator builds the same decider at
-    /// start and refuses what the engine refuses, so a refusal here is a
-    /// construction that skipped validation; it keeps the legacy path and
-    /// says so at error level.
-    #[must_use]
-    pub fn with_policy_engine(
-        mut self,
-        mode: PolicyEngineMode,
-        prefill: &PolicyConfig,
-        decode: &PolicyConfig,
-    ) -> Self {
-        if mode == PolicyEngineMode::Engine {
-            match Decider::from_configs(&self.default_policy_config, prefill, decode) {
-                Ok(decider) => {
-                    info!(
-                        needs = ?decider.engine().needs(),
-                        "The policy engine is hosted behind --policy-engine engine"
-                    );
-                    decider.set_load_receiver(self.load_rx.read().clone());
-                    self.decider = Some(Arc::new(decider));
-                }
-                Err(error) => {
-                    error!(%error, "The policy engine refused a configuration the validator did not see; the legacy policies decide");
-                }
-            }
-        }
-        self
-    }
-
-    /// The policy engine, when it decides.
-    pub fn decider(&self) -> Option<&Arc<Decider>> {
-        self.decider.as_ref()
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and
@@ -601,9 +554,6 @@ impl PolicyRegistry {
             guard.clone_from(&rx);
         }
         self.each_policy(|policy| policy.set_load_receiver(rx.clone()));
-        if let Some(decider) = &self.decider {
-            decider.set_load_receiver(rx);
-        }
     }
 
     /// Visit every policy the registry holds once: the default, the PD and
@@ -1179,105 +1129,15 @@ mod tests {
     use super::*;
     use crate::{
         policies::{
-            engine_host::HostRequest, test_support::headers_with_routing_key, BucketConfig,
-            BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
+            test_support::headers_with_routing_key, BucketConfig, BucketPolicy, CacheAwareConfig,
+            CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
-            load_state::{one_rank_load, LoadSnapshot},
+            load_state::LoadSnapshot,
             test_support::{ready_worker, worker_of},
             HashRing, Worker, WorkerLoadGuard, WorkerType,
         },
     };
-
-    /// `--policy-engine engine` puts the engine behind `decider()`; the legacy
-    /// path leaves it empty, and a configuration the engine cannot serve keeps
-    /// the legacy path (the validator refuses it at start).
-    #[test]
-    fn the_engine_switch_builds_the_decider_and_the_legacy_path_leaves_it_empty() {
-        let round_robin = PolicyConfig::RoundRobin;
-        let legacy = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Legacy,
-            &round_robin,
-            &round_robin,
-        );
-        assert!(legacy.decider().is_none());
-        let engine = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &round_robin,
-            &round_robin,
-        );
-        assert!(engine.decider().is_some());
-        let unserved = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &PolicyConfig::ConsistentHashing,
-            &round_robin,
-        );
-        assert!(unserved.decider().is_none());
-    }
-
-    /// The load feed handed to the registry reaches the engine whether the
-    /// decider exists before or after the hand-off. Worker 1 carries two
-    /// in-flight requests, so a dark pool (no feed) takes worker 0 by the
-    /// host count and only the reports flip the pick to the idle worker 1.
-    #[test]
-    fn the_load_feed_hand_off_reaches_the_decider() {
-        let least_load = PolicyConfig::LeastLoad {
-            kv_pressure_weight: 0.0,
-            mean_prefill_tokens: 100,
-            default_throughput: 1000.0,
-        };
-        let workers = vec![
-            ready_worker("http://w0:8000", "m"),
-            ready_worker("http://w1:8000", "m"),
-        ];
-        workers[1].increment_load();
-        workers[1].increment_load();
-        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
-            (
-                workers[0].url().to_string(),
-                one_rank_load(4096, 0.5, 2000.0),
-            ),
-            (workers[1].url().to_string(), one_rank_load(0, 0.1, 2000.0)),
-        ]));
-        let pick = |registry: &PolicyRegistry| {
-            let decider = registry.decider().expect("the engine");
-            let request = HostRequest {
-                model: "m",
-                ..HostRequest::default()
-            };
-            let (decision, _) = decider.decide(&request, &workers, &[]);
-            let first = decision.pick().expect("a pick").targets.first().copied();
-            first.map(|t| t.position)
-        };
-        let idle_wins = |registry: &PolicyRegistry| {
-            assert_eq!(pick(registry), Some(1), "the reports flip the pick");
-        };
-
-        let dark = PolicyRegistry::new(least_load.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &least_load,
-            &least_load,
-        );
-        assert_eq!(
-            pick(&dark),
-            Some(0),
-            "without the feed the host count decides"
-        );
-
-        let handed_first = PolicyRegistry::new(least_load.clone());
-        handed_first.set_load_receiver(Some(rx.clone()));
-        let handed_first =
-            handed_first.with_policy_engine(PolicyEngineMode::Engine, &least_load, &least_load);
-        idle_wins(&handed_first);
-
-        let handed_after = PolicyRegistry::new(least_load.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &least_load,
-            &least_load,
-        );
-        handed_after.set_load_receiver(Some(rx));
-        idle_wins(&handed_after);
-    }
 
     fn cache_aware_policy() -> Arc<dyn LoadBalancingPolicy> {
         Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
