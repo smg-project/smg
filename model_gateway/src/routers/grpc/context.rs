@@ -58,11 +58,14 @@ use crate::{
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
-        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, sse::SseSender},
+        common::{
+            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
+            prefill_admission::PrefillLoadGuard, sse::SseSender,
+        },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
-    worker::{PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
     workflow::TokenizerLoadFailures,
 };
 
@@ -2139,7 +2142,10 @@ mod tests {
 
     #[tokio::test]
     async fn batch_prompts_preserve_phase_load_semantics() {
-        use crate::worker::{BasicWorkerBuilder, PrefillAdmission, WorkerType};
+        use crate::{
+            routers::common::prefill_admission::PrefillAdmission,
+            worker::{BasicWorkerBuilder, WorkerType},
+        };
 
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://prefill:30000")

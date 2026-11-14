@@ -1,4 +1,5 @@
 mod hy_v4;
+mod random_filter;
 mod render_context;
 
 use super::*;
