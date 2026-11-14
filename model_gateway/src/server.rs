@@ -2870,9 +2870,11 @@ async fn graceful_shutdown(
 /// teardown: both listeners until they have stopped (see
 /// [`serve_together`]), the admin listener's error reported, then the wait
 /// for the work that is still in flight (see [`drain_before_teardown`]). A
-/// listener's failure stops the other with `drain`; that work shares the
-/// same `drain`, counted from the same instant. Both results come back for
-/// the caller to return.
+/// listener's failure stops the other with `drain`, when another is still
+/// serving; that work shares the same `drain`, counted from the failure,
+/// and from the failure the probes read draining, whether or not another
+/// listener was there to stop: the gateway is on its way out. Both results
+/// come back for the caller to return.
 async fn serve_until_drained(
     data: Serving,
     admin: Serving,
@@ -2882,28 +2884,39 @@ async fn serve_until_drained(
     shutdown: tokio::task::JoinHandle<tokio::time::Instant>,
     drain: Duration,
 ) -> (std::io::Result<()>, std::io::Result<()>) {
-    // The instant a listener's failure stopped the other.
-    let stopped = OnceLock::new();
+    // What a listener's failure found: the instant, and whether a shutdown
+    // was under way. The drain flag is read before it is set, so the
+    // failure's own mark never passes for a shutdown's. The note is taken
+    // at the failure whether or not another listener is there to stop: in
+    // the stop closures, or below when none ran. The first note stands.
+    let failure = OnceLock::new();
+    let note_failure = || {
+        let _ = failure.set((tokio::time::Instant::now(), inflight_tracker.is_draining()));
+        inflight_tracker.begin_drain();
+    };
     let (data_result, admin_result) = serve_together(
         data,
         admin,
         || {
-            let _ = stopped.set(tokio::time::Instant::now());
+            note_failure();
             stop_data();
         },
         || {
-            let _ = stopped.set(tokio::time::Instant::now());
+            note_failure();
             stop_admin();
         },
     )
     .await;
+    // A failure that found the other serving ended had nothing to stop, so
+    // no stop closure ran: with no admin listener, the default, the admin
+    // serving ends at once. That failure ended the listeners, now.
+    if data_result.is_err() || admin_result.is_err() {
+        note_failure();
+    }
     if let Err(e) = &admin_result {
         error!("Admin listener stopped with an error: {e}");
     }
-    let stopped = stopped
-        .into_inner()
-        .unwrap_or_else(tokio::time::Instant::now);
-    drain_before_teardown(inflight_tracker, shutdown, stopped, drain).await;
+    drain_before_teardown(inflight_tracker, shutdown, failure.into_inner(), drain).await;
     (data_result, admin_result)
 }
 
@@ -2918,18 +2931,24 @@ async fn serve_until_drained(
 /// ended (the settle window first, when a listener failed inside it), and
 /// what was admitted after that drain, while the listeners still closed
 /// their connections, gets what is left of the grace. With none (a listener
-/// failed and stopped the other at `stopped`, and no signal came) it is the
-/// end of the `drain` the stopped listener was given.
+/// failed, and no shutdown was under way by then) it is one `drain` after
+/// the failure, the end of the `drain` a listener it stopped was given; a
+/// signal that comes after the failure does not move it. `failure` is what
+/// the failure found: its instant, and whether a shutdown was under way.
 async fn drain_before_teardown(
     inflight_tracker: &InFlightRequestTracker,
     shutdown: tokio::task::JoinHandle<tokio::time::Instant>,
-    stopped: tokio::time::Instant,
+    failure: Option<(tokio::time::Instant, bool)>,
     drain: Duration,
 ) {
     if inflight_tracker.is_empty() {
         return;
     }
-    if inflight_tracker.is_draining() {
+    // With no failure the listeners ended on their own, now, and the drain
+    // flag is a shutdown's alone.
+    let (stopped, shutdown_under_way) =
+        failure.unwrap_or_else(|| (tokio::time::Instant::now(), inflight_tracker.is_draining()));
+    if shutdown_under_way {
         match shutdown.await {
             Ok(deadline) => {
                 // With no time left there is nothing to wait for: the task's
@@ -2945,7 +2964,8 @@ async fn drain_before_teardown(
             Err(e) => error!("The shutdown task ended abnormally: {e}"),
         }
     } else {
-        // What the stopped listener's connections left of the drain.
+        // What is left of the drain since the failure; a listener it stopped
+        // closed its connections inside the same drain.
         let left = drain.saturating_sub(stopped.elapsed());
         if !inflight_tracker.wait_for_drain(left).await {
             warn!(
@@ -3575,12 +3595,16 @@ mod tests {
     }
 
     /// The ways out of serving: the shutdown signal; a listener that fails
-    /// with no signal; a listener that fails once the signal has come.
+    /// with no signal; a listener that fails once the signal has come; a
+    /// listener that fails, and the signal three seconds later; the only
+    /// listener, with no admin listener beside it, failing with no signal.
     #[derive(Clone, Copy, Debug)]
     enum WayOut {
         Signal,
         ListenerFailure,
         Both,
+        FailureThenSignal,
+        OnlyListenerFailure,
     }
 
     /// The exit as `startup` runs it, on a paused clock: the shutdown task,
@@ -3589,7 +3613,10 @@ mod tests {
     /// connections: no time with none to close, the whole drain when one
     /// holds out. The listeners are stopped when the settle window ends
     /// under the signal; the data listener's failure stops the other at once
-    /// with no signal, and a second into the settle window with one.
+    /// with no signal, and a second into the settle window with one; on the
+    /// fourth way the signal comes three seconds after the failure. On the
+    /// last there is no admin listener, as by default: the data listener
+    /// fails a second into serving, with no signal and nothing to stop.
     /// Returns when the listeners ended and when the exit did.
     async fn exit(
         tracker: &Arc<InFlightRequestTracker>,
@@ -3615,21 +3642,28 @@ mod tests {
                 Err(std::io::Error::other("accept failed"))
             })
         };
-        // The admin listener is the last to end on every way out, and notes
-        // when it does.
+        // The last listener to end notes when it does: the admin listener,
+        // or the data listener where it is the only one.
         let (ended, listeners_ended) = watch::channel(Duration::ZERO);
-        let admin: Serving = Box::pin({
-            let closed = until_closed(stopped.clone());
-            async move {
-                let result = closed.await;
+        let noting_its_end = move |serving: Serving| -> Serving {
+            Box::pin(async move {
+                let result = serving.await;
                 ended.send_replace(start.elapsed());
                 result
-            }
-        });
+            })
+        };
         let data = match way {
-            WayOut::Signal => until_closed(stopped),
-            WayOut::ListenerFailure => failing_after(Duration::ZERO),
-            WayOut::Both => failing_after(Duration::from_secs(1)),
+            WayOut::Signal => until_closed(stopped.clone()),
+            WayOut::ListenerFailure | WayOut::FailureThenSignal => failing_after(Duration::ZERO),
+            WayOut::Both | WayOut::OnlyListenerFailure => failing_after(Duration::from_secs(1)),
+        };
+        let (data, admin) = if matches!(way, WayOut::OnlyListenerFailure) {
+            // The admin serving `serve_listeners` builds with no admin
+            // listener: ended before it began.
+            let no_admin: Serving = Box::pin(std::future::ready(Ok(())));
+            (noting_its_end(data), no_admin)
+        } else {
+            (data, noting_its_end(until_closed(stopped)))
         };
         #[expect(
             clippy::disallowed_methods,
@@ -3639,9 +3673,15 @@ mod tests {
             let tracker = Arc::clone(tracker);
             let stop = Arc::clone(&stop);
             async move {
-                if matches!(way, WayOut::ListenerFailure) {
+                match way {
                     // The signal never comes.
-                    std::future::pending::<()>().await;
+                    WayOut::ListenerFailure | WayOut::OnlyListenerFailure => {
+                        std::future::pending::<()>().await;
+                    }
+                    WayOut::FailureThenSignal => {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    WayOut::Signal | WayOut::Both => {}
                 }
                 graceful_shutdown(
                     &tracker,
@@ -3656,19 +3696,25 @@ mod tests {
             }
         });
         // The shutdown task is under way before the listeners are served on.
+        // An exit that never ends (it waits on a signal that never comes)
+        // fails its case here; it does not hang the run.
         tokio::task::yield_now().await;
-        let _ = serve_until_drained(
-            data,
-            admin,
-            || {},
-            move || {
-                stop.send_replace(true);
-            },
-            tracker,
-            shutdown,
-            budget.drain,
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3600),
+            serve_until_drained(
+                data,
+                admin,
+                || {},
+                move || {
+                    stop.send_replace(true);
+                },
+                tracker,
+                shutdown,
+                budget.drain,
+            ),
         )
-        .await;
+        .await
+        .expect("the exit ends");
         let listeners_ended = *listeners_ended.borrow();
         (listeners_ended, start.elapsed())
     }
@@ -3813,6 +3859,100 @@ mod tests {
                 "the mutation answers at {answers_at:?} s"
             );
         }
+    }
+
+    /// Whether the probes read draining at each of `at`, the seconds since
+    /// the exit began.
+    async fn draining_at<const N: usize>(
+        tracker: &InFlightRequestTracker,
+        at: [u64; N],
+    ) -> [bool; N] {
+        let start = tokio::time::Instant::now();
+        let mut read = [false; N];
+        for (slot, at) in read.iter_mut().zip(at) {
+            tokio::time::sleep_until(start + Duration::from_secs(at)).await;
+            *slot = tracker.is_draining();
+        }
+        read
+    }
+
+    /// A listener's failure with no signal takes the gateway down. From the
+    /// instant it stops the other listener the probes read draining, for as
+    /// long as that listener takes to close its connections: a gateway that
+    /// no longer accepts connections is not ready.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_reports_not_ready_while_the_other_listener_closes() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(&tracker, budget, WayOut::ListenerFailure, secs(10)),
+            draining_at(&tracker, [1, 9]),
+        );
+        assert_eq!(times, (secs(10), secs(10)));
+        assert_eq!(draining, [true, true]);
+    }
+
+    /// The same while the exit waits for a departed client's mutation with
+    /// both listeners closed, and the wait still ends one drain after the
+    /// failure: the failure's own mark is not a shutdown's, so the exit does
+    /// not wait on a shutdown task whose signal never comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_reports_not_ready_while_the_exit_waits_for_a_mutation() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(&tracker, budget, WayOut::ListenerFailure, Duration::ZERO),
+            draining_at(&tracker, [1, 24]),
+        );
+        assert_eq!(times, (secs(0), secs(25)));
+        assert_eq!(draining, [true, true]);
+    }
+
+    /// The same with no admin listener, the default: the failure finds no
+    /// other listener to stop, and it takes the gateway down all the same.
+    /// The probes read ready until the failure, a second into serving, and
+    /// draining from it; the exit ends one drain after the failure.
+    #[tokio::test(start_paused = true)]
+    async fn the_only_listeners_failure_reports_not_ready_while_the_exit_waits_for_a_mutation() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(
+                &tracker,
+                budget,
+                WayOut::OnlyListenerFailure,
+                Duration::ZERO
+            ),
+            draining_at(&tracker, [0, 2, 25]),
+        );
+        assert_eq!(times, (secs(1), secs(26)));
+        assert_eq!(draining, [false, true, true]);
+    }
+
+    /// A signal that comes after a listener's failure does not move the
+    /// exit's deadline: the failure stopped the gateway with no shutdown
+    /// under way, and the exit ends one drain after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_after_a_listeners_failure_does_not_move_the_exits_deadline() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        assert_eq!(
+            exit(&tracker, budget, WayOut::FailureThenSignal, secs(10)).await,
+            (secs(10), secs(25))
+        );
     }
 
     /// An unknown URL and a wrong method answer a JSON envelope in the shape

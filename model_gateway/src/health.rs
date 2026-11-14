@@ -52,6 +52,11 @@
 //! while `/liveness` and `/health` keep returning `200`, so the load balancer
 //! or orchestrator stops routing new connections during the
 //! endpoint-propagation window without restarting the process.
+//!
+//! A listener's failure with no shutdown signal takes the gateway down and
+//! sets the same flag. From then on only the dedicated probe listener still
+//! accepts connections, so a new probe is answered there alone:
+//! `/readiness` with the same `503`, until the process exits.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
