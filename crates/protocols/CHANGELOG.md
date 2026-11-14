@@ -103,6 +103,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Messages `mcp_toolset` keeps its pinned tool listing (`tools`), and a thinking config its
+  `block_binding` under `enabled` and `adaptive`, as the beta takes them. Both were dropped, so the
+  provider asked the MCP server for its tools again, and answered a failed thinking-block check
+  with its default instead of the behavior the client chose. Breaking: `McpToolset` gains `tools`,
+  and `ThinkingConfig::Enabled` and `ThinkingConfig::Adaptive` gain `block_binding`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

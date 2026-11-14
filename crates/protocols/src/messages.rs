@@ -1339,6 +1339,9 @@ pub enum ThinkingConfig {
         budget_tokens: u32,
         /// How thinking content is returned in the response.
         display: Option<ThinkingDisplay>,
+        /// What happens when a thinking block the request sends back fails
+        /// the conversation check (beta), kept as written.
+        block_binding: Option<Value>,
     },
     /// Disable extended thinking
     Disabled,
@@ -1347,6 +1350,9 @@ pub enum ThinkingConfig {
         /// How thinking content is returned in the response.
         /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
         display: Option<ThinkingDisplay>,
+        /// What happens when a thinking block the request sends back fails
+        /// the conversation check (beta), kept as written.
+        block_binding: Option<Value>,
     },
     /// No thinking up front; the model may think between its tool calls.
     /// The public API takes `type` alone here: the `/v1/messages` request
@@ -1375,7 +1381,7 @@ impl ThinkingConfig {
     /// `disabled` and `between_tools` state none.
     pub fn display(&self) -> Option<ThinkingDisplay> {
         match self {
-            Self::Enabled { display, .. } | Self::Adaptive { display } => *display,
+            Self::Enabled { display, .. } | Self::Adaptive { display, .. } => *display,
             Self::Disabled | Self::BetweenTools { .. } => None,
         }
     }
@@ -2401,6 +2407,10 @@ pub struct McpToolset {
 
     /// Cache control for this toolset
     pub cache_control: Option<CacheControl>,
+
+    /// The server's tool listing, pinned (beta): when present, the server is
+    /// not asked for its tools before sampling. Kept as written.
+    pub tools: Option<Vec<Value>>,
 }
 
 /// Default configuration for MCP tools
@@ -3673,6 +3683,7 @@ mod tests {
             default_config: None,
             configs,
             cache_control: None,
+            tools: None,
         })
     }
 
@@ -3752,6 +3763,35 @@ mod tests {
                 assert_eq!(content.tool_references[0].tool_name, "get_weather");
             }
             _ => panic!("Expected ToolSearchToolResult variant"),
+        }
+    }
+
+    /// The beta's pinned tool listing on an MCP toolset, and a thinking
+    /// config's block binding under `enabled` and `adaptive`, are kept and
+    /// written back as sent.
+    #[test]
+    fn a_toolset_keeps_its_pinned_listing_and_thinking_its_block_binding() {
+        let tools = json!([{
+            "type": "mcp_toolset",
+            "mcp_server_name": "brave",
+            "tools": [{"name": "brave_web_search", "input_schema": {"type": "object"}}]
+        }]);
+        for thinking in [
+            json!({"type": "enabled", "budget_tokens": 2048, "block_binding": {"prefix_mismatch_behavior": "drop_block"}}),
+            json!({"type": "adaptive", "block_binding": {}}),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "Search the web for the release notes."}],
+                "mcp_servers": [{"type": "url", "name": "brave", "url": "https://mcp.example.com/mcp"}],
+                "tools": tools,
+                "thinking": thinking
+            }))
+            .unwrap();
+            let written = serde_json::to_value(&request).unwrap();
+            assert_eq!(written["tools"], tools);
+            assert_eq!(written["thinking"], thinking);
         }
     }
 
@@ -3937,7 +3977,7 @@ mod tests {
     fn test_thinking_config_adaptive_minimal() {
         let cfg: ThinkingConfig = serde_json::from_str(r#"{"type":"adaptive"}"#).unwrap();
         match cfg {
-            ThinkingConfig::Adaptive { display } => assert_eq!(display, None),
+            ThinkingConfig::Adaptive { display, .. } => assert_eq!(display, None),
             other => panic!("expected Adaptive, got {other:?}"),
         }
     }
@@ -3947,7 +3987,7 @@ mod tests {
         let cfg: ThinkingConfig =
             serde_json::from_str(r#"{"type":"adaptive","display":"omitted"}"#).unwrap();
         match cfg {
-            ThinkingConfig::Adaptive { display } => {
+            ThinkingConfig::Adaptive { display, .. } => {
                 assert_eq!(display, Some(ThinkingDisplay::Omitted));
             }
             other => panic!("expected Adaptive, got {other:?}"),
@@ -3956,7 +3996,7 @@ mod tests {
         let cfg: ThinkingConfig =
             serde_json::from_str(r#"{"type":"adaptive","display":"summarized"}"#).unwrap();
         match cfg {
-            ThinkingConfig::Adaptive { display } => {
+            ThinkingConfig::Adaptive { display, .. } => {
                 assert_eq!(display, Some(ThinkingDisplay::Summarized));
             }
             other => panic!("expected Adaptive, got {other:?}"),
@@ -3965,7 +4005,10 @@ mod tests {
 
     #[test]
     fn test_thinking_config_adaptive_round_trip_omits_null_display() {
-        let cfg = ThinkingConfig::Adaptive { display: None };
+        let cfg = ThinkingConfig::Adaptive {
+            display: None,
+            block_binding: None,
+        };
         let json = serde_json::to_string(&cfg).unwrap();
         assert_eq!(json, r#"{"type":"adaptive"}"#);
     }
@@ -3978,7 +4021,8 @@ mod tests {
             cfg,
             ThinkingConfig::Enabled {
                 budget_tokens: 1024,
-                display: None
+                display: None,
+                ..
             }
         ));
 
@@ -3996,6 +4040,7 @@ mod tests {
             ThinkingConfig::Enabled {
                 budget_tokens,
                 display,
+                ..
             } => {
                 assert_eq!(budget_tokens, 2048);
                 assert_eq!(display, Some(ThinkingDisplay::Summarized));
@@ -4009,6 +4054,7 @@ mod tests {
         let cfg = ThinkingConfig::Enabled {
             budget_tokens: 1024,
             display: None,
+            block_binding: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert_eq!(json, r#"{"type":"enabled","budget_tokens":1024}"#);
@@ -4025,7 +4071,7 @@ mod tests {
             ] {
                 let cfg: ThinkingConfig = serde_json::from_value(input.clone()).expect(name);
                 let parsed = match &cfg {
-                    ThinkingConfig::Adaptive { display }
+                    ThinkingConfig::Adaptive { display, .. }
                     | ThinkingConfig::Enabled { display, .. } => *display,
                     ThinkingConfig::Disabled | ThinkingConfig::BetweenTools { .. } => None,
                 };
@@ -4070,7 +4116,10 @@ mod tests {
         );
         let cfg: ThinkingConfig =
             serde_json::from_value(json!({"type": "adaptive", "display": null})).unwrap();
-        assert!(matches!(cfg, ThinkingConfig::Adaptive { display: None }));
+        assert!(matches!(
+            cfg,
+            ThinkingConfig::Adaptive { display: None, .. }
+        ));
     }
 
     /// `omitted` is the one value that returns the thinking blocks without
@@ -4171,7 +4220,8 @@ mod tests {
         assert!(matches!(
             request.thinking,
             Some(ThinkingConfig::Adaptive {
-                display: Some(ThinkingDisplay::Updates)
+                display: Some(ThinkingDisplay::Updates),
+                ..
             })
         ));
         assert_eq!(request.reasoning_effort(), Some("high"));
