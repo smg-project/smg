@@ -666,6 +666,7 @@ crate::impl_rank_load_conversions!(proto);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::{testing::refused_endpoint, DEFAULT_CONNECT_TIMEOUT};
 
     /// A request with a `logit_bias` is refused: the wire has no sparse map.
     /// (The completion builder keeps a receiver, and a lazy channel needs the
@@ -690,11 +691,8 @@ mod tests {
             "model": "m", "prompt": "hi", "logit_bias": {"1": -100}
         }))
         .expect("a completion request");
-        let channel = Channel::unconnected(
-            "http://127.0.0.1:1",
-            crate::channel::DEFAULT_CONNECT_TIMEOUT,
-        )
-        .expect("a channel to nowhere");
+        let channel = Channel::unconnected("http://127.0.0.1:1", DEFAULT_CONNECT_TIMEOUT)
+            .expect("a channel to nowhere");
         let client = TrtllmServiceClient {
             client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
@@ -721,7 +719,6 @@ mod tests {
             )
             .is_ok());
     }
-    use crate::channel::testing::refused_endpoint;
 
     /// A poll's answer reaches the worker's report rank for rank, the
     /// measured capacity included where the servicer reports one.
@@ -1018,11 +1015,8 @@ mod tests {
 
         // A client over a lazy channel nothing listens on (made under the
         // runtime a channel needs): the builders dial nothing.
-        let channel = Channel::unconnected(
-            "http://127.0.0.1:1",
-            crate::channel::DEFAULT_CONNECT_TIMEOUT,
-        )
-        .expect("a channel to nowhere");
+        let channel = Channel::unconnected("http://127.0.0.1:1", DEFAULT_CONNECT_TIMEOUT)
+            .expect("a channel to nowhere");
         let client = TrtllmServiceClient {
             client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),

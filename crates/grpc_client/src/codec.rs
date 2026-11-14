@@ -474,6 +474,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        common_proto::Modality,
         mlx_proto, sglang_proto, tokenspeed_encoder_proto, tokenspeed_proto,
         tokenspeed_scheduler::tokenspeed_proto::{tensor_data::Payload, TensorData},
         trtllm_proto, vllm_proto,
@@ -631,7 +632,7 @@ mod tests {
         assert!(reserves_for(&vllm_proto::GenerateRequest {
             media_refs: Some(vllm_proto::MediaRefs {
                 items: vec![vllm_proto::MediaRef {
-                    modality: crate::common_proto::Modality::Image as i32,
+                    modality: Modality::Image as i32,
                     url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
                 }],
             }),

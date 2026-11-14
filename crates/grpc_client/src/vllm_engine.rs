@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use crate::{
     channel::Channel,
+    framed::{call_with_frames, vllm_frames},
     request_fields::{
         body_format, completion_constraint, logit_bias_by_token_id, plain_constraint,
         seeded_folded_i32, seeded_i32, stop_strings, ConstraintKind, OutputConstraint,
@@ -521,7 +522,7 @@ impl VllmEngineClient {
         req: proto::GenerateRequest,
     ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
         let request_id = req.request_id.clone();
-        let frames = crate::framed::vllm_frames(req);
+        let frames = vllm_frames(req);
         async move {
             let frames = frames?;
             let mut carrier = Request::new(());
@@ -529,7 +530,7 @@ impl VllmEngineClient {
                 warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = crate::framed::call_with_frames::<proto::GenerateResponse>(
+            let stream = call_with_frames::<proto::GenerateResponse>(
                 self.channel(),
                 "/vllm.grpc.engine.VllmEngine/Generate",
                 metadata.into_headers(),

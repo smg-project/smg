@@ -62,7 +62,8 @@ use tonic::{
 use tonic_prost::ProstCodec;
 
 use crate::{
-    codec::{reserves_for, EAGER_BUFFER_BYTES},
+    channel::Channel,
+    codec::{encode_prompt_carrier, reserves_for, EAGER_BUFFER_BYTES},
     sglang_proto as sg,
     tokenspeed_scheduler::tokenspeed_proto as ts,
     vllm_proto as vllm,
@@ -117,7 +118,7 @@ impl Frames {
             BytesMut::with_capacity(EAGER_BUFFER_BYTES)
         };
         scratch.put_bytes(0, PREFIX_BYTES);
-        if !crate::codec::encode_prompt_carrier(&mut message, &mut scratch) {
+        if !encode_prompt_carrier(&mut message, &mut scratch) {
             message.encode_raw(&mut scratch);
         }
         let prefix = prefix_of(scratch.len() - PREFIX_BYTES)?;
@@ -699,7 +700,7 @@ fn sglang_framed_tensor_len(tensor: &sg::TensorData) -> usize {
 /// errors map through tonic's `Status::from_error`, as the generated client
 /// maps them.
 pub(crate) async fn call_with_frames<R>(
-    channel: &crate::channel::Channel,
+    channel: &Channel,
     path: &'static str,
     headers: http::HeaderMap,
     frames: Vec<Bytes>,
@@ -767,7 +768,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::common_proto::ShmHandle;
+    use crate::{codec::scratch_capacity, common_proto::ShmHandle};
 
     /// The 1080p float32 class and the 4k float32 class of the bed's corpus.
     const CLASS_1080P: usize = 1920 * 1080 * 3 * 4;
@@ -995,7 +996,7 @@ mod tests {
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
             assert_identical(&req, &frames);
-            let ids = crate::codec::scratch_capacity();
+            let ids = scratch_capacity();
             assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
         })
         .join()
@@ -1021,7 +1022,7 @@ mod tests {
                 };
                 assert_identical(&req, &frames_of(&req));
             }
-            assert_eq!(crate::codec::scratch_capacity(), 0);
+            assert_eq!(scratch_capacity(), 0);
         })
         .join()
         .expect("the media pin holds");
@@ -1077,6 +1078,7 @@ mod tests {
 
         use super::{assert_identical, joined, CLASS_1080P, CLASS_4K};
         use crate::{
+            codec::scratch_capacity,
             common_proto::{RemoteTensorHandle, ShmHandle},
             framed::{vllm_frames, FRAME_MIN_BYTES, PREFIX_BYTES},
             vllm_proto as vllm,
@@ -1375,7 +1377,7 @@ mod tests {
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
                 assert_identical(&req, &frames);
-                let ids = crate::codec::scratch_capacity();
+                let ids = scratch_capacity();
                 assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
             })
             .join()
@@ -1415,7 +1417,7 @@ mod tests {
                     };
                     assert_identical(&req, &frames_of(&req));
                 }
-                assert_eq!(crate::codec::scratch_capacity(), 0);
+                assert_eq!(scratch_capacity(), 0);
             })
             .join()
             .expect("the media pin holds");
@@ -1450,6 +1452,7 @@ mod tests {
 
         use super::{assert_identical, joined, CLASS_1080P, CLASS_4K};
         use crate::{
+            codec::scratch_capacity,
             framed::{sglang_frames, FRAME_MIN_BYTES, PREFIX_BYTES},
             sglang_proto as sg,
         };
@@ -1729,7 +1732,7 @@ mod tests {
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
                 assert_identical(&req, &frames);
-                let ids = crate::codec::scratch_capacity();
+                let ids = scratch_capacity();
                 assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
             })
             .join()
@@ -1771,7 +1774,7 @@ mod tests {
                     };
                     assert_identical(&req, &frames_of(&req));
                 }
-                assert_eq!(crate::codec::scratch_capacity(), 0);
+                assert_eq!(scratch_capacity(), 0);
             })
             .join()
             .expect("the media pin holds");
