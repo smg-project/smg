@@ -12,15 +12,22 @@
 //! - Rate-limited refresh on an unknown `kid`
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use jsonwebtoken::jwk::{Jwk, JwkSet};
+use jsonwebtoken::{
+    jwk::{AlgorithmParameters, Jwk, JwkSet},
+    Algorithm, DecodingKey,
+};
 use parking_lot::{Mutex, RwLock};
 use rustls::crypto::{ring, CryptoProvider};
 use tracing::{debug, info, warn};
 use url::Url;
+
+use crate::jwt::JwtValidatorError;
 
 /// Maximum allowed JWKS response size (1 MB)
 const MAX_JWKS_RESPONSE_SIZE: u64 = 1024 * 1024;
@@ -208,16 +215,121 @@ struct OidcDiscovery {
     issuer: String,
 }
 
-/// Cached JWKS with expiration tracking.
+/// The cached key set with expiration tracking: its keys by `kid`, each with
+/// its parsed form, built once here so a token's check borrows its key instead
+/// of copying the set, the key and the key's parsed form per token.
 struct CachedJwks {
-    jwks: JwkSet,
+    keys: HashMap<String, Arc<SigningKey>>,
     fetched_at: Instant,
     ttl: Duration,
 }
 
 impl CachedJwks {
+    fn new(jwks: JwkSet, ttl: Duration) -> Self {
+        let mut keys = HashMap::with_capacity(jwks.keys.len());
+        for jwk in jwks.keys {
+            let Some(kid) = jwk.common.key_id.clone() else {
+                continue;
+            };
+            // The first key of a `kid` is the one a lookup finds, as before.
+            keys.entry(kid)
+                .or_insert_with(|| Arc::new(SigningKey::new(jwk)));
+        }
+        Self {
+            keys,
+            fetched_at: Instant::now(),
+            ttl,
+        }
+    }
+
     fn is_expired(&self) -> bool {
         self.fetched_at.elapsed() > self.ttl
+    }
+}
+
+/// A key of the cached set as a token's check reads it: the JWK as fetched
+/// and, for a key the validator can use, its parsed form, built once when the
+/// set is fetched and dropped with it, so no token parses the key again.
+#[derive(Debug)]
+pub(crate) struct SigningKey {
+    pub(crate) jwk: Jwk,
+    pub(crate) parsed: Option<ParsedKey>,
+}
+
+/// The parsed form of a JWK: the algorithm its tokens must carry and the
+/// decoding key built from its components.
+#[derive(Debug)]
+pub(crate) struct ParsedKey {
+    pub(crate) algorithm: Algorithm,
+    pub(crate) decoding_key: DecodingKey,
+}
+
+impl SigningKey {
+    fn new(jwk: Jwk) -> Self {
+        let parsed = match (key_algorithm(&jwk), decoding_key(&jwk)) {
+            (Ok(algorithm), Ok(decoding_key)) => Some(ParsedKey {
+                algorithm,
+                decoding_key,
+            }),
+            // A key this validator cannot use: a token's check reports why.
+            _ => None,
+        };
+        Self { jwk, parsed }
+    }
+}
+
+/// The algorithm a JWK's tokens must carry.
+pub(crate) fn key_algorithm(jwk: &Jwk) -> Result<Algorithm, JwtValidatorError> {
+    // First check if algorithm is explicitly specified
+    if let Some(alg) = &jwk.common.key_algorithm {
+        return Ok(match alg {
+            jsonwebtoken::jwk::KeyAlgorithm::RS256 => Algorithm::RS256,
+            jsonwebtoken::jwk::KeyAlgorithm::RS384 => Algorithm::RS384,
+            jsonwebtoken::jwk::KeyAlgorithm::RS512 => Algorithm::RS512,
+            jsonwebtoken::jwk::KeyAlgorithm::ES256 => Algorithm::ES256,
+            jsonwebtoken::jwk::KeyAlgorithm::ES384 => Algorithm::ES384,
+            other => {
+                return Err(JwtValidatorError::ValidationFailed(format!(
+                    "Unsupported key algorithm: {other:?}"
+                )))
+            }
+        });
+    }
+
+    // Infer from key type
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => Ok(Algorithm::RS256), // Default RSA to RS256
+        AlgorithmParameters::EllipticCurve(ec) => {
+            use jsonwebtoken::jwk::EllipticCurve;
+            match ec.curve {
+                EllipticCurve::P256 => Ok(Algorithm::ES256),
+                EllipticCurve::P384 => Ok(Algorithm::ES384),
+                // Other curves not supported for ECDSA
+                _ => Err(JwtValidatorError::ValidationFailed(format!(
+                    "Unsupported EC curve: {:?}",
+                    ec.curve
+                ))),
+            }
+        }
+        _ => Err(JwtValidatorError::ValidationFailed(
+            "Cannot determine algorithm from key".to_string(),
+        )),
+    }
+}
+
+/// The decoding key built from a JWK's components.
+pub(crate) fn decoding_key(jwk: &Jwk) -> Result<DecodingKey, JwtValidatorError> {
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(rsa) => Ok(DecodingKey::from_rsa_components(&rsa.n, &rsa.e)?),
+        AlgorithmParameters::EllipticCurve(ec) => {
+            Ok(DecodingKey::from_ec_components(&ec.x, &ec.y)?)
+        }
+        AlgorithmParameters::OctetKey(_) => {
+            Err(JwtValidatorError::UnsupportedAlgorithm(Algorithm::HS256))
+        }
+        AlgorithmParameters::OctetKeyPair(_) => {
+            Err(JwtValidatorError::UnsupportedAlgorithm(Algorithm::EdDSA))
+        }
     }
 }
 
@@ -406,39 +518,40 @@ impl JwksProvider {
 
     /// Fetch the key set and make it the cached one: the step behind an expiry
     /// refresh and an unknown-`kid` refresh alike.
-    async fn refresh(&self) -> Result<JwkSet, JwksError> {
+    async fn refresh(&self) -> Result<(), JwksError> {
         let jwks = self.fetch_jwks().await?;
-        *self.cache.write() = Some(CachedJwks {
-            jwks: jwks.clone(),
-            fetched_at: Instant::now(),
-            ttl: self.ttl,
-        });
-        Ok(jwks)
+        *self.cache.write() = Some(CachedJwks::new(jwks, self.ttl));
+        Ok(())
     }
 
-    /// Get the cached JWKS, refreshing if expired or not present.
-    pub async fn get_jwks(&self) -> Result<JwkSet, JwksError> {
-        // Check cache first
+    /// Fetch the key set when none is cached or the cached one has expired.
+    async fn ensure_fresh(&self) -> Result<(), JwksError> {
+        if self
+            .cache
+            .read()
+            .as_ref()
+            .is_some_and(|cached| !cached.is_expired())
         {
-            let cache = self.cache.read();
-            if let Some(cached) = cache.as_ref() {
-                if !cached.is_expired() {
-                    return Ok(cached.jwks.clone());
-                }
-            }
+            return Ok(());
         }
-
-        // Cache miss or expired.
         self.refresh().await
     }
 
-    /// Get a specific key by kid (key ID).
-    pub async fn get_key(&self, kid: &str) -> Result<Jwk, JwksError> {
-        let jwks = self.get_jwks().await?;
+    /// The cached set's key of this `kid`: a shared entry, nothing copied.
+    fn cached_key(&self, kid: &str) -> Option<Arc<SigningKey>> {
+        self.cache
+            .read()
+            .as_ref()
+            .and_then(|cached| cached.keys.get(kid))
+            .cloned()
+    }
 
-        // First try to find by kid
-        if let Some(key) = jwks.find(kid) {
-            return Ok(key.clone());
+    /// Get a specific key by kid (key ID): the cached set's entry, with the
+    /// key's parsed form, shared with every other check of a token it signed.
+    pub async fn get_key(&self, kid: &str) -> Result<Arc<SigningKey>, JwksError> {
+        self.ensure_fresh().await?;
+        if let Some(key) = self.cached_key(kid) {
+            return Ok(key);
         }
 
         // Key not found - try refreshing the cache in case keys were rotated,
@@ -451,9 +564,8 @@ impl JwksProvider {
             return Err(JwksError::KeyNotFound(kid.to_string()));
         }
         warn!("Key {} not found in cached JWKS, refreshing...", kid);
-        let jwks = self.refresh().await?;
-        jwks.find(kid)
-            .cloned()
+        self.refresh().await?;
+        self.cached_key(kid)
             .ok_or_else(|| JwksError::KeyNotFound(kid.to_string()))
     }
 
@@ -517,23 +629,15 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{test_support::discovery_server, *};
+    use crate::jwt::test_support::rsa_components;
 
     #[test]
     fn test_cached_jwks_expiration() {
-        let jwks = JwkSet { keys: vec![] };
-        let cached = CachedJwks {
-            jwks,
-            fetched_at: Instant::now() - Duration::from_secs(100),
-            ttl: Duration::from_secs(60),
-        };
+        let mut cached = CachedJwks::new(JwkSet { keys: vec![] }, Duration::from_secs(60));
+        cached.fetched_at = Instant::now() - Duration::from_secs(100);
         assert!(cached.is_expired());
 
-        let jwks = JwkSet { keys: vec![] };
-        let cached = CachedJwks {
-            jwks,
-            fetched_at: Instant::now(),
-            ttl: Duration::from_secs(60),
-        };
+        let cached = CachedJwks::new(JwkSet { keys: vec![] }, Duration::from_secs(60));
         assert!(!cached.is_expired());
     }
 
@@ -681,13 +785,16 @@ mod tests {
             if *self.failing.read() {
                 return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
             }
+            // One real key under every served `kid`: the provider parses each
+            // entry at the fetch, so the set must carry parseable components.
+            let (n, e) = rsa_components();
             let keys: Vec<Value> = self
                 .keys
                 .read()
                 .iter()
                 .map(|kid| {
                     json!({ "kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid,
-                            "n": "sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1Wl", "e": "AQAB" })
+                            "n": n, "e": e })
                 })
                 .collect();
             (StatusCode::OK, Json(json!({ "keys": keys })))
@@ -712,6 +819,7 @@ mod tests {
                 .get_key("k1")
                 .await
                 .unwrap()
+                .jwk
                 .common
                 .key_id
                 .as_deref(),
@@ -731,6 +839,24 @@ mod tests {
             1,
             "misses inside the interval must not fetch"
         );
+    }
+
+    /// A lookup hands out the cached set's own entry, parsed once at the fetch:
+    /// two lookups of a `kid` share it, and a token's check borrows the
+    /// algorithm and the decoding key instead of building them.
+    #[tokio::test]
+    async fn a_lookup_shares_the_key_parsed_once_at_the_fetch() {
+        let server = JwksServer::start(&["k1"]).await;
+        let provider = server.provider();
+
+        let first = provider.get_key("k1").await.unwrap();
+        let again = provider.get_key("k1").await.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &again), "two lookups share one entry");
+        assert_eq!(first.jwk.common.key_id.as_deref(), Some("k1"));
+        let parsed = first.parsed.as_ref().expect("an RSA key parses");
+        assert_eq!(parsed.algorithm, Algorithm::RS256);
+        assert_eq!(server.hits(), 1);
     }
 
     #[tokio::test]
@@ -754,6 +880,7 @@ mod tests {
                 .get_key("k2")
                 .await
                 .unwrap()
+                .jwk
                 .common
                 .key_id
                 .as_deref(),
@@ -801,12 +928,9 @@ mod tests {
             let cache = provider.cache.read();
             let cached = cache.as_ref().unwrap();
             assert!(!cached.is_expired());
-            cached
-                .jwks
-                .keys
-                .iter()
-                .filter_map(|key| key.common.key_id.clone())
-                .collect()
+            let mut kids: Vec<String> = cached.keys.keys().cloned().collect();
+            kids.sort();
+            kids
         };
         provider.get_key("k1").await.unwrap();
         assert_eq!(cached_kids(&provider), ["k1"]);
@@ -822,7 +946,7 @@ mod tests {
         *server.keys.write() = vec!["k3"];
         provider.cache.write().as_mut().unwrap().fetched_at =
             Instant::now() - TTL - Duration::from_secs(1);
-        assert_eq!(provider.get_jwks().await.unwrap().keys.len(), 1);
+        provider.get_key("k3").await.unwrap();
         assert_eq!(cached_kids(&provider), ["k3"]);
         assert_eq!(server.hits(), 3);
     }
@@ -874,7 +998,8 @@ mod tests {
     async fn a_chunked_key_set_past_the_limit_is_refused_as_it_is_read() {
         let origin = chunked_server(20).await; // 1.25 MiB over a 1 MiB limit
         let provider = JwksProvider::new(format!("{origin}/jwks.json"), TTL).unwrap();
-        let err = provider.get_jwks().await.unwrap_err();
+        // The first lookup fetches the set; the refusal is its error.
+        let err = provider.get_key("k1").await.unwrap_err();
         assert!(
             matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && read <= max + 64 * 1024 && max == MAX_JWKS_RESPONSE_SIZE),
             "{err:?}"
