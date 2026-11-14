@@ -87,7 +87,8 @@ def test_explicit_read_uses_full_suite_and_captures_options_once(tmp_path, optio
     assert result.returncode == 0, result.stderr
     assert values == {
         "amd_read_rdma_options_json": f"{DEFAULT_AMD_OPTIONS} {options}",
-        "matrix": [
+        "matrix": [],
+        "read_matrix": [
             {
                 "engine": "vllm",
                 "kv_backend": "moriio",
@@ -245,7 +246,7 @@ def test_normal_read_opt_in_obeys_legs_and_cron_split_without_duplicates(
     )
     assert baseline.returncode == result.returncode == 0, result.stderr
     eligible = enabled == "true" and schedule != "45 9 * * 0"
-    expected = original["matrix"] + (
+    expected_read = (
         [
             {
                 "engine": "vllm",
@@ -259,7 +260,8 @@ def test_normal_read_opt_in_obeys_legs_and_cron_split_without_duplicates(
         if eligible
         else []
     )
-    assert values["matrix"] == expected
+    assert values["matrix"] == original["matrix"]
+    assert values["read_matrix"] == expected_read
     if eligible:
         assert values["amd_read_rdma_options_json"] == (
             DEFAULT_AMD_OPTIONS + " --device=/dev/infiniband"

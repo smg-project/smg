@@ -33,6 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      read_matrix: ${{ steps.plan.outputs.read_matrix }}
       amd_read_rdma_options_json: ${{ steps.plan.outputs.amd_read_rdma_options_json }}
     steps:
       - uses: actions/checkout@v7
@@ -126,6 +127,11 @@ jobs:
                   {engine: "vllm", kv_backend: "nixl", vendor: "amd"},
                   {engine: "vllm", kv_backend: "moriio", moriio_mode: "write", vendor: "amd"}]
                 else [{engine: .}] end) | add // []')
+          # A supported host job manages READ's standalone host-network CID.
+          # Keep every non-READ row byte-for-byte equivalent to the old matrix.
+          read_matrix=$(jq -c '[.[] | select(.moriio_mode == "read" and .moriio_backend == "rdma")]' <<< "$matrix")
+          matrix=$(jq -c '[.[] | select((.moriio_mode == "read" and .moriio_backend == "rdma") | not)]' <<< "$matrix")
+          echo "read_matrix=$read_matrix" >> "$GITHUB_OUTPUT"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
 
@@ -276,4 +282,22 @@ jobs:
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       min_selected: 0
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.tokenspeed-image.outputs.image || '' }}
+    secrets: inherit
+
+  pd-topologies-read:
+    name: pd-topologies (vllm-moriio-read-rdma-amd)
+    permissions:
+      contents: read
+      packages: read
+    needs: [plan, build-wheel, tokenspeed-image]
+    if: ${{ needs.plan.outputs.read_matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.read_matrix) }}
+    uses: ./.github/workflows/e2e-moriio-read-host.yml
+    with:
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi300x' }}
+      image: ${{ matrix.container_image }}
+      options_json: ${{ needs.plan.outputs.amd_read_rdma_options_json }}
     secrets: inherit
