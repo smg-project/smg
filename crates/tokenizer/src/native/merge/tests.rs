@@ -15,6 +15,7 @@ use super::{
     super::bytes_char, ByteTokens, Merge, MergeTable, BUCKET, HOT_SIDE, PAIR_FILTER_BITS_PER_MERGE,
     SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
 };
+use crate::word_cache::LateBoundModel;
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
 fn alphabet_vocab() -> (Vocab, [char; 256]) {
@@ -1428,7 +1429,7 @@ fn a_run_of_one_character_overflows_the_stack_arrays_and_a_pair_no_token_holds_i
 
 /// The model as its section reads into the loading model (the one-pass
 /// read the loader's tables take their merges and largest id from).
-fn read_of(bpe: &BPE) -> crate::word_cache::LateBoundModel {
+fn read_of(bpe: &BPE) -> LateBoundModel {
     let json =
         serde_json::to_string(&ModelWrapper::BPE(bpe.clone())).expect("the model serializes");
     serde_json::from_str(&json).expect("the loading model reads its section")
@@ -1442,7 +1443,7 @@ fn section_of(
     merges: &[(&str, &str)],
     byte_fallback: bool,
     unk_token: Option<&str>,
-) -> crate::word_cache::LateBoundModel {
+) -> LateBoundModel {
     let vocab: std::collections::BTreeMap<&str, u32> = vocab
         .iter()
         .map(|(token, &id)| (token.as_str(), id))

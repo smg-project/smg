@@ -5,6 +5,11 @@
 //! idempotency, retirement accounting, stale-id semantics, exact
 //! truncation order, or `ChainTooLong` atomicity.
 
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers: a failed store ends the test"
+)]
+
 use radix_tree::{
     Config, FlatTree, HolderId, Overlap, OverlapScratch, RadixTree, Stats, StoreError, StoreOutcome,
 };

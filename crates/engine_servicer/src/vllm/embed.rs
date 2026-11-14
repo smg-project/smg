@@ -9,6 +9,7 @@ use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 
 use super::State;
+use crate::embed::guarded;
 
 /// Handle one `Embed` request against the connected engine.
 pub(super) async fn embed(
@@ -22,7 +23,7 @@ pub(super) async fn embed(
     };
     // A generation runner serves no pooling task; vLLM's frontend refuses
     // this before the engine sees it, in these words.
-    crate::embed::guarded(
+    guarded(
         state,
         req.request_id.clone(),
         state.model.is_generation,

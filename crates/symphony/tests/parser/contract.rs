@@ -143,6 +143,10 @@ fn hy_v3() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::HyV3.format(), keyed_tools()))
 }
 
+fn longcat() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::LongCat.format(), keyed_tools()))
+}
+
 fn ling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Ling.format(), keyed_tools()))
 }
@@ -846,6 +850,12 @@ const FORMATS: &[Subject] = &[
         new: hy_v3,
         outputs: HY_V3_OUTPUTS,
         table: Some(Table::HyV3),
+    },
+    Subject {
+        name: "longcat",
+        new: longcat,
+        outputs: LONGCAT_OUTPUTS,
+        table: Some(Table::LongCat),
     },
     Subject {
         name: "ling",
@@ -2157,6 +2167,32 @@ const DOTS3_OUTPUTS: &[&str] = &[
     "<think>\nThe user asks about Paris: <dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
 ];
 
+/// Keyed arguments in LongCat's spelling: the recorded shapes with GLM 4.6's newlines under the
+/// prefixed tags and the template's newline after each close, a cut stream, a call without
+/// arguments, a null and a list, prose where a tag should be, the plain syntax quoted in content.
+const LONGCAT_OUTPUTS: &[&str] = &[
+    "The user asks.</longcat_think>Let me check.<longcat_tool_call>get_weather\n\
+     <longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Paris</longcat_arg_value>\n\
+     <longcat_arg_key>days</longcat_arg_key>\n<longcat_arg_value>3</longcat_arg_value>\n\
+     </longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Paris</longcat_arg_value>\n</longcat_tool_call>\n\
+     <longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Rome</longcat_arg_value>\n</longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n</longcat_tool_call>\n",
+    "Hello!",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Par",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Par\
+     </longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>note</longcat_arg_key>\n\
+     <longcat_arg_value>null</longcat_arg_value>\n<longcat_arg_key>extra</longcat_arg_key>\n\
+     <longcat_arg_value>[1, 2]</longcat_arg_value>\n</longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\nprose<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Paris</longcat_arg_value>\n</longcat_tool_call>\n",
+    "The syntax is:\n\n```\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\
+     \n</tool_call>\n```\n\nThat is all.",
+];
+
 /// The outputs bellwether's common set records for GLM 4.6, and one cut short.
 const GLM4_OUTPUTS: &[&str] = &[
     "\n<think>The user asks about Paris.</think>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
@@ -2788,6 +2824,7 @@ const CALLS_WITHOUT_ARGUMENTS: &[(&str, &str)] = &[
         "hy_v3",
         "<tool_calls>\n<tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
     ),
+    ("longcat", "<longcat_tool_call>get_weather\n</longcat_tool_call>"),
     ("ling", "<tool_call>get_weather\n</tool_call>"),
     ("glm", "<tool_call>get_weather</tool_call>"),
     ("glm4", "<tool_call>get_weather\n</tool_call>"),

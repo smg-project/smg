@@ -472,6 +472,7 @@ impl PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inventory::ToolEntry;
 
     fn test_engine() -> PolicyEngine {
         PolicyEngine::new(Arc::new(AuditLog::new()))
@@ -502,7 +503,7 @@ mod tests {
             Arc::new(serde_json::Map::new()),
         );
         tool.annotations = Some(RmcpToolAnnotations::with_title("Create issue"));
-        let entry = crate::inventory::ToolEntry::from_server_tool("issues", tool);
+        let entry = ToolEntry::from_server_tool("issues", tool);
         let decision = test_engine().evaluate(
             "issues",
             "create_issue",

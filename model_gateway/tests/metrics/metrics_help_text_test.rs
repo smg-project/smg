@@ -13,6 +13,8 @@ use std::collections::BTreeSet;
 
 use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
 
+use crate::metrics::recorder;
+
 /// Names of the `smg_` families announced by `# <marker> <name> ...` lines.
 fn families(body: &str, marker: &str) -> BTreeSet<String> {
     body.lines()
@@ -25,7 +27,7 @@ fn families(body: &str, marker: &str) -> BTreeSet<String> {
 
 #[tokio::test]
 async fn every_smg_family_has_help_text() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

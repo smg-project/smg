@@ -1,0 +1,85 @@
+name: PR Policy Controller Image
+
+# The controller image's own check on a pull request that touches its
+# Dockerfile, the crate's manifest or source, or the toolchain pin: the image
+# builds, and the built image runs: the version, the help, then the controller
+# started in a container under the security context the Helm chart gives the
+# router, its probes read and a clean stop. Nothing is pushed and no cache is
+# saved.
+on:
+  pull_request:
+    paths:
+      - 'docker/policy-controller.Dockerfile'
+      - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/src/**'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/pr-policy-controller-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-policy-controller-image-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build the controller image and run it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: smg-policy-controller:pr
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        run: docker build --progress plain --file docker/policy-controller.Dockerfile --tag "$IMAGE" .
+
+      - name: Read the version and the help
+        run: |
+          docker run --rm "$IMAGE" --version
+          docker run --rm "$IMAGE" --help
+
+      # The container runs under the security context the chart gives the
+      # router (deploy/helm/smg/values.yaml): a read-only root filesystem,
+      # no capability, no privilege escalation, UID 65532. The
+      # controller's id is the container's host name, as under Kubernetes.
+      - name: Start the controller, read its probes and stop it
+        run: |
+          docker run --detach --name controller \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --publish 127.0.0.1:30103:30103 "$IMAGE"
+          # The admin listener answers within a second of the start. A
+          # controller that refused to start has exited: the wait ends at
+          # once and the reads below fail the step.
+          for _ in $(seq 1 30); do
+            if curl -fs --max-time 2 -o /dev/null http://127.0.0.1:30103/liveness; then
+              break
+            fi
+            [ "$(docker inspect --format '{{.State.Running}}' controller)" = "true" ] || break
+            sleep 1
+          done
+          for path in liveness readiness version; do
+            curl -fsS --max-time 5 "http://127.0.0.1:30103/${path}"
+            echo
+          done
+          user="$(docker exec controller id -u)"
+          if [ "$user" != "65532" ]; then
+            echo "::error::the controller runs as UID ${user}, not 65532"
+            exit 1
+          fi
+          # SIGTERM drains: readiness fails, the settle window passes, the
+          # listeners close and the process exits 0.
+          docker stop -t 60 controller
+          code="$(docker inspect --format '{{.State.ExitCode}}' controller)"
+          if [ "$code" != "0" ]; then
+            echo "::error::the controller exited ${code} after SIGTERM"
+            exit 1
+          fi
+
+      - name: The controller's log
+        if: always()
+        run: docker logs controller || true
