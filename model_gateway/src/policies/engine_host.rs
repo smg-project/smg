@@ -30,8 +30,8 @@ use std::{
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::{Mutex, RwLock};
 use smg_policy_controller::{
+    fingerprint,
     spec::{BindingSpec, LeastLoadParams, ProfileSpec, ScoreSpec, ScoreStage},
-    store::identity,
     Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId, LeaseKind,
     Lifecycle, LoadRow, Membership, Needs, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts,
     Role, Scratch, Side, SignalSource, SpecError, Target, WorkerId,
@@ -40,7 +40,6 @@ use tracing::debug;
 
 use crate::{
     config::{PolicyConfig, PowerOfTwoLoadMetric},
-    policies::host_stores::HostStores,
     routers::common::pd_admission,
     worker::{
         expected_wait::DEFAULT_MEAN_PREFILL_TOKENS,
@@ -166,18 +165,13 @@ fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
     }
 }
 
-/// The number standing for a worker's incarnation until the controller's
-/// store numbers them: the handle's address, as the load feed's provenance
-/// fence reads it. A same-URL replacement is a new handle.
-pub fn incarnation(worker: &dyn Worker) -> u64 {
-    (worker as *const dyn Worker).cast::<()>().addr() as u64
-}
-
 /// The stable id of a worker in the view: its registration key (the URL)
-/// and its incarnation, under the store's identity rule, so a same-URL
-/// replacement is a new id and the host's rows carry the view's ids.
+/// and the incarnation behind the handle, so a same-URL replacement is a new
+/// id. Until the controller's store numbers incarnations, the handle's
+/// address stands for it, as the load feed's provenance fence does.
 pub fn worker_id(worker: &dyn Worker) -> WorkerId {
-    identity(worker.url(), incarnation(worker))
+    let handle = (worker as *const dyn Worker).cast::<()>().addr() as u64;
+    WorkerId(fingerprint(worker.url().as_bytes()) ^ handle.wrapping_mul(0x9e37_79b9_7f4a_7c15))
 }
 
 /// Whether stages with `needs` read the request body: its text, or the
@@ -232,10 +226,6 @@ pub struct Decider {
     /// under the lock they share.
     #[cfg(test)]
     between_check_and_booking: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// The store ingress over this process's structures, handed in under
-    /// `--policy-engine engine`; nothing reads or writes through it until the
-    /// step that moves the ingestion drivers.
-    stores: RwLock<Option<Arc<HostStores>>>,
     /// The host's clock origin: every instant in the view is microseconds
     /// since it.
     origin: Instant,
@@ -310,7 +300,6 @@ impl Decider {
             retired: Mutex::new(Retired::default()),
             #[cfg(test)]
             between_check_and_booking: Mutex::new(None),
-            stores: RwLock::new(None),
             origin: Instant::now(),
             seq: AtomicU64::new(1),
             mean_prompt_tokens: spec.profiles.get("default").map_or(0, mean_prefill_of),
@@ -373,17 +362,6 @@ impl Decider {
     /// Hand the engine the worker monitor's load feed.
     pub fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
         *self.loads.write() = rx;
-    }
-
-    /// Hand the engine the host's store ingress (the registry, the monitors
-    /// and the admission counters behind the store traits).
-    pub fn set_stores(&self, stores: Arc<HostStores>) {
-        *self.stores.write() = Some(stores);
-    }
-
-    /// The host's store ingress, once handed in.
-    pub fn stores(&self) -> Option<Arc<HostStores>> {
-        self.stores.read().clone()
     }
 
     fn snapshot(&self) -> Option<Arc<LoadSnapshot>> {
@@ -755,7 +733,7 @@ impl Retired {
 /// partial report or a rank without a rate leaves it unknown (zero), and
 /// the scorer prices the worker at the fleet's nominal rate. Any other
 /// role's drain is the generation rate of the ranks with a request running.
-pub(crate) fn load_row(
+fn load_row(
     report: &WorkerLoadResponse,
     worker_type: WorkerType,
     now: Instant,
