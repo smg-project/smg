@@ -141,7 +141,7 @@ jobs:
           # A dry run builds one interpreter to stay fast; the nightly builds
           # the full matrix.
           args: --release --out dist --features vendored-openssl --interpreter ${{ env.DRY_RUN == 'true' && '3.12' || '3.10 3.11 3.12 3.13' }}
-          rust-toolchain: 1.98.0
+          rust-toolchain: 1.100.0
           before-script-linux: |
             if command -v yum &> /dev/null; then
               yum update -y && yum install -y wget unzip gcc gcc-c++ perl-core make
@@ -167,7 +167,7 @@ jobs:
           working-directory: smg-repo/bindings/python
           command: sdist
           args: --out dist
-          rust-toolchain: 1.98.0
+          rust-toolchain: 1.100.0
 
       - name: Check packages
         run: |
@@ -243,7 +243,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.98.0
+          toolchain: 1.100.0
 
       - name: Install protoc
         run: |

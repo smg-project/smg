@@ -10,7 +10,7 @@ bash "$(dirname "${BASH_SOURCE[0]}")/ci_install_build_deps.sh"
 export PATH="${CI_PROTOC_PREFIX:-${HOME}/.local}/bin:${PATH}"
 
 # Install rustup (Rust installer and version manager)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.100.0
 
 
 # Follow the installation prompts, then reload your shell
