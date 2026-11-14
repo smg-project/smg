@@ -2817,12 +2817,13 @@ impl RouterTrait for PDRouter {
                 ));
             }
             // The client's error names the request's address, its query
-            // kept: the masked address beside it names the side.
+            // kept: the answer carries its cause without the address, and
+            // the masked address beside it names the side.
             Err(e) => {
                 errors.push(format!(
                     "Prefill {} error: {}",
                     prefill.redacted_url(),
-                    e.without_url()
+                    cause(&e)
                 ));
             }
         }
@@ -2845,7 +2846,7 @@ impl RouterTrait for PDRouter {
                 errors.push(format!(
                     "Decode {} error: {}",
                     decode.redacted_url(),
-                    e.without_url()
+                    cause(&e)
                 ));
             }
         }
@@ -4698,9 +4699,9 @@ mod tests {
     /// masked, whether a side answers, answers an error or refuses the
     /// connection: a worker registered with a password and a token in its
     /// query is named by its scheme, host and port, and a refused
-    /// connection's error does not name the request's address. The route is
-    /// public. The stubs answer every path: the probe's route joins such an
-    /// address after its query.
+    /// connection's entry carries the transport's reason without the
+    /// request's address. The route is public. The stubs answer every path:
+    /// the probe's route joins such an address after its query.
     #[tokio::test]
     async fn health_generate_names_the_pair_it_tried_with_masked_addresses() {
         async fn probe(prefill: &str, decode: &str) -> (StatusCode, String) {
@@ -4759,6 +4760,14 @@ mod tests {
             for side in [prefill, decode] {
                 let masked = side.replacen("http://", "http://***@", 1);
                 assert!(body.contains(&masked), "{masked} is not named in: {body}");
+            }
+            // The side that refused the connection is answered with the
+            // transport's reason after the client's own words.
+            if wanted == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(
+                    body.contains(" error: error sending request: "),
+                    "the refused side is answered without its reason: {body}"
+                );
             }
         }
         assert!(
