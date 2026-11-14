@@ -6,6 +6,11 @@
 //! attempt is lost to the socket under the call, and the client is answered
 //! as for every other way the worker's transport fails, on the last attempt
 //! as on the ones before it.
+//!
+//! Unix alone: the engine's port is kept across its lives by a shared
+//! reservation (`RefusedAddress::reserve_shared`), a Unix socket option.
+
+#![cfg(unix)]
 
 use std::{
     sync::{
@@ -239,14 +244,31 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
     .await;
     assert_eq!(request_status(router.as_ref()).await, 200);
 
-    // The engine dies: the next request fails and opens the breaker, the
-    // next probe demotes the worker, and requests are refused.
+    // The engine dies, and two things can find it first. A request: it
+    // fails and opens the breaker, and the next probe demotes the worker. Or
+    // a probe: the worker is demoted, its requests are refused before the
+    // worker is tried, and the breaker never sees a failure. Either way the
+    // worker stops being routable: one that stays ready with a closed
+    // breaker through twenty requests fails here.
     engine.kill().await;
     for _ in 0..20 {
-        if worker.circuit_breaker_state() == CircuitState::Open {
+        if worker.circuit_breaker_state() == CircuitState::Open
+            || worker.status() != WorkerStatus::Ready
+        {
             break;
         }
         let _ = request_status(router.as_ref()).await;
+    }
+    if worker.circuit_breaker_state() != CircuitState::Open {
+        assert_ne!(
+            worker.status(),
+            WorkerStatus::Ready,
+            "twenty requests to a dead engine left the worker ready and its breaker closed"
+        );
+        // The probe came first. The case is about a worker that returns with
+        // its breaker open, so the failure a request would have recorded is
+        // recorded here.
+        worker.record_circuit_breaker_outcome(false);
     }
     assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
     common::wait_until("the worker's demotion", RECOVERY_BOUND, || {

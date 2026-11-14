@@ -188,6 +188,7 @@ impl RefusedAddress {
     /// the port with the listeners of [`RefusedAddress::listen_shared`], one
     /// for each life of the worker, and outlives them: the port is refused
     /// again when a listener is gone, and stays taken between two lives.
+    /// Unix alone: a test module that calls it is gated `#![cfg(unix)]`.
     #[expect(
         clippy::expect_used,
         reason = "a test fixture: a loopback socket the system cannot give is a test failure"
@@ -206,6 +207,8 @@ impl RefusedAddress {
 
     /// A listener beside the reservation, for one life of the worker:
     /// connections are answered while it lives and refused again after it.
+    /// The life before must be gone first: a second listener alive at once
+    /// is not refused, and the two share the connections.
     /// Only a reservation of [`RefusedAddress::reserve_shared`] shares its
     /// port: on any other the bind is refused, and the test fails here.
     #[expect(
