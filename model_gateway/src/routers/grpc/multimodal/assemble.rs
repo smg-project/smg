@@ -5,6 +5,7 @@
 //! per-item encoder inputs and per-item content hashes used for encode routing.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Instant,
 };
@@ -245,8 +246,9 @@ fn assemble_vllm_batches(
 #[derive(Debug, Clone)]
 pub(super) struct VllmAssembly {
     /// The float dtype the primary tensor is written in (`float32`,
-    /// `bfloat16`, `float16`).
-    pub encoder_dtype: String,
+    /// `bfloat16`, `float16`): the process's own name borrowed, or the one
+    /// copy of the worker's label.
+    pub encoder_dtype: Cow<'static, str>,
     /// The engine rescales and normalizes pixels on device: it takes the
     /// pixels' own `uint8` bytes and would normalize floats twice.
     pub device_normalizes: bool,
@@ -521,7 +523,7 @@ pub(crate) fn assemble_tokenspeed_for_encode(
 struct TokenSpeedAssemblyOptions {
     shm_enabled: bool,
     shm_min_bytes: usize,
-    encoder_input_dtype: String,
+    encoder_input_dtype: Cow<'static, str>,
     skip_pixel_values: bool,
 }
 
@@ -596,7 +598,7 @@ fn assemble_tokenspeed_with_options(
         // encoder_input is stripped downstream (clear_mm_pixel_values), so skip
         // the per-item slice + serialize entirely when skip_pixel_values is set.
         let encoder_input = if skip_pixel_values {
-            TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.clone())
+            TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.to_string())
         } else if let Some(input) = owned_input.take() {
             match serialize_tokenspeed_encoder_input_owned(
                 input,

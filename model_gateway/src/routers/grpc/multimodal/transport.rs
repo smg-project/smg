@@ -11,6 +11,7 @@
 //! 64 KiB).
 
 use std::{
+    borrow::Cow,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -369,7 +370,7 @@ fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn Worker>>
 
 /// SGLang's declared floating encoder dtype, with float32 for older workers.
 pub(super) fn mm_sglang_encoder_input_dtype(workers: Option<&WorkerSelection>) -> EncoderDtype {
-    sglang_wire_dtype(mm_encoder_input_dtype_from_worker(workers).as_deref())
+    with_worker_encoder_dtype(workers, sglang_wire_dtype)
 }
 
 /// Accept only floating encoder inputs; unknown labels retain the legacy wire.
@@ -387,23 +388,52 @@ fn sglang_wire_dtype(label: Option<&str>) -> EncoderDtype {
 /// prefers: a worker only reads the bytes at the width it already knows, so the
 /// router keeps sending the widest one until it is told the other end reads
 /// something else.
-pub(super) fn mm_vllm_encoder_input_dtype(workers: Option<&WorkerSelection>) -> String {
-    resolve_mm_vllm_encoder_input_dtype(
-        mm_vllm_encoder_input_dtype_from_env(),
-        mm_encoder_input_dtype_from_worker(workers),
-    )
+pub(super) fn mm_vllm_encoder_input_dtype(workers: Option<&WorkerSelection>) -> Cow<'static, str> {
+    let override_dtype = mm_vllm_encoder_input_dtype_from_env();
+    with_worker_encoder_dtype(workers, |worker_dtype| {
+        resolve_mm_vllm_encoder_input_dtype(override_dtype, worker_dtype).kept()
+    })
 }
 
-fn resolve_mm_vllm_encoder_input_dtype(
-    override_dtype: Option<String>,
-    worker_dtype: Option<String>,
-) -> String {
+fn resolve_mm_vllm_encoder_input_dtype<'a>(
+    override_dtype: Option<&'static str>,
+    worker_dtype: Option<&'a str>,
+) -> ResolvedDtype<'a> {
     override_dtype
-        .or(worker_dtype)
-        .unwrap_or_else(|| "float32".to_string())
+        .map(ResolvedDtype::Process)
+        .or_else(|| worker_dtype.map(ResolvedDtype::Worker))
+        .unwrap_or(ResolvedDtype::Process("float32"))
 }
 
-fn mm_vllm_encoder_input_dtype_from_env() -> Option<String> {
+/// Where a resolved dtype name lives: the router's overrides and the built-in
+/// defaults are the process's own strings; a worker's label lives in its
+/// metadata (or in a direct SGLang worker's connection) and is copied only
+/// when an assembly keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedDtype<'a> {
+    Process(&'static str),
+    Worker(&'a str),
+}
+
+impl<'a> ResolvedDtype<'a> {
+    fn as_str(self) -> &'a str {
+        match self {
+            Self::Process(dtype) => dtype,
+            Self::Worker(dtype) => dtype,
+        }
+    }
+
+    /// The name as an assembly keeps it for the request: borrowed when it is
+    /// the process's own, one copy when it is the worker's.
+    fn kept(self) -> Cow<'static, str> {
+        match self {
+            Self::Process(dtype) => Cow::Borrowed(dtype),
+            Self::Worker(dtype) => Cow::Owned(dtype.to_owned()),
+        }
+    }
+}
+
+fn mm_vllm_encoder_input_dtype_from_env() -> Option<&'static str> {
     static DTYPE: OnceLock<Option<String>> = OnceLock::new();
     cached_env_dtype(&DTYPE, "SMG_VLLM_ENCODER_INPUT_DTYPE")
 }
@@ -411,28 +441,29 @@ fn mm_vllm_encoder_input_dtype_from_env() -> Option<String> {
 pub(super) fn mm_encoder_input_dtype(
     modality: Modality,
     workers: Option<&WorkerSelection>,
-) -> String {
-    resolve_mm_encoder_input_dtype(
-        mm_modality_encoder_input_dtype_from_env(modality),
-        mm_default_encoder_input_dtype_from_env(),
-        mm_encoder_input_dtype_from_worker(workers),
-    )
+) -> Cow<'static, str> {
+    let modality_override = mm_modality_encoder_input_dtype_from_env(modality);
+    let default_override = mm_default_encoder_input_dtype_from_env();
+    with_worker_encoder_dtype(workers, |worker_dtype| {
+        resolve_mm_encoder_input_dtype(modality_override, default_override, worker_dtype).kept()
+    })
 }
 
-fn resolve_mm_encoder_input_dtype(
-    modality_override: Option<String>,
-    default_override: Option<String>,
-    worker_dtype: Option<String>,
-) -> String {
+fn resolve_mm_encoder_input_dtype<'a>(
+    modality_override: Option<&'static str>,
+    default_override: Option<&'static str>,
+    worker_dtype: Option<&'a str>,
+) -> ResolvedDtype<'a> {
     // Use one configurable wire policy across modalities, with an optional
     // per-modality override for encoder contracts that require another dtype.
     modality_override
         .or(default_override)
-        .or(worker_dtype)
-        .unwrap_or_else(|| "bfloat16".to_string())
+        .map(ResolvedDtype::Process)
+        .or_else(|| worker_dtype.map(ResolvedDtype::Worker))
+        .unwrap_or(ResolvedDtype::Process("bfloat16"))
 }
 
-fn mm_modality_encoder_input_dtype_from_env(modality: Modality) -> Option<String> {
+fn mm_modality_encoder_input_dtype_from_env(modality: Modality) -> Option<&'static str> {
     static IMAGE_DTYPE: OnceLock<Option<String>> = OnceLock::new();
     static VIDEO_DTYPE: OnceLock<Option<String>> = OnceLock::new();
     static AUDIO_DTYPE: OnceLock<Option<String>> = OnceLock::new();
@@ -450,14 +481,16 @@ fn mm_modality_encoder_input_dtype_from_env(modality: Modality) -> Option<String
     }
 }
 
-fn mm_default_encoder_input_dtype_from_env() -> Option<String> {
+fn mm_default_encoder_input_dtype_from_env() -> Option<&'static str> {
     static DEFAULT_DTYPE: OnceLock<Option<String>> = OnceLock::new();
     cached_env_dtype(&DEFAULT_DTYPE, "SMG_TOKENSPEED_ENCODER_INPUT_DTYPE")
 }
 
-fn cached_env_dtype(cell: &'static OnceLock<Option<String>>, name: &str) -> Option<String> {
+/// The override `name` names, read from the environment once and borrowed
+/// from the cell for the rest of the process.
+fn cached_env_dtype(cell: &'static OnceLock<Option<String>>, name: &str) -> Option<&'static str> {
     cell.get_or_init(|| std::env::var(name).ok().filter(|dtype| !dtype.is_empty()))
-        .clone()
+        .as_deref()
 }
 
 /// The label a vLLM worker advertises when its engine rescales and normalizes
@@ -479,29 +512,36 @@ fn device_normalizes(worker: &dyn Worker) -> bool {
         .is_some_and(|value| value == "true")
 }
 
-fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Option<String> {
-    encoder_dtype_label(primary_worker(workers)?.as_ref())
-}
-
-/// An explicit encoder dtype label wins; a direct SGLang worker otherwise
-/// reads the current connection's declaration, including after reconnects.
-fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
+/// `read` over the primary worker's encoder dtype label, borrowed for the
+/// call: an explicit label wins; a direct SGLang worker otherwise reads the
+/// current connection's declaration, including after reconnects; neither
+/// needs a copy to be read.
+fn with_worker_encoder_dtype<T>(
+    workers: Option<&WorkerSelection>,
+    read: impl FnOnce(Option<&str>) -> T,
+) -> T {
+    let Some(worker) = primary_worker(workers) else {
+        return read(None);
+    };
     let backend = worker.backend_client_if_initialized();
-    encoder_dtype_label_with_backend(worker, backend.as_deref())
+    read(encoder_dtype_label_with_backend(
+        worker.as_ref(),
+        backend.as_deref(),
+    ))
 }
 
 /// Preserve explicit labels; infer a dtype only when all connected engines agree.
-fn encoder_dtype_label_with_backend(
-    worker: &dyn Worker,
-    backend: Option<&BackendClient>,
-) -> Option<String> {
+fn encoder_dtype_label_with_backend<'a>(
+    worker: &'a dyn Worker,
+    backend: Option<&'a BackendClient>,
+) -> Option<&'a str> {
     let spec = &worker.metadata().spec;
     if let Some(dtype) = spec
         .labels
         .get("multimodal_encoder_dtype")
         .filter(|dtype| !dtype.is_empty())
     {
-        return Some(dtype.clone());
+        return Some(dtype.as_str());
     }
     if spec.runtime_type != RuntimeType::Sglang {
         return None;
@@ -514,15 +554,15 @@ fn encoder_dtype_label_with_backend(
         .engines()
         .iter()
         .all(|engine| engine.ready_response.multimodal_encoder_dtype.as_ref() == Some(dtype))
-        .then(|| dtype.clone())
+        .then_some(dtype.as_str())
 }
 
 /// The router's own encoder dtype overrides, read once from the environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DtypeOverrides {
-    vllm: Option<String>,
-    image: Option<String>,
-    default: Option<String>,
+    vllm: Option<&'static str>,
+    image: Option<&'static str>,
+    default: Option<&'static str>,
 }
 
 impl DtypeOverrides {
@@ -566,35 +606,33 @@ fn shared_image_wire_dtype_over(
     pools: &[RoutingPool],
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
-    let workers: Vec<Arc<dyn Worker>> = pools
-        .iter()
-        .flat_map(|pool| {
-            registry
-                .get_routing_pool(model_id, *pool)
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    shared_image_wire_dtype(&workers, overrides)
+    let mut agreed = None;
+    for pool in pools {
+        let workers = registry.get_routing_pool(model_id, *pool);
+        agree_on_image_wire_dtype(&mut agreed, workers.iter(), overrides)?;
+    }
+    agreed
 }
 
-/// Defer one-pass writes until every destination has a known, matching dtype.
-fn shared_image_wire_dtype(
-    workers: &[Arc<dyn Worker>],
+/// Defer one-pass writes until every destination has a known, matching
+/// dtype: folds `workers` into `agreed` (`None` while no worker has spoken),
+/// `None` at the first worker no one-pass layout serves or that disagrees
+/// with the dtype agreed so far, `Some(())` when every one of them agrees.
+fn agree_on_image_wire_dtype<'a>(
+    agreed: &mut Option<EncoderDtype>,
+    workers: impl Iterator<Item = &'a Arc<dyn Worker>>,
     overrides: &DtypeOverrides,
-) -> Option<EncoderDtype> {
-    let mut shared = None;
+) -> Option<()> {
     for worker in workers {
         let backend = worker.backend_client_if_initialized();
         let dtype = image_wire_dtype_with_backend(worker.as_ref(), overrides, backend.as_deref())?;
-        match shared {
-            None => shared = Some(dtype),
-            Some(existing) if existing == dtype => {}
+        match agreed {
+            None => *agreed = Some(dtype),
+            Some(existing) if *existing == dtype => {}
             Some(_) => return None,
         }
     }
-    shared
+    Some(())
 }
 
 /// The byte bound a request's pixel tensors must stay within before any image
@@ -631,21 +669,18 @@ fn image_wire_cap_over(
     pools: &[RoutingPool],
     rdma_lane_stages: &dyn Fn() -> bool,
 ) -> Option<usize> {
-    let workers: Vec<Arc<dyn Worker>> = pools
-        .iter()
-        .flat_map(|pool| {
-            registry
-                .get_routing_pool(model_id, *pool)
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    (!workers.is_empty()
-        && workers
+    let mut any = false;
+    for pool in pools {
+        let workers = registry.get_routing_pool(model_id, *pool);
+        if !workers
             .iter()
-            .all(|worker| pixels_ride_in_the_message(worker, rdma_lane_stages)))
-    .then_some(WIRE_MESSAGE_CAP)
+            .all(|worker| pixels_ride_in_the_message(worker, rdma_lane_stages))
+        {
+            return None;
+        }
+        any |= !workers.is_empty();
+    }
+    any.then_some(WIRE_MESSAGE_CAP)
 }
 
 /// Whether `worker` takes a request's pixel tensors inline in the Generate
@@ -719,23 +754,19 @@ fn image_wire_dtype_with_backend(
 /// one-pass layout can serve it.
 fn image_wire_dtype(
     runtime: RuntimeType,
-    label: Option<String>,
+    label: Option<&str>,
     device_normalizes: bool,
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let dtype = match runtime {
-        RuntimeType::Sglang => sglang_wire_dtype(label.as_deref()),
+        RuntimeType::Sglang => sglang_wire_dtype(label),
         RuntimeType::Vllm if device_normalizes => return None,
         RuntimeType::Vllm => wire_dtype(
-            &resolve_mm_vllm_encoder_input_dtype(overrides.vllm.clone(), label),
+            resolve_mm_vllm_encoder_input_dtype(overrides.vllm, label).as_str(),
             true,
         ),
         RuntimeType::TokenSpeed => wire_dtype(
-            &resolve_mm_encoder_input_dtype(
-                overrides.image.clone(),
-                overrides.default.clone(),
-                label,
-            ),
+            resolve_mm_encoder_input_dtype(overrides.image, overrides.default, label).as_str(),
             false,
         ),
         RuntimeType::Trtllm
@@ -856,6 +887,14 @@ fn compute_shm_namespace_id() -> Option<String> {
     None
 }
 
+#[cfg(all(
+    test,
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+mod allocation_pins;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,11 +912,21 @@ mod tests {
         Arc::new(builder.build())
     }
 
+    /// The dtype `workers` agree on, the one fold over a slice.
+    fn shared_image_wire_dtype(
+        workers: &[Arc<dyn Worker>],
+        overrides: &DtypeOverrides,
+    ) -> Option<EncoderDtype> {
+        let mut agreed = None;
+        agree_on_image_wire_dtype(&mut agreed, workers.iter(), overrides)?;
+        agreed
+    }
+
     /// Pool planning agrees with assembly, including SGLang worker labels.
     #[test]
     fn a_worker_image_wire_dtype_is_what_its_assembly_writes() {
         let plain = DtypeOverrides::default();
-        let bf16 = || Some("bfloat16".to_string());
+        let bf16 = || Some("bfloat16");
         assert_eq!(
             image_wire_dtype(RuntimeType::Sglang, bf16(), false, &plain),
             Some(EncoderDtype::BFloat16)
@@ -896,7 +945,7 @@ mod tests {
             "an engine normalizing on device takes the pixels' own bytes"
         );
         assert_eq!(
-            image_wire_dtype(RuntimeType::Vllm, Some("uint8".to_string()), false, &plain),
+            image_wire_dtype(RuntimeType::Vllm, Some("uint8"), false, &plain),
             None
         );
         assert_eq!(
@@ -904,12 +953,7 @@ mod tests {
             Some(EncoderDtype::BFloat16)
         );
         assert_eq!(
-            image_wire_dtype(
-                RuntimeType::TokenSpeed,
-                Some("uint8".to_string()),
-                false,
-                &plain
-            ),
+            image_wire_dtype(RuntimeType::TokenSpeed, Some("uint8"), false, &plain),
             Some(EncoderDtype::Float32),
             "that wire reads float widths only"
         );
@@ -918,8 +962,8 @@ mod tests {
             None
         );
         let overridden = DtypeOverrides {
-            vllm: Some("float16".to_string()),
-            image: Some("float32".to_string()),
+            vllm: Some("float16"),
+            image: Some("float32"),
             default: bf16(),
         };
         assert_eq!(
@@ -1391,26 +1435,35 @@ mod tests {
     #[test]
     fn modality_dtype_precedes_global_then_worker_with_bfloat16_fallback() {
         assert_eq!(
-            resolve_mm_encoder_input_dtype(
-                Some("float16".to_string()),
-                Some("float32".to_string()),
-                Some("bfloat16".to_string()),
-            ),
-            "float16"
+            resolve_mm_encoder_input_dtype(Some("float16"), Some("float32"), Some("bfloat16")),
+            ResolvedDtype::Process("float16")
         );
         assert_eq!(
-            resolve_mm_encoder_input_dtype(
-                None,
-                Some("float32".to_string()),
-                Some("bfloat16".to_string()),
-            ),
-            "float32"
+            resolve_mm_encoder_input_dtype(None, Some("float32"), Some("bfloat16")),
+            ResolvedDtype::Process("float32")
         );
         assert_eq!(
-            resolve_mm_encoder_input_dtype(None, None, Some("bfloat16".to_string()),),
-            "bfloat16"
+            resolve_mm_encoder_input_dtype(None, None, Some("bfloat16")),
+            ResolvedDtype::Worker("bfloat16")
         );
-        assert_eq!(resolve_mm_encoder_input_dtype(None, None, None), "bfloat16");
+        assert_eq!(
+            resolve_mm_encoder_input_dtype(None, None, None),
+            ResolvedDtype::Process("bfloat16")
+        );
+    }
+
+    /// An assembly keeps the process's own names borrowed and a worker's
+    /// label as its one copy.
+    #[test]
+    fn an_assembly_keeps_a_workers_label_as_its_one_copy() {
+        assert!(matches!(
+            ResolvedDtype::Process("float32").kept(),
+            Cow::Borrowed("float32")
+        ));
+        assert!(matches!(
+            ResolvedDtype::Worker("bfloat16").kept(),
+            Cow::Owned(dtype) if dtype == "bfloat16"
+        ));
     }
 
     /// The vLLM wire starts from the widest dtype and narrows only when asked,
@@ -1419,17 +1472,17 @@ mod tests {
     /// request against an older worker into a failure or worse.
     #[test]
     fn vllm_dtype_stays_float32_until_something_asks_for_narrower() {
-        assert_eq!(resolve_mm_vllm_encoder_input_dtype(None, None), "float32");
         assert_eq!(
-            resolve_mm_vllm_encoder_input_dtype(None, Some("bfloat16".to_string())),
-            "bfloat16"
+            resolve_mm_vllm_encoder_input_dtype(None, None),
+            ResolvedDtype::Process("float32")
         );
         assert_eq!(
-            resolve_mm_vllm_encoder_input_dtype(
-                Some("float16".to_string()),
-                Some("bfloat16".to_string()),
-            ),
-            "float16"
+            resolve_mm_vllm_encoder_input_dtype(None, Some("bfloat16")),
+            ResolvedDtype::Worker("bfloat16")
+        );
+        assert_eq!(
+            resolve_mm_vllm_encoder_input_dtype(Some("float16"), Some("bfloat16")),
+            ResolvedDtype::Process("float16")
         );
     }
 
