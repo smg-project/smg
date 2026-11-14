@@ -333,7 +333,10 @@ impl TokenizerRegistry {
     /// whose name is published under another ID is no name's (a removal by
     /// name between its two steps, or two loads of the name that once ran
     /// together) and goes by its ID alone, the name staying that other
-    /// entry's. An entry `load` has stored and not yet published is not
+    /// entry's: that publication is held read-locked through the removal,
+    /// so a removal of the other entry by name or a put-back of this one
+    /// under its ID waits on it and no name is left mapping to a removed
+    /// entry. An entry `load` has stored and not yet published is not
     /// taken, so a name never outlives its entry. Returns the entry if it
     /// was taken.
     pub fn remove_by_id(&self, id: &str) -> Option<TokenizerEntry> {
@@ -341,15 +344,14 @@ impl TokenizerRegistry {
         if let Some(entry) = self.remove_if_id(&name, id) {
             return Some(entry);
         }
-        let named_elsewhere = self
-            .name_to_id
-            .get(&name)
-            .is_some_and(|published| published.as_str() != id);
-        if named_elsewhere {
-            self.tokenizers.remove(id).map(|(_, entry)| entry)
-        } else {
-            None
+        // The publication stays held (the name's shard read-locked) until
+        // the removal below is done: the name first, then the entry, the
+        // order `get` and `register` nest in too.
+        let published = self.name_to_id.get(&name)?;
+        if published.as_str() == id {
+            return None;
         }
+        self.tokenizers.remove(id).map(|(_, entry)| entry)
     }
 
     /// Remove the tokenizer under `name` when it is the entry with `id`
@@ -405,6 +407,7 @@ mod tests {
         time::Duration,
     };
 
+    use dashmap::try_result::TryResult;
     use tokio::{sync::oneshot, time::sleep};
 
     use crate::{mock::MockTokenizer, traits::Tokenizer, LoadError, TokenizerRegistry};
@@ -955,5 +958,65 @@ mod tests {
             registry.loading_locks.is_empty(),
             "the last load out removes the lock"
         );
+    }
+
+    /// A removal by ID of an entry whose name is published under another ID
+    /// holds that publication read-locked through the removal: a removal of
+    /// the other entry by name and a put-back of this one under its ID wait
+    /// on it, so the entry removed is the one the publication was read
+    /// beside and no name is left mapping to a removed entry. Pinned by the
+    /// lock itself: with the old entry's shard held read, the removal parks
+    /// at its write, and while it is parked a write to the name's
+    /// publication is refused.
+    #[tokio::test]
+    async fn test_remove_by_id_holds_the_names_publication_through_the_removal() {
+        let registry = Arc::new(TokenizerRegistry::new());
+        let old = TokenizerRegistry::generate_id();
+        registry
+            .load(&old, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+        // A release between its two steps, then a replacement published.
+        registry.name_to_id.remove("model1").unwrap();
+        let replacement = TokenizerRegistry::generate_id();
+        registry
+            .load(&replacement, "model1", "source1", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+
+        // The old entry's shard held read: the removal parks at its write.
+        let parked = registry.tokenizers.get(&old).unwrap();
+        let removal = {
+            let registry = registry.clone();
+            let old = old.clone();
+            tokio::task::spawn_blocking(move || registry.remove_by_id(&old))
+        };
+        // While it is parked, the name's publication is held: a write to it
+        // is refused, and stays refused (two reads a millisecond apart, so a
+        // passing write lock of the name-first step is not mistaken for it).
+        let mut refused = 0;
+        for _ in 0..5_000 {
+            if matches!(registry.name_to_id.try_get_mut("model1"), TryResult::Locked) {
+                refused += 1;
+                if refused == 2 {
+                    break;
+                }
+            } else {
+                refused = 0;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            refused, 2,
+            "the name's publication is not held through the removal"
+        );
+        drop(parked);
+        assert_eq!(removal.await.unwrap().unwrap().id, old);
+        assert!(!registry.contains_id(&old));
+        assert_eq!(registry.get_by_name("model1").unwrap().id, replacement);
     }
 }
