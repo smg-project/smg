@@ -549,6 +549,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "cola2",
+        model: "ByteDance-Seed/Cola2",
+        also: &[],
+        released: "2026-11-06",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "colgrep-agent-2b",
         model: "lightonai/colgrep-agent-2B",
         also: &[],
