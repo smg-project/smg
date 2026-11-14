@@ -2881,6 +2881,16 @@ const GROUPS: &[Group] = &[
         status: Status::AwaitingFixtures,
     },
     Group {
+        slug: "silentvision-52m",
+        model: "srmortal/SilentVision-52M",
+        also: &[],
+        released: "2026-10-31",
+        smg: (None, None),
+        table: Some(Table::Plain),
+        set: Some(5),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "singvl-s1-4b",
         model: "inclusionAI/SingVL_S1_4B",
         also: &[],

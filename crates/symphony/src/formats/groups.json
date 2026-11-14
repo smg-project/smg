@@ -218,6 +218,7 @@
   {"model": "InternScience/Sage-A1.5", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "ByteDance-Seed/Seed-OSS-36B-Instruct", "also": ["Seed-OSS-36B-Base-woSyn"], "table": "seed_oss", "opener": null, "after": null},
   {"model": "microsoft/Sentiment-Analysis-7B", "also": [], "table": "plain", "opener": null, "after": null},
+  {"model": "srmortal/SilentVision-52M", "also": [], "table": "plain", "opener": null, "after": null},
   {"model": "inclusionAI/SingVL_S1_4B", "also": [], "table": "qwen3_tagged", "opener": null, "after": null},
   {"model": "XHToken/Spark-X2.6-4B", "also": ["Spark-X2.6-1.7B"], "table": "glm", "opener": "<｜start▁of▁sentence｜><|Bot|>", "after": null},
   {"model": "stepfun-ai/Step-3.5-Flash", "also": [], "table": "qwen3_tagged", "opener": null, "after": "\n"},

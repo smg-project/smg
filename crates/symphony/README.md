@@ -246,6 +246,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-11-06 | [arete-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/arete-27b) | NousResearch/Arete-27B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-11-04 | [longcat-2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/longcat-2.5) | meituan-longcat/LongCat-2.5 |  | `longcat` | 19 | replaying the set | none |
 | 2026-11-04 | [ripple-65b-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/ripple-65b-preview) | ricursiveAI/Ripple-65B-Preview |  | `qwen3` | 28 | replaying the set | none |
+| 2026-10-31 | [silentvision-52m](https://github.com/smg-project/bellwether/tree/main/fixtures/silentvision-52m) | srmortal/SilentVision-52M |  | `plain` | 5 | replaying the set | none |
 | 2026-10-30 | [mage-vl-cowork](https://github.com/smg-project/bellwether/tree/main/fixtures/mage-vl-cowork) | microsoft/Mage-VL-Cowork |  | `qwen3` | 28 | replaying the set | none |
 | 2026-10-26 | [lbs-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/lbs-27b) | inclusionAI/LBS-27B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-26 | [otel-2.0-llm-31b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/otel-2.0-llm-31b-it) | RedHatAI/OTel-2.0-LLM-31B-IT |  | `gemma4` | 28 | replaying the set | none |
