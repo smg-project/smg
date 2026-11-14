@@ -423,7 +423,7 @@ mod tests {
             "results": [{"index": 0, "relevance_score": 0.123_456_789_012_345}]
         }))
         .expect("a worker's answer");
-        let results = answer.into_results();
+        let results = answer.results;
         assert_eq!(results[0].score, 0.123_456_789_012_345_f64);
         assert_eq!(
             serde_json::to_value(&results[0]).expect("serialize")["score"],
@@ -470,7 +470,7 @@ mod tests {
         );
     }
 
-    fn result(index: usize, score: f32) -> RerankResult {
+    fn result(index: usize, score: f64) -> RerankResult {
         RerankResult {
             score,
             document: None,

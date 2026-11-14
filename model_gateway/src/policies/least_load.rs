@@ -13,13 +13,13 @@ use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 // Retain the public paths used by existing callers and configuration defaults.
-pub use crate::worker::expected_wait::{
+pub use crate::policies::expected_wait::{
     DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
 };
 use crate::{
     observability::cache_trace,
+    policies::expected_wait::ExpectedWait,
     worker::{
-        expected_wait::ExpectedWait,
         load_state::{LoadReceiver, LoadSnapshot},
         Worker, WorkerType,
     },
