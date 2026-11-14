@@ -4251,3 +4251,98 @@ async fn chat_json_mode_preserves_literals_in_streaming_and_complete_responses()
         assert_eq!(choice.message.reasoning_content.as_deref(), Some("check"));
     }
 }
+
+/// With tools offered, a structured JSON response keeps a quoted tool-call
+/// spelling as content, streamed (split inside the spelling) and complete:
+/// the tool parser does not read it as a call or drop framing spellings.
+#[tokio::test]
+async fn chat_json_mode_with_tools_keeps_quoted_tool_markers_as_content() {
+    let payload = concat!(
+        r#"{"value":"<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{}}"#,
+        r#"<|end_message|> and <|content_thinking|>x"}"#
+    );
+    let framed = format!("<|message_model|><|content_text|>{payload}<|end_message|>");
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "eof-test", "messages": [],
+        "response_format": {"type": "json_object"},
+        "tools": [{"type": "function", "function": {
+            "name": "lookup", "parameters": {"type": "object"}
+        }}],
+        "separate_reasoning": true, "stream": true
+    }))
+    .unwrap();
+    let spec = ChatResponseSpec::from(&request);
+    assert!(spec.json_mode && spec.tools.is_some());
+    let resolver = || {
+        utils::ParserResolver::with_flags(
+            Arc::new(WorkerRegistry::new()),
+            Some("inkling".to_string()),
+            Some("inkling".to_string()),
+        )
+    };
+    let split = framed.find("tool_json").unwrap();
+    let (stream, server) = scripted_stream(
+        vec![
+            chunk(0, &framed[..split]),
+            chunk(0, &framed[split..]),
+            complete(0, "stop"),
+        ],
+        "0",
+    )
+    .await;
+    let (tx, rx) = sse_channel();
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let result = streaming_processor(resolver())
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            tokenizer.clone(),
+            (None, None, false, false, false),
+            spec.clone(),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "content"), payload, "{events:?}");
+    assert!(
+        events.iter().all(|event| {
+            let choice = &event["choices"][0];
+            choice["delta"]["tool_calls"].is_null() && choice["finish_reason"] != "tool_calls"
+        }),
+        "{events:?}"
+    );
+
+    let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
+        output_ids: framed.chars().map(u32::from).collect(),
+        finish_reason: "stop".to_string(),
+        ..Default::default()
+    }));
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer.clone(),
+        llm_tokenizer::StopSequenceConfig::default(),
+        false,
+    );
+    let (choice, _) = unary_processor(resolver())
+        .process_single_choice(
+            "test-request",
+            &complete,
+            0,
+            &spec,
+            "eof-test",
+            &tokenizer,
+            &mut decoder,
+            0,
+            true,
+            true,
+            Some("inkling"),
+            Some("inkling"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(choice.message.content.as_deref(), Some(payload));
+    assert!(choice.message.tool_calls.is_none());
+}
