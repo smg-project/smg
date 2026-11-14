@@ -601,6 +601,7 @@ pub(crate) fn mooncake_decode_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::{BasicWorker, BasicWorkerBuilder, WorkerType};
 
     /// The decode side's bootstrap URL must parse for every spelling the
     /// bootstrap host arrives in: bracketed from a worker URL, bare from a
@@ -675,9 +676,9 @@ mod tests {
         );
     }
 
-    fn moriio_worker(url: &str, labels: &[(&str, &str)]) -> crate::worker::BasicWorker {
-        let mut builder = crate::worker::BasicWorkerBuilder::new(url)
-            .worker_type(crate::worker::WorkerType::Decode)
+    fn moriio_worker(url: &str, labels: &[(&str, &str)]) -> BasicWorker {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Decode)
             .kv_connector(MORIIO_CONNECTOR);
         for (key, value) in labels {
             builder = builder.label(*key, *value);
@@ -751,15 +752,15 @@ mod tests {
                 "{labels:?} must be refused"
             );
         }
-        let nixl = crate::worker::BasicWorkerBuilder::new("http://p:1")
+        let nixl = BasicWorkerBuilder::new("http://p:1")
             .kv_connector(NIXL_CONNECTOR)
             .label("moriio_mode", "read")
             .build();
         assert!(moriio_endpoint(&nixl).is_err());
         // One worker per rank would let the two sides of a request pick
         // different ranks.
-        let per_rank = crate::worker::BasicWorkerBuilder::new("http://decode:8200")
-            .worker_type(crate::worker::WorkerType::Decode)
+        let per_rank = BasicWorkerBuilder::new("http://decode:8200")
+            .worker_type(WorkerType::Decode)
             .kv_connector(MORIIO_CONNECTOR)
             .label("moriio_mode", "write")
             .dp_config(3, 8)
@@ -1177,8 +1178,6 @@ mod tests {
 
     #[test]
     fn invalid_dp_size_label_fails_closed_on_minting() {
-        use crate::worker::{BasicWorkerBuilder, WorkerType};
-
         let worker = BasicWorkerBuilder::new("http://prefill:8000")
             .worker_type(WorkerType::Prefill)
             .kv_connector(MOONCAKE_CONNECTOR)
@@ -1228,7 +1227,7 @@ mod tests {
 
     #[test]
     fn a_refreshed_engine_id_is_what_the_handoff_is_minted_for() {
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType};
+        use crate::worker::{ConnectionMode, RuntimeType};
 
         let worker = BasicWorkerBuilder::new("grpc://p:1")
             .worker_type(WorkerType::Prefill)

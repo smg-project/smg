@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 
 use crate::{
     channel::Channel,
+    framed::{call_with_frames, tokenspeed_frames},
     request_fields::{
         body_format, completion_constraint, logit_bias_by_token_text, plain_constraint, seed_bits,
         stop_strings, ConstraintKind, OutputConstraint, PlainSampling,
@@ -579,7 +580,7 @@ impl TokenSpeedSchedulerClient {
         req: tokenspeed_proto::GenerateRequest,
     ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
         let request_id = req.request_id.clone();
-        let frames = crate::framed::tokenspeed_frames(req);
+        let frames = tokenspeed_frames(req);
         async move {
             let frames = frames?;
             let mut carrier = Request::new(());
@@ -587,7 +588,7 @@ impl TokenSpeedSchedulerClient {
                 tracing::warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = crate::framed::call_with_frames::<tokenspeed_proto::GenerateResponse>(
+            let stream = call_with_frames::<tokenspeed_proto::GenerateResponse>(
                 self.channel(),
                 "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/Generate",
                 metadata.into_headers(),
