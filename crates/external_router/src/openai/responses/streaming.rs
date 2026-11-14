@@ -1002,7 +1002,6 @@ pub(super) fn handle_streaming_with_tool_interception(
     let client_clone = client.clone();
     let url_clone = url.clone();
     let headers_opt = headers.cloned();
-    let payload_clone = payload.clone();
     let orchestrator_clone = Arc::clone(orchestrator);
     let forwarded_headers = extract_forwardable_request_headers(headers);
 
@@ -1022,7 +1021,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             &session_request_id,
             forwarded_headers.clone(),
         );
-        let mut current_payload = payload_clone;
+        let mut current_payload = payload;
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
         let mut flags = RelayFlags {
             first_iteration: true,
