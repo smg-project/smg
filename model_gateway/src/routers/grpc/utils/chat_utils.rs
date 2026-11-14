@@ -818,6 +818,15 @@ fn validate_chat_parts(
             ChatMessage::Function { .. } => None,
         };
         let assistant = matches!(message, ChatMessage::Assistant { .. });
+        // The roles whose content the public contract keeps to text: a media
+        // part there is refused here, before any fetch, in this door's own
+        // sentence, not after the pipeline processed it and the rendered
+        // prompt carried no anchor for it (the template's own sentence).
+        let text_only_role = match message {
+            ChatMessage::System { .. } => Some("system"),
+            ChatMessage::Developer { .. } => Some("developer"),
+            _ => None,
+        };
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
                 match part {
@@ -849,12 +858,30 @@ fn validate_chat_parts(
                                 .to_string(),
                         );
                     }
-                    _ => {}
+                    _ => {
+                        if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
+                            return Err(format!(
+                                "Unsupported chat content part type {kind:?} in a {role} message \
+                                 for gRPC backends: media parts are taken in user messages"
+                            ));
+                        }
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The wire name (`type`) of a media content part; `None` for any other part.
+fn media_part_type(part: &ContentPart) -> Option<&'static str> {
+    match part {
+        ContentPart::ImageUrl { .. } => Some("image_url"),
+        ContentPart::AudioUrl { .. } => Some("audio_url"),
+        ContentPart::InputAudio { .. } => Some("input_audio"),
+        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
+    }
 }
 
 /// The template selects the reference path by the first block and emits only

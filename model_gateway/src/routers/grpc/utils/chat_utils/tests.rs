@@ -96,6 +96,49 @@ fn a_refusal_part_outside_an_assistant_turn_is_refused() {
     assert!(validate_chat_content_parts(&messages).is_ok());
 }
 
+/// A media part is taken in a user message (and in a tool result): in a
+/// system or developer message it is refused at the door in this door's own
+/// sentence, before any fetch, not after the pipeline ran it and the rendered
+/// prompt carried no anchor for it.
+#[test]
+fn a_media_part_in_a_system_or_developer_message_is_refused_at_the_door() {
+    let parts = [
+        json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}),
+        json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+        json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}),
+        json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+    ];
+    for role in ["system", "developer"] {
+        for part in &parts {
+            let kind = part["type"].as_str().unwrap();
+            let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+                {"role": role, "content": [{"type": "text", "text": "you see"}, part]},
+                {"role": "user", "content": "describe"}
+            ]))
+            .unwrap();
+            let error = validate_chat_content_parts(&messages).unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "Unsupported chat content part type {kind:?} in a {role} message for gRPC \
+                     backends: media parts are taken in user messages"
+                )
+            );
+        }
+    }
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "system", "content": [{"type": "text", "text": "you see"}]},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+        ]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
