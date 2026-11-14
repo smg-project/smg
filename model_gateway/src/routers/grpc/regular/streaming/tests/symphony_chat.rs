@@ -62,6 +62,7 @@ pub(super) fn assigned(
         forcing: None,
         opener: None,
         forced_ids: None,
+        json_answer: false,
         span: Span::none(),
         marked: Arc::default(),
     });
@@ -747,6 +748,7 @@ pub(super) fn assigned_message(
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         }),
