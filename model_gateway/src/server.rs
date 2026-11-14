@@ -2937,8 +2937,17 @@ async fn serve_until_drained(
     // Wakes the leave: at a failure's note, and at the end of the exit's own
     // wait when no listener failed.
     let noted = tokio::sync::Notify::new();
-    let note_failure = || {
-        let _ = failure.set((tokio::time::Instant::now(), inflight_tracker.is_draining()));
+    // The first note says which listener failed: from here the probes read
+    // draining, and no other line says why until the listeners have ended.
+    let note_failure = |listener: &str| {
+        let found = (tokio::time::Instant::now(), inflight_tracker.is_draining());
+        if failure.set(found).is_ok() {
+            error!(
+                listener,
+                in_flight = inflight_tracker.len(),
+                "A listener failed: stopping the gateway, readiness draining"
+            );
+        }
         inflight_tracker.begin_drain();
         noted.notify_one();
     };
@@ -2947,11 +2956,11 @@ async fn serve_until_drained(
             data,
             admin,
             || {
-                note_failure();
+                note_failure("admin");
                 stop_data();
             },
             || {
-                note_failure();
+                note_failure("data");
                 stop_admin();
             },
         )
@@ -2959,8 +2968,10 @@ async fn serve_until_drained(
         // A failure that found the other serving ended had nothing to stop,
         // so no stop closure ran: with no admin listener, the default, the
         // admin serving ends at once. That failure ended the listeners, now.
-        if data_result.is_err() || admin_result.is_err() {
-            note_failure();
+        if data_result.is_err() {
+            note_failure("data");
+        } else if admin_result.is_err() {
+            note_failure("admin");
         }
         if let Err(e) = &admin_result {
             error!("Admin listener stopped with an error: {e}");
@@ -3671,7 +3682,8 @@ mod tests {
     /// The ways out of serving: the shutdown signal; a listener that fails
     /// with no signal; a listener that fails once the signal has come; a
     /// listener that fails, and the signal three seconds later; the only
-    /// listener, with no admin listener beside it, failing with no signal.
+    /// listener, with no admin listener beside it, failing with no signal;
+    /// the admin listener failing with no signal.
     #[derive(Clone, Copy, Debug)]
     enum WayOut {
         Signal,
@@ -3679,6 +3691,7 @@ mod tests {
         Both,
         FailureThenSignal,
         OnlyListenerFailure,
+        AdminFailure,
     }
 
     /// The exit as `startup` runs it, on a paused clock: the shutdown task,
@@ -3689,12 +3702,13 @@ mod tests {
     /// under the signal; the data listener's failure stops the other at once
     /// with no signal, and a second into the settle window with one; on the
     /// fourth way the signal comes three seconds after the failure. On the
-    /// last there is no admin listener, as by default: the data listener
+    /// fifth there is no admin listener, as by default: the data listener
     /// fails a second into serving, with no signal and nothing to stop: a
     /// second in, because a listener ready at its first poll, beside an admin
     /// serving that has ended, would leave the pick of the first to end to
-    /// chance. A failure's leave of the mesh is `leave_mesh`, and `stop_mesh`
-    /// the stop of one the drain cut short.
+    /// chance. On the last the admin listener fails at once, with no signal,
+    /// and stops the data listener. A failure's leave of the mesh is
+    /// `leave_mesh`, and `stop_mesh` the stop of one the drain cut short.
     /// Returns when the listeners ended and when the exit did.
     async fn exit_leaving(
         tracker: &Arc<InFlightRequestTracker>,
@@ -3723,7 +3737,7 @@ mod tests {
             })
         };
         // The last listener to end notes when it does: the admin listener,
-        // or the data listener where it is the only one.
+        // or the data listener where it is the only one or the one stopped.
         let (ended, listeners_ended) = watch::channel(Duration::ZERO);
         let noting_its_end = move |serving: Serving| -> Serving {
             Box::pin(async move {
@@ -3733,17 +3747,21 @@ mod tests {
             })
         };
         let data = match way {
-            WayOut::Signal => until_closed(stopped.clone()),
+            WayOut::Signal | WayOut::AdminFailure => until_closed(stopped.clone()),
             WayOut::ListenerFailure | WayOut::FailureThenSignal => failing_after(Duration::ZERO),
             WayOut::Both | WayOut::OnlyListenerFailure => failing_after(Duration::from_secs(1)),
         };
-        let (data, admin) = if matches!(way, WayOut::OnlyListenerFailure) {
+        let (data, admin) = match way {
             // The admin serving `serve_listeners` builds with no admin
             // listener: ended before it began.
-            let no_admin: Serving = Box::pin(std::future::ready(Ok(())));
-            (noting_its_end(data), no_admin)
-        } else {
-            (data, noting_its_end(until_closed(stopped)))
+            WayOut::OnlyListenerFailure => {
+                let no_admin: Serving = Box::pin(std::future::ready(Ok(())));
+                (noting_its_end(data), no_admin)
+            }
+            // The data listener, stopped by the admin listener's failure, is
+            // the last to end.
+            WayOut::AdminFailure => (noting_its_end(data), failing_after(Duration::ZERO)),
+            _ => (data, noting_its_end(until_closed(stopped))),
         };
         #[expect(
             clippy::disallowed_methods,
@@ -3755,7 +3773,9 @@ mod tests {
             async move {
                 match way {
                     // The signal never comes.
-                    WayOut::ListenerFailure | WayOut::OnlyListenerFailure => {
+                    WayOut::ListenerFailure
+                    | WayOut::OnlyListenerFailure
+                    | WayOut::AdminFailure => {
                         std::future::pending::<()>().await;
                     }
                     WayOut::FailureThenSignal => {
@@ -3785,7 +3805,12 @@ mod tests {
                 data,
                 admin,
                 OnFailure {
-                    stop_data: || {},
+                    stop_data: {
+                        let stop = Arc::clone(&stop);
+                        move || {
+                            stop.send_replace(true);
+                        }
+                    },
                     stop_admin: move || {
                         stop.send_replace(true);
                     },
@@ -4156,6 +4181,64 @@ mod tests {
         let (times, ()) = tokio::join!(signal, admitted);
         assert_eq!(times, (secs(7), secs(12)));
         assert!(!logs_contain("Drain timed out"));
+    }
+
+    /// A listener's failure is said at its own instant, once, at error
+    /// level: which listener failed, and that readiness drains. The line is
+    /// there two seconds in, while the stopped listener still closes; the
+    /// listeners' end adds none, and a signal alone writes none. The admin
+    /// listener's failure is noted at its instant like the data listener's:
+    /// the exit ends one drain after it.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_listeners_failure_is_said_at_its_own_instant() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        // The error lines so far that name the data listener, and the admin
+        // listener, as the one that failed.
+        let said_so_far = || {
+            let said = std::cell::Cell::new((0, 0));
+            logs_assert(|lines: &[&str]| {
+                let naming = |listener: &str| {
+                    let field = format!("listener=\"{listener}\"");
+                    lines
+                        .iter()
+                        .filter(|line| line.contains("ERROR") && line.contains("A listener failed"))
+                        .filter(|line| line.contains(&field))
+                        .count()
+                };
+                said.set((naming("data"), naming("admin")));
+                Ok(())
+            });
+            said.get()
+        };
+        for (way, wanted) in [
+            (WayOut::Signal, (0, 0)),
+            (WayOut::ListenerFailure, (1, 0)),
+            (WayOut::OnlyListenerFailure, (2, 0)),
+            (WayOut::Both, (3, 0)),
+            (WayOut::AdminFailure, (3, 1)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, _gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            let two_seconds_in = async {
+                tokio::time::sleep(secs(2)).await;
+                said_so_far()
+            };
+            let (times, early) =
+                tokio::join!(exit(&tracker, budget, way, secs(10)), two_seconds_in);
+            assert_eq!(early, wanted, "{way:?}: the lines two seconds in");
+            assert_eq!(said_so_far(), wanted, "{way:?}: the lines after the exit");
+            if matches!(way, WayOut::AdminFailure) {
+                assert_eq!(
+                    times,
+                    (secs(10), secs(25)),
+                    "the exit ends one drain after the admin listener's failure"
+                );
+            }
+        }
     }
 
     /// A leave of the mesh that takes `leaving`, and the read of when it
