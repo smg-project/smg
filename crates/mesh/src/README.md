@@ -200,9 +200,10 @@ window it broadcasts `Leaving` to the live members
 (`MeshServerHandler::graceful_shutdown` in `service.rs`, bounded by the
 window), so they see the member leave within seconds; the broadcast dials
 the members with the node's TLS identity when the mesh has one, so it
-reaches them under mTLS too. A member that dies without that is noticed
-through the probes, `Suspected` after the first failed probe round and
-`Down` after the next.
+reaches them under mTLS too. A gateway that stops because a listener failed
+leaves the same way, from the failure. A member that dies without that is
+noticed through the probes, `Suspected` after the first failed probe round
+and `Down` after the next.
 
 Only the owner of a `worker:` key tombstones it. Without `--mesh-server-name`
 a restarted gateway comes back under a fresh random name, so the old name

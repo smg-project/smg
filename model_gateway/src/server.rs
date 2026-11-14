@@ -2676,6 +2676,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.shutdown_settle_secs,
     );
     let drain_timeout = budget.drain;
+    // A listener's failure leaves the mesh too (see `serve_until_drained`).
+    let failure_mesh = mesh_handler.clone();
     #[expect(
         clippy::disallowed_methods,
         reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
@@ -2690,21 +2692,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         // and no more (with no window, what the grace allows); cut short, the
         // pings it still had pending are dropped with it (no dial outlives
         // the call) and the gossip loop is stopped by `stop_mesh`.
-        let leave_mesh = async {
-            if let Some(mesh) = &mesh_handler {
-                if let Err(e) = mesh.graceful_shutdown().await {
-                    warn!("Leaving the mesh failed: {e:#}");
-                }
-            }
-        };
-        // The leave's own stop of the gossip loop did not run: stop it as a
-        // finished leave would have, so both paths end the same way; the
-        // pings the leave still had pending went with it.
-        let stop_mesh = || {
-            if let Some(mesh) = &mesh_handler {
-                mesh.shutdown();
-            }
-        };
+        let leave_mesh = leave_the_mesh(mesh_handler.as_deref());
+        let stop_mesh = || stop_the_mesh(mesh_handler.as_deref());
         graceful_shutdown(
             &inflight_tracker,
             budget,
@@ -2733,8 +2722,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let (server_result, admin_result) = serve_until_drained(
         data_serving,
         admin_serving,
-        move || data_stop.graceful_shutdown(Some(drain_timeout)),
-        move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+        OnFailure {
+            stop_data: move || data_stop.graceful_shutdown(Some(drain_timeout)),
+            stop_admin: move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+            leave_mesh: leave_the_mesh(failure_mesh.as_deref()),
+            stop_mesh: || stop_the_mesh(failure_mesh.as_deref()),
+        },
         &app_context.inflight_tracker,
         shutdown,
         drain_timeout,
@@ -2790,6 +2783,27 @@ impl ShutdownBudget {
             settle,
             drain: grace.saturating_sub(settle),
         }
+    }
+}
+
+/// Leaving the mesh: `Leaving` goes to the live members (see
+/// `MeshServerHandler::graceful_shutdown`). A second leave finds the member
+/// `Leaving`, sends nothing and stops the gossip loop at once. With no mesh
+/// there is nothing to leave.
+async fn leave_the_mesh(mesh_handler: Option<&MeshServerHandler>) {
+    if let Some(mesh) = mesh_handler {
+        if let Err(e) = mesh.graceful_shutdown().await {
+            warn!("Leaving the mesh failed: {e:#}");
+        }
+    }
+}
+
+/// A leave that was cut short did not get to its own stop of the gossip
+/// loop: this stops it as a finished leave would have, so both end the same
+/// way. The pings the leave still had pending went with it.
+fn stop_the_mesh(mesh_handler: Option<&MeshServerHandler>) {
+    if let Some(mesh) = mesh_handler {
+        mesh.shutdown();
     }
 }
 
@@ -2866,6 +2880,21 @@ async fn graceful_shutdown(
     deadline
 }
 
+/// What a listener's failure does about the rest of the gateway. Every
+/// caller writes every hook: a way out with nothing to stop or to leave says
+/// so.
+struct OnFailure<D, A, L, M> {
+    /// Stops the data listener: called when the admin listener failed.
+    stop_data: D,
+    /// Stops the admin listener: called when the data listener failed.
+    stop_admin: A,
+    /// Leaves the mesh: begun at the failure, when no shutdown is under way.
+    leave_mesh: L,
+    /// Stops the mesh's gossip loop: called when the drain's end cut the
+    /// leave short.
+    stop_mesh: M,
+}
+
 /// Serving to its end, the part of `startup` between its listeners and its
 /// teardown: both listeners until they have stopped (see
 /// [`serve_together`]), the admin listener's error reported, then the wait
@@ -2875,49 +2904,85 @@ async fn graceful_shutdown(
 /// and from the failure the probes read draining, whether or not another
 /// listener was there to stop: the gateway is on its way out. Both results
 /// come back for the caller to return.
+///
+/// A failure with no shutdown under way leaves the mesh too. The leave
+/// begins at the failure and runs beside the listeners' close and the wait
+/// for the work in flight. It gets what is left of `drain`, and the exit
+/// waits for it. One the drain's end cuts short has its gossip loop stopped,
+/// as a shutdown's has. A failure during a shutdown starts no leave here:
+/// the shutdown task leaves.
 async fn serve_until_drained(
     data: Serving,
     admin: Serving,
-    stop_data: impl FnOnce(),
-    stop_admin: impl FnOnce(),
+    on_failure: OnFailure<impl FnOnce(), impl FnOnce(), impl Future<Output = ()>, impl FnOnce()>,
     inflight_tracker: &InFlightRequestTracker,
     shutdown: tokio::task::JoinHandle<tokio::time::Instant>,
     drain: Duration,
 ) -> (std::io::Result<()>, std::io::Result<()>) {
+    let OnFailure {
+        stop_data,
+        stop_admin,
+        leave_mesh,
+        stop_mesh,
+    } = on_failure;
     // What a listener's failure found: the instant, and whether a shutdown
     // was under way. The drain flag is read before it is set, so the
     // failure's own mark never passes for a shutdown's. The note is taken
     // at the failure whether or not another listener is there to stop: in
     // the stop closures, or below when none ran. The first note stands.
     let failure = OnceLock::new();
+    // Wakes the leave: at a failure's note, and at the end of the exit's own
+    // wait when no listener failed.
+    let noted = tokio::sync::Notify::new();
     let note_failure = || {
         let _ = failure.set((tokio::time::Instant::now(), inflight_tracker.is_draining()));
         inflight_tracker.begin_drain();
+        noted.notify_one();
     };
-    let (data_result, admin_result) = serve_together(
-        data,
-        admin,
-        || {
+    let served = async {
+        let (data_result, admin_result) = serve_together(
+            data,
+            admin,
+            || {
+                note_failure();
+                stop_data();
+            },
+            || {
+                note_failure();
+                stop_admin();
+            },
+        )
+        .await;
+        // A failure that found the other serving ended had nothing to stop,
+        // so no stop closure ran: with no admin listener, the default, the
+        // admin serving ends at once. That failure ended the listeners, now.
+        if data_result.is_err() || admin_result.is_err() {
             note_failure();
-            stop_data();
-        },
-        || {
-            note_failure();
-            stop_admin();
-        },
-    )
-    .await;
-    // A failure that found the other serving ended had nothing to stop, so
-    // no stop closure ran: with no admin listener, the default, the admin
-    // serving ends at once. That failure ended the listeners, now.
-    if data_result.is_err() || admin_result.is_err() {
-        note_failure();
-    }
-    if let Err(e) = &admin_result {
-        error!("Admin listener stopped with an error: {e}");
-    }
-    drain_before_teardown(inflight_tracker, shutdown, failure.into_inner(), drain).await;
-    (data_result, admin_result)
+        }
+        if let Err(e) = &admin_result {
+            error!("Admin listener stopped with an error: {e}");
+        }
+        drain_before_teardown(inflight_tracker, shutdown, failure.get().copied(), drain).await;
+        noted.notify_one();
+        (data_result, admin_result)
+    };
+    // The members hear of a failure's stop as they hear of a signal's: from
+    // the member itself, not from failed probes once the process is gone.
+    let leave = async {
+        noted.notified().await;
+        if let Some(&(stopped, false)) = failure.get() {
+            let left = drain.saturating_sub(stopped.elapsed());
+            if tokio::time::timeout(left, leave_mesh).await.is_err() {
+                stop_mesh();
+                info!(
+                    "Leaving the mesh was cut short by the end of the drain; its pending pings \
+                     were dropped and the gossip loop is stopped now"
+                );
+            }
+        }
+    };
+    let (results, ()) = tokio::join!(served, leave);
+    results
 }
 
 /// The wait between the listeners' end and the teardown, for work that is in
@@ -3616,13 +3681,19 @@ mod tests {
     /// with no signal, and a second into the settle window with one; on the
     /// fourth way the signal comes three seconds after the failure. On the
     /// last there is no admin listener, as by default: the data listener
-    /// fails a second into serving, with no signal and nothing to stop.
+    /// fails a second into serving, with no signal and nothing to stop: a
+    /// second in, because a listener ready at its first poll, beside an admin
+    /// serving that has ended, would leave the pick of the first to end to
+    /// chance. A failure's leave of the mesh is `leave_mesh`, and `stop_mesh`
+    /// the stop of one the drain cut short.
     /// Returns when the listeners ended and when the exit did.
-    async fn exit(
+    async fn exit_leaving(
         tracker: &Arc<InFlightRequestTracker>,
         budget: ShutdownBudget,
         way: WayOut,
         closing: Duration,
+        leave_mesh: impl Future<Output = ()>,
+        stop_mesh: impl FnOnce(),
     ) -> (Duration, Duration) {
         use tokio::sync::watch;
 
@@ -3704,9 +3775,13 @@ mod tests {
             serve_until_drained(
                 data,
                 admin,
-                || {},
-                move || {
-                    stop.send_replace(true);
+                OnFailure {
+                    stop_data: || {},
+                    stop_admin: move || {
+                        stop.send_replace(true);
+                    },
+                    leave_mesh,
+                    stop_mesh,
                 },
                 tracker,
                 shutdown,
@@ -3717,6 +3792,17 @@ mod tests {
         .expect("the exit ends");
         let listeners_ended = *listeners_ended.borrow();
         (listeners_ended, start.elapsed())
+    }
+
+    /// That exit for a gateway with no mesh: nothing to leave or to stop.
+    async fn exit(
+        tracker: &Arc<InFlightRequestTracker>,
+        budget: ShutdownBudget,
+        way: WayOut,
+        closing: Duration,
+    ) -> (Duration, Duration) {
+        let (leave_mesh, stop_mesh) = (leave_the_mesh(None), || stop_the_mesh(None));
+        exit_leaving(tracker, budget, way, closing, leave_mesh, stop_mesh).await
     }
 
     /// With nothing in flight the exit ends when the listeners do, on every
@@ -3953,6 +4039,221 @@ mod tests {
             exit(&tracker, budget, WayOut::FailureThenSignal, secs(10)).await,
             (secs(10), secs(25))
         );
+    }
+
+    /// A leave of the mesh that takes `leaving`, and the read of when it
+    /// began, counted from now: `None` while it has not.
+    fn a_leave_taking(
+        leaving: Duration,
+    ) -> (impl Future<Output = ()>, impl Fn() -> Option<Duration>) {
+        use tokio::sync::watch;
+
+        let start = tokio::time::Instant::now();
+        let (began, leave_began) = watch::channel(None);
+        let leave = async move {
+            began.send_replace(Some(start.elapsed()));
+            tokio::time::sleep(leaving).await;
+        };
+        (leave, move || *leave_began.borrow())
+    }
+
+    /// The stop of the mesh where no leave is cut short: never called.
+    fn no_stop() -> impl FnOnce() {
+        || panic!("the mesh is stopped only when the drain cuts a leave short")
+    }
+
+    /// A listener's failure with no shutdown under way leaves the mesh from
+    /// its own instant: at once while the other listener still closes, and
+    /// when the only listener fails. A failure during a shutdown starts no
+    /// leave of its own, the shutdown task has left; nor does a signal.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_leaves_the_mesh_from_its_own_instant() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        for (way, wanted) in [
+            (WayOut::ListenerFailure, Some(secs(0))),
+            (WayOut::OnlyListenerFailure, Some(secs(1))),
+            (WayOut::FailureThenSignal, Some(secs(0))),
+            (WayOut::Both, None),
+            (WayOut::Signal, None),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (leave, began) = a_leave_taking(secs(1));
+            exit_leaving(&tracker, budget, way, secs(10), leave, no_stop()).await;
+            assert_eq!(began(), wanted, "{way:?}");
+        }
+    }
+
+    /// The exit waits for the failure's leave of the mesh: with nothing in
+    /// flight it ends when the leave does.
+    #[tokio::test(start_paused = true)]
+    async fn the_exit_waits_for_the_failures_leave() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        for (leaving, ended) in [(0, 1), (4, 5)] {
+            let tracker = InFlightRequestTracker::new();
+            let (leave, began) = a_leave_taking(secs(leaving));
+            let way = WayOut::OnlyListenerFailure;
+            let times = exit_leaving(&tracker, budget, way, Duration::ZERO, leave, no_stop()).await;
+            assert_eq!(times, (secs(1), secs(ended)), "a leave of {leaving} s");
+            assert_eq!(began(), Some(secs(1)), "a leave of {leaving} s");
+        }
+    }
+
+    /// A leave the drain cannot hold is cut short at the drain's end and the
+    /// mesh is stopped outright: the exit ends one drain after the failure,
+    /// not when the leave would have.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_leave_that_outlasts_the_drain_is_cut_short_at_the_deadline() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (leave, began) = a_leave_taking(secs(40));
+        let mesh_stopped = Arc::new(AtomicBool::new(false));
+        let stop_mesh = {
+            let mesh_stopped = Arc::clone(&mesh_stopped);
+            move || mesh_stopped.store(true, Ordering::SeqCst)
+        };
+        let way = WayOut::OnlyListenerFailure;
+        let times = exit_leaving(&tracker, budget, way, Duration::ZERO, leave, stop_mesh).await;
+        assert_eq!(times, (secs(1), secs(26)));
+        assert_eq!(began(), Some(secs(1)));
+        assert!(
+            mesh_stopped.load(Ordering::SeqCst),
+            "the leave was cut short"
+        );
+        assert!(logs_contain(
+            "Leaving the mesh was cut short by the end of the drain"
+        ));
+    }
+
+    /// With no mesh a listener's failure waits for no leave: the exit ends
+    /// with the listeners.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_mesh_a_listeners_failure_waits_for_no_leave() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        for (way, ended) in [
+            (WayOut::ListenerFailure, 0),
+            (WayOut::OnlyListenerFailure, 1),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            assert_eq!(
+                exit(&tracker, budget, way, Duration::ZERO).await,
+                (secs(ended), secs(ended)),
+                "{way:?}"
+            );
+        }
+    }
+
+    /// A mesh member on an ephemeral loopback port, serving and joining
+    /// `peers`.
+    async fn a_mesh_member(
+        name: &str,
+        peers: Vec<std::net::SocketAddr>,
+    ) -> (std::net::SocketAddr, Arc<MeshServerHandler>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, handler) = MeshServerBuilder::new(name.to_string(), addr, addr, peers).build();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the member serves for the length of the case"
+        )]
+        spawn(async move {
+            let _ = server.start_with_listener(listener).await;
+        });
+        (addr, Arc::new(handler))
+    }
+
+    /// What `member` holds for the member named `of`, read every 50 ms until
+    /// it is `wanted` or `within` has passed: the last status read.
+    async fn status_read_by(
+        member: &MeshServerHandler,
+        of: &str,
+        wanted: smg_mesh::gossip::NodeStatus,
+        within: Duration,
+    ) -> Option<smg_mesh::gossip::NodeStatus> {
+        let start = tokio::time::Instant::now();
+        loop {
+            let status = member.state.read().get(of).map(smg_mesh::status_of);
+            if status == Some(wanted) || start.elapsed() >= within {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A listener's failure with no signal leaves the mesh, as a signal does:
+    /// while the failed member's exit still waits for a departed client's
+    /// mutation, the other member reads it `Leaving`. A second leave, as the
+    /// shutdown task's is when a signal follows the failure, finds the member
+    /// `Leaving`: it changes nothing and returns at once.
+    #[tokio::test]
+    async fn a_listeners_failure_leaves_the_mesh() {
+        use smg_mesh::gossip::NodeStatus;
+
+        let secs = Duration::from_secs;
+        let (addr_a, a) = a_mesh_member("A", Vec::new()).await;
+        let (_addr_b, b) = a_mesh_member("B", vec![addr_a]).await;
+        assert_eq!(
+            status_read_by(&a, "B", NodeStatus::Alive, secs(20)).await,
+            Some(NodeStatus::Alive),
+            "A sees B join"
+        );
+        assert_eq!(
+            status_read_by(&b, "A", NodeStatus::Alive, secs(20)).await,
+            Some(NodeStatus::Alive),
+            "B sees A"
+        );
+
+        // B's exit: its only listener fails, with no signal, and a departed
+        // client's mutation holds the exit.
+        let tracker = InFlightRequestTracker::new();
+        let (call, gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let data: Serving = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(std::io::Error::other("accept failed"))
+        });
+        let no_admin: Serving = Box::pin(std::future::ready(Ok(())));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the stand-in for the shutdown task `startup` spawns; its signal never comes"
+        )]
+        let shutdown = spawn(std::future::pending::<tokio::time::Instant>());
+        let exit = serve_until_drained(
+            data,
+            no_admin,
+            OnFailure {
+                stop_data: || {},
+                stop_admin: || {},
+                leave_mesh: leave_the_mesh(Some(&b)),
+                stop_mesh: || stop_the_mesh(Some(&b)),
+            },
+            &tracker,
+            shutdown,
+            secs(30),
+        );
+        tokio::pin!(exit);
+        tokio::select! {
+            _ = &mut exit => panic!("the exit ended while the mutation was in flight"),
+            status = status_read_by(&a, "B", NodeStatus::Leaving, secs(5)) => assert_eq!(
+                status,
+                Some(NodeStatus::Leaving),
+                "what A reads of B within five seconds of B's listener failure"
+            ),
+        }
+        let own_entry = || b.state.read().get("B").map(|b| (b.status, b.version));
+        let left = own_entry();
+        tokio::time::timeout(Duration::from_millis(500), leave_the_mesh(Some(&b)))
+            .await
+            .expect("a second leave returns at once");
+        assert_eq!(own_entry(), left, "a second leave changes nothing");
+        gate.notify_one();
+        let _ = exit.await;
+        a.shutdown();
     }
 
     /// An unknown URL and a wrong method answer a JSON envelope in the shape
