@@ -1302,7 +1302,7 @@ fn test_snapshot_bincode_round_trip() {
 
     let snap = tree.snapshot();
     let bytes = snap.to_bytes().unwrap();
-    let restored_snap = crate::snapshot::TreeSnapshot::from_bytes(&bytes).unwrap();
+    let restored_snap = TreeSnapshot::from_bytes(&bytes).unwrap();
 
     let restored = Tree::from_snapshot(&restored_snap);
     let r = restored.match_prefix_with_counts("Hello world");

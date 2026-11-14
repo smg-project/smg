@@ -509,6 +509,7 @@ mod tests {
     use metrics_util::parse_quantiles;
 
     use super::*;
+    use crate::worker::BasicWorker;
 
     const WORKER_A: &str = "grpc://[fd00::a]:50051";
     const WORKER_B: &str = "grpc://[fd00::b]:50051";
@@ -587,7 +588,7 @@ mod tests {
         );
 
         // A dead witness: the test's late writes race the removal, before any upkeep.
-        series.retire(WORKER_A, Weak::<crate::worker::BasicWorker>::new());
+        series.retire(WORKER_A, Weak::<BasicWorker>::new());
         let (_, workers) = scrape(&series, || {
             // Writes after the removal: a racing health check, a late outcome.
             gauge!("health", "worker" => WORKER_A).set(0.0);

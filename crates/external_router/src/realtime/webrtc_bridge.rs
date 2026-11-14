@@ -639,8 +639,7 @@ impl WebRtcBridge {
                         call_id = self.call_id,
                         "Buffering client event (upstream channel not open)"
                     );
-                    self.pending_to_upstream
-                        .push((data.binary, data.data.to_vec()));
+                    self.pending_to_upstream.push((data.binary, data.data));
                 }
             }
             Event::ChannelClose(id) => {
@@ -707,8 +706,7 @@ impl WebRtcBridge {
                         call_id = self.call_id,
                         "Buffering upstream event (client channel not open)"
                     );
-                    self.pending_to_client
-                        .push((data.binary, data.data.to_vec()));
+                    self.pending_to_client.push((data.binary, data.data));
                 }
             }
             Event::ChannelClose(id) => {
@@ -1223,5 +1221,59 @@ mod tests {
         // client hung up first, even if the upstream had also gone idle → success
         // (a client close must never be recorded as an upstream 502).
         assert!(bridge_ended_successfully(false, true, false, true));
+    }
+
+    /// A data-channel packet that arrives before the far side's channel is
+    /// open waits in the pending queue with its bytes and its binary flag,
+    /// in both directions; the queue holds a thousand packets and drops the
+    /// next.
+    #[tokio::test]
+    async fn a_packet_buffered_before_the_far_channel_opens_keeps_its_bytes() {
+        use str0m::channel::ChannelConfig;
+        let now = Instant::now();
+        let mut client_rtc = RtcConfig::new().build(now);
+        let mut upstream_rtc = RtcConfig::new().build(now);
+        let client_id = client_rtc
+            .direct_api()
+            .create_data_channel(ChannelConfig::default());
+        let upstream_id = upstream_rtc
+            .direct_api()
+            .create_data_channel(ChannelConfig::default());
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let bind = || UdpSocket::bind(SocketAddr::new(loopback, 0));
+        let mut bridge = WebRtcBridge {
+            client_rtc,
+            client_socket: bind().await.expect("a loopback socket"),
+            client_candidate_addr: SocketAddr::new(loopback, 1),
+            upstream_rtc,
+            upstream_socket: bind().await.expect("a loopback socket"),
+            upstream_candidate_addr: SocketAddr::new(loopback, 2),
+            client_channel: None,
+            upstream_channel: Some(upstream_id),
+            upstream_channel_ready: false,
+            upstream_audio_mid: None,
+            client_audio_mid: None,
+            pending_to_client: Vec::new(),
+            pending_to_upstream: Vec::new(),
+            call_id: "call".to_string(),
+            cancel_token: CancellationToken::new(),
+        };
+        let packet = |id, n: usize| ChannelData {
+            id,
+            binary: n.is_multiple_of(2),
+            data: vec![n as u8; 4096],
+        };
+        for n in 0..1001 {
+            bridge.handle_client_event(Event::ChannelData(packet(client_id, n)));
+            bridge.handle_upstream_event(Event::ChannelData(packet(upstream_id, n)));
+        }
+        for pending in [&bridge.pending_to_upstream, &bridge.pending_to_client] {
+            assert_eq!(pending.len(), 1000, "a thousand wait, the next is dropped");
+            for (n, (binary, data)) in pending.iter().enumerate() {
+                assert_eq!(*binary, n.is_multiple_of(2));
+                assert_eq!(data.len(), 4096);
+                assert!(data.iter().all(|byte| *byte == n as u8), "packet {n}");
+            }
+        }
     }
 }

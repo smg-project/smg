@@ -14,6 +14,8 @@
 //! Run: RADIX_COMPARE_SIDE=... cargo test -p smg-radix-tree --release \
 //!   --test tree_compare -- --ignored --nocapture
 
+#![expect(clippy::print_stdout, reason = "the comparison's numbers are printed")]
+
 mod common;
 
 use std::time::Instant;
@@ -123,7 +125,10 @@ fn placement_chain_keys(hashes: &[kv_index::ContentHash]) -> Vec<(u64, u64)> {
     out
 }
 
-#[allow(clippy::large_enum_variant)] // bench-local, one instance per process
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bench-local, one instance per process"
+)]
 enum Side {
     Token(TokenTree),
     String(StringTree),
@@ -216,7 +221,7 @@ fn tree_compare() {
             (Side::Radix { tree, ids, .. }, Prepared::Blocks(tenant, blocks)) => {
                 tree.store(ids[*tenant], None, blocks).expect("store");
             }
-            _ => unreachable!(),
+            _ => panic!("a prepared item of another side"),
         }
     }
     let build = build_start.elapsed();
@@ -283,7 +288,7 @@ fn tree_compare() {
                     .find(|o| o.holder.parts().0 == idx)
                     .map_or(0, |o| o.depth * *block)
             }
-            _ => unreachable!(),
+            _ => panic!("a prepared item of another side"),
         };
         lat.push(t.elapsed().as_nanos() as u64);
         promised_minus_true += matched_tokens as i64 - *true_len as i64;

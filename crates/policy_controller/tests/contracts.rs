@@ -1,7 +1,9 @@
 //! The policy controller's two wire contracts, compiled and parsed at test
 //! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
-//! and the WebAssembly world `smg:policy@1.0.0`. No code is generated and
-//! nothing at run time reads the files. The tests hold four things: the
+//! and the WebAssembly world `smg:policy@1.0.0`. Nothing at run time reads
+//! the files; the world's `types` interface is rendered from the crate's
+//! types by the `wit` module and held to the committed file by `tests/wit.rs`.
+//! The tests here hold four things: the
 //! files compile; the view, decision and lifecycle messages and records
 //! mirror this crate's types field for field, in the crate's order; the
 //! versioned names a plugin author builds against (the package, the RPCs and

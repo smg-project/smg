@@ -146,13 +146,13 @@ ignores --tenant-rate-limit-config and --priority-scheduler-config without
 their enabled flags). Renders nothing.
 */}}
 {{- define "smg.validateAdmission" -}}
-{{- if and .Values.router.tenantRateLimit.enabled (not .Values.router.tenantRateLimit.configMap.name) -}}
+{{- if and (.Values.router.tenantRateLimit).enabled (not ((.Values.router.tenantRateLimit).configMap).name) -}}
 {{- fail "router.tenantRateLimit.enabled needs router.tenantRateLimit.configMap.name: the gateway requires --tenant-rate-limit-config with --tenant-rate-limit-enabled" -}}
 {{- end -}}
-{{- if and .Values.router.priorityScheduler.configMap.name (not .Values.router.priorityScheduler.enabled) -}}
+{{- if and ((.Values.router.priorityScheduler).configMap).name (not .Values.router.priorityScheduler.enabled) -}}
 {{- fail "router.priorityScheduler.configMap.name without router.priorityScheduler.enabled: the gateway ignores --priority-scheduler-config without --priority-scheduler-enabled" -}}
 {{- end -}}
-{{- if and .Values.router.tenantRateLimit.configMap.name (not .Values.router.tenantRateLimit.enabled) -}}
+{{- if and ((.Values.router.tenantRateLimit).configMap).name (not .Values.router.tenantRateLimit.enabled) -}}
 {{- fail "router.tenantRateLimit.configMap.name without router.tenantRateLimit.enabled: the gateway ignores --tenant-rate-limit-config without --tenant-rate-limit-enabled" -}}
 {{- end -}}
 {{- end -}}
@@ -363,8 +363,8 @@ Called from the router Deployment template.
 {{- end }}
 {{- end }}
 {{- end }}
-{{- $disaggregationMode := .Values.router.disaggregation.mode | default "" }}
-{{- $roleWorkers := or .Values.router.disaggregation.prefill .Values.router.disaggregation.decode .Values.router.disaggregation.encode }}
+{{- $disaggregationMode := (.Values.router.disaggregation).mode | default "" }}
+{{- $roleWorkers := or (.Values.router.disaggregation).prefill (.Values.router.disaggregation).decode (.Values.router.disaggregation).encode }}
 {{- $chartWorkersAreRegular := and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
 {{- /* A disaggregated gateway reads only its role workers and drops regular
      worker URLs without a word, so the chart refuses them under a mode and
@@ -421,7 +421,7 @@ Called from the router Deployment template.
 - "--selector"
 - {{ .selector | quote }}
 {{- end }}
-{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- $mode := ($.Values.router.disaggregation).mode | default "" }}
 {{- if and (not $mode) (or .prefillSelector .decodeSelector .encodeSelector) -}}
 {{- fail "router.discovery.kubernetes names a role selector (prefillSelector, decodeSelector or encodeSelector) without router.disaggregation.mode: set mode to pd or epd" -}}
 {{- end }}
@@ -456,7 +456,7 @@ Called from the router Deployment template.
 - {{ include "smg.discoveryFilePath" $ | quote }}
 {{- else if eq .provider "slurm" }}
 {{- with .slurm }}
-{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- $mode := ($.Values.router.disaggregation).mode | default "" }}
 {{- if and (not $mode) (or .prefillJobNames .decodeJobNames .encodeJobNames) -}}
 {{- fail "router.discovery.slurm names a role job (prefillJobNames, decodeJobNames or encodeJobNames) without router.disaggregation.mode: set mode to pd or epd" -}}
 {{- end }}
@@ -553,7 +553,9 @@ Called from the router Deployment template.
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
 - "--mm-turbojpeg"
-- {{ .Values.router.mmTurbojpeg | quote }}
+{{- /* Absent when an upgrade reuses the values of a release from before this
+     value: the chart's default then, where the gateway's own is prefer. */}}
+- {{ .Values.router.mmTurbojpeg | default "require" | quote }}
 {{- if .Values.router.grpcRequestTimeoutSecs }}
 - "--grpc-request-timeout-secs"
 - {{ .Values.router.grpcRequestTimeoutSecs | quote }}
@@ -677,19 +679,21 @@ Called from the router Deployment template.
 - "--control-plane-api-keys-file"
 - {{ printf "/etc/smg/control-plane/%s" (include "smg.controlPlaneSecretKey" .) | quote }}
 {{- end }}
-{{- if .Values.router.tenantRateLimit.enabled }}
+{{- if (.Values.router.tenantRateLimit).enabled }}
 - "--tenant-rate-limit-enabled"
 {{- end }}
-{{- if .Values.router.tenantRateLimit.configMap.name }}
+{{- if ((.Values.router.tenantRateLimit).configMap).name }}
 - "--tenant-rate-limit-config"
-- {{ printf "/etc/smg/rate-limit/%s" .Values.router.tenantRateLimit.configMap.key | quote }}
+{{- /* No key when an upgrade reuses the values of a release from before the
+     block and turns it on, as for the scheduler below: the chart's default. */}}
+- {{ printf "/etc/smg/rate-limit/%s" (.Values.router.tenantRateLimit.configMap.key | default "rate-limit.yaml") | quote }}
 {{- end }}
-{{- if .Values.router.priorityScheduler.enabled }}
+{{- if (.Values.router.priorityScheduler).enabled }}
 - "--priority-scheduler-enabled"
 {{- end }}
-{{- if .Values.router.priorityScheduler.configMap.name }}
+{{- if ((.Values.router.priorityScheduler).configMap).name }}
 - "--priority-scheduler-config"
-- {{ printf "/etc/smg/scheduler/%s" .Values.router.priorityScheduler.configMap.key | quote }}
+- {{ printf "/etc/smg/scheduler/%s" (.Values.router.priorityScheduler.configMap.key | default "scheduler.yaml") | quote }}
 {{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}
@@ -726,9 +730,9 @@ names a Secret the operator manages; otherwise `auth.controlPlane.apiKeys`,
 when set, is written into a chart-managed Secret. Empty when neither is set.
 */}}
 {{- define "smg.controlPlaneSecretName" -}}
-{{- if .Values.auth.controlPlane.existingSecret -}}
+{{- if (.Values.auth.controlPlane).existingSecret -}}
 {{- .Values.auth.controlPlane.existingSecret -}}
-{{- else if .Values.auth.controlPlane.apiKeys -}}
+{{- else if (.Values.auth.controlPlane).apiKeys -}}
 {{- printf "%s-control-plane" (include "smg.fullname" .) -}}
 {{- end -}}
 {{- end }}
@@ -976,5 +980,89 @@ Used by smg.routerArgs when workers are defined but workerUrls is empty.
 {{- $scheme = "grpc" }}
 {{- end }}
 - "{{ $scheme }}://{{ include "smg.fullname" $ }}-worker-{{ $worker.name }}:{{ $port }}"
+{{- end }}
+{{- end }}
+
+{{/*
+Policy controller name -- its Deployment, its Service, its budget and its
+ServiceMonitor.
+*/}}
+{{- define "smg.policyControllerName" -}}
+{{- printf "%s-policy-controller" (include "smg.fullname" .) -}}
+{{- end }}
+
+{{/*
+Policy controller selector labels -- the release's selector labels with the
+controller's own component, so no router or worker selector takes its pods.
+*/}}
+{{- define "smg.policyControllerSelectorLabels" -}}
+{{ include "smg.selectorLabels" . }}
+app.kubernetes.io/component: policy-controller
+{{- end }}
+
+{{/*
+Policy controller image -- policyController.image, its registry falling back
+to the global one. The repository and the tag have no default: no controller
+image is published yet.
+*/}}
+{{- define "smg.policyControllerImage" -}}
+{{- $image := .Values.policyController.image -}}
+{{- if or (not $image.repository) (not $image.tag) -}}
+{{- fail "policyController.enabled needs policyController.image.repository and policyController.image.tag: no controller image is published yet, so neither has a default" -}}
+{{- end -}}
+{{- printf "%s/%s:%s" ($image.registry | default .Values.global.image.registry) $image.repository $image.tag -}}
+{{- end }}
+
+{{/*
+Policy controller CLI arguments -- every argument is a flag of
+smg-policy-controller, each from a value. The controller's id is not here:
+the flag reads HOSTNAME, the pod's name. What the controller refuses at
+start is refused at render: two listeners on one port, and a settle window
+over half the grace period (the controller's own default of 5 seconds when
+shutdownSettleSeconds is null).
+*/}}
+{{- define "smg.policyControllerArgs" -}}
+{{- $controller := .Values.policyController -}}
+{{- $seen := dict -}}
+{{- range $listener := list "gateway" "control" "replication" "admin" -}}
+{{- $port := index $controller.ports $listener | int | toString -}}
+{{- with index $seen $port -}}
+{{- fail (printf "policyController.ports.%s %s equals policyController.ports.%s: the controller refuses two listeners on one port" $listener $port .) -}}
+{{- end -}}
+{{- $_ := set $seen $port $listener -}}
+{{- end -}}
+{{- $grace := int $controller.shutdownGracePeriodSeconds -}}
+{{- $settle := 5 -}}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) -}}
+{{- $settle = int $controller.shutdownSettleSeconds -}}
+{{- end -}}
+{{- if gt (mul $settle 2) $grace -}}
+{{- fail (printf "policyController: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
+{{- end -}}
+- "--gateway-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.gateway) | quote }}
+- "--control-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.control) | quote }}
+- "--replication-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.replication) | quote }}
+- "--admin-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.admin) | quote }}
+- "--shutdown-grace-period-secs"
+- {{ $grace | quote }}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) }}
+- "--shutdown-settle-secs"
+- {{ $settle | quote }}
+{{- end }}
+{{- with $controller.runtimeWorkerThreads }}
+- "--runtime-worker-threads"
+- {{ . | quote }}
+{{- end }}
+- "--log-level"
+- {{ $controller.logging.level | quote }}
+{{- if $controller.logging.json }}
+- "--log-json"
+{{- end }}
+{{- range $controller.extraArgs }}
+- {{ . | quote }}
 {{- end }}
 {{- end }}
