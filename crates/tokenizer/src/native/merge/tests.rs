@@ -901,9 +901,10 @@ fn two_byte_characters_on_one_id_merge_as_the_model_does() {
 }
 
 /// The table is the hot grid (`HOT_SIDE` x `HOT_SIDE` words) and its
-/// entries: a power of two of buckets, one cache line of four sixteen-byte
-/// entries each, at a load of one half or less, the pair filter, and the
-/// pre-formed character analysis counted apart.
+/// entries: exactly the buckets its merges need at a load of one half, one
+/// cache line of four sixteen-byte entries per two merges (two buckets at the
+/// least), the pair filter, and the pre-formed character analysis counted
+/// apart.
 #[test]
 fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
@@ -917,13 +918,13 @@ fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less
     );
     let analysis = table.preformed.bytes();
     let entries = (table.bytes() - size_of::<MergeTable>() - grid - filter - analysis) / 16;
-    assert!(entries.is_power_of_two(), "{entries} entries");
-    assert!(
-        entries >= 2 * merges,
+    assert_eq!(
+        entries,
+        4 * merges.div_ceil(2).max(2),
         "{entries} entries for {merges} merges"
     );
     assert!(
-        entries < 4 * merges + 8,
+        entries >= 2 * merges,
         "{entries} entries for {merges} merges"
     );
 }
