@@ -2661,6 +2661,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "userlm-2.0",
+        model: "microsoft/UserLM-2.0",
+        also: &[],
+        released: "2026-10-01",
+        smg: (None, None),
+        table: Some(Table::Plain),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "webworld-32b",
         model: "Qwen/WebWorld-32B",
         also: &["WebWorld-8B", "WebWorld-14B"],
