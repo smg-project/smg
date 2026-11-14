@@ -44,6 +44,11 @@ fn plugin(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, config: Vec<u8
     let mut spec = PluginSpec::new(name, component);
     spec.config = config;
     spec.budget_micros = FRAME_MICROS;
+    // A cool-down of zero: a stall of the host reads as slowness (two
+    // decisions past the frame among a thread's last 128) and opens the
+    // breaker; without a cool-down no measured decision takes the
+    // fallback, and each group checks that none did.
+    spec.breaker.cooldown_micros = 0;
     spec.metrics = vec![
         "observed".into(),
         "now".into(),
@@ -154,10 +159,11 @@ fn decide(c: &mut Criterion) {
                 stats.traps,
                 stats.fuel_exhausted,
                 stats.invalid,
-                stats.declined
+                stats.declined,
+                stats.bypassed
             ),
-            (0, 0, 0, 0),
-            "{world}: the honest guest answered every call: {stats:?}"
+            (0, 0, 0, 0, 0),
+            "{world}: the honest guest answered every call of every decision: {stats:?}"
         );
     }
     group.finish();
@@ -198,6 +204,18 @@ fn decide_fresh(c: &mut Criterion) {
                 );
             });
         }
+        let stats = plugin.stats();
+        assert_eq!(
+            (
+                stats.traps,
+                stats.fuel_exhausted,
+                stats.invalid,
+                stats.declined,
+                stats.bypassed
+            ),
+            (0, 0, 0, 0, 0),
+            "{world}: the honest guest answered every call of every decision: {stats:?}"
+        );
     }
     group.finish();
 }

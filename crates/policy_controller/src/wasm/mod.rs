@@ -37,28 +37,37 @@
 //! fallback and keeps the instance; a trap, an exhausted budget or an answer
 //! that breaks a validity rule (a duplicate or out-of-range filter position,
 //! a non-finite score, a pick outside the survivors) falls back too, drops
-//! the instance (rebuilt once at the decision's close, for a slot the decision
-//! emptied; a faulted instance is never reused) and counts on the breaker;
-//! a call the decision's remainder ends short of the plugin's own bounds (a
+//! the instance (rebuilt once at the decision's close, for a slot the
+//! decision emptied; a faulted instance is never reused) and counts on the
+//! breaker. The decision is the breaker's unit: a plugin fails a decision
+//! once, however many of its opens fail in it (each side of a pair, each
+//! binding), and its later opens of that decision fall back without a call.
+//! A call the decision's remainder ends short of the plugin's own bounds (a
 //! grant below its frame, by a plugin whose own spend did not consume the
 //! budget alone) is the decision's budget spent, its instance dropped and
-//! the breaker untouched, whichever scope ran first: under the default frame
-//! a plugin is charged only when it alone consumed the budget. A cold slot's `init` is judged
-//! under its own frame alone (clamped below its cost by the remainder, it is
-//! the decision's budget spent and the close rebuilds the slot). A
-//! resource's destructor runs under a small fuel frame and a wall bound of
-//! its own, so a spent budget drops no healthy instance and a cheap slow
-//! destructor cannot stretch a decision. The breaker opens for a cool-down on
-//! a run of failures within its window, or when the moving p50 of the
-//! plugin's decisions passes half the budget or the p99 (the second-slowest
-//! of the ring) passes it: one sample per decision, the plugin's own charge
-//! in it (its constructor and stage calls, whatever ended them) over the
-//! decision's budget, taken at its last close, the ring the thread's across
-//! rebuilds; open, the stages take their fallbacks without a call. Without a
-//! fallback stage,
-//! `failure: open` steps aside (keep all, flat scores, rank by score) and
-//! `failure: closed` sheds (an emptied pool or a declined pick naming the
-//! plugin).
+//! the breaker untouched, whichever scope ran first: under the default
+//! frame a plugin is charged only when it alone consumed the budget. A cold
+//! slot's `init` is judged under its own frame alone: one the remainder
+//! clamps and ends (its charge reached what was left) is the decision's
+//! budget spent and the close rebuilds the slot; one that ends by itself
+//! short of the clamp is the plugin's own failure, as under the full frame.
+//! A resource's destructor runs under a small fuel frame and a wall bound
+//! of its own, so a spent budget drops no healthy instance and a cheap slow
+//! destructor cannot stretch a decision.
+//!
+//! The breaker opens for a cool-down on a run of failures within its window,
+//! or when the moving p50 of the plugin's decisions passes half the budget
+//! or the p99 (the second-slowest of the ring) passes it: one sample per
+//! decision, the plugin's own charge in it (its constructor and stage
+//! calls, whatever ended them, and a lazy `init` the decision paid) over
+//! the decision's budget, taken at its last close, the ring the thread's
+//! across rebuilds. An opening writes one warning with the plugin, the rule
+//! and the cool-down; a report made while the breaker is open, by a call
+//! admitted before it opened, is dropped, so one incident is one opening.
+//! Open, the stages take their fallbacks without a call. Without a fallback
+//! stage, `failure: open` steps aside (keep all, flat scores, rank by score)
+//! and `failure: closed` sheds (an emptied pool or a declined pick naming
+//! the plugin).
 //!
 //! What is not here yet: the spec's `plugins` section that names a module,
 //! its memory budget over every row and `max_candidates` (the row lands with
