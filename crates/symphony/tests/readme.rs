@@ -1862,7 +1862,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "minicpm-ocr-1.0",
         model: "openbmb/MiniCPM-OCR-1.0",
-        also: &[],
+        also: &["MiniCPM-OCR-1.0-AWQ", "MiniCPM-OCR-1.0-GPTQ"],
         released: "2026-10-21",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
@@ -1872,7 +1872,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "minicpm-ocr-jev",
         model: "openbmb/MiniCPM-OCR-Jev",
-        also: &[],
+        also: &["MiniCPM-OCR-Jev-AWQ", "MiniCPM-OCR-Jev-GPTQ"],
         released: "2026-10-23",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
@@ -1882,7 +1882,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "minicpm-v-4.7-1b",
         model: "openbmb/MiniCPM-V-4.7-1B",
-        also: &[],
+        also: &["MiniCPM-V-4.7-1B-GPTQ"],
         released: "2026-10-06",
         smg: (None, None),
         table: Some(Table::Qwen3Tagged),
@@ -2218,7 +2218,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-3.5-bolt-74b-a9b-bf16",
         model: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16",
-        also: &[],
+        also: &["NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"],
         released: "2026-10-09",
         smg: (Some("qwen_xml"), Some("nano_v3")),
         table: Some(Table::Qwen3Tagged),
