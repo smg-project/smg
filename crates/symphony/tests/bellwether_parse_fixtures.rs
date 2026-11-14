@@ -326,6 +326,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // OvisOCR3 writes Qwen 3.5's tagged calls under ChatML with a template of its own: the thought
     // opened in the prompt only when the request turns thinking on, closed as an empty block otherwise.
     ("ovisocr3", GenerationPrompt::OpensTheThoughtWhenAsked),
+    // SilentVision-52M writes content alone under ChatML (its template has no tool syntax and no
+    // thinking switch); the generation prompt is the assistant header and nothing more.
+    ("silentvision-52m", GenerationPrompt::Plain),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
