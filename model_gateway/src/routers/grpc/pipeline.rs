@@ -86,11 +86,12 @@ use crate::{
         common::{
             json_response,
             placement::{self, Candidates, WireConstraint},
+            prefill_admission::PrefillAdmission,
             retry::{is_retryable_response, BackoffCalculator},
         },
         error,
     },
-    worker::{PrefillAdmission, RoutingPool, WorkerRegistry},
+    worker::{RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
