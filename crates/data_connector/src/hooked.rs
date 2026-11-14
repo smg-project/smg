@@ -762,7 +762,7 @@ mod tests {
     use super::*;
     use crate::{
         context::{current_extra_columns, with_request_context, RequestContext},
-        core::StorageFailure,
+        core::{SortOrder, StorageFailure},
         hooks::HookError,
         memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
     };
@@ -1776,7 +1776,7 @@ mod tests {
                 &conv.id,
                 ListParams {
                     limit: 10,
-                    order: crate::core::SortOrder::Asc,
+                    order: SortOrder::Asc,
                     after: None,
                 },
             )
