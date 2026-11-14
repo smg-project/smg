@@ -200,6 +200,7 @@ fn test_rerank_response_creation() {
     let response = RerankResponse::new(
         results.clone(),
         "test-model".to_string(),
+        None,
         Some(StringOrArray::String("req-123".to_string())),
     );
 
@@ -225,6 +226,7 @@ fn test_rerank_response_serialization() {
     let response = RerankResponse::new(
         results,
         "test-model".to_string(),
+        None,
         Some(StringOrArray::String("req-123".to_string())),
     );
 
@@ -263,6 +265,7 @@ fn test_rerank_response_apply_top_k() {
     let mut response = RerankResponse::new(
         results,
         "test-model".to_string(),
+        None,
         Some(StringOrArray::String("req-123".to_string())),
     );
 
@@ -285,6 +288,7 @@ fn test_rerank_response_apply_top_k_larger_than_results() {
     let mut response = RerankResponse::new(
         results,
         "test-model".to_string(),
+        None,
         Some(StringOrArray::String("req-123".to_string())),
     );
 
@@ -304,6 +308,7 @@ fn test_rerank_response_drop_documents() {
     let mut response = RerankResponse::new(
         results,
         "test-model".to_string(),
+        None,
         Some(StringOrArray::String("req-123".to_string())),
     );
 
@@ -435,7 +440,7 @@ fn a_worker_answer_in_any_rerank_contract_reads_into_the_gateway_results() {
     let native: RerankWorkerResponse =
         from_str(r#"[{"score": 0.9, "document": "d1", "index": 0, "meta_info": {"k": 1}}]"#)
             .unwrap();
-    let results = native.into_results();
+    let results = native.results;
     assert_eq!(
         (
             results[0].index,
@@ -449,7 +454,7 @@ fn a_worker_answer_in_any_rerank_contract_reads_into_the_gateway_results() {
     let ranked: RerankWorkerResponse =
         from_str(r#"[{"index": 1, "score": 0.6, "text": "d2"}, {"index": 0, "score": 0.4}]"#)
             .unwrap();
-    let results = ranked.into_results();
+    let results = ranked.results;
     assert_eq!(results[0].document.as_deref(), Some("d2"));
     assert_eq!(results[1].document, None);
 
@@ -460,7 +465,7 @@ fn a_worker_answer_in_any_rerank_contract_reads_into_the_gateway_results() {
                         {"index": 0, "relevance_score": 0.07}]}"#,
     )
     .unwrap();
-    let results = object.into_results();
+    let results = object.results;
     assert_eq!((results[0].index, results[0].score), (1, 0.93));
     assert_eq!(results[0].document, None);
 
@@ -470,7 +475,7 @@ fn a_worker_answer_in_any_rerank_contract_reads_into_the_gateway_results() {
                         {"index": 1, "document": {"text": null}, "relevance_score": 0.1}]}"#,
     )
     .unwrap();
-    let results = object.into_results();
+    let results = object.results;
     assert_eq!(results[0].document.as_deref(), Some("d1"));
     assert_eq!(results[1].document, None);
 
@@ -589,6 +594,7 @@ fn test_rerank_response_with_usage_info() {
     let mut response = RerankResponse::new(
         results,
         "test-model".to_string(),
+        None,
         Some(StringOrArray::String("req-123".to_string())),
     );
 
@@ -660,7 +666,8 @@ fn test_full_rerank_workflow() {
     ];
 
     // Create response
-    let mut response = RerankResponse::new(results, request.model.clone(), request.rid.clone());
+    let mut response =
+        RerankResponse::new(results, request.model.clone(), None, request.rid.clone());
 
     // Apply top_k
     response.apply_top_k(request.effective_top_k());

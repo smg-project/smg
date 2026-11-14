@@ -38,6 +38,7 @@ use crate::{
             persist_response_if_needed, NotStored, ReplayInto, ResponsesContext,
         },
     },
+    tenant::storage_tenant,
 };
 
 /// Internal implementation for non-streaming responses
@@ -58,7 +59,7 @@ pub(super) async fn route_responses_internal(
 ) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // 1. Load conversation history (as the caller's tenant may see it) and
     //    build modified request
-    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let tenant = storage_tenant(&params.tenant_request_meta);
     let modified_request = load_history(
         ctx.history_stores(),
         &request,
@@ -166,7 +167,7 @@ pub(super) async fn execute_tool_loop(
 ) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
-    let mut state = ToolLoopState::new(&current_request);
+    let mut state = ToolLoopState::default();
 
     // Configuration: max iterations as safety limit
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
@@ -352,7 +353,7 @@ pub(super) async fn execute_tool_loop(
                 let output_str = result.output.to_string();
                 record_mcp_call(
                     &mut state,
-                    &current_request.model,
+                    &current_request,
                     result,
                     output_str,
                     output_item,
@@ -408,7 +409,7 @@ pub(super) async fn execute_tool_loop(
             }
 
             // Build resume request with conversation history
-            current_request = build_next_request(&state, current_request);
+            current_request = build_next_request(&mut state, current_request);
 
             // Continue to next iteration
         }
