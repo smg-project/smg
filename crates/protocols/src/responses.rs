@@ -4222,6 +4222,50 @@ pub fn generate_id(prefix: &str) -> String {
     id
 }
 
+/// `Response.conversation` on the wire. The public API writes the linked
+/// conversation as an object, `{"id": "conv_..."}` (`ResponseConversation`);
+/// the field keeps the id alone. This module writes that object and reads it,
+/// or a bare id, the shape the crate wrote before, which stored responses
+/// keep.
+mod response_conversation {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::common::ConversationRef;
+
+    /// The object the public API writes.
+    #[derive(Serialize)]
+    struct ResponseConversation<'a> {
+        /// The id of the conversation the response is linked to.
+        id: &'a str,
+    }
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's `with` hands the field to its serializer by reference"
+    )]
+    pub(super) fn serialize<S: Serializer>(
+        conversation: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match conversation {
+            Some(id) => ResponseConversation { id }.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        Ok(
+            Option::<ConversationRef>::deserialize(deserializer)?.map(
+                |reference| match reference {
+                    ConversationRef::Id(id) | ConversationRef::Object { id } => id,
+                },
+            ),
+        )
+    }
+}
+
 /// The Response object of `POST /v1/responses`.
 ///
 /// The public API returns every field of this object on every response
@@ -4256,8 +4300,14 @@ pub struct ResponsesResponse {
     #[serialize_always]
     pub background: Option<bool>,
 
-    /// Conversation this response is linked to, if any.
-    #[serde(default)]
+    /// Conversation this response is linked to, if any, by its id. Written
+    /// as the public API writes it, `{"id": ...}`; a bare id, as the crate
+    /// wrote it before, still reads. The schema takes both shapes, as the
+    /// reader does: a response stored before the object was written is
+    /// served back with the bare id, and a client generated from the schema
+    /// reads it too.
+    #[serde(default, with = "response_conversation")]
+    #[schemars(with = "Option<ConversationRef>")]
     pub conversation: Option<String>,
 
     /// Response status

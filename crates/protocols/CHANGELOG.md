@@ -94,6 +94,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Response linked to a conversation writes it as the public API does, `{"id": "conv_..."}`
+  (`ResponseConversation`), where the crate wrote the bare id, and reads either shape: the crate
+  refused a Response carrying the object with ``invalid type: map, expected a string``. The field
+  keeps the id alone (`Option<String>`), so code that reads it is unchanged, and its schema takes
+  both shapes, so a client generated from it also reads a response stored with the bare id.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

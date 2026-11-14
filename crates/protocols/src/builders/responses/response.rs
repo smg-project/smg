@@ -122,9 +122,9 @@ impl ResponsesResponseBuilder {
         self.presence_penalty = request.presence_penalty;
         self.store = request.store.unwrap_or(true);
         self.background = request.background;
-        // ResponsesResponse stores `conversation` as a plain `Option<String>`
-        // (response side per spec is `optional { id }` only); flatten the
-        // request's union-typed reference down to its underlying id string.
+        // ResponsesResponse keeps `conversation` as the id alone and writes it
+        // as the public API's `{ "id": ... }` object; flatten the request's
+        // union-typed reference down to that id.
         self.conversation = request.conversation.as_ref().map(|c| c.as_id().to_string());
         self.temperature = request.temperature;
         // Echoed as sent: the object form stays an object, a bare string stays
@@ -546,6 +546,31 @@ mod tests {
             !body.contains_key("conversation"),
             "an unlinked response omits conversation"
         );
+    }
+
+    /// A response linked to a conversation writes it as the public API does,
+    /// an object with its id, whether the request named the conversation by
+    /// a bare id or by that object.
+    #[test]
+    fn a_linked_response_writes_its_conversation_as_an_object() {
+        for conversation in [
+            serde_json::json!("conv_1"),
+            serde_json::json!({"id": "conv_1"}),
+        ] {
+            let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "input": "hi", "conversation": conversation
+            }))
+            .unwrap();
+            let response = ResponsesResponse::builder("resp_conv", "m")
+                .copy_from_request(&request)
+                .build();
+            let body = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                body["conversation"],
+                serde_json::json!({"id": "conv_1"}),
+                "request conversation {conversation}"
+            );
+        }
     }
 
     #[test]
