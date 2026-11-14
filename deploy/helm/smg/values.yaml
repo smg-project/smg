@@ -320,7 +320,9 @@ router:
     maxReplicas: 5
     targetCPUUtilizationPercentage: 80
 
-  # -- Pod disruption budget
+  # -- Pod disruption budget. With one replica, minAvailable: 1 lets no pod
+  #    be evicted and a node drain waits on it for ever: run two replicas or
+  #    more, or leave the budget off.
   podDisruptionBudget:
     enabled: false
     minAvailable: 1
@@ -394,6 +396,133 @@ router:
   #    release after 1.13.0 on, the older parsers on 1.13.0). A set value needs an
   #    image of 1.13.0 or later and applies to gRPC and ZMQ workers only.
   parser: ""
+
+# =============================================================================
+# Policy Controller Configuration
+# =============================================================================
+# The standalone policy controller (smg-policy-controller): a Deployment of its
+# own beside the router, with its Service. Off by default. The controller
+# runs on its own today: nothing in this chart points the router at it.
+# A null removes a value's default. With the controller on, the templates
+# need the ports, the log level, the probes' paths, the grace period and the
+# budget's number, and the schema refuses a null for each, as it does for the
+# security context. Off, the block is not read and needs none of them. An
+# empty probe path is refused either way.
+policyController:
+  enabled: false
+
+  # -- The controller's image. No image is published yet, so repository and
+  #    tag have no default, and a release that turns the controller on
+  #    without them is refused at render. registry "" takes
+  #    global.image.registry; the pull policy and the pull secrets are the
+  #    global ones.
+  image:
+    registry: ""
+    repository: ""
+    tag: ""
+
+  # -- Replicas. The controller does not elect a leader yet: every replica is
+  #    a controller of its own. Keep one.
+  replicas: 1
+
+  # -- The listeners' container ports, each passed as its --*-listen flag: the
+  #    gateways and the relays (gateway), the operators (control), the standbys
+  #    (replication) and the HTTP admin listener with the probes and /metrics
+  #    (admin). Two listeners on one port are refused at render: the
+  #    controller refuses them at start.
+  ports:
+    gateway: 30100
+    control: 30101
+    replication: 30102
+    admin: 30103
+
+  # -- The Service <fullname>-policy-controller, three ports on the listeners'
+  #    own numbers: `grpc` for the gateways' listener, `control` for the
+  #    operators' and `metrics` for the admin listener, the scrape target, as
+  #    the router's Service carries the router's metrics port. The standbys'
+  #    listener has no Service.
+  service:
+    type: ClusterIP
+    annotations: {}
+
+  # -- Logging: the level of the controller's own crates (debug, info, warn
+  #    or error) and JSON output.
+  logging:
+    level: info
+    json: false
+
+  # -- Pod resources
+  resources: {}
+
+  # -- The async runtime's worker threads (--runtime-worker-threads, 1 to
+  #    4096). The controller's own default is one for every CPU it may use,
+  #    which with no CPU limit is every core of the node. 2 is the smallest
+  #    count that leaves a worker for the probes while a task holds the
+  #    other. Raise it with the CPU limit; null leaves the flag out, so the
+  #    count follows the CPU limit.
+  runtimeWorkerThreads: 2
+
+  nodeSelector: {}
+  tolerations: []
+  # -- Pod affinity. Left empty with more than one replica, the chart renders
+  #    a preferred anti-affinity that spreads the replicas across nodes.
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
+
+  # -- Extra CLI args appended to the controller's arguments
+  extraArgs: []
+
+  # -- Extra environment variables
+  extraEnv: []
+
+  # -- Pod disruption budget. With one replica, minAvailable: 1 lets no pod
+  #    be evicted and a node drain waits on it for ever: run two replicas or
+  #    more, or leave the budget off.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+  # -- Security context of the controller container: the router's. Your image
+  #    runs as UID 65532 under it; for an image built with another user set
+  #    runAsUser as for the router. The controller writes no file, so the
+  #    read-only root filesystem needs no volume. With the controller on the
+  #    schema refuses a null here: to run with none, set each member to null.
+  securityContext:
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  # -- Liveness probe tuning. `/liveness` on the admin listener answers 200
+  #    while the process serves, draining included.
+  livenessProbe:
+    path: /liveness
+    initialDelaySeconds: 5
+    periodSeconds: 30
+
+  # -- Readiness probe tuning. `/readiness` on the admin listener answers 200
+  #    once every listener serves and 503 from SIGTERM on.
+  readinessProbe:
+    path: /readiness
+    initialDelaySeconds: 2
+    periodSeconds: 10
+
+  # -- Graceful shutdown: how long a shutdown may take in all after SIGTERM
+  #    (passed as --shutdown-grace-period-secs; 30 is the controller's own
+  #    default). The pod's terminationGracePeriodSeconds is this plus
+  #    terminationGraceMarginSeconds.
+  shutdownGracePeriodSeconds: 30
+  # -- The window the listeners keep accepting after readiness fails; null
+  #    keeps the controller's default of 5 seconds. More than half the grace
+  #    period is refused at render: the controller refuses it at start.
+  shutdownSettleSeconds: null
+  terminationGraceMarginSeconds: 10
 
 # =============================================================================
 # HuggingFace Configuration

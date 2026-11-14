@@ -1,0 +1,103 @@
+{{- if (.Values.policyController).enabled }}
+{{- /* The standalone policy controller, a Deployment of its own: nothing here
+     points the router at it. The pod mounts no service account token: the
+     controller calls no Kubernetes API yet. */}}
+{{- $controller := .Values.policyController }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+spec:
+  replicas: {{ $controller.replicas }}
+  selector:
+    matchLabels:
+      {{- include "smg.policyControllerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with $controller.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "smg.policyControllerSelectorLabels" . | nindent 8 }}
+        {{- with $controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ add (int $controller.shutdownGracePeriodSeconds) (int $controller.terminationGraceMarginSeconds) }}
+      containers:
+        - name: policy-controller
+          image: "{{ include "smg.policyControllerImage" . }}"
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args:
+            {{- include "smg.policyControllerArgs" . | nindent 12 }}
+          ports:
+            - name: gateway
+              containerPort: {{ $controller.ports.gateway }}
+              protocol: TCP
+            - name: control
+              containerPort: {{ $controller.ports.control }}
+              protocol: TCP
+            - name: replication
+              containerPort: {{ $controller.ports.replication }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $controller.ports.admin }}
+              protocol: TCP
+          {{- with $controller.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ $controller.livenessProbe.path }}
+              port: admin
+            initialDelaySeconds: {{ $controller.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ $controller.livenessProbe.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ $controller.readinessProbe.path }}
+              port: admin
+            initialDelaySeconds: {{ $controller.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ $controller.readinessProbe.periodSeconds }}
+          {{- with $controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $controller.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with $controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $controller.affinity }}
+      affinity:
+        {{- toYaml $controller.affinity | nindent 8 }}
+      {{- else if gt (int $controller.replicas) 1 }}
+      {{- /* No affinity of the operator's and more than one replica: prefer
+           one replica a node. */}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "smg.policyControllerSelectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- with $controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

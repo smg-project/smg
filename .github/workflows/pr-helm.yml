@@ -1,12 +1,17 @@
 name: PR Helm Chart
 
-# The chart's own checks on a pull request that touches it: `helm lint` and
-# the alert rule unit tests (deploy/helm/smg/tests/rules/run.sh, which renders
-# the PrometheusRule and replays every test file against it with promtool).
+# The chart's own checks on a pull request that touches it: `helm lint`, the
+# alert rule unit tests (deploy/helm/smg/tests/rules/run.sh, which renders
+# the PrometheusRule and replays every test file against it with promtool),
+# and the policy controller's block against the controller binary itself,
+# which is why a change of that binary's flags starts the workflow too.
 on:
   pull_request:
     paths:
       - 'deploy/helm/smg/**'
+      - 'bindings/python/tests/test_helm_chart_policy_controller.py'
+      - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/src/**'
       - '.github/workflows/pr-helm.yml'
   workflow_dispatch:
 
@@ -56,3 +61,42 @@ jobs:
 
       - name: Run the alert rule tests
         run: bash deploy/helm/smg/tests/rules/run.sh
+
+  # Every argument the chart's controller Deployment passes is a flag the
+  # controller has, held by the binary itself: the job builds it (no cache is
+  # saved) and runs the chart's controller tests with it. Without the binary
+  # those cases are skipped, as they are in the Python unit test job.
+  policy-controller:
+    name: Run the policy controller on the chart's arguments
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.17.0
+
+      - name: Install protoc
+        run: bash scripts/ci_install_protoc.sh
+
+      # The toolchain rust-toolchain.toml names, then the controller binary.
+      - name: Build the controller
+        run: |
+          rustup toolchain install
+          cargo build --locked --package smg-policy-controller --features controller,kubernetes
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Run the chart's controller tests with the binary
+        env:
+          SMG_POLICY_CONTROLLER_BIN: ${{ github.workspace }}/target/debug/smg-policy-controller
+        run: |
+          python3 -m pip install pytest pyyaml
+          python3 -m pytest -q -rs bindings/python/tests/test_helm_chart_policy_controller.py
