@@ -219,6 +219,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
+    /// The runtime a stream of this worker notes its progress on, captured
+    /// once at the stream's start (see `TrackedStream`): the shared
+    /// [`WorkerRuntime`] every handle of the worker reaches, so the runtime's
+    /// own millisecond rule decides every note. `None` for a worker without
+    /// one, whose streams note through [`Self::note_token_progress_at`].
+    ///
+    /// A stream keeps noting the runtime it captured, so a worker's runtime
+    /// is not swapped once the worker can take a stream: the one swap,
+    /// [`Self::inherit_shared_state_from`], runs on a replacement before the
+    /// registry publishes it.
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        None
+    }
+
     /// Check if the worker is currently healthy (status == Ready).
     ///
     /// This is a routing predicate — returns true only for `Ready` workers.
@@ -735,6 +749,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// its runs.
     fn prefill_unanswered_run(&self) -> Option<Duration> {
         None
+    }
+
+    /// How long the worker's prompts have gone unanswered since its latest
+    /// first response: [`Self::prefill_unanswered_run`] with the idle spells
+    /// still left out but read whether or not a prompt is pending, so a
+    /// worker that was given up on and holds nothing still reports the
+    /// silence it owes. Zero after an answer, for a worker never dispatched
+    /// to, or for one that does not track its runs.
+    fn prefill_unanswered_total(&self) -> Duration {
+        Duration::ZERO
     }
 
     /// Whether the engine behind the worker is on a prompt shape it has not
@@ -1746,6 +1770,10 @@ impl Worker for BasicWorker {
         changed
     }
 
+    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+        Some(self.runtime.load_full())
+    }
+
     fn note_contact(&self) {
         self.runtime.load().note_contact();
     }
@@ -1893,6 +1921,10 @@ impl Worker for BasicWorker {
 
     fn prefill_unanswered_run(&self) -> Option<Duration> {
         self.runtime.load().prefill_unanswered_run()
+    }
+
+    fn prefill_unanswered_total(&self) -> Duration {
+        self.runtime.load().prefill_unanswered_total()
     }
 
     fn prefill_cold_shape(&self, tokens: u64) -> bool {

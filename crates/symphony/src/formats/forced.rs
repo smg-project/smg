@@ -12,6 +12,9 @@
 //!
 //! Notes on this format, and on what it leaves open: `docs/tables.md`.
 
+use openai_protocol::common::Tool;
+use serde_json::Value;
+
 use crate::format::{CallSyntax, Emits, Format};
 
 /// The forced call's format.
@@ -19,6 +22,16 @@ pub fn forced() -> Format {
     Format::new("forced")
         .state("arguments", Emits::Arguments)
         .calls(CallSyntax::ForcedArguments)
+}
+
+/// The JSON schema the engine writes the forced call under, which this table then reads: the
+/// `parameters` of the first of `tools` named `function`, as the gateway builds it where the
+/// model's own table has no tag for the call. `None` when no tool of that name is declared.
+pub fn arguments_schema(tools: &[Tool], function: &str) -> Option<Value> {
+    tools
+        .iter()
+        .find(|tool| tool.function.name == function)
+        .map(|tool| tool.function.parameters_schema().clone())
 }
 
 #[cfg(test)]

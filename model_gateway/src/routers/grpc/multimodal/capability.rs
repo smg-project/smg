@@ -379,14 +379,14 @@ mod tests {
         assert!(request_needs_vision(Some(&decoded), None));
 
         let audio = MediaPlan::new([MediaContentPart::AudioUrl {
-            url: "data:audio/wav;base64,AAAA".to_string(),
+            url: "data:audio/wav;base64,AAAA".to_string().into(),
             uuid: None,
         }]);
         assert!(!audio.is_empty());
         assert!(!request_needs_vision(None, Some(&audio)));
 
         let image = MediaPlan::new([MediaContentPart::ImageUrl {
-            url: "data:image/png;base64,AAAA".to_string(),
+            url: "data:image/png;base64,AAAA".to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
@@ -493,7 +493,7 @@ mod tests {
 
         fn image_part() -> MediaContentPart {
             MediaContentPart::ImageUrl {
-                url: "data:image/png;base64,AAAA".to_string(),
+                url: "data:image/png;base64,AAAA".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
@@ -502,7 +502,7 @@ mod tests {
 
         fn audio_part() -> MediaContentPart {
             MediaContentPart::AudioUrl {
-                url: "data:audio/wav;base64,AAAA".to_string(),
+                url: "data:audio/wav;base64,AAAA".to_string().into(),
                 uuid: None,
             }
         }
@@ -513,7 +513,7 @@ mod tests {
 
         fn video_part() -> MediaContentPart {
             MediaContentPart::VideoUrl {
-                url: "data:video/mp4;base64,AAAA".to_string(),
+                url: "data:video/mp4;base64,AAAA".to_string().into(),
                 uuid: None,
                 fps: Some(0.5),
                 max_long_side_pixel: None,
