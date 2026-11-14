@@ -3,8 +3,11 @@
 //! before calling it, what one least-load decision pays over a fed pool (the expected-wait
 //! scorer that least_load, power_of_two and cache-aware share), what one request pays inside
 //! the two ring policies over a ready pool with its ring, what one pick of the simple
-//! policies (power_of_two, random, round_robin, passthrough) pays over the same pool, and what
-//! a keyed request pays for a sticky hit, under the routing-key override and in the manual policy.
+//! policies (power_of_two, random, round_robin, passthrough) pays over the same pool, what
+//! a keyed request pays for a sticky hit, under the routing-key override and in the manual
+//! policy, and what one prefill-decode pair placement pays through the routers' pair selection
+//! (`pair_placement`: round robin and cache-aware over an event index, 64 and 512 workers a
+//! side, untraced and inside a cache-trace capture).
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
@@ -15,19 +18,26 @@
 use std::{collections::HashMap, hint::black_box, sync::Arc};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use kv_index::{compute_content_hash, request_prefix_hashes};
 use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
-        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualPolicy,
-        PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
-        RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
+        CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
+        LoadBalancingPolicy, ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy,
+        PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
+    routers::common::bench_support::PairPath,
     worker::{
+        kv_event_monitor::bench_support::IndexFeed,
         load_state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, HashRing, Worker, WorkerType,
+        BasicWorkerBuilder, ConnectionMode, HashRing, KvEventMonitor, KvIndex, ModelCard,
+        RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
+};
+use smg_grpc_client::common_proto::{
+    kv_cache_event, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
 
 const BLOCK_SIZE: usize = 16;
@@ -402,6 +412,145 @@ fn bench_keyed_sticky_hit(c: &mut Criterion) {
     group.finish();
 }
 
+/// The model of the pair fleet.
+const PAIR_MODEL: &str = "pair-model";
+/// Blocks of a pair request's prompt.
+const PAIR_PROMPT_BLOCKS: usize = 4;
+
+/// The stored event of one prompt, as an engine publishes a chain.
+fn stored(tokens: &[u32]) -> KvEventBatch {
+    let contents: Vec<_> = tokens
+        .chunks(BLOCK_SIZE)
+        .map(compute_content_hash)
+        .collect();
+    let blocks = tokens
+        .chunks(BLOCK_SIZE)
+        .zip(request_prefix_hashes(&contents))
+        .map(|(chunk, prefix)| KvBlock {
+            block_hash: prefix.0 as i64,
+            token_ids: chunk.to_vec(),
+            block_size: BLOCK_SIZE as i32,
+            ..Default::default()
+        })
+        .collect();
+    KvEventBatch {
+        events: vec![KvCacheEvent {
+            event_id: 0,
+            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                blocks,
+                ..Default::default()
+            })),
+        }],
+        ..Default::default()
+    }
+}
+
+/// A prefill-decode fleet of one model, `side` workers a role over the gRPC wire, every
+/// prefill paired with every decode, registered as the gateway registers them, with one
+/// policy object a role: round robin, or cache-aware over one event index in which prompt
+/// `p` is held by prefill `p` and by decode `p`. The prompts come with it.
+fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, Vec<Vec<u32>>) {
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut pools: Vec<Vec<Arc<dyn Worker>>> = Vec::new();
+    for (host, role) in [
+        ("prefill", WorkerType::Prefill),
+        ("decode", WorkerType::Decode),
+    ] {
+        let pool: Vec<Arc<dyn Worker>> = (0..side)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://{host}-{i:03}:9000"))
+                        .model(ModelCard::new(PAIR_MODEL))
+                        .worker_type(role)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .kv_connector("NixlConnector")
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        for worker in &pool {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        pools.push(pool);
+    }
+    let prompts: Vec<Vec<u32>> = (0..side)
+        .map(|p| {
+            (0..BLOCK_SIZE * PAIR_PROMPT_BLOCKS)
+                .map(|t| (p * 1_000 + t + 1) as u32)
+                .collect()
+        })
+        .collect();
+    let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+    if cache_aware {
+        let index = Arc::new(KvIndex::chain());
+        for pool in &pools {
+            for (p, worker) in pool.iter().enumerate() {
+                let mut feed = IndexFeed::new(&index, worker.url()).unwrap();
+                feed.apply(&index, &stored(&prompts[p]));
+            }
+        }
+        let monitor = Arc::new(KvEventMonitor::new());
+        monitor.set_index(PAIR_MODEL, Arc::clone(&index));
+        monitor.set_block_size(PAIR_MODEL, BLOCK_SIZE);
+        let policy = |pool: &[Arc<dyn Worker>]| {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                block_size: BLOCK_SIZE,
+                ..Default::default()
+            });
+            policy.init_workers(pool);
+            policy.set_kv_event_monitor(Some(Arc::clone(&monitor)));
+            Arc::new(policy)
+        };
+        policies.set_prefill_policy(policy(&pools[0]));
+        policies.set_decode_policy(policy(&pools[1]));
+    } else {
+        policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        policies.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
+    }
+    (PairPath::new(registry, policies, PAIR_MODEL), prompts)
+}
+
+/// One pair placement through the routers' own pair selection, with no admission window: the
+/// open prefills and the picked prefill's open partners gathered for the request, one policy
+/// pick over each. Under round robin, and under cache-aware where each request's prompt has
+/// one holder a role (an index lookup and a hit on both sides), at 64 and 512 workers a side,
+/// untraced and inside a cache-trace capture.
+fn bench_pair_placement(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pair_placement");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    for side in [64, 512] {
+        for (policy, cache_aware) in [("round_robin", false), ("cache_aware", true)] {
+            let (path, prompts) = pair_fleet(side, cache_aware);
+            for (mode, traced) in [("untraced", false), ("traced", true)] {
+                group.throughput(Throughput::Elements(1));
+                let mut next = 0usize;
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{policy}/{mode}"), side),
+                    &side,
+                    |b, _| {
+                        b.iter(|| {
+                            let tokens = &prompts[next % prompts.len()];
+                            next += 1;
+                            let pair =
+                                runtime.block_on(path.place(Some(black_box(tokens)), traced));
+                            black_box(pair.unwrap())
+                        });
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_select,
@@ -410,6 +559,7 @@ criterion_group!(
     bench_least_load_after_report,
     bench_ring_policies,
     bench_simple_policy_pick,
-    bench_keyed_sticky_hit
+    bench_keyed_sticky_hit,
+    bench_pair_placement
 );
 criterion_main!(benches);

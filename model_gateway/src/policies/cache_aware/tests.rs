@@ -30,7 +30,7 @@ fn overlap_affinity_group(
     workers: &[Arc<dyn Worker>],
     tokens: &[u32],
     healthy_indices: &[usize],
-    indexer: &KvIndex,
+    indexer: &Arc<KvIndex>,
     block_size: usize,
     tuning: &OverlapTuning<'_>,
 ) -> Vec<usize> {
@@ -48,7 +48,7 @@ use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
     worker::{
         runtime::StallReason,
-        test_support::{no_health_check, worker_of},
+        test_support::{no_health_check, ready_worker, worker_of},
         BasicWorkerBuilder, WorkerBlocks, WorkerType,
     },
 };
@@ -2572,7 +2572,7 @@ fn hybrid_holders_are_ranked_at_what_their_groups_can_serve() {
     ];
     for (w1_window, w1_state, w2_window, w2_state, want, note) in cells {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        let indexer = KvIndex::chain();
+        let indexer = Arc::new(KvIndex::chain());
         hybrid_worker(
             &indexer,
             "http://w1:8000",
@@ -2603,7 +2603,7 @@ fn hybrid_holders_are_ranked_at_what_their_groups_can_serve() {
 fn a_plain_worker_keeps_the_index_overlap_beside_a_hybrid_one() {
     let tokens: Vec<u32> = (1..=40).collect();
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    let indexer = KvIndex::chain();
+    let indexer = Arc::new(KvIndex::chain());
     hybrid_worker(
         &indexer,
         "http://w1:8000",
@@ -5116,7 +5116,7 @@ fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
     let w3 = indexer.worker_id("http://w3:8000").unwrap();
     let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
-    assert!(table.describes(&workers));
+    assert!(table.describes(&workers, &indexer));
     assert!(table.fresh(liveness::now_ms()));
     assert_eq!(table.position(w3, &workers), Some(2));
     assert_eq!(table.id_at, vec![None, None, Some(w3)]);
@@ -5133,6 +5133,324 @@ fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     // Every worker was admitted just now: a young fleet lists nothing to slice.
     assert!(table.warming.is_empty());
     assert!(!table.fresh(liveness::now_ms() + POOL_TABLE_REFRESH_MS));
+}
+
+/// Eight workers behind one policy and one event index, for the lists a
+/// prefill-decode fleet hands a policy: `held[i]` is the token sequence
+/// stored for worker `i`, none when empty. Worker `busy` reports a queue and
+/// the others none, so a request placed by load never goes to it.
+fn two_lists(held: [&[u32]; 8], busy: usize) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let workers = make_workers(&refs);
+    policy.init_workers(&workers);
+    let mut queued = [0; 8];
+    queued[busy] = 10_000;
+    update_expected_wait_loads(&policy, &workers, &queued);
+    let indexer = Arc::new(KvIndex::chain());
+    for (i, url) in urls.iter().enumerate() {
+        let id = indexer.intern_worker(url).unwrap();
+        if !held[i].is_empty() {
+            store_blocks(&indexer, id, held[i], 4, (i as u64 + 1) * 1_000_000);
+        }
+    }
+    let monitor = Arc::new(KvEventMonitor::new());
+    monitor.indexers.insert("unknown".to_string(), indexer);
+    policy.set_kv_event_monitor(Some(monitor));
+    (policy, workers)
+}
+
+/// The picked prefill's partner list is a `Vec` built per request, so two
+/// lists of one length come at one address. Each reads a table of its own
+/// workers: the second list's holder keeps its prompt.
+#[test]
+fn a_second_list_at_the_first_lists_address_keeps_its_own_holder() {
+    let first: Vec<u32> = (1..=16).collect();
+    let second: Vec<u32> = (101..=116).collect();
+    let mut held: [&[u32]; 8] = [&[]; 8];
+    held[1] = &first;
+    held[6] = &second;
+    // The second list's holder is its one busy worker: a request that
+    // misses it is placed by load on another.
+    let (policy, workers) = two_lists(held, 6);
+    // One buffer, as the allocator hands a request's list the address of
+    // the last one: the first list, then the second in its place.
+    let mut list: Vec<Arc<dyn Worker>> = workers[..4].to_vec();
+    assert_eq!(route_tokens(&policy, &list, &first), 1);
+    list.clone_from_slice(&workers[4..]);
+    assert_eq!(
+        route_tokens(&policy, &list, &second),
+        2,
+        "the second list's holder, at its own position"
+    );
+}
+
+/// One policy object serves every model of its role. A second model's pool
+/// of the first one's length, at its address, reads a table of its own
+/// workers and its own index.
+#[test]
+fn a_second_models_pool_at_the_first_models_address_keeps_its_own_holder() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let pool = |model: &str| -> Vec<Arc<dyn Worker>> {
+        (0..4)
+            .map(|i| ready_worker(&format!("http://{model}{i}:8000"), model))
+            .collect()
+    };
+    let (a, b) = (pool("a"), pool("b"));
+    let prompt: Vec<u32> = (1..=16).collect();
+    let monitor = Arc::new(KvEventMonitor::new());
+    // The second model's holder is the one busy worker: a request that
+    // misses it is placed by load on another.
+    let both: Vec<Arc<dyn Worker>> = a.iter().chain(&b).cloned().collect();
+    policy.init_workers(&both);
+    update_expected_wait_loads(&policy, &both, &[0, 0, 0, 0, 0, 10_000, 0, 0]);
+    // An index numbers its workers as their first batches arrive: here in
+    // opposite orders. Worker 1 of each model holds the prompt.
+    for (model, workers, order) in [("a", &a, [0, 1, 2, 3]), ("b", &b, [3, 2, 1, 0])] {
+        let indexer = Arc::new(KvIndex::chain());
+        for i in order {
+            let id = indexer.intern_worker(workers[i].url()).unwrap();
+            if i == 1 {
+                store_blocks(&indexer, id, &prompt, 4, 1_000_000);
+            }
+        }
+        monitor.indexers.insert(model.to_string(), indexer);
+    }
+    policy.set_kv_event_monitor(Some(monitor));
+    let mut list = a.clone();
+    assert_eq!(route_tokens(&policy, &list, &prompt), 1);
+    list.clone_from_slice(&b);
+    assert_eq!(
+        route_tokens(&policy, &list, &prompt),
+        1,
+        "the second model's holder, by its own index"
+    );
+}
+
+/// The warm-up slice reads a list's rows through the table. At the address
+/// a settled list left, the next list's emptied worker still takes its miss:
+/// the facts read are its own, not those of the row the first list had there.
+#[test]
+fn a_second_list_at_the_first_lists_address_reads_its_own_warm_up_facts() {
+    // 1,100 blocks a worker, past the level that makes an empty index thin;
+    // worker 6 holds nothing.
+    let cached: Vec<Vec<u32>> = (0..8u32)
+        .map(|i| (0..4_400).map(|t| (i + 1) * 100_000 + t).collect())
+        .collect();
+    let mut held: [&[u32]; 8] = [&[]; 8];
+    for (i, tokens) in cached.iter().enumerate() {
+        if i != 6 {
+            held[i] = tokens;
+        }
+    }
+    // The emptied worker is its list's one busy worker: a miss placed by
+    // load goes to another, the slice's first miss goes to it.
+    let (policy, workers) = two_lists(held, 6);
+    let novel = |turn: u32| -> Vec<u32> { (0..16).map(|t| 90_000_000 + turn * 16 + t).collect() };
+    let mut list: Vec<Arc<dyn Worker>> = workers[..4].to_vec();
+    // A miss on the settled list is placed by load and moves no counter.
+    route_tokens(&policy, &list, &novel(0));
+    assert_eq!(policy.warmup_misses.load(Ordering::Relaxed), 0);
+    list.clone_from_slice(&workers[4..]);
+    assert_eq!(
+        route_tokens(&policy, &list, &novel(1)),
+        2,
+        "the emptied worker of the second list takes the slice's miss"
+    );
+}
+
+/// A table answers for the workers it was built from under the index it was
+/// built against, and for no other list or index: a list of the same length
+/// with another worker at one position is not described, wherever it lives,
+/// nor the same workers under another index, and a copy of the list at
+/// another address is.
+#[test]
+fn a_pool_table_describes_its_own_workers_at_any_address() {
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+    let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
+    let weak_handles = Arc::weak_count(&workers[1]);
+    let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
+    let copy = workers.clone();
+    assert!(
+        table.describes(&copy, &indexer),
+        "the same workers in another buffer"
+    );
+    let mut other = workers.clone();
+    other[1] = make_workers(&["http://w2:8000"]).remove(0);
+    assert!(
+        !table.describes(&other, &indexer),
+        "another worker at one position"
+    );
+    assert!(!table.describes(&workers[..2], &indexer), "a shorter list");
+    // The same buffer with another list in it: the address alone says nothing.
+    let mut buffer = workers.clone();
+    let address = buffer.as_ptr();
+    buffer.clone_from_slice(&other);
+    assert_eq!(buffer.as_ptr(), address);
+    assert!(!table.describes(&buffer, &indexer));
+    // An index numbers its workers in its own space: the ids are the first
+    // index's alone, and the table keeps no index alive.
+    let another = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
+    assert!(
+        !table.describes(&copy, &another),
+        "the same workers under another index"
+    );
+    assert_eq!(Arc::strong_count(&indexer), 1);
+    assert_eq!(Arc::weak_count(&indexer), 1);
+    // The table holds one weak handle a worker: the worker's address stays
+    // the table's while the table lives, and the worker dies with its last
+    // owner all the same.
+    assert_eq!(Arc::weak_count(&workers[1]), weak_handles + 1);
+    let second = Arc::downgrade(&workers[1]);
+    drop((workers, copy));
+    assert!(
+        second.upgrade().is_none(),
+        "the table keeps no worker alive"
+    );
+    assert!(!table.describes(&other, &indexer));
+    // Only the table holds the dead worker's allocation now: a worker made
+    // after the drop cannot land at its address.
+    drop(second);
+    let mut after = other.clone();
+    after[1] = make_workers(&["http://w2:8000"]).remove(0);
+    assert!(
+        !table.describes(&after, &indexer),
+        "a worker made after the drop"
+    );
+}
+
+/// Four workers of two models by turns behind one policy, as a pool of
+/// workers that serve both: each model's index holds the workers that report
+/// that model, numbered as their batches arrived. Worker 0 holds the first
+/// prompt in the first index, worker 3 the second prompt in the second. The
+/// second prompt's holder reports a queue and the others none, so a request
+/// that misses it is placed by load on another.
+fn mixed_primaries() -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, [Vec<u32>; 2]) {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers: Vec<Arc<dyn Worker>> = ["a", "b", "a", "b"]
+        .iter()
+        .enumerate()
+        .map(|(i, model)| ready_worker(&format!("http://w{i}:8000"), model))
+        .collect();
+    policy.init_workers(&workers);
+    update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 10_000]);
+    let prompts: [Vec<u32>; 2] = [(1..=16).collect(), (101..=116).collect()];
+    let monitor = Arc::new(KvEventMonitor::new());
+    for (model, members, holder, prompt) in
+        [("a", [0, 2], 0, &prompts[0]), ("b", [1, 3], 3, &prompts[1])]
+    {
+        let indexer = Arc::new(KvIndex::chain());
+        for i in members {
+            let id = indexer.intern_worker(workers[i].url()).unwrap();
+            if i == holder {
+                store_blocks(&indexer, id, prompt, 4, 1_000_000);
+            }
+        }
+        monitor.indexers.insert(model.to_string(), indexer);
+    }
+    policy.set_kv_event_monitor(Some(monitor));
+    (policy, workers, prompts)
+}
+
+/// A table's ids are its index's own, and a decision reads the index of the
+/// model its list's first admitted worker reports. When that worker fails
+/// the same list comes under the next index inside the refresh period: its
+/// holder is found by that index's ids, not through the table built against
+/// the first.
+#[test]
+fn a_list_whose_first_worker_fails_reads_the_next_index() {
+    let (policy, workers, prompts) = mixed_primaries();
+    assert_eq!(route_tokens(&policy, &workers, &prompts[0]), 0);
+    workers[0].set_status(WorkerStatus::NotReady);
+    assert_eq!(
+        route_tokens(&policy, &workers, &prompts[1]),
+        3,
+        "the second index's holder, by its own ids"
+    );
+}
+
+/// The registry hands each model a slice of its own, and two models served
+/// by the same workers get two slices of the same handles. The second
+/// slice, coming under the second index, reads a table of that index.
+#[test]
+fn a_second_slice_of_the_same_workers_reads_its_own_index() {
+    let (policy, workers, prompts) = mixed_primaries();
+    let first = workers.clone();
+    assert_eq!(route_tokens(&policy, &first, &prompts[0]), 0);
+    workers[0].set_status(WorkerStatus::NotReady);
+    let second = workers.clone();
+    assert_eq!(
+        route_tokens(&policy, &second, &prompts[1]),
+        3,
+        "the second index's holder, by its own ids"
+    );
+}
+
+/// Only the rebuild of a stale table takes the building flag, and only it
+/// gives the flag back: a table built for a list that had none leaves a
+/// rebuild running beside it its flag.
+#[test]
+fn a_build_for_a_new_list_leaves_a_running_rebuild_its_flag() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    // Another decision is rebuilding a stale table: it holds the flag.
+    policy.pool_table_building.store(true, Ordering::Release);
+    policy.pool_table(&workers, &indexer, now);
+    assert!(
+        policy.pool_table_building.load(Ordering::Acquire),
+        "a first build is no rebuild"
+    );
+    policy.pool_table_building.store(false, Ordering::Release);
+    // The same list past its refresh: this rebuild takes the flag and gives
+    // it back.
+    policy.pool_table(&workers, &indexer, now + POOL_TABLE_REFRESH_MS);
+    assert!(!policy.pool_table_building.load(Ordering::Acquire));
+    assert_eq!(policy.pool_tables.load().len(), 1);
+}
+
+/// A list has one kept table wherever its slice lives: found inside the
+/// refresh period, rebuilt in its own place after it, and gone as the oldest
+/// once eight younger lists are kept.
+#[test]
+fn a_list_has_one_kept_table_and_the_ninth_list_takes_the_oldest_place() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let workers = make_workers(&refs);
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    let first = policy.pool_table(&workers[..4], &indexer, now);
+    let copy = workers[..4].to_vec();
+    assert!(
+        Arc::ptr_eq(&first, &policy.pool_table(&copy, &indexer, now)),
+        "the same list in another buffer reads the kept table"
+    );
+    let rebuilt = policy.pool_table(&copy, &indexer, now + POOL_TABLE_REFRESH_MS);
+    assert!(!Arc::ptr_eq(&first, &rebuilt), "rebuilt past the period");
+    assert_eq!(
+        policy.pool_tables.load().len(),
+        1,
+        "in the stale one's place"
+    );
+    // The same list under another index has a table of its own.
+    let another = Arc::new(KvIndex::chain());
+    let under_another = policy.pool_table(&copy, &another, now + POOL_TABLE_REFRESH_MS);
+    assert!(!Arc::ptr_eq(&rebuilt, &under_another));
+    assert_eq!(policy.pool_tables.load().len(), 2);
+    // Eight younger lists, one worker each.
+    for (i, worker) in workers.iter().enumerate() {
+        let list = [Arc::clone(worker)];
+        policy.pool_table(&list, &indexer, now + POOL_TABLE_REFRESH_MS + 1 + i as u64);
+    }
+    let kept = policy.pool_tables.load();
+    assert_eq!(kept.len(), POOL_TABLES_KEPT);
+    assert!(
+        kept.iter().all(|table| !table.describes(&copy, &indexer)),
+        "the oldest table went"
+    );
 }
 
 /// `count` workers that all hold the shared block `[1, 2, 3, 4]` (a chat
