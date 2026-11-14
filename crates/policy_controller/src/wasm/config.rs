@@ -171,7 +171,8 @@ pub struct PluginSpec {
     pub fuel_per_micro: u64,
     pub view: Exposure,
     /// What the host must feed for the plugin's stages to mean anything
-    /// (hashes, loads, headers, media); the plugin declares it, the host
+    /// (hashes, loads, headers, media, the affinity column behind a
+    /// candidate's five affinity facts); the plugin declares it, the host
     /// cannot read it off a module.
     pub needs: Needs,
     /// The counters the plugin may add to, by id; a name per id.

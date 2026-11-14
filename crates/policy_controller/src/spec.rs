@@ -127,6 +127,14 @@ pub struct Needs {
     /// The request's own key's in-flight count per worker (a sessions rule
     /// with an in-flight cap).
     pub session_in_flight: bool,
+    /// The affinity column
+    /// ([`RequestFacts::affinity`](crate::RequestFacts::affinity)): one
+    /// [`AffinityFacts`](crate::AffinityFacts) a candidate. A stage that
+    /// reads any of the five declares this, whatever feeds them: `events`
+    /// asks for the index and the hash fields for the request's hashes, and
+    /// neither stands for the column. A host fills the column where this is
+    /// declared and may hand an empty one elsewhere.
+    pub affinity: bool,
 }
 
 impl Needs {
@@ -144,6 +152,7 @@ impl Needs {
             media: self.media || other.media,
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
+            affinity: self.affinity || other.affinity,
         }
     }
 }
@@ -1816,7 +1825,6 @@ fn check_profile(
     name: &str,
     p: &ProfileSpec,
     view: &ViewSpec,
-    needs: &mut Needs,
     deferred: &mut Deferred,
 ) -> Result<Option<Profile>, SpecError> {
     let gates = gates_of(p, view);
@@ -1836,13 +1844,10 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         match scorer_of(&stage, gates) {
-            Resolved::Built(scorer) => {
-                *needs = needs.or(scorer.needs());
-                scorers.push(Weighted {
-                    scorer,
-                    weight: stage.weight(),
-                });
-            }
+            Resolved::Built(scorer) => scorers.push(Weighted {
+                scorer,
+                weight: stage.weight(),
+            }),
             Resolved::NotInBuild(what) => {
                 complete = false;
                 deferred.note(stage_at.0, what);
@@ -2441,12 +2446,12 @@ impl PolicySpec {
         check_view(&self.view, denied_headers)?;
         check_index(&self.index, &self.view)?;
         let mut deferred = Deferred::default();
+        // What no stage declares: the sessions rules' counts and the view's
+        // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
         let mut profiles = Vec::with_capacity(self.profiles.len());
         for (name, profile) in &self.profiles {
-            if let Some(built) =
-                check_profile(name, profile, &self.view, &mut needs, &mut deferred)?
-            {
+            if let Some(built) = check_profile(name, profile, &self.view, &mut deferred)? {
                 profiles.push(built);
             }
         }
@@ -2600,6 +2605,9 @@ mod tests {
             assert_eq!(engine.needs().loads, load_aware, "{name}");
             assert_eq!(engine.needs().ring, name == "consistent_hashing", "{name}");
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
+            // The affinity column is fed where an affinity stage reads it
+            // and nowhere else: a preset without one declares no column.
+            assert_eq!(engine.needs().affinity, name == "cache_aware", "{name}");
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
@@ -2682,18 +2690,21 @@ mod tests {
         // A decode-phase binding before the pair binding decides the decode
         // requests that come alone; a pair's decode side is decided by the
         // binding its prefill lookup resolves to, with that pair's decode
-        // profile. The decode needs carry both.
+        // profile. The decode needs carry both. The pair's decode profile
+        // is not the first profile in name order, the order the engine
+        // holds them in: a decode slot that read the first profile would
+        // find the decode-only one and lose the pair's needs.
         let text = r#"{
           "apiVersion": "smg.policy/v1",
           "profiles": {
             "decode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
             "prefill": { "filter": ["healthy"], "pick": "round-robin" },
-            "decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "pair-decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
             "default": { "filter": ["healthy"], "pick": "round-robin" }
           },
           "bindings": [
             { "match": { "model": "*", "phase": ["decode"] }, "profile": "decode-only" },
-            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "pair-decode" } },
             { "match": { "model": "*" }, "profile": "default" }
           ]
         }"#;
@@ -3855,16 +3866,29 @@ mod tests {
     /// default (1.5, plus the margin) it spills.
     #[test]
     fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
-        use crate::{Candidate, Constraints, Health, PoolFacts, RequestFacts, Scratch, WorkerId};
+        use crate::{
+            AffinityFacts, Candidate, Constraints, Health, PoolFacts, RequestFacts, Scratch,
+            WorkerId,
+        };
         let hashes = [0u64; 16];
+        // The first worker holds the whole request; the column says so.
+        let held = [
+            AffinityFacts {
+                overlap_blocks: 16,
+                ..AffinityFacts::default()
+            },
+            AffinityFacts::default(),
+            AffinityFacts::default(),
+        ];
         let facts = RequestFacts {
             model: "m",
             block_hashes: &hashes,
             prompt_tokens: 256,
             seed: 7,
+            affinity: &held,
             ..RequestFacts::default()
         };
-        let row = |position: u32, in_flight: u32, overlap_blocks: u32| Candidate {
+        let row = |position: u32, in_flight: u32| Candidate {
             position,
             id: WorkerId(100 + u64::from(position)),
             health: Health {
@@ -3872,10 +3896,9 @@ mod tests {
                 ..Health::default()
             },
             in_flight,
-            overlap_blocks,
             ..Candidate::default()
         };
-        let pool = [row(0, 20, 16), row(1, 0, 0), row(2, 0, 0)];
+        let pool = [row(0, 20), row(1, 0), row(2, 0)];
         let leader = |score: &str| {
             let engine = spec_with_score(score).validate().expect("a valid profile");
             let decision = engine.decide(

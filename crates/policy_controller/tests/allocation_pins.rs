@@ -214,6 +214,7 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
     let pools = PairPools {
         prefills: &prefills,
         decodes: &decodes,
+        ..PairPools::default()
     };
     engine
         .decide_pair(&facts(1), &pool(80), pools, &cx, &cx, &mut scratch)

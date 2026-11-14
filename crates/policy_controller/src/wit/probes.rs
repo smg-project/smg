@@ -4,8 +4,11 @@
 //! against the descriptor in [`super::types`] (a retyped field fails the WIT
 //! test; the WIT order is the descriptor's, held by the byte-for-byte test,
 //! a struct's declaration order binding nothing). The host-only fields (a candidate's position and
-//! sample instant, a request's host clock, a lease's issue instant and
+//! sample instant, a request's host clock and affinity column, a lease's issue instant and
 //! session verdict, a target's and a pair's positions) are named as such.
+//! A `candidate` is tied to two structs, the engine's row and its entry of
+//! the request's affinity column: each is destructured whole, and the
+//! record's order, which neither struct holds, is named beside them.
 //! `dispatched` has no struct of its own: the host composes it from a lease,
 //! a target and a side.
 
@@ -14,8 +17,9 @@ use crate::{
     lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
     sessions::SessionVerdict,
     view::{
-        Candidate, HashKind, Header, Health, Identity, LoadRow, MediaCounts, OverloadRegime, Phase,
-        PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId, ZoneCapacity,
+        AffinityFacts, Candidate, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
+        OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,
+        ZoneCapacity,
     },
 };
 
@@ -65,6 +69,9 @@ wit! {
     Option<Pair> => "option<pair>",
     // Host-only: a lease's session verdict never reaches a guest.
     SessionVerdict => "host-only",
+    // Host-only: a guest reads the request's affinity column as five fields
+    // of each candidate.
+    &[AffinityFacts] => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -103,11 +110,34 @@ macro_rules! probe {
         let fields = fields.into_iter().filter(|(name, _)| !host.contains(name)).collect();
         Probe { record: $record, before: &[$(($bn, $bt)),*], fields }
     }};
+    // A record tied to two structs. Each pattern names every field of its
+    // struct without `..`, as above; `order` names the record's fields in
+    // the record's order, which neither struct holds. A field of either
+    // struct that `order` and `host` both leave out is not dropped: it
+    // follows the order, where the descriptor's test names it.
+    ($record:literal, before [$($bn:literal: $bt:literal),*],
+     $ty:ident { $($field:ident),+ $(,)? } = $value:expr,
+     $ty2:ident { $($field2:ident),+ $(,)? } = $value2:expr,
+     order [$($ordered:ident),+ $(,)?] host [$($host:ident),*]) => {{
+        let $ty { $($field),+ } = $value;
+        let $ty2 { $($field2),+ } = $value2;
+        $(let _ = $host;)*
+        let named: &[&str] = &[$(stringify!($ordered),)+ $(stringify!($host)),*];
+        let bound: Vec<(&'static str, &'static str)> = vec![
+            $((stringify!($field), ty($field)),)+
+            $((stringify!($field2), ty($field2))),+
+        ];
+        let mut fields: Vec<(&'static str, &'static str)> =
+            vec![$((stringify!($ordered), ty($ordered))),+];
+        fields.extend(bound.into_iter().filter(|(name, _)| !named.contains(name)));
+        Probe { record: $record, before: &[$(($bn, $bt)),*], fields }
+    }};
 }
 
 /// Every record's probe, over a default value of its struct.
 pub(crate) fn all() -> Vec<Probe> {
     let candidate = Candidate::default();
+    let affinity = AffinityFacts::default();
     let load = LoadRow::default();
     let media = MediaCounts::default();
     let request = RequestFacts::default();
@@ -131,19 +161,28 @@ pub(crate) fn all() -> Vec<Probe> {
             running, queued, waiting_uncached_tokens, kv_usage_permille, active_kv_permille,
             live_rate, resident_tokens, report_age_ms, source, max_running,
         } host [], &load),
-        probe!("candidate", before [], Candidate {
-            position, id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector,
-            in_flight, load, load_sampled_at_micros, overlap_blocks, predicted_blocks,
-            session_hit, session_in_flight, pair_class, has_capacity, has_room,
-            admitted_age_ms, indexed_growth, zone, labels, ec_compatible, vision, host_local,
-            active_sessions, key, indexed_blocks,
-        } host [position, load_sampled_at_micros], &candidate),
+        probe!("candidate", before [],
+            Candidate {
+                position, id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector,
+                in_flight, load, load_sampled_at_micros, session_hit, session_in_flight,
+                pair_class, has_capacity, has_room, zone, labels, ec_compatible, vision,
+                host_local, active_sessions, key,
+            } = &candidate,
+            AffinityFacts {
+                overlap_blocks, predicted_blocks, admitted_age_ms, indexed_growth, indexed_blocks,
+            } = &affinity,
+            order [
+                id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector, in_flight,
+                load, overlap_blocks, predicted_blocks, session_hit, session_in_flight,
+                pair_class, has_capacity, has_room, admitted_age_ms, indexed_growth, zone,
+                labels, ec_compatible, vision, host_local, active_sessions, key, indexed_blocks,
+            ] host [position, load_sampled_at_micros]),
         probe!("media", before [], MediaCounts { images, audio, video, bytes } host [], &media),
         probe!("request", before [], RequestFacts {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
-            budget_micros, headers, media, seed, block_size, now_micros,
-        } host [now_micros], &request),
+            budget_micros, headers, media, seed, block_size, now_micros, affinity,
+        } host [now_micros, affinity], &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
             pool_size, membership_epoch, ring_epoch, regime, generation, zones,
@@ -199,6 +238,37 @@ mod tests {
     fn every_record_probe_matches_its_descriptor() {
         let drift = drift();
         assert!(drift.is_empty(), "{}", drift.join("\n"));
+    }
+
+    /// The probe of a record tied to two structs reads the record's order
+    /// from its `order` list, and a field of either struct that the list and
+    /// `host` both leave out follows the list instead of vanishing: the
+    /// descriptor's test then names the record.
+    #[test]
+    fn a_field_the_order_leaves_out_follows_it() {
+        struct Row {
+            a: u32,
+            b: u64,
+            c: bool,
+        }
+        struct Column {
+            x: u32,
+            y: u16,
+        }
+        let row = Row {
+            a: 0,
+            b: 0,
+            c: false,
+        };
+        let column = Column { x: 0, y: 0 };
+        let probe = probe!("toy", before [],
+            Row { a, b, c } = &row,
+            Column { x, y } = &column,
+            order [b, x, a] host [c]);
+        assert_eq!(
+            probe.fields,
+            [("b", "u64"), ("x", "u32"), ("a", "u32"), ("y", "u16")]
+        );
     }
 
     #[test]

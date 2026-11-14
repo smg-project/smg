@@ -11,8 +11,9 @@
 //! Section by section:
 //!
 //! - 4.1, the view ([`view`]): [`RequestFacts`], [`Candidate`] rows with their
-//!   [`LoadRow`], [`Constraints`] and [`PoolFacts`]. Built once per decision by
-//!   the host into a reused buffer; no handle, no callback into the host.
+//!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
+//!   and [`PoolFacts`]. Built once per decision by the host into a reused
+//!   buffer; no handle, no callback into the host.
 //! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
@@ -99,9 +100,9 @@ pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
 pub use spec::{Needs, PolicySpec, SessionsSpec, SpecError, API_VERSION, PRESETS};
 pub use view::{
-    fingerprint, Candidate, Constraints, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
-    OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,
-    ZoneCapacity,
+    fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
+    LoadRow, MediaCounts, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource,
+    WireModes, WorkerId, ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
