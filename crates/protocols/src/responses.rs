@@ -2812,6 +2812,8 @@ pub enum LocalShellExec {
 // Configuration Enums
 // ============================================================================
 
+/// The processing tier a request asks for, and the one a Response reports it
+/// was served on (`ServiceTierResponses` in the spec); the two may differ.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(rename = "ResponsesServiceTier")]
@@ -2822,6 +2824,12 @@ pub enum ServiceTier {
     Flex,
     Scale,
     Priority,
+    /// Fast mode, which `priority` also selects. The OpenAI API answers a
+    /// `fast` request with `priority`; the gRPC routers echo `fast`.
+    Fast,
+    /// The access-controlled Ultrafast Processing tier. A Response served on
+    /// it reports `ultrafast`.
+    Ultrafast,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, schemars::JsonSchema)]

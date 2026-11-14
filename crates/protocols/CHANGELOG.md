@@ -94,6 +94,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses request with `service_tier: "fast"` or `"ultrafast"`, as the public API offers them
+  (`ServiceTierResponses`), parses and forwards the tier, and a Response served on either parses.
+  The crate refused both as unknown variants. Breaking: `ServiceTier` gains `Fast` and `Ultrafast`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
