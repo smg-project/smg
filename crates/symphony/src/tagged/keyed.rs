@@ -1,7 +1,7 @@
 //! Keyed arguments: the events of one call written as its name and then `<arg_key>` and
 //! `<arg_value>` pairs, from its bytes.
 //!
-//! GLM, Hy4, Hy V3, Ling and IQuest write a call as
+//! GLM, Hy4, Hy V3, Ling, IQuest and LongCat write a call as
 //!
 //! ```text
 //! <tool_call>get_weather
@@ -14,9 +14,10 @@
 //! each with its own spellings of the four tags ([`Tags`]) and its own newlines around them (Ling
 //! writes one after the name, after each `</arg_key>` and before the close, GLM 4.5 and 4.6 one
 //! after the name, after each `</arg_key>` and after each `</arg_value>`, K2-Horizon the same under
-//! `ifm|`-prefixed tags with the block's own around its calls, Hy V3 K2-Horizon's under the plain
-//! tags with `<tool_sep>` after the name ([`Tags::name_end`]), Hy4 and IQuest none;
-//! [`Newlines`]). The engine's table
+//! `ifm|`-prefixed tags with the block's own around its calls, LongCat the same under
+//! `longcat_`-prefixed tags with no block, Hy V3 K2-Horizon's under the plain tags with
+//! `<tool_sep>` after the name ([`Tags::name_end`]), Hy4 and IQuest none; [`Newlines`]). The
+//! engine's table
 //! owns the call markers: it enters this assembler after the opening marker and leaves it at the
 //! closing one, which it hands over as the call's end. Between the two the assembler reads the
 //! name and the tags itself.
@@ -201,6 +202,19 @@ impl Tags {
         name_end: "<tool_sep>",
         newlines: Newlines::K2_HORIZON,
         ..Self::PLAIN
+    };
+
+    /// LongCat's spelling, every tag prefixed `longcat_`, with GLM 4.5 and 4.6's newlines (in
+    /// longcat-2.5's recorded parse sets, 18 of 18 calls read `<longcat_tool_call>NAME\n`,
+    /// 28 of 28 pairs `</longcat_arg_key>\n<longcat_arg_value>` and `</longcat_arg_value>\n`, the
+    /// one without arguments `<longcat_tool_call>NAME\n</longcat_tool_call>`).
+    pub const LONGCAT: Self = Self {
+        key_open: "<longcat_arg_key>",
+        key_close: "</longcat_arg_key>",
+        value_open: "<longcat_arg_value>",
+        value_close: "</longcat_arg_value>",
+        name_end: "",
+        newlines: Newlines::GLM4,
     };
 
     fn text(&self, tag: usize) -> &'static str {
@@ -1477,7 +1491,7 @@ mod tests {
         }
     }
 
-    /// A refused run inside a call that read a pair before it and one after it, in the three
+    /// A refused run inside a call that read a pair before it and one after it, in four
     /// spellings of the tags: the pairs stand as the call's fragments, and nothing is made up for
     /// the call's close, so the arguments are a strict JSON prefix and no whole value (what the
     /// fragments promise until a call's own end says it is whole: a client that reads them as
@@ -1486,7 +1500,7 @@ mod tests {
     /// whole still closes its object.
     #[test]
     fn a_call_the_syntax_refused_bytes_inside_keeps_its_pairs_and_gets_no_close() {
-        for tags in [Tags::PLAIN, Tags::K2_HORIZON, Tags::HY4] {
+        for tags in [Tags::PLAIN, Tags::K2_HORIZON, Tags::HY4, Tags::LONGCAT] {
             let call = format!(
                 "f{key}s{key_close}{value}Paris{value_close}junk{key}n{key_close}{value}3{value_close}",
                 key = tags.key_open,

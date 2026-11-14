@@ -3,8 +3,10 @@
 //! inside its noise. An exact-cache hit hands out one copy of the prompt's
 //! ids; a decode step on a byte-level vocabulary allocates nothing; a decode
 //! step on a byte-fallback vocabulary allocates nothing either on its plain-piece
-//! path, the piece going from the table into the stream's buffer. Each
-//! pin states the count it reads today and what moves it, so the change that
+//! path, the piece going from the table into the stream's buffer; a cold
+//! text of pieces the map tier has not met allocates for the tier's slabs
+//! alone, not per piece. Each pin states the count it reads today and what
+//! moves it, so the change that
 //! removes a copy flips the pin in the same commit. A separate executable, so
 //! it can declare the counting allocator the pins need.
 
@@ -187,10 +189,11 @@ fn distinct(steps: &[usize]) -> BTreeSet<usize> {
 #[test]
 fn a_first_sight_of_a_forty_byte_piece_merges_without_the_heap() {
     let tokenizer = byte_level();
-    // The thread's cache and its map tier exist and have room: the pieces
-    // below settle both before the measured piece.
-    for letter in ["a", "b", "c", "d", "e", "f"] {
-        let settled = letter.repeat(40);
+    // The thread's cache and its map tier exist and have room: the twenty
+    // pieces below settle the cache and grow the tier's slabs past the
+    // measured piece before it comes.
+    for letter in 'a'..='t' {
+        let settled: String = std::iter::repeat_n(letter, 40).collect();
         tokenizer.encode(&settled, false).expect("an encode");
     }
     // One piece of forty bytes under the byte-level split, with merges in it.
@@ -199,9 +202,52 @@ fn a_first_sight_of_a_forty_byte_piece_merges_without_the_heap() {
     let encoding = encoding.expect("an encode");
     assert_eq!(encoding.token_ids().len(), 24, "h e llo, eight times");
     assert_eq!(
-        calls, 4,
-        "a first sight of a 40-byte piece allocated {calls} times: the ids and the cache entry \
-         are four (the units live inline), the merge itself none"
+        calls, 2,
+        "a first sight of a 40-byte piece allocated {calls} times: the ids and the encoding \
+         are two (the units live inline), the cache entry none (the map tier's slabs have \
+         room), the merge itself none"
+    );
+}
+
+/// `len` letters, distinct for distinct `i`: `i` spelled in letters, padded
+/// with one the spelling never uses.
+fn letters(len: usize, i: u32) -> String {
+    let digits = b"abcdefghij";
+    let mut word: String = format!("{i:05}")
+        .bytes()
+        .map(|digit| char::from(digits[usize::from(digit - b'0')]))
+        .collect();
+    while word.len() < len {
+        word.push('x');
+    }
+    word
+}
+
+#[test]
+fn a_cold_two_kilobyte_text_of_map_tier_pieces_allocates_for_its_slabs_alone() {
+    let tokenizer = byte_level();
+    // The thread's cache exists: one short piece settles it, so the count
+    // below is the text's own.
+    tokenizer.encode("hello", false).expect("an encode");
+    // Forty words of 48 letters, each with its space one piece of 49 bytes
+    // under the byte-level split, none seen before: 2 KB of map-tier misses.
+    let text: String = (0..40).map(|i| format!(" {}", letters(48, i))).collect();
+    assert_eq!(text.len(), 40 * 49);
+    let (encoding, calls) = allocations_during(|| tokenizer.encode(&text, false));
+    let encoding = encoding.expect("an encode");
+    assert!(encoding.token_ids().len() >= 40);
+    // The slabs' doublings are fifteen (the byte slab seven, the id slab seven, the slots
+    // once); the crate's default encoder reads three more than the v1 feature's encoder
+    // for the same text, on its own path.
+    #[cfg(not(feature = "tokenizers-v1"))]
+    const EXPECTED: usize = 18;
+    #[cfg(feature = "tokenizers-v1")]
+    const EXPECTED: usize = 15;
+    assert_eq!(
+        calls, EXPECTED,
+        "a cold 2 KB text of forty map-tier pieces allocated {calls} times: the slabs' doublings \
+         as the tier grows for its first pieces and the encoder's own (two boxes per piece, \
+         88 in all, before the slabs)"
     );
 }
 
