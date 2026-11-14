@@ -1,59 +1,19 @@
 //! What a control-plane key lookup allocates, pinned at today's count, so
 //! the next change that copies the matched entry fails a test rather than
 //! moving a number inside a benchmark's noise. A separate executable, so it
-//! can declare the counting allocator the pin needs.
+//! can declare the counting allocator the pin needs (`common`).
 
 #![expect(
     clippy::print_stderr,
     reason = "the count a pin reads is printed for the Numbers table"
 )]
-#![expect(
-    unsafe_code,
-    reason = "a counting global allocator is the only way to see what a lookup allocated"
-)]
+mod common;
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
-};
-
+use common::counting_alloc::{allocations_during, Counting};
 use smg_auth::{ApiKeyEntry, ApiKeySet, Role};
-
-thread_local! {
-    /// Allocation and reallocation calls this thread made.
-    static CALLS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        CALLS.with(|calls| calls.set(calls.get() + 1));
-        // SAFETY: the same layout contract as the caller's, forwarded to the system allocator.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` came from `alloc` with this layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        CALLS.with(|calls| calls.set(calls.get() + 1));
-        // SAFETY: `ptr` came from `alloc` with this layout; the caller upholds `new_size`.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
-
-/// What `work` returns, and the allocation calls this thread made during it.
-fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
-    let before = CALLS.with(Cell::get);
-    let out = work();
-    (out, CALLS.with(Cell::get) - before)
-}
 
 /// A lookup hashes the presented key on the stack and reads the matched
 /// entry through the set's snapshot: nothing is allocated, whether the key
