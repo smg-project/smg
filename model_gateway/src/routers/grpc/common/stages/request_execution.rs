@@ -1016,8 +1016,7 @@ fn pin_grouped_dp_prefill_room(
         }
         ExecutionPlan::EncodePrefillDecode { .. } => "an EPD request",
         ExecutionPlan::Batch { .. } => "a batched request",
-        ExecutionPlan::EmbedBatch { .. } => "a batched embed request",
-        ExecutionPlan::Single(_) => return None,
+        ExecutionPlan::Single(_) | ExecutionPlan::EmbedBatch { .. } => return None,
     };
     note_unpinned_prefill_room(prefill.as_ref(), unpinned);
     None
