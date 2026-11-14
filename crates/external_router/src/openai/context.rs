@@ -205,10 +205,6 @@ impl RequestContext {
         self.state.worker.as_ref().map(|w| w.provider.as_ref())
     }
 
-    pub fn payload(&self) -> Option<&PayloadState> {
-        self.state.payload.as_ref()
-    }
-
     pub fn take_payload(&mut self) -> Option<PayloadState> {
         self.state.payload.take()
     }

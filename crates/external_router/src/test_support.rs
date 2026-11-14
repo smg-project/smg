@@ -268,6 +268,8 @@ pub(crate) mod counting_alloc {
     thread_local! {
         /// Allocation and reallocation calls this thread made.
         static CALLS: Cell<usize> = const { Cell::new(0) };
+        /// Bytes this thread requested, the growth of a reallocation once.
+        static BYTES: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Allocation and reallocation calls this thread made so far.
@@ -275,11 +277,22 @@ pub(crate) mod counting_alloc {
         CALLS.with(Cell::get)
     }
 
+    /// Bytes this thread requested so far (the growth of a reallocation
+    /// counts once).
+    pub(crate) fn bytes() -> usize {
+        BYTES.with(Cell::get)
+    }
+
+    fn count(bytes: usize) {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+        BYTES.with(|total| total.set(total.get() + bytes));
+    }
+
     struct Counting;
 
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            CALLS.with(|calls| calls.set(calls.get() + 1));
+            count(layout.size());
             // SAFETY: the caller's layout contract, forwarded to the system allocator.
             unsafe { System.alloc(layout) }
         }
@@ -290,7 +303,7 @@ pub(crate) mod counting_alloc {
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            CALLS.with(|calls| calls.set(calls.get() + 1));
+            count(new_size.saturating_sub(layout.size()));
             // SAFETY: `ptr` came from this allocator with `layout`; the new size is the caller's.
             unsafe { System.realloc(ptr, layout, new_size) }
         }
@@ -300,15 +313,20 @@ pub(crate) mod counting_alloc {
     static GLOBAL: Counting = Counting;
 
     /// The count moves by one for one allocation and one reallocation,
-    /// and not for a free: what every pin in the crate reads.
+    /// and not for a free, and the bytes by what was requested, a
+    /// reallocation's growth once: what every pin in the crate reads.
     #[test]
     fn the_count_follows_this_threads_allocation_calls() {
         let before = calls();
-        let mut bytes: Vec<u8> = Vec::with_capacity(8);
+        let before_bytes = bytes();
+        let mut bytes_held: Vec<u8> = Vec::with_capacity(8);
         assert_eq!(calls() - before, 1, "one allocation");
-        bytes.extend(std::iter::repeat_n(0u8, 64));
+        assert_eq!(bytes() - before_bytes, 8, "the allocation's bytes");
+        bytes_held.extend(std::iter::repeat_n(0u8, 64));
         assert_eq!(calls() - before, 2, "one reallocation on top");
-        drop(bytes);
+        assert_eq!(bytes() - before_bytes, 64, "the reallocation's growth once");
+        drop(bytes_held);
         assert_eq!(calls() - before, 2, "a free is not counted");
+        assert_eq!(bytes() - before_bytes, 64, "a free takes nothing back");
     }
 }

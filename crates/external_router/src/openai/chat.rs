@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    context::{ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection},
+    context::{ComponentRefs, RequestContext, SharedComponents, WorkerSelection},
     provider::ProviderRegistry,
     router::resolve_provider,
 };
@@ -232,18 +232,11 @@ pub(super) async fn route_chat(
     });
 
     let url = format!("{}/v1/chat/completions", worker.url());
-    ctx.state.payload = Some(PayloadState {
-        json: payload,
-        url: url.clone(),
-    });
 
-    // Wrap values in Arc to avoid cloning large objects on each retry attempt
-    #[expect(
-        clippy::expect_used,
-        reason = "payload is set earlier in this function; absence is a logic error"
-    )]
-    let payload_ref = ctx.payload().expect("Payload not prepared");
-    let payload_json = Arc::new(payload_ref.json.clone());
+    // The attempts share the one serialized payload through an Arc, and it
+    // moves in: nothing on this route reads it back from the context, so it
+    // is not stored there to be copied out again.
+    let payload_json = Arc::new(payload);
     let client = ctx.components.client().clone();
     let headers_cloned = Arc::new(ctx.headers().cloned());
     let worker_api_key = Arc::new(worker.api_key().cloned());
@@ -354,10 +347,17 @@ pub(super) async fn route_chat(
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use axum::body::to_bytes;
 
     use super::*;
-    use crate::{retry::REQUEST_TIMEOUT_CODE, test_support::upstream};
+    use crate::{
+        error::extract_error_code_from_response,
+        retry::REQUEST_TIMEOUT_CODE,
+        tenant::TenantKey,
+        test_support::{counting_alloc, http_client, upstream, RefusedAddress, StubWorker},
+        worker::{ExternalWorker, WorkerStats},
+    };
 
     async fn bytes_of(response: Response) -> Vec<u8> {
         to_bytes(response.into_body(), usize::MAX)
@@ -471,7 +471,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
-            error::extract_error_code_from_response(&response),
+            extract_error_code_from_response(&response),
             REQUEST_TIMEOUT_CODE
         );
         assert!(!is_retryable_response(&response));
@@ -487,5 +487,114 @@ mod tests {
             Some("text/event-stream")
         );
         assert_eq!(bytes_of(response).await, b"data: x\n\n");
+    }
+
+    /// A worker source that selects its one worker (the crate's stub source
+    /// selects none).
+    #[derive(Debug)]
+    struct OneWorker(Arc<dyn ExternalWorker>);
+
+    #[async_trait]
+    impl WorkerSource for OneWorker {
+        async fn select(
+            &self,
+            _req: &SelectWorkerRequest<'_>,
+        ) -> Result<Arc<dyn ExternalWorker>, Response> {
+            Ok(Arc::clone(&self.0))
+        }
+
+        fn retry_config(&self, _model_id: &str) -> Option<RetryConfig> {
+            None
+        }
+
+        fn stats(&self) -> WorkerStats {
+            WorkerStats::default()
+        }
+
+        fn external_workers(&self) -> Vec<Arc<dyn ExternalWorker>> {
+            vec![Arc::clone(&self.0)]
+        }
+    }
+
+    /// A chat request whose one message carries `content_bytes` of text.
+    fn chat_request(content_bytes: usize) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x".repeat(content_bytes)}],
+        }))
+        .expect("a chat request")
+    }
+
+    /// The bytes this thread allocates while the route takes a request of
+    /// `content_bytes` of message text to its one attempt, against a worker
+    /// that refuses the connection: the serialized body is built before the
+    /// connect, and no socket's timing enters the count.
+    async fn bytes_allocated_by_the_route(
+        deps: &ChatRouterContext<'_>,
+        tenant: &TenantRequestMeta,
+        content_bytes: usize,
+    ) -> usize {
+        let body = chat_request(content_bytes);
+        let before = counting_alloc::bytes();
+        let response = route_chat(deps, None, tenant, body, "m").await;
+        let allocated = counting_alloc::bytes() - before;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "upstream_error",
+            "the answer is the one attempt's refused connect"
+        );
+        allocated
+    }
+
+    /// The serialized request is built once and moves into the share the
+    /// attempts send: the route does not copy it a second time. Read as the
+    /// bytes the route allocates per byte of message text between two sizes
+    /// in the same growth band of the serializers' buffers (the fixed costs
+    /// cancel), up to the one attempt's connect: the exact serialization's
+    /// text and value and the attempt's own serialization remain, five bytes
+    /// per byte at these sizes; the route before this change copied the value
+    /// once more and read six. The window's floor catches a route that answers
+    /// before it serializes; the error code ties the answer to the attempt.
+    #[expect(
+        clippy::print_stderr,
+        reason = "the numbers a pin reads are printed for the Numbers table"
+    )]
+    #[tokio::test]
+    async fn the_serialized_request_is_not_copied_a_second_time_for_the_attempts() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}", refused.addr());
+        let workers: Arc<dyn WorkerSource> = Arc::new(OneWorker(StubWorker::at(&url)));
+        let provider_registry = ProviderRegistry::new();
+        let shared_components = Arc::new(SharedComponents {
+            client: http_client(),
+        });
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        let deps = ChatRouterContext {
+            workers: &workers,
+            provider_registry: &provider_registry,
+            shared_components: &shared_components,
+            retry_config: &retry_config,
+        };
+        let tenant = TenantRequestMeta::new(TenantKey::new("t"));
+        // Whatever a first request builds once is not the pin's.
+        bytes_allocated_by_the_route(&deps, &tenant, 1024).await;
+        let (small, large) = (48 * 1024, 96 * 1024);
+        let at_small = bytes_allocated_by_the_route(&deps, &tenant, small).await;
+        let at_large = bytes_allocated_by_the_route(&deps, &tenant, large).await;
+        let per_thousand = at_large.saturating_sub(at_small) * 1000 / (large - small);
+        eprintln!(
+            "bytes allocated by the chat route: {at_small} for {small} bytes of message text, {at_large} for {large}: {per_thousand} per thousand bytes of text"
+        );
+        assert!(
+            (4000..5500).contains(&per_thousand),
+            "bytes allocated per thousand bytes of message text: {per_thousand}"
+        );
     }
 }
