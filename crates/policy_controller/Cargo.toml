@@ -9,8 +9,9 @@ keywords = ["routing", "policy", "load-balancing", "llm"]
 categories = ["algorithms"]
 
 [dependencies]
-# No workspace crate: the engine knows nothing about its host (a gateway, a
-# controller, a binding).
+# No workspace crate in the default build: the engine knows nothing about
+# its host (a gateway, a controller, a binding). The ingestion drivers below
+# the `ingest` feature speak to the engines and are the first to need one.
 # The credit tally is read by every deciding thread and replaced whole on
 # the rare write (a rank's first dispatch, a membership change): a load
 # costs no shared write.
@@ -31,6 +32,14 @@ thiserror = { workspace = true }
 k8s-openapi = { version = "0.27.0", features = ["v1_33"], optional = true }
 kube = { version = "3.0.1", default-features = false, features = ["client", "rustls-tls", "ring"], optional = true }
 
+# The ingestion drivers (the `ingest` feature): the load path over the
+# store's ingress traits (the `GetLoads` poll through the engines' gRPC
+# clients, the metrics scrape over HTTP) and the load helpers the gateway
+# shares with the controller (the row conversion, the scrape parser).
+openai-protocol = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
+smg-grpc-client = { workspace = true, optional = true }
+
 # The standalone controller (the `controller` feature): the listeners, the
 # health service, the admin endpoints and the binary. Every dependency below
 # is optional so a host that embeds the engine (the gateway, a binding)
@@ -39,8 +48,9 @@ axum = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 metrics = { version = "0.24.6", optional = true }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
-# The process TLS crypto provider, installed once before the first listener;
-# the gateway, the servicer and the mock worker install the same one.
+# The process TLS crypto provider, installed once before the first listener
+# or HTTP client; the gateway, the servicer and the mock worker install the
+# same one.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
 tonic = { workspace = true, features = ["tls-ring"], optional = true }
@@ -49,10 +59,25 @@ tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 [features]
-# The standalone controller: the store's drivers, the listeners with their
+# The ingestion drivers over the store: the load path (the `GetLoads` poll
+# per engine under the store's poll arbitration, the metrics scrape of an
+# engine without a servicer) and the load helpers the gateway shares. Off by
+# default; the gateway turns it on for the helpers, the controller for the
+# drivers.
+ingest = [
+    "dep:openai-protocol",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:smg-grpc-client",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tracing",
+]
+# The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the gRPC health service, the admin endpoints and the binary of the
 # package's name. Off by default: the engine alone has no server dependency.
 controller = [
+    "ingest",
     "dep:axum",
     "dep:clap",
     "dep:metrics",
@@ -75,7 +100,8 @@ criterion = "0.8"
 # the same stand-in served over HTTP.
 axum = { workspace = true }
 http = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+# The load driver's unit tests add the test macro and tokio's paused clock.
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # The corpus test reads YAML documents; the gateway reads its spec file with
 # the same crate.
 serde_yaml = { workspace = true }
@@ -93,6 +119,9 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # The admin router's tests drive it with `oneshot`, no socket.
 # The Kubernetes elector's stand-in is a `service_fn` of the same crate.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# The load driver's tests poll the mock worker's gRPC engines in-process:
+# the same `GetLoads` answers the gateway's tests read.
+mock-worker = { path = "../mock_worker" }
 
 [[bin]]
 name = "smg-policy-controller"
@@ -106,6 +135,10 @@ required-features = ["controller"]
 [[test]]
 name = "elector_k8s_cell"
 required-features = ["kubernetes"]
+
+[[test]]
+name = "ingest"
+required-features = ["controller"]
 
 [[bench]]
 name = "decision"
