@@ -2735,27 +2735,6 @@ class TestPdPairingMode:
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
 
 
-class TestPolicyEngine:
-    """--policy-engine takes the Rust CLI's two values with its default (legacy) and
-    reaches the Rust router; a launcher-started router decided through the legacy path."""
-
-    def test_default_is_the_rust_cli_default(self):
-        assert RouterArgs().policy_engine == "legacy"
-        assert parse_router_args([]).policy_engine == "legacy"
-
-    @pytest.mark.parametrize("mode", ["legacy", "engine"])
-    def test_each_choice_parses(self, mode):
-        assert parse_router_args(["--policy-engine", mode]).policy_engine == mode
-        assert _prefixed(["--router-policy-engine", mode]).policy_engine == mode
-
-    def test_an_unknown_value_is_refused_at_parse_time(self):
-        with pytest.raises(SystemExit):
-            parse_router_args(["--policy-engine", "remote"])
-
-    def test_reaches_the_rust_router(self):
-        assert _rust_router_kwargs(policy_engine="engine")["policy_engine"] == "engine"
-
-
 class TestPowerOfTwoLoadMetric:
     """--power-of-two-load-metric takes resident_tokens:<request_tokens> besides the
     metric names, and refuses it without a non-negative cost at parse time."""

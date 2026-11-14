@@ -21,7 +21,7 @@ use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::{host_stores::HostStores, PolicyRegistry},
+    policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -431,8 +431,7 @@ impl AppContextBuilder {
         // effect for every context built from it, the server's and a test's
         // alike. They are process-wide and the first call wins, so a
         // constructor that builds the policy registry itself configures them
-        // before that build (`from_config` and the test harness do): the
-        // engine's warm-up stage is tuned from them as the registry is built.
+        // before that build (`from_config` and the test harness do).
         // This call covers a context assembled without such a constructor.
         liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
@@ -502,18 +501,6 @@ impl AppContextBuilder {
         let policy_registry = self
             .policy_registry
             .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
-        // Under `--policy-engine engine` the host's store ingress stands
-        // beside the engine (the registry, the monitors and the admission
-        // counters behind the store traits); nothing reads or writes through
-        // it until the step that moves the ingestion drivers. Under `legacy`
-        // nothing is built.
-        if let Some(decider) = policy_registry.decider() {
-            decider.set_stores(Arc::new(HostStores::new(
-                Arc::clone(&worker_registry),
-                self.worker_monitor.as_ref(),
-                self.kv_event_monitor.as_ref(),
-            )));
-        }
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
@@ -618,9 +605,8 @@ impl AppContextBuilder {
                 .iter()
                 .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
         );
-        // The policy engine's warm-up stage is tuned from the liveness budgets
-        // when the policy registry is built below, so the configuration's
-        // budgets take effect first (the first call wins; `build` keeps its
+        // The configuration's liveness budgets take effect before the policy
+        // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
         liveness::configure_from(&router_config);
         Ok(Self::new()
@@ -813,8 +799,7 @@ impl AppContextBuilder {
                 config.policy.clone(),
                 config.routing_key_override.clone(),
             )
-            .with_pd_pairing_mode(config.pd_pairing_mode)
-            .with_policy_engine_for(config.policy_engine, &config.mode, &config.policy),
+            .with_pd_pairing_mode(config.pd_pairing_mode),
         ));
         self
     }
@@ -1290,78 +1275,24 @@ mod tests {
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
-    /// The switch reaches the policy registry of a built context: `engine`
-    /// with a carried policy exposes the decider, `legacy` none.
+    /// A dropped context lets its worker monitor go: the monitor holds the
+    /// policy registry, and nothing the context builds holds the monitor
+    /// back.
     #[tokio::test]
-    async fn a_context_under_the_engine_switch_exposes_the_decider_and_legacy_none() {
-        use crate::config::PolicyEngineMode;
-
-        let build = |mode: PolicyEngineMode| {
-            let mut config = RouterConfig::builder()
-                .round_robin_policy()
-                .policy_engine(mode)
-                .build_unchecked();
-            config.health_check.disable_health_check = true;
-            config
-        };
-        let engine = AppContext::from_config(build(PolicyEngineMode::Engine), 30, None, None)
-            .await
-            .expect("a context under engine");
-        assert!(engine.policy_registry.decider().is_some());
-        let legacy = AppContext::from_config(build(PolicyEngineMode::Legacy), 30, None, None)
-            .await
-            .expect("a context under legacy");
-        assert!(legacy.policy_registry.decider().is_none());
-    }
-
-    /// Under `engine` the host's store ingress stands beside the decider;
-    /// under `legacy` there is no decider to hand it to.
-    #[tokio::test]
-    async fn a_context_under_the_engine_switch_hands_the_host_stores_to_the_decider() {
-        use smg_policy_controller::store::WorkersStore;
-
-        use crate::config::PolicyEngineMode;
-
+    async fn a_dropped_context_lets_its_worker_monitor_go() {
         let mut config = RouterConfig::builder()
             .round_robin_policy()
-            .policy_engine(PolicyEngineMode::Engine)
             .build_unchecked();
         config.health_check.disable_health_check = true;
         let context = AppContext::from_config(config, 30, None, None)
             .await
-            .expect("a context under engine");
-        let decider = context.policy_registry.decider().expect("the engine");
-        let stores = decider.stores().expect("the host's stores");
-        assert_eq!(stores.epoch(), 0, "nothing wrote through them");
-    }
-
-    /// The worker monitor holds the policy registry; under `engine` the
-    /// registry's decider holds the host's stores, which must not hold the
-    /// monitor back, or a dropped context leaves its monitor alive.
-    #[tokio::test]
-    async fn a_context_under_the_engine_switch_lets_its_worker_monitor_go_when_dropped() {
-        use crate::config::PolicyEngineMode;
-
-        for (name, mode) in [
-            ("legacy", PolicyEngineMode::Legacy),
-            ("engine", PolicyEngineMode::Engine),
-        ] {
-            let mut config = RouterConfig::builder()
-                .round_robin_policy()
-                .policy_engine(mode)
-                .build_unchecked();
-            config.health_check.disable_health_check = true;
-            let context = AppContext::from_config(config, 30, None, None)
-                .await
-                .expect("a context");
-            let monitor =
-                Arc::downgrade(context.worker_monitor.as_ref().expect("the worker monitor"));
-            drop(context);
-            assert!(
-                monitor.upgrade().is_none(),
-                "the worker monitor outlives its context under {name}"
-            );
-        }
+            .expect("a context");
+        let monitor = Arc::downgrade(context.worker_monitor.as_ref().expect("the worker monitor"));
+        drop(context);
+        assert!(
+            monitor.upgrade().is_none(),
+            "the worker monitor outlives its context"
+        );
     }
 
     #[test]
@@ -1636,17 +1567,10 @@ pub(crate) mod testing {
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
             prefill_admission: None,
-            policy_registry: Arc::new(
-                crate::policies::PolicyRegistry::with_override(
-                    router_config.policy.clone(),
-                    router_config.routing_key_override.clone(),
-                )
-                .with_policy_engine_for(
-                    router_config.policy_engine,
-                    &router_config.mode,
-                    &router_config.policy,
-                ),
-            ),
+            policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
+                router_config.policy.clone(),
+                router_config.routing_key_override.clone(),
+            )),
             reasoning_parser_factory: None,
             tool_parser_factory,
             gateway: None,

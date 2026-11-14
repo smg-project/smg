@@ -50,7 +50,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, Decider, PolicyRegistry, WorkerRole},
+    policies::{CacheNamespace, PolicyRegistry, WorkerRole},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -837,7 +837,6 @@ impl PDRouter {
                     cache_namespace,
                     candidate_filter: None,
                     tried: &[],
-                    sequence: None,
                 },
                 sticky_key,
             )
@@ -2169,26 +2168,18 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue, under the lock
-    /// on both paths: the legacy policies, or the engine's decision and
-    /// commit ([`Self::place_pd_pair_through_engine`]).
+    /// the selection runs at the head of the admission queue.
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let decider = placement::pair_decider(&self.policy_registry, &inputs);
         let ((prefill, decode), prefill_guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &PdPair| prefill,
-            |capacity| match decider {
-                Some(decider) => {
-                    self.place_pd_pair_through_engine(decider, model_id, inputs, capacity)
-                }
-                None => self.select_pd_pair(model_id, inputs, capacity),
-            },
+            |capacity| self.select_pd_pair(model_id, inputs, capacity),
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
@@ -2197,37 +2188,6 @@ impl PDRouter {
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
         };
         Ok(((prefill, decode), guards))
-    }
-
-    /// [`Self::select_pd_pair`] through the policy engine under
-    /// `--policy-engine engine`, inside the admission callback as the legacy
-    /// selection runs: the pair decided over the window as the lock reads it
-    /// and committed under the same hold, by the request the queue lets
-    /// select; a commit every target of which missed re-decides once with
-    /// the misses excluded, then the request waits for a slot.
-    fn place_pd_pair_through_engine(
-        &self,
-        decider: &Decider,
-        model_id: &str,
-        inputs: PlacementInputs<'_>,
-        capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
-        let pairs = self.pd_pairs(model_id);
-        let has_capacity = |worker: &Arc<dyn Worker>| {
-            capacity.is_none_or(|capacity| capacity.has_capacity(worker))
-        };
-        placement::place_pair_through_engine(
-            &self.worker_registry,
-            &self.policy_registry,
-            decider,
-            model_id,
-            &pairs,
-            None,
-            false,
-            &has_capacity,
-            inputs,
-        )
-        .map(|pair| (pair.prefill, pair.decode))
     }
 
     /// The pair index `model_id` routes within. Shared HTTP-transport
@@ -2949,7 +2909,6 @@ impl RouterTrait for PDRouter {
                     cache_namespace: None,
                     candidate_filter: None,
                     tried: &[],
-                    sequence: None,
                 },
             ) else {
                 return error::service_unavailable(
@@ -6550,61 +6509,6 @@ mod tests {
                 .register_or_replace(Arc::from(create_test_worker(url, role, true)));
         }
         router
-    }
-
-    /// Under `--policy-engine engine` the pair is decided and committed
-    /// through the engine under the admission lock: the admitted
-    /// request holds its prefill seat, nobody is queued, and the next
-    /// request is decided and admitted once the seat is released.
-    #[tokio::test]
-    async fn the_engine_decides_the_pair_at_the_admission_head() {
-        use std::time::Duration;
-
-        use crate::config::PolicyEngineMode;
-
-        let round_robin = PolicyConfig::RoundRobin;
-        let router = PDRouter {
-            policy_registry: Arc::new(PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-                PolicyEngineMode::Engine,
-                &round_robin,
-                &round_robin,
-            )),
-            prefill_admission: Some(Arc::new(PrefillAdmission::new(
-                1,
-                1,
-                Duration::from_secs(5),
-            ))),
-            ..create_test_pd_router()
-        };
-        for (url, role) in [
-            ("http://prefill-1:8000", WorkerType::Prefill),
-            ("http://decode-1:8000", WorkerType::Decode),
-        ] {
-            router
-                .worker_registry
-                .register_or_replace(Arc::from(create_test_worker(url.to_string(), role, true)));
-        }
-        let decider = router.policy_registry.decider().expect("hosted");
-        let ((prefill, decode), guards) = router
-            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
-            .await
-            .expect("a pair is admitted");
-        assert_eq!(prefill.url(), "http://prefill-1:8000");
-        assert_eq!(decode.url(), "http://decode-1:8000");
-        assert_eq!(decider.decisions(), 1, "the engine decided the pair");
-        assert_eq!(prefill.load(), 1, "the admitted request holds its seat");
-        assert_eq!(
-            router.prefill_admission.as_ref().unwrap().queued_requests(),
-            0
-        );
-        drop(guards);
-        assert_eq!(prefill.load(), 0, "the seat is released with the guards");
-        let ((_, _), guards) = router
-            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
-            .await
-            .expect("the next request is admitted");
-        assert_eq!(decider.decisions(), 2);
-        drop(guards);
     }
 
     /// The prefill side's answer frees its seat before the decode side's

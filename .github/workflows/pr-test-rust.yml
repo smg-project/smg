@@ -1289,11 +1289,9 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
-              # the policy controller crate: linked by the gateway (the placement and
-              # selection types on every request, the load monitor's scrape reading); its
-              # engine decides behind --policy-engine engine alone, which no lane sets:
-              # the core
-              ("crates/policy_controller/**",                    CORE),
+              # the policy controller crate: linked by no binary yet (its gateway host is
+              # a later change, which moves this row to the core)
+              ("crates/policy_controller/**",                    NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path

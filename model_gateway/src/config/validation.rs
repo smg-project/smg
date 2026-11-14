@@ -5,19 +5,29 @@ use std::{
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
-use smg_policy_controller::spec::DENIED_HEADERS;
 use tokio::sync::Semaphore;
 
 use super::*;
 use crate::{
     middleware::scheduler,
-    policies::{
-        cost as selection_cost,
-        engine_host::{encode_preset_name, preset_name, unsupported_form, Decider},
-    },
+    policies::cost as selection_cost,
     tenant::MAX_TENANT_ID_LEN,
     worker::{endpoint::Endpoint, ConnectionMode},
 };
+
+/// The credential header names `routing_key_override.headers` may not carry
+/// (see [`ConfigValidator::validate_routing_key_headers`]). The policy
+/// controller crate refuses the same names in a specification's header
+/// lists.
+const DENIED_HEADERS: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -491,71 +501,11 @@ pub fn available_cpus() -> usize {
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
-    /// Under `--policy-engine engine` every policy that decides (the default,
-    /// the two pair sides and, under encode-prefill-decode, the encode side)
-    /// is one whose stages the engine carries in this build, and the engine
-    /// itself accepts the configuration: the decider is built once here, so
-    /// a tunable the engine refuses fails the start instead of falling back
-    /// to the legacy path.
-    fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
-        if config.policy_engine != PolicyEngineMode::Engine {
-            return Ok(());
-        }
-        let prefill = config.mode.get_prefill_policy(&config.policy);
-        let decode = config.mode.get_decode_policy(&config.policy);
-        for policy in [&config.policy, prefill, decode] {
-            if preset_name(policy).is_none() {
-                return Err(ConfigError::invalid_value(
-                    "policy_engine",
-                    policy.name(),
-                    format!(
-                        "the policy engine does not carry the stages of {} in this build; it \
-                         carries random, round_robin, passthrough, power_of_two (expected_wait, \
-                         requests, least_requests), least_load, manual and cache_aware in its \
-                         default form",
-                        unsupported_form(policy)
-                    ),
-                ));
-            }
-        }
-        // The encode items of an encode-prefill-decode deployment: the mode's
-        // encode policy (the one default when unset), the `epd` plan's
-        // encode profile.
-        let encode = matches!(config.mode, RoutingMode::EncodePrefillDecode { .. })
-            .then(|| config.mode.get_encode_policy(&DEFAULT_ENCODE_POLICY));
-        if let Some(policy) = encode.filter(|policy| encode_preset_name(policy).is_none()) {
-            return Err(ConfigError::invalid_value(
-                "policy_engine",
-                policy.name(),
-                "the policy engine carries random, round_robin and consistent_hashing on the \
-                 encode side in this build",
-            ));
-        }
-        Decider::from_configs_with_encode(
-            &config.policy,
-            prefill,
-            decode,
-            encode,
-            &config.routing_key_override,
-        )
-        .map_err(|error| {
-            let mut names = vec![config.policy.name()];
-            for policy in [prefill, decode].into_iter().chain(encode) {
-                if !names.contains(&policy.name()) {
-                    names.push(policy.name());
-                }
-            }
-            ConfigError::invalid_value("policy_engine", names.join("/"), error.to_string())
-        })?;
-        Ok(())
-    }
-
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_routing_key_headers(config)?;
-        Self::validate_policy_engine(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -784,9 +734,8 @@ impl ConfigValidator {
     /// a thread turn's client lineage goes out under the first configured
     /// name, and the provider paths forward a request's `Authorization` over
     /// the worker's own key, so a credential name there sends a lineage as a
-    /// credential and the upstream refuses the turn. The names on the policy
-    /// contracts' header deny-list are refused at load by name, under both
-    /// policy engines, ahead of the engine build.
+    /// credential and the upstream refuses the turn. The names of
+    /// [`DENIED_HEADERS`] are refused at load by name.
     fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
         for name in &config.routing_key_override.headers {
             HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
@@ -2768,142 +2717,6 @@ mod tests {
         ));
     }
 
-    /// A tunable the engine refuses (a default throughput that overflows the
-    /// engine's single-precision parameter) fails the start under the
-    /// switch instead of falling back; the legacy path takes it.
-    #[test]
-    fn the_engine_switch_refuses_a_tunable_the_engine_cannot_carry() {
-        let config = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            policy: PolicyConfig::LeastLoad {
-                kv_pressure_weight: 0.15,
-                mean_prefill_tokens: 1024,
-                default_throughput: 1e40,
-            },
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
-                if field == "policy_engine" && value == "least_load" && reason.contains("default_throughput")
-        ));
-        let legacy = RouterConfig {
-            policy_engine: PolicyEngineMode::Legacy,
-            ..config
-        };
-        assert!(ConfigValidator::validate(&legacy).is_ok());
-    }
-
-    /// Under `engine` an encode-prefill-decode deployment starts: the engine
-    /// binds the mode's encode policy (consistent hashing when unset) as the
-    /// `epd` plan's encode profile, and each of the encode side's three
-    /// policies is carried; the legacy path takes it as before.
-    #[test]
-    fn the_engine_switch_accepts_encode_prefill_decode_with_its_encode_policy() {
-        let epd = |encode_policy: Option<PolicyConfig>| RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            mode: RoutingMode::EncodePrefillDecode {
-                encode_urls: vec![("http://encode:8000".to_string(), None)],
-                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
-                decode_urls: vec!["http://decode:8000".to_string()],
-                encode_policy,
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate(&epd(None)).is_ok());
-        for policy in [
-            PolicyConfig::Random,
-            PolicyConfig::RoundRobin,
-            PolicyConfig::ConsistentHashing,
-        ] {
-            let name = policy.name();
-            assert!(
-                ConfigValidator::validate(&epd(Some(policy))).is_ok(),
-                "{name}"
-            );
-        }
-        let legacy = RouterConfig {
-            policy_engine: PolicyEngineMode::Legacy,
-            ..epd(None)
-        };
-        assert!(ConfigValidator::validate(&legacy).is_ok());
-    }
-
-    /// Under `engine` a policy, or a form of one, the engine does not carry
-    /// is refused at start by name, on the default and on a pair side; the
-    /// legacy path takes it, and the engine takes the default form.
-    #[test]
-    fn the_engine_switch_refuses_a_policy_the_engine_does_not_carry() {
-        let mut tempered = PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000);
-        if let PolicyConfig::CacheAware {
-            selection_temperature,
-            ..
-        } = &mut tempered
-        {
-            *selection_temperature = 0.5;
-        }
-        let config = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            policy: tempered,
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
-                if field == "policy_engine"
-                    && value == "cache_aware"
-                    && reason.contains("cache_aware with a selection temperature")
-        ));
-        let served = RouterConfig {
-            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
-            ..config.clone()
-        };
-        assert!(
-            ConfigValidator::validate(&served).is_ok(),
-            "the default form is served"
-        );
-        let legacy = RouterConfig {
-            policy_engine: PolicyEngineMode::Legacy,
-            ..config
-        };
-        assert!(ConfigValidator::validate(&legacy).is_ok());
-
-        let carried = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            policy: PolicyConfig::RoundRobin,
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: Some(PolicyConfig::LeastLoad {
-                    kv_pressure_weight: 1.0,
-                    mean_prefill_tokens: 100,
-                    default_throughput: 1000.0,
-                }),
-                decode_policy: None,
-            },
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate(&carried).is_ok());
-        let decode_side = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_metric: PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 64 },
-                }),
-            },
-            ..carried
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&decode_side),
-            Err(ConfigError::InvalidValue { ref field, ref value, .. })
-                if field == "policy_engine" && value == "power_of_two"
-        ));
-    }
-
     #[test]
     fn zero_mm_per_request_image_limit_is_rejected() {
         let config = RouterConfig {
@@ -3857,33 +3670,6 @@ mod tests {
         )
     }
 
-    /// Under `engine` the sticky override's headers are the default
-    /// binding's sessions rule: a name repeated in another case is one
-    /// header, as under legacy; a header on the deny-list is refused at load
-    /// by name under both engines, before the engine build reads it.
-    #[test]
-    fn the_engine_switch_takes_a_repeated_routing_header_and_refuses_a_denied_one() {
-        let mut config = regular_mode_config();
-        config.policy_engine = PolicyEngineMode::Engine;
-        config.routing_key_override.enabled = true;
-        config.routing_key_override.headers =
-            vec!["X-Routing-Key".to_string(), "x-routing-key".to_string()];
-        assert!(ConfigValidator::validate(&config).is_ok());
-        for engine in [PolicyEngineMode::Engine, PolicyEngineMode::Legacy] {
-            config.policy_engine = engine;
-            config.routing_key_override.headers = vec!["x-api-key".to_string()];
-            assert!(
-                matches!(
-                    ConfigValidator::validate(&config),
-                    Err(ConfigError::ValidationFailed { ref reason })
-                        if reason.contains("routing_key_override.headers")
-                            && reason.contains("x-api-key")
-                ),
-                "{engine:?}"
-            );
-        }
-    }
-
     /// A routing-key header is never a credential: every name on the shared
     /// header deny-list is refused at load by name, in any letter case and in
     /// any position of the list, where a plain name beside it is taken.
@@ -3909,6 +3695,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The deny-list by name: a name dropped from it would be taken as a
+    /// routing-key header with no case above turning red.
+    #[test]
+    fn the_denied_routing_key_headers_are_the_seven_credential_names() {
+        assert_eq!(
+            DENIED_HEADERS,
+            [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key",
+                "api-key",
+                "x-goog-api-key",
+            ]
+        );
     }
 
     #[test]

@@ -137,13 +137,6 @@ impl BasicWorkerBuilder {
         builder
     }
 
-    /// The engine's KV block size in tokens as a registration states it;
-    /// `None` leaves it to what the engine's streams report.
-    pub fn kv_block_size(mut self, tokens: Option<usize>) -> Self {
-        self.spec.kv_block_size = tokens;
-        self
-    }
-
     /// Set the bootstrap port (for prefill workers in PD disaggregation)
     pub fn bootstrap_port(mut self, port: Option<u16>) -> Self {
         self.spec.bootstrap_port = port;

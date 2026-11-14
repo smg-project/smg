@@ -18,9 +18,7 @@ mod cache_namespace;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
-pub mod engine_host;
 mod factory;
-pub mod host_stores;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -38,7 +36,6 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
-pub use engine_host::Decider;
 pub use factory::PolicyFactory;
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;

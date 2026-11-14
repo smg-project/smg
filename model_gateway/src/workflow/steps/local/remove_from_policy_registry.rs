@@ -78,26 +78,12 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             if let Some(ref monitor) = app_context.kv_event_monitor {
                 monitor.on_worker_removed(worker.url()).await;
             }
-        }
 
-        // Drop the state the policies and the hosted engine keep on the
-        // removed workers (a load-aware policy's dispatch tally by URL, the
-        // engine's rows by handle) so it does not leak under churn. The
-        // workers the registry step removed count as well as the ones found:
-        // a same-URL replacement during the drain is a handle of its own,
-        // and each handle is pruned once.
-        let mut pruned: Vec<usize> = Vec::new();
-        for worker in workers_to_remove
-            .iter()
-            .chain(&context.data.removed_workers)
-        {
-            let handle = Arc::as_ptr(worker).cast::<()>() as usize;
-            if !pruned.contains(&handle) {
-                pruned.push(handle);
-                app_context
-                    .policy_registry
-                    .on_worker_removed(worker.as_ref());
-            }
+            // Drop the state the policies keep on the worker (a load-aware
+            // policy's dispatch tally) so it does not leak under churn.
+            app_context
+                .policy_registry
+                .remove_worker_from_policies(worker.url());
         }
 
         // The removed workers' URLs leave their models' trees too, those of

@@ -351,7 +351,6 @@ impl Router {
                 cache_namespace,
                 candidate_filter,
                 tried,
-                sequence: None,
             },
         )
     }
@@ -1227,12 +1226,6 @@ impl Router {
         model_id: &str,
         routing: &RoutingDerivatives,
     ) -> Result<Arc<dyn Worker>, Response> {
-        // The request's sequence before the pool read: see
-        // `PlacementInputs::sequence`.
-        let sequence = self
-            .policy_registry
-            .decider()
-            .map(|decider| decider.begin());
         let all_workers = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
@@ -1267,7 +1260,6 @@ impl Router {
                 cache_namespace: routing.cache_namespace,
                 candidate_filter: None,
                 tried: &[],
-                sequence,
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
