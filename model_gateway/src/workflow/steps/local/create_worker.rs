@@ -26,12 +26,15 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
-        basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
-        circuit_breaker::CircuitBreakerConfig,
-        endpoint::Endpoint,
-        metadata::join_base,
-        overload::OverloadThresholds,
-        resilience::resolve_resilience,
+        health::{
+            circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
+            resilience::resolve_resilience,
+        },
+        identity::{
+            basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
+            endpoint::Endpoint,
+            metadata::join_base,
+        },
         BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
@@ -355,7 +358,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 // Promotion can be event-driven: a ZMQ worker signals the
                 // manager the instant its handshake completes, and any worker
                 // demoted by health is signalled on its first successful
-                // contact (see `worker::liveness`), so every worker gets the
+                // contact (see `worker::health::liveness`), so every worker gets the
                 // registry's connect signal.
                 builder =
                     builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
@@ -2621,7 +2624,7 @@ mod rank_window_tests {
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
         routers::grpc::client::ServerInfo,
-        worker::{basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        worker::{identity::basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
         workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 

@@ -12,7 +12,7 @@ use crate::{
     middleware::scheduler,
     policies::cost as selection_cost,
     tenant::MAX_TENANT_ID_LEN,
-    worker::{endpoint::Endpoint, ConnectionMode},
+    worker::{identity::endpoint::Endpoint, ConnectionMode},
 };
 
 /// The credential header names `routing_key_override.headers` may not carry

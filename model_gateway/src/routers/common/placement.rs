@@ -40,7 +40,9 @@ use crate::{
         error,
     },
     worker::{
-        overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
+        health::overload::{
+            BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION,
+        },
         ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
         WorkerRegistry, WorkerType,
     },
@@ -1312,7 +1314,7 @@ mod tests {
             PowerOfTwoPolicy, RoundRobinPolicy,
         },
         worker::{
-            load_state::{one_rank_load, TestFeed},
+            load::state::{one_rank_load, TestFeed},
             runtime::StallReason,
             BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
         },

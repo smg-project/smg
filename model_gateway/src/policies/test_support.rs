@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::{load_state::TestFeed, test_support::worker_of, Worker, WorkerType};
+use crate::worker::{load::state::TestFeed, test_support::worker_of, Worker, WorkerType};
 
 /// A healthy worker (health checks disabled) at `url`.
 pub(crate) fn make_worker(url: &str) -> Arc<dyn Worker> {
