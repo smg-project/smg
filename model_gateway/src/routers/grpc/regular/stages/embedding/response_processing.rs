@@ -1,8 +1,12 @@
-//! Response processing stage for embedding requests
+//! Response processing stage for embedding requests: one vector per input,
+//! in the request's order, under the request's summed usage.
 
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::embedding::{EmbeddingObject, EmbeddingResponse};
+use openai_protocol::{
+    common::UsageInfo,
+    embedding::{EmbeddingObject, EmbeddingResponse},
+};
 use tracing::error;
 
 use crate::routers::{
@@ -58,9 +62,7 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
         })?;
 
         // Expect Embedding result variant
-        let proto_response = if let ExecutionResult::Embedding { response } = execution_result {
-            response
-        } else {
+        let ExecutionResult::Embedding { responses } = execution_result else {
             error!(
                 function = "EmbeddingResponseProcessingStage::process",
                 "Invalid execution result: expected Embedding"
@@ -71,13 +73,19 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
             ));
         };
 
-        // Convert proto response to HTTP response
-        let embedding_response = self
-            .convert_response(ctx, proto_response)
-            .map_err(|boxed_err| *boxed_err)?;
+        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
+            error!(
+                function = "EmbeddingResponseProcessingStage::convert_response",
+                "Dispatch metadata missing in context"
+            );
+            error::internal_error("dispatch_missing", "Dispatch metadata missing")
+        })?;
 
         // Store in context for pipeline to extract
-        ctx.response.final_response = Some(FinalResponse::Embedding(embedding_response));
+        ctx.response.final_response = Some(FinalResponse::Embedding(embedding_response(
+            dispatch.model.clone(),
+            &responses,
+        )));
 
         Ok(None)
     }
@@ -87,50 +95,91 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
     }
 }
 
-impl EmbeddingResponseProcessingStage {
-    #[expect(
-        clippy::unused_self,
-        reason = "method on stage struct for consistency with other stage convert_response methods"
-    )]
-    fn convert_response(
-        &self,
-        ctx: &DispatchContext,
-        proto: ProtoEmbedComplete,
-    ) -> Result<EmbeddingResponse, Box<Response>> {
-        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
-            error!(
-                function = "EmbeddingResponseProcessingStage::convert_response",
-                "Dispatch metadata missing in context"
-            );
-            error::internal_error("dispatch_missing", "Dispatch metadata missing")
-        })?;
-
-        let model = dispatch.model.clone();
-
-        // Convert flat embedding vector to response
-        // single input -> single embedding object
-
-        let embedding_data = EmbeddingObject {
-            object: "embedding".to_string(),
-            embedding: proto.embedding().to_vec(),
-            index: 0,
-        };
-
-        let prompt_tokens = proto.prompt_tokens();
-
-        let usage = openai_protocol::common::UsageInfo {
+/// The response to the request: the engine's answers as the list of
+/// vectors, `data[i]` the vector of input `i`, the usage their prompt tokens
+/// summed (an embedding has no completion tokens).
+fn embedding_response(model: String, responses: &[ProtoEmbedComplete]) -> EmbeddingResponse {
+    let mut prompt_tokens = 0u32;
+    let data = responses
+        .iter()
+        .enumerate()
+        .map(|(index, proto)| {
+            prompt_tokens = prompt_tokens.saturating_add(proto.prompt_tokens());
+            EmbeddingObject {
+                object: "embedding".to_string(),
+                embedding: proto.embedding().to_vec(),
+                index: index as u32,
+            }
+        })
+        .collect();
+    EmbeddingResponse {
+        object: "list".to_string(),
+        data,
+        model,
+        usage: UsageInfo {
             prompt_tokens,
-            total_tokens: prompt_tokens, // Embedding has no completion tokens
+            total_tokens: prompt_tokens,
             completion_tokens: 0,
             prompt_tokens_details: None,
             reasoning_tokens: None,
-        };
+        },
+    }
+}
 
-        Ok(EmbeddingResponse {
-            object: "list".to_string(),
-            data: vec![embedding_data],
-            model,
-            usage,
+#[cfg(test)]
+mod tests {
+    use smg_grpc_client::vllm_proto as vllm;
+
+    use super::*;
+
+    fn answer(embedding: Vec<f32>, prompt_tokens: u32) -> ProtoEmbedComplete {
+        ProtoEmbedComplete::Vllm(vllm::EmbedResponse {
+            embedding_dim: embedding.len() as u32,
+            embedding,
+            prompt_tokens,
         })
+    }
+
+    /// A batch's answers come out as one list, each vector at its input's
+    /// index, the usage summed over the inputs.
+    #[test]
+    fn each_input_gets_its_vector_at_its_index_and_the_usage_sums() {
+        let response = embedding_response(
+            "m".to_owned(),
+            &[
+                answer(vec![0.1, 0.2], 3),
+                answer(vec![0.3, 0.4], 5),
+                answer(vec![0.5, 0.6], 1),
+            ],
+        );
+        assert_eq!(response.object, "list");
+        assert_eq!(response.model, "m");
+        let indexed: Vec<(u32, Vec<f32>)> = response
+            .data
+            .iter()
+            .map(|item| (item.index, item.embedding.clone()))
+            .collect();
+        assert_eq!(
+            indexed,
+            vec![
+                (0, vec![0.1, 0.2]),
+                (1, vec![0.3, 0.4]),
+                (2, vec![0.5, 0.6])
+            ]
+        );
+        assert!(response.data.iter().all(|item| item.object == "embedding"));
+        assert_eq!(response.usage.prompt_tokens, 9);
+        assert_eq!(response.usage.total_tokens, 9);
+        assert_eq!(response.usage.completion_tokens, 0);
+    }
+
+    /// One input is one vector at index 0, as it always was.
+    #[test]
+    fn a_single_input_is_one_vector_at_index_zero() {
+        let response = embedding_response("m".to_owned(), &[answer(vec![1.0], 4)]);
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].index, 0);
+        assert_eq!(response.data[0].embedding, vec![1.0]);
+        assert_eq!(response.usage.prompt_tokens, 4);
     }
 }

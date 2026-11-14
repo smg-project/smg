@@ -140,10 +140,9 @@ impl ProcessStage for ClassifyResponseProcessingStage {
             error::internal_error("execution_result_missing", "Execution result missing")
         })?;
 
-        // Expect Embedding result variant (classify uses embed backend)
-        let proto_response = if let ExecutionResult::Embedding { response } = execution_result {
-            response
-        } else {
+        // Expect Embedding result variant (classify uses embed backend): one
+        // answer per input of the batch, in the request's order.
+        let ExecutionResult::Embedding { responses } = execution_result else {
             error!(
                 function = "ClassifyResponseProcessingStage::process",
                 "Invalid execution result: expected Embedding"
@@ -154,36 +153,36 @@ impl ProcessStage for ClassifyResponseProcessingStage {
             ));
         };
 
-        // Get logits from embedding response
-        let logits = proto_response.embedding();
+        // The id2label mapping of the worker's model card, borrowed once for
+        // every input of the batch.
+        let id2label = Self::id2label_from_context(ctx);
 
-        if logits.is_empty() {
-            error!(
-                function = "ClassifyResponseProcessingStage::process",
-                "Empty logits received from scheduler"
-            );
-            return Err(error::internal_error(
-                "empty_logits",
-                "Empty logits received from scheduler",
-            ));
+        // Each input's logits to its class: softmax, argmax, the label.
+        let mut prompt_tokens = 0u32;
+        let mut data = Vec::with_capacity(responses.len());
+        for (index, proto_response) in responses.iter().enumerate() {
+            let logits = proto_response.embedding();
+            if logits.is_empty() {
+                error!(
+                    function = "ClassifyResponseProcessingStage::process",
+                    index, "Empty logits received from scheduler"
+                );
+                return Err(error::internal_error(
+                    "empty_logits",
+                    "Empty logits received from scheduler",
+                ));
+            }
+            let probs = Self::softmax(logits);
+            let predicted_class = Self::argmax(&probs);
+            let label = Self::get_label(id2label, predicted_class);
+            prompt_tokens = prompt_tokens.saturating_add(proto_response.prompt_tokens());
+            data.push(ClassifyData {
+                index: index as u32,
+                label,
+                num_classes: probs.len() as u32,
+                probs,
+            });
         }
-
-        // Apply softmax to get probabilities
-        let probs = Self::softmax(logits);
-
-        // Get predicted class (argmax)
-        let predicted_class = Self::argmax(&probs);
-
-        // Get label for predicted class, read from the worker's model card
-        let label = Self::get_label(Self::id2label_from_context(ctx), predicted_class);
-
-        // Build classify data
-        let classify_data = ClassifyData {
-            index: 0,
-            label,
-            num_classes: probs.len() as u32,
-            probs,
-        };
 
         // Get dispatch metadata
         let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
@@ -194,8 +193,7 @@ impl ProcessStage for ClassifyResponseProcessingStage {
             error::internal_error("dispatch_missing", "Dispatch metadata missing")
         })?;
 
-        // Build usage info
-        let prompt_tokens = proto_response.prompt_tokens();
+        // Build usage info: the inputs' prompt tokens summed, no completion.
         let usage = UsageInfo {
             prompt_tokens,
             total_tokens: prompt_tokens,
@@ -209,7 +207,7 @@ impl ProcessStage for ClassifyResponseProcessingStage {
             dispatch.request_id.clone(),
             dispatch.model.clone(),
             dispatch.created,
-            vec![classify_data],
+            data,
             usage,
         );
 

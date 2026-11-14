@@ -429,10 +429,7 @@ impl GrpcClient {
         }
     }
 
-    pub async fn embed(
-        &mut self,
-        req: ProtoEmbedRequest,
-    ) -> Result<ProtoEmbedComplete, tonic::Status> {
+    pub async fn embed(&self, req: ProtoEmbedRequest) -> Result<ProtoEmbedComplete, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
                 let resp = client.embed(*boxed_req).await?;

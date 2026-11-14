@@ -334,10 +334,7 @@ impl BackendClient {
         }
     }
 
-    pub async fn embed(
-        &mut self,
-        req: ProtoEmbedRequest,
-    ) -> Result<ProtoEmbedComplete, tonic::Status> {
+    pub async fn embed(&self, req: ProtoEmbedRequest) -> Result<ProtoEmbedComplete, tonic::Status> {
         match self {
             Self::Grpc(client) => client.embed(req).await,
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
