@@ -22,8 +22,8 @@ use symphony::{
 use super::{
     super::*,
     eof::{
-        chat_spec, chat_text, chunk, chunk_with_logprobs, collect_events, complete, dispatch,
-        logprob_carriers, processor, scripted_stream, CharacterTokenizer,
+        chat_spec, chat_text, chunk, chunk_of_ids, chunk_with_logprobs, collect_events, complete,
+        dispatch, logprob_carriers, processor, scripted_stream, CharacterTokenizer,
     },
 };
 use crate::{
@@ -35,7 +35,7 @@ use crate::{
             symphony::{
                 assign, telemetry,
                 template::Templates,
-                testing::{tools, Refusing},
+                testing::{atomic_kimi_ids, tools, AtomicKimi, Refusing},
                 Asks, Assignment,
             },
         },
@@ -2266,6 +2266,97 @@ async fn a_whole_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_
 /// thought.
 const KIMI_K3_THINKING_PROMPT: &str =
     "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>";
+
+/// A native length finish flushes a possible stop prefix through the bound
+/// reader before ending it. Literal lookalikes stay text; genuine framing is
+/// dropped, while all generated tokens remain in the engine's usage total.
+#[tokio::test]
+async fn structural_kimi_length_finish_preserves_literal_tails_and_usage() {
+    let thought = "Plan é🌍.";
+    let answer = "Answer {\"marker\":\"<|close|>message\"} é🌍� ";
+    for tail in ["<|close|>message", "<|close|>", "<|open|>tools"] {
+        for structural in [false, true] {
+            let ids = atomic_kimi_ids(&[
+                (thought, false),
+                ("<|close|>think<|sep|>", true),
+                ("<|open|>response<|sep|>", true),
+                (answer, false),
+                (tail, structural),
+            ]);
+            let tail_tokens = atomic_kimi_ids(&[(tail, structural)]).len();
+            for cut in [0, ids.len() - tail_tokens + 1, ids.len() - 1, ids.len()] {
+                let mut spec = assigned(chat_spec(false), kimi_k3(), KIMI_K3_THINKING_PROMPT);
+                spec.expected_choices = 1;
+                spec.stream_options =
+                    Some(serde_json::from_value(json!({"include_usage": true})).unwrap());
+                spec.stop = Some(StringOrArray::Array(vec![
+                    "<|close|>message<|sep|>".into(),
+                    "<|open|>tools<|sep|>".into(),
+                ]));
+                let mut first = chunk_of_ids(0, ids[..cut].to_vec());
+                let mut second = chunk_of_ids(0, ids[cut..].to_vec());
+                if let Some(proto::generate_response::Response::Chunk(chunk)) = &mut first.response
+                {
+                    chunk.completion_tokens = cut as u32;
+                }
+                if let Some(proto::generate_response::Response::Chunk(chunk)) = &mut second.response
+                {
+                    chunk.completion_tokens = ids.len() as u32;
+                }
+                let mut finish = complete(0, "length");
+                if let Some(proto::generate_response::Response::Complete(complete)) =
+                    &mut finish.response
+                {
+                    complete.prompt_tokens = 17;
+                    complete.completion_tokens = ids.len() as u32;
+                }
+                let ((result, events), scrape) = scraped(stream_events_through(
+                    Arc::new(AtomicKimi::default()),
+                    vec![first, second, finish],
+                    false,
+                    spec,
+                ))
+                .await;
+                result.expect("the engine's length finish reaches the client");
+                assert_eq!(chat_text(&events, 0, "reasoning_content"), thought);
+                assert_eq!(
+                    chat_text(&events, 0, "content"),
+                    if structural {
+                        answer.to_string()
+                    } else {
+                        format!("{answer}{tail}")
+                    },
+                    "tail={tail:?}, structural={structural}, cut={cut}"
+                );
+                let finishes: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
+                    .collect();
+                assert_eq!(finishes, ["length"]);
+                assert!(tool_call_deltas(&events).is_empty());
+                let usage: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| event["usage"].as_object())
+                    .collect();
+                assert_eq!(usage.len(), 1, "one authoritative usage tail: {events:#?}");
+                assert_eq!(usage[0]["prompt_tokens"], 17);
+                assert_eq!(usage[0]["completion_tokens"], ids.len());
+                assert_eq!(usage[0]["total_tokens"], 17 + ids.len());
+                assert_eq!(
+                    usage[0]["completion_tokens_details"]["reasoning_tokens"],
+                    thought.chars().count()
+                );
+                let binding = series_line(
+                    &scrape,
+                    telemetry::STRUCTURAL_BINDINGS,
+                    &["table=\"kimi_k3\"", "mode=\"bound\""],
+                )
+                .expect("token origins are bound");
+                assert!(binding.ends_with(" 1"), "{binding}");
+            }
+        }
+    }
+}
 
 /// A Kimi K3 reply written straight into the prefilled thought and closed by the answer's closer
 /// and the end of the turn, never by the thought's closer (seen on about 1 % of very long turns),

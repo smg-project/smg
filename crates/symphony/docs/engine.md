@@ -220,3 +220,29 @@ loop {
 - What was read is final: merging adjacent text of one kind only ever touches events pushed
   into the same buffer since it was last recycled or drained, so a stream sees one `Content`
   event per step for a run of content, and a whole read sees one for the whole run.
+
+## Structural-token provenance
+
+A tokenized caller can bind a format's declared structural atoms before the first generated
+delta, including an empty or held delta. It supplies verified atom ranges in pre-stop decoded
+byte coordinates before feeding the text that contains them. Stop buffering may release an
+atom on a later ordinary token or at the decoder's tail; that release does not transfer the
+atom's identity. Prompt replay stays text-only and starts generated coordinates at zero.
+
+The engine keeps this provenance separate from the token-count ledger. Invalid counting spans
+may make counts unavailable, but cannot switch bound framing back to string matching. A
+separate cursor follows raw pieces and rewinds any suffix returned for a header rescan; origins
+are retained until their bytes have been emitted. EOF cut-tag handling checks the same origin.
+Unbound text-only callers retain their prior behavior, as do formats without structural atoms.
+
+Binding is an explicit caller contract: the caller verifies vocabulary atoms and supplies
+their ranges. The engine does not infer token identity from decoded spellings or counting
+spans, and adding this API does not bind an existing caller automatically.
+
+The tokenized gRPC gateway reader resolves every declared atom to a distinct vocabulary ID
+before its first generated delta, including an empty delta. Complete bindings use token origins;
+otherwise the reader keeps text-only compatibility for that output. The gateway exposes
+`smg_symphony_structural_bindings_total{table,mode}` with `bound` and `text_only` modes,
+without model text, request IDs or vocabulary IDs. Qualification must establish bound mode
+rather than infer it from a successful response. The decoder's origin coordinates describe the
+prefix through its first stop or reset; this reader does not use the legacy `resume` operation.

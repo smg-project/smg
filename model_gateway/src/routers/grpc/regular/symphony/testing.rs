@@ -527,3 +527,90 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
         self.clone()
     }
 }
+
+/// Synthetic vocabulary: ordinary character IDs can spell exactly the same
+/// bytes as these two atomic IDs. These are not captured model token IDs.
+#[derive(Default)]
+pub(crate) struct AtomicKimi {
+    special: llm_tokenizer::traits::SpecialTokens,
+}
+
+impl llm_tokenizer::traits::Encoder for AtomicKimi {
+    fn encode(
+        &self,
+        input: &str,
+        _special: bool,
+    ) -> anyhow::Result<llm_tokenizer::traits::Encoding> {
+        Ok(llm_tokenizer::traits::Encoding::Plain(
+            input.chars().map(u32::from).collect(),
+        ))
+    }
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        special: bool,
+    ) -> anyhow::Result<Vec<llm_tokenizer::traits::Encoding>> {
+        inputs
+            .iter()
+            .map(|input| self.encode(input, special))
+            .collect()
+    }
+}
+
+impl llm_tokenizer::traits::Decoder for AtomicKimi {
+    fn decode(&self, ids: &[u32], _skip: bool) -> anyhow::Result<String> {
+        ids.iter()
+            .map(|id| {
+                self.id_to_token(*id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown synthetic ID"))
+            })
+            .collect()
+    }
+}
+
+impl Tokenizer for AtomicKimi {
+    fn vocab_size(&self) -> usize {
+        0x110002
+    }
+    fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+        &self.special
+    }
+    fn token_to_id(&self, text: &str) -> Option<u32> {
+        match text {
+            "<|open|>" => Some(0x110000),
+            "<|close|>" => Some(0x110001),
+            _ if text.chars().count() == 1 => text.chars().next().map(u32::from),
+            _ => None,
+        }
+    }
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        match id {
+            0x110000 => Some("<|open|>".into()),
+            0x110001 => Some("<|close|>".into()),
+            _ => char::from_u32(id).map(|ch| ch.to_string()),
+        }
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+pub(crate) fn atomic_kimi_ids(parts: &[(&str, bool)]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for (text, structural) in parts {
+        let rest = if *structural {
+            let (atom, id) = if text.starts_with("<|open|>") {
+                ("<|open|>", 0x110000)
+            } else {
+                ("<|close|>", 0x110001)
+            };
+            assert!(text.starts_with(atom));
+            ids.push(id);
+            &text[atom.len()..]
+        } else {
+            text
+        };
+        ids.extend(rest.chars().map(u32::from));
+    }
+    ids
+}

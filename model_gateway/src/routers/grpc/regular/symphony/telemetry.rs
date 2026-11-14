@@ -148,6 +148,10 @@ pub(crate) const FALLBACK: &str = "smg_symphony_fallback_total";
 /// by `table` and `reason` ([`record_refused`]): `tool_use_input`, a `tool_use` block that cannot
 /// carry the arguments the model wrote.
 pub(crate) const REFUSED: &str = "smg_symphony_refused_total";
+/// Readers with declared structural atoms, by table and binding mode. This
+/// records no model text, request IDs or vocabulary IDs and lets qualification
+/// distinguish the token-bound path from text-only compatibility.
+pub(crate) const STRUCTURAL_BINDINGS: &str = "smg_symphony_structural_bindings_total";
 /// The buckets of [`MALFORMED_BYTES`]: a marker's worth to a whole answer.
 pub(crate) const MALFORMED_BYTES_BUCKETS: [f64; 9] = [
     1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0,
@@ -840,6 +844,10 @@ pub(crate) fn record_failed(table: &'static str) {
     increment(&series(table).outputs[FAILED], 1);
 }
 
+pub(crate) fn record_structural_binding(table: &'static str, bound: bool) {
+    increment(&series(table).structural_bindings[usize::from(!bound)], 1);
+}
+
 /// Leaves a failed output on `span`, the request's: the table, the outcome and the `bytes` read
 /// when it failed. No run names a reason and the engine's finish is not known yet. `marked` is
 /// the request's, as for [`Tally::mark`]: a failure after a reading's mark leaves the mark (the
@@ -965,12 +973,18 @@ pub(crate) fn record_fallback(why: Fallback, table: Option<&'static str>) {
 /// resolves the table); a table published again sets nothing.
 pub(crate) fn init_table_series(table: &'static str) {
     let series = series(table);
-    for key in series.outputs.iter().chain(series.malformed.iter()).chain([
-        &series.calls_suppressed,
-        &series.calls_forbidden,
-        &series.refused,
-        &series.fallback[FORCED_CALL_WITHOUT_TAG],
-    ]) {
+    for key in series
+        .outputs
+        .iter()
+        .chain(series.malformed.iter())
+        .chain(series.structural_bindings.iter())
+        .chain([
+            &series.calls_suppressed,
+            &series.calls_forbidden,
+            &series.refused,
+            &series.fallback[FORCED_CALL_WITHOUT_TAG],
+        ])
+    {
         publish(key);
     }
     // A histogram has no zero to set: registering it publishes the family with an empty
@@ -1041,6 +1055,7 @@ fn observe(key: &Key, value: f64) {
 
 /// The keys of one table's series, built once, and the bucket for its lines.
 struct Series {
+    structural_bindings: [Key; 2],
     /// [`OUTPUTS`] by outcome, in the order of [`OUTCOMES`].
     outputs: [Key; OUTCOMES.len()],
     /// [`MALFORMED`] by reason, in the order of [`REASONS`].
@@ -1080,6 +1095,8 @@ impl Series {
             Key::from_parts(name, all)
         };
         Self {
+            structural_bindings: ["bound", "text_only"]
+                .map(|mode| key(STRUCTURAL_BINDINGS, &[("mode", mode)])),
             outputs: OUTCOMES.map(|outcome| key(OUTPUTS, &[("outcome", outcome)])),
             malformed: REASONS.map(|reason| key(MALFORMED, &[("reason", reason)])),
             malformed_bytes: key(MALFORMED_BYTES, &[]),

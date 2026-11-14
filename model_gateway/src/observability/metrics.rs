@@ -859,6 +859,10 @@ pub(crate) fn init_metrics() {
         symphony_telemetry::REFUSED,
         "Whole Messages responses a Symphony table read that the gateway refused (HTTP 500), by table and reason (tool_use_input: a tool_use block cannot carry the arguments the model wrote); the output stays counted under smg_symphony_outputs_total by its own outcome"
     );
+    describe_counter!(
+        symphony_telemetry::STRUCTURAL_BINDINGS,
+        "Symphony readers with declared structural atoms, by table and mode: bound (complete vocabulary IDs) or text_only (binding unavailable before output); no text or token IDs are exposed"
+    );
     describe_counter!("smg_tokenizer_cache_lookups_total", "Tokenizer cache lookups by layer and result; L1 includes inputs without cacheable boundaries and excludes L0 hits");
     describe_counter!(
         "smg_tokenizer_cache_evictions_total",
