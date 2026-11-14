@@ -2350,22 +2350,27 @@ impl RouterConfig {
         ConfigValidator::validate(self)
     }
 
-    /// Connection attempts per health-check success for a worker named at
-    /// startup or an external API endpoint.
+    /// Connection attempts per health-check success stamped on a worker
+    /// named at startup or an external API endpoint.
     pub(crate) const CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 10;
 
-    /// Connection attempts per health-check success for a worker a
+    /// Connection attempts per health-check success stamped on a worker a
     /// discovery provider registers: twice a configured worker's, since a
     /// discovered engine is often published while it is still loading.
     pub(crate) const DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 20;
 
-    /// The connection attempts a registration gets before it fails
-    /// (`WorkerSpec::max_connection_attempts`, the connection-detection
-    /// step's budget): `attempts_per_success` tries for each health-check
-    /// success the worker must then show, one success counted at least.
-    /// Every registration path derives its budget here, with its own
-    /// multiplier ([`Self::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS`],
-    /// [`Self::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS`]).
+    /// The value the gateway stamps on `WorkerSpec::max_connection_attempts`
+    /// for a worker it registers itself (named at startup, an external API
+    /// endpoint, published by a discovery provider): `attempts_per_success`
+    /// for each health-check success the worker must then show, one success
+    /// counted at least, with the path's own multiplier
+    /// ([`Self::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS`],
+    /// [`Self::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS`]). A worker added
+    /// through the worker API keeps the spec's default instead. The value
+    /// rides on the spec and shows in the connection-detection step's debug
+    /// line; the step's retries follow the registration workflow's retry
+    /// policy, whose attempt count comes from the worker startup timeout and
+    /// check interval, so no behaviour reads this value today.
     pub(crate) fn connection_attempt_budget(&self, attempts_per_success: u32) -> u32 {
         self.health_check.success_threshold.max(1) * attempts_per_success
     }
