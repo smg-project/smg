@@ -10,7 +10,10 @@ use tracing::error as trace_error;
 use crate::{
     observability::metrics::metrics_labels,
     routers::{
-        common::pd_failure::{PdSide, SidePhase},
+        common::{
+            pd_failure::{PdSide, SidePhase},
+            prefill_admission::PrefillLoadGuard,
+        },
         error,
         grpc::{
             context::ExecutionResult,
@@ -24,7 +27,7 @@ use crate::{
             },
         },
     },
-    worker::{PrefillLoadGuard, Worker},
+    worker::Worker,
 };
 
 /// Drain each Prefill sample through its terminal response, releasing only that
