@@ -2108,9 +2108,12 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::core::config::{
-        test_support::sse_server, ArgMappingConfig, ResponseFormatConfig, Tool as McpTool,
-        ToolConfig,
+    use crate::{
+        annotations::ToolAnnotations,
+        core::config::{
+            test_support::sse_server, ArgMappingConfig, ResponseFormatConfig, Tool as McpTool,
+            ToolConfig,
+        },
     };
 
     fn create_test_tool(name: &str) -> McpTool {
@@ -2286,7 +2289,7 @@ mod tests {
             ApprovalMode::Interactive,
         );
 
-        let hints = crate::annotations::ToolAnnotations::new();
+        let hints = ToolAnnotations::new();
         let params = ApprovalParams {
             request_id: "req-shutdown-test",
             server_key: "test-server",
