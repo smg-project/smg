@@ -208,6 +208,46 @@ async fn on_local_insert_buffers_per_model() {
 }
 
 #[tokio::test]
+async fn inserts_after_the_first_land_in_the_same_buffer_in_order() {
+    // The first insert of a model builds its buffer; the inserts after it
+    // find the buffer by a borrowed lookup. All land in one buffer, in
+    // order, drain as one batch, and an insert after the drain rebuilds
+    // the buffer.
+    let mesh = MeshKV::new("node-a".into());
+    let adapter = adapter_with_empty_handle(&mesh);
+
+    adapter.on_local_insert("model-1", delta(1, "http://w1"));
+    adapter.on_local_insert("model-1", delta(2, "http://w1"));
+    adapter.on_local_insert("model-1", delta(3, "http://w2"));
+
+    let hashes: Vec<u64> = adapter
+        .pending_deltas
+        .get("model-1")
+        .unwrap()
+        .iter()
+        .map(|d| d.node_hash)
+        .collect();
+    assert_eq!(hashes, [1, 2, 3]);
+
+    let entries = adapter.drain_pending_deltas();
+    assert_eq!(entries.len(), 1, "one batch for the model");
+    let batch: Vec<TreeDelta> = bincode::deserialize(&entries[0].1).unwrap();
+    let drained: Vec<u64> = batch.iter().map(|d| d.node_hash).collect();
+    assert_eq!(drained, [1, 2, 3]);
+    assert!(
+        adapter.pending_deltas.get("model-1").is_none(),
+        "the drain takes the buffer with it"
+    );
+
+    adapter.on_local_insert("model-1", delta(4, "http://w1"));
+    assert_eq!(
+        adapter.pending_deltas.get("model-1").unwrap().len(),
+        1,
+        "an insert after the drain rebuilds the buffer"
+    );
+}
+
+#[tokio::test]
 async fn drain_batches_per_model_and_clears_buffer() {
     let mesh = MeshKV::new("node-a".into());
     let adapter = adapter_with_empty_handle(&mesh);
