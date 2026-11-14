@@ -2495,25 +2495,25 @@ mod tests {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "u".to_string(),
+                    url: "u".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
             },
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "u".to_string(),
+                    url: "u".to_string().into(),
                 },
             },
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "d".to_string(),
+                    data: "d".to_string().into(),
                     format: "wav".to_string(),
                 },
             },
             ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "u".to_string(),
+                    url: "u".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
