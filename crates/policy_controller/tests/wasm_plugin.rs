@@ -1298,6 +1298,85 @@ fn the_decisions_budget_bounds_the_sum_of_its_calls() {
     );
 }
 
+/// The same arithmetic while the slot's lazy `init` inside the decision is
+/// held off its core: the slot is forgotten before the decision, so its
+/// `init` runs on the decision's budget, and the host's clock naps two
+/// hundred milliseconds inside the one call `init` makes. The init's charge,
+/// the larger of its fuel and that wall, comes off the remainder before the
+/// constructor runs: with ten loops to a burn the three calls still answer;
+/// with one loop the filter would meet the remainder.
+#[test]
+fn the_decisions_budget_holds_while_the_slots_init_is_held_off_its_core() {
+    let steer = Arc::new(AtomicU8::new(0));
+    let runtime = steered_runtime(&steer, std::time::Duration::from_millis(200));
+    let mut burner = spec(
+        "stalled-burner",
+        guest::record_guest(),
+        mode::BURN_IN_STAGES,
+    );
+    burner.config.push(mode::INIT_ASKS_THE_CLOCK);
+    burner.budget_micros = 0;
+    burner.fuel_per_micro = SLOW_CALIBRATION;
+    burns(&mut burner, 10);
+    let fuel_per_micro = burner.fuel_per_micro;
+    let plugin = Plugin::load(&runtime, burner).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    let decide_under = |budget_micros: u32, seed: u64| {
+        engine.decide(
+            &RequestFacts {
+                budget_micros,
+                ..facts(seed)
+            },
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    };
+    let before = plugin.stats().fuel_used;
+    assert!(matches!(
+        decide_under(SLOW_FRAME_MICROS * 10, 1),
+        Decision::Pick(_)
+    ));
+    let one = plugin.stats();
+    let per_call = (one.fuel_used - before) / 3;
+    let budget_micros = u32::try_from((per_call * 5 / 2).div_ceil(fuel_per_micro)).expect("fits");
+    // A cold slot: the decision's open runs `init`, whose one clock call naps
+    // two hundred milliseconds on the decision's budget.
+    plugin.forget_instance();
+    steer.store(1, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let decision = decide_under(budget_micros, 2);
+    steer.store(0, Ordering::Relaxed);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "the init napped inside the decision: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(decision, Decision::Pick(_)),
+        "the fallbacks decide"
+    );
+    let two = plugin.stats();
+    // The open's init, and the close's rebuild after the picker's run-out
+    // (its own nap outside the budget).
+    assert!(
+        two.lazy_instantiations > one.lazy_instantiations,
+        "the cold slot's init ran inside the decision: {two:?}"
+    );
+    assert_eq!(
+        two.answered - one.answered,
+        3,
+        "the constructor, the filter and the scorer answered behind the stalled init: {two:?}"
+    );
+    assert_eq!(
+        (two.budget_gone, two.traps),
+        (0, 0),
+        "the stall is a charge on the remainder, never a failure: {two:?}"
+    );
+}
+
 /// A declined filter declines once per open decision: the pair plan's
 /// partner scan asks row by row and reads the cached decline.
 #[test]
