@@ -581,7 +581,12 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             get: Some(operation(
                 "listResponseInputItems",
                 "List input items for a response",
-                Some(response_id_param),
+                Some(
+                    response_id_param
+                        .into_iter()
+                        .chain(["limit", "order", "after", "include"].map(optional_query_param))
+                        .collect(),
+                ),
                 None,
                 input_items_responses,
             )),
@@ -1633,6 +1638,34 @@ mod tests {
         assert_eq!(
             doc["paths"]["/workers"]["get"]["parameters"][0]["name"],
             json!("model")
+        );
+    }
+
+    #[test]
+    fn the_input_items_list_names_its_paging_parameters() {
+        let doc = document_value();
+        let parameters: Vec<_> = doc["paths"]["/v1/responses/{response_id}/input_items"]["get"]
+            ["parameters"]
+            .as_array()
+            .expect("the parameters")
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter["name"].as_str().unwrap_or(""),
+                    parameter["in"].as_str().unwrap_or(""),
+                    parameter["required"].as_bool(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            parameters,
+            vec![
+                ("response_id", "path", Some(true)),
+                ("limit", "query", Some(false)),
+                ("order", "query", Some(false)),
+                ("after", "query", Some(false)),
+                ("include", "query", Some(false)),
+            ]
         );
     }
 

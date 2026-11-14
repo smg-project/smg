@@ -54,6 +54,21 @@ impl Transport {
         self.send_with_retry(req, None::<()>).await
     }
 
+    /// Send a GET request with a query string with retry; a repeated key sends
+    /// one pair per value, and an empty query sends the bare path.
+    pub(crate) async fn get_with_query(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Response, SmgError> {
+        let req = if query.is_empty() {
+            self.client.get(self.url(path))
+        } else {
+            self.client.get(query_url(&self.url(path), query)?)
+        };
+        self.send_with_retry(req, None::<()>).await
+    }
+
     /// Send a POST request with a JSON body with retry.
     pub(crate) async fn post<T: Serialize>(
         &self,
@@ -179,4 +194,34 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// Check if a reqwest error is transient and worth retrying.
 fn is_retryable_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout()
+}
+
+/// The URL of a GET with a query: the pairs form-encoded in the order given
+/// (the url crate's encoder, which the HTTP client re-exports).
+fn query_url(url: &str, query: &[(&str, String)]) -> Result<reqwest::Url, SmgError> {
+    reqwest::Url::parse_with_params(url, query)
+        .map_err(|e| SmgError::Stream(format!("invalid request url: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_url;
+
+    #[test]
+    fn the_query_url_names_each_pair_in_order_and_encodes_the_values() {
+        let url = query_url(
+            "http://gateway.test/v1/responses/resp_1/input_items",
+            &[
+                ("limit", "2".to_string()),
+                ("after", "msg 3".to_string()),
+                ("include", "a".to_string()),
+                ("include", "b".to_string()),
+            ],
+        )
+        .expect("a well-formed url");
+        assert_eq!(
+            url.as_str(),
+            "http://gateway.test/v1/responses/resp_1/input_items?limit=2&after=msg+3&include=a&include=b"
+        );
+    }
 }
