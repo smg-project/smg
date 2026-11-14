@@ -301,6 +301,12 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // flint writes GLM's keyed calls with nothing between the tags under a bare marker frame; its
     // prompt ends bare at `<|assistant|>` under every kwarg (the model writes the thought or not).
     ("flint", GenerationPrompt::ModelDecides),
+    // GLM5.3-Flash-E192-DGX-Spark writes GLM's keyed calls with nothing between the tags; its
+    // prompt opens the thought under every kwarg (an effort line, no thinking switch).
+    (
+        "glm5.3-flash-e192-dgx-spark",
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
