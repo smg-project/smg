@@ -3583,6 +3583,45 @@ fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
     );
 }
 
+/// The registry hands the series store a worker's id with its registration:
+/// of two workers whose addresses differ in the userinfo alone, the scrape
+/// tells the second from the first by its id, and writes neither credential.
+#[test]
+fn a_registration_hands_the_series_store_the_workers_id() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    let worker = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker("http://key-one@id-seam:8080"))
+            .unwrap();
+        let second = registry
+            .register(worker("http://key-two@id-seam:8080"))
+            .unwrap();
+        let mut rendered = String::new();
+        series.render_into(&mut rendered);
+        let health = |label: &str| {
+            let line = format!("smg_worker_health{{worker=\"{label}\"}} ");
+            rendered.lines().any(|rendered| rendered.starts_with(&line))
+        };
+        assert!(health("http://***@id-seam:8080"), "{rendered}");
+        let with_id = format!("http://***@id-seam:8080 {}", second.as_str());
+        assert!(health(&with_id), "{rendered}");
+        assert!(!rendered.contains("key-one") && !rendered.contains("key-two"));
+    });
+}
+
 /// A worker replaced at its URL stays alive in the handles taken before the
 /// replacement (a load guard) and writes under the URL when they go: the
 /// registry hands the store its witness at the replacement, so once the URL
