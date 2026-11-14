@@ -1318,8 +1318,8 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
         let run = {
-            let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
-            ctx.state.messages_tools = Some(tools);
+            let mut ctx =
+                RequestContext::for_messages(request, tools, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)

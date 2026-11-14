@@ -257,6 +257,7 @@ pub(crate) struct MessagesResponseSpec {
 /// converted once. The route takes them out of the request it still owns
 /// before the request is shared, so the schemas move instead of being copied
 /// per request; a reader with only a borrowed request converts by reference.
+#[derive(Clone)]
 pub(crate) struct MessagesTools {
     pub declared: bool,
     pub chat_tools: Arc<[Tool]>,

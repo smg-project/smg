@@ -475,8 +475,12 @@ mod tests {
             }))
             .expect("a Messages request"),
         );
-        let mut ctx =
-            RequestContext::for_messages(Arc::clone(&request), None, MODEL.into(), components());
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
+            Arc::clone(&request),
+            None,
+            MODEL.into(),
+            components(),
+        );
         ctx.state.parser = Some(ParserChoice::Symphony);
         let asks = Asks::for_messages(&request, false);
         let names = ctx.components.parser_resolver.names_for(None, MODEL);
@@ -547,8 +551,12 @@ mod tests {
             (1, 0),
             "the custom tool alone is declared, and the choice narrows it away"
         );
-        let mut ctx =
-            RequestContext::for_messages(Arc::clone(&request), None, MODEL.into(), components());
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
+            Arc::clone(&request),
+            None,
+            MODEL.into(),
+            components(),
+        );
         ctx.state.parser = Some(ParserChoice::Symphony);
         let asks = Asks::for_messages(&request, false);
         let names = ctx.components.parser_resolver.names_for(None, MODEL);
@@ -670,8 +678,12 @@ mod tests {
             }))
             .expect("messages request"),
         );
-        let mut ctx =
-            RequestContext::for_messages(Arc::clone(&messages), None, MODEL.into(), components());
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
+            Arc::clone(&messages),
+            None,
+            MODEL.into(),
+            components(),
+        );
         let for_messages = decided(&mut ctx, Asks::for_messages(&messages, false));
 
         assert_eq!(for_chat, for_messages);

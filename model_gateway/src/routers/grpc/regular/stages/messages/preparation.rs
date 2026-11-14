@@ -83,7 +83,7 @@ impl MessagePreparationStage {
         // parsers read them all from the spec.
         let spec = Box::new(MessagesResponseSpec::with_tools(
             request,
-            ctx.state.messages_tools.take(),
+            ctx.state.messages_tools.clone(),
         ));
         let filtered_tools =
             message_utils::template_tools(&spec.chat_tools, request.tool_choice.as_ref());
@@ -318,7 +318,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),
@@ -394,7 +394,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 model.into(),
@@ -473,7 +473,7 @@ mod tests {
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),

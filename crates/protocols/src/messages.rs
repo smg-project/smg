@@ -1198,9 +1198,19 @@ impl From<CustomTool> for common::Tool {
 }
 
 impl From<&CustomTool> for common::Tool {
-    /// The same tool from a borrowed custom tool: a copy of it moves in.
+    /// The same tool from a borrowed custom tool: the name, the description
+    /// and the schema are copied once; the fields a chat tool does not carry
+    /// (`extra`, `cache_control`, ...) are not.
     fn from(tool: &CustomTool) -> Self {
-        Self::from(tool.clone())
+        Self::from(CustomTool {
+            name: tool.name.clone(),
+            tool_type: None,
+            description: tool.description.clone(),
+            input_schema: tool.input_schema.clone(),
+            defer_loading: None,
+            cache_control: None,
+            extra: Map::new(),
+        })
     }
 }
 

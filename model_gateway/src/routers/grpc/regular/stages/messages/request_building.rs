@@ -255,7 +255,7 @@ mod tests {
             }))
             .expect("a Messages request"),
         );
-        let mut ctx = RequestContext::for_messages(
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
             Arc::clone(&messages),
             None,
             MODEL.to_string(),
