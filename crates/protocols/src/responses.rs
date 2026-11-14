@@ -353,8 +353,10 @@ pub enum ResponseTool {
     #[serde(rename = "function")]
     Function(FunctionTool),
 
-    /// Built-in tool.
-    #[serde(rename = "web_search_preview")]
+    /// Built-in preview web search tool. The public API also names it by its
+    /// dated type, `web_search_preview_2025_03_11`, which reads as this tool
+    /// and is written under the canonical `web_search_preview`.
+    #[serde(rename = "web_search_preview", alias = "web_search_preview_2025_03_11")]
     WebSearchPreview(WebSearchPreviewTool),
 
     /// Built-in non-preview hosted web search tool.
@@ -1228,6 +1230,9 @@ pub enum McpConnectorId {
 pub struct WebSearchPreviewTool {
     pub search_context_size: Option<String>,
     pub user_location: Option<Value>,
+    /// The kinds of content the search returns, `text` and `image` in the
+    /// public API (`SearchContentType`).
+    pub search_content_types: Option<Vec<String>>,
 }
 
 /// Non-preview hosted web search tool configuration.

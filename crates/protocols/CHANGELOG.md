@@ -94,6 +94,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- The preview web search tool takes the public API's dated type, `web_search_preview_2025_03_11`,
+  written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
+  refused a request declaring either, as an unknown tool type or field. Breaking:
+  `WebSearchPreviewTool` gains `search_content_types: Option<Vec<String>>`.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
