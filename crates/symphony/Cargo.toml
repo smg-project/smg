@@ -40,5 +40,9 @@ harness = false
 name = "grammar"
 harness = false
 
+[[bench]]
+name = "forced"
+harness = false
+
 [lints]
 workspace = true
