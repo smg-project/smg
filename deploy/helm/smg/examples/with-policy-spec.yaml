@@ -1,0 +1,29 @@
+# The routing policy as a specification document. router.policySpec holds the
+# document; the chart writes it into a ConfigMap mounted at
+# /etc/smg/policy/spec.yaml and passes --policy-spec with --policy-engine engine.
+# The document below is the chart's default policy as a composition of the
+# stages this gateway build carries (the chart's cache_aware, not an engine
+# preset name), each stage at its own default, which equals the chart's tuning
+# default: prefix-affinity's threshold 0.3 and spill abs 64 / rel 1.5, the
+# index's max_size 67108864 and sweep_s 120, the host's block size 16. So no
+# tuning value is written; the README's Policy Specification section maps each
+# chart value to its field in the document. A stage the build lacks is refused
+# by name at start, so a document names only stages its gateway release builds;
+# the policy crate's tests keep this example one the engine accepts.
+# files/policyspec.schema.json describes the document and the gateway validates
+# it at start. None of router.policy, the cache tuning values or the role
+# policies renders beside it, and one changed from its default is refused at
+# render. An existing ConfigMap holding spec.yaml can be named with
+# router.policySpecConfigMap instead.
+router:
+  policySpec:
+    apiVersion: smg.policy/v1
+    generation: 1
+    profiles:
+      cache_aware:
+        filter: [healthy, not-overloaded, not-tried]
+        score: [prefix-affinity, least-load]
+        pick: best
+    bindings:
+      - match: { model: "*" }
+        profile: cache_aware

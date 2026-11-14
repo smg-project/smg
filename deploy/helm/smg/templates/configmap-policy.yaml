@@ -1,0 +1,19 @@
+{{- /*
+The policy specification document of router.policySpec as the file the
+router reads: the router Deployment mounts this ConfigMap whole at
+/etc/smg/policy and passes --policy-spec /etc/smg/policy/spec.yaml. Not
+rendered under router.policySpecConfigMap (an existing ConfigMap whose key
+is spec.yaml too) or without a specification.
+*/}}
+{{- if .Values.router.policySpec }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "smg.fullname" . }}-policy-spec
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+data:
+  spec.yaml: |
+    {{- toYaml .Values.router.policySpec | nindent 4 }}
+{{- end }}

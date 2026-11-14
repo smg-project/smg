@@ -212,6 +212,107 @@ it cannot start without. Renders nothing.
 {{- end }}
 
 {{/*
+Policy specification source -- "inline" when router.policySpec holds a
+document (written into the chart's own ConfigMap), "configmap" when
+router.policySpecConfigMap names an existing one, empty when the policy
+values render as flags. Both set is refused by smg.validatePolicySpec.
+*/}}
+{{- define "smg.policySpecSource" -}}
+{{- if .Values.router.policySpec -}}
+inline
+{{- else if .Values.router.policySpecConfigMap -}}
+configmap
+{{- end -}}
+{{- end }}
+
+{{/*
+Policy specification ConfigMap -- the ConfigMap the router mounts at
+/etc/smg/policy: the chart's own under router.policySpec, the named one
+under router.policySpecConfigMap. Empty without a specification.
+*/}}
+{{- define "smg.policySpecConfigMapName" -}}
+{{- if .Values.router.policySpec -}}
+{{ include "smg.fullname" . }}-policy-spec
+{{- else if .Values.router.policySpecConfigMap -}}
+{{ .Values.router.policySpecConfigMap }}
+{{- end -}}
+{{- end }}
+
+{{/*
+Policy specification validation -- refuses at render time what the gateway
+would refuse at start-up or run without telling: two specification
+sources; a policy value changed from its chart default where its flag
+would not render, beside a specification (the document owns the routing
+policy, and the gateway refuses a flag that disagrees with it) or under
+router.legacyPolicyFlags=false (the value would never reach the gateway);
+and a disaggregated mode or IGW beside a specification (the gateway does
+not read the document for those fleets yet and refuses the pair at
+start), checked after the values so a role policy is named first.
+The defaults compared against are values.yaml's; a render test pins them
+equal. Renders nothing.
+*/}}
+{{- define "smg.validatePolicySpec" -}}
+{{- $router := .Values.router -}}
+{{- if and $router.policySpec $router.policySpecConfigMap -}}
+{{- fail "router.policySpec and router.policySpecConfigMap name two specifications: set one or the other" -}}
+{{- end -}}
+{{- $source := include "smg.policySpecSource" . -}}
+{{- $spec := ternary "router.policySpec" "router.policySpecConfigMap" (eq $source "inline") -}}
+{{- if or $source (not $router.legacyPolicyFlags) -}}
+{{- $changed := list -}}
+{{- if ne ($router.policy | toString) "cache_aware" -}}
+{{- $changed = append $changed "router.policy" -}}
+{{- end -}}
+{{- if $router.disaggregation.prefillPolicy -}}
+{{- $changed = append $changed "router.disaggregation.prefillPolicy" -}}
+{{- end -}}
+{{- if $router.disaggregation.decodePolicy -}}
+{{- $changed = append $changed "router.disaggregation.decodePolicy" -}}
+{{- end -}}
+{{- if $router.disaggregation.encodePolicy -}}
+{{- $changed = append $changed "router.disaggregation.encodePolicy" -}}
+{{- end -}}
+{{- if ne (float64 $router.cacheThreshold) 0.3 -}}
+{{- $changed = append $changed "router.cacheThreshold" -}}
+{{- end -}}
+{{- if ne (int64 $router.balanceAbsThreshold) 64 -}}
+{{- $changed = append $changed "router.balanceAbsThreshold" -}}
+{{- end -}}
+{{- if ne (float64 $router.balanceRelThreshold) 1.5 -}}
+{{- $changed = append $changed "router.balanceRelThreshold" -}}
+{{- end -}}
+{{- if ne (int64 $router.evictionIntervalSecs) 120 -}}
+{{- $changed = append $changed "router.evictionIntervalSecs" -}}
+{{- end -}}
+{{- if ne (int64 $router.maxTreeSize) 67108864 -}}
+{{- $changed = append $changed "router.maxTreeSize" -}}
+{{- end -}}
+{{- if ne (int64 $router.blockSize) 16 -}}
+{{- $changed = append $changed "router.blockSize" -}}
+{{- end -}}
+{{- with $changed -}}
+{{- if $source -}}
+{{- fail (printf "%s set beside %s: the policy specification owns the routing policy, so write the value in the document or drop it (the gateway refuses a flag that disagrees with the document)" (join ", " .) $spec) -}}
+{{- else -}}
+{{- fail (printf "%s set under router.legacyPolicyFlags=false: the policy flags are off, so the value would never reach the gateway; write it in a policy specification document (router.policySpec) or drop it" (join ", " .)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $source -}}
+{{- $fleet := list -}}
+{{- with $router.disaggregation.mode -}}
+{{- $fleet = append $fleet (printf "router.disaggregation.mode=%s" .) -}}
+{{- end -}}
+{{- if $router.enableIgw -}}
+{{- $fleet = append $fleet "router.enableIgw=true" -}}
+{{- end -}}
+{{- with $fleet -}}
+{{- fail (printf "%s set beside %s: the gateway does not read the policy specification for a disaggregated or IGW fleet yet and refuses the pair at start, so drop the document or the mode" (join ", " .) $spec) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Consul TLS files -- the files of router.discovery.consul.tls.existingSecret
 the router pod mounts under /etc/smg/consul-tls, as a JSON list for
 fromJsonArray: each with its key within the Secret (key), its file name in
@@ -268,8 +369,23 @@ Called from the router Deployment template.
 - {{ . | quote }}
 {{- end }}
 {{- end }}
+{{- /* The routing policy: the specification document (mounted by the router
+     Deployment at /etc/smg/policy/spec.yaml) with the engine that reads it,
+     or the policy values as the gateway's flags, never both: the gateway
+     refuses a flag that disagrees with the document. Under
+     router.legacyPolicyFlags=false and no document, the gateway's own
+     defaults apply. */}}
+{{- $policySpec := include "smg.policySpecSource" . }}
+{{- $policyFlags := and (not $policySpec) .Values.router.legacyPolicyFlags }}
+{{- if $policySpec }}
+- "--policy-engine"
+- "engine"
+- "--policy-spec"
+- "/etc/smg/policy/spec.yaml"
+{{- else if $policyFlags }}
 - "--policy"
 - {{ .Values.router.policy | quote }}
+{{- end }}
 {{- with .Values.router.disaggregation }}
 {{- $mode := .mode | default "" }}
 {{- /* The role flags of disaggregated serving, typed: a role given without
@@ -286,15 +402,15 @@ Called from the router Deployment template.
 {{- else if eq $mode "epd" }}
 - "--epd-disaggregation"
 {{- end }}
-{{- if .prefillPolicy }}
+{{- if and $policyFlags .prefillPolicy }}
 - "--prefill-policy"
 - {{ .prefillPolicy | quote }}
 {{- end }}
-{{- if .decodePolicy }}
+{{- if and $policyFlags .decodePolicy }}
 - "--decode-policy"
 - {{ .decodePolicy | quote }}
 {{- end }}
-{{- if .encodePolicy }}
+{{- if and $policyFlags .encodePolicy }}
 - "--encode-policy"
 - {{ .encodePolicy | quote }}
 {{- end }}
@@ -536,6 +652,7 @@ Called from the router Deployment template.
 - "--chat-template"
 - {{ .Values.router.chatTemplate | quote }}
 {{- end }}
+{{- if $policyFlags }}
 - "--cache-threshold"
 - {{ .Values.router.cacheThreshold | quote }}
 - "--balance-abs-threshold"
@@ -548,6 +665,7 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxTreeSize | quote }}
 - "--block-size"
 - {{ .Values.router.blockSize | quote }}
+{{- end }}
 - "--max-payload-size"
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"

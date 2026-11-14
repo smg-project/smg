@@ -1,5 +1,6 @@
 {{- include "smg.validateDiscovery" . -}}
 {{- include "smg.validateAdmission" . -}}
+{{- include "smg.validatePolicySpec" . -}}
 apiVersion: apps/v1
 {{- if .Values.router.mesh.enabled }}
 kind: StatefulSet
@@ -53,6 +54,13 @@ spec:
         {{- end }}
         {{- if include "smg.oracleSecretManaged" . }}
         checksum/oracle-secret: {{ include (print $.Template.BasePath "/secret-oracle.yaml") . | sha256sum }}
+        {{- end }}
+        {{- /* The policy specification is read at start, so a changed
+             router.policySpec rolls the pods through its ConfigMap's checksum.
+             An existing ConfigMap the chart does not see needs a rollout
+             restart. */}}
+        {{- if .Values.router.policySpec }}
+        checksum/policy-spec: {{ include (print $.Template.BasePath "/configmap-policy.yaml") . | sha256sum }}
         {{- end }}
         {{- with .Values.router.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -199,6 +207,11 @@ spec:
               mountPath: /etc/smg/scheduler
               readOnly: true
             {{- end }}
+            {{- if include "smg.policySpecConfigMapName" . }}
+            - name: policy-spec
+              mountPath: /etc/smg/policy
+              readOnly: true
+            {{- end }}
             {{- if include "smg.consulTlsFiles" . | fromJsonArray }}
             - name: consul-tls
               mountPath: /etc/smg/consul-tls
@@ -248,6 +261,15 @@ spec:
         - name: scheduler
           configMap:
             name: {{ .Values.router.priorityScheduler.configMap.name }}
+        {{- end }}
+        {{- /* The policy specification, a whole ConfigMap as the discovery
+             manifest: the kubelet's symlink swap brings an edit to spec.yaml
+             for the gateway's later file watch. Not optional: the gateway
+             refuses to start without the document. */}}
+        {{- with include "smg.policySpecConfigMapName" . }}
+        - name: policy-spec
+          configMap:
+            name: {{ . }}
         {{- end }}
         {{- with include "smg.consulTlsFiles" . | fromJsonArray }}
         - name: consul-tls
