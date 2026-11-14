@@ -3293,7 +3293,7 @@ pub struct ResponsesRequest {
     pub prompt_cache_key: Option<String>,
 
     /// Retention policy for prompt-cache entries.
-    /// Spec: body param `prompt_cache_retention` (`"in-memory"` | `"24h"`).
+    /// Spec: body param `prompt_cache_retention` (`"in_memory"` | `"24h"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
 

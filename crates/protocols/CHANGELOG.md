@@ -94,6 +94,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
+  (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
+  request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public
+  API does not list, in the requests and responses it serialized.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and

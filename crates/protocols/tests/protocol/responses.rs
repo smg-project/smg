@@ -656,24 +656,30 @@ fn test_responses_request_new_top_level_fields_round_trip() {
     );
 }
 
-/// `prompt_cache_retention` accepts the other spec value and serializes
-/// back with the hyphenated rename.
+/// `prompt_cache_retention` reads the public API's `in_memory`, and the
+/// hyphenated `in-memory` this crate wrote before, and writes `in_memory`.
 #[test]
 fn test_prompt_cache_retention_in_memory_round_trip() {
-    let request: ResponsesRequest = serde_json::from_value(json!({
-        "model": "gpt-5.4",
-        "input": "hello",
-        "prompt_cache_retention": "in-memory"
-    }))
-    .expect("should deserialize");
+    for spelling in ["in_memory", "in-memory"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "prompt_cache_retention": spelling
+        }))
+        .expect(spelling);
 
-    assert_eq!(
-        request.prompt_cache_retention,
-        Some(PromptCacheRetention::InMemory)
-    );
+        assert_eq!(
+            request.prompt_cache_retention,
+            Some(PromptCacheRetention::InMemory),
+            "{spelling}"
+        );
 
-    let reserialized = serde_json::to_value(&request).expect("should serialize");
-    assert_eq!(reserialized["prompt_cache_retention"], "in-memory");
+        let reserialized = serde_json::to_value(&request).expect("should serialize");
+        assert_eq!(
+            reserialized["prompt_cache_retention"], "in_memory",
+            "{spelling}"
+        );
+    }
 }
 
 /// Absent fields must stay absent on the wire (no `"prompt": null` etc.),
