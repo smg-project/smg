@@ -6,6 +6,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Added
 
+- `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
+  map of its pairs), `responses::validate_metadata_pair_count` (its 16-pair bound alone, for a
+  count read on its own), `responses::validate_input_message_role` (an input message's role in
+  the public set) and `common::json_type_name` are public: a route that reads a metadata object or
+  stores message items of its own (the gateway's Conversations routes) validates them with the
+  rules the Responses request already validates with, in the same words and under the same codes.
 - `into_chat_tools` and the by-value `From<CustomTool> for Tool` and `From<InputSchema> for Value`:
   a caller that owns a Messages request's tools converts them into chat tools without copying the
   schemas (the properties and the additional fields move in); the by-reference forms stay for a
@@ -48,6 +54,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A `metadata` value that is not a string is refused as `400 invalid_type`, naming the key and the
+  type sent (`Invalid type for 'metadata.k': expected a string, but got an object instead.`), as
+  the public API refuses one; before, a request's `metadata` passed validation with an object, a
+  number, a boolean or a null value under a key.
 - A rerank worker's answer is read as `RerankWorkerResponse { results, usage, id }`: its `usage`
   (a rerank server's `prompt_tokens` and `total_tokens`, read as the crate's `UsageInfo`, whose
   `completion_tokens` defaults; a usage in another spelling is left out, as before) and its `id`
@@ -136,10 +146,17 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `type` and a `name` and no `input_schema` as `ToolSearch`, which kept only those two keys,
   `allowed_callers` and `cache_control`, so the provider route dropped the rest. Breaking:
   `ToolSearchTool` gains `extra: Map<String, Value>`.
+- A reasoning output item without `content`, as the public API writes it (`id`, `summary` and
+  `encrypted_content`), parses, with no content. The crate refused the item, and any Response
+  carrying it, with ``missing field `content` ``. An item the gateway writes is unchanged.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
   read the same way; a usage the gateway writes is unchanged.
+- `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
+  (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
+  request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public
+  API does not list, in the requests and responses it serialized.
 - `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
   `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
   "input_image" in a function output for text-only backends: only text parts are carried as a tool
@@ -150,6 +167,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   The message reaches a client on both routes that read it: the chat-family Responses conversion
   (`400 unsupported_content_part`) and the Harmony builder's tool message
   (`400 harmony_build_failed`).
+- A Response linked to a conversation writes it as the public API does, `{"id": "conv_..."}`
+  (`ResponseConversation`), where the crate wrote the bare id, and reads either shape: the crate
+  refused a Response carrying the object with ``invalid type: map, expected a string``. The field
+  keeps the id alone (`Option<String>`), so code that reads it is unchanged, and its schema takes
+  both shapes, so a client generated from it also reads a response stored with the bare id.
 - The generate route's request rule refuses an empty `text` under `prompt_empty` only when the body
   has no `input_ids` and no media field carries an item (beside ids the engine serves the ids without
   reading the text; a media-only prompt is sent with an empty `text`, as the engine reads it);
@@ -159,6 +181,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the ids without a word. The
   request's media read (`GenerateRequest::media_fields`, `carries_media`) is one definition here,
   read by the gRPC path's media refusal as well.
+- A built-in `range` or `length` rule that carries no message of its own answers a sentence in the
+  routes' form (`Invalid 'dimensions': integer below minimum value. Expected an integer >= 1, but got 0
+  instead.`) instead of the validation library's rendering of the rule's name and parameters
+  (`Validation error: range [{"min": Number(1), "value": Number(0)}]`); the code and param are
+  unchanged. Every such rule of the crate (`dimensions`, the sampling parameters, ...) answers this way.
+- A Responses input file part with `detail: "auto"`, the public API's default (`FileInputDetail`),
+  parses, and a prompt's file variable keeps its `detail` when the request is written back for an
+  upstream. The crate refused the request with ``unknown variant `auto`, expected `low` or
+  `high` `` and dropped the variable's detail. Breaking: `FileDetail` gains `Auto`, now its default,
+  and `PromptVariableTyped::ResponseInputFile` gains `detail: Option<FileDetail>`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
@@ -184,13 +216,24 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `structural_tag` joins the one-constraint rule beside `regex`, `ebnf` and `json_schema`, and a
   `beam_width` below one is refused, as SGLang refuses both. Breaking: `SamplingParams` gains the
   seven fields.
+- A web search call parses as the public API writes it: a `find_in_page` action (the crate named
+  it `find`, which still reads and is now written `find_in_page`), an `open_page` action without
+  a URL or with a null one, and the `incomplete` status. The crate refused each as an unknown
+  variant or a missing field. Breaking: `WebSearchCallStatus` gains `Incomplete`, and
+  `WebSearchAction::OpenPage.url` is `Option<String>`.
 - A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
   body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
   key was left out, so a client generated from the public schema, which marks it required, read a
   choice it does not expect. A choice with log probabilities is written as before.
+- A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
+  (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
+  `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
+- A replayed `computer_call_output` input item with `acknowledged_safety_checks: null`, which the
+  public API allows (`ComputerCallOutputItemParam`), parses as none acknowledged. The crate refused
+  the request whole, as matching no variant of `ResponseInput`.
 - `EmbeddingRequest`, `ClassifyRequest`, `TokenizeRequest`, `DetokenizeRequest` and
   `V1RerankReqInput` implement `Validate` and `Normalizable`, so the gateway reads
   `/v1/embeddings`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize` and `/v1/rerank` through its
@@ -200,6 +243,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
   its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
   declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- The preview web search tool takes the public API's dated type, `web_search_preview_2025_03_11`,
+  written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
+  refused a request declaring either, as an unknown tool type or field. Breaking:
+  `WebSearchPreviewTool` gains `search_content_types: Option<Vec<String>>`.
 - `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
   an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
   member of another kind than the first is refused by its index), and `EmbeddingRequest` the
@@ -210,11 +257,23 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   route's (`validate_embedding_input`), which also takes the serving engine's array of objects, a
   structured member each, forwarded with no field of them read. The rule reads shape only: a
   batch's length, the `encoding_format` and the objects' fields are the serving engine's to bound.
+- A `ResponsesResponse` whose `metadata` is `null`, or whose `incomplete_details.reason` is
+  `max_messages` or `steered`, as the public API writes them, parses; it refused all three.
+  `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
+  `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
+  `MaxMessages` and `Steered`.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
   `text.format` description into the Chat request it builds, but a gRPC engine still gets only the
   format's schema, as before. Breaking: `JsonSchemaFormat` gains `description: Option<String>`.
+- A Responses request's reasoning config keeps `mode`, `context` and the deprecated
+  `generate_summary`, as the public API's `Reasoning` takes them, when the request is written back
+  for an upstream, and a Response's `reasoning` echoes the ones the request set. The crate dropped
+  all three, so a `pro`-mode request reached the upstream in its default mode. Breaking:
+  `ResponseReasoningParam` gains `mode: Option<String>`, `context: Option<ReasoningContext>` and
+  `generate_summary: Option<ReasoningSummary>`, `ReasoningInfo` gains the three as
+  `Option<String>`, and the crate gains `ReasoningContext`.
 - A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
   cached, as the public API defaults the key. The crate refused the whole usage, and the
   completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream
@@ -222,6 +281,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `text_tokens` in the completion details. A usage the gateway builds is written as before.
   Breaking: `PromptTokenUsageInfo` gains `text_tokens`, `image_tokens` and `cache_write_tokens`,
   and `CompletionTokensDetails` gains `text_tokens`, all `Option<u32>`.
+- A Responses function tool declared with `async`, `defer_loading`, `output_schema` or
+  `allowed_callers`, and a custom tool declared with `async` or `allowed_callers`, as the public
+  API's tools take them, parse and are forwarded as given. The crate refused each as an unknown
+  field. The function tool's four keys are validated for shape as the custom tool's typed fields
+  are (`invalid_type` otherwise). `FunctionTool::chat_function` leaves the four keys out of the
+  copy a chat template renders, and `FunctionTool::allows_direct_calls` and
+  `CustomTool::allows_direct_calls` say whether the model may call a tool itself. Breaking:
+  `CustomTool` gains `r#async: Option<bool>` and `allowed_callers: Option<Vec<String>>`.
 - `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
   `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
   gateway's `/generate` reads its body through the validated extractor and answers a negative
@@ -231,6 +298,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
   `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
   `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
+- A `/v1/tokenize` answer carries `max_model_len`, as SGLang's `/tokenize` writes it: the smallest
+  context window any of the model's workers reports, or -1, SGLang's value when there is none.
+  SGLang's own `TokenizeResponse` refused the gateway's answer without it. Breaking:
+  `TokenizeResponse` gains `max_model_len`.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a
