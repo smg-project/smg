@@ -1898,12 +1898,6 @@ impl WorkerRegistry {
         self.remove_inner(worker_id, None, None)
     }
 
-    /// Core removal shared by [`Self::remove`] and [`Self::remove_remote`].
-    /// When `expect_origin` is set, the origin is re-checked after the
-    /// per-worker mutation lock is acquired and the removal aborts on a
-    /// mismatch — a lock-free pre-check alone races `replace_inner`'s
-    /// promotion (check Mesh, block on the lock, promotion lands, then
-    /// delete a now locally-owned worker).
     /// Remove the worker only while `condition` reads true of the worker as
     /// it stands, the read and the removal under the same per-worker lock.
     /// The removal workflow's final step removes the incarnation it drained
@@ -1918,6 +1912,14 @@ impl WorkerRegistry {
         self.remove_inner(worker_id, None, Some(&condition))
     }
 
+    /// Core removal shared by [`Self::remove`], [`Self::remove_remote`] and
+    /// [`Self::remove_if`]. When `expect_origin` is set, the origin is
+    /// re-checked after the per-worker mutation lock is acquired and the
+    /// removal aborts on a mismatch — a lock-free pre-check alone races
+    /// `replace_inner`'s promotion (check Mesh, block on the lock, promotion
+    /// lands, then delete a now locally-owned worker). When `condition` is
+    /// set, it is read of the worker under the same lock and the removal
+    /// returns `None` unless it holds.
     fn remove_inner(
         &self,
         worker_id: &WorkerId,
