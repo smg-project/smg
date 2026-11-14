@@ -706,7 +706,7 @@ fn push_mcp_blocks(content: &mut Vec<ContentBlock>, call: &McpToolCall) {
                 citations: None,
             }),
         ])),
-        is_error: call.is_error.then_some(true),
+        is_error: Some(call.is_error),
     });
 }
 
@@ -761,6 +761,41 @@ mod tests {
             serde_json::to_string(&custom.input_schema).unwrap(),
             serde_json::to_string(&schema).unwrap()
         );
+    }
+
+    /// The answer's `mcp_tool_result` blocks say whether each call failed, as
+    /// the stream's do: `false` for a call that succeeded, `true` for one
+    /// that failed, never `null`.
+    #[test]
+    fn the_answers_mcp_tool_results_say_whether_each_call_failed() {
+        let message: Message = serde_json::from_value(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn", "stop_sequence": null, "stop_details": null,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "container": null
+        }))
+        .unwrap();
+        let call = |id: &str, is_error| McpToolCall {
+            original_id: format!("toolu_{id}"),
+            mcp_id: format!("mcptoolu_{id}"),
+            name: "lookup".to_string(),
+            server_name: "srv".to_string(),
+            input: json!({}),
+            result_content: "42".to_string(),
+            is_error,
+        };
+        let answer =
+            rebuild_response_with_mcp_blocks(message, &[call("1", false), call("2", true)], &[]);
+        let answer = serde_json::to_value(answer).unwrap();
+        let results: Vec<&Value> = answer["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "mcp_tool_result")
+            .collect();
+        assert_eq!(results.len(), 2, "{answer}");
+        assert_eq!(results[0]["is_error"], json!(false));
+        assert_eq!(results[1]["is_error"], json!(true));
     }
 
     /// Every message as one line, `role: text` or `role: [block, ...]`, a
