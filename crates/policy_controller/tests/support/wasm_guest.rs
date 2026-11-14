@@ -76,7 +76,7 @@ pub mod mode {
     pub const TRAP_IN_CONSTRUCTOR: u8 = 24;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
-    /// without end.
+    /// without end, of three trap at once.
     pub const INIT_ASKS_THE_CLOCK: u8 = 1;
     /// `init` fails.
     pub const REFUSE_INIT: u8 = 255;
@@ -321,7 +321,8 @@ fn guest_wat(guest: Guest) -> String {
       (then (global.set $mode (i32.load8_u (local.get $ptr)))))
     ;; A second config byte, when set: `init` asks the host's live clock, one
     ;; host call that costs a few units of fuel however long the host takes
-    ;; to answer. An answer of one makes it refuse, of two spin without end.
+    ;; to answer. An answer of one makes it refuse, of two spin without end,
+    ;; of three trap at once.
     (if (i32.gt_u (local.get $len) (i32.const 1))
       (then
         (if (i32.load8_u offset=1 (local.get $ptr))
@@ -330,7 +331,9 @@ fn guest_wat(guest: Guest) -> String {
             (if (i64.eq (local.get $asked) (i64.const 1))
               (then (global.set $mode (i32.const 255))))
             (if (i64.eq (local.get $asked) (i64.const 2))
-              (then (loop $spin (br $spin))))))))
+              (then (loop $spin (br $spin))))
+            (if (i64.eq (local.get $asked) (i64.const 3))
+              (then unreachable))))))
     (if (i32.eq (global.get $mode) (i32.const {burn_init}))
       (then
         (local.set $k (i32.const 8))

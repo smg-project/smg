@@ -2,11 +2,13 @@
 //! ran out of under its own bounds count as failures within a window; a
 //! moving p50 past half the decision's budget or a p99 past it (one sample
 //! per decision: the plugin's own charge in it, its constructor and stage
-//! calls whatever ended them, over the decision's budget) counts as
-//! slowness; either opens the breaker for a cool-down, during which every
-//! stage of the plugin takes its fallback without a call. One breaker per
-//! plugin, shared by its instances; the latency ring is per thread, kept
-//! across the thread's rebuilds (no shared write per call).
+//! calls whatever ended them and a lazy `init` the decision paid, over the
+//! decision's budget) counts as slowness; either opens the breaker for a
+//! cool-down, during which every stage of the plugin takes its fallback
+//! without a call. A report made during the cool-down, by a call admitted
+//! before the open, is dropped: one incident is one opening. One breaker
+//! per plugin, shared by its instances; the latency ring is per thread,
+//! kept across the thread's rebuilds (no shared write per call).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,7 +17,7 @@ use parking_lot::Mutex;
 use super::config::BreakerSpec;
 
 /// The failure window: when it started, on the runtime's clock, and the
-/// failures counted in it. With none counted no window is open: the next
+/// failures counted in it. With none counted there is no window: the next
 /// failure starts one at its own instant.
 #[derive(Debug, Default)]
 struct Window {
@@ -63,9 +65,15 @@ impl Breaker {
         false
     }
 
-    /// One failure at `now`: opens the breaker at the window's threshold.
-    pub(crate) fn failure(&self, now_micros: u64) {
+    /// One failure at `now`: opens the breaker at the window's threshold,
+    /// and says whether this one opened it. A failure reported while the
+    /// breaker is open, by a call admitted before it opened, is dropped: it
+    /// counts in no window and opens nothing again.
+    pub(crate) fn failure(&self, now_micros: u64) -> bool {
         let mut window = self.window.lock();
+        if now_micros < self.open_until.load(Ordering::Relaxed) {
+            return false;
+        }
         if window.failures == 0
             || now_micros.saturating_sub(window.start_micros) > self.spec.window_micros
         {
@@ -78,14 +86,23 @@ impl Breaker {
             window.failures = 0;
         }
         window.failures = window.failures.saturating_add(1);
-        if window.failures >= self.spec.failures {
+        let opened = window.failures >= self.spec.failures;
+        if opened {
             self.open(&mut window, now_micros);
         }
+        opened
     }
 
-    /// The latency rule tripped: open at once.
-    pub(crate) fn slow(&self, now_micros: u64) {
-        self.open(&mut self.window.lock(), now_micros);
+    /// The latency rule tripped: opens at once, and says whether it did. A
+    /// slow window reported while the breaker is open, completed by
+    /// decisions in flight at the open, is dropped like a failure.
+    pub(crate) fn slow(&self, now_micros: u64) -> bool {
+        let mut window = self.window.lock();
+        if now_micros < self.open_until.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.open(&mut window, now_micros);
+        true
     }
 
     /// Opens for the cool-down and forgets the window's count, so the next
@@ -104,15 +121,19 @@ impl Breaker {
     pub(crate) fn opens(&self) -> u64 {
         self.opens.load(Ordering::Relaxed)
     }
+
+    /// How long an opening lasts.
+    pub(crate) fn cooldown_micros(&self) -> u64 {
+        self.spec.cooldown_micros
+    }
 }
 
 /// The last [`Latency::SAMPLES`] decisions of one plugin on one thread, read
 /// every [`Latency::EVERY`] samples, each the plugin's charge in the decision
 /// as a share of its budget (in thousandths): a p50 past half the budget or
-/// a p99 past it is slow. The p99 of a window is its second-slowest sample, so one
-/// outlier
-/// does not open the breaker, and a window that read slow is forgotten, so
-/// it does not open it twice.
+/// a p99 past it is slow. The p99 of a window is its second-slowest sample,
+/// so one outlier does not open the breaker, and a window that read slow is
+/// forgotten, so it does not open it twice.
 #[derive(Debug)]
 pub(crate) struct Latency {
     ring: [u32; Self::SAMPLES],
@@ -260,6 +281,71 @@ mod tests {
         );
     }
 
+    /// A failure reported while the breaker is open, by a call admitted
+    /// before it opened, counts in no window and opens nothing again.
+    #[test]
+    fn a_failure_reported_while_open_neither_counts_nor_opens() {
+        // A cool-down shorter than the window.
+        let b = Breaker::new(BreakerSpec {
+            failures: 3,
+            window_micros: 1_000,
+            cooldown_micros: 100,
+        });
+        b.failure(0);
+        b.failure(0);
+        b.failure(0);
+        assert!(b.is_open(1));
+        // Three calls already out at the open fail during the cool-down.
+        b.failure(10);
+        b.failure(20);
+        b.failure(30);
+        assert_eq!(b.opens(), 1, "a report while open opens nothing again");
+        assert!(!b.is_open(100), "the cool-down was not restarted");
+        // The count starts afresh after the cool-down: one failure is the
+        // first of three, not the third.
+        b.failure(110);
+        assert!(
+            !b.is_open(111),
+            "the reports made while open were not counted"
+        );
+        b.failure(120);
+        b.failure(130);
+        assert!(b.is_open(131));
+        assert_eq!(b.opens(), 2);
+    }
+
+    /// A slow window reported while the breaker is open, completed by
+    /// decisions in flight at the open, opens nothing again.
+    #[test]
+    fn a_slow_window_reported_while_open_does_not_open_again() {
+        let b = Breaker::new(spec());
+        b.slow(100);
+        b.slow(2_000);
+        assert_eq!(b.opens(), 1);
+        assert!(!b.is_open(5_100), "the cool-down was not restarted");
+    }
+
+    #[test]
+    fn a_report_says_whether_it_opened_the_breaker() {
+        let b = Breaker::new(spec());
+        assert!(!b.failure(10));
+        assert!(!b.failure(20));
+        assert!(b.failure(30), "the third failure opened it");
+        assert!(!b.failure(40), "a report while open opened nothing");
+        assert!(!b.slow(50), "nor did a slow window");
+        assert!(b.slow(5_030), "after the cool-down a slow window opens");
+        // The same edge for a failure: the cool-down's last instant is
+        // inside it, its end is not.
+        let one = Breaker::new(BreakerSpec {
+            failures: 1,
+            window_micros: 1_000,
+            cooldown_micros: 100,
+        });
+        assert!(one.failure(0));
+        assert!(!one.failure(99), "the cool-down's last instant");
+        assert!(one.failure(100), "the cool-down has passed");
+    }
+
     /// Spins, then yields, until `ready`.
     fn wait(ready: impl Fn() -> bool) {
         let mut spins = 0_u32;
@@ -273,9 +359,9 @@ mod tests {
         }
     }
 
-    /// `racers` threads fail at the same instant on the expired window of a
-    /// fresh breaker whose threshold is `failures`, round after round: the
-    /// breakers as the rounds left them.
+    /// `racers` threads fail at the same instant past the window of a
+    /// breaker that failed once, under a threshold of `failures`, round
+    /// after round: the breakers as the rounds left them.
     fn race(racers: usize, failures: u32) -> Vec<Breaker> {
         const ROUNDS: usize = 4_000;
         let spec = BreakerSpec {
@@ -283,7 +369,15 @@ mod tests {
             window_micros: 10,
             cooldown_micros: 1_000,
         };
-        let breakers: Vec<Breaker> = (0..ROUNDS).map(|_| Breaker::new(spec)).collect();
+        let breakers: Vec<Breaker> = (0..ROUNDS)
+            .map(|_| {
+                let breaker = Breaker::new(spec);
+                // One failure: its window, ten microseconds from zero, has
+                // run out by the instant of the race.
+                breaker.failure(0);
+                breaker
+            })
+            .collect();
         // The rounds started so far, and the failures reported in all.
         let started = AtomicUsize::new(0);
         let reported = AtomicUsize::new(0);
@@ -292,7 +386,7 @@ mod tests {
                 scope.spawn(|| {
                     for (round, breaker) in breakers.iter().enumerate() {
                         wait(|| started.load(Ordering::Acquire) > round);
-                        // Past the window of a breaker that never failed.
+                        // Past the window the breaker's one failure started.
                         breaker.failure(1_000);
                         reported.fetch_add(1, Ordering::Release);
                     }

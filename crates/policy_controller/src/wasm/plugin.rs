@@ -440,14 +440,17 @@ pub struct Plugin {
     /// own frame.
     spent: ThreadLocal<Cell<(u64, u64)>>,
     /// Per thread: the latency ring, one sample per decision (the plugin's
-    /// own charged spend in it over the decision's budget), kept across
-    /// rebuilds so a plugin dropped every decision still completes a window.
+    /// own charged spend in it and a lazy `init` the decision paid, over the
+    /// decision's budget), kept across rebuilds so a plugin dropped every
+    /// decision still completes a window.
     latency: ThreadLocal<RefCell<Latency>>,
     /// Per thread: the decision's number, this plugin's opens of it still to
     /// close (each side of a pair, each binding), so the decision's sample is
-    /// taken at the plugin's last close of it, and the charge of a lazy
-    /// `init` the decision paid (part of its sample, not of its own spend).
-    decision_opens: ThreadLocal<Cell<(u64, u32, u64)>>,
+    /// taken at the plugin's last close of it, the charge of a lazy `init`
+    /// the decision paid (part of its sample, not of its own spend), and
+    /// whether the plugin already failed the decision: the decision is the
+    /// breaker's unit, so it counts one failure however many opens fail.
+    decision_opens: ThreadLocal<Cell<(u64, u32, u64, bool)>>,
 }
 
 impl fmt::Debug for Plugin {
@@ -904,19 +907,64 @@ impl Plugin {
             Fault::Invalid => bump(&self.tally.invalid),
         }
         self.drop_instance(instance);
-        self.breaker.failure(self.runtime.now_micros());
+        self.fail(self.runtime.now_micros());
     }
 
-    /// One of this plugin's opens of decision `decision` on this thread.
-    fn note_open(&self, decision: u64) {
+    /// One failure on the breaker, marked on the decision it fell in. The
+    /// decision is the breaker's unit: once a plugin failed one, its later
+    /// opens of it bypass and its close counts no second failure, so a
+    /// threshold of N failures is N decisions on a pair as on a single
+    /// placement. Outside a decision (a lifecycle event) nothing is marked.
+    fn fail(&self, now: u64) {
         let opens = self.decision_opens.get_or_default();
-        let (stamp, count, init) = opens.get();
-        let (count, init) = if stamp == decision {
-            (count, init)
+        let (stamp, count, init, _) = opens.get();
+        if count != 0 {
+            opens.set((stamp, count, init, true));
+        }
+        self.report(now);
+    }
+
+    /// One failure reported to the breaker; an opening writes its line.
+    fn report(&self, now: u64) {
+        if self.breaker.failure(now) {
+            self.opened("failures");
+        }
+    }
+
+    /// The breaker opened under `rule`: the one line of an opening. For the
+    /// cool-down every stage of the plugin takes its fallback, and nothing
+    /// else says so as it happens. A report made while the breaker is open
+    /// opens nothing, so an incident is one line: one a cool-down at most.
+    fn opened(&self, rule: &'static str) {
+        tracing::warn!(
+            plugin = self.name,
+            rule,
+            cooldown_micros = self.breaker.cooldown_micros(),
+            "the plugin's breaker opened: its stages take their fallback for the cool-down"
+        );
+    }
+
+    /// Whether this plugin already failed decision `decision` on this
+    /// thread; true until the thread's next decision opens it. Read at the
+    /// close, and only when a rebuild failed.
+    fn failed_in(&self, decision: u64) -> bool {
+        let (stamp, _, _, failed) = self.decision_opens.get_or_default().get();
+        stamp == decision && failed
+    }
+
+    /// One of this plugin's opens of decision `decision` on this thread;
+    /// says whether the plugin already failed that decision (the one read
+    /// of the cell an open makes).
+    fn note_open(&self, decision: u64) -> bool {
+        let opens = self.decision_opens.get_or_default();
+        let (stamp, count, init, failed) = opens.get();
+        let (count, init, failed) = if stamp == decision {
+            (count, init, failed)
         } else {
-            (0, 0)
+            (0, 0, false)
         };
-        opens.set((decision, count.saturating_add(1), init));
+        opens.set((decision, count.saturating_add(1), init, failed));
+        failed
     }
 
     /// The charge of a lazy `init` decision `decision` paid on this thread:
@@ -924,25 +972,25 @@ impl Plugin {
     /// what the decision cost it.
     fn note_init(&self, decision: u64, micros: u64) {
         let opens = self.decision_opens.get_or_default();
-        let (stamp, count, init) = opens.get();
+        let (stamp, count, init, failed) = opens.get();
         if stamp == decision {
-            opens.set((stamp, count, init.saturating_add(micros)));
+            opens.set((stamp, count, init.saturating_add(micros), failed));
         }
     }
 
     /// One of this plugin's closes of decision `decision`: the last one takes
     /// the decision's latency sample, the plugin's own charged spend in the
-    /// decision (its constructor and stage calls, whatever ended them) over
-    /// the decision's budget. A decision the plugin made no call in records
-    /// nothing.
+    /// decision (its constructor and stage calls, whatever ended them) plus
+    /// the charge of a lazy `init` the decision paid, over the decision's
+    /// budget. A decision that charged the plugin nothing records nothing.
     fn note_close(&self, decision: u64, seed_micros: u64) {
         let opens = self.decision_opens.get_or_default();
-        let (stamp, count, init) = opens.get();
+        let (stamp, count, init, failed) = opens.get();
         if stamp != decision {
             return;
         }
         let count = count.saturating_sub(1);
-        opens.set((decision, count, init));
+        opens.set((decision, count, init, failed));
         if count != 0 {
             return;
         }
@@ -964,8 +1012,8 @@ impl Plugin {
             .get_or(|| RefCell::new(Latency::new()))
             .borrow_mut()
             .record(sample, seed);
-        if slow {
-            self.breaker.slow(self.runtime.now_micros());
+        if slow && self.breaker.slow(self.runtime.now_micros()) {
+            self.opened("latency");
         }
     }
 
@@ -1002,7 +1050,7 @@ impl Plugin {
                     *guard = Some(instance);
                 }
                 Err(_) => {
-                    self.breaker.failure(now);
+                    self.report(now);
                     return;
                 }
             }
@@ -1286,7 +1334,13 @@ impl Bound {
             budget.seed_micros = u64::from(facts.budget_micros);
             budget.stamp = budget.stamp.wrapping_add(1).max(1);
         }
-        plugin.note_open(budget.stamp);
+        if plugin.note_open(budget.stamp) {
+            // The plugin already failed this decision (the other side of a
+            // pair, another binding): its part in the decision is over, with
+            // no call, no `init` and no second count.
+            open.bypass = true;
+            return;
+        }
         let now = plugin.runtime.now_micros();
         if plugin.breaker.is_open(now) {
             bump(&plugin.tally.bypassed);
@@ -1297,7 +1351,7 @@ impl Bound {
             // The frame budget is gone on arrival: no frame is forwarded, no
             // instance is made or fed, the breaker counts a budget hit.
             bump(&plugin.tally.budget_gone);
-            plugin.breaker.failure(now);
+            plugin.fail(now);
             open.bypass = true;
             return;
         }
@@ -1337,8 +1391,13 @@ impl Bound {
                     plugin.note_init(budget.stamp, charged);
                     *guard = Some(instance);
                 }
-                Err(LoadError::Trap { .. }) if left < init_fuel => {
-                    // The remainder clamped `init` below its own frame: the
+                Err(LoadError::Trap { .. })
+                    if left < init_fuel && charged >= budget.remaining_micros =>
+                {
+                    // The remainder clamped `init` below its own frame and
+                    // the clamp ended it: the charge reached what was left
+                    // (out of fuel uses the whole grant, and the deadline
+                    // never fires before the remainder has passed). The
                     // decision's budget is spent (the whole remainder is
                     // drawn, so no later open of the decision runs on it
                     // again), the slot stays cold for the close to rebuild
@@ -1356,12 +1415,14 @@ impl Bound {
                     return;
                 }
                 Err(_) => {
-                    // `init` failed under its own frame: the failure is the
-                    // breaker's, the charge the decision's and part of the
-                    // plugin's sample.
+                    // `init` failed by itself: under its own frame, or short
+                    // of a clamp (a charge below the remainder: it would
+                    // have ended the same under the full frame). The failure
+                    // is the breaker's, the charge the decision's and part
+                    // of the plugin's sample.
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
                     plugin.note_init(budget.stamp, charged);
-                    plugin.breaker.failure(now);
+                    plugin.fail(now);
                     open.bypass = true;
                     return;
                 }
@@ -1459,6 +1520,7 @@ impl Bound {
             budget.opens = budget.opens.saturating_sub(1);
             plugin.note_close(budget.stamp, budget.seed_micros);
         }
+        let decision = budget.stamp;
         drop(budget);
         // A slot this decision emptied (a call interrupted or trapped, an
         // answer outside the contract, a destructor that ran out) is rebuilt
@@ -1480,7 +1542,12 @@ impl Bound {
                         }
                         Err(error) => {
                             tracing::warn!(plugin = plugin.name, %error, "the rebuild of a dropped instance failed");
-                            plugin.breaker.failure(now);
+                            // One failure a decision: a rebuild that fails after
+                            // the fault that emptied the slot was counted is not
+                            // a second one.
+                            if !plugin.failed_in(decision) {
+                                plugin.report(now);
+                            }
                         }
                     }
                 }

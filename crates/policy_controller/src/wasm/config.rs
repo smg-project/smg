@@ -127,10 +127,10 @@ impl Default for LogLimit {
 
 /// When the plugin is bypassed to its fallbacks for a cool-down: this many
 /// failures (traps, invalid answers, the budget hits the plugin ran out of
-/// under its own bounds) within the window, or a moving p50 of its decisions
-/// past half the budget or a p99 (the second-slowest sample of the ring,
-/// each the plugin's own charge in a decision over that decision's budget)
-/// past it.
+/// under its own bounds; one a decision, however many of its opens fail)
+/// within the window, or a moving p50 of its decisions past half the budget
+/// or a p99 (the second-slowest sample of the ring, each the plugin's own
+/// charge in a decision over that decision's budget) past it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BreakerSpec {
     pub failures: u32,
