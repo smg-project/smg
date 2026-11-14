@@ -259,6 +259,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-21 | [flint](https://github.com/smg-project/bellwether/tree/main/fixtures/flint) | RecursiveSI/flint |  | `glm` | 28 | replaying the set | none |
 | 2026-10-21 | [lfm3-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-omni-2b) | LiquidAI/LFM3-Omni-2B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-21 | [minicpm-ocr-1.0](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm-ocr-1.0) | openbmb/MiniCPM-OCR-1.0 |  | `qwen3`, tagged calls | 19 | replaying the set | none |
+| 2026-10-21 | [ovisocr3](https://github.com/smg-project/bellwether/tree/main/fixtures/ovisocr3) | ATH-MaaS/OvisOCR3 |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-19 | [lfm3-vl-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm3-vl-2b) | LiquidAI/LFM3-VL-2B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-10-19 | [spark-x2.6-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/spark-x2.6-4b) | XHToken/Spark-X2.6-4B | Spark-X2.6-1.7B | `glm` | 27 | replaying the set | none |
 | 2026-10-17 | [sentiment-analysis-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/sentiment-analysis-7b) | microsoft/Sentiment-Analysis-7B |  | `plain` | — | awaiting fixtures | none |

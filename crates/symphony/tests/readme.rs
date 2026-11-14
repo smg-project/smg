@@ -2400,6 +2400,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "ovisocr3",
+        model: "ATH-MaaS/OvisOCR3",
+        also: &[],
+        released: "2026-10-21",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(19),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "phi-4-mini-instruct",
         model: "microsoft/Phi-4-mini-instruct",
         also: &[],
