@@ -6,6 +6,11 @@
 //! the fleet to answer reads the failure at once, with the log that says why,
 //! instead of waiting on a process that serves nothing.
 #![cfg(unix)]
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test binary: a failed step panics with what failed"
+)]
 
 use std::{
     io::Read,

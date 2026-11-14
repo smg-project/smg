@@ -2,6 +2,12 @@
 //! `POST /admin/script/{worker}` make a worker answer, frame by frame, and
 //! what a request no script covers still gets.
 
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test binary: a failed step panics with what failed"
+)]
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -112,12 +118,12 @@ fn chunk(
     }
 }
 
-fn logprobs(token_ids: &[u32], values: &[f32]) -> Option<ts::OutputLogProbs> {
-    Some(ts::OutputLogProbs {
+fn logprobs(token_ids: &[u32], values: &[f32]) -> ts::OutputLogProbs {
+    ts::OutputLogProbs {
         token_logprobs: values.to_vec(),
         token_ids: token_ids.to_vec(),
         top_logprobs: Vec::new(),
-    })
+    }
 }
 
 #[tokio::test]
@@ -147,7 +153,7 @@ async fn grpc_streams_the_scripted_answer_frame_for_frame() {
             prompt_tokens: 7,
             completion_tokens: 3,
             cached_tokens: 2,
-            output_logprobs: logprobs(&[10, 11, 12], &[-0.5, -1.0, -1.5]),
+            output_logprobs: Some(logprobs(&[10, 11, 12], &[-0.5, -1.0, -1.5])),
             matched_stop: Some(ts::generate_complete::MatchedStop::MatchedStopStr(
                 "</s>".to_string(),
             )),
@@ -159,9 +165,9 @@ async fn grpc_streams_the_scripted_answer_frame_for_frame() {
     assert_eq!(
         streamed,
         vec![
-            chunk("s", vec![10], 7, 1, 2, logprobs(&[10], &[-0.5])),
-            chunk("s", vec![11], 7, 2, 2, logprobs(&[11], &[-1.0])),
-            chunk("s", vec![12], 7, 3, 2, logprobs(&[12], &[-1.5])),
+            chunk("s", vec![10], 7, 1, 2, Some(logprobs(&[10], &[-0.5]))),
+            chunk("s", vec![11], 7, 2, 2, Some(logprobs(&[11], &[-1.0]))),
+            chunk("s", vec![12], 7, 3, 2, Some(logprobs(&[12], &[-1.5]))),
             complete.clone(),
         ]
     );
@@ -735,8 +741,8 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
     assert_eq!(
         streamed,
         vec![
-            chunk("c", vec![30], 3, 1, 0, logprobs(&[30], &[-0.1])),
-            chunk("c", vec![31], 3, 2, 0, logprobs(&[31], &[-0.2])),
+            chunk("c", vec![30], 3, 1, 0, Some(logprobs(&[30], &[-0.1]))),
+            chunk("c", vec![31], 3, 2, 0, Some(logprobs(&[31], &[-0.2]))),
             ts::GenerateResponse {
                 request_id: "c".to_string(),
                 response: Some(GenResp::Complete(ts::GenerateComplete {
@@ -745,7 +751,7 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
                     prompt_tokens: 3,
                     completion_tokens: 2,
                     cached_tokens: 0,
-                    output_logprobs: logprobs(&[30, 31], &[-0.1, -0.2]),
+                    output_logprobs: Some(logprobs(&[30, 31], &[-0.1, -0.2])),
                     matched_stop: None,
                     index: 0,
                     weight_version: None,

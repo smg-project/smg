@@ -725,6 +725,8 @@ async fn truth_served() -> Json<Value> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::oneshot;
+
     use super::*;
     use crate::{config::Role, grpc::serve_with_listener, tls::install_crypto_provider};
 
@@ -740,7 +742,7 @@ mod tests {
     /// engine once that port is bound.
     #[tokio::test]
     async fn a_listener_that_cannot_bind_its_bootstrap_port_never_joins_the_fleet() {
-        let taken = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let taken = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a port to occupy");
         let taken_port = taken.local_addr().expect("address").port();
@@ -750,7 +752,7 @@ mod tests {
         // registered here. The listener is held through the check, so no
         // other test takes the port meanwhile.
         let (listener, port) = loop {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("the worker's port");
             let port = listener.local_addr().expect("address").port();
@@ -761,7 +763,7 @@ mod tests {
                 break (listener, port);
             }
         };
-        let cfg = std::sync::Arc::new(Config {
+        let cfg = Arc::new(Config {
             host: "127.0.0.1".to_string(),
             grpc_base_port: port,
             grpc_count: 1,
@@ -772,8 +774,8 @@ mod tests {
         });
         // The worker stops at the bind: serving returns instead of running on.
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            serve_with_listener(std::sync::Arc::clone(&cfg), listener),
+            Duration::from_secs(10),
+            serve_with_listener(Arc::clone(&cfg), listener),
         )
         .await
         .expect("the worker stops at the bootstrap bind");
@@ -798,17 +800,17 @@ mod tests {
     /// read back answers, and the shutdown ends the server.
     #[tokio::test]
     async fn the_admin_api_serves_a_listener_the_caller_bound_until_its_shutdown() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the admin listener");
         let port = listener.local_addr().expect("address").port();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (stop, stopped) = oneshot::channel::<()>();
         #[expect(
             clippy::disallowed_methods,
             reason = "the server task is joined at the end of the test"
         )]
         let server = tokio::spawn(serve_with_listener_until(
-            std::sync::Arc::new(Config::default()),
+            Arc::new(Config::default()),
             listener,
             async {
                 let _ = stopped.await;
@@ -827,7 +829,7 @@ mod tests {
             .expect("the admin API answers on the port read back");
         assert_eq!(health.text().await.expect("the body"), "ok");
         stop.send(()).expect("the server waits on its shutdown");
-        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        tokio::time::timeout(Duration::from_secs(10), server)
             .await
             .expect("the server stops at its shutdown")
             .expect("the server task");
@@ -838,14 +840,14 @@ mod tests {
     /// binds the admin listener itself and reads the port back.
     #[tokio::test]
     async fn a_taken_admin_port_stops_the_server_before_it_serves() {
-        let taken = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let taken = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a port to occupy");
         let port = taken.local_addr().expect("address").port();
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            Duration::from_secs(10),
             serve_until(
-                std::sync::Arc::new(Config::default()),
+                Arc::new(Config::default()),
                 "127.0.0.1".to_string(),
                 port,
                 pending(),

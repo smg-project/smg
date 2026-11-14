@@ -27,6 +27,13 @@
 //! each a shared head from a pool of `--prefix-pool` fixed texts
 //! (`--prefix-ratio` of the prompt) followed by a unique tail, so cache-aware
 //! routing sees shared prefixes and unique remainders as in production.
+
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool reports on its standard streams"
+)]
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
