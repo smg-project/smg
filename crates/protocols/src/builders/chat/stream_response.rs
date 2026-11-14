@@ -5,7 +5,7 @@
 use super::response::now_unix_seconds;
 use crate::{
     chat::*,
-    common::{FunctionCallDelta, ToolCallDelta, Usage},
+    common::{ChatLogProbs, FunctionCallDelta, ToolCallDelta, Usage},
 };
 
 /// Builder for ChatCompletionStreamResponse
@@ -127,7 +127,7 @@ impl ChatCompletionStreamResponseBuilder {
         mut self,
         index: u32,
         content: impl Into<String>,
-        logprobs: Option<crate::common::ChatLogProbs>,
+        logprobs: Option<ChatLogProbs>,
     ) -> Self {
         self.choices.push(ChatStreamChoice {
             index,

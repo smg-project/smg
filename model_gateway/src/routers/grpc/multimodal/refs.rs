@@ -669,6 +669,25 @@ fn data_url(media_type: &str, data: &str) -> String {
     format!("data:{media_type};base64,{data}")
 }
 
+/// The wire form of a forwardable part's URL: the text as the request wrote
+/// it, or the base64 source a data URL is built from. Classifying a part
+/// names the form; only a wire that takes the URL builds it.
+enum WireUrl<'a> {
+    AsWritten(&'a str),
+    Base64 { media_type: &'a str, data: &'a str },
+}
+
+impl<'a> WireUrl<'a> {
+    /// The URL the wire takes: borrowed as written, or the data URL built
+    /// once from the base64 source.
+    fn build(&self) -> Cow<'a, str> {
+        match self {
+            Self::AsWritten(url) => Cow::Borrowed(url),
+            Self::Base64 { media_type, data } => Cow::Owned(data_url(media_type, data)),
+        }
+    }
+}
+
 /// Lower-cased URL scheme; `data` for data URLs, empty for bare paths.
 fn url_scheme(url: &str) -> String {
     url.split_once(':')
@@ -683,11 +702,12 @@ fn url_scheme(url: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Classify one part as a forwardable reference: its modality, URL and the
-/// router's byte cap for inline payloads.
+/// Classify one part as a forwardable reference: its modality, the wire form
+/// of its URL (built only where a wire takes it) and the router's byte cap
+/// for inline payloads.
 fn forwardable_ref(
     part: &MediaContentPart,
-) -> Result<(common::Modality, Cow<'_, str>, usize), MmRefsError> {
+) -> Result<(common::Modality, WireUrl<'_>, usize), MmRefsError> {
     match part {
         MediaContentPart::ImageUrl {
             url,
@@ -695,7 +715,7 @@ fn forwardable_ref(
             ..
         } => Ok((
             common::Modality::Image,
-            Cow::Borrowed(url.as_str()),
+            WireUrl::AsWritten(url.as_str()),
             media::image_max_input_bytes(),
         )),
         MediaContentPart::ImageBase64 {
@@ -705,7 +725,7 @@ fn forwardable_ref(
             ..
         } => Ok((
             common::Modality::Image,
-            Cow::Owned(data_url(media_type, data)),
+            WireUrl::Base64 { media_type, data },
             media::image_max_input_bytes(),
         )),
         MediaContentPart::VideoUrl {
@@ -715,7 +735,7 @@ fn forwardable_ref(
             ..
         } => Ok((
             common::Modality::Video,
-            Cow::Borrowed(url.as_str()),
+            WireUrl::AsWritten(url.as_str()),
             media::video_max_input_bytes(),
         )),
         MediaContentPart::ImageUrl { .. }
@@ -729,14 +749,14 @@ fn forwardable_ref(
         }
         MediaContentPart::AudioUrl { url, .. } => Ok((
             common::Modality::Audio,
-            Cow::Borrowed(url.as_str()),
+            WireUrl::AsWritten(url.as_str()),
             media::audio_max_input_bytes(),
         )),
         MediaContentPart::AudioBase64 {
             media_type, data, ..
         } => Ok((
             common::Modality::Audio,
-            Cow::Owned(data_url(media_type, data)),
+            WireUrl::Base64 { media_type, data },
             media::audio_max_input_bytes(),
         )),
         MediaContentPart::AudioData { .. } => {
@@ -751,7 +771,8 @@ fn forwardable_ref(
 
 /// Whether this plan is forwardable apart from per-item hints: `Ok(true)` when
 /// a part carries one, `Ok(false)` when none does; a part with no reference
-/// form at all is the error, whatever its position.
+/// form at all is the error, whatever its position. Classification only: no
+/// part's URL is built here.
 fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
     let mut hinted = false;
     for part in plan.parts() {
@@ -769,6 +790,7 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
     let mut items = Vec::with_capacity(plan.parts().len());
     for (index, part) in plan.parts().iter().enumerate() {
         let (modality, url, limit) = forwardable_ref(part)?;
+        let url = url.build();
         if let Some(bytes) = data_url_payload_bytes(&url) {
             if bytes > limit {
                 return Err(MmRefsError::RefTooLarge {
@@ -791,6 +813,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    use crate::routers::grpc::testing::bytes_allocated_during;
     use crate::{
         routers::grpc::multimodal::{
             config::MultimodalConfigRegistry, settings::MultimodalSettings,
@@ -814,6 +842,24 @@ mod tests {
 
     fn plan(parts: Vec<MediaContentPart>) -> MediaPlan {
         MediaPlan::new(parts)
+    }
+
+    fn base64_image(data: &str) -> MediaContentPart {
+        MediaContentPart::ImageBase64 {
+            media_type: "image/png".to_string(),
+            data: Arc::new(data.to_string()),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }
+    }
+
+    fn base64_audio(data: &str) -> MediaContentPart {
+        MediaContentPart::AudioBase64 {
+            media_type: "audio/wav".to_string(),
+            data: Arc::new(data.to_string()),
+            uuid: None,
+        }
     }
 
     fn expandable_placeholders() -> PlaceholderTokens {
@@ -1878,6 +1924,40 @@ mod tests {
                 (common::Modality::Image as i32, "https://a/2.png"),
             ]
         );
+    }
+
+    #[test]
+    fn assemble_builds_the_data_url_of_a_base64_part() {
+        let refs = assemble_media_refs(&plan(vec![base64_image("AAAA"), base64_audio("BBBB")]))
+            .expect("assembles");
+        let urls: Vec<&str> = refs.items.iter().map(|item| item.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["data:image/png;base64,AAAA", "data:audio/wav;base64,BBBB"]
+        );
+    }
+
+    /// Hint detection classifies the parts and builds no URL: the data URL of
+    /// a base64 part is built once, at assembly, so detection allocates nothing
+    /// however large the payloads are.
+    #[cfg(all(
+        feature = "jemalloc-stats",
+        not(target_env = "msvc"),
+        not(target_env = "musl")
+    ))]
+    #[test]
+    fn hint_detection_builds_no_data_url() {
+        let plan = plan(vec![
+            base64_image(&"A".repeat(4 << 20)),
+            base64_audio(&"B".repeat(1 << 20)),
+        ]);
+        // Warm the one-time caches on the path (the env-read byte caps) so
+        // the counter measures the per-request cost alone.
+        assert_eq!(plan_carries_hints(&plan), Ok(false));
+        let bytes = bytes_allocated_during(|| {
+            assert_eq!(plan_carries_hints(&plan), Ok(false));
+        });
+        assert_eq!(bytes, 0, "detection allocated {bytes} bytes");
     }
 
     #[test]
