@@ -5,9 +5,13 @@
 //! the two ring policies over a ready pool with its ring, what one pick of the simple
 //! policies (power_of_two, random, round_robin, passthrough) pays over the same pool, what
 //! a keyed request pays for a sticky hit, under the routing-key override and in the manual
-//! policy, and what one prefill-decode pair placement pays through the routers' pair selection
-//! (`pair_placement`: round robin and cache-aware over an event index, 64 and 512 workers a
-//! side, untraced and inside a cache-trace capture).
+//! policy, what one regular placement pays through the routers' single-worker selection
+//! (`regular_placement`: round robin and cache-aware over an event index, 128 and 1,024
+//! workers), and what one prefill-decode pair placement pays through the routers' pair
+//! selection (`pair_placement`: round robin and cache-aware over an event index, 64 and 512
+//! workers a side, untraced and inside a cache-trace capture). The two placement groups
+//! refuse to run under a process trace switch (`SMG_CACHE_TRACE`, `SMG_CACHE_TRACE_HEADER`),
+//! which captures every placement, the cells labelled untraced too.
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
@@ -28,7 +32,7 @@ use smg::{
         LoadBalancingPolicy, ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy,
         PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
-    routers::common::bench_support::PairPath,
+    routers::common::bench_support::{process_trace_configured, PairPath, RegularPath},
     worker::{
         kv_event_monitor::bench_support::IndexFeed,
         load_state::{one_rank_load, TestFeed},
@@ -412,10 +416,22 @@ fn bench_keyed_sticky_hit(c: &mut Criterion) {
     group.finish();
 }
 
+/// The model of the regular fleet.
+const REGULAR_MODEL: &str = "regular-model";
 /// The model of the pair fleet.
 const PAIR_MODEL: &str = "pair-model";
-/// Blocks of a pair request's prompt.
-const PAIR_PROMPT_BLOCKS: usize = 4;
+/// Blocks of a placement request's prompt.
+const PLACEMENT_PROMPT_BLOCKS: usize = 4;
+
+/// A placement group measures what its labels say only in a process with no trace switch:
+/// a switch captures every placement, the cells labelled untraced too.
+fn refuse_a_process_trace(group: &str) {
+    assert!(
+        !process_trace_configured(),
+        "{group}: unset SMG_CACHE_TRACE and SMG_CACHE_TRACE_HEADER; a process trace switch \
+         captures every placement, the untraced cells too"
+    );
+}
 
 /// The stored event of one prompt, as an engine publishes a chain.
 fn stored(tokens: &[u32]) -> KvEventBatch {
@@ -443,6 +459,115 @@ fn stored(tokens: &[u32]) -> KvEventBatch {
         }],
         ..Default::default()
     }
+}
+
+/// One prompt a worker of a placement fleet's pool.
+fn placement_prompts(count: usize) -> Vec<Vec<u32>> {
+    (0..count)
+        .map(|p| {
+            (0..BLOCK_SIZE * PLACEMENT_PROMPT_BLOCKS)
+                .map(|t| (p * 1_000 + t + 1) as u32)
+                .collect()
+        })
+        .collect()
+}
+
+/// An event monitor whose index of `model` holds prompt `p` on worker `p` of each pool.
+fn holders_monitor(
+    model: &str,
+    pools: &[Vec<Arc<dyn Worker>>],
+    prompts: &[Vec<u32>],
+) -> Arc<KvEventMonitor> {
+    let index = Arc::new(KvIndex::chain());
+    for pool in pools {
+        for (p, worker) in pool.iter().enumerate() {
+            let mut feed = IndexFeed::new(&index, worker.url()).unwrap();
+            feed.apply(&index, &stored(&prompts[p]));
+        }
+    }
+    let monitor = Arc::new(KvEventMonitor::new());
+    monitor.set_index(model, Arc::clone(&index));
+    monitor.set_block_size(model, BLOCK_SIZE);
+    monitor
+}
+
+/// A regular fleet of one model, `workers` workers over the gRPC wire, registered as the
+/// gateway registers them, under one default policy: round robin, or cache-aware (the pair
+/// fleet's configuration) over one event index in which prompt `p` is held by worker `p`.
+/// The prompts come with it.
+fn regular_fleet(workers: usize, cache_aware: bool) -> (RegularPath, Vec<Vec<u32>>) {
+    let registry = Arc::new(WorkerRegistry::new());
+    let pool: Vec<Arc<dyn Worker>> = (0..workers)
+        .map(|i| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://regular-{i:04}:9000"))
+                    .model(ModelCard::new(REGULAR_MODEL))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    for worker in &pool {
+        registry.register(Arc::clone(worker)).unwrap();
+    }
+    let prompts = placement_prompts(workers);
+    let policies = if cache_aware {
+        let policies = PolicyRegistry::new(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 10_000));
+        policies.set_kv_event_monitor(Some(holders_monitor(REGULAR_MODEL, &[pool], &prompts)));
+        policies
+    } else {
+        PolicyRegistry::new(PolicyConfig::RoundRobin)
+    };
+    (
+        RegularPath::new(registry, Arc::new(policies), REGULAR_MODEL),
+        prompts,
+    )
+}
+
+/// One regular placement through the routers' own single-worker selection: the model's pool
+/// drawn from the registry and one policy pick over it, with no filter, no wire pin and no
+/// tried engine. Under round robin, and under cache-aware where each request's prompt has
+/// one holder (an index lookup and a hit), at 128 and 1,024 workers. The
+/// `cache_aware_filtered` cells run the cache-aware placement under a candidate filter that
+/// refuses nobody, as both routers hand one on a request's first attempt.
+fn bench_regular_placement(c: &mut Criterion) {
+    refuse_a_process_trace("regular_placement");
+    let mut group = c.benchmark_group("regular_placement");
+    for workers in [128, 1_024] {
+        for (policy, cache_aware) in [("round_robin", false), ("cache_aware", true)] {
+            let (path, prompts) = regular_fleet(workers, cache_aware);
+            group.throughput(Throughput::Elements(1));
+            let mut next = 0usize;
+            group.bench_with_input(BenchmarkId::new(policy, workers), &workers, |b, _| {
+                b.iter(|| {
+                    let tokens = &prompts[next % prompts.len()];
+                    next += 1;
+                    black_box(path.place(Some(black_box(tokens))).unwrap())
+                });
+            });
+            if !cache_aware {
+                continue;
+            }
+            let mut next = 0usize;
+            group.bench_with_input(
+                BenchmarkId::new("cache_aware_filtered", workers),
+                &workers,
+                |b, _| {
+                    b.iter(|| {
+                        let tokens = &prompts[next % prompts.len()];
+                        next += 1;
+                        black_box(path.place_filtered(Some(black_box(tokens))).unwrap())
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
 }
 
 /// A prefill-decode fleet of one model, `side` workers a role over the gRPC wire, every
@@ -478,25 +603,10 @@ fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, Vec<Vec<u32>>) {
         }
         pools.push(pool);
     }
-    let prompts: Vec<Vec<u32>> = (0..side)
-        .map(|p| {
-            (0..BLOCK_SIZE * PAIR_PROMPT_BLOCKS)
-                .map(|t| (p * 1_000 + t + 1) as u32)
-                .collect()
-        })
-        .collect();
+    let prompts = placement_prompts(side);
     let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
     if cache_aware {
-        let index = Arc::new(KvIndex::chain());
-        for pool in &pools {
-            for (p, worker) in pool.iter().enumerate() {
-                let mut feed = IndexFeed::new(&index, worker.url()).unwrap();
-                feed.apply(&index, &stored(&prompts[p]));
-            }
-        }
-        let monitor = Arc::new(KvEventMonitor::new());
-        monitor.set_index(PAIR_MODEL, Arc::clone(&index));
-        monitor.set_block_size(PAIR_MODEL, BLOCK_SIZE);
+        let monitor = holders_monitor(PAIR_MODEL, &pools, &prompts);
         let policy = |pool: &[Arc<dyn Worker>]| {
             let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
                 eviction_interval_secs: 0,
@@ -522,6 +632,7 @@ fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, Vec<Vec<u32>>) {
 /// one holder a role (an index lookup and a hit on both sides), at 64 and 512 workers a side,
 /// untraced and inside a cache-trace capture.
 fn bench_pair_placement(c: &mut Criterion) {
+    refuse_a_process_trace("pair_placement");
     let mut group = c.benchmark_group("pair_placement");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -560,6 +671,7 @@ criterion_group!(
     bench_ring_policies,
     bench_simple_policy_pick,
     bench_keyed_sticky_hit,
+    bench_regular_placement,
     bench_pair_placement
 );
 criterion_main!(benches);

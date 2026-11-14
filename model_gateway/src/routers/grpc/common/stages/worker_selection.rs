@@ -1768,23 +1768,14 @@ impl WorkerSelectionStage {
             };
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
-        let candidates = placement::candidates(
-            &self.worker_registry,
-            model_id,
-            RoutingPool::GrpcPipelineRegular,
-            wire,
-        );
-        let candidates = candidates.as_slice();
-        // Preserve the borrowed-snapshot path when every worker qualifies.
-        // Use this same snapshot for selection so membership cannot change
-        // between deciding whether a filter is needed and applying it.
-        let candidate_filter = candidate_filter
-            .filter(|accepts| candidates.iter().any(|worker| !accepts(worker.as_ref())));
-        placement::select_from(
+        // A filter every worker passes costs the selection nothing: it keeps
+        // the snapshot as it drew it, with its name on the way to the policy.
+        placement::select_single(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
-            candidates,
+            RoutingPool::GrpcPipelineRegular,
+            wire,
             PlacementInputs {
                 text,
                 tokens,
@@ -2228,6 +2219,7 @@ fn assign_encode_workers(
                 hash_ring: hash_ring.clone(),
                 role: WorkerRole::Single,
                 overload_lifted: false,
+                named: None,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;
             let worker = encode_workers[worker_idx].clone();
@@ -3086,6 +3078,82 @@ mod tests {
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by header key");
         }
+    }
+
+    /// The regular selection goes through the placement's own entry, so the
+    /// registry's list keeps its name on the way to the policy: the
+    /// cache-aware policy keeps the pool's one table by the list's name. A
+    /// filter every worker passes narrows nothing; one that refuses a worker
+    /// hands the policy a list of its own, which nobody names.
+    #[test]
+    fn the_regular_selection_names_its_pool_to_the_policy() {
+        use crate::policies::{as_cache_aware, test_support::hold_prompt};
+
+        let model_id = "test-model-named-pool";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for i in 0..3 {
+            worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{}", 8350 + i))
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::cache_aware(
+            0.5, 32, 1.1, 0, 4096,
+        )));
+        let pool = worker_registry.get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular);
+        assert_eq!(pool.len(), 3);
+        // The pool's first worker holds the prompt in the model's index.
+        let tokens = hold_prompt(&policy_registry, pool[0].as_ref());
+        let default_policy = policy_registry.get_default_policy();
+        let cache_aware = as_cache_aware(default_policy.as_ref()).expect("cache-aware by default");
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        let place = |filter: Option<CandidateFilter<'_>>| {
+            stage
+                .select_single_worker(
+                    model_id,
+                    None,
+                    Some(&tokens),
+                    None,
+                    None,
+                    None,
+                    None,
+                    filter,
+                )
+                .expect("a worker")
+        };
+        assert_eq!(place(None).url(), pool[0].url(), "the holder");
+        place(None);
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 0),
+            "the pool's one table, by the list's name"
+        );
+        let anyone = |_: &dyn Worker| true;
+        place(Some(&anyone));
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 0),
+            "a filter nobody fails narrows nothing"
+        );
+        let holder_url = pool[0].url().to_string();
+        let not_the_holder = |worker: &dyn Worker| worker.url() != holder_url;
+        place(Some(&not_the_holder));
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 1),
+            "a filtered list is nobody's"
+        );
     }
 
     /// The gRPC transport must shed an all-overloaded model with the same

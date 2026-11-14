@@ -29,7 +29,7 @@ use crate::{
     },
     policies::{
         as_consistent_hashing, policy_filters_unavailable_workers, CacheNamespace,
-        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
@@ -122,7 +122,9 @@ pub(crate) struct PlacementInputs<'a> {
     pub cache_namespace: Option<CacheNamespace>,
     /// Extra per-request candidate predicate; a worker it rejects is never
     /// selected (e.g. only workers that process media references themselves,
-    /// or none that already answered this request definitively).
+    /// or none that already answered this request definitively). It is asked
+    /// once a candidate, and while it refuses nobody the selection runs over
+    /// the pool as drawn.
     pub candidate_filter: Option<CandidateFilter<'a>>,
     /// Engines (by base URL) a failed attempt of this request already
     /// dispatched to. A retry skips them while another available candidate
@@ -148,6 +150,104 @@ impl Candidates {
         match self {
             Self::Shared(shared) => shared,
             Self::Pinned(pinned) => pinned,
+        }
+    }
+
+    /// The snapshot's own list, when the candidates are that list whole.
+    fn shared(&self) -> Option<&Arc<[Arc<dyn Worker>]>> {
+        match self {
+            Self::Shared(shared) => Some(shared),
+            Self::Pinned(_) => None,
+        }
+    }
+}
+
+/// The candidates of one selection as a part of a list the routing snapshot
+/// owns: each kept worker beside its position in that list. Every narrowing
+/// goes through here, so a position never names another worker than the
+/// handle beside it, and the policy is told which list its candidates are
+/// cut from ([`NamedList`]).
+pub(crate) struct Narrowed<'a> {
+    list: &'a Arc<[Arc<dyn Worker>]>,
+    positions: Vec<usize>,
+    workers: Vec<Arc<dyn Worker>>,
+}
+
+impl<'a> Narrowed<'a> {
+    /// The workers of `list` at `positions`, which ascend: a policy finds a
+    /// candidate by its position, and nothing downstream sorts them.
+    fn at(list: &'a Arc<[Arc<dyn Worker>]>, positions: Vec<usize>) -> Self {
+        debug_assert!(
+            positions.is_sorted_by(|a, b| a < b),
+            "a list's part is named in the list's order"
+        );
+        let workers = positions.iter().map(|&at| Arc::clone(&list[at])).collect();
+        Self {
+            list,
+            positions,
+            workers,
+        }
+    }
+
+    /// The workers of `list` that `keep` accepts, in the list's order.
+    pub(crate) fn of(
+        list: &'a Arc<[Arc<dyn Worker>]>,
+        mut keep: impl FnMut(&Arc<dyn Worker>) -> bool,
+    ) -> Self {
+        // Sized once for the whole list: two allocations a narrowing, however
+        // many workers it keeps.
+        let mut positions = Vec::with_capacity(list.len());
+        let mut workers = Vec::with_capacity(list.len());
+        for (at, worker) in list.iter().enumerate() {
+            if keep(worker) {
+                positions.push(at);
+                workers.push(Arc::clone(worker));
+            }
+        }
+        Self {
+            list,
+            positions,
+            workers,
+        }
+    }
+
+    /// The candidates, in the list's order.
+    pub(crate) fn workers(&self) -> &[Arc<dyn Worker>] {
+        &self.workers
+    }
+
+    /// The position in the list of candidate `candidate`.
+    fn position(&self, candidate: usize) -> usize {
+        self.positions[candidate]
+    }
+
+    /// The candidates as a policy is told of them.
+    fn named(&self) -> NamedList<'_> {
+        NamedList {
+            list: self.list,
+            positions: Some(&self.positions),
+        }
+    }
+
+    /// Keep the candidates `keep` accepts, when it accepts some and refuses
+    /// some; otherwise the candidates stay as they are. `keep` is asked
+    /// once a candidate, the kept ones stay in their order, and nothing is
+    /// allocated.
+    fn narrow_to(&mut self, mut keep: impl FnMut(&dyn Worker) -> bool) {
+        // The kept candidates move to the front, in their order; the others
+        // end up behind them and are cut off only when there is someone to
+        // keep and someone to cut.
+        let mut kept = 0;
+        for at in 0..self.workers.len() {
+            if keep(self.workers[at].as_ref()) {
+                self.workers.swap(kept, at);
+                self.positions.swap(kept, at);
+                kept += 1;
+            }
+        }
+        if kept > 0 && kept < self.workers.len() {
+            self.workers.truncate(kept);
+            self.positions.truncate(kept);
         }
     }
 }
@@ -240,12 +340,19 @@ pub(crate) fn select_single(
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     let candidates = candidates(registry, model_id, pool, wire);
-    select_from(registry, policies, model_id, candidates.as_slice(), inputs)
+    select_among(
+        registry,
+        policies,
+        model_id,
+        candidates.as_slice(),
+        candidates.shared(),
+        inputs,
+    )
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
-/// workers from a path that cannot pin a rank.
+/// workers from a path that cannot pin a rank. Nobody names such a list.
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -253,16 +360,41 @@ pub(crate) fn select_from(
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
+    select_among(registry, policies, model_id, candidates, None, inputs)
+}
+
+/// The selection behind both single-worker entries. `whole` is the
+/// snapshot's own list when `candidates` is that list as the registry holds
+/// it: the policy is told the list's name when the candidates reach it as
+/// that list, and reads which workers it was handed once something narrowed
+/// them (a candidate filter that refuses a worker, a policy that needs its
+/// candidates filtered for it, the engines a retry already tried).
+fn select_among(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+    whole: Option<&Arc<[Arc<dyn Worker>]>>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Arc<dyn Worker>> {
     let policy = policies.get_policy_or_default(model_id);
 
     // The per-request predicate applies to every entry point, so a caller
-    // that sets it can never dispatch to a worker it rejects.
+    // that sets it can never dispatch to a worker it rejects. Each candidate
+    // is asked once. A predicate that refuses nobody (a first attempt's
+    // ledger, a media demand every worker meets) leaves the candidates as
+    // they were drawn: nothing is collected, and the pool keeps its name.
+    let refused = inputs.candidate_filter.and_then(|accepts| {
+        let first = candidates.iter().position(|w| !accepts(w.as_ref()))?;
+        Some((accepts, first))
+    });
     let accepted;
-    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
-        Some(accepts) => {
-            accepted = candidates
+    let candidates: &[Arc<dyn Worker>] = match refused {
+        Some((accepts, first)) => {
+            let (passed, rest) = candidates.split_at(first);
+            accepted = passed
                 .iter()
-                .filter(|w| accepts(w.as_ref()))
+                .chain(rest[1..].iter().filter(|w| accepts(w.as_ref())))
                 .cloned()
                 .collect::<Vec<_>>();
             &accepted
@@ -281,6 +413,7 @@ pub(crate) fn select_from(
         hash_ring: registry.get_hash_ring(model_id),
         role: WorkerRole::Single,
         overload_lifted: false,
+        named: None,
     };
     // A request its policy places by session key keeps a regular owner over
     // the overload thresholds (`LoadBalancingPolicy::routes_by_session_key`);
@@ -340,6 +473,15 @@ pub(crate) fn select_from(
     if available.is_empty() {
         return overload_fallback(registry, policy.name(), model_id, candidates);
     }
+    // The name goes with the list itself, read here and nowhere above:
+    // whatever narrowed the candidates handed on a list of its own, at
+    // another address, and nobody names that one.
+    info.named = whole
+        .filter(|list| std::ptr::eq(&list[..], available))
+        .map(|list| NamedList {
+            list,
+            positions: None,
+        });
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
@@ -1122,10 +1264,10 @@ pub(crate) fn select_pair(
             ));
         }
     }
-    let prefill: Vec<Arc<dyn Worker>> = open
-        .iter()
-        .map(|&i| Arc::clone(&pairs.prefill[i]))
-        .collect();
+    // The open prefills as a part of the index's own list: the policy is
+    // told the list, so what it keeps for the pool does not move with the
+    // workers that are open for this request.
+    let prefill = Narrowed::at(&pairs.prefill, open);
     let hash_ring = registry.get_hash_ring(model_id);
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
@@ -1137,6 +1279,7 @@ pub(crate) fn select_pair(
         hash_ring,
         role: WorkerRole::Prefill,
         overload_lifted: lift_prefill,
+        named: Some(prefill.named()),
     };
     // Both pools were filtered for availability above (a pool the overload
     // veto cannot steer counting as available), so a miss here is the
@@ -1148,7 +1291,7 @@ pub(crate) fn select_pair(
         })
     };
     let Some(prefill_idx) =
-        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+        policies.select_worker_for_model(&prefill_policy, model_id, prefill.workers(), &info)
     else {
         // A policy that declines a lifted pool all over the thresholds: the
         // least-loaded default steers it, as it steers any other such pool.
@@ -1168,21 +1311,19 @@ pub(crate) fn select_pair(
         }
         return Err(declined(WorkerRole::Prefill, prefill_policy.name()));
     };
-    let selected_prefill = prefill[prefill_idx].clone();
+    let selected_prefill = prefill.workers()[prefill_idx].clone();
     if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&selected_prefill)) {
         return Err(fail(
             WorkerRole::Prefill,
             PlacementFailure::PrefillAtCapacity,
         ));
     }
-    // The pick's open partners: non-empty by construction, short of an
-    // availability flip between the two reads.
-    let mut decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
-        .iter()
-        .filter(|d| partner_open(d, pair_runtime))
-        .cloned()
-        .collect();
-    if decode.is_empty() {
+    // The pick's open partners, as a part of its partner list: non-empty by
+    // construction, short of an availability flip between the two reads.
+    let mut decode = Narrowed::of(&pairs.partners[prefill.position(prefill_idx)], |d| {
+        partner_open(d, pair_runtime)
+    });
+    if decode.workers().is_empty() {
         debug!(
             ?pair_runtime,
             "The selected prefill's partners went unavailable"
@@ -1195,14 +1336,15 @@ pub(crate) fn select_pair(
     // fallback and not as a selection of the decode policy. Any other keeps
     // the veto for its policy.
     let selected_decode = if lift_decode {
-        overload::least_loaded_uniform(decode.iter(), &mut rand::rng())
+        overload::least_loaded_uniform(decode.workers().iter(), &mut rand::rng())
             .cloned()
             .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
     } else {
         info.role = WorkerRole::Decode;
         info.overload_lifted = false;
-        match policies.select_worker_for_model(&decode_policy, model_id, &decode, &info) {
-            Some(decode_idx) => decode[decode_idx].clone(),
+        info.named = Some(decode.named());
+        match policies.select_worker_for_model(&decode_policy, model_id, decode.workers(), &info) {
+            Some(decode_idx) => decode.workers()[decode_idx].clone(),
             None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
         }
     };
@@ -1265,24 +1407,12 @@ pub(crate) fn select_pair(
 pub(crate) fn retain_decodes_with_a_room(
     decode_policy: &dyn LoadBalancingPolicy,
     headers: Option<&HeaderMap>,
-    decode: &mut Vec<Arc<dyn Worker>>,
+    decode: &mut Narrowed<'_>,
 ) {
     if !admission_prefilters(decode_policy, headers) {
         return;
     }
-    // The candidates with a room move to the front, in their order; the
-    // ones without end up behind them and are cut off only when there is
-    // someone to keep and someone to cut.
-    let mut kept = 0;
-    for at in 0..decode.len() {
-        if pd_admission::has_free_room(decode[at].as_ref()) {
-            decode.swap(kept, at);
-            kept += 1;
-        }
-    }
-    if kept > 0 && kept < decode.len() {
-        decode.truncate(kept);
-    }
+    decode.narrow_to(pd_admission::has_free_room);
 }
 
 #[cfg(test)]
@@ -1490,24 +1620,251 @@ mod tests {
             )
         };
         let policy = RoundRobinPolicy::new();
-        let mut candidates: Vec<Arc<dyn Worker>> =
-            ["grpc://d:1", "grpc://d:2", "grpc://d:3", "grpc://d:4"]
-                .map(decode)
-                .into();
-        assert!(candidates[0].try_admit_pd(1, 1) && candidates[2].try_admit_pd(1, 1));
+        let list: Arc<[Arc<dyn Worker>]> = ["grpc://d:1", "grpc://d:2", "grpc://d:3", "grpc://d:4"]
+            .map(decode)
+            .into();
+        let urls = |candidates: &Narrowed<'_>| -> Vec<String> {
+            candidates
+                .workers()
+                .iter()
+                .map(|d| d.url().to_string())
+                .collect()
+        };
+        let mut candidates = Narrowed::of(&list, |_| true);
+        assert!(list[0].try_admit_pd(1, 1) && list[2].try_admit_pd(1, 1));
         retain_decodes_with_a_room(&policy, None, &mut candidates);
-        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
-        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"]);
+        assert_eq!(urls(&candidates), ["grpc://d:2", "grpc://d:4"]);
+        // Each kept candidate keeps its own position in the list beside it.
+        assert_eq!(candidates.named().positions, Some(&[1, 3][..]));
 
         // Every candidate full, then every one with a room: the list as it was.
-        assert!(candidates[0].try_admit_pd(1, 1) && candidates[1].try_admit_pd(1, 1));
+        assert!(list[1].try_admit_pd(1, 1) && list[3].try_admit_pd(1, 1));
         retain_decodes_with_a_room(&policy, None, &mut candidates);
-        assert_eq!(candidates.len(), 2, "nothing to keep: the policy's list");
-        candidates[0].release_pd(1);
-        candidates[1].release_pd(1);
+        assert_eq!(
+            candidates.workers().len(),
+            2,
+            "nothing to keep: the policy's list"
+        );
+        list[1].release_pd(1);
+        list[3].release_pd(1);
         retain_decodes_with_a_room(&policy, None, &mut candidates);
-        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
-        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"], "nothing to cut");
+        assert_eq!(
+            urls(&candidates),
+            ["grpc://d:2", "grpc://d:4"],
+            "nothing to cut"
+        );
+        assert_eq!(candidates.named().positions, Some(&[1, 3][..]));
+    }
+
+    /// What a policy was told of the list its candidates are cut from: the
+    /// role, the positions, and whether each candidate is the list's own
+    /// worker at its position.
+    type Told = (WorkerRole, Option<Vec<usize>>, bool);
+
+    /// A policy that records what it is told, per selection, and takes its
+    /// first candidate.
+    #[derive(Debug, Default)]
+    struct NameRecorder {
+        seen: Mutex<Vec<Told>>,
+    }
+
+    impl LoadBalancingPolicy for NameRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            let told = info.named.map(|named| {
+                let positions: Vec<usize> = match named.positions {
+                    Some(positions) => positions.to_vec(),
+                    None => (0..named.list.len()).collect(),
+                };
+                let agrees = positions.len() == workers.len()
+                    && positions
+                        .iter()
+                        .zip(workers)
+                        .all(|(&at, worker)| Arc::ptr_eq(&named.list[at], worker));
+                (positions, agrees)
+            });
+            let (positions, agrees) = match told {
+                Some((positions, agrees)) => (Some(positions), agrees),
+                None => (None, false),
+            };
+            self.seen
+                .lock()
+                .unwrap()
+                .push((info.role, positions, agrees));
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "name_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A pair placement tells each role's policy the list its candidates are
+    /// cut from and each candidate's position in it: the index's prefill
+    /// list with the open prefills, the pick's partner list with its open
+    /// partners. A worker that closes leaves the candidates and the
+    /// positions together.
+    #[test]
+    fn a_pair_placement_names_both_sides_with_their_positions() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:3", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let prefill = Arc::new(NameRecorder::default());
+        let decode = Arc::new(NameRecorder::default());
+        policies.set_prefill_policy(prefill.clone());
+        policies.set_decode_policy(decode.clone());
+        let pairs = pairs_of(&registry, &policies);
+        let place = || {
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .map(|_| ())
+        };
+        place().expect("a pair");
+        // The list's first prefill and its first decode close: both open
+        // sets start at position 1.
+        pairs.prefill[0].set_status(WorkerStatus::NotReady);
+        pairs.partners[1][0].set_status(WorkerStatus::NotReady);
+        place().expect("a pair");
+        assert_eq!(
+            *prefill.seen.lock().unwrap(),
+            [
+                (WorkerRole::Prefill, Some(vec![0, 1, 2]), true),
+                (WorkerRole::Prefill, Some(vec![1, 2]), true),
+            ]
+        );
+        assert_eq!(
+            *decode.seen.lock().unwrap(),
+            [
+                (WorkerRole::Decode, Some(vec![0, 1]), true),
+                (WorkerRole::Decode, Some(vec![1]), true),
+            ]
+        );
+    }
+
+    /// The regular entry names the registry's own pool to its policy, so
+    /// the cache-aware policy keeps the pool's one table by the list's
+    /// name, under a candidate filter too while it refuses nobody. A filter
+    /// that refuses a worker and a retry's tried engines hand the policy
+    /// lists of their own, which nobody names: each has a table by its
+    /// workers. The filter is asked once a candidate either way.
+    #[test]
+    fn the_regular_entry_names_its_pool_until_something_narrows_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::policies::{as_cache_aware, test_support::hold_prompt};
+
+        let registry = registry_with(&[
+            ("http://w1:8000", ConnectionMode::Http, RuntimeType::Vllm),
+            ("http://w2:8000", ConnectionMode::Http, RuntimeType::Vllm),
+            ("http://w3:8000", ConnectionMode::Http, RuntimeType::Vllm),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        let pool = registry.get_routing_pool(MODEL, RoutingPool::HttpRegular);
+        assert_eq!(pool.len(), 3);
+        // The pool's first worker holds the prompt in the model's index.
+        let tokens = hold_prompt(&policies, pool[0].as_ref());
+        let default_policy = policies.get_default_policy();
+        let cache_aware = as_cache_aware(default_policy.as_ref()).expect("cache-aware by default");
+        let place = |inputs: PlacementInputs<'_>| {
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                inputs,
+            )
+            .expect("a worker")
+        };
+        let inputs = PlacementInputs {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(place(inputs).url(), pool[0].url(), "the holder");
+        place(inputs);
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 0),
+            "the pool's one table, by the list's name"
+        );
+        // A filter that refuses nobody (the HTTP router's ledger on a first
+        // attempt) leaves the pool as it was drawn, with its name.
+        let asked = AtomicUsize::new(0);
+        let everyone = |_: &dyn Worker| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+        let picked = place(PlacementInputs {
+            candidate_filter: Some(&everyone),
+            ..inputs
+        });
+        assert_eq!(picked.url(), pool[0].url(), "the holder, under the filter");
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 0),
+            "a filter that refuses nobody leaves the pool its name"
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 3, "each candidate once");
+        // A filter that refuses a worker hands the policy a list of its own:
+        // the workers before the refused one and those after it that pass,
+        // each asked once.
+        let (second_url, holder_url) = (pool[1].url().to_string(), pool[0].url().to_string());
+        let not_the_second = |worker: &dyn Worker| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            worker.url() != second_url
+        };
+        let picked = place(PlacementInputs {
+            candidate_filter: Some(&not_the_second),
+            ..inputs
+        });
+        assert_eq!(
+            picked.url(),
+            pool[0].url(),
+            "the holder stands before the refused worker and stays a candidate"
+        );
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 1),
+            "a list a filter narrowed is nobody's"
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 6, "each candidate once");
+        let not_the_holder = |worker: &dyn Worker| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            worker.url() != holder_url
+        };
+        let picked = place(PlacementInputs {
+            candidate_filter: Some(&not_the_holder),
+            ..inputs
+        });
+        assert_ne!(picked.url(), pool[0].url(), "never the refused worker");
+        assert_eq!(cache_aware.kept_tables(), (1, 2), "nor is the next one");
+        assert_eq!(asked.load(Ordering::Relaxed), 9, "each candidate once");
+        let tried = [pool[2].base_url().to_string()];
+        place(PlacementInputs {
+            tried: &tried,
+            ..inputs
+        });
+        assert_eq!(cache_aware.kept_tables(), (1, 3), "nor is a retry's");
     }
 
     /// An explicit target under consistent hashing indexes the partners the
