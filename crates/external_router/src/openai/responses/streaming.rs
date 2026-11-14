@@ -1551,6 +1551,93 @@ mod tests {
         assert_eq!(header, format!("http://***@127.0.0.1:{port}"));
     }
 
+    /// A header the upstream sent more than once reaches the client of a
+    /// streamed answer with every value, in order: the relay's copy of the
+    /// preserved headers appends a pair per value instead of keeping the last.
+    #[tokio::test]
+    async fn the_streamed_answer_keeps_every_value_of_a_repeated_upstream_header() {
+        use std::sync::Arc;
+
+        use axum::{
+            http::{
+                header::{CONTENT_TYPE, SET_COOKIE},
+                StatusCode,
+            },
+            response::AppendHeaders,
+            routing::any,
+            Router,
+        };
+        use openai_protocol::responses::ResponsesRequest;
+        use serde_json::json;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            openai::context::StorageHandles,
+            test_support::{http_client, StubWorker},
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("an address").port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub upstream answering one event stream; aborted at the test's end"
+        )]
+        let upstream = tokio::spawn(async move {
+            // `AppendHeaders`: the plain header array would insert and keep one cookie.
+            let app = Router::new().fallback(any(|| async {
+                (
+                    AppendHeaders([
+                        (CONTENT_TYPE, "text/event-stream"),
+                        (SET_COOKIE, "a=1"),
+                        (SET_COOKIE, "b=2"),
+                    ]),
+                    "event: response.completed\ndata: {}\n\n",
+                )
+            }));
+            axum::serve(listener, app).await.expect("the stub serves");
+        });
+        let worker_url = format!("http://127.0.0.1:{port}");
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("{worker_url}/v1/responses"),
+            payload: json!({}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::new(MemoryResponseStorage::new()),
+                conversation: Arc::new(MemoryConversationStorage::new()),
+                conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+                request_context: None,
+                tenant: None,
+            },
+        };
+
+        let response = handle_simple_streaming_passthrough(
+            &http_client(),
+            &StubWorker::at(&worker_url),
+            None,
+            req,
+        )
+        .await;
+        upstream.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("an ascii cookie"))
+            .collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+    }
+
     /// The relay's inputs: a stream of chunks, one SSE block per chunk.
     fn chunks(blocks: &[&str]) -> impl Stream<Item = reqwest::Result<Bytes>> + Unpin {
         let frames: Vec<reqwest::Result<Bytes>> = blocks
