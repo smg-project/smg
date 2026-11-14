@@ -16,6 +16,7 @@ use openai_protocol::{
     event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
     responses::{generate_id, McpToolCallError, ResponseTool, ResponsesRequest},
 };
+use serde::Serialize;
 use serde_json::{json, to_value, Value};
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput, ToolExecutionResult};
 use tracing::{debug, info, warn};
@@ -32,7 +33,7 @@ use crate::{
         extract_embedded_openai_responses, mcp_response_item_id, FormatRegistry, ResponseFormat,
         ResponseTransformer,
     },
-    sse::SseSender,
+    sse::{SseEncoder, SseSender},
 };
 
 /// State for tracking multi-turn tool calling loop
@@ -47,6 +48,12 @@ pub(crate) struct ToolLoopState {
     pub existing_mcp_list_tools_labels: HashSet<String>,
     /// Transformed output items (mcp_call, web_search_call, etc.) - stored to avoid reconstruction
     pub mcp_call_items: Vec<Value>,
+    /// The `mcp_list_tools` items this loop renders, built at their first use
+    /// and kept (see [`Self::mcp_list_tools_items`]).
+    mcp_list_tools_items: Option<Vec<Value>>,
+    /// How many of `conversation_history`'s items the loop's payload carries
+    /// already; a resume appends the rest.
+    history_in_payload: usize,
 }
 
 impl ToolLoopState {
@@ -61,7 +68,46 @@ impl ToolLoopState {
             conversation_history: Vec::new(),
             existing_mcp_list_tools_labels: known_labels,
             mcp_call_items: Vec::new(),
+            mcp_list_tools_items: None,
+            history_in_payload: 0,
         }
+    }
+
+    /// The `mcp_list_tools` items of the bindings this loop announces: every
+    /// server of the session without an item in the history the request
+    /// continues, the internal servers' among them (the final response leaves
+    /// those out). Built once, each tool's schema copied into them once: the
+    /// stream's start and the final response render the same items.
+    pub fn mcp_list_tools_items(&mut self, session: &McpToolSession<'_>) -> &[Value] {
+        self.mcp_list_tools_items.get_or_insert_with(|| {
+            mcp_list_tools_bindings_to_emit(
+                &self.existing_mcp_list_tools_labels,
+                session.mcp_servers(),
+            )
+            .iter()
+            .map(|(server_label, server_key)| {
+                openai_bridge::mcp_list_tools_json(session, server_label, server_key)
+            })
+            .collect()
+        })
+    }
+
+    /// The kept `mcp_list_tools` items, moved out for a response's last
+    /// render: the stored record on the streaming path; the answered, the
+    /// approval or the tool-call-limit response on the non-streaming path.
+    /// Nothing reads them afterwards, so that render owns them instead of
+    /// copying every schema once more.
+    pub fn take_mcp_list_tools_items(&mut self, session: &McpToolSession<'_>) -> Vec<Value> {
+        self.mcp_list_tools_items(session);
+        self.mcp_list_tools_items.take().unwrap_or_default()
+    }
+
+    /// The calls recorded since the loop's payload last took them, each with
+    /// its output: the next resume payload appends them.
+    pub fn history_to_append(&mut self) -> &[Value] {
+        let from = self.history_in_payload.min(self.conversation_history.len());
+        self.history_in_payload = self.conversation_history.len();
+        &self.conversation_history[from..]
     }
 
     /// Record a tool call in the loop state
@@ -518,25 +564,24 @@ fn remap_tool_choice_for_functions(tool_choice: Option<&Value>, tools: &[Value])
     }
 }
 
-/// Build a resume payload: the payload the loop started from, its input (the
-/// request's own, with the history it continues loaded in front) followed by
-/// every call this loop executed with its output.
-pub(crate) fn build_resume_payload(
-    base_payload: &Value,
-    conversation_history: &[Value],
-    tools_json: &Value,
+/// Turn the payload the loop just sent into the payload of its next turn, in
+/// place: the calls executed since the last turn, each with its output, go
+/// behind its input (the request's own, with the history it continues loaded
+/// in front), the model is left free to answer, and the loop's own `stream`
+/// and `store` are set. One payload serves every turn; its input items and
+/// its tools are never copied.
+pub(crate) fn resume_payload_in_place(
+    payload: &mut Value,
+    new_history: &[Value],
     is_streaming: bool,
-) -> Result<Value, String> {
-    let mut payload = base_payload.clone();
-
+) -> Result<(), String> {
     let obj = payload
         .as_object_mut()
         .ok_or_else(|| "payload not an object".to_string())?;
 
-    // The copy of the payload above owns an input of its own: taken out in
-    // place (a removal would move the last key into its slot under the
-    // crate's ordered maps), its items are moved into the resumed list, not
-    // copied a second time; the insert below fills the slot again.
+    // The input is taken out in place (a removal would move the last key into
+    // its slot under the crate's ordered maps) and its items are moved into
+    // the resumed list; the insert below fills the slot again.
     let mut input_array = match obj.get_mut("input").map(Value::take) {
         Some(Value::Array(items)) => items,
         Some(Value::String(text)) => vec![json!({
@@ -547,52 +592,54 @@ pub(crate) fn build_resume_payload(
         _ => return Err("payload input is neither a string nor an item list".to_string()),
     };
 
-    input_array.extend_from_slice(conversation_history);
+    input_array.extend_from_slice(new_history);
     obj.insert("input".to_string(), Value::Array(input_array));
 
-    if let Some(tools_arr) = tools_json.as_array() {
-        if !tools_arr.is_empty() {
-            obj.insert("tools".to_string(), tools_json.clone());
-            // The tool call already happened; "auto" lets the model answer
-            // instead of looping a preserved "required" until the call limit.
-            obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
-        }
+    if obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        // The tool call already happened; "auto" lets the model answer
+        // instead of looping a preserved "required" until the call limit.
+        obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
     }
 
     obj.insert("stream".to_string(), Value::Bool(is_streaming));
     obj.insert("store".to_string(), Value::Bool(false));
 
-    Ok(payload)
+    Ok(())
 }
 
-/// Send mcp_list_tools events to client at the start of streaming
-/// Returns false if client disconnected
+/// Send the `mcp_list_tools` events of one item to the client at the start of
+/// streaming: the item added empty, the listing in progress and completed,
+/// the item done with its tools. The item is written to the wire where it
+/// stands (the loop keeps it for the final response), not copied into the
+/// events. Returns false if the client disconnected.
 pub(crate) async fn send_mcp_list_tools_events(
     tx: &SseSender,
-    session: &McpToolSession<'_>,
-    server_label: &str,
+    enc: &mut SseEncoder,
+    item: &Value,
     output_index: usize,
     sequence_number: &mut u64,
-    server_key: &str,
 ) -> bool {
-    let tools_item_full = openai_bridge::mcp_list_tools_json(session, server_label, server_key);
-    let item_id = tools_item_full
-        .get("id")
-        .and_then(|v| v.as_str())
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+    let server_label = item
+        .get("server_label")
+        .and_then(Value::as_str)
         .unwrap_or("");
-
-    // Create empty tools version for the initial added event
-    let mut tools_item_empty = tools_item_full.clone();
-    if let Some(obj) = tools_item_empty.as_object_mut() {
-        obj.insert("tools".to_string(), json!([]));
-    }
 
     // Event 1: response.output_item.added with empty tools
     let event1_payload = json!({
         "type": OutputItemEvent::ADDED,
         "sequence_number": *sequence_number,
         "output_index": output_index,
-        "item": tools_item_empty
+        "item": {
+            "type": ItemType::MCP_LIST_TOOLS,
+            "id": item_id,
+            "server_label": server_label,
+            "tools": []
+        }
     });
     *sequence_number += 1;
     let event1 = format!(
@@ -638,20 +685,46 @@ pub(crate) async fn send_mcp_list_tools_events(
         return false;
     }
 
-    // Event 4: response.output_item.done with full tools list
-    let event4_payload = json!({
-        "type": OutputItemEvent::DONE,
-        "sequence_number": *sequence_number,
-        "output_index": output_index,
-        "item": tools_item_full
-    });
+    // Event 4: response.output_item.done with the full tools list, the item
+    // serialised from where it stands
+    let event4_payload = OutputItemEventPayload {
+        event_type: OutputItemEvent::DONE,
+        sequence_number: *sequence_number,
+        output_index,
+        item,
+    };
     *sequence_number += 1;
-    let event4 = format!(
-        "event: {}\ndata: {}\n\n",
-        OutputItemEvent::DONE,
-        event4_payload
-    );
-    tx.send(Ok(Bytes::from(event4))).await.is_ok()
+    let event4 = match enc.encode_event(OutputItemEvent::DONE, &event4_payload) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                "failed to encode the list-tools done event via SseEncoder, falling back: {error}"
+            );
+            Bytes::from(format!(
+                "event: {}\ndata: {}\n\n",
+                OutputItemEvent::DONE,
+                json!({
+                    "type": OutputItemEvent::DONE,
+                    "sequence_number": event4_payload.sequence_number,
+                    "output_index": output_index,
+                    "item": item
+                })
+            ))
+        }
+    };
+    tx.send(Ok(event4)).await.is_ok()
+}
+
+/// An `output_item` event's payload around a borrowed item: the item is
+/// serialised onto the wire from where it stands, where `json!` would copy
+/// it into the event first.
+#[derive(Serialize)]
+struct OutputItemEventPayload<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item: &'a Value,
 }
 
 /// Send intermediate event during tool execution (searching/interpreting).
@@ -797,66 +870,109 @@ pub(crate) fn mcp_list_tools_bindings_to_emit(
         .collect()
 }
 
-/// Inject MCP metadata into a streaming response
+/// Inject MCP metadata into a streaming response: the loop's output prefix
+/// in front of the response's output, the kept `mcp_list_tools` items copied
+/// (the `response.completed` event, which is not the last render; see
+/// [`inject_mcp_metadata_last`]).
 pub(crate) fn inject_mcp_metadata_streaming(
     response: &mut Value,
-    state: &ToolLoopState,
+    state: &mut ToolLoopState,
     session: &McpToolSession<'_>,
 ) {
-    let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-        &state.existing_mcp_list_tools_labels,
-        session.mcp_servers(),
-    );
+    let prefix = mcp_output_prefix(state, session, 0);
+    inject_mcp_output_prefix(response, prefix);
+}
 
+/// Inject MCP metadata into a response's last render: the stored record on
+/// the streaming path, the answered response on the non-streaming path. The
+/// kept `mcp_list_tools` items move into it; nothing reads them afterwards.
+pub(crate) fn inject_mcp_metadata_last(
+    response: &mut Value,
+    state: &mut ToolLoopState,
+    session: &McpToolSession<'_>,
+) {
+    let prefix = mcp_output_prefix_last(state, session, 0);
+    inject_mcp_output_prefix(response, prefix);
+}
+
+fn inject_mcp_output_prefix(response: &mut Value, prefix: Vec<Value>) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
         output_array.retain(|item| {
             item.get("type").and_then(|t| t.as_str()) != Some(ItemType::MCP_LIST_TOOLS)
         });
-
-        let mut prefix = Vec::with_capacity(list_tools_bindings.len() + state.mcp_call_items.len());
-        for (server_label, server_key) in &list_tools_bindings {
-            if !session.is_internal_server_label(server_label) {
-                prefix.push(openai_bridge::mcp_list_tools_json(
-                    session,
-                    server_label,
-                    server_key,
-                ));
-            }
-        }
-        prefix.extend(
-            state
-                .mcp_call_items
-                .iter()
-                .filter(|item| !is_internal_mcp_response_item(item, session))
-                .cloned(),
-        );
         output_array.splice(0..0, prefix);
     } else if let Some(obj) = response.as_object_mut() {
-        let mut output_items = Vec::new();
-        for (server_label, server_key) in &list_tools_bindings {
-            if !session.is_internal_server_label(server_label) {
-                output_items.push(openai_bridge::mcp_list_tools_json(
-                    session,
-                    server_label,
-                    server_key,
-                ));
-            }
-        }
-        // Use stored transformed items (no reconstruction needed)
-        output_items.extend(
-            state
-                .mcp_call_items
-                .iter()
-                .filter(|item| !is_internal_mcp_response_item(item, session))
-                .cloned(),
-        );
-        obj.insert("output".to_string(), Value::Array(output_items));
+        obj.insert("output".to_string(), Value::Array(prefix));
     }
+}
+
+/// The items the loop renders in front of a response's output: its
+/// `mcp_list_tools` items (copied: the `response.completed` render, which is
+/// not the last reader; see [`mcp_output_prefix_last`]), then the calls it
+/// executed (the stored transformed items, no reconstruction), the internal
+/// servers' left out; with room for `extra` items the caller appends.
+fn mcp_output_prefix(
+    state: &mut ToolLoopState,
+    session: &McpToolSession<'_>,
+    extra: usize,
+) -> Vec<Value> {
+    let list_tools_items: Vec<Value> = state
+        .mcp_list_tools_items(session)
+        .iter()
+        .filter(|item| !is_internal_list_tools_item(item, session))
+        .cloned()
+        .collect();
+    mcp_output_prefix_with(list_tools_items, state, session, extra)
+}
+
+/// The prefix of a response's last render: the kept `mcp_list_tools` items
+/// moved, not copied (the answered, the approval and the tool-call-limit
+/// responses of the non-streaming path, the stored record of the streaming
+/// one); nothing reads them afterwards.
+fn mcp_output_prefix_last(
+    state: &mut ToolLoopState,
+    session: &McpToolSession<'_>,
+    extra: usize,
+) -> Vec<Value> {
+    let list_tools_items: Vec<Value> = state
+        .take_mcp_list_tools_items(session)
+        .into_iter()
+        .filter(|item| !is_internal_list_tools_item(item, session))
+        .collect();
+    mcp_output_prefix_with(list_tools_items, state, session, extra)
+}
+
+/// The prefix around `mcp_list_tools` items the caller already owns (copied
+/// or taken), then the executed calls.
+fn mcp_output_prefix_with(
+    list_tools_items: Vec<Value>,
+    state: &ToolLoopState,
+    session: &McpToolSession<'_>,
+    extra: usize,
+) -> Vec<Value> {
+    let mut prefix =
+        Vec::with_capacity(list_tools_items.len() + state.mcp_call_items.len() + extra);
+    prefix.extend(list_tools_items);
+    prefix.extend(
+        state
+            .mcp_call_items
+            .iter()
+            .filter(|item| !is_internal_mcp_response_item(item, session))
+            .cloned(),
+    );
+    prefix
+}
+
+/// An `mcp_list_tools` item of one of the session's internal servers.
+fn is_internal_list_tools_item(item: &Value, session: &McpToolSession<'_>) -> bool {
+    item.get("server_label")
+        .and_then(Value::as_str)
+        .is_some_and(|server_label| session.is_internal_server_label(server_label))
 }
 
 fn build_approval_response(
     mut response: Value,
-    state: ToolLoopState,
+    mut state: ToolLoopState,
     session: &McpToolSession<'_>,
     original_body: &ResponsesRequest,
     approval_item: Value,
@@ -866,24 +982,17 @@ fn build_approval_response(
         .ok_or_else(|| "response not an object".to_string())?;
     obj.insert("status".to_string(), Value::String("completed".to_string()));
 
-    let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-        &state.existing_mcp_list_tools_labels,
-        session.mcp_servers(),
-    );
-
     match obj.get_mut("output").and_then(|v| v.as_array_mut()) {
         Some(output_array) => {
             let retained_items = retained_output_items(output_array, original_body);
-            let prefix =
-                approval_prefix_items(&state, session, &list_tools_bindings, approval_item);
+            let prefix = approval_prefix_items(&mut state, session, approval_item);
 
             output_array.clear();
             output_array.extend(prefix);
             output_array.extend(retained_items);
         }
         None => {
-            let output_items =
-                approval_prefix_items(&state, session, &list_tools_bindings, approval_item);
+            let output_items = approval_prefix_items(&mut state, session, approval_item);
             obj.insert("output".to_string(), Value::Array(output_items));
         }
     }
@@ -932,28 +1041,11 @@ pub(crate) fn retained_output_items(
 }
 
 fn approval_prefix_items(
-    state: &ToolLoopState,
+    state: &mut ToolLoopState,
     session: &McpToolSession<'_>,
-    list_tools_bindings: &[(String, String)],
     approval_item: Value,
 ) -> Vec<Value> {
-    let mut prefix = Vec::with_capacity(list_tools_bindings.len() + state.mcp_call_items.len() + 1);
-    for (list_server_label, server_key) in list_tools_bindings {
-        if !session.is_internal_server_label(list_server_label) {
-            prefix.push(openai_bridge::mcp_list_tools_json(
-                session,
-                list_server_label,
-                server_key,
-            ));
-        }
-    }
-    prefix.extend(
-        state
-            .mcp_call_items
-            .iter()
-            .filter(|item| !is_internal_mcp_response_item(item, session))
-            .cloned(),
-    );
+    let mut prefix = mcp_output_prefix_last(state, session, 1);
     if !is_internal_mcp_response_item(&approval_item, session) {
         prefix.push(approval_item);
     }
@@ -985,8 +1077,6 @@ pub(crate) async fn execute_tool_loop(
 
     let mut state = ToolLoopState::new(existing_mcp_list_tools_labels.to_vec());
     let max_tool_calls = original_body.max_tool_calls.map(|n| n as usize);
-    let base_payload = initial_payload.clone();
-    let tools_json = base_payload.get("tools").cloned().unwrap_or(json!([]));
     let mut current_payload = initial_payload;
 
     info!(
@@ -1012,7 +1102,7 @@ pub(crate) async fn execute_tool_loop(
                     state.iteration, state.total_calls
                 );
                 if state.total_calls > 0 {
-                    inject_mcp_metadata_streaming(&mut response_json, &state, session);
+                    inject_mcp_metadata_last(&mut response_json, &mut state, session);
                 }
                 return Ok(response_json);
             }
@@ -1063,12 +1153,7 @@ pub(crate) async fn execute_tool_loop(
             }
         }
 
-        current_payload = build_resume_payload(
-            &base_payload,
-            &state.conversation_history,
-            &tools_json,
-            false,
-        )?;
+        resume_payload_in_place(&mut current_payload, state.history_to_append(), false)?;
     }
 }
 
@@ -1327,7 +1412,7 @@ fn record_tool_metrics(model_id: &str, tool_output: &smg_mcp::ToolExecutionOutpu
 /// Build an incomplete response when limits are exceeded
 fn build_incomplete_response(
     mut response: Value,
-    state: ToolLoopState,
+    mut state: ToolLoopState,
     reason: &str,
     session: &McpToolSession<'_>,
     format_registry: &FormatRegistry,
@@ -1343,11 +1428,6 @@ fn build_incomplete_response(
     obj.insert(
         "incomplete_details".to_string(),
         json!({ "reason": reason }),
-    );
-
-    let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-        &state.existing_mcp_list_tools_labels,
-        session.mcp_servers(),
     );
 
     let user_function_names: HashSet<&str> = original_body
@@ -1429,25 +1509,7 @@ fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !incomplete_items.is_empty() {
-            let mut prefix = Vec::with_capacity(
-                list_tools_bindings.len() + state.mcp_call_items.len() + incomplete_items.len(),
-            );
-            for (server_label, server_key) in &list_tools_bindings {
-                if !session.is_internal_server_label(server_label) {
-                    prefix.push(openai_bridge::mcp_list_tools_json(
-                        session,
-                        server_label,
-                        server_key,
-                    ));
-                }
-            }
-            prefix.extend(
-                state
-                    .mcp_call_items
-                    .iter()
-                    .filter(|item| !is_internal_mcp_response_item(item, session))
-                    .cloned(),
-            );
+            let mut prefix = mcp_output_prefix_last(&mut state, session, incomplete_items.len());
             prefix.extend(
                 incomplete_items
                     .into_iter()
@@ -2312,7 +2374,8 @@ mod tests {
     #[test]
     fn resume_payload_keeps_the_base_keys_in_place() {
         let base = json!({"model": "test-model", "input": "hi", "stream": false, "metadata": {}});
-        let resumed = super::build_resume_payload(&base, &[], &json!([]), false).unwrap();
+        let mut resumed = base;
+        super::resume_payload_in_place(&mut resumed, &[], false).unwrap();
         let keys: Vec<&str> = resumed
             .as_object()
             .unwrap()
@@ -2331,13 +2394,8 @@ mod tests {
             "tools": [{"type": "function", "name": "ask_wiki"}],
             "tool_choice": "required"
         });
-        let resumed = super::build_resume_payload(
-            &base,
-            &[],
-            &json!([{"type": "function", "name": "ask_wiki"}]),
-            false,
-        )
-        .expect("resume payload");
+        let mut resumed = base;
+        super::resume_payload_in_place(&mut resumed, &[], false).expect("resume payload");
 
         assert_eq!(resumed["tool_choice"], json!("auto"));
         assert_eq!(
@@ -2366,13 +2424,8 @@ mod tests {
             json!({"type": "function_call_output", "call_id": "call_B", "output": "found"}),
         ];
 
-        let resumed = super::build_resume_payload(
-            &base,
-            &executed,
-            &json!([{"type": "function", "name": "search"}]),
-            false,
-        )
-        .expect("resume payload");
+        let mut resumed = base;
+        super::resume_payload_in_place(&mut resumed, &executed, false).expect("resume payload");
 
         let kinds: Vec<(&str, &str)> = resumed["input"]
             .as_array()
@@ -2613,42 +2666,108 @@ mod tests {
         );
     }
 
-    /// The resume payload of a request of ten input items and four history
-    /// items: its allocation calls are pinned. The payload is copied once (the
-    /// loop keeps the one it started from); the input items of that copy are
-    /// moved into the resumed list, where a second copy of them was made
-    /// before. The count is printed for the Numbers table.
+    /// Turn N appends only the calls recorded since turn N-1: the cursor
+    /// advances with every resume, so a call never rides upstream twice and
+    /// a turn with nothing new appends nothing.
+    #[test]
+    fn a_resume_appends_only_the_calls_recorded_since_the_last_turn() {
+        let mut state = ToolLoopState::new(Vec::new());
+        let mut payload = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": "find it"}],
+            "tools": [{"type": "function", "name": "search"}]
+        });
+        let call = |state: &mut ToolLoopState, id: &str| {
+            state.record_call(
+                false,
+                id.to_string(),
+                "search".to_string(),
+                "{}".to_string(),
+                "found".to_string(),
+                json!({"type": "mcp_call", "id": id}),
+            );
+        };
+        let kinds = |payload: &serde_json::Value| -> Vec<(String, String)> {
+            payload["input"]
+                .as_array()
+                .expect("an item list")
+                .iter()
+                .map(|item| {
+                    (
+                        item["type"].as_str().unwrap_or("?").to_string(),
+                        item["call_id"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        call(&mut state, "call_A");
+        super::resume_payload_in_place(&mut payload, state.history_to_append(), false)
+            .expect("the first resume");
+        call(&mut state, "call_B");
+        super::resume_payload_in_place(&mut payload, state.history_to_append(), false)
+            .expect("the second resume");
+        let expected: Vec<(String, String)> = [
+            ("message", ""),
+            ("function_call", "call_A"),
+            ("function_call_output", "call_A"),
+            ("function_call", "call_B"),
+            ("function_call_output", "call_B"),
+        ]
+        .iter()
+        .map(|(kind, id)| (kind.to_string(), id.to_string()))
+        .collect();
+        assert_eq!(
+            kinds(&payload),
+            expected,
+            "each call once, in order, behind the input"
+        );
+
+        super::resume_payload_in_place(&mut payload, state.history_to_append(), false)
+            .expect("a resume with nothing new");
+        assert_eq!(
+            kinds(&payload),
+            expected,
+            "a turn with nothing new appends nothing"
+        );
+    }
+
+    /// The resume payload of a request of ten input items, one tool and four
+    /// history items: its allocation calls are pinned. The payload the loop
+    /// sent is edited in place (the four items are copied behind its input),
+    /// where a copy of the whole payload, its tools included, was made per
+    /// turn. The count is printed for the Numbers table.
     #[test]
     #[expect(
         clippy::print_stderr,
         reason = "the count a pin reads is printed for the Numbers table"
     )]
-    fn a_resume_payload_moves_the_copied_input_items() {
+    fn a_resume_payload_appends_the_new_history_in_place() {
         let items: Vec<serde_json::Value> = (0..10)
             .map(|i| {
                 json!({"type": "message", "role": "user", "content": [{"type": "input_text",
                     "text": format!("turn {i}: a sentence long enough to live on the heap")}]})
             })
             .collect();
-        let base = json!({"model": "m", "input": items, "tools": [], "stream": false});
+        let tools =
+            json!([{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]);
+        let mut payload = json!({"model": "m", "input": items, "tools": tools, "stream": false});
+        let first_item = payload["input"][0].clone();
         let history: Vec<serde_json::Value> = (0..4)
             .map(|i| json!({"type": "function_call_output", "call_id": format!("call_{i}"), "output": format!("result {i}")}))
             .collect();
-        let tools =
-            json!([{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]);
 
         let before = counting_alloc::calls();
-        let resumed =
-            super::build_resume_payload(&base, &history, &tools, false).expect("a resume payload");
+        super::resume_payload_in_place(&mut payload, &history, false).expect("a resume payload");
         let calls = counting_alloc::calls() - before;
 
         eprintln!(
             "a resume payload of 10 input items and 4 history items: {calls} allocation calls"
         );
-        assert_eq!(resumed["input"].as_array().map(Vec::len), Some(14));
-        assert_eq!(resumed["input"][0], base["input"][0]);
-        assert_eq!(resumed["input"][13], history[3]);
-        assert_eq!(resumed["tool_choice"], json!("auto"));
+        assert_eq!(payload["input"].as_array().map(Vec::len), Some(14));
+        assert_eq!(payload["input"][0], first_item);
+        assert_eq!(payload["input"][13], history[3]);
+        assert_eq!(payload["tool_choice"], json!("auto"));
         assert_eq!(
             calls, PINNED_RESUME_CALLS,
             "the resume payload's allocation calls changed"
@@ -2656,5 +2775,101 @@ mod tests {
     }
 
     /// Allocation calls of the resume payload above, today.
-    const PINNED_RESUME_CALLS: usize = 199;
+    const PINNED_RESUME_CALLS: usize = 38;
+
+    /// A tool whose JSON Schema is about a kilobyte: eight string arguments
+    /// with a sentence of description each.
+    fn kilobyte_tool(name: &str) -> Tool {
+        let mut properties = serde_json::Map::new();
+        for field in [
+            "query", "locale", "region", "format", "cursor", "filter", "since", "until",
+        ] {
+            properties.insert(
+                field.to_string(),
+                json!({"type": "string", "description": format!("the {field} of the lookup, a sentence long enough to make the schema about a kilobyte of JSON")}),
+            );
+        }
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".to_string(), json!("object"));
+        schema.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(properties),
+        );
+        schema.insert("required".to_string(), json!(["query"]));
+        Tool::new(name.to_string(), "a tool of a kilobyte of schema", schema)
+    }
+
+    /// The model's tool list and the `mcp_list_tools` item of a session of
+    /// 30 tools with 1 KB schemas: their allocation calls are pinned. Each
+    /// schema is copied once into each (the copy the payload owns), where
+    /// `json!` and the typed item's serialisation copied it twice. The count
+    /// is printed for the Numbers table.
+    #[tokio::test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the count a pin reads is printed for the Numbers table"
+    )]
+    async fn the_tool_descriptors_copy_each_schema_once() {
+        let (orchestrator, bindings) = function_tool_session().await;
+        for i in 0..30 {
+            orchestrator
+                .tool_inventory()
+                .insert_entry(ToolEntry::from_server_tool(
+                    "wiki-server",
+                    kilobyte_tool(&format!("lookup_{i:02}")),
+                ));
+        }
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        assert!(
+            serde_json::to_string(&*kilobyte_tool("probe").input_schema)
+                .expect("a schema")
+                .len()
+                >= 1024
+        );
+        let mut payload = json!({
+            "model": "m",
+            "input": "q",
+            "tools": [{"type": "mcp", "server_label": "wiki"}]
+        });
+
+        let before = counting_alloc::calls();
+        super::prepare_mcp_tools_as_functions(&mut payload, &session);
+        let item = crate::openai_bridge::mcp_list_tools_json(&session, "wiki", "wiki-server");
+        let calls = counting_alloc::calls() - before;
+
+        eprintln!(
+            "the model's tool list and the list-tools item of 30 tools with 1 KB schemas: {calls} allocation calls"
+        );
+        assert_eq!(payload["tools"].as_array().map(Vec::len), Some(31));
+        assert_eq!(item["tools"].as_array().map(Vec::len), Some(31));
+        assert_eq!(
+            calls, PINNED_DESCRIPTOR_CALLS,
+            "the tool descriptors' allocation calls changed"
+        );
+    }
+
+    /// Allocation calls of the tool descriptors above, today.
+    const PINNED_DESCRIPTOR_CALLS: usize = 4643;
+
+    /// The JSON list-tools item is the typed item serialised, byte for byte
+    /// (its id aside: each build draws one).
+    #[tokio::test]
+    async fn the_json_list_tools_item_is_the_typed_one() {
+        let (orchestrator, bindings) = function_tool_session().await;
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let mut built = crate::openai_bridge::mcp_list_tools_json(&session, "wiki", "wiki-server");
+        let mut typed = serde_json::to_value(crate::openai_bridge::mcp_list_tools_item(
+            &session,
+            "wiki",
+            "wiki-server",
+        ))
+        .expect("the typed item serialises");
+        for item in [&mut built, &mut typed] {
+            item["id"] = json!("mcpl_x");
+        }
+        assert_eq!(
+            serde_json::to_string(&built).expect("JSON"),
+            serde_json::to_string(&typed).expect("JSON")
+        );
+    }
 }
