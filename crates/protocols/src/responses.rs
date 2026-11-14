@@ -9,16 +9,19 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, strict_schema_missing_additional_properties, validate_json_schema_shape,
-        validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
-        FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
-        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        default_true, deserialize_null_as_empty_vec, json_type_name,
+        strict_schema_missing_additional_properties, validate_json_schema_shape, validate_stop,
+        ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
+        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
+        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
         ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
-    builders::ResponsesResponseBuilder, common::invalid, profile::is_openai_vendor_model,
+    builders::ResponsesResponseBuilder,
+    common::{deserialize_null_as_empty_map, invalid},
+    profile::is_openai_vendor_model,
     validated::Normalizable,
 };
 
@@ -102,7 +105,11 @@ pub enum BuiltInToolChoiceType {
     #[serde(rename = "web_search_preview_2025_03_11")]
     WebSearchPreview20250311,
     ImageGeneration,
+    /// The GA computer tool; `computer_use` names it too, and
+    /// `computer_use_preview` the preview tool.
+    Computer,
     ComputerUsePreview,
+    ComputerUse,
     CodeInterpreter,
 }
 
@@ -194,10 +201,8 @@ pub enum ResponsesToolChoice {
     /// `"none"` | `"auto"` | `"required"`.
     Options(ToolChoiceOptions),
 
-    /// `{"type": "file_search" | "web_search" | "web_search_preview" |
-    /// "web_search_preview_2025_03_11" | "image_generation" |
-    /// "computer_use_preview" | "code_interpreter"}` — select a built-in
-    /// hosted tool by type alone (no additional payload).
+    /// `{"type": "<hosted tool>"}`, a type [`BuiltInToolChoiceType`] names:
+    /// select a built-in hosted tool by type alone (no additional payload).
     Types {
         #[serde(rename = "type")]
         tool_type: BuiltInToolChoiceType,
@@ -352,8 +357,10 @@ pub enum ResponseTool {
     #[serde(rename = "function")]
     Function(FunctionTool),
 
-    /// Built-in tool.
-    #[serde(rename = "web_search_preview")]
+    /// Built-in preview web search tool. The public API also names it by its
+    /// dated type, `web_search_preview_2025_03_11`, which reads as this tool
+    /// and is written under the canonical `web_search_preview`.
+    #[serde(rename = "web_search_preview", alias = "web_search_preview_2025_03_11")]
     WebSearchPreview(WebSearchPreviewTool),
 
     /// Built-in non-preview hosted web search tool.
@@ -403,7 +410,7 @@ pub enum ResponseTool {
 
     /// User-defined custom tool with optional grammar-constrained input.
     ///
-    /// Spec: `{ name, type: "custom", defer_loading?, description?, format? }`.
+    /// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
     /// `format` constrains the model's free-form `input` payload — `Text` is
     /// unconstrained, `Grammar` enforces a Lark or regex production at decode
     /// time. The model returns a `custom_tool_call` output item carrying the
@@ -530,17 +537,63 @@ pub struct FunctionTool {
     pub function: Function,
 }
 
+impl FunctionTool {
+    /// The public API's function-tool keys beyond the function object's own
+    /// (`FunctionTool` in the spec): how the API calls the tool rather than
+    /// what the model calls. They are kept in [`Function::extra`] and
+    /// forwarded as given.
+    pub const TOOL_KEYS: &'static [&'static str] =
+        &["async", "defer_loading", "output_schema", "allowed_callers"];
+
+    /// Every key a function tool takes, as its refusal of another key lists
+    /// them: the function object's own, then [`Self::TOOL_KEYS`].
+    const FIELDS: &'static [&'static str] = &[
+        "name",
+        "description",
+        "parameters",
+        "strict",
+        "async",
+        "defer_loading",
+        "output_schema",
+        "allowed_callers",
+    ];
+
+    /// The function object a chat template is handed: the tool's function
+    /// without [`Self::TOOL_KEYS`], which describe the call, not the function.
+    pub fn chat_function(&self) -> Function {
+        let mut function = self.function.clone();
+        function
+            .extra
+            .retain(|key, _| !Self::TOOL_KEYS.contains(&key.as_str()));
+        function
+    }
+
+    /// Whether the model may call the tool itself: `allowed_callers` is absent,
+    /// `null` or names `direct`. A tool only code may call (`["programmatic"]`)
+    /// needs a router that runs programmatic tool calls.
+    pub fn allows_direct_calls(&self) -> bool {
+        match self.function.extra.get("allowed_callers") {
+            Some(Value::Array(callers)) => callers.iter().any(|caller| caller == "direct"),
+            _ => true,
+        }
+    }
+}
+
 /// A function tool rejects keys outside its schema, as the sibling tool
 /// structs do with `deny_unknown_fields`. The function object collects such
 /// keys in [`Function::extra`] (the chat API keeps them for the template), and
 /// serde does not support `deny_unknown_fields` on a struct that flattens a
-/// struct with a flattened map of its own, so the check is made here.
+/// struct with a flattened map of its own, so the check is made here. The
+/// public API's own tool keys ([`FunctionTool::TOOL_KEYS`]) stay in `extra`.
 impl<'de> Deserialize<'de> for FunctionTool {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        const FIELDS: &[&str] = &["name", "description", "parameters", "strict"];
         let function = Function::deserialize(deserializer)?;
-        if let Some(key) = function.extra.keys().next() {
-            return Err(serde::de::Error::unknown_field(key, FIELDS));
+        if let Some(key) = function
+            .extra
+            .keys()
+            .find(|key| !FunctionTool::TOOL_KEYS.contains(&key.as_str()))
+        {
+            return Err(serde::de::Error::unknown_field(key, FunctionTool::FIELDS));
         }
         Ok(Self { function })
     }
@@ -671,7 +724,7 @@ pub enum FileSearchRanker {
 
 /// User-defined custom tool definition.
 ///
-/// Spec: `{ name, type: "custom", defer_loading?, description?, format? }`.
+/// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
 /// The discriminator (`type: "custom"`) is enforced by the parent
 /// [`ResponseTool`] enum; this struct only carries the payload fields so the
 /// `flatten`-style wire shape survives a round-trip.
@@ -690,6 +743,23 @@ pub struct CustomTool {
     /// Optional input-format constraint — `text` (unconstrained) or
     /// `grammar` (Lark / regex production).
     pub format: Option<CustomToolInputFormat>,
+    /// Whether the tool's response may come back asynchronously rather than
+    /// on the next response creation.
+    #[serde(rename = "async")]
+    pub r#async: Option<bool>,
+    /// The contexts the tool may be invoked from (`CallableToolAllowedCaller`:
+    /// `direct`, `programmatic`), forwarded as given.
+    pub allowed_callers: Option<Vec<String>>,
+}
+
+impl CustomTool {
+    /// Whether the model may call the tool itself: `allowed_callers` is absent
+    /// or names `direct` (see [`FunctionTool::allows_direct_calls`]).
+    pub fn allows_direct_calls(&self) -> bool {
+        self.allowed_callers
+            .as_ref()
+            .is_none_or(|callers| callers.iter().any(|caller| caller == "direct"))
+    }
 }
 
 /// Input-format constraint applied to a [`CustomTool`].
@@ -1227,6 +1297,9 @@ pub enum McpConnectorId {
 pub struct WebSearchPreviewTool {
     pub search_context_size: Option<String>,
     pub user_location: Option<Value>,
+    /// The kinds of content the search returns, `text` and `image` in the
+    /// public API (`SearchContentType`).
+    pub search_content_types: Option<Vec<String>>,
 }
 
 /// Non-preview hosted web search tool configuration.
@@ -1577,6 +1650,36 @@ pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
+    /// The reasoning execution mode (`ReasoningModeEnum`: `standard`, `pro`,
+    /// or another string the upstream takes), forwarded as given.
+    pub mode: Option<String>,
+    /// Which reasoning items are rendered back to the model on later turns.
+    pub context: Option<ReasoningContext>,
+    /// The deprecated spelling of `summary`, forwarded as given. It is a field
+    /// of its own rather than an alias, so a body that sends both spellings
+    /// still parses.
+    pub generate_summary: Option<ReasoningSummary>,
+}
+
+/// Which reasoning items are rendered back to the model on later turns
+/// (`Reasoning.context` in the spec); `auto` lets the model decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContext {
+    Auto,
+    CurrentTurn,
+    AllTurns,
+}
+
+impl ReasoningContext {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CurrentTurn => "current_turn",
+            Self::AllTurns => "all_turns",
+        }
+    }
 }
 
 #[expect(
@@ -1662,20 +1765,21 @@ pub enum StringOrContentParts {
 }
 
 impl StringOrContentParts {
-    /// Project tool output into a text-only backend without silently losing media.
+    /// Project tool output into a text-only backend without silently losing
+    /// media: a part without text is refused, and the refusal names the part.
     pub fn to_text_only(&self) -> Result<String, String> {
         match self {
             Self::String(text) => Ok(text.clone()),
             Self::Array(parts) => {
                 let mut text = String::new();
                 for part in parts {
-                    let Some(part) = part.text() else {
-                        return Err(
-                            "Multimodal function output is not supported by this text-only backend"
-                                .to_string(),
-                        );
+                    let Some(part_text) = part.text() else {
+                        let kind = part.type_name();
+                        return Err(format!(
+                            "Unsupported content part type {kind:?} in a function output for text-only backends: only text parts are carried as a tool result"
+                        ));
                     };
-                    text.push_str(part);
+                    text.push_str(part_text);
                 }
                 Ok(text)
             }
@@ -1884,7 +1988,13 @@ pub enum ResponseInputOutputItem {
         id: Option<String>,
         call_id: String,
         output: ComputerCallOutputContent,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// The safety checks the developer acknowledged. The public API's
+        /// input item takes an array or `null`; `null` reads as none.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_null_as_empty_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
         acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ComputerCallStatus>,
@@ -2148,13 +2258,15 @@ pub enum SimpleInputMessageTypeTag {
     Message,
 }
 
-/// Detail level for [`ResponseContentPart::InputFile`]. Spec restricts this
-/// to `"low" | "high"` (defaults to `low`); it is narrower than [`Detail`]
-/// used for images which also admits `auto` / `original`.
+/// Detail level for [`ResponseContentPart::InputFile`] (`FileInputDetail`
+/// in the spec): `auto`, the public API's default, lets the system choose;
+/// `low` and `high` pick a level. It is narrower than [`Detail`], used for
+/// images, which also admits `original`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FileDetail {
     #[default]
+    Auto,
     Low,
     High,
 }
@@ -2245,6 +2357,18 @@ impl ResponseContentPart {
         match self {
             Self::OutputText { text, .. } | Self::InputText { text } => Some(text),
             Self::InputImage { .. } | Self::InputFile { .. } | Self::Refusal { .. } => None,
+        }
+    }
+
+    /// The wire-format type name (e.g. `"input_image"`), for a refusal that
+    /// names the part.
+    const fn type_name(&self) -> &'static str {
+        match self {
+            Self::OutputText { .. } => "output_text",
+            Self::InputText { .. } => "input_text",
+            Self::InputImage { .. } => "input_image",
+            Self::InputFile { .. } => "input_file",
+            Self::Refusal { .. } => "refusal",
         }
     }
 }
@@ -2351,6 +2475,10 @@ pub enum ResponseOutputItem {
         id: String,
         #[serde(default)]
         summary: Vec<SummaryTextContent>,
+        /// The reasoning text. The public API does not require the key and
+        /// often leaves it out, so an item written without it reads as
+        /// having none.
+        #[serde(default)]
         content: Vec<ResponseReasoningContent>,
         /// Encrypted reasoning payload for gpt-5 / o-series round-trip.
         /// Opaque to SMG; preserved verbatim.
@@ -2649,7 +2777,7 @@ pub enum ResponseOutputItem {
 // Built-in Tool Call Types
 // ============================================================================
 
-/// Status for web search tool calls.
+/// Status for web search tool calls (`WebSearchCallStatus` in the spec).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchCallStatus {
@@ -2657,6 +2785,7 @@ pub enum WebSearchCallStatus {
     Searching,
     Completed,
     Failed,
+    Incomplete,
 }
 
 /// Action performed during a web search.
@@ -2671,13 +2800,16 @@ pub enum WebSearchAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sources: Vec<WebSearchSource>,
     },
+    /// The page the model opened. The public API does not require the URL,
+    /// and may write it as `null`.
     OpenPage {
-        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
-    Find {
-        url: String,
-        pattern: String,
-    },
+    /// A search for a pattern in a page. The public API names the action
+    /// `find_in_page`; `find`, the name this crate wrote before, still reads.
+    #[serde(rename = "find_in_page", alias = "find")]
+    Find { url: String, pattern: String },
 }
 
 /// A source returned from web search.
@@ -2840,25 +2972,34 @@ pub enum ResponseStatus {
     Cancelled,
 }
 
-/// Why a response stopped before producing complete output.
+/// Why a response stopped before producing complete output: the public API's
+/// `incomplete_details.reason`.
 ///
-/// Mirrors OpenAI's `incomplete_details.reason`: reserved strictly for the two
-/// truncation semantics. Any other stop condition (wall-clock timeout,
-/// `max_tool_calls` exhaustion, provider errors) is surfaced as a `failed`
-/// status with an `error` payload instead.
+/// The gateway's own Responses report `max_output_tokens` alone: any other stop
+/// condition of its own (wall-clock timeout, `max_tool_calls` exhaustion,
+/// provider errors) is surfaced as a `failed` status with an `error` payload
+/// instead. The other reasons are an upstream's, which a typed reader of its
+/// Response parses.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum IncompleteReason {
     /// Output was truncated because it hit `max_output_tokens`.
     MaxOutputTokens,
+    /// An upstream's `max_messages`, which the public API lists without
+    /// describing it.
+    MaxMessages,
     /// Output was truncated by the content filter.
     ContentFilter,
+    /// The response stopped at a safe output boundary after a WebSocket
+    /// `response.steer` event; the server may then create a successor response
+    /// with the queued input.
+    Steered,
 }
 
 /// Structured detail attached to a response whose status is `incomplete`.
 ///
-/// Wire shape: `{ "reason": "max_output_tokens" | "content_filter" }`.
+/// Wire shape: `{ "reason": "max_output_tokens" | "max_messages" | "content_filter" | "steered" }`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IncompleteDetails {
     /// The reason the response is incomplete.
@@ -2866,12 +3007,20 @@ pub struct IncompleteDetails {
 }
 
 /// The `reasoning` block of a Response object. The public API returns it on
-/// every response, both keys present (`null` when the request set none), so
-/// neither key is skipped here.
+/// every response with `effort` and `summary` present (`null` when the request
+/// set none), so neither is skipped here. `mode`, `context` and
+/// `generate_summary` echo the request's when it set them, and are left out
+/// otherwise.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReasoningInfo {
     pub effort: Option<String>,
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
 }
 
 impl From<&ResponseReasoningParam> for ReasoningInfo {
@@ -2879,6 +3028,11 @@ impl From<&ResponseReasoningParam> for ReasoningInfo {
         Self {
             effort: param.effort.map(|effort| effort.as_str().to_string()),
             summary: param.summary.map(|summary| summary.as_str().to_string()),
+            mode: param.mode.clone(),
+            context: param.context.map(|context| context.as_str().to_string()),
+            generate_summary: param
+                .generate_summary
+                .map(|summary| summary.as_str().to_string()),
         }
     }
 }
@@ -3072,6 +3226,9 @@ impl ResponseUsage {
             prompt_tokens_details: Some(PromptTokenUsageInfo {
                 cached_tokens: self.input_tokens_details.cached_tokens,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             }),
         }
     }
@@ -3276,7 +3433,7 @@ pub struct ResponsesRequest {
     pub prompt_cache_key: Option<String>,
 
     /// Retention policy for prompt-cache entries.
-    /// Spec: body param `prompt_cache_retention` (`"in-memory"` | `"24h"`).
+    /// Spec: body param `prompt_cache_retention` (`"in_memory"` | `"24h"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
 
@@ -3769,17 +3926,38 @@ const MAX_METADATA_PAIRS: usize = 16;
 const MAX_METADATA_KEY_CHARS: usize = 64;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
 
+/// The request's `metadata` under the public API's bounds (the field's custom
+/// rule; see [`validate_metadata_pairs`]).
 fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
-    if metadata.len() > MAX_METADATA_PAIRS {
+    validate_metadata_pairs(metadata.iter())
+}
+
+/// The public API's bound on the number of `metadata` pairs (16) for a count
+/// read on its own (a stored object once a patch is merged into it):
+/// `object_above_max_properties` above it.
+pub fn validate_metadata_pair_count(count: usize) -> Result<(), ValidationError> {
+    if count > MAX_METADATA_PAIRS {
         return Err(invalid(
             "object_above_max_properties",
             format!(
-                "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
-                metadata.len()
+                "Invalid 'metadata': too many properties. The object has {count} properties, but the maximum is {MAX_METADATA_PAIRS}."
             ),
         ));
     }
-    for (key, value) in metadata {
+    Ok(())
+}
+
+/// The public API's bounds on a `metadata` object, for any map of its pairs:
+/// at most 16 pairs (`object_above_max_properties`), keys of at most 64
+/// characters and string values of at most 512 (`string_above_max_length`),
+/// and every value a string (`invalid_type`). The Responses request validates
+/// its `metadata` with this rule; a route that reads a metadata object of its
+/// own (the gateway's Conversations routes) validates it the same way.
+pub fn validate_metadata_pairs<'a>(
+    pairs: impl ExactSizeIterator<Item = (&'a String, &'a Value)>,
+) -> Result<(), ValidationError> {
+    validate_metadata_pair_count(pairs.len())?;
+    for (key, value) in pairs {
         if key.chars().count() > MAX_METADATA_KEY_CHARS {
             return Err(invalid(
                 "string_above_max_length",
@@ -3789,16 +3967,23 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
                 ),
             ));
         }
-        if let Some(text) = value.as_str() {
-            if text.chars().count() > MAX_METADATA_VALUE_CHARS {
-                return Err(invalid(
-                    "string_above_max_length",
-                    format!(
-                        "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
-                        text.chars().count()
-                    ),
-                ));
-            }
+        let Value::String(text) = value else {
+            return Err(invalid(
+                "invalid_type",
+                format!(
+                    "Invalid type for 'metadata.{key}': expected a string, but got {} instead.",
+                    json_type_name(value)
+                ),
+            ));
+        };
+        if text.chars().count() > MAX_METADATA_VALUE_CHARS {
+            return Err(invalid(
+                "string_above_max_length",
+                format!(
+                    "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
+                    text.chars().count()
+                ),
+            ));
         }
     }
     Ok(())
@@ -3807,7 +3992,12 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
 /// The roles an input message may carry.
 const INPUT_MESSAGE_ROLES: [&str; 4] = ["assistant", "system", "developer", "user"];
 
-fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
+/// An input message's `role` under the public API's set (`assistant`,
+/// `system`, `developer`, `user`; `invalid_value` otherwise). The Responses
+/// request validates its message items with this rule; a route that stores
+/// message items of its own (the gateway's Conversations routes) validates
+/// them the same way.
+pub fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
     if INPUT_MESSAGE_ROLES.contains(&role) {
         return Ok(());
     }
@@ -3946,6 +4136,41 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
     Ok(())
 }
 
+/// The public API's function-tool keys ([`FunctionTool::TOOL_KEYS`]) are kept
+/// untyped in the function's `extra`, so their shapes are checked here, as the
+/// custom tool's typed fields check theirs: `async` and `defer_loading` a
+/// boolean, `allowed_callers` an array of strings, `output_schema` an object,
+/// each of them also `null`.
+fn validate_function_tool_keys(function: &Function, at: &str) -> Result<(), ValidationError> {
+    for key in FunctionTool::TOOL_KEYS {
+        let Some(value) = function.extra.get(*key) else {
+            continue;
+        };
+        let (expected, got) = match *key {
+            "async" | "defer_loading" if !(value.is_boolean() || value.is_null()) => {
+                ("a boolean", json_type_name(value))
+            }
+            "allowed_callers" => match value {
+                Value::Null => continue,
+                Value::Array(callers) => match callers.iter().find(|caller| !caller.is_string()) {
+                    Some(caller) => ("an array of strings", json_type_name(caller)),
+                    None => continue,
+                },
+                _ => ("an array of strings", json_type_name(value)),
+            },
+            "output_schema" if !(value.is_object() || value.is_null()) => {
+                ("an object", json_type_name(value))
+            }
+            _ => continue,
+        };
+        return Err(invalid(
+            "invalid_type",
+            format!("Invalid type for '{at}.{key}': expected {expected}, but got {got} instead."),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates ResponseTool structure based on tool type
 fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
@@ -3966,6 +4191,17 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                             json_type_name(function.parameters_schema())
                         ),
                     ));
+                }
+                validate_function_tool_keys(function, &format!("tools[{idx}]"))?;
+            }
+            ResponseTool::Namespace(namespace) => {
+                for (member_idx, member) in namespace.tools.iter().enumerate() {
+                    if let NamespaceTool::Function(function_tool) = member {
+                        validate_function_tool_keys(
+                            &function_tool.function,
+                            &format!("tools[{idx}].tools[{member_idx}]"),
+                        )?;
+                    }
                 }
             }
             // The hosted local_shell tool is not served by the gateway, and the
@@ -4034,18 +4270,6 @@ fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// The JSON type name used in validation messages.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
-}
-
 /// Normalize a SimpleInputMessage to a proper Message item
 ///
 /// This helper converts SimpleInputMessage (which can have flexible content)
@@ -4055,11 +4279,13 @@ fn json_type_name(value: &Value) -> &'static str {
 /// the centralized ID generation pattern with "msg_" prefix for consistency.
 ///
 /// # Arguments
-/// * `item` - The input item to normalize
+/// * `item` - The input item to normalize, taken by value: a SimpleInputMessage
+///   gives its content and role to the Message built from it, every other item
+///   comes back as it came, moved and not copied
 ///
 /// # Returns
 /// A normalized ResponseInputOutputItem (either Message if converted, or original if not SimpleInputMessage)
-pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutputItem {
+pub fn normalize_input_item(item: ResponseInputOutputItem) -> ResponseInputOutputItem {
     match item {
         ResponseInputOutputItem::SimpleInputMessage {
             content,
@@ -4069,20 +4295,20 @@ pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutp
         } => {
             let content_vec = match content {
                 StringOrContentParts::String(s) => {
-                    vec![ResponseContentPart::InputText { text: s.clone() }]
+                    vec![ResponseContentPart::InputText { text: s }]
                 }
-                StringOrContentParts::Array(parts) => parts.clone(),
+                StringOrContentParts::Array(parts) => parts,
             };
 
             ResponseInputOutputItem::Message {
                 id: generate_id("msg"),
-                role: role.clone(),
+                role,
                 content: content_vec,
                 status: Some("completed".to_string()),
-                phase: *phase,
+                phase,
             }
         }
-        _ => item.clone(),
+        other => other,
     }
 }
 
@@ -4197,14 +4423,66 @@ fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
     }
 }
 
+/// A fresh id: `prefix`, an underscore and 50 lowercase hex digits (25 random
+/// bytes), written into one string sized for the whole id.
 pub fn generate_id(prefix: &str) -> String {
     use rand::Rng;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut rng = rand::rng();
-    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
     let mut bytes = [0u8; 25];
     rng.fill_bytes(&mut bytes);
-    let hex_string: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{prefix}_{hex_string}")
+    let mut id = String::with_capacity(prefix.len() + 1 + 2 * bytes.len());
+    id.push_str(prefix);
+    id.push('_');
+    for byte in bytes {
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    id
+}
+
+/// `Response.conversation` on the wire. The public API writes the linked
+/// conversation as an object, `{"id": "conv_..."}` (`ResponseConversation`);
+/// the field keeps the id alone. This module writes that object and reads it,
+/// or a bare id, the shape the crate wrote before, which stored responses
+/// keep.
+mod response_conversation {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::common::ConversationRef;
+
+    /// The object the public API writes.
+    #[derive(Serialize)]
+    struct ResponseConversation<'a> {
+        /// The id of the conversation the response is linked to.
+        id: &'a str,
+    }
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's `with` hands the field to its serializer by reference"
+    )]
+    pub(super) fn serialize<S: Serializer>(
+        conversation: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match conversation {
+            Some(id) => ResponseConversation { id }.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        Ok(
+            Option::<ConversationRef>::deserialize(deserializer)?.map(
+                |reference| match reference {
+                    ConversationRef::Id(id) | ConversationRef::Object { id } => id,
+                },
+            ),
+        )
+    }
 }
 
 /// The Response object of `POST /v1/responses`.
@@ -4241,8 +4519,14 @@ pub struct ResponsesResponse {
     #[serialize_always]
     pub background: Option<bool>,
 
-    /// Conversation this response is linked to, if any.
-    #[serde(default)]
+    /// Conversation this response is linked to, if any, by its id. Written
+    /// as the public API writes it, `{"id": ...}`; a bare id, as the crate
+    /// wrote it before, still reads. The schema takes both shapes, as the
+    /// reader does: a response stored before the object was written is
+    /// served back with the bare id, and a client generated from the schema
+    /// reads it too.
+    #[serde(default, with = "response_conversation")]
+    #[schemars(with = "Option<ConversationRef>")]
     pub conversation: Option<String>,
 
     /// Response status
@@ -4361,8 +4645,9 @@ pub struct ResponsesResponse {
     #[serialize_always]
     pub presence_penalty: Option<f32>,
 
-    /// Additional metadata
-    #[serde(default)]
+    /// Additional metadata. An upstream may write `null`, as the public API's
+    /// `Metadata` allows, which reads as the empty map.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_map")]
     pub metadata: HashMap<String, Value>,
 }
 
@@ -4542,6 +4827,13 @@ impl ResponseReasoningContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A function tool's refusal of an unknown key lists the public API's tool
+    /// keys among those it takes.
+    #[test]
+    fn a_function_tools_fields_end_with_its_tool_keys() {
+        assert!(FunctionTool::FIELDS.ends_with(FunctionTool::TOOL_KEYS));
+    }
 
     /// The three sampling knobs the request keeps as plain values read as set
     /// only off their serde defaults: absent is unset, a value is set, and a
@@ -4851,6 +5143,59 @@ mod tests {
         );
     }
 
+    /// `validate_metadata_pairs` holds the public API's bounds for any map of
+    /// pairs: the pair count, the key and value lengths, and strings only,
+    /// each under the public code; a map at the bounds passes.
+    #[test]
+    fn metadata_pairs_are_bounded_as_the_public_api_bounds_them() {
+        let code = |pairs: Vec<(String, Value)>| {
+            let map: serde_json::Map<String, Value> = pairs.into_iter().collect();
+            validate_metadata_pairs(map.iter()).map_err(|error| error.code.to_string())
+        };
+        assert_eq!(
+            code(
+                (0..16)
+                    .map(|i| (format!("{i:0>64}"), serde_json::json!("v".repeat(512))))
+                    .collect()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            code(
+                (0..17)
+                    .map(|i| (format!("k{i}"), serde_json::json!("v")))
+                    .collect()
+            ),
+            Err("object_above_max_properties".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".repeat(65), serde_json::json!("v"))]),
+            Err("string_above_max_length".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".to_string(), serde_json::json!("v".repeat(513)))]),
+            Err("string_above_max_length".to_string())
+        );
+        for (value, named) in [
+            (serde_json::json!({"nested": 1}), "an object"),
+            (serde_json::json!(5), "a number"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(null), "null"),
+            (serde_json::json!(["v"]), "an array"),
+        ] {
+            let map: serde_json::Map<String, Value> =
+                [("k".to_string(), value)].into_iter().collect();
+            let error = validate_metadata_pairs(map.iter())
+                .expect_err("a value that is not a string is refused");
+            assert_eq!(error.code, "invalid_type");
+            let message = error.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("'metadata.k'") && message.contains(named),
+                "{message}"
+            );
+        }
+    }
+
     /// Codex puts `client_metadata` on every request: it must parse, and it
     /// must not be forwarded to the workers.
     #[test]
@@ -5006,7 +5351,8 @@ mod tests {
         assert_eq!(text.extract_text_for_routing(), "plain");
     }
 
-    /// Text-only content takes the text parts and refuses any other part.
+    /// Text-only content takes the text parts and refuses any other part,
+    /// naming the first part it cannot carry.
     #[test]
     fn text_only_content_refuses_a_part_without_text() {
         let with_image = StringOrContentParts::Array(vec![
@@ -5019,7 +5365,21 @@ mod tests {
                 image_url: Some("https://a/1.png".to_string()),
             },
         ]);
-        assert!(with_image.to_text_only().is_err());
+        assert_eq!(
+            with_image.to_text_only().unwrap_err(),
+            "Unsupported content part type \"input_image\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
+        let with_file = StringOrContentParts::Array(vec![ResponseContentPart::InputFile {
+            detail: None,
+            file_data: None,
+            file_id: Some("file_1".to_string()),
+            file_url: None,
+            filename: None,
+        }]);
+        assert_eq!(
+            with_file.to_text_only().unwrap_err(),
+            "Unsupported content part type \"input_file\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
 
         let text = StringOrContentParts::Array(vec![
             ResponseContentPart::InputText {
@@ -5032,5 +5392,59 @@ mod tests {
             },
         ]);
         assert_eq!(text.to_text_only().unwrap(), "ab");
+    }
+
+    /// The normaliser takes an item by value: a bare `{role, content}` message
+    /// becomes a message item carrying that content and role, and every other
+    /// item comes back as it came.
+    #[test]
+    fn normalize_input_item_reshapes_a_bare_message_and_keeps_every_other_item() {
+        let item = |body: Value| -> ResponseInputOutputItem {
+            serde_json::from_value(body).expect("the input item deserializes")
+        };
+        let wire = |item: &ResponseInputOutputItem| serde_json::to_value(item).unwrap();
+
+        let bare = normalize_input_item(item(
+            serde_json::json!({"role": "user", "content": "continue", "phase": "commentary"}),
+        ));
+        let ResponseInputOutputItem::Message {
+            id,
+            role,
+            content,
+            status,
+            phase,
+        } = &bare
+        else {
+            panic!("a bare message becomes a message item, got {bare:?}");
+        };
+        assert!(id.starts_with("msg_"), "a generated message id, got {id}");
+        assert_eq!(role, "user");
+        assert_eq!(
+            serde_json::to_value(content).unwrap(),
+            serde_json::json!([{"type": "input_text", "text": "continue"}])
+        );
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(*phase, Some(MessagePhase::Commentary));
+
+        let parts = normalize_input_item(item(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]
+        })));
+        assert_eq!(
+            wire(&parts)["content"],
+            serde_json::json!([{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]),
+            "the parts move over in order"
+        );
+
+        let call = item(serde_json::json!({
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "lookup", "arguments": "{\"key\": \"k\"}"
+        }));
+        let before = wire(&call);
+        assert_eq!(
+            wire(&normalize_input_item(call)),
+            before,
+            "an item that is not a bare message is returned as it came"
+        );
     }
 }

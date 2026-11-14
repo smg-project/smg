@@ -91,12 +91,18 @@ against the tag once the gate is green; `make release-publish-plan VERSION=<x.y.
 exact commands and the artifact names (the gateway image's `latest` moves only for a final; a
 crate publishes when its exact version is not on crates.io yet; a PyPI version that is complete,
 wheel and sdist, is skipped, and `-f packages=proto|servicer|both` on `release-grpc` names a
-package outright for a retry). A release candidate is never published to PyPI or crates.io:
+package outright for a retry). The Go bindings module, `github.com/smg-project/smg/bindings/golang`,
+is published by the tag `bindings/golang/v<version>` at the release commit: the plan prints the
+`git tag` and `git push` for it, run by a maintainer with tag rights beside `v<version>` until
+`release-go` pushes it too (`make release-ship` dispatches workflows only, so it is run by hand
+either way). The plan prints that item only where `bindings/golang/go.mod` at the ref declares that
+path: a tag at an older release would name a `go.mod` that `go get` refuses, so a plan for an older
+line leaves it out and says why; the first such tag is 1.16.0's. A release candidate is never published to PyPI or crates.io:
 `release-pypi`, `release-crates` and `release-grpc` refuse a ref whose name carries `-rc.` (the
 job is skipped, and its first step says why when it is reached anyway),
 `make release-publish-plan VERSION=1.14.0-rc.1` leaves the three out and says so,
-`make release-check` reports the rule, and the candidate ships as its images, its chart, its Go
-module tag and its GitHub pre-release. The nightly prerelease and the CI images are unchanged by
+`make release-check` reports the rule, and the candidate ships as its images, its chart, its two Go
+module tags and its GitHub pre-release. The nightly prerelease and the CI images are unchanged by
 this process.
 
 ## The gate

@@ -54,6 +54,7 @@ import zmq
 
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
+from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
 from smg_grpc_servicer.sglang.request_traces import TRACE_HEADERS_KEY, RequestTraces
 
 if TYPE_CHECKING:
@@ -1271,6 +1272,7 @@ def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyRes
         num_gpu_blocks=max_total // page_size,
         block_size=page_size,
         dtype=wire_dtype(scheduler.model_config.dtype),
+        multimodal_encoder_dtype=encoder_dtype(None, lambda: scheduler.model_config.dtype),
         vllm_version=f"sglang-{_sglang_version()}",
         world_size=tp_size * pp_size,
         # The schedulers the engine runs, one handshake each, as the launcher

@@ -22,8 +22,10 @@ use crate::tenant::is_canonical_serving_tenant_key;
 pub struct TenantPolicySpec {
     /// Canonical tenant key (e.g. `auth:team-red`). Must be `None` on
     /// [`RateLimitYaml::default_policy`] and `Some` on every entry in
-    /// [`RateLimitYaml::tenants`].
-    #[serde(default)]
+    /// [`RateLimitYaml::tenants`]. Written only when present: the default
+    /// policy carries no `tenant_key` on the wire, as the document's
+    /// schema says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_key: Option<String>,
     pub tokens_per_minute: u32,
     pub requests_per_minute: u32,
@@ -269,6 +271,20 @@ mod tests {
             tenants: vec![policy(Some("auth:team-red"), 5000, 300)],
         };
         assert!(yaml.validate().is_ok());
+    }
+
+    #[test]
+    fn the_default_policy_serializes_without_a_tenant_key() {
+        let yaml = RateLimitYaml {
+            default_policy: policy(None, 1000, 60),
+            tenants: vec![policy(Some("auth:team-red"), 5000, 300)],
+        };
+        let document = serde_json::to_value(&yaml).expect("a document");
+        assert!(
+            document["default_policy"].get("tenant_key").is_none(),
+            "the default policy carries no tenant_key on the wire"
+        );
+        assert_eq!(document["tenants"][0]["tenant_key"], "auth:team-red");
     }
 
     #[test]

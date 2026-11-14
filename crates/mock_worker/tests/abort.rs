@@ -1,6 +1,13 @@
 //! Drive cancellation through the gateway's gRPC client, including its
 //! abort-on-drop path, and check the simulated engine's own load.
 
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "a test binary: a failed step panics with what failed"
+)]
+
 use std::time::Duration;
 
 use futures::StreamExt;

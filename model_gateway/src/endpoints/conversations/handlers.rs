@@ -1,20 +1,30 @@
 //! Conversation CRUD handlers for the /v1/conversations API - shared across routers
 
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    sync::Arc,
+};
 
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::Utc;
+use openai_protocol::{
+    common::json_type_name,
+    responses::{
+        validate_input_message_role, validate_metadata_pair_count, validate_metadata_pairs,
+        ResponseContentPart,
+    },
+};
 use serde_json::{json, Value};
 use smg_data_connector::{
     AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
     SortOrder, StorageFailure,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::routers::{
     common::{openai_bridge, persistence_utils::item_to_json},
@@ -25,12 +35,15 @@ use crate::routers::{
 // Constants
 // ============================================================================
 
-pub const MAX_METADATA_PROPERTIES: usize = 16;
 const MAX_ITEMS_PER_REQUEST: usize = 20;
 /// The longest item id a client may supply, in bytes: the id columns of the
 /// SQL stores are 64 wide, and every backend gives the same refusal before any
 /// store is asked, where one of them used to fail the insert instead.
 pub const MAX_ITEM_ID_LENGTH: usize = 64;
+/// The `status` values a message item may carry (the public API's set for a
+/// message; the other item types have sets of their own and keep the status
+/// they are sent).
+const MESSAGE_STATUSES: [&str; 3] = ["in_progress", "completed", "incomplete"];
 
 const SUPPORTED_ITEM_TYPES: &[&str] = &[
     "message",
@@ -113,6 +126,40 @@ fn item_id_above_max_length(id: &str) -> Response {
     }))
 }
 
+/// A refusal in the public API's words: `code` and `message` as a validator
+/// of the protocols crate gives them, under `param` (none for the body as a
+/// whole).
+fn refused(param: Option<&str>, code: &str, message: &str) -> Response {
+    bad_request_structured(json!({
+        "message": message,
+        "type": "invalid_request_error",
+        "param": param,
+        "code": code
+    }))
+}
+
+/// The refusal of a `metadata` object outside the public API's bounds, as
+/// `validate_metadata_pairs` words it.
+fn metadata_refused(code: &str, message: Option<&str>) -> Response {
+    refused(Some("metadata"), code, message.unwrap_or_default())
+}
+
+/// A request body that is not a JSON object is refused as the typed
+/// extractors refuse one (`invalid_type`), before any field is read.
+fn object_body(body: &Value) -> Result<(), Response> {
+    if body.is_object() {
+        return Ok(());
+    }
+    Err(refused(
+        None,
+        "invalid_type",
+        &format!(
+            "Invalid type for the request body: expected an object, but got {} instead.",
+            json_type_name(body)
+        ),
+    ))
+}
+
 // ============================================================================
 // Storage Helpers
 // ============================================================================
@@ -136,32 +183,44 @@ async fn ensure_conversation_exists(
 // Metadata Operations
 // ============================================================================
 
-fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Value>>, String> {
+/// The `metadata` of a create body: none when absent, the object once the
+/// public API's bounds hold (`validate_metadata_pairs`: 16 pairs, 64-character
+/// keys, 512-character string values, strings only); a bound crossed and a
+/// value of another type are refused under the public API's codes.
+fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Value>>, Response> {
     match value.get("metadata") {
         Some(Value::Object(map)) => {
-            if map.len() > MAX_METADATA_PROPERTIES {
-                Err(format!(
-                    "metadata cannot have more than {MAX_METADATA_PROPERTIES} properties"
-                ))
-            } else {
-                Ok(Some(map.clone()))
-            }
+            validate_metadata_pairs(map.iter())
+                .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
+            Ok(Some(map.clone()))
         }
-        Some(_) => Err("metadata must be an object".to_string()),
+        Some(other) => Err(metadata_not_an_object(other)),
         None => Ok(None),
     }
 }
 
+/// `current` with the `metadata` patch of an update body applied (a null
+/// value removes its key). The key and value rules are read on the patch's
+/// own pairs, so a pair stored before these rules held does not block an
+/// unrelated patch; the 16-pair bound is the stored object's and is read on
+/// the merged result. A patch that crosses either changes nothing.
 fn apply_metadata_patches(
     current: Option<serde_json::Map<String, Value>>,
     body: &Value,
-) -> Result<Option<serde_json::Map<String, Value>>, String> {
+) -> Result<Option<serde_json::Map<String, Value>>, Response> {
     let patch_map = match body.get("metadata") {
         Some(Value::Object(map)) => map,
-        Some(_) => return Err("metadata must be an object".to_string()),
+        Some(other) => return Err(metadata_not_an_object(other)),
         None => return Ok(current),
     };
 
+    // A null value removes its key and is not a value under the rules.
+    let patched: Vec<(&String, &Value)> = patch_map
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .collect();
+    validate_metadata_pairs(patched.iter().copied())
+        .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
     let mut result = current.unwrap_or_default();
     for (k, v) in patch_map {
         if v.is_null() {
@@ -170,12 +229,8 @@ fn apply_metadata_patches(
             result.insert(k.clone(), v.clone());
         }
     }
-
-    if result.len() > MAX_METADATA_PROPERTIES {
-        return Err(format!(
-            "metadata cannot have more than {MAX_METADATA_PROPERTIES} properties"
-        ));
-    }
+    validate_metadata_pair_count(result.len())
+        .map_err(|error| metadata_refused(&error.code, error.message.as_deref()))?;
 
     Ok(if result.is_empty() {
         None
@@ -184,20 +239,55 @@ fn apply_metadata_patches(
     })
 }
 
+/// The refusal of a `metadata` field that is not an object.
+fn metadata_not_an_object(value: &Value) -> Response {
+    metadata_refused(
+        "invalid_type",
+        Some(&format!(
+            "Invalid type for 'metadata': expected an object, but got {} instead.",
+            json_type_name(value)
+        )),
+    )
+}
+
 // ============================================================================
 // Conversation CRUD Handlers
 // ============================================================================
 
 /// `POST /v1/conversations`: the conversation is scoped to the caller's
-/// `tenant`.
+/// `tenant`. Its `items`, when the request carries any, are prepared, stored
+/// and linked through the path of `POST /v1/conversations/{id}/items` (the
+/// same bounds, refusals and `warnings`), so a conversation created with items
+/// and one created empty and given the same items list the same. The whole
+/// batch is checked before the conversation exists (`prepare_items`: the
+/// bounds, an unsupported type, a message without a role, an unknown
+/// reference, an id of another tenant), so a refused create creates no
+/// conversation; a store fault during the writes, a reference the writes
+/// evicted from a bounded store, or an id another caller's write took since
+/// the batch was prepared, deletes the conversation just created (the records
+/// the batch wrote stay in the item store, unlinked).
 pub async fn create_conversation(
     storage: &Arc<dyn ConversationStorage>,
+    item_storage: &Arc<dyn ConversationItemStorage>,
     tenant: Option<&str>,
     body: Value,
 ) -> Response {
+    if let Err(response) = object_body(&body) {
+        return response;
+    }
     let metadata = match validate_metadata(&body) {
         Ok(m) => m,
-        Err(msg) => return bad_request(msg),
+        Err(response) => return response,
+    };
+    let items = match items_of(&body, false) {
+        Ok(items) => items,
+        Err(response) => return response,
+    };
+    // The whole batch is checked against the stores before the conversation
+    // exists, so a refused batch leaves nothing behind.
+    let prepared = match prepare_items(item_storage, None, items, tenant).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
     };
 
     let new_conv = NewConversation {
@@ -206,13 +296,38 @@ pub async fn create_conversation(
         tenant: tenant.map(str::to_string),
     };
 
-    match storage.create_conversation(new_conv).await {
-        Ok(conversation) => {
-            info!(conversation_id = %conversation.id.0, "Created conversation");
-            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
+    let conversation = match storage.create_conversation(new_conv).await {
+        Ok(conversation) => conversation,
+        Err(e) => return store_error("Failed to create conversation", &e),
+    };
+    info!(conversation_id = %conversation.id.0, "Created conversation");
+    let mut answer = conversation_to_json(&conversation);
+    if !prepared.is_empty() {
+        match store_items(item_storage, &conversation.id, prepared, tenant).await {
+            Ok((_, warnings)) => {
+                if !warnings.is_empty() {
+                    if let Some(obj) = answer.as_object_mut() {
+                        obj.insert("warnings".to_string(), json!(warnings));
+                    }
+                }
+            }
+            Err(response) => {
+                // A store fault, a referenced item the writes evicted, or an
+                // id another tenant's write took since the batch was prepared
+                // reaches here: every other refusal was found before the
+                // conversation was created.
+                if let Err(e) = storage.delete_conversation(&conversation.id).await {
+                    warn!(
+                        conversation_id = %conversation.id.0,
+                        error = %e,
+                        "A conversation whose items were refused could not be deleted"
+                    );
+                }
+                return response;
+            }
         }
-        Err(e) => store_error("Failed to create conversation", &e),
     }
+    (StatusCode::OK, Json(answer)).into_response()
 }
 
 pub async fn get_conversation(
@@ -236,6 +351,9 @@ pub async fn update_conversation(
     conv_id: &str,
     body: Value,
 ) -> Response {
+    if let Err(response) = object_body(&body) {
+        return response;
+    }
     let conversation_id = ConversationId::from(conv_id);
 
     let current = match ensure_conversation_exists(storage, &conversation_id, tenant).await {
@@ -245,7 +363,7 @@ pub async fn update_conversation(
 
     let final_metadata = match apply_metadata_patches(current.metadata.clone(), &body) {
         Ok(m) => m,
-        Err(msg) => return bad_request(msg),
+        Err(response) => return response,
     };
 
     match storage
@@ -325,18 +443,22 @@ pub async fn list_conversation_items(
 
     match item_storage.list_items(&conversation_id, params).await {
         Ok(items) => {
+            let has_more = items.len() == limit;
+            let first_id = items.first().map(|item| item.id.0.clone());
+            let last_id = items.last().map(|item| item.id.0.clone());
             // The item objects as the public API lists them: each item's own
-            // fields, the same object the single-item GET answers.
-            let item_values: Vec<Value> = items.iter().map(item_to_json).collect();
+            // fields, the same object the single-item GET answers; the page is
+            // this answer's own, so each item moves into its object.
+            let item_values: Vec<Value> = items.into_iter().map(item_to_json).collect();
 
             (
                 StatusCode::OK,
                 Json(json!({
                     "object": "list",
                     "data": item_values,
-                    "has_more": items.len() == limit,
-                    "first_id": items.first().map(|item| &item.id.0),
-                    "last_id": items.last().map(|item| &item.id.0),
+                    "has_more": has_more,
+                    "first_id": first_id,
+                    "last_id": last_id,
                 })),
             )
                 .into_response()
@@ -352,6 +474,9 @@ pub async fn create_conversation_items(
     conv_id: &str,
     body: Value,
 ) -> Response {
+    if let Err(response) = object_body(&body) {
+        return response;
+    }
     let conversation_id = ConversationId::from(conv_id);
 
     if let Err(response) =
@@ -360,55 +485,19 @@ pub async fn create_conversation_items(
         return response;
     }
 
-    let items_array = match body.get("items").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return bad_request("Missing or invalid 'items' field"),
+    let items = match items_of(&body, true) {
+        Ok(items) => items,
+        Err(response) => return response,
     };
-
-    if items_array.len() > MAX_ITEMS_PER_REQUEST {
-        return bad_request(format!(
-            "Cannot add more than {MAX_ITEMS_PER_REQUEST} items at a time"
-        ));
-    }
-
-    // Bounded before any store is asked, for the whole batch: the stores' id columns are
-    // this wide, and a later item's over-long id must not leave earlier items behind.
-    if let Some(id_str) = items_array
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .find(|id| id.len() > MAX_ITEM_ID_LENGTH)
-    {
-        return item_id_above_max_length(id_str);
-    }
-
-    let mut created_items = Vec::new();
-    let mut warnings = Vec::new();
-    let mut link_pairs = Vec::new();
-    let mut seen_ids = HashSet::new();
-    // One stamp per item, each later than the one before: the stores order a conversation's
-    // items by `added_at`, so the items of this call list in the order the request gave them.
-    let mut stamps = AddedAtSequence::new();
-
-    for item_val in items_array {
-        let added_at = stamps.next_added_at();
-        match process_item(item_storage, &conversation_id, item_val, added_at, tenant).await {
-            Ok((item_json, item_id, warning)) => {
-                if seen_ids.insert(item_id.0.clone()) {
-                    link_pairs.push((item_id, added_at));
-                }
-                created_items.push(item_json);
-                if let Some(w) = warning {
-                    warnings.push(w);
-                }
-            }
+    let prepared = match prepare_items(item_storage, Some(&conversation_id), items, tenant).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (created_items, warnings) =
+        match store_items(item_storage, &conversation_id, prepared, tenant).await {
+            Ok(stored) => stored,
             Err(response) => return response,
-        }
-    }
-
-    // Batch-link all items in a single operation
-    if let Err(e) = item_storage.link_items(&conversation_id, &link_pairs).await {
-        return store_error("Failed to link items to conversation", &e);
-    }
+        };
 
     let mut response = json!({
         "object": "list",
@@ -427,139 +516,337 @@ pub async fn create_conversation_items(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-/// Process a single item for creation. Returns (json, item_id, warning).
-/// Linking is deferred to the caller for batch operation. An item that exists
-/// already (an `item_reference`, an item arriving under its own id) is taken
-/// only when the caller's `tenant` may see it; a new item is scoped to it.
-async fn process_item(
-    item_storage: &Arc<dyn ConversationItemStorage>,
-    conversation_id: &ConversationId,
-    item_val: &Value,
-    added_at: chrono::DateTime<Utc>,
-    tenant: Option<&str>,
-) -> Result<(Value, ConversationItemId, Option<String>), Response> {
-    let item_type = item_val
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("message");
-
-    // Handle item_reference specially - just resolve existing item
-    if item_type == "item_reference" {
-        return process_item_reference(item_storage, conversation_id, item_val, added_at, tenant)
-            .await;
-    }
-
-    let user_provided_id = item_val.get("id").and_then(|v| v.as_str());
-
-    let (item, warning) = if let Some(id_str) = user_provided_id {
-        process_item_with_id(item_storage, conversation_id, item_val, id_str, tenant).await?
-    } else {
-        process_new_item(item_storage, item_val, tenant).await?
+/// The `items` of a request body: the array, its per-request bound and the
+/// id-length bound, read before any store is asked. An absent or null field is
+/// the refusal when `required` (the add-items route) and an empty batch
+/// otherwise (the create route, whose `items` are optional).
+fn items_of(body: &Value, required: bool) -> Result<&[Value], Response> {
+    let items_array: &[Value] = match body.get("items") {
+        Some(Value::Array(items)) => items,
+        None | Some(Value::Null) if !required => &[],
+        _ => return Err(bad_request("Missing or invalid 'items' field")),
     };
 
-    let item_id = item.id.clone();
-    Ok((item_to_json(&item), item_id, warning))
+    if items_array.len() > MAX_ITEMS_PER_REQUEST {
+        return Err(bad_request(format!(
+            "Cannot add more than {MAX_ITEMS_PER_REQUEST} items at a time"
+        )));
+    }
+
+    // Bounded before any store is asked, for the whole batch: the stores' id columns are
+    // this wide, and a later item's over-long id must not leave earlier items behind.
+    if let Some(id_str) = items_array
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .find(|id| id.len() > MAX_ITEM_ID_LENGTH)
+    {
+        return Err(item_id_above_max_length(id_str));
+    }
+    Ok(items_array)
 }
 
-/// Process an item_reference - resolve an existing item for linking.
-/// Linking is deferred to the caller for batch operation. A reference to an item the
-/// conversation already has is refused, as an item arriving under such an id is: the
-/// public API does not re-add an item a conversation has (the stores would move it to the
-/// new position).
-async fn process_item_reference(
+/// A parsed item and the warning of an accepted-but-unimplemented type.
+type OwnContent = (NewConversationItem, Option<String>);
+
+/// One item of a request batch once the stores have been asked and before
+/// anything is written: an item that exists already and is taken as it is (an
+/// `item_reference`, an item arriving under an id the caller may see), a new
+/// item to write with the warning of a type accepted but not implemented, or a
+/// repeat of an earlier item of the same batch (the same client-supplied id
+/// twice, a reference to an item the batch itself adds).
+enum PreparedItem {
+    /// An `item_reference`: the stored item it names.
+    Existing(ConversationItem),
+    /// An item adopted under its own client-supplied id: the stored item, and
+    /// the request's own parsed content to write under that id should the
+    /// batch's writes evict the stored one (`None` for a bare id the parser
+    /// does not take).
+    Adopted(ConversationItem, Option<Box<OwnContent>>),
+    New(NewConversationItem, Option<String>),
+    SameAs(usize),
+}
+
+/// An adopted item awaiting the re-check after the batch's writes: its id and
+/// the request's own content.
+struct Adoption {
+    id: ConversationItemId,
+    own: Option<Box<OwnContent>>,
+}
+
+/// The whole batch checked against the stores before any write, in the order
+/// given: every refusal the routes give (the parser's, an unknown reference, an
+/// id of another tenant, an item the conversation already has) is found here,
+/// so a refused batch stores nothing on either route. `conversation_id` is
+/// `None` while the conversation does not exist yet (the create route):
+/// nothing can be linked to it.
+async fn prepare_items(
     item_storage: &Arc<dyn ConversationItemStorage>,
-    conversation_id: &ConversationId,
-    item_val: &Value,
-    _added_at: chrono::DateTime<Utc>,
+    conversation_id: Option<&ConversationId>,
+    items: &[Value],
     tenant: Option<&str>,
-) -> Result<(Value, ConversationItemId, Option<String>), Response> {
-    let ref_id = item_val
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| bad_request("item_reference requires 'id' field"))?;
-
-    let item_id = ConversationItemId::from(ref_id);
-
-    let is_linked = item_storage
-        .is_item_linked(conversation_id, &item_id)
-        .await
-        .map_err(|e| store_error("Failed to check item link", &e))?;
-    if is_linked {
-        return Err(item_already_in_conversation());
+) -> Result<Vec<PreparedItem>, Response> {
+    let mut prepared = Vec::with_capacity(items.len());
+    // The ids this batch brings itself (a new item under its own id): a later
+    // item of the batch that names one is a repeat, not a lookup the store
+    // cannot answer before the write.
+    let mut batch_ids: HashMap<&str, usize> = HashMap::new();
+    for item_val in items {
+        let item_type = item_val
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
+        let id = item_val.get("id").and_then(Value::as_str);
+        if let Some(index) = id.and_then(|id| batch_ids.get(id)) {
+            prepared.push(PreparedItem::SameAs(*index));
+            continue;
+        }
+        let item = if item_type == "item_reference" {
+            prepare_item_reference(item_storage, conversation_id, id, tenant).await?
+        } else if let Some(id_str) = id {
+            prepare_item_with_id(item_storage, conversation_id, item_val, id_str, tenant).await?
+        } else {
+            let (new_item, warning) = parse_item_from_value(item_val, tenant)?;
+            PreparedItem::New(new_item, warning)
+        };
+        if let (Some(id_str), PreparedItem::New(..)) = (id, &item) {
+            batch_ids.insert(id_str, prepared.len());
+        }
+        prepared.push(item);
     }
+    Ok(prepared)
+}
+
+/// An `item_reference`: the existing item it names, as the caller's `tenant`
+/// may see it. A reference to an item the conversation already has is refused,
+/// as an item arriving under such an id is: the public API does not re-add an
+/// item a conversation has (the stores would move it to the new position).
+async fn prepare_item_reference(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: Option<&ConversationId>,
+    id: Option<&str>,
+    tenant: Option<&str>,
+) -> Result<PreparedItem, Response> {
+    let ref_id = id.ok_or_else(|| bad_request("item_reference requires 'id' field"))?;
+    let item_id = ConversationItemId::from(ref_id);
+    refuse_an_item_the_conversation_has(item_storage, conversation_id, &item_id).await?;
 
     // An item of another tenant is as unknown as a missing one.
-    let existing_item = match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) if item.is_visible_to(tenant) => item,
-        Ok(_) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
-        Err(e) => return Err(store_error("Failed to get referenced item", &e)),
-    };
-
-    let item_id = existing_item.id.clone();
-    Ok((item_to_json(&existing_item), item_id, None))
+    match item_storage.get_item(&item_id).await {
+        Ok(Some(item)) if item.is_visible_to(tenant) => Ok(PreparedItem::Existing(item)),
+        Ok(_) => Err(not_found(format!("Referenced item '{ref_id}' not found"))),
+        Err(e) => Err(store_error("Failed to get referenced item", &e)),
+    }
 }
 
-/// Process an item with a user-provided ID
-async fn process_item_with_id(
+/// An item arriving under its own id: the caller's own (or an untenanted one)
+/// is taken as it is, another tenant's is neither served nor overwritten, an
+/// id the store does not hold is parsed as a new item under that id.
+async fn prepare_item_with_id(
     item_storage: &Arc<dyn ConversationItemStorage>,
-    conversation_id: &ConversationId,
+    conversation_id: Option<&ConversationId>,
     item_val: &Value,
     id_str: &str,
     tenant: Option<&str>,
-) -> Result<(ConversationItem, Option<String>), Response> {
+) -> Result<PreparedItem, Response> {
     // Bounded before any store is asked: the stores' id columns are this wide,
     // and an id over the bound must be the same 400 on every backend.
     if id_str.len() > MAX_ITEM_ID_LENGTH {
         return Err(item_id_above_max_length(id_str));
     }
     let item_id = ConversationItemId::from(id_str);
+    refuse_an_item_the_conversation_has(item_storage, conversation_id, &item_id).await?;
 
-    // Check if already linked
-    let is_linked = item_storage
-        .is_item_linked(conversation_id, &item_id)
-        .await
-        .map_err(|e| store_error("Failed to check item link", &e))?;
-
-    if is_linked {
-        return Err(item_already_in_conversation());
-    }
-
-    // Check if item exists globally: the caller's own (or an untenanted one)
-    // is taken as it is; another tenant's is neither served nor overwritten.
     match item_storage.get_item(&item_id).await {
-        Ok(Some(existing)) if existing.is_visible_to(tenant) => Ok((existing, None)),
+        Ok(Some(existing)) if existing.is_visible_to(tenant) => {
+            // The request's own content, kept beside the adoption: written
+            // under this id should the batch's writes evict the stored item.
+            let own = parse_item_from_value(item_val, tenant)
+                .ok()
+                .map(|(mut item, warning)| {
+                    item.id = Some(item_id.clone());
+                    Box::new((item, warning))
+                });
+            Ok(PreparedItem::Adopted(existing, own))
+        }
         Ok(Some(_)) => Err(bad_request(format!("Item id '{id_str}' cannot be used"))),
         Ok(None) => {
-            // Create new item with the provided ID
-            let (mut new_item, warning) =
-                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
+            let (mut new_item, warning) = parse_item_from_value(item_val, tenant)?;
             new_item.id = Some(item_id);
-
-            let created = item_storage
-                .create_item(new_item)
-                .await
-                .map_err(|e| store_error("Failed to create item", &e))?;
-
-            Ok((created, warning))
+            Ok(PreparedItem::New(new_item, warning))
         }
         Err(e) => Err(store_error("Failed to check item existence", &e)),
     }
 }
 
-/// Process a new item without a user-provided ID
-async fn process_new_item(
-    item_storage: &Arc<dyn ConversationItemStorage>,
-    item_val: &Value,
+/// The refusal of an item a write under a caller-supplied id answered that the
+/// caller may not see: the store keeps the item it already holds under an id,
+/// so a caller that prepared the id as absent and lost the race to another
+/// caller's write is answered that caller's item. It is refused as the prepare
+/// step refuses such an id, before anything of the batch is linked.
+fn refuse_an_item_the_caller_may_not_see(
+    item: &ConversationItem,
     tenant: Option<&str>,
-) -> Result<(ConversationItem, Option<String>), Response> {
-    let (new_item, warning) = parse_item_from_value(item_val, tenant).map_err(bad_request)?;
+) -> Result<(), Response> {
+    if item.is_visible_to(tenant) {
+        Ok(())
+    } else {
+        Err(bad_request(format!(
+            "Item id '{}' cannot be used",
+            item.id.0
+        )))
+    }
+}
 
-    let created = item_storage
-        .create_item(new_item)
+/// The refusal of an item the conversation already has; nothing is linked to a
+/// conversation that does not exist yet.
+async fn refuse_an_item_the_conversation_has(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: Option<&ConversationId>,
+    item_id: &ConversationItemId,
+) -> Result<(), Response> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(());
+    };
+    let is_linked = item_storage
+        .is_item_linked(conversation_id, item_id)
         .await
-        .map_err(|e| store_error("Failed to create item", &e))?;
+        .map_err(|e| store_error("Failed to check item link", &e))?;
+    if is_linked {
+        return Err(item_already_in_conversation());
+    }
+    Ok(())
+}
 
-    Ok((created, warning))
+/// The prepared items of one request written and linked into `conversation_id`
+/// in the order given: each item as the public API lists it, and the warnings
+/// of the item types accepted but not implemented. Every refusal was found by
+/// `prepare_items`; what ends the batch here is a store fault, or a referenced
+/// item the batch's own writes evicted (a bounded store drops its oldest
+/// records on a write): after a batch that wrote a new item, every reference
+/// and adoption is read again before the link. A reference that is gone fails
+/// the batch, so nothing of it is linked (its new records stay in the store
+/// unlinked: the store's delete unlinks only, and a retry under the same id
+/// adopts them); an adopted id that is gone takes the request's own content
+/// under that id, as the write-as-you-go order answered, and every entry of
+/// the answer that names that id (the adoption, a reference to it, a repeat
+/// of it) lists the item as it is stored then. A batch without a new item
+/// asks the stores nothing more. A write under a caller-supplied id answers
+/// the item the store already holds under it, and the re-check reads whatever
+/// item sits under an adopted or referenced id: one another caller wrote
+/// since the batch was prepared, which `tenant` may not see, is refused
+/// before any link, as the prepare step refuses such an id (an adoption) or
+/// does not find it (a reference).
+async fn store_items(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: &ConversationId,
+    items: Vec<PreparedItem>,
+    tenant: Option<&str>,
+) -> Result<(Vec<Value>, Vec<String>), Response> {
+    let mut created_items: Vec<Value> = Vec::with_capacity(items.len());
+    let mut item_ids: Vec<ConversationItemId> = Vec::with_capacity(items.len());
+    let mut warnings = Vec::new();
+    let mut link_pairs = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut referenced: Vec<ConversationItemId> = Vec::new();
+    let mut adopted: Vec<Adoption> = Vec::new();
+    let mut wrote = false;
+    // One stamp per item, each later than the one before: the stores order a conversation's
+    // items by `added_at`, so the items of this call list in the order the request gave them.
+    let mut stamps = AddedAtSequence::new();
+
+    for prepared in items {
+        let added_at = stamps.next_added_at();
+        let (item_json, item_id, warning) = match prepared {
+            PreparedItem::Existing(item) => {
+                referenced.push(item.id.clone());
+                let id = item.id.clone();
+                (item_to_json(item), id, None)
+            }
+            PreparedItem::Adopted(item, own) => {
+                adopted.push(Adoption {
+                    id: item.id.clone(),
+                    own,
+                });
+                let id = item.id.clone();
+                (item_to_json(item), id, None)
+            }
+            PreparedItem::New(new_item, warning) => {
+                wrote = true;
+                let created = item_storage
+                    .create_item(new_item)
+                    .await
+                    .map_err(|e| store_error("Failed to create item", &e))?;
+                refuse_an_item_the_caller_may_not_see(&created, tenant)?;
+                let id = created.id.clone();
+                (item_to_json(created), id, warning)
+            }
+            PreparedItem::SameAs(index) => {
+                (created_items[index].clone(), item_ids[index].clone(), None)
+            }
+        };
+        if seen_ids.insert(item_id.0.clone()) {
+            link_pairs.push((item_id.clone(), added_at));
+        }
+        created_items.push(item_json);
+        item_ids.push(item_id);
+        if let Some(w) = warning {
+            warnings.push(w);
+        }
+    }
+
+    // The references and adoptions were resolved before the writes; a bounded
+    // store may have dropped one of them to make room for this batch's new
+    // items. An adopted id that is gone takes the request's own content (a
+    // write of its own, read before the references), and every entry of the
+    // answer that names that id lists the item as written; a reference that is
+    // gone ends the batch before anything is linked, as a missing reference
+    // does.
+    if wrote {
+        for Adoption { id: item_id, own } in adopted {
+            match item_storage.get_item(&item_id).await {
+                Ok(Some(item)) => refuse_an_item_the_caller_may_not_see(&item, tenant)?,
+                Ok(None) => match own.map(|boxed| *boxed) {
+                    Some((new_item, warning)) => {
+                        let created = item_storage
+                            .create_item(new_item)
+                            .await
+                            .map_err(|e| store_error("Failed to create item", &e))?;
+                        refuse_an_item_the_caller_may_not_see(&created, tenant)?;
+                        let written = item_to_json(created);
+                        for (entry, id) in created_items.iter_mut().zip(&item_ids) {
+                            if *id == item_id {
+                                *entry = written.clone();
+                            }
+                        }
+                        if let Some(w) = warning {
+                            warnings.push(w);
+                        }
+                    }
+                    None => return Err(not_found(format!("Item '{}' not found", item_id.0))),
+                },
+                Err(e) => return Err(store_error("Failed to re-check item", &e)),
+            }
+        }
+        for item_id in &referenced {
+            match item_storage.get_item(item_id).await {
+                Ok(Some(item)) if item.is_visible_to(tenant) => {}
+                Ok(_) => {
+                    return Err(not_found(format!(
+                        "Referenced item '{}' not found",
+                        item_id.0
+                    )))
+                }
+                Err(e) => return Err(store_error("Failed to re-check referenced item", &e)),
+            }
+        }
+    }
+
+    // Batch-link all items in a single operation
+    item_storage
+        .link_items(conversation_id, &link_pairs)
+        .await
+        .map_err(|e| store_error("Failed to link items to conversation", &e))?;
+    Ok((created_items, warnings))
 }
 
 /// The `include` values a conversation item GET accepts (the public API's
@@ -643,7 +930,7 @@ pub async fn get_conversation_item(
     }
 
     match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(&item))).into_response(),
+        Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(item))).into_response(),
         Ok(None) => not_found("Item not found"),
         Err(e) => store_error("Failed to get item", &e),
     }
@@ -682,21 +969,25 @@ pub async fn delete_conversation_item(
 // Parsing and Serialization
 // ============================================================================
 
+/// A request item as the stores take it, with the warning of a type accepted
+/// but not implemented; a refusal is the response the caller answers. A
+/// message item's `role`, `status` and content parts are checked against the
+/// public API's sets (`validate_message_fields`) before any store is asked.
 fn parse_item_from_value(
     item_val: &Value,
     tenant: Option<&str>,
-) -> Result<(NewConversationItem, Option<String>), String> {
+) -> Result<(NewConversationItem, Option<String>), Response> {
     let item_type = item_val
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("message");
 
     if !SUPPORTED_ITEM_TYPES.contains(&item_type) {
-        return Err(format!(
+        return Err(bad_request(format!(
             "Unsupported item type '{}'. Supported types: {}",
             item_type,
             SUPPORTED_ITEM_TYPES.join(", ")
-        ));
+        )));
     }
 
     let warning = if IMPLEMENTED_ITEM_TYPES.contains(&item_type) {
@@ -713,8 +1004,24 @@ fn parse_item_from_value(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    if item_type == "message" && role.is_none() {
-        return Err("Message items require 'role' field".to_string());
+    if item_type == "message" {
+        if let Some(other) = item_val
+            .get("role")
+            .filter(|role| !role.is_null() && !role.is_string())
+        {
+            return Err(refused(
+                Some("items[].role"),
+                "invalid_type",
+                &format!(
+                    "Invalid type for 'items[].role': expected a string, but got {} instead.",
+                    json_type_name(other)
+                ),
+            ));
+        }
+        if role.is_none() {
+            return Err(bad_request("Message items require 'role' field"));
+        }
+        validate_message_fields(item_val)?;
     }
 
     let status = item_val
@@ -750,6 +1057,128 @@ fn parse_item_from_value(
     ))
 }
 
+/// A message item's `role`, `status` and `content` under the public API's
+/// sets, refused in its words before any store is asked: the role through the
+/// rule the Responses request validates with, the status in the message set,
+/// the content a string or an array of the content parts the Responses
+/// request takes (each part read with the typed part, so an unknown type, a
+/// missing field and a wrong shape are refused as the typed extractors refuse
+/// them). An item of another type keeps its fields as sent.
+fn validate_message_fields(item_val: &Value) -> Result<(), Response> {
+    if let Some(role) = item_val.get("role").and_then(Value::as_str) {
+        validate_input_message_role(role).map_err(|error| {
+            refused(
+                Some("items[].role"),
+                &error.code,
+                error.message.as_deref().unwrap_or_default(),
+            )
+        })?;
+    }
+    if let Some(status) = item_val.get("status").filter(|status| !status.is_null()) {
+        if !status
+            .as_str()
+            .is_some_and(|status| MESSAGE_STATUSES.contains(&status))
+        {
+            let shown = status
+                .as_str()
+                .map_or_else(|| status.to_string(), str::to_owned);
+            return Err(refused(
+                Some("items[].status"),
+                "invalid_value",
+                &format!(
+                    "Invalid value: '{shown}'. Supported values are: 'in_progress', 'completed', and 'incomplete'."
+                ),
+            ));
+        }
+    }
+    match item_val.get("content") {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(parts)) => {
+            for (index, part) in parts.iter().enumerate() {
+                if let Err(error) = serde_json::from_value::<ResponseContentPart>(part.clone()) {
+                    return Err(part_refused(index, part, &error.to_string()));
+                }
+            }
+            Ok(())
+        }
+        Some(other) => Err(refused(
+            Some("items[].content"),
+            "invalid_type",
+            &format!(
+                "Invalid type for 'items[].content': expected a string or an array of content parts, but got {} instead.",
+                json_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// The refusal of a message content part the typed part does not read, under
+/// the public API's code for serde's reason, on the field the reason names
+/// without a guess: a part that is not an object is `invalid_type`; one
+/// without a `type` is `missing_required_parameter` on its type, one whose
+/// `type` is not a string `invalid_type` on it, one whose `type` is outside
+/// the part set `invalid_value` on it (a type the set knows is never blamed
+/// for a nested variant of the same name); a missing field of a part that holds
+/// nothing nested is `missing_required_parameter` on that field. serde names
+/// a missing field or an unknown variant without its path, so an error that
+/// may come from inside a nested value (an annotation's field, a `detail`
+/// outside its set) names the part itself, under the code of its kind.
+fn part_refused(index: usize, part: &Value, reason: &str) -> Response {
+    let part_param = format!("items[].content[{index}]");
+    let missing_field = reason
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(field, _)| field);
+    let (param, code) = match part.get("type") {
+        _ if !part.is_object() => (part_param.clone(), "invalid_type"),
+        None | Some(Value::Null) => (format!("{part_param}.type"), "missing_required_parameter"),
+        Some(Value::String(own)) if unknown_variant_is(reason, own) && !part_type_is_known(own) => {
+            (format!("{part_param}.type"), "invalid_value")
+        }
+        Some(Value::String(_)) => {
+            let nested = part
+                .as_object()
+                .is_some_and(|fields| fields.values().any(|v| v.is_object() || v.is_array()));
+            match missing_field {
+                Some(field) if !nested => (
+                    format!("{part_param}.{field}"),
+                    "missing_required_parameter",
+                ),
+                Some(_) => (part_param.clone(), "missing_required_parameter"),
+                None if reason.starts_with("unknown variant") => {
+                    (part_param.clone(), "invalid_value")
+                }
+                None => (part_param.clone(), "invalid_type"),
+            }
+        }
+        Some(_) => (format!("{part_param}.type"), "invalid_type"),
+    };
+    refused(
+        Some(&param),
+        code,
+        &format!("Invalid '{part_param}': {reason}"),
+    )
+}
+
+/// Whether the part set knows `type_name`: a part of that type alone fails on a
+/// missing field (or passes), never on an unknown variant, so an unknown-variant
+/// reason on such a part comes from a value nested inside it.
+fn part_type_is_known(type_name: &str) -> bool {
+    match serde_json::from_value::<ResponseContentPart>(json!({ "type": type_name })) {
+        Ok(_) => true,
+        Err(error) => !error.to_string().starts_with("unknown variant"),
+    }
+}
+
+/// Whether serde's reason is the unknown-variant refusal of `name` itself
+/// (``unknown variant `name`, expected ...``), not of a value nested in it.
+fn unknown_variant_is(reason: &str, name: &str) -> bool {
+    reason
+        .strip_prefix("unknown variant `")
+        .and_then(|rest| rest.strip_prefix(name))
+        .is_some_and(|rest| rest.starts_with('`'))
+}
+
 /// The content of a message item as it is stored and listed: a plain string
 /// becomes the one typed part the public API makes of it for the message's
 /// role, so an item added as `"content": "text"` has the shape of one added
@@ -783,7 +1212,9 @@ pub fn conversation_to_json(conversation: &Conversation) -> Value {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
-    use smg_data_connector::{MemoryConversationItemStorage, MemoryConversationStorage};
+    use smg_data_connector::{
+        MemoryConfig, MemoryConversationItemStorage, MemoryConversationStorage,
+    };
 
     use super::*;
     use crate::middleware::test_support::json_of;
@@ -899,6 +1330,576 @@ mod tests {
             .unwrap());
     }
 
+    /// A conversation created with `items` lists them, in the order given, as
+    /// a conversation created empty and given the same items does; the
+    /// accepted-but-unimplemented types answer the add-items route's
+    /// `warnings`; a batch the add-items route refuses before any store (over
+    /// the bound, an unsupported type, a malformed field) creates no
+    /// conversation, and one the store refuses leaves none behind.
+    #[tokio::test]
+    async fn a_conversation_created_with_items_lists_them_as_the_add_items_route_stores_them() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let two = json!([
+            {"type": "message", "role": "user", "content": "first"},
+            {"type": "message", "role": "assistant", "content": "second"}
+        ]);
+        let shape = |listed: &Value| -> Vec<Value> {
+            listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| json!([item["type"], item["role"], item["content"], item["status"]]))
+                .collect()
+        };
+
+        let response = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": two, "metadata": {"a": "b"}}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_of(response).await;
+        assert_eq!(created["object"], "conversation", "{created}");
+        assert_eq!(created["metadata"]["a"], "b", "{created}");
+        assert!(created.get("warnings").is_none(), "{created}");
+        let with_items = created["id"].as_str().unwrap().to_string();
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &with_items,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed["data"].as_array().map(Vec::len), Some(2), "{listed}");
+        assert_eq!(listed["data"][0]["content"][0]["text"], "first", "{listed}");
+        assert_eq!(
+            listed["data"][1]["content"][0]["text"], "second",
+            "{listed}"
+        );
+
+        let with_null =
+            create_conversation(&conversations, &items, None, json!({"items": null})).await;
+        assert_eq!(
+            with_null.status(),
+            StatusCode::OK,
+            "a null items field is an absent one"
+        );
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let then_added = empty["id"].as_str().unwrap().to_string();
+        let added = create_conversation_items(
+            &conversations,
+            &items,
+            None,
+            &then_added,
+            json!({"items": two}),
+        )
+        .await;
+        assert_eq!(added.status(), StatusCode::OK);
+        let listed_after = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &then_added,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            shape(&listed),
+            shape(&listed_after),
+            "{listed}\n{listed_after}"
+        );
+
+        let response = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let warned = json_of(response).await;
+        assert_eq!(
+            warned["warnings"].as_array().map(Vec::len),
+            Some(1),
+            "{warned}"
+        );
+
+        let before = conversations.stored_record_count();
+        let items_before = items.stored_record_count();
+        let too_many: Vec<Value> = (0..=MAX_ITEMS_PER_REQUEST)
+            .map(|i| json!({"type": "message", "role": "user", "content": format!("m{i}")}))
+            .collect();
+        for (body, status) in [
+            (json!({"items": too_many}), StatusCode::BAD_REQUEST),
+            (
+                json!({"items": [{"type": "bogus"}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                json!({"items": [{"type": "message", "content": "no role"}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (json!({"items": "first"}), StatusCode::BAD_REQUEST),
+            (
+                json!({"items": [{"type": "item_reference", "id": "msg_nowhere"}]}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = create_conversation(&conversations, &items, None, body.clone()).await;
+            assert_eq!(response.status(), status, "{body}");
+            assert_eq!(
+                conversations.stored_record_count(),
+                before,
+                "a refused create creates nothing: {body}"
+            );
+            assert_eq!(
+                items.stored_record_count(),
+                items_before,
+                "a refused create stores no item: {body}"
+            );
+        }
+
+        // An id the caller already holds is adopted without a parse, as the
+        // add-items route adopts it: no role is asked of it.
+        let held = listed["data"][0]["id"].as_str().unwrap().to_string();
+        let adopted = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": [{"id": held}]}),
+        )
+        .await;
+        assert_eq!(adopted.status(), StatusCode::OK);
+    }
+
+    /// A batch refused after its first item (an unknown reference, an
+    /// unsupported type) stores nothing on either route: the whole batch is
+    /// prepared before the first write, so a corrected retry under the same id
+    /// is a fresh write with the retry's content.
+    #[tokio::test]
+    async fn a_refused_batch_stores_nothing_on_either_route() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conversation = empty["id"].as_str().unwrap().to_string();
+        let conversations_before = conversations.stored_record_count();
+        let items_before = items.stored_record_count();
+        let first = json!({"id": "msg_first", "type": "message", "role": "user", "content": "A"});
+
+        for (second, status) in [
+            (
+                json!({"type": "item_reference", "id": "msg_nowhere"}),
+                StatusCode::NOT_FOUND,
+            ),
+            (json!({"type": "bogus"}), StatusCode::BAD_REQUEST),
+        ] {
+            let body = json!({"items": [first, second]});
+            let on_create = create_conversation(&conversations, &items, None, body.clone()).await;
+            assert_eq!(on_create.status(), status, "{body}");
+            let on_add = create_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(on_add.status(), status, "{body}");
+            assert_eq!(
+                conversations.stored_record_count(),
+                conversations_before,
+                "no conversation: {body}"
+            );
+            assert_eq!(items.stored_record_count(), items_before, "no item: {body}");
+        }
+
+        let retried = create_conversation_items(
+            &conversations,
+            &items,
+            None,
+            &conversation,
+            json!({"items": [{"id": "msg_first", "type": "message", "role": "user", "content": "B"}]}),
+        )
+        .await;
+        assert_eq!(retried.status(), StatusCode::OK);
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed["data"][0]["content"][0]["text"], "B", "{listed}");
+    }
+
+    /// A conversation's `metadata` is bounded as the public API bounds it, on
+    /// create and on update: 16 pairs, 64-character keys, 512-character
+    /// values, strings only; every refusal carries the public code under
+    /// `metadata` and stores nothing; metadata at the bounds is kept; a body
+    /// that is not an object is refused before any field is read.
+    #[tokio::test]
+    async fn metadata_is_bounded_as_the_public_api_bounds_it_on_create_and_update() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let error_of = |response: Response| async move { json_of(response).await["error"].clone() };
+        let one = |key: String, value: Value| {
+            let mut map = serde_json::Map::new();
+            map.insert(key, value);
+            Value::Object(map)
+        };
+
+        let before = conversations.stored_record_count();
+        let seventeen: serde_json::Map<String, Value> =
+            (0..17).map(|i| (format!("k{i}"), json!("v"))).collect();
+        for (metadata, code) in [
+            (json!({"k": "v".repeat(513)}), "string_above_max_length"),
+            (one("k".repeat(65), json!("v")), "string_above_max_length"),
+            (Value::Object(seventeen), "object_above_max_properties"),
+            (json!({"k": {"nested": 1}}), "invalid_type"),
+            (json!({"n": 5}), "invalid_type"),
+            (json!("text"), "invalid_type"),
+        ] {
+            let response =
+                create_conversation(&conversations, &items, None, json!({"metadata": metadata}))
+                    .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{metadata}");
+            let error = error_of(response).await;
+            assert_eq!(error["code"], code, "{error}");
+            assert_eq!(error["param"], "metadata", "{error}");
+            assert_eq!(
+                conversations.stored_record_count(),
+                before,
+                "a refused create creates nothing: {metadata}"
+            );
+        }
+        let response = create_conversation(&conversations, &items, None, json!([])).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = error_of(response).await;
+        assert_eq!(error["code"], "invalid_type", "{error}");
+        assert!(error["param"].is_null(), "{error}");
+        assert_eq!(conversations.stored_record_count(), before);
+
+        let at_the_bounds: serde_json::Map<String, Value> = (0..16)
+            .map(|i| (format!("{i:0>64}"), json!("v".repeat(512))))
+            .collect();
+        let response = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"metadata": Value::Object(at_the_bounds.clone())}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json_of(response).await;
+        assert_eq!(
+            created["metadata"],
+            Value::Object(at_the_bounds.clone()),
+            "{created}"
+        );
+        let conv_id = created["id"].as_str().unwrap().to_string();
+
+        let key0 = format!("{:0>64}", 0);
+        for (body, code) in [
+            (
+                json!({"metadata": one(key0.clone(), json!("v".repeat(513)))}),
+                "string_above_max_length",
+            ),
+            (
+                json!({"metadata": one(key0.clone(), json!(1))}),
+                "invalid_type",
+            ),
+            (
+                json!({"metadata": {"seventeenth": "v"}}),
+                "object_above_max_properties",
+            ),
+            (json!({"metadata": "text"}), "invalid_type"),
+            (json!([]), "invalid_type"),
+        ] {
+            let response = update_conversation(&conversations, None, &conv_id, body.clone()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(error_of(response).await["code"], code, "{body}");
+        }
+        let kept = json_of(get_conversation(&conversations, None, &conv_id).await).await;
+        assert_eq!(
+            kept["metadata"],
+            Value::Object(at_the_bounds),
+            "a refused update changes nothing: {kept}"
+        );
+        let response = update_conversation(
+            &conversations,
+            None,
+            &conv_id,
+            json!({"metadata": one(key0, Value::Null)}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = json_of(response).await;
+        assert_eq!(
+            updated["metadata"].as_object().map(serde_json::Map::len),
+            Some(15),
+            "{updated}"
+        );
+
+        // A pair stored before these rules held (a number) does not block an
+        // unrelated patch: the key and value rules are read on the patch's own
+        // pairs, the pair count on the merged object.
+        let stored = conversations
+            .create_conversation(NewConversation {
+                id: None,
+                metadata: json!({"n": 5}).as_object().cloned(),
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let response = update_conversation(
+            &conversations,
+            None,
+            &stored.id.0,
+            json!({"metadata": {"a": "b"}}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let patched = json_of(response).await;
+        assert_eq!(patched["metadata"], json!({"n": 5, "a": "b"}), "{patched}");
+        let sixteen_more: serde_json::Map<String, Value> =
+            (0..16).map(|i| (format!("k{i}"), json!("v"))).collect();
+        let response = update_conversation(
+            &conversations,
+            None,
+            &stored.id.0,
+            json!({"metadata": Value::Object(sixteen_more)}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_of(response).await["error"]["code"],
+            "object_above_max_properties",
+            "the pair count is the merged object's"
+        );
+    }
+
+    /// A message item's `role`, `status` and content parts are refused outside
+    /// the public API's sets, in its words and under the field named, before
+    /// any store is asked, on the add-items route and on create alike; an item
+    /// inside the sets (a developer message, an incomplete status, the typed
+    /// parts) is stored and listed as sent, and an item of another type keeps
+    /// its status.
+    #[tokio::test]
+    async fn a_message_items_role_status_and_parts_are_refused_outside_the_public_sets() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conv_id = created["id"].as_str().unwrap().to_string();
+        let message = |fields: Value| {
+            let mut item = json!({"type": "message", "role": "user", "content": "x"});
+            item.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            json!({"items": [item]})
+        };
+
+        let before = conversations.stored_record_count();
+        for (body, code, param) in [
+            (
+                message(json!({"role": "bogus"})),
+                "invalid_value",
+                "items[].role",
+            ),
+            (message(json!({"role": 42})), "invalid_type", "items[].role"),
+            (
+                message(json!({"status": "flying"})),
+                "invalid_value",
+                "items[].status",
+            ),
+            (
+                message(json!({"status": 3})),
+                "invalid_value",
+                "items[].status",
+            ),
+            (
+                message(json!({"content": [{"type": "bogus_part", "x": 1}]})),
+                "invalid_value",
+                "items[].content[0].type",
+            ),
+            (
+                message(
+                    json!({"content": [{"type": "input_text", "text": "ok"}, {"text": "no type"}]}),
+                ),
+                "missing_required_parameter",
+                "items[].content[1].type",
+            ),
+            (
+                message(json!({"content": [{"type": "input_text"}]})),
+                "missing_required_parameter",
+                "items[].content[0].text",
+            ),
+            (
+                message(json!({"content": [{"type": "refusal", "refusal": 7}]})),
+                "invalid_type",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [{"type": 7}]})),
+                "invalid_type",
+                "items[].content[0].type",
+            ),
+            (
+                message(json!({"content": ["a bare string"]})),
+                "invalid_type",
+                "items[].content[0]",
+            ),
+            // An error inside a nested value names the part, never a field of it
+            // that is fine or that it does not have.
+            (
+                message(json!({"content": [
+                    {"type": "input_image", "image_url": "https://example.com/a.png", "detail": "ultra"}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "url_citation", "url": "u"}]}
+                ]})),
+                "missing_required_parameter",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "bogus"}]}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            // A nested variant that carries the part's own type name is still the
+            // part's error, not its type's.
+            (
+                message(json!({"content": [
+                    {"type": "output_text", "text": "x", "annotations": [{"type": "output_text"}]}
+                ]})),
+                "invalid_value",
+                "items[].content[0]",
+            ),
+            (
+                message(json!({"content": {"text": "x"}})),
+                "invalid_type",
+                "items[].content",
+            ),
+            (
+                message(json!({"content": null})),
+                "invalid_type",
+                "items[].content",
+            ),
+        ] {
+            let response =
+                create_conversation_items(&conversations, &items, None, &conv_id, body.clone())
+                    .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error = json_of(response).await["error"].clone();
+            assert_eq!(error["code"], code, "{body}: {error}");
+            assert_eq!(error["param"], param, "{body}: {error}");
+            assert_eq!(error["type"], "invalid_request_error", "{body}: {error}");
+            let response = create_conversation(&conversations, &items, None, body.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "on create: {body}"
+            );
+            assert_eq!(
+                conversations.stored_record_count(),
+                before,
+                "a refused create creates nothing: {body}"
+            );
+        }
+        let response =
+            create_conversation_items(&conversations, &items, None, &conv_id, json!([])).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_of(response).await["error"]["code"], "invalid_type");
+
+        // A batch refused at its second item under these rules stores nothing
+        // of its first: the whole batch is prepared before any write.
+        let items_before = items.stored_record_count();
+        let mixed = json!({"items": [
+            {"id": "msg_first", "type": "message", "role": "user", "content": "ok"},
+            {"type": "message", "role": "user", "content": "x", "status": "flying"}
+        ]});
+        let response =
+            create_conversation_items(&conversations, &items, None, &conv_id, mixed).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            items.stored_record_count(),
+            items_before,
+            "nothing of a refused batch is stored"
+        );
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, None, &conv_id, None, None, None).await,
+        )
+        .await;
+        assert!(
+            listed["data"].as_array().unwrap().is_empty(),
+            "nothing is stored for a refused batch: {listed}"
+        );
+
+        let accepted = json!({"items": [
+            {"type": "message", "role": "developer", "content": "rules", "status": "incomplete"},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"},
+                {"type": "input_image", "image_url": "https://example.com/a.png"}
+            ]},
+            {"type": "message", "role": "assistant", "status": "in_progress", "content": [
+                {"type": "output_text", "text": "hello"},
+                {"type": "refusal", "refusal": "no"}
+            ]},
+            {"type": "web_search_call", "id": "ws_1", "status": "searching"}
+        ]});
+        let response =
+            create_conversation_items(&conversations, &items, None, &conv_id, accepted).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let added = json_of(response).await;
+        assert_eq!(added["data"].as_array().map(Vec::len), Some(4), "{added}");
+        assert_eq!(added["data"][0]["status"], "incomplete", "{added}");
+        assert_eq!(
+            added["data"][1]["content"][1]["type"], "input_image",
+            "{added}"
+        );
+        assert_eq!(added["data"][2]["content"][1]["refusal"], "no", "{added}");
+        assert_eq!(
+            added["data"][3]["status"], "searching",
+            "an item of another type keeps its status: {added}"
+        );
+    }
+
     const A: Option<&str> = Some("header:tenant-a");
     const B: Option<&str> = Some("header:tenant-b");
 
@@ -913,7 +1914,8 @@ mod tests {
             Arc::new(MemoryConversationStorage::new());
         let items: Arc<dyn ConversationItemStorage> =
             Arc::new(MemoryConversationItemStorage::new());
-        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, A, json!({})).await).await;
         let conv_id = created["id"].as_str().unwrap().to_string();
         let added = json_of(
             create_conversation_items(
@@ -1014,7 +2016,8 @@ mod tests {
     #[tokio::test]
     async fn another_tenants_item_cannot_be_referenced_or_adopted() {
         let (conversations, items, _conv_a, item_a) = conversation_of_a().await;
-        let created = json_of(create_conversation(&conversations, B, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, B, json!({})).await).await;
         let conv_b = created["id"].as_str().unwrap().to_string();
 
         let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
@@ -1038,7 +2041,8 @@ mod tests {
         assert_eq!(listed["data"].as_array().map(Vec::len), Some(0));
 
         // The owner references its own item into a second conversation of its own.
-        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, A, json!({})).await).await;
         let conv_a2 = created["id"].as_str().unwrap().to_string();
         let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
         let answer =
@@ -1054,7 +2058,8 @@ mod tests {
             Arc::new(MemoryConversationStorage::new());
         let items: Arc<dyn ConversationItemStorage> =
             Arc::new(MemoryConversationItemStorage::new());
-        let created = json_of(create_conversation(&conversations, None, json!({})).await).await;
+        let created =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
         let conv_id = created["id"].as_str().unwrap().to_string();
         for caller in [None, A] {
             assert_eq!(
@@ -1127,6 +2132,520 @@ mod tests {
             assert_eq!(error["type"], route_error::error_type_for_status(status));
             assert!(error["message"].is_string());
             assert!(error["param"].is_null());
+        }
+    }
+
+    /// A reference to an item the same batch adds, and a new id given twice in
+    /// one batch, store the item once and list it once on both routes: the
+    /// batch's own ids are known before any write, so no store is asked for an
+    /// item that is not written yet; an accepted-but-unimplemented type warns
+    /// once.
+    #[tokio::test]
+    async fn a_reference_to_an_item_of_the_same_batch_and_a_repeated_id_store_the_item_once() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conversation = empty["id"].as_str().unwrap().to_string();
+        let message =
+            |id: &str| json!({"id": id, "type": "message", "role": "user", "content": "x"});
+        let ids_of = |listed: &Value| -> Vec<String> {
+            listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The create route: a reference to the item the batch itself adds.
+        let before = items.stored_record_count().unwrap();
+        let created = create_conversation(
+            &conversations,
+            &items,
+            None,
+            json!({"items": [message("msg_a"), {"type": "item_reference", "id": "msg_a"}]}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = json_of(created).await;
+        assert!(created.get("warnings").is_none(), "{created}");
+        let with_items = created["id"].as_str().unwrap().to_string();
+        assert_eq!(items.stored_record_count(), Some(before + 1));
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &with_items,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(ids_of(&listed), vec!["msg_a"], "{listed}");
+
+        // The add-items route: the same new id twice, then an accepted-but-unimplemented
+        // type referenced by its own batch (one warning, not two).
+        for (batch, id, warnings) in [
+            (json!([message("msg_b"), message("msg_b")]), "msg_b", 0),
+            (
+                json!([
+                    {"id": "ws_c", "type": "web_search_call", "status": "completed"},
+                    {"type": "item_reference", "id": "ws_c"}
+                ]),
+                "ws_c",
+                1,
+            ),
+        ] {
+            let before = items.stored_record_count().unwrap();
+            let added = create_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                json!({"items": batch}),
+            )
+            .await;
+            assert_eq!(added.status(), StatusCode::OK, "{id}");
+            let added = json_of(added).await;
+            assert_eq!(added["data"].as_array().map(Vec::len), Some(2), "{added}");
+            assert_eq!(added["data"][1]["id"], id, "{added}");
+            assert_eq!(
+                added["warnings"].as_array().map(Vec::len).unwrap_or(0),
+                warnings,
+                "{added}"
+            );
+            assert_eq!(items.stored_record_count(), Some(before + 1), "{id}");
+        }
+        let listed = json_of(
+            list_conversation_items(
+                &conversations,
+                &items,
+                None,
+                &conversation,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(ids_of(&listed), vec!["msg_b", "ws_c"], "{listed}");
+    }
+
+    /// A reference resolved before the writes can name an item a bounded
+    /// store drops to make room for the batch's own new items. Every reference
+    /// is read again after the writes: one that is gone fails the batch before
+    /// anything is linked, on both routes, with the answer of a missing
+    /// reference.
+    #[tokio::test]
+    async fn a_reference_the_batch_s_own_writes_evict_fails_the_batch_before_the_link() {
+        for route in ["create", "add-items"] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let two_items = MemoryConfig {
+                max_items: 2,
+                ..MemoryConfig::default()
+            };
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            let stored = |id: &str| NewConversationItem {
+                id: Some(ConversationItemId::from(id)),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([{"type": "input_text", "text": id}]),
+                status: None,
+                tenant: None,
+            };
+            items.create_item(stored("msg_one")).await.unwrap();
+            items.create_item(stored("msg_two")).await.unwrap();
+            let empty =
+                json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+            let conversation = empty["id"].as_str().unwrap().to_string();
+            let conversations_before = conversations.stored_record_count();
+
+            // The new item takes the store over its bound: one of the two
+            // stored items goes, and the batch references both.
+            let batch = json!({"items": [
+                {"id": "msg_new", "type": "message", "role": "user", "content": "new"},
+                {"type": "item_reference", "id": "msg_one"},
+                {"type": "item_reference", "id": "msg_two"}
+            ]});
+            let response = match route {
+                "create" => create_conversation(&conversations, &items, None, batch).await,
+                _ => {
+                    create_conversation_items(&conversations, &items, None, &conversation, batch)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{route}");
+            let body = json_of(response).await;
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("msg_one") || message.contains("msg_two"),
+                "{route}: the answer names the evicted reference: {body}"
+            );
+            let kept = [
+                items
+                    .get_item(&ConversationItemId::from("msg_one"))
+                    .await
+                    .unwrap(),
+                items
+                    .get_item(&ConversationItemId::from("msg_two"))
+                    .await
+                    .unwrap(),
+            ];
+            assert_eq!(
+                kept.iter().filter(|item| item.is_some()).count(),
+                1,
+                "{route}: one stored item went to make room"
+            );
+            assert_eq!(
+                conversations.stored_record_count(),
+                conversations_before,
+                "{route}: no conversation is left behind"
+            );
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    None,
+                    &conversation,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                listed["data"].as_array().map(Vec::len),
+                Some(0),
+                "{route}: {listed}"
+            );
+            assert!(
+                !items
+                    .is_item_linked(
+                        &ConversationId::from(conversation.as_str()),
+                        &ConversationItemId::from("msg_new")
+                    )
+                    .await
+                    .unwrap(),
+                "{route}: nothing of the batch is linked"
+            );
+        }
+    }
+
+    /// An item adopted under its own id is not a reference: when the batch's
+    /// writes evict the stored item, the request's own content is written
+    /// under that id (the answer the write-as-you-go order gave), on both
+    /// routes; a bare id that is gone answers as a missing item.
+    #[tokio::test]
+    async fn an_adopted_id_the_batch_s_own_writes_evict_takes_the_request_s_content() {
+        let two_items = MemoryConfig {
+            max_items: 2,
+            ..MemoryConfig::default()
+        };
+        let stored = |id: &str| NewConversationItem {
+            id: Some(ConversationItemId::from(id)),
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([{"type": "input_text", "text": "stored"}]),
+            status: None,
+            tenant: None,
+        };
+        for route in ["create", "add-items"] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            // The oldest record goes first: the two stored items get distinct stamps.
+            items.create_item(stored("msg_oldest")).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            items.create_item(stored("msg_other")).await.unwrap();
+            let empty =
+                json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+            let conversation = empty["id"].as_str().unwrap().to_string();
+            let batch = json!({"items": [
+                {"type": "message", "role": "user", "content": "new"},
+                {"id": "msg_oldest", "type": "message", "role": "user", "content": "own"}
+            ]});
+            let response = match route {
+                "create" => create_conversation(&conversations, &items, None, batch).await,
+                _ => {
+                    create_conversation_items(&conversations, &items, None, &conversation, batch)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let body = json_of(response).await;
+            let listed_in = if route == "create" {
+                body["id"].as_str().unwrap().to_string()
+            } else {
+                assert_eq!(
+                    body["data"][1]["content"][0]["text"], "own",
+                    "{route}: {body}"
+                );
+                conversation.clone()
+            };
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    None,
+                    &listed_in,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            let texts: Vec<&str> = listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["content"][0]["text"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(texts, vec!["new", "own"], "{route}: {listed}");
+            assert_eq!(listed["data"][1]["id"], "msg_oldest", "{route}: {listed}");
+        }
+
+        // A bare id (nothing the parser takes) adopted and then evicted by the
+        // batch's write answers as a missing item, not a reference.
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+        items.create_item(stored("msg_oldest")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        items.create_item(stored("msg_other")).await.unwrap();
+        let empty =
+            json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+        let conversation = empty["id"].as_str().unwrap().to_string();
+        let response = create_conversation_items(
+            &conversations,
+            &items,
+            None,
+            &conversation,
+            json!({"items": [
+                {"type": "message", "role": "user", "content": "new"},
+                {"id": "msg_oldest"}
+            ]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_of(response).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("msg_oldest") && !message.contains("Referenced"),
+            "{body}"
+        );
+    }
+    /// An adopted id the batch's writes evict is written once with the
+    /// request's own content, and every entry of the answer that names it (the
+    /// adoption, a reference to it, a repeat of it) lists the item as the
+    /// listing does, on both routes.
+    #[tokio::test]
+    async fn a_recreated_adopted_id_lists_the_same_in_every_entry_of_the_answer() {
+        let two_items = MemoryConfig {
+            max_items: 2,
+            ..MemoryConfig::default()
+        };
+        let stored = |id: &str| NewConversationItem {
+            id: Some(ConversationItemId::from(id)),
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([{"type": "input_text", "text": "stored"}]),
+            status: None,
+            tenant: None,
+        };
+        for route in ["create", "add-items"] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            // The oldest record goes first: the two stored items get distinct stamps.
+            items.create_item(stored("msg_oldest")).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            items.create_item(stored("msg_other")).await.unwrap();
+            let empty =
+                json_of(create_conversation(&conversations, &items, None, json!({})).await).await;
+            let conversation = empty["id"].as_str().unwrap().to_string();
+            // The new item evicts the oldest; the batch then adopts that id, references it and
+            // adopts it again.
+            let batch = json!({"items": [
+                {"type": "message", "role": "user", "content": "new"},
+                {"id": "msg_oldest", "type": "message", "role": "user", "content": "own"},
+                {"type": "item_reference", "id": "msg_oldest"},
+                {"id": "msg_oldest", "type": "message", "role": "user", "content": "own again"}
+            ]});
+            let response = match route {
+                "create" => create_conversation(&conversations, &items, None, batch).await,
+                _ => {
+                    create_conversation_items(&conversations, &items, None, &conversation, batch)
+                        .await
+                }
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let body = json_of(response).await;
+            let listed_in = if route == "create" {
+                body["id"].as_str().unwrap().to_string()
+            } else {
+                let texts: Vec<&str> = body["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["content"][0]["text"].as_str().unwrap_or(""))
+                    .collect();
+                assert_eq!(texts, vec!["new", "own", "own", "own"], "{route}: {body}");
+                conversation.clone()
+            };
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    None,
+                    &listed_in,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            let texts: Vec<&str> = listed["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["content"][0]["text"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(texts, vec!["new", "own"], "{route}: {listed}");
+            assert_eq!(listed["data"][1]["id"], "msg_oldest", "{route}: {listed}");
+            assert!(
+                items
+                    .get_item(&ConversationItemId::from("msg_other"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{route}: the other stored item went to make room for the recreation"
+            );
+        }
+    }
+
+    /// The post-write re-check applies the prepare step's visibility rule: when
+    /// the batch's own writes evicted an adopted or referenced item and another
+    /// caller's write took the id before the re-check, the item now under the id
+    /// is refused as the prepare step refuses it (an adoption's 400, a
+    /// reference's 404) and nothing of the batch is linked; the other caller's
+    /// item is untouched.
+    #[tokio::test]
+    async fn an_id_another_caller_took_before_the_re_check_is_refused_before_the_link() {
+        for (case, entry, status) in [
+            (
+                "adoption",
+                json!({"id": "msg_o", "type": "message", "role": "user", "content": "own"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "reference",
+                json!({"type": "item_reference", "id": "msg_o"}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let conversations: Arc<dyn ConversationStorage> =
+                Arc::new(MemoryConversationStorage::new());
+            let two_items = MemoryConfig {
+                max_items: 2,
+                ..MemoryConfig::default()
+            };
+            let items: Arc<dyn ConversationItemStorage> =
+                Arc::new(MemoryConversationItemStorage::with_config(&two_items));
+            let stored = |id: &str, tenant: Option<&str>| NewConversationItem {
+                id: Some(ConversationItemId::from(id)),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([{"type": "input_text", "text": id}]),
+                status: None,
+                tenant: tenant.map(str::to_string),
+            };
+            items.create_item(stored("msg_o", A)).await.unwrap();
+            items.create_item(stored("msg_u", A)).await.unwrap();
+            let created =
+                json_of(create_conversation(&conversations, &items, A, json!({})).await).await;
+            let conv_id = created["id"].as_str().unwrap().to_string();
+            let conversation = ConversationId::from(conv_id.as_str());
+
+            // The batch is prepared while msg_o is a's own item.
+            let batch = [
+                json!({"id": "msg_new", "type": "message", "role": "user", "content": "new"}),
+                entry,
+            ];
+            let prepared = match prepare_items(&items, Some(&conversation), &batch, A).await {
+                Ok(prepared) => prepared,
+                Err(response) => panic!("{case}: prepared: {}", json_of(response).await),
+            };
+            // Between the prepare and the writes: a write evicts msg_o (the
+            // oldest record of the bounded store) and another caller's write
+            // takes the id.
+            items.create_item(stored("msg_filler", A)).await.unwrap();
+            items.create_item(stored("msg_o", B)).await.unwrap();
+
+            let response = store_items(&items, &conversation, prepared, A)
+                .await
+                .expect_err("the id now holds another caller's item");
+            assert_eq!(response.status(), status, "{case}");
+            let body = json_of(response).await;
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("msg_o"),
+                "{case}: the answer names the id: {body}"
+            );
+            for id in ["msg_o", "msg_new"] {
+                assert!(
+                    !items
+                        .is_item_linked(&conversation, &ConversationItemId::from(id))
+                        .await
+                        .unwrap(),
+                    "{case}: {id} is not linked"
+                );
+            }
+            let listed = json_of(
+                list_conversation_items(
+                    &conversations,
+                    &items,
+                    A,
+                    &conv_id,
+                    None,
+                    Some("asc"),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                listed["data"].as_array().map(Vec::len),
+                Some(0),
+                "{case}: {listed}"
+            );
+            let other = items
+                .get_item(&ConversationItemId::from("msg_o"))
+                .await
+                .unwrap()
+                .expect("the other caller's item stands");
+            assert_eq!(other.tenant.as_deref(), B, "{case}");
+            assert_eq!(other.content[0]["text"], "msg_o", "{case}");
         }
     }
 }

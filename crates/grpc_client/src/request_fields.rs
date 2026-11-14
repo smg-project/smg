@@ -1,5 +1,5 @@
-//! The parts of a request every engine client reads alike: the schema a chat
-//! request's `response_format` asks for, and a plain generate request's sampling
+//! The parts of a request every engine client reads alike: the constraint a
+//! chat request's `response_format` asks for, and a plain generate request's sampling
 //! parameters with the shared defaults applied, and the one structured constraint
 //! a completion or plain request names. Each client places the values in its own
 //! proto; what differs between engines (the constraint variant, how a disabled
@@ -14,22 +14,30 @@ use openai_protocol::{
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 
-/// The JSON schema a chat request's `response_format` constrains the output to:
-/// `{"type":"object"}` for `json_object`, the given schema for `json_schema`,
-/// nothing for `text` or none.
-pub fn response_format_schema(request: &ChatCompletionRequest) -> Result<Option<String>, String> {
-    let json_object;
-    let schema = match &request.response_format {
-        Some(ResponseFormat::JsonObject) => {
-            json_object = serde_json::json!({"type": "object"});
-            &json_object
+/// The constraint a chat request's `response_format` puts on the output, with
+/// its text: a JSON schema (`{"type":"object"}` for `json_object`, the given
+/// schema for `json_schema`), or a structural tag (the object as it arrived,
+/// `type` included, which is what the engines' own servers hand their grammar
+/// compiler); nothing for `text` or none.
+pub fn response_format_constraint(
+    request: &ChatCompletionRequest,
+) -> Result<Option<(ConstraintKind, String)>, String> {
+    let (kind, text) = match &request.response_format {
+        Some(ResponseFormat::JsonObject) => (
+            ConstraintKind::JsonSchema,
+            serde_json::to_string(&serde_json::json!({"type": "object"})),
+        ),
+        Some(ResponseFormat::JsonSchema { json_schema }) => (
+            ConstraintKind::JsonSchema,
+            serde_json::to_string(&json_schema.schema),
+        ),
+        Some(format @ ResponseFormat::StructuralTag { .. }) => {
+            (ConstraintKind::StructuralTag, serde_json::to_string(format))
         }
-        Some(ResponseFormat::JsonSchema { json_schema }) => &json_schema.schema,
         Some(ResponseFormat::Text) | None => return Ok(None),
     };
-    serde_json::to_string(schema)
-        .map(Some)
-        .map_err(|e| format!("Failed to serialize JSON schema: {e}"))
+    text.map(|text| Some((kind, text)))
+        .map_err(|e| format!("Failed to serialize the response_format constraint: {e}"))
 }
 
 /// Which of a chat body's own format fields request building set aside: the
@@ -69,10 +77,11 @@ impl OutputConstraint {
 }
 
 /// A chat body's own format constraints as the engine's request reads them:
-/// the schema its `response_format` asks for ([`response_format_schema`]), its
-/// `ebnf` and its `regex`, each absent when set aside.
+/// the constraint its `response_format` asks for
+/// ([`response_format_constraint`]), its `ebnf` and its `regex`, each absent
+/// when set aside.
 pub struct BodyFormat<'a> {
-    pub schema: Option<String>,
+    pub format: Option<(ConstraintKind, String)>,
     pub ebnf: Option<&'a str>,
     pub regex: Option<&'a str>,
 }
@@ -83,10 +92,10 @@ pub fn body_format(
     set_aside: FormatSetAside,
 ) -> Result<BodyFormat<'_>, String> {
     Ok(BodyFormat {
-        schema: if set_aside.response_format {
+        format: if set_aside.response_format {
             None
         } else {
-            response_format_schema(request)?
+            response_format_constraint(request)?
         },
         ebnf: request.ebnf.as_deref().filter(|_| !set_aside.grammar),
         regex: request.regex.as_deref().filter(|_| !set_aside.grammar),
@@ -116,13 +125,14 @@ pub fn logit_bias_by_token_text(bias: Option<&HashMap<String, f32>>) -> HashMap<
     bias.map_or_else(HashMap::new, HashMap::clone)
 }
 
-/// The kind of structured constraint a request names: a JSON schema, a regex
-/// or an EBNF grammar. Each client spells it in its own proto.
+/// The kind of structured constraint a request names: a JSON schema, a regex,
+/// an EBNF grammar or a structural tag. Each client spells it in its own proto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstraintKind {
     JsonSchema,
     Regex,
     Ebnf,
+    StructuralTag,
 }
 
 /// The one structured constraint among `json_schema`, `regex` and `ebnf`, with
@@ -245,6 +255,64 @@ impl Default for PlainSampling {
     }
 }
 
+/// An OpenAI-compatible `seed` (any int64) on a wire whose seed is an unsigned 64-bit word:
+/// the same bits, so every seed is a seed and distinct seeds stay distinct; a negative one
+/// lands in the upper half of the word.
+pub fn seed_bits(seed: i64) -> u64 {
+    seed as u64
+}
+
+/// A 64-bit seed on a wire whose seed is a signed 32-bit word: the two halves of its bits
+/// folded into one, so distinct seeds stay distinct as far as 32 bits allow (a saturating cast
+/// would send every seed past 2^31 to one value).
+pub fn seed_folded_i32(seed: u64) -> i32 {
+    ((seed ^ (seed >> 32)) as u32) as i32
+}
+
+/// An OpenAI-compatible `seed` (any int64) on a wire whose seed is a signed 32-bit word: itself
+/// when it fits, else its bits folded ([`seed_folded_i32`]); a refusal or a silent drop would make
+/// the public field narrower than the public API's.
+pub fn legacy_seed_i32(seed: i64) -> i32 {
+    i32::try_from(seed).unwrap_or_else(|_| seed_folded_i32(seed_bits(seed)))
+}
+
+/// A seed on a wire whose signed 32-bit field feeds an engine that seeds an unsigned word: the
+/// legacy form ([`legacy_seed_i32`]) with its sign bit cleared, so a seed that fits and is not
+/// negative stays itself and every other seed lands on a non-negative value (31 bits of identity)
+/// where a negative word would be refused by the engine.
+pub fn non_negative_seed_i32(seed: i64) -> i32 {
+    legacy_seed_i32(seed) & i32::MAX
+}
+
+/// A 64-bit seed on such a wire: the fold ([`seed_folded_i32`]) with its sign bit cleared.
+pub fn non_negative_folded_i32(seed: u64) -> i32 {
+    seed_folded_i32(seed) & i32::MAX
+}
+
+/// A seed on a wire whose engine reads `-1` as "no seed": the legacy form ([`legacy_seed_i32`])
+/// with that one value moved by [`seeded_word`], so a seeded request never runs unseeded.
+pub fn seeded_i32(seed: i64) -> i32 {
+    seeded_word(legacy_seed_i32(seed))
+}
+
+/// A 64-bit seed on such a wire: the fold ([`seed_folded_i32`]) with `-1` moved the same way.
+pub fn seeded_folded_i32(seed: u64) -> i32 {
+    seeded_word(seed_folded_i32(seed))
+}
+
+/// A seed word for the wire whose engine reads `-1` as "no seed": `-1` alone becomes the word's
+/// minimum, which the fold also reaches (the one shared value a 32-bit field costs); every other
+/// word is itself. The engine's in-repo servicers hand it the word's unsigned form, so a seed they
+/// derive per choice is never `-1` either; this rule covers the request seed for a servicer older
+/// than the gateway.
+fn seeded_word(seed: i32) -> i32 {
+    if seed == -1 {
+        i32::MIN
+    } else {
+        seed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,30 +327,49 @@ mod tests {
     }
 
     #[test]
-    fn response_format_schema_per_kind() {
+    fn response_format_constraint_per_kind() {
         assert_eq!(
-            response_format_schema(&chat(serde_json::json!({}))),
+            response_format_constraint(&chat(serde_json::json!({}))),
             Ok(None)
         );
         assert_eq!(
-            response_format_schema(&chat(
+            response_format_constraint(&chat(
                 serde_json::json!({"response_format": {"type": "text"}})
             )),
             Ok(None)
         );
         assert_eq!(
-            response_format_schema(&chat(
+            response_format_constraint(&chat(
                 serde_json::json!({"response_format": {"type": "json_object"}})
             )),
-            Ok(Some(r#"{"type":"object"}"#.to_string()))
+            Ok(Some((
+                ConstraintKind::JsonSchema,
+                r#"{"type":"object"}"#.to_string()
+            )))
         );
         let schema =
             serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}});
         assert_eq!(
-            response_format_schema(&chat(serde_json::json!({
+            response_format_constraint(&chat(serde_json::json!({
                 "response_format": {"type": "json_schema", "json_schema": {"name": "s", "schema": schema}}
             }))),
-            Ok(Some(serde_json::to_string(&schema).unwrap()))
+            Ok(Some((
+                ConstraintKind::JsonSchema,
+                serde_json::to_string(&schema).unwrap()
+            )))
+        );
+        // a structural tag is the object as it arrived, `type` included
+        let tag = serde_json::json!({
+            "type": "structural_tag",
+            "structures": [{"begin": "<w>", "schema": schema, "end": "</w>"}],
+            "triggers": ["<w>"]
+        });
+        assert_eq!(
+            response_format_constraint(&chat(serde_json::json!({"response_format": tag}))),
+            Ok(Some((
+                ConstraintKind::StructuralTag,
+                serde_json::to_string(&tag).unwrap()
+            )))
         );
     }
 
@@ -338,7 +425,13 @@ mod tests {
         }));
 
         let all = body_format(&request, FormatSetAside::default()).expect("read");
-        assert_eq!(all.schema.as_deref(), Some(r#"{"type":"object"}"#));
+        assert_eq!(
+            all.format,
+            Some((
+                ConstraintKind::JsonSchema,
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
         assert_eq!(
             (all.ebnf, all.regex),
             (Some("root ::= \"x\""), Some("[a-z]+"))
@@ -353,7 +446,7 @@ mod tests {
         )
         .expect("read");
         assert_eq!(
-            answered.schema, None,
+            answered.format, None,
             "the schema the tag answers is not read"
         );
         assert_eq!(
@@ -370,7 +463,7 @@ mod tests {
         )
         .expect("read");
         assert!(
-            whole_turn.schema.is_none() && whole_turn.ebnf.is_none() && whole_turn.regex.is_none()
+            whole_turn.format.is_none() && whole_turn.ebnf.is_none() && whole_turn.regex.is_none()
         );
     }
 
@@ -414,5 +507,66 @@ mod tests {
             assert_eq!(completion_constraint(&completion), read, "{field}");
             assert_eq!(plain_constraint(&plain), read, "{field}");
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn a_seed_keeps_its_bits_on_an_unsigned_wire() {
+        assert_eq!(seed_bits(7), 7);
+        assert_eq!(seed_bits(-1), u64::MAX);
+        assert_eq!(seed_bits(i64::MIN), 1 << 63);
+    }
+
+    #[test]
+    fn a_seed_folds_onto_a_signed_32_bit_wire_only_past_its_range() {
+        assert_eq!(legacy_seed_i32(7), 7);
+        assert_eq!(legacy_seed_i32(-1), -1);
+        assert_eq!(legacy_seed_i32(i64::from(i32::MIN)), i32::MIN);
+        assert_eq!(legacy_seed_i32(1 << 32), 1);
+        assert_eq!(legacy_seed_i32(i64::MIN), i32::MIN);
+        assert_ne!(legacy_seed_i32(i64::MAX), legacy_seed_i32(i64::MAX - 1));
+        assert_eq!(seed_folded_i32(7), 7);
+        assert_eq!(seed_folded_i32(1 << 32), 1);
+        assert_eq!(seed_folded_i32(u64::MAX), 0);
+    }
+
+    #[test]
+    fn a_seed_for_an_unsigned_word_behind_a_signed_field_is_never_negative() {
+        assert_eq!(non_negative_seed_i32(7), 7);
+        assert_eq!(non_negative_seed_i32(i64::from(i32::MAX)), i32::MAX);
+        assert_eq!(non_negative_seed_i32(-1), i32::MAX);
+        assert_eq!(non_negative_seed_i32(i64::from(i32::MIN)), 0);
+        assert_eq!(non_negative_seed_i32(1 << 31), 0);
+        assert_eq!(non_negative_seed_i32(i64::MAX), 0);
+        assert_eq!(non_negative_folded_i32(7), 7);
+        assert_eq!(non_negative_folded_i32(1 << 31), 0);
+        assert_eq!(non_negative_folded_i32(u64::MAX), 0);
+        for seed in [-1, i64::MIN, i64::MAX, 1 << 31, 1 << 32] {
+            assert!(non_negative_seed_i32(seed) >= 0, "{seed}");
+        }
+    }
+
+    #[test]
+    fn a_seed_for_an_engine_that_reads_minus_one_as_unseeded_is_never_minus_one() {
+        assert_eq!(seeded_i32(7), 7);
+        assert_eq!(seeded_i32(-2), -2);
+        assert_eq!(seeded_i32(-1), i32::MIN);
+        assert_eq!(seeded_i32(i64::from(u32::MAX)), i32::MIN);
+        assert_eq!(seeded_i32(i64::MAX), i32::MIN);
+        assert_eq!(seeded_folded_i32(7), 7);
+        assert_eq!(seeded_folded_i32(u64::from(u32::MAX)), i32::MIN);
+        assert_eq!(seeded_folded_i32(u64::MAX), 0);
+        for seed in [-1, i64::from(u32::MAX), i64::MIN, i64::MAX] {
+            assert_ne!(seeded_i32(seed), -1, "{seed}");
+        }
+        // The rule on a bare word: `-1` alone moves to the minimum, every other word stays.
+        assert_eq!(seeded_word((-2i32).wrapping_add(1)), i32::MIN);
+        assert_eq!(seeded_word(-2), -2);
+        assert_eq!(seeded_word(i32::MAX.wrapping_add(1)), i32::MIN);
+        assert_eq!(seeded_word(0), 0);
     }
 }

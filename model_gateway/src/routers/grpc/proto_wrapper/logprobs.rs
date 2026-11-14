@@ -124,6 +124,13 @@ macro_rules! columns {
 }
 
 impl<'a> ProtoOutputLogProbs<'a> {
+    /// The TRT-LLM wire's output logprobs. That wire says "none" with an
+    /// empty list where the others leave the field absent, so an empty list
+    /// reads as `None` for a stream chunk and a complete answer alike.
+    pub fn trtllm(records: &'a [trtllm::TokenLogprob]) -> Option<Self> {
+        (!records.is_empty()).then_some(Self::Trtllm(records))
+    }
+
     /// The scored positions: as far as the sampled columns reach, or the
     /// records.
     pub fn len(&self) -> usize {

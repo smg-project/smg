@@ -447,6 +447,7 @@ impl Generator {
                 request_id: format!("r{index}"),
                 prompt_token_ids: prompt.clone(),
                 max_new,
+                choice: 0,
                 events,
             });
             self.stream.prompts.push(prompt.clone());

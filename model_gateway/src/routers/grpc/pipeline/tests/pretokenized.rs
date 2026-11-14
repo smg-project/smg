@@ -243,6 +243,13 @@ fn json_body(body: &bytes::Bytes) -> Value {
         .unwrap_or_else(|e| panic!("json body: {e}: {}", String::from_utf8_lossy(body)))
 }
 
+/// The request was answered 200, or the body says why not.
+#[track_caller]
+fn answered_ok(status: http::StatusCode, body: &bytes::Bytes) {
+    let body = String::from_utf8_lossy(body);
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+}
+
 /// The `data:` payloads of an SSE body that ends with `[DONE]`.
 fn sse_events(body: &bytes::Bytes) -> Vec<Value> {
     let body = String::from_utf8_lossy(body);
@@ -263,12 +270,7 @@ async fn ids_reach_the_worker_as_sent_without_an_encode() {
 
     let (status, body) = bed.generate(ids_request(false)).await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     let body = json_body(&body);
     assert!(body.is_object(), "one prompt answers as one object: {body}");
     assert_eq!(
@@ -304,12 +306,7 @@ async fn a_text_request_on_the_same_path_encodes_once() {
         }))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     let body = json_body(&body);
     assert_eq!(
         bed.tokenizer.encodes(),
@@ -332,7 +329,7 @@ async fn a_streamed_ids_request_reports_the_ids_count_on_every_event() {
 
     let (status, body) = bed.generate(ids_request(true)).await;
 
-    assert_eq!(status, http::StatusCode::OK);
+    answered_ok(status, &body);
     let events = sse_events(&body);
     assert!(!events.is_empty(), "{}", String::from_utf8_lossy(&body));
     for event in &events {
@@ -440,12 +437,7 @@ async fn an_id_inside_the_reported_embedding_table_reaches_the_worker() {
         }))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     assert_eq!(
         bed.seen_ids(),
         vec![ids],
@@ -492,12 +484,7 @@ async fn an_added_token_above_the_vocabulary_reaches_the_worker() {
         }))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     assert_eq!(
         bed.seen_ids(),
         vec![ids],
@@ -514,12 +501,7 @@ async fn a_completion_token_prompt_reaches_the_worker_as_sent_without_an_encode(
         .complete(json!({"model": MODEL, "prompt": IDS, "max_tokens": 4}))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     let body = json_body(&body);
     assert_eq!(body["object"], "text_completion", "{body}");
     assert_eq!(
@@ -554,12 +536,7 @@ async fn a_completion_text_prompt_on_the_same_path_encodes_once() {
         .complete(json!({"model": MODEL, "prompt": "Hello world", "max_tokens": 4}))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     let body = json_body(&body);
     assert_eq!(
         bed.tokenizer.encodes(),
@@ -579,12 +556,7 @@ async fn a_batch_of_completion_token_prompts_is_one_engine_request_per_prompt() 
         .complete(json!({"model": MODEL, "prompt": [IDS, HELLO_WORLD], "max_tokens": 4}))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     let body = json_body(&body);
     // The batch's requests are dispatched together; the stub records them as they land.
     let mut seen = bed.seen_ids();
@@ -625,12 +597,7 @@ async fn an_echoed_completion_token_prompt_opens_with_its_decode() {
         .complete(json!({"model": MODEL, "prompt": HELLO_WORLD, "max_tokens": 4, "echo": true}))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     let body = json_body(&body);
     assert_eq!(
         body["choices"][0]["text"], "Hello worldParis",
@@ -659,7 +626,7 @@ async fn a_streamed_completion_token_prompt_reports_the_ids_count_in_its_usage()
         }))
         .await;
 
-    assert_eq!(status, http::StatusCode::OK);
+    answered_ok(status, &body);
     let events = sse_events(&body);
     assert!(!events.is_empty(), "{}", String::from_utf8_lossy(&body));
     let text: String = events
@@ -734,12 +701,7 @@ async fn an_added_token_above_the_vocabulary_reaches_the_worker_on_the_completio
         .complete(json!({"model": MODEL, "prompt": ids, "max_tokens": 4}))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     assert_eq!(
         bed.seen_ids(),
         vec![ids],
@@ -758,12 +720,7 @@ async fn a_completion_id_inside_the_reported_embedding_table_reaches_the_worker(
         .complete(json!({"model": MODEL, "prompt": ids, "max_tokens": 4}))
         .await;
 
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
+    answered_ok(status, &body);
     assert_eq!(
         bed.seen_ids(),
         vec![ids],

@@ -9,6 +9,7 @@ use std::{
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
 use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::common::ResponseFormat;
 use rand::RngExt;
 use smg_grpc_client::{
     mlx_proto,
@@ -306,30 +307,45 @@ impl IdStamp {
             Self::Suffixed { base } => plan.set_request_id(suffixed_id(base, uuid::Uuid::now_v7())),
             Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
-                let ExecutionPlan::Batch {
-                    shared_request_id,
-                    requests,
-                    ..
-                } = plan
-                else {
-                    error!(
-                        function = "IdStamp::restamp",
-                        "Batch id stamp on a non-batch plan"
-                    );
-                    return Err(error::internal_error(
-                        "id_stamp_plan_mismatch",
-                        "Id stamp does not match the plan shape",
-                    ));
-                };
                 let shared = batch
                     .stable_shared
                     .clone()
                     .unwrap_or_else(|| minted_id(batch.prefix, uuid::Uuid::now_v7()));
-                for (i, request) in requests.iter_mut().enumerate() {
-                    request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                match plan {
+                    ExecutionPlan::Batch {
+                        shared_request_id,
+                        requests,
+                        ..
+                    } => {
+                        for (i, request) in requests.iter_mut().enumerate() {
+                            request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                        }
+                        *shared_request_id = shared;
+                        Ok(())
+                    }
+                    ExecutionPlan::EmbedBatch {
+                        shared_request_id,
+                        requests,
+                    } => {
+                        for (i, request) in requests.iter_mut().enumerate() {
+                            request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                        }
+                        *shared_request_id = shared;
+                        Ok(())
+                    }
+                    ExecutionPlan::Single(_)
+                    | ExecutionPlan::PrefillDecode(_)
+                    | ExecutionPlan::EncodePrefillDecode { .. } => {
+                        error!(
+                            function = "IdStamp::restamp",
+                            "Batch id stamp on a non-batch plan"
+                        );
+                        Err(error::internal_error(
+                            "id_stamp_plan_mismatch",
+                            "Id stamp does not match the plan shape",
+                        ))
+                    }
                 }
-                *shared_request_id = shared;
-                Ok(())
             }
         }
     }
@@ -487,18 +503,30 @@ impl ToolConstraintStamp {
     /// Capture the stamp for a built request that carries the forced call's
     /// structural tag. Nothing is captured for a JSON-schema constraint (no
     /// shape to follow) or when the backend's builder let the request's
-    /// `response_format` outrank the tool constraint (the request then
-    /// carries a schema, grammar or regex, never a structural tag).
-    /// `first_token` says the table built the tag for an engine that starts
-    /// the grammar at the first token.
+    /// `response_format` outrank the tool constraint: the request then
+    /// carries the body's own constraint, a schema, a grammar, a regex, or
+    /// the body's own structural tag, told from the forced call's by
+    /// `own_format`, the `response_format` as the builder read it (`None`
+    /// where the constraint set it aside). `first_token` says the table
+    /// built the tag for an engine that starts the grammar at the first
+    /// token.
     pub(crate) fn capture(
         unshaped: Option<(String, String)>,
         parser: Option<&str>,
         first_token: bool,
         request: &ProtoGenerateRequest,
+        own_format: Option<&ResponseFormat>,
     ) -> Option<Self> {
         let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
-        request.structural_tag()?;
+        let carried = request.structural_tag()?;
+        // The body's own tag rides as its builder wrote it
+        // (`response_format_constraint`): a request that carries it keeps it
+        // on every retry.
+        if let Some(own @ ResponseFormat::StructuralTag { .. }) = own_format {
+            if serde_json::to_string(own).is_ok_and(|tag| tag == carried) {
+                return None;
+            }
+        }
         Some(Self::Registry {
             constraint,
             parser: parser.map(str::to_string),
@@ -841,7 +869,7 @@ pub(crate) fn resolve_string_stops(
         ProtoGenerateRequest::Sglang(req) => {
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -851,7 +879,7 @@ pub(crate) fn resolve_string_stops(
             // not part of shared stop resolution.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -864,7 +892,7 @@ pub(crate) fn resolve_string_stops(
             // stops at EOS itself, so its translation carries no frontend ids.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -1050,7 +1078,7 @@ pub(crate) fn finish_generate_request(
             ));
         }
         let refs =
-            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            assemble_media_refs(&plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
         proto_request
             .set_media_refs(refs)
             .map_err(|e| error::bad_request("multimodal_not_supported", e))?;

@@ -346,7 +346,7 @@ pub(crate) fn translate_batches(
     {
         return Err(
             "multimodal payload carries grid tensors but no pixel_values and no \
-                    kv_transfer_params or ec_transfer_params; a pixel-less leg requires a \
+                    kv_transfer_params or ec_transfer_params; a pixel-less request requires a \
                     handoff"
                 .to_string(),
         );

@@ -155,20 +155,22 @@ impl RdmaExporter {
     /// free-notif or the TTL. On any failure (no listener IP, oversized image, or no
     /// free slot) returns `Err(bytes)` so the caller re-attaches them inline.
     pub fn export(&self, slot_key: i64, bytes: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+        self.export_slice(slot_key, &bytes).ok_or(bytes)
+    }
+
+    /// Stage an immutable byte slice in the slot arena.
+    pub fn export_slice(&self, slot_key: i64, bytes: &[u8]) -> Option<Vec<u8>> {
         let inner = &self.inner;
         if inner.cfg.listen_ip.is_empty() {
             // No listener IP -> cannot do the cross-node metadata exchange.
-            return Err(bytes);
+            return None;
         }
-        let Some((slot, addr, gen)) =
+        // An oversized tensor or an exhausted pool leaves the payload inline.
+        let (slot, addr, gen) =
             inner
                 .arena
                 .pool
-                .lease_and_write(slot_key, &bytes, Instant::now())
-        else {
-            // Image too big for a slot, or the pool is momentarily exhausted.
-            return Err(bytes);
-        };
+                .lease_and_write(slot_key, bytes, Instant::now())?;
 
         let ip = inner.cfg.listen_ip.as_bytes();
         let port = inner.cfg.listen_port;
@@ -184,7 +186,7 @@ impl RdmaExporter {
             slot_key,
             addr, slot, "EPD RDMA: staged pixel slot (listener {}:{})", inner.cfg.listen_ip, port
         );
-        Ok(descriptor)
+        Some(descriptor)
     }
 }
 

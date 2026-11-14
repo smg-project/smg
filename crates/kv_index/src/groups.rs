@@ -637,7 +637,10 @@ impl GroupViews {
             .and_then(|slot| slot.clone())
     }
 
-    /// `worker`'s view, created at its first non-main group event.
+    /// `worker`'s view, created at its first non-main group event. Created once: the read lock
+    /// is tried first and the write lock taken on a miss, where `get_or_insert_with` fills the
+    /// slot, so of two creators racing for one id the second finds the slot filled, and the view
+    /// is made once and counted once.
     pub fn get_or_create(&self, worker: u32) -> Arc<WorkerGroups> {
         if let Some(view) = self.get(worker) {
             return view;

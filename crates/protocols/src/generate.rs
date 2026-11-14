@@ -6,8 +6,8 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, is_false, join_ids, CachePartition,
-        GenerationRequest, InputIds,
+        default_true, deserialize_null_as_false, invalid, invalid_at, is_false, join_ids,
+        CachePartition, GenerationRequest, InputIds,
     },
     sampling_params::SamplingParams,
 };
@@ -17,6 +17,9 @@ use crate::validated::Normalizable;
 // The native Generate API (one engine's own format)
 // ============================================================================
 
+/// A request to the native generate route: the input as text, token ids or
+/// embeddings with its media, the model, the sampling parameters, and the
+/// log-probability, hidden-state, session and adapter options.
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
@@ -63,6 +66,7 @@ pub struct GenerateRequest {
 
     /// Sampling parameters (the native API's style)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
     pub sampling_params: Option<SamplingParams>,
 
     /// Whether to return logprobs
@@ -180,28 +184,105 @@ pub struct GenerateRequest {
     pub other: Map<String, Value>,
 }
 
+impl GenerateRequest {
+    /// The media fields of the request that carry something: `image_data`,
+    /// `video_data` and `audio_data` when present and naming an item (a null,
+    /// an empty list, or a list of nulls and empty lists is no media; any
+    /// other value, an empty string included, is, as the engine reads it).
+    /// One definition for every path that reads media.
+    pub fn media_fields(&self) -> Vec<&'static str> {
+        [
+            ("image_data", &self.image_data),
+            ("video_data", &self.video_data),
+            ("audio_data", &self.audio_data),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.as_ref().is_some_and(value_carries_media))
+        .map(|(name, _)| name)
+        .collect()
+    }
+
+    /// Whether a media field of the request carries an item.
+    pub fn carries_media(&self) -> bool {
+        !self.media_fields().is_empty()
+    }
+}
+
+/// Whether `value` names media as the engine reads it: anything but a null,
+/// or a list, nested to any depth, one of whose items does.
+fn value_carries_media(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => items.iter().any(value_carries_media),
+        _ => true,
+    }
+}
+
 impl Normalizable for GenerateRequest {
     // Use default no-op implementation - no normalization needed for GenerateRequest
 }
 
-/// Validation function for GenerateRequest - ensure exactly one input type is provided
+/// Validation function for GenerateRequest: a body with no prompt at all is
+/// refused, an empty `text` with no ids and no media item is refused (beside
+/// ids the engine serves the ids without reading the text; a media-only
+/// prompt is sent with an empty `text`, as the engine reads it; a body with
+/// two of `text`, `input_ids` and `input_embeds` is served, the engine taking
+/// the ids over the text and the embeds only without a text), an empty
+/// `input_ids` is refused as the chat route refuses an empty `messages`, and
+/// a negative id in `input_ids` is refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
-    // Exactly one of text or input_ids must be provided
-    // Note: input_embeds not yet supported in Rust implementation
-    let has_text = req.text.is_some();
-    let has_input_ids = req.input_ids.is_some();
-
-    let count = [has_text, has_input_ids].iter().filter(|&&x| x).count();
-
-    if count == 0 {
-        return Err(validator::ValidationError::new(
-            "Either text or input_ids should be provided.",
+    // A body with no prompt at all is refused. `input_embeds` is a prompt on
+    // the paths that forward the body as-is.
+    if req.text.is_none() && req.input_ids.is_none() && req.input_embeds.is_none() {
+        return Err(invalid(
+            "missing_required_parameter",
+            "One of 'text', 'input_ids' or 'input_embeds' is required.",
+        ));
+    }
+    // An empty text with no ids and no media is no prompt, as the completions
+    // route reads an empty prompt: the same refusal. Beside ids the engine
+    // serves the ids without reading the text; beside a media item it is the
+    // media-only prompt, sent with an empty text as the engine reads it. The
+    // embeds rescue nothing: with a text present the engine drops them.
+    if req.text.as_deref() == Some("") && req.input_ids.is_none() && !req.carries_media() {
+        return Err(invalid_at(
+            "text",
+            "prompt_empty",
+            "Invalid 'text': empty string. Expected a prompt with minimum length 1, but got an empty string instead.",
         ));
     }
 
-    if count > 1 {
-        return Err(validator::ValidationError::new(
-            "Either text or input_ids should be provided.",
+    // An empty list of ids is no prompt, as an empty `messages` is no
+    // conversation on the chat route: the same refusal.
+    let no_ids = match &req.input_ids {
+        Some(InputIds::Single(ids)) => ids.is_empty(),
+        Some(InputIds::Batch(sequences)) => {
+            sequences.is_empty() || sequences.iter().any(Vec::is_empty)
+        }
+        None => false,
+    };
+    if no_ids {
+        return Err(invalid_at(
+            "input_ids",
+            "empty_array",
+            "Invalid 'input_ids': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+        ));
+    }
+
+    // A negative id is no token. Refused here, both wires answer it the same
+    // way at the boundary: the HTTP routers key the routing tokens with a
+    // cast that would wrap it, and an engine refuses it in its own words one
+    // hop later; the gRPC stage's own check becomes a second line.
+    let negative = match &req.input_ids {
+        Some(InputIds::Single(ids)) => ids.iter().copied().find(|&id| id < 0),
+        Some(InputIds::Batch(sequences)) => sequences.iter().flatten().copied().find(|&id| id < 0),
+        None => None,
+    };
+    if let Some(id) = negative {
+        return Err(invalid_at(
+            "input_ids",
+            "integer_below_min_value",
+            format!("Invalid 'input_ids': a token id must be non-negative, but got {id} instead."),
         ));
     }
 
@@ -338,6 +419,8 @@ pub enum GenerateFinishReason {
     Other(Value),
 }
 
+/// The kind of a generate finish reason as the wire names it: `length` (the
+/// token cap reached) or `stop` (a stop condition met).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum GenerateFinishType {
@@ -379,6 +462,28 @@ mod tests {
         let mut r = req();
         r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
         assert_eq!(r.routing_tokens(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn a_negative_input_id_is_refused_single_or_batched() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Single(vec![1, -2, 3]));
+        let err = validate_generate_request(&r).expect_err("a negative id is no token");
+        assert_eq!(err.code, "integer_below_min_value");
+        assert_eq!(
+            err.params.get("field").map(ToString::to_string).as_deref(),
+            Some("\"input_ids\"")
+        );
+        assert!(
+            err.message.as_deref().unwrap_or("").contains("-2"),
+            "the message names the offending id: {err:?}"
+        );
+
+        r.input_ids = Some(InputIds::Batch(vec![vec![1], vec![2, -3]]));
+        assert!(validate_generate_request(&r).is_err());
+
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert!(validate_generate_request(&r).is_ok());
     }
 
     #[test]
@@ -473,5 +578,200 @@ mod tests {
         };
         assert_eq!(with_n(0).choices(), 1);
         assert_eq!(with_n(4).choices(), 4);
+    }
+
+    /// The rules of `sampling_params` run on the request as the chat route's
+    /// run on its fields, with the chat route's lower bound on `n`, and an
+    /// empty `input_ids` is refused as the chat route refuses an empty
+    /// `messages`; a request within the rules passes.
+    #[test]
+    fn a_generate_request_runs_the_rules_the_chat_route_runs() {
+        use validator::ValidationErrorsKind;
+
+        let request = |value: Value| -> GenerateRequest {
+            serde_json::from_value(value).expect("a generate request")
+        };
+        let within = request(serde_json::json!({
+            "model": "m",
+            "text": "hi",
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+        }));
+        assert!(
+            within.validate().is_ok(),
+            "a request within the rules passes"
+        );
+
+        for (field, value, code) in [
+            ("temperature", serde_json::json!(-1), "range"),
+            ("top_p", serde_json::json!(2), "decimal_above_max_value"),
+            ("n", serde_json::json!(0), "range"),
+        ] {
+            let refused = request(serde_json::json!({
+                "model": "m",
+                "text": "hi",
+                "sampling_params": {field: value, "max_new_tokens": 4}
+            }));
+            let errors = refused.validate().expect_err(field);
+            let Some(ValidationErrorsKind::Struct(nested)) = errors.errors().get("sampling_params")
+            else {
+                panic!("{field}: the refusal is under sampling_params: {errors:?}");
+            };
+            let Some(ValidationErrorsKind::Field(found)) = nested.errors().get(field) else {
+                panic!("{field}: the refusal names the field: {nested:?}");
+            };
+            assert_eq!(found[0].code, code, "{field}");
+        }
+
+        let empty = request(serde_json::json!({"model": "m", "input_ids": []}));
+        let errors = empty.validate().expect_err("an empty input_ids is refused");
+        let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+            panic!("the refusal is a rule over the request: {errors:?}");
+        };
+        assert_eq!(found[0].code, "empty_array");
+        assert_eq!(found[0].params["field"], "input_ids");
+    }
+
+    /// A body with `text`, `input_ids` or `input_embeds` alone passes, as does
+    /// a body with two prompts (the engine taking the ids over the text and
+    /// the embeds only without a text), an empty `text` beside ids (served
+    /// from the ids) and an empty `text` beside a media item (the media-only
+    /// prompt); an empty `text` alone or beside embeds alone is refused under
+    /// `text`, an empty `input_ids` beside an empty `text` under `input_ids`,
+    /// a body with no prompt at all as a rule over the request, and a
+    /// cross-field sampling rule names its field.
+    #[test]
+    fn a_generate_request_is_refused_without_a_prompt_or_with_an_empty_text() {
+        use validator::ValidationErrorsKind;
+
+        let request = |value: Value| -> GenerateRequest {
+            serde_json::from_value(value).expect("a generate request")
+        };
+        for served in [
+            serde_json::json!({"model": "m", "text": "hi"}),
+            serde_json::json!({"model": "m", "input_ids": [1, 2]}),
+            serde_json::json!({"model": "m", "input_embeds": [[0.1, 0.2]]}),
+            serde_json::json!({"model": "m", "text": "hi", "input_ids": [1, 2]}),
+            serde_json::json!({"model": "m", "text": "", "input_ids": [1, 2]}),
+            serde_json::json!({"model": "m", "text": "", "audio_data": "a.wav"}),
+            serde_json::json!({"model": "m", "text": "", "image_data": [[null, "a.png"]]}),
+        ] {
+            assert!(request(served.clone()).validate().is_ok(), "{served}");
+        }
+        for (body, field, code) in [
+            (
+                serde_json::json!({"model": "m", "text": ""}),
+                "text",
+                "prompt_empty",
+            ),
+            (
+                serde_json::json!({"model": "m", "text": "", "audio_data": [null, []]}),
+                "text",
+                "prompt_empty",
+            ),
+            (
+                serde_json::json!({"model": "m", "text": "", "input_embeds": [[0.1, 0.2]]}),
+                "text",
+                "prompt_empty",
+            ),
+            (
+                serde_json::json!({"model": "m", "text": "", "input_ids": []}),
+                "input_ids",
+                "empty_array",
+            ),
+        ] {
+            let errors = request(body.clone()).validate().expect_err("refused");
+            let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+                panic!("{body}: the refusal is a rule over the request: {errors:?}");
+            };
+            assert_eq!(found[0].code, code, "{body}");
+            assert_eq!(found[0].params["field"], field, "{body}");
+        }
+
+        let none =
+            request(serde_json::json!({"model": "m", "sampling_params": {"max_new_tokens": 4}}));
+        let errors = none.validate().expect_err("no prompt at all is refused");
+        let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+            panic!("the refusal is a rule over the request: {errors:?}");
+        };
+        assert_eq!(found[0].code, "missing_required_parameter");
+        assert_eq!(
+            found[0].message.as_deref(),
+            Some("One of 'text', 'input_ids' or 'input_embeds' is required.")
+        );
+
+        let crossed = request(serde_json::json!({
+            "model": "m",
+            "text": "hi",
+            "sampling_params": {"min_new_tokens": 8, "max_new_tokens": 4}
+        }));
+        let errors = crossed.validate().expect_err("min above max is refused");
+        let Some(ValidationErrorsKind::Struct(nested)) = errors.errors().get("sampling_params")
+        else {
+            panic!("the refusal is under sampling_params: {errors:?}");
+        };
+        let Some(ValidationErrorsKind::Field(found)) = nested.errors().get("__all__") else {
+            panic!("the refusal is the cross-field rule: {nested:?}");
+        };
+        assert_eq!(found[0].code, "invalid_value");
+        assert_eq!(found[0].params["field"], "min_new_tokens");
+    }
+
+    /// A body names media when one of the three fields carries something; a
+    /// text-only body, a null, an empty list and a list of nulls and empty
+    /// lists do not.
+    #[test]
+    fn the_media_fields_that_carry_something_are_named() {
+        let request = |extra: Value| -> GenerateRequest {
+            let mut body = serde_json::json!({"model": "m", "text": "hi"});
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            serde_json::from_value(body).expect("a generate request")
+        };
+        assert!(request(serde_json::json!({})).media_fields().is_empty());
+        assert!(request(serde_json::json!({"image_data": null}))
+            .media_fields()
+            .is_empty());
+        assert!(request(serde_json::json!({"image_data": []}))
+            .media_fields()
+            .is_empty());
+        assert!(request(serde_json::json!({"image_data": [null]}))
+            .media_fields()
+            .is_empty());
+        assert!(request(serde_json::json!({"video_data": [[]]}))
+            .media_fields()
+            .is_empty());
+        assert!(
+            request(serde_json::json!({"audio_data": [null, [], [null]]}))
+                .media_fields()
+                .is_empty()
+        );
+        assert_eq!(
+            request(serde_json::json!({"image_data": [[null, "a.png"]]})).media_fields(),
+            ["image_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"image_data": "data:image/png;base64,iVBORw0KGgo="}))
+                .media_fields(),
+            ["image_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"video_data": ["clip.mp4"], "audio_data": "a.wav"}))
+                .media_fields(),
+            ["video_data", "audio_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"audio_data": ""})).media_fields(),
+            ["audio_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"audio_data": [""]})).media_fields(),
+            ["audio_data"]
+        );
+        assert_eq!(
+            request(serde_json::json!({"image_data": {"url": "a.png"}})).media_fields(),
+            ["image_data"]
+        );
+        assert!(request(serde_json::json!({"audio_data": "a.wav"})).carries_media());
     }
 }

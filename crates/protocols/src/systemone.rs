@@ -177,6 +177,10 @@ pub struct SystemOneResponse {
     pub other: Map<String, Value>,
 }
 
+/// One answer of a System One response, tagged by its `type`: a probability
+/// (`noul`), a choice with its confidence and each option's probability, or a
+/// score with its confidence, legend and probabilities; the backend's extra
+/// fields ride along in each.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SystemOneAnswer {
@@ -206,6 +210,8 @@ pub enum SystemOneAnswer {
     },
 }
 
+/// The token usage of a System One response: input and output tokens, with the
+/// backend's extra fields kept as they came.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SystemOneUsage {
     pub input_tokens: u64,

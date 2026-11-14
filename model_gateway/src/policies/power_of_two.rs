@@ -58,16 +58,22 @@ fn fewest_of_pair<'a>(workers: &[Arc<dyn Worker>], pair: &'a [usize; 2]) -> &'a 
 }
 
 /// The candidates with the fewest router in-flight requests. Each count is read
-/// once, so concurrent dispatches cannot empty the result.
+/// once, in one pass (a lower count starts the list over, an equal one joins
+/// it), so concurrent dispatches cannot empty the result.
 fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<usize> {
-    let loads: Vec<usize> = candidates.iter().map(|&i| workers[i].load()).collect();
-    let fewest = loads.iter().copied().min().unwrap_or(0);
-    candidates
-        .iter()
-        .zip(loads)
-        .filter(|&(_, load)| load == fewest)
-        .map(|(&i, _)| i)
-        .collect()
+    let mut fewest = usize::MAX;
+    let mut ties = Vec::new();
+    for &i in candidates {
+        let load = workers[i].load();
+        if load < fewest {
+            fewest = load;
+            ties.clear();
+        }
+        if load == fewest {
+            ties.push(i);
+        }
+    }
+    ties
 }
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -383,6 +384,7 @@ class Sandbox:
         )
         self.put("grpc_servicer/servicer.py", "x = 1\n")
         self.put("bindings/golang/Cargo.toml", versioned("smg-golang", "1.13.0"))
+        self.put("bindings/golang/go.mod", f"module {GO_MODULE}\n\ngo 1.24.0\n")
         self.put("bindings/python/Cargo.toml", versioned("smg-python", "1.13.0"))
         self.put("bindings/python/pyproject.toml", '[project]\nname = "smg"\nversion = "1.13.0"\n')
         self.put("bindings/python/src/smg/version.py", '__version__ = "1.13.0"\n')
@@ -2137,6 +2139,9 @@ def test_notes_refresh_reads_every_body_again_and_a_cut_cache_file_is_read_again
 # --- publish-plan ----------------------------------------------------------------------------
 
 
+GO_MODULE = "github.com/smg-project/smg/bindings/golang"  # what bindings/golang/go.mod declares
+
+
 def plan_items(out: str) -> list[int]:
     """The numbers of a publishing plan's items, in the order printed."""
     return [int(line.split(".", 1)[0]) for line in out.splitlines() if re.match(r"\d+\. ", line)]
@@ -2166,7 +2171,7 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
         "a crate with publish = [] is never published either: not in the plan"
     )
     assert "publish = false or publish = [] is never published and not listed" in out
-    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
 def test_publish_plan_leaves_pypi_and_crates_io_out_of_a_candidate(repo: Sandbox) -> None:
@@ -2185,7 +2190,29 @@ def test_publish_plan_leaves_pypi_and_crates_io_out_of_a_candidate(repo: Sandbox
     assert "A candidate is never published to PyPI or crates.io" in out
     assert "smg==" not in out and "tool-parser" not in out
     assert repo.curl_calls() == [], "no registry is read for a plan that publishes to none"
-    assert plan_items(out) == [1, 2, 3, 4, 5]
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6]
+
+
+def test_publish_plan_leaves_the_bindings_tag_out_where_the_module_path_is_old(
+    repo: Sandbox,
+) -> None:
+    """A patch of a line whose bindings/golang/go.mod still declares another module path: the plan prints no
+    `bindings/golang/v<version>` tag item (the tag would name a go.mod that go get refuses) and says why; the
+    other items count without a gap."""
+    finished_release(repo)
+    repo.tool("bump", "1.14.1")
+    repo.put("bindings/golang/go.mod", "module github.com/lightseek/smg/go-grpc-sdk\n\ngo 1.24.0\n")
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore: the older line keeps its module path")
+    repo.land_on_release()
+    out = repo.tool("publish-plan", "1.14.1").stdout
+    assert "git tag bindings/golang/v1.14.1" not in out
+    assert (
+        "no Go bindings module tag: bindings/golang/go.mod at origin/release/1.14 does not declare "
+        f"{GO_MODULE}, so a tag there would not resolve" in out
+    )
+    assert "gh workflow run release-go.yml --ref v1.14.1 -f version=1.14.1" in out
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_publish_plan_prints_one_engine_dispatch_per_release_base(repo: Sandbox) -> None:
@@ -2248,7 +2275,7 @@ def test_check_reports_that_a_candidate_never_reaches_the_registries(repo: Sandb
     assert (
         "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi,"
         " release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan 1.14.0-rc.1"
-        " leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub"
+        " leaves them out): its artifacts are the images, the chart, the two Go module tags and the GitHub"
         " pre-release" in out
     )
     repo.tool("bump", "1.14.0")
@@ -3844,6 +3871,166 @@ def test_sync_versions_moves_main_to_the_next_development_version_when_a_release
         "the gateway reads 1.15.0-dev, above 1.14.0: it and its mirrors keep that" in again.stdout
     )
     assert repo.version_of("model_gateway/Cargo.toml") == "1.15.0-dev"
+
+
+def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sandbox) -> None:
+    """A release branch raises the floor a package puts on another of ours when it ships fields the
+    code reads (the servicer's floor on the proto package). After the release, main's floor follows
+    the branch's: the whole line, comment included, where the requirement is alone on its line
+    (the comment states the floor's reason), the requirement alone where it sits inline in an
+    extra, the rest of that line staying main's; a floor on a package that is not ours is left to
+    the maintainer; a floor main already raised higher stays; a second run changes nothing."""
+    # main's floor quotes an older floor in its comment and has an entry after it
+    floor = '    "smg-grpc-proto>=0.4.0",  # up from "smg-grpc-proto>=0.3.0"\n'
+    extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
+    # an extra whose first entry is a literal string with a URL fragment: its hash opens no comment
+    frag = "cu = ['wheel @ https://example.org/w.whl#sha256=abc', \"smg-grpc-proto>=0.4.0\"]\n"
+    repo.commit_main(
+        "chore(servicer): the floors",
+        "grpc_servicer/pyproject.toml",
+        '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}{frag}',
+    )
+    repo.cut()
+    # the branch's bump raised the floors with what it published (by hand, as a cut's review does):
+    # the dependencies entry, last in its array and without a comma there, the extra's inline
+    # requirement, and one that is not ours
+    repo.git("switch", "--quiet", "release/1.14")
+    raised = '    "smg-grpc-proto>=0.5.0"  # 0.5.0 adds the fields the servicer reads\n'
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml")
+        .replace(floor + '    "grpcio>=1.60",\n', '    "grpcio>=1.70",\n' + raised)
+        .replace(extra, 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.23.0"]\n')
+        .replace(frag, frag.replace("0.4.0", "0.5.0")),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(release): the servicer's floors")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    done = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    text = repo.read("grpc_servicer/pyproject.toml")
+    # the branch's requirement and comment, main's comma (an entry follows on main): one line
+    followed = '    "smg-grpc-proto>=0.5.0",  # 0.5.0 adds the fields the servicer reads\n'
+    assert followed in text, text
+    assert text.count("smg-grpc-proto>=0.5.0") == 3 and "0.3.0" not in text, text
+    assert 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.22.0"]\n' in text, text
+    assert frag.replace("0.4.0", "0.5.0") in text, text
+    assert tomllib.loads(text)["project"]["dependencies"] == [
+        "smg-grpc-proto>=0.5.0",
+        "grpcio>=1.60",
+    ]
+    assert '"grpcio>=1.60"' in text, "a floor on a package that is not ours is the maintainer's"
+    assert done.stdout.count("grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0") == 3
+    assert "0.4.0 -> 0.5.0 (requirement 3)" in done.stdout, done.stdout
+    again = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert again.returncode == 0 and "already follows" in again.stdout, again.stdout
+    # a floor main raised above the branch's stays where main put it
+    higher = text.replace(followed, '    "smg-grpc-proto>=0.6.0",  # main went further\n')
+    assert higher != text
+    repo.put("grpc_servicer/pyproject.toml", higher)
+    kept = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert kept.returncode == 0 and "already follows" in kept.stdout, kept.stdout
+    assert repo.read("grpc_servicer/pyproject.toml") == higher
+
+
+def test_sync_versions_refuses_a_floor_it_cannot_pair_by_position(repo: Sandbox) -> None:
+    """A name that occurs a different number of times in main's file and the release's (an extra
+    added on one side since the cut, placed before an older one) cannot be paired by position: the
+    sync names the file, the name and the counts, moves nothing for that name and fails, so the
+    release flow stops for a move by hand rather than writing a floor onto the wrong entry."""
+    floor = '    "smg-grpc-proto>=0.4.0",\n'
+    extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
+    repo.commit_main(
+        "chore(servicer): the floors",
+        "grpc_servicer/pyproject.toml",
+        '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}',
+    )
+    repo.cut()
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml").replace("0.4.0", "0.5.0"),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(release): the servicer's floors")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    # main added an extra with its own requirement on the proto package, before the mlx extra
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml").replace(
+            extra, 'tpu = ["smg-grpc-proto>=0.4.0"]\n' + extra
+        ),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "feat(servicer): a tpu extra")
+    done = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert (
+        "sync_versions: grpc_servicer/pyproject.toml: smg-grpc-proto>= occurs 3 time(s) here and 2"
+        " in origin/release/1.14: the pairing is ambiguous, not moved (move it by hand)"
+    ) in done.stderr, done.stderr
+    text = repo.read("grpc_servicer/pyproject.toml")
+    assert "0.5.0" not in text and text.count("smg-grpc-proto>=0.4.0") == 3, text
+    # the move by hand the message asks for: main carries the release's floors, the counts still
+    # differ (the release never takes main's new extra), nothing is pending, and the rerun passes
+    repo.put("grpc_servicer/pyproject.toml", text.replace("0.4.0", "0.5.0"))
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(servicer): the floors by hand")
+    again = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "ambiguous" not in again.stderr and "already follows" in again.stdout, again.stdout
+    # main dropping its extras is the same case the other way (one occurrence against two)
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml")
+        .replace('tpu = ["smg-grpc-proto>=0.5.0"]\n', "")
+        .replace(extra.replace("0.4.0", "0.5.0"), ""),
+    )
+    assert repo.read("grpc_servicer/pyproject.toml").count("smg-grpc-proto>=") == 1
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(servicer): the extras dropped")
+    dropped = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert dropped.returncode == 0 and "ambiguous" not in dropped.stderr, dropped.stderr
 
 
 def test_sync_versions_usage_and_version_order() -> None:

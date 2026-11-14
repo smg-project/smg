@@ -8,7 +8,26 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost, worker::endpoint::Endpoint};
+use crate::{
+    middleware::scheduler,
+    policies::cost as selection_cost,
+    tenant::MAX_TENANT_ID_LEN,
+    worker::{endpoint::Endpoint, ConnectionMode},
+};
+
+/// The credential header names `routing_key_override.headers` may not carry
+/// (see [`ConfigValidator::validate_routing_key_headers`]). The policy
+/// controller crate refuses the same names in a specification's header
+/// lists.
+const DENIED_HEADERS: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -70,7 +89,7 @@ fn names_a_local_path(source: &str) -> bool {
 /// register); or a start-up URL names a gRPC worker itself. The connection
 /// mode alone misses the middle two: it follows the start-up URLs only.
 fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
-    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+    if config.connection_mode == ConnectionMode::Grpc
         || config.enable_igw
         || config.discovery.is_some()
     {
@@ -289,7 +308,78 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
             ));
         }
     }
+    // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
+    // (`user:secret@`) has no meaning at all: refused, by the adapter's own
+    // reading (an `@` anywhere after the scheme), so that nothing the
+    // validator passes is refused at registration instead, whatever the
+    // `Endpoint` grammar makes of the rest of the string. (A gRPC worker
+    // URL's userinfo is accepted and named by [`unused_credentials_warning`],
+    // at start-up and at registration, where a log line is seen.)
+    if url
+        .strip_prefix("tcp://")
+        .is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            Endpoint::redacted_str(url),
+            "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets at the \
+             host and port",
+        ));
+    }
     Ok(())
+}
+
+/// The warning for a `grpc://` worker URL that carries userinfo
+/// (`user:secret@`), `None` for every other URL. An HTTP worker's userinfo
+/// is sent as basic auth; a gRPC worker never receives it, since the channel
+/// names the host and port alone, so a credential written there is named
+/// once, masked, instead of dropped in silence. The URL stays accepted: it is
+/// otherwise valid and deployments may carry one. Pure, so that start-up can
+/// log it after the subscriber exists (the validator runs before) and the
+/// add-worker route can log it at registration.
+pub fn unused_credentials_warning(url: &str) -> Option<String> {
+    let endpoint = Endpoint::parse(url).ok()?;
+    (url.starts_with("grpc://") && endpoint.has_credentials()).then(|| {
+        format!(
+            "worker URL {} carries userinfo, which is not sent to a gRPC worker: the gateway's \
+             channel names the host and port alone",
+            endpoint.redacted()
+        )
+    })
+}
+
+/// [`unused_credentials_warning`] over every worker URL the configuration
+/// lists for a mode, in the order they are listed.
+pub fn unused_credentials_warnings(mode: &RoutingMode) -> Vec<String> {
+    let urls: Vec<&str> = match mode {
+        RoutingMode::Regular { worker_urls }
+        | RoutingMode::OpenAI { worker_urls }
+        | RoutingMode::Anthropic { worker_urls }
+        | RoutingMode::Gemini { worker_urls } => worker_urls.iter().map(String::as_str).collect(),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => prefill_urls
+            .iter()
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+        RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } => encode_urls
+            .iter()
+            .chain(prefill_urls.iter())
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+    };
+    urls.into_iter()
+        .filter_map(unused_credentials_warning)
+        .collect()
 }
 
 /// The encode side takes three policies. This is the one list: the mode walk
@@ -415,6 +505,7 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_routing_key_headers(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -422,7 +513,6 @@ impl ConfigValidator {
         Self::validate_log_dir(config)?;
         Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
-        Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_memory_history(config)?;
@@ -640,6 +730,12 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// `routing_key_override.headers` names routing keys, never credentials:
+    /// a thread turn's client lineage goes out under the first configured
+    /// name, and the provider paths forward a request's `Authorization` over
+    /// the worker's own key, so a credential name there sends a lineage as a
+    /// credential and the upstream refuses the turn. The names of
+    /// [`DENIED_HEADERS`] are refused at load by name.
     fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
         for name in &config.routing_key_override.headers {
             HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
@@ -647,6 +743,16 @@ impl ConfigValidator {
                     "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
                 ),
             })?;
+            if DENIED_HEADERS
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(name))
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "routing_key_override.headers contains the credential header name '{name}': a routing key is never a credential"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -749,12 +855,11 @@ impl ConfigValidator {
             }
             // The canonical key is stored with every response and
             // conversation, in a 255-byte column on the SQL backends.
-            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+            if entry.tenant_id.len() > MAX_TENANT_ID_LEN {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "tenant_api_keys tenant_id '{}' is longer than {} bytes",
-                        entry.tenant_id,
-                        crate::tenant::MAX_TENANT_ID_LEN
+                        entry.tenant_id, MAX_TENANT_ID_LEN
                     ),
                 });
             }
@@ -842,6 +947,14 @@ impl ConfigValidator {
             return Err(ConfigError::invalid_value(
                 "oracle.pool_timeout_secs",
                 oracle.pool_timeout_secs,
+                "Must be > 0",
+            ));
+        }
+
+        if oracle.op_timeout_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "oracle.op_timeout_secs",
+                oracle.op_timeout_secs,
                 "Must be > 0",
             ));
         }
@@ -1274,6 +1387,16 @@ impl ConfigValidator {
             if let Err(reason) = parse_bind_host(admin_host) {
                 return Err(ConfigError::invalid_value("admin_host", admin_host, reason));
             }
+        }
+        // The bound is the admin listener's own: without a port there is no
+        // listener for it to bound, and nothing would say so.
+        if config.admin_max_connections > 0 && config.admin_port.is_none() {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
+                "--admin-max-connections needs --admin-port: the admin listener exists only \
+                 with a port",
+            ));
         }
 
         // Each listener needs its own port. Two of them on one port used to
@@ -2374,8 +2497,8 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use crate::worker::ConnectionMode;
 
     /// Serialized thresholds survive round trips and reject invalid values for either role.
     #[test]
@@ -3411,6 +3534,88 @@ mod tests {
         }
     }
 
+    /// A userinfo is refused on a `tcp://` worker URL (the sockets bind the
+    /// host and port; nothing reads it), masked in the refusal.
+    #[test]
+    fn a_tcp_worker_url_with_userinfo_is_refused_masked() {
+        for url in [
+            "tcp://user:secret@10.0.0.5:31000",
+            "tcp://secret@10.0.0.5:31000",
+        ] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("tcp://***@10.0.0.5:31000"), "{text}");
+            assert!(text.contains("takes no userinfo"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+        }
+        assert!(validate_worker_url("tcp://10.0.0.5:31000").is_ok());
+    }
+
+    /// What the ZMQ adapter refuses for a userinfo, the validator refuses
+    /// first: a `tcp://` URL with an `@` that the endpoint grammar reads as
+    /// something else (a rank suffix after it, an empty userinfo) is refused
+    /// here, masked, instead of passing to a refusal at registration.
+    #[test]
+    fn a_tcp_worker_url_the_adapter_refuses_is_refused_by_the_validator() {
+        for url in ["tcp://user:secret@host:1@2", "tcp://@host:31000"] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("takes no userinfo"), "{url}: {text}");
+            assert!(!text.contains("secret"), "{url}: {text}");
+        }
+        let text = validate_worker_url("tcp://user:secret@host:1@2")
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("tcp://***@host:1@2"), "{text}");
+    }
+
+    /// A `grpc://` worker URL with userinfo stays accepted and earns the one
+    /// warning, which names the address masked and never the secret; an
+    /// `http://` URL's userinfo is basic auth and earns none, nor does a URL
+    /// without one. Over a mode, every listed URL is read once, in order.
+    #[test]
+    fn a_grpc_worker_url_with_userinfo_is_accepted_and_named_once_masked() {
+        validate_worker_url("grpc://user:secret@worker:50051").expect("accepted");
+        let warning = unused_credentials_warning("grpc://user:secret@worker:50051").unwrap();
+        assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
+        assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
+        assert!(!warning.contains("secret"), "{warning}");
+        // An `@` inside a query or fragment is no userinfo: no warning.
+        for url in [
+            "http://user:secret@worker:8000",
+            "grpc://worker:50051",
+            "grpc://worker:50051?token=a@b",
+            "grpc://worker:50051#a@b",
+        ] {
+            assert_eq!(unused_credentials_warning(url), None, "{url}");
+        }
+
+        let mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![
+                ("grpc://user:secret@prefill:50051".to_string(), Some(8998)),
+                ("http://user:secret@prefill-http:8000".to_string(), None),
+            ],
+            decode_urls: vec![
+                "grpc://decode:50051".to_string(),
+                "grpc://token@decode-2:50051".to_string(),
+            ],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let warnings = unused_credentials_warnings(&mode);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("grpc://***@prefill:50051"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("grpc://***@decode-2:50051"),
+            "{warnings:?}"
+        );
+        assert!(unused_credentials_warnings(&RoutingMode::Regular {
+            worker_urls: vec!["http://user:secret@worker:8000".to_string()],
+        })
+        .is_empty());
+    }
+
     #[test]
     fn worker_url_rejects_disallowed_scheme() {
         assert!(validate_worker_url("ftp://example.com:21").is_err());
@@ -3463,6 +3668,51 @@ mod tests {
             },
             PolicyConfig::Random,
         )
+    }
+
+    /// A routing-key header is never a credential: every name on the shared
+    /// header deny-list is refused at load by name, in any letter case and in
+    /// any position of the list, where a plain name beside it is taken.
+    #[test]
+    fn routing_key_headers_refuse_credential_names() {
+        let mut config = regular_mode_config();
+        config.routing_key_override.enabled = true;
+        config.routing_key_override.headers = vec!["x-routing-key".to_string()];
+        assert!(ConfigValidator::validate(&config).is_ok());
+        for denied in DENIED_HEADERS {
+            for name in [denied.to_string(), denied.to_ascii_uppercase()] {
+                config.routing_key_override.headers =
+                    vec!["x-routing-key".to_string(), name.clone()];
+                assert!(
+                    matches!(
+                        ConfigValidator::validate(&config),
+                        Err(ConfigError::ValidationFailed { ref reason })
+                            if reason.contains("routing_key_override.headers")
+                                && reason.contains(&name)
+                                && reason.contains("credential")
+                    ),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// The deny-list by name: a name dropped from it would be taken as a
+    /// routing-key header with no case above turning red.
+    #[test]
+    fn the_denied_routing_key_headers_are_the_seven_credential_names() {
+        assert_eq!(
+            DENIED_HEADERS,
+            [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key",
+                "api-key",
+                "x-goog-api-key",
+            ]
+        );
     }
 
     #[test]
@@ -5153,6 +5403,7 @@ mod tests {
     fn an_admin_connection_limit_above_the_permit_maximum_is_rejected() {
         let config = |admin_max_connections: usize| RouterConfig {
             admin_max_connections,
+            admin_port: Some(30004),
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker:8000".to_string()],
             },
@@ -5171,6 +5422,38 @@ mod tests {
                 assert_eq!(field, "admin_max_connections");
                 assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
                 assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
+        }
+    }
+
+    /// The bound is the admin listener's own: without `admin_port` there is
+    /// no listener to bound, so a bound without the port is refused by name
+    /// (as a host without the port is); with the port, or without a bound,
+    /// the settings pass.
+    #[test]
+    fn an_admin_connection_bound_without_an_admin_port_is_rejected() {
+        let config = |admin_max_connections: usize, admin_port: Option<u16>| RouterConfig {
+            admin_max_connections,
+            admin_port,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for (bound, port) in [(0, None), (16, Some(30004))] {
+            ConfigValidator::validate(&config(bound, port))
+                .unwrap_or_else(|e| panic!("bound {bound} with port {port:?}: {e}"));
+        }
+        match ConfigValidator::validate(&config(16, None)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, "16");
+                assert!(reason.contains("--admin-port"), "{reason}");
             }
             other => panic!("expected an invalid admin_max_connections, got {other:?}"),
         }

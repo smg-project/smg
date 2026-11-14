@@ -21,6 +21,7 @@
 //! - [`worker`]: the worker domain: identity, registry, health, load, resilience, monitoring, and the RL control plane's read-only view of the registry.
 //! - [`workflow`]: the workflow engine and its steps: worker registration and lifecycle, tokenizer, MCP and WASM registration.
 
+pub mod admin;
 pub mod app_context;
 pub mod config;
 pub mod endpoints;
@@ -31,6 +32,7 @@ pub mod middleware;
 pub mod observability;
 pub mod policies;
 pub mod rate_limit;
+pub mod rl_adapter;
 pub mod routers;
 pub mod secrets;
 pub mod server;
@@ -40,3 +42,10 @@ pub mod version;
 pub mod wasm;
 pub mod worker;
 pub mod workflow;
+
+/// The lib's tests run under the allocator the executable runs under
+/// (`main.rs`), so a test can read what a path allocates on its own thread
+/// through the allocator's counters (`routers::grpc::testing`).
+#[cfg(all(test, not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

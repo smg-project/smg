@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,7 +10,10 @@ use smg::{config::RouterConfig, routers::RouterFactory};
 use tower::ServiceExt;
 
 use crate::common::{
-    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    mock_worker::{
+        set_request_recorder, HealthStatus, MockWorker, MockWorkerConfig, RequestRecorder,
+        WorkerType,
+    },
     AppTestContext,
 };
 
@@ -294,6 +299,86 @@ mod generation_tests {
         ctx.shutdown().await;
     }
 
+    /// The route reads its body through the gateway's validated extractor, as
+    /// the chat route does: a negative temperature, a `top_p` above one, an
+    /// `n` of zero, an empty `input_ids` and a negative token id in it are
+    /// refused in the error envelope with the chat route's codes before a
+    /// worker sees them, and a body within the rules is served.
+    #[tokio::test]
+    async fn generate_refuses_the_sampling_values_the_chat_route_refuses() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18109,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (body, code, param) in [
+            (
+                json!({"text": "hi", "sampling_params": {"temperature": -1, "max_new_tokens": 4}}),
+                "decimal_below_min_value",
+                "sampling_params.temperature",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"top_p": 2, "max_new_tokens": 4}}),
+                "decimal_above_max_value",
+                "sampling_params.top_p",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"n": 0, "max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "sampling_params.n",
+            ),
+            (
+                json!({"input_ids": [], "sampling_params": {"max_new_tokens": 4}}),
+                "empty_array",
+                "input_ids",
+            ),
+            (
+                json!({"input_ids": [1, -2, 3], "sampling_params": {"max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "input_ids",
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                envelope["error"]["type"], "invalid_request_error",
+                "{envelope}"
+            );
+            assert_eq!(envelope["error"]["code"], code, "{envelope}");
+            assert_eq!(envelope["error"]["param"], param, "{envelope}");
+        }
+
+        let served = json!({
+            "text": "hi",
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+        });
+        let resp = app.oneshot(post(served)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a body within the rules is served"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_v1_chat_completions_streaming_preserves_worker_json_error_content_type() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -329,6 +414,54 @@ mod generation_tests {
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body_json["error"]["type"], "internal_error");
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/completions` serves a `max_tokens` of zero: it is the
+    /// prompt-scoring request (`echo` with `logprobs`, nothing generated),
+    /// so the gateway forwards the zero to the worker as written, where the
+    /// chat route refuses its own `max_tokens: 0`.
+    #[tokio::test]
+    async fn test_v1_completions_max_tokens_zero_reaches_the_worker_as_written() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18114, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18114,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "prompt": "hello",
+            "max_tokens": 0,
+            "echo": true,
+            "logprobs": 1
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "max_tokens 0 is a request, not a refused value"
+        );
+        let forwarded = recorder.only_body();
+        assert_eq!(
+            forwarded["max_tokens"], 0,
+            "the zero reaches the worker as written: {forwarded}"
+        );
+        assert_eq!(forwarded["echo"], true, "echo rides with it: {forwarded}");
 
         ctx.shutdown().await;
     }
@@ -1179,7 +1312,7 @@ mod responses_endpoint_tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         assert_eq!(
             err_body["error"]["code"].as_str(),
@@ -2086,6 +2219,62 @@ mod rerank_tests {
         ctx.shutdown().await;
     }
 
+    /// `/v1/rerank` routes by the body's `model`, as `/v1/embeddings` does:
+    /// the worker receives it, and `top_n` holds on the answer.
+    #[tokio::test]
+    async fn test_v1_rerank_carries_the_model_and_top_n() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18113, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18113,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial"
+            ],
+            "top_n": 1
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "mock-model");
+        assert_eq!(
+            body_json["results"].as_array().unwrap().len(),
+            1,
+            "top_n holds on the answer"
+        );
+        assert_eq!(
+            recorder.only_body()["model"],
+            "mock-model",
+            "the worker receives the body's model"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_rerank_invalid_request() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -2220,6 +2409,379 @@ mod single_model_tests {
             let body: serde_json::Value = serde_json::from_slice(&body)
                 .unwrap_or_else(|_| json!({"error": {"code": "unknown_url"}}));
             assert_eq!(body["error"]["code"], "model_not_found", "{uri}: {body}");
+        }
+
+        ctx.shutdown().await;
+    }
+}
+
+/// Five routes whose handlers took their body through axum's plain
+/// extractor read it through the gateway's validated extractor: a body that
+/// does not parse, a wrong type and a failed rule answer the gateway's error
+/// envelope with the status and code the chat route answers, before the
+/// router sees the body.
+#[cfg(test)]
+mod validated_body_tests {
+    use super::*;
+
+    /// The status, the content type and the body of `body` posted to `path`;
+    /// a body that is not JSON is kept under `not_json`, so an assertion
+    /// names it.
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (StatusCode, String, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"not_json": String::from_utf8_lossy(&bytes)}));
+        (status, content_type, body)
+    }
+
+    /// `body` is the gateway's envelope for a refused request: the type is
+    /// `invalid_request_error`, the code is `code`, the message a string, and
+    /// `param` names the field when the case pins one (a body that is no
+    /// object carries serde's path to the value it stopped at, or none).
+    fn assert_envelope(body: &serde_json::Value, code: &str, param: Option<&str>, context: &str) {
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "{context}: {body}"
+        );
+        assert_eq!(body["error"]["code"], code, "{context}: {body}");
+        if let Some(param) = param {
+            assert_eq!(body["error"]["param"], param, "{context}: {body}");
+        }
+        assert!(body["error"]["message"].is_string(), "{context}: {body}");
+    }
+
+    /// `/v1/rerank` runs the rules of the native route on its body before the
+    /// worker sees it: a body that passes them is served, an empty `query`
+    /// or `documents` list and a missing `query` are refused in the envelope.
+    #[tokio::test]
+    async fn v1_rerank_runs_the_rules_of_the_native_route_before_the_worker() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18121,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let served = r#"{"model":"mock-model","query":"q","documents":["a","b"]}"#;
+        let (status, _, body) = post(&app, "/v1/rerank", "application/json", served).await;
+        assert_eq!(status, StatusCode::OK, "a valid body is served: {body}");
+
+        for (refused, code, param) in [
+            (
+                r#"{"model":"mock-model","query":"","documents":["a"]}"#,
+                "invalid_value",
+                "query",
+            ),
+            (
+                r#"{"model":"mock-model","query":"q","documents":[]}"#,
+                "invalid_value",
+                "documents",
+            ),
+            (
+                r#"{"model":"mock-model","documents":["a"]}"#,
+                "missing_required_parameter",
+                "query",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/rerank", "application/json", refused).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{refused}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), refused);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/generate` serves a body with `text` and `input_ids` (the engine takes
+    /// the ids first), an empty `text` beside ids among them, and passes an
+    /// empty `text` beside a media item through the door (the gRPC path then
+    /// refuses the media as before, not the text); an empty `text` alone is
+    /// refused under `text` and a body with no prompt at all as a rule over
+    /// the request, in the envelope before the worker sees it.
+    #[tokio::test]
+    async fn generate_takes_the_ids_over_the_text_and_an_empty_text_with_ids_or_media() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18122,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        // The media-only prompt passes the door and the relay forwards it as the
+        // engine takes it; the gRPC path's media refusal is that stage's own.
+        for served in [
+            r#"{"model":"mock-model","text":"hi","sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"hi","input_ids":[1,2],"sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"","input_ids":[1,2],"sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"","audio_data":"a.wav","sampling_params":{"max_new_tokens":2}}"#,
+        ] {
+            let (status, _, body) = post(&app, "/generate", "application/json", served).await;
+            assert_eq!(status, StatusCode::OK, "{served}: served: {body}");
+        }
+        for (refused, code, param) in [
+            (
+                r#"{"model":"mock-model","text":""}"#,
+                "prompt_empty",
+                Some("text"),
+            ),
+            (
+                r#"{"model":"mock-model","sampling_params":{"max_new_tokens":2}}"#,
+                "missing_required_parameter",
+                None,
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/generate", "application/json", refused).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{refused}: {content_type}"
+            );
+            assert_envelope(&body, code, param, refused);
+        }
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/embeddings` answers a body of the wrong shape, a body under
+    /// another content type and a body that does not parse in the envelope,
+    /// as the chat route does, not with axum's text/plain 422, 415 and 400.
+    #[tokio::test]
+    async fn v1_embeddings_answers_a_malformed_body_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (content_type, sent, code) in [
+            ("application/json", "[1,2,3]", "invalid_type"),
+            (
+                "text/plain",
+                r#"{"model":"mock-model","input":"hello"}"#,
+                "json_parse_error",
+            ),
+            (
+                "application/json",
+                r#"{"model":"mock-model","input":"#,
+                "invalid_json",
+            ),
+        ] {
+            let (status, answered_type, body) =
+                post(&app, "/v1/embeddings", content_type, sent).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}: {body}");
+            assert!(
+                answered_type.starts_with("application/json"),
+                "{sent}: {answered_type}"
+            );
+            assert_envelope(&body, code, None, sent);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/classify` names the field a body misses or mistypes in the
+    /// envelope's `param`, as the chat route does.
+    #[tokio::test]
+    async fn v1_classify_names_the_refused_field_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (sent, code, param) in [
+            (
+                r#"{"model":"mock-model"}"#,
+                "missing_required_parameter",
+                "input",
+            ),
+            (r#"{"model":7,"input":"hello"}"#, "invalid_type", "model"),
+            (
+                r#"{"model":"mock-model","input":[1,-2]}"#,
+                "integer_below_min_value",
+                "input",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/classify", "application/json", sent).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{sent}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), sent);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// The body of an embeddings or classify request for `input`, as a client
+    /// sends it.
+    fn input_body(input: serde_json::Value) -> String {
+        json!({"model": "mock-model", "input": input}).to_string()
+    }
+
+    /// An array of `n` one-letter inputs.
+    fn inputs(n: usize) -> serde_json::Value {
+        serde_json::Value::Array(vec![json!("x"); n])
+    }
+
+    /// `/v1/embeddings` runs the public API's shape rules on its body at the
+    /// door both the gRPC path and the HTTP relay read through: every `input`
+    /// shape the API refuses and a `dimensions` under one are refused in the
+    /// envelope under the existing code for the fault, with the field in
+    /// `param`; the shapes the API takes pass the door, a long batch, an encoding
+    /// format the gateway does not read and the serving engine's array of
+    /// objects among them (no worker serves
+    /// the model here, so the gateway's own not-found answer follows, never a
+    /// refusal).
+    #[tokio::test]
+    async fn v1_embeddings_refuses_the_inputs_the_public_api_refuses() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        let with = |input: &str, options: serde_json::Value| {
+            let mut body = json!({"model": "mock-model", "input": input});
+            body.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            body.to_string()
+        };
+        for (sent, code, param) in [
+            (input_body(json!([])), "empty_array", "input"),
+            (input_body(json!("")), "empty_input", "input"),
+            (input_body(json!(["a", ""])), "empty_input", "input"),
+            (input_body(json!({"text": "x"})), "invalid_type", "input"),
+            (input_body(json!(null)), "invalid_type", "input"),
+            (input_body(json!(42)), "invalid_type", "input"),
+            (input_body(json!(["a", 1, null])), "invalid_type", "input"),
+            (
+                input_body(json!([{"text": "a"}, "b"])),
+                "invalid_type",
+                "input",
+            ),
+            (input_body(json!([[1, 2], []])), "empty_array", "input"),
+            (
+                input_body(json!([1, -2])),
+                "integer_below_min_value",
+                "input",
+            ),
+            (
+                input_body(json!([[1, 2], [-3]])),
+                "integer_below_min_value",
+                "input",
+            ),
+            (
+                with("x", json!({"dimensions": 0})),
+                "integer_below_min_value",
+                "dimensions",
+            ),
+            (
+                with("x", json!({"dimensions": -1})),
+                "integer_below_min_value",
+                "dimensions",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/embeddings", "application/json", &sent).await;
+            let shown = &sent[..sent.len().min(120)];
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{shown}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{shown}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), shown);
+        }
+
+        for served in [
+            input_body(json!("hello")),
+            input_body(json!(["a", "b"])),
+            input_body(json!([1, 2, 3])),
+            input_body(json!([[1, 2], [3]])),
+            input_body(json!([{"text": "a"}, {"image": "https://example.com/a.jpg"}])),
+            input_body(inputs(4096)),
+            with("x", json!({"dimensions": 1, "encoding_format": "float"})),
+            with("x", json!({"encoding_format": "base64"})),
+            with("x", json!({"encoding_format": "hex"})),
+        ] {
+            let (status, _, body) = post(&app, "/v1/embeddings", "application/json", &served).await;
+            let shown = &served[..served.len().min(120)];
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{shown}: the door passes it to routing: {body}"
+            );
+            assert_eq!(body["error"]["code"], "model_not_found", "{shown}: {body}");
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/classify` runs the public API's `input` rule at the same door, the
+    /// embeddings route's without its array of objects: the shapes the public
+    /// API refuses are refused in the envelope under `input`, the shapes it
+    /// takes pass to routing.
+    #[tokio::test]
+    async fn v1_classify_refuses_the_inputs_the_public_api_refuses() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (sent, code) in [
+            (input_body(json!([])), "empty_array"),
+            (input_body(json!("")), "empty_input"),
+            (input_body(json!({"a": 1})), "invalid_type"),
+            (input_body(json!([{"text": "a"}])), "invalid_type"),
+            (input_body(json!(null)), "invalid_type"),
+            (input_body(json!(["a", 1])), "invalid_type"),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/classify", "application/json", &sent).await;
+            let shown = &sent[..sent.len().min(120)];
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{shown}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{shown}: {content_type}"
+            );
+            assert_envelope(&body, code, Some("input"), shown);
+        }
+
+        for served in [
+            input_body(json!("hello")),
+            input_body(json!(["a", "b"])),
+            input_body(json!([1, 2, 3])),
+            input_body(inputs(4096)),
+        ] {
+            let (status, _, body) = post(&app, "/v1/classify", "application/json", &served).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{served}: the door passes it to routing: {body}"
+            );
+            assert_eq!(body["error"]["code"], "model_not_found", "{served}: {body}");
         }
 
         ctx.shutdown().await;

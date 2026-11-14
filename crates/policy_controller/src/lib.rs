@@ -24,35 +24,80 @@
 //! - 4.4, the framework ([`framework`]): a [`Profile`] runs [`Filter`]s,
 //!   weighted [`Scorer`]s and one [`Picker`]; a [`Plan`] sequences profiles for
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
-//!   A scorer or picker allocates nothing per decision.
+//!   A scorer or picker allocates nothing per decision. The consistent-hash
+//!   scorer owns its ring ([`ring`]), fed by the membership hooks.
 //! - 4.6, the schema ([`spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists.
 //!
-//! What this step does not hold: the plugin hosts, the operator calls, the
-//! store, ingestion, the gRPC API and the election; they arrive in later steps
-//! and build on these types. The
+//! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
+//!   which the controller's store is fed (membership, health, loads, KV event
+//!   cursors, reservations, sessions, leases), the one-process
+//!   [`store::MemoryStore`] behind them and the contract tests over it. A
+//!   gateway in the embedded mode implements the same traits over its own
+//!   structures; nothing decides through them yet.
+//! - 10, the election ([`elector`]): one [`elector::Elector`] over a
+//!   [`elector::LeaseBackend`] (the lease file and the in-process record
+//!   here, the Kubernetes `Lease` next), terms that only grow, and the
+//!   [`elector::Fence`] a shard thread reads before every decision it sends.
+//!
+//! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
+//!   feature): user policies as components of the committed `smg:policy`
+//!   package, one kept instance per deciding thread, every call under fuel,
+//!   bound to a profile as the framework's own stages.
+//! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
+//!   path (the `GetLoads` poll per engine under the store's poll
+//!   arbitration, the metrics scrape of an engine without a servicer) and
+//!   the load helpers the gateway shares with the controller (the row
+//!   conversion, the scrape parser). The KV subscription, the prober and
+//!   discovery arrive in the step's later PRs.
+//!
+//! - Behind the `controller` feature, the standalone controller
+//!   (`controller`): the listeners with their credentialed scopes, the
+//!   health service on each, the admin endpoints, readiness and the drain,
+//!   the load driver over the store, and the binary of the package's name
+//!   over them. The scopes' calls and the election arrive in the step's
+//!   later PRs.
+//!
+//! What this step does not hold: the gRPC plugin service, the operator calls,
+//! the other ingestion drivers and the gRPC API; they arrive in later
+//! steps and build on these types. The
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
+pub mod affinity;
 pub mod builtins;
+#[cfg(feature = "controller")]
+pub mod controller;
 pub mod decision;
+pub mod elector;
 pub mod framework;
+#[cfg(feature = "ingest")]
+pub mod ingest;
 pub mod lease;
+pub mod ring;
+pub mod sessions;
 pub mod spec;
+pub mod store;
 pub mod view;
+#[cfg(feature = "wasm")]
+pub mod wasm;
+pub mod wit;
 
 pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch, TieBand, Weighted,
+    Binding, DecisionScope, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch,
+    TieBand, Weighted,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
     TransportClass,
 };
-pub use spec::{Needs, PolicySpec, SpecError, API_VERSION, PRESETS};
+pub use ring::{ConsistentHash, Ring};
+pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
+pub use spec::{Needs, PolicySpec, SessionsSpec, SpecError, API_VERSION, PRESETS};
 pub use view::{
     fingerprint, Candidate, Constraints, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
     OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,

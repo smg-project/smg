@@ -193,3 +193,13 @@ def test_each_scheduler_reports_its_own_rank_on_either_release():
     unresolved = _scheduler(dp_size=8, enable_dp_attention=True)
     unresolved.ps = SimpleNamespace(dp_rank=5, attn_dp_rank=5)
     assert wire.scheduler_dp_rank(unresolved) == 5
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_handshake_publishes_resolved_encoder_dtype(dtype):
+    """A direct gateway receives the same effective dtype as the gRPC servicer."""
+    scheduler = _scheduler()
+    scheduler.model_config.dtype = "torch." + dtype
+    ready = wire.ready_response_for_scheduler(scheduler)
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(ready))
+    assert decoded["multimodal_encoder_dtype"] == dtype

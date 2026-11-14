@@ -4,7 +4,7 @@ use openai_protocol::common::{Function, Tool, ToolChoice, ToolChoiceValue};
 use serde_json::json;
 use tool_parser::{GrammarStart, MinimaxM3Parser, ParserFactory, ToolConstraint, ToolParser};
 
-use crate::common::create_test_tools;
+use crate::common::{create_test_tools, update_task_tools};
 
 const NS: &str = "]<]minimax[>[";
 
@@ -26,27 +26,6 @@ fn tool_block(invokes: &[(&str, String)]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{NS}<tool_call>\n{inner}\n{NS}</tool_call>")
-}
-
-/// Tools matching the M2 `update_task(taskId: string, subject: string)` example.
-fn update_task_tools() -> Vec<Tool> {
-    vec![Tool {
-        tool_type: "function".to_string(),
-        function: Function {
-            name: "update_task".to_string(),
-            description: None,
-            parameters: Some(json!({
-                "type": "object",
-                "properties": {
-                    "taskId":  {"type": "string"},
-                    "subject": {"type": "string"}
-                },
-                "required": ["taskId", "subject"]
-            })),
-            strict: None,
-            extra: Default::default(),
-        },
-    }]
 }
 
 #[tokio::test]

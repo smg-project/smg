@@ -31,30 +31,6 @@ else
     # Clean SGLang processes
     pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::' | xargs -r kill -9
 
-    # Clean all GPU processes if any argument is provided
-    if [ $# -gt 0 ]; then
-        # Install lsof if not already available
-        if ! command -v lsof >/dev/null 2>&1; then
-            if command -v sudo >/dev/null 2>&1; then
-                bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-                sudo apt-get update
-                sudo apt-get install -y lsof
-            else
-                bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-                apt-get update
-                apt-get install -y lsof
-            fi
-        fi
-        kill -9 $(nvidia-smi | sed -n '/Processes:/,$p' | grep "   [0-9]" | awk '{print $5}') 2>/dev/null
-        lsof /dev/nvidia* | awk '{print $2}' | xargs kill -9 2>/dev/null
-    fi
-
-    # Show GPU status after clean up
-    nvidia-smi
-
-    NODE_INFO="${NODE_IP:-$(hostname)}"
-    echo "Running on node: $NODE_INFO"
-
     # The processes this container can see that hold a GPU device file open,
     # one pid per line. Reads $CI_GPU_GUARD_PROC_ROOT (/proc; the tests point
     # it at a scratch tree).
@@ -68,6 +44,21 @@ else
             esac
         done | sort -un
     }
+
+    # Clean all GPU processes if any argument is provided
+    if [ $# -gt 0 ]; then
+        kill -9 $(nvidia-smi | sed -n '/Processes:/,$p' | grep "   [0-9]" | awk '{print $5}') 2>/dev/null
+        # The holders of a device file are found in /proc, as the report
+        # below finds them: nothing is installed inside the test step (an
+        # apt-get here charged the mirror's speed to the test budget).
+        gpu_device_holders | xargs -r kill -9 2>/dev/null
+    fi
+
+    # Show GPU status after clean up
+    nvidia-smi
+
+    NODE_INFO="${NODE_IP:-$(hostname)}"
+    echo "Running on node: $NODE_INFO"
 
     # The command line of a process this container can see.
     gpu_command_of() {

@@ -6,10 +6,12 @@
 use std::fmt::Debug;
 
 use crate::{
+    builtins::{Best, FewestSessions, LeastRequests, Random},
     decision::{Decision, Pair, Pick, Shed, ShedReason, Target, Targets, Trace, TRACE_TOP},
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
+    sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
-    view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
+    view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -23,6 +25,27 @@ pub trait Filter: Send + Sync + Debug {
 
     fn soft(&self) -> bool {
         false
+    }
+
+    /// The per-decision scope this stage reads, if it holds one.
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
+
+    /// Drops from `kept` (positions into `candidates`, in order) the rows this
+    /// filter refuses, in place: one call per decision, with [`Filter::keep`]
+    /// inlined into the loop. A filter that answers for the whole pool at
+    /// once overrides it, and must drop exactly the rows [`Filter::keep`]
+    /// refuses: the pair plan's partner and routable passes still ask `keep`
+    /// row by row.
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        kept.retain(|&i| self.keep(facts, &candidates[i as usize], cx));
     }
 }
 
@@ -62,6 +85,11 @@ pub trait Scorer: Lifecycle + Debug {
     fn needs(&self) -> Needs {
         Needs::default()
     }
+
+    /// The per-decision scope this stage reads, if it holds one.
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
 }
 
 /// Turns the scored survivors into ordered targets. `scores[i]` belongs to
@@ -79,6 +107,24 @@ pub trait Picker: Lifecycle + Debug {
         band: TieBand,
         out: &mut Targets,
     );
+
+    /// The per-decision scope this stage reads, if it holds one.
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
+}
+
+/// Per-decision state a stage set keeps across the stages of one profile
+/// (a plugin's `decision` resource over the view): the engine opens it once
+/// before the profile's first stage of a decision reads it and closes it
+/// after the last, on every path out, so a stage set used by several stages
+/// of one profile, or asked row by row, reads one state. A built-in stage
+/// holds none; the profile's flag ([`Profile::scoped`]) is read once in the
+/// engine, so a profile without one pays nothing per decision.
+pub trait DecisionScope: Send + Sync + Debug {
+    fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>);
+
+    fn close(&self);
 }
 
 /// A scorer with its weight in the profile's combination.
@@ -97,6 +143,64 @@ pub struct Profile {
     pub picker: Box<dyn Picker>,
 }
 
+impl Profile {
+    /// What this profile's stages read from the host beyond the facts every
+    /// view carries. The engine's summary ([`Engine::needs`]) adds the view's
+    /// own list of headers.
+    pub fn needs(&self) -> Needs {
+        self.scorers
+            .iter()
+            .fold(Needs::default(), |needs, w| needs.or(w.scorer.needs()))
+    }
+
+    /// Whether any stage holds a [`DecisionScope`].
+    pub fn scoped(&self) -> bool {
+        self.scopes().next().is_some()
+    }
+
+    fn scopes(&self) -> impl Iterator<Item = &dyn DecisionScope> {
+        self.filters
+            .iter()
+            .filter_map(|f| f.scope())
+            .chain(self.scorers.iter().filter_map(|w| w.scorer.scope()))
+            .chain(self.picker.scope())
+    }
+
+    /// Opens every stage's scope over the view; the guard closes them. Out
+    /// of line, so a profile without a scope keeps the engine's decision path
+    /// as it was.
+    #[cold]
+    #[inline(never)]
+    fn open<'a>(
+        &'a self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        pool: &PoolFacts<'_>,
+    ) -> Opened<'a> {
+        for scope in self.scopes() {
+            scope.open(facts, candidates, pool);
+        }
+        Opened(self)
+    }
+}
+
+/// The open scopes of one profile for one decision, closed on drop.
+struct Opened<'a>(&'a Profile);
+
+impl Drop for Opened<'_> {
+    fn drop(&mut self) {
+        close_scopes(self.0);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn close_scopes(profile: &Profile) {
+    for scope in profile.scopes() {
+        scope.close();
+    }
+}
+
 /// Per-decision scratch the framework owns; kept by the host per thread so a
 /// decision allocates nothing after the first.
 #[derive(Debug, Default)]
@@ -107,14 +211,16 @@ pub struct Scratch {
     classes: Vec<u32>,
 }
 
-/// The buffers of one profile run: the survivors, their combined scores and
-/// one scorer's stage. A pair decision keeps the prefill's apart from the
-/// decode side's, so the prefill's survivors stay for the next prefill target.
+/// The buffers of one profile run: the survivors, their combined scores, one
+/// scorer's stage and the survivors a soft filter restores when it would
+/// leave nothing. A pair decision keeps the prefill's apart from the decode
+/// side's, so the prefill's survivors stay for the next prefill target.
 #[derive(Debug, Default)]
 struct Buffers {
     kept: Vec<u32>,
     scores: Vec<f32>,
     stage: Vec<f32>,
+    before_soft: Vec<u32>,
 }
 
 impl Scratch {
@@ -154,86 +260,75 @@ fn combine(
     TieBand(band)
 }
 
-/// The filters over `candidates`: the hard ones, then each soft one as long
-/// as it leaves something. Returns the name of the filter that emptied the
-/// pool, if one did.
+/// The filters over `candidates`, stage by stage in profile order, each one
+/// pass over the survivors so far: the pair class, the partnered test, the
+/// `epd` plan's compatibility and vision rules, the hard filters, then each
+/// soft filter as long as it leaves something.
+/// Returns the name of the stage that emptied the pool, if one did (design
+/// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
+/// a class with no decode by the partners.
 fn filter(
     profile: &Profile,
     facts: &RequestFacts<'_>,
     cx: &Constraints<'_>,
-    kept: &mut Vec<u32>,
+    buf: &mut Buffers,
     set: Set<'_>,
 ) -> Option<&'static str> {
     let Set {
         candidates,
         class,
         partnered,
+        encode,
     } = set;
+    let kept = &mut buf.kept;
     kept.clear();
-    kept.extend((0..candidates.len() as u32).filter(|&i| {
-        let c = &candidates[i as usize];
-        class.is_none_or(|k| c.pair_class == k)
-            && partnered.is_none_or(|p| p.binary_search(&c.pair_class).is_ok())
-            && profile
-                .filters
-                .iter()
-                .filter(|f| !f.soft())
-                .all(|f| f.keep(facts, c, cx))
-    }));
-    if kept.is_empty() {
-        return Some(emptied_by(profile, facts, cx, kept, set));
-    }
-    for soft in profile.filters.iter().filter(|f| f.soft()) {
-        if kept
-            .iter()
-            .any(|&i| soft.keep(facts, &candidates[i as usize], cx))
-        {
-            kept.retain(|&i| soft.keep(facts, &candidates[i as usize], cx));
+    match class {
+        Some(k) => {
+            kept.extend(
+                (0..candidates.len() as u32).filter(|&i| candidates[i as usize].pair_class == k),
+            );
+            if kept.is_empty() {
+                return Some("partners");
+            }
         }
+        None => kept.extend(0..candidates.len() as u32),
     }
-    None
-}
-
-/// The hard filter that left nothing (design 4.2: a shed names the stage that
-/// emptied the pool). The stages run again in profile order over the pool
-/// (the pair class, then the partnered test, then the hard filters) and the
-/// first after which no row survives is named; the pool is empty at this
-/// point, so the second walk costs a pick nothing. A pool with no candidate
-/// was emptied by no stage, a class with no decode by the partners.
-fn emptied_by(
-    profile: &Profile,
-    facts: &RequestFacts<'_>,
-    cx: &Constraints<'_>,
-    kept: &mut Vec<u32>,
-    set: Set<'_>,
-) -> &'static str {
-    let Set {
-        candidates,
-        class,
-        partnered,
-    } = set;
-    kept.clear();
-    kept.extend(
-        (0..candidates.len() as u32)
-            .filter(|&i| class.is_none_or(|k| candidates[i as usize].pair_class == k)),
-    );
     if kept.is_empty() {
-        return if class.is_some() { "partners" } else { "none" };
+        return Some("none");
     }
     if let Some(p) = partnered {
         kept.retain(|&i| p.binary_search(&candidates[i as usize].pair_class).is_ok());
         if kept.is_empty() {
-            return "partnered";
+            return Some("partnered");
+        }
+    }
+    if encode {
+        kept.retain(|&i| candidates[i as usize].ec_compatible);
+        if kept.is_empty() {
+            return Some("ec-compatible");
+        }
+        kept.retain(|&i| vision_fits(facts, &candidates[i as usize]));
+        if kept.is_empty() {
+            return Some("vision");
         }
     }
     for hard in profile.filters.iter().filter(|f| !f.soft()) {
-        kept.retain(|&i| hard.keep(facts, &candidates[i as usize], cx));
+        hard.retain(facts, candidates, cx, kept);
         if kept.is_empty() {
-            return hard.name();
+            return Some(hard.name());
         }
     }
-    kept.clear();
-    "none"
+    for soft in profile.filters.iter().filter(|f| f.soft()) {
+        buf.before_soft.clear();
+        buf.before_soft.extend_from_slice(kept);
+        soft.retain(facts, candidates, cx, kept);
+        if kept.is_empty() {
+            // Copied back, not swapped: a swap would hand `kept` the backup's
+            // smaller buffer, and the next decision would grow it again.
+            kept.extend_from_slice(&buf.before_soft);
+        }
+    }
+    None
 }
 
 fn trace_of(
@@ -251,24 +346,31 @@ fn trace_of(
         generation: pool.generation,
         ..Trace::default()
     };
-    let mut order: [usize; TRACE_TOP] = [usize::MAX; TRACE_TOP];
-    for slot in 0..TRACE_TOP.min(kept.len()) {
-        let mut best: Option<usize> = None;
-        for (i, &score) in scores.iter().enumerate() {
-            if order[..slot].contains(&i) {
-                continue;
-            }
-            if best.is_none_or(|b| score > scores[b]) {
-                best = Some(i);
-            }
+    // One pass: a row enters the top when it beats the lowest row kept, and
+    // moves above a kept row only when strictly better, so equal scores keep
+    // the scan's order (the earlier row ahead).
+    let mut top: [(usize, f32); TRACE_TOP] = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let mut len = 0usize;
+    for (i, &score) in scores.iter().enumerate() {
+        if len == TRACE_TOP && score <= top[TRACE_TOP - 1].1 {
+            continue;
         }
-        let Some(i) = best else {
-            break;
+        let mut slot = if len < TRACE_TOP {
+            len += 1;
+            len - 1
+        } else {
+            TRACE_TOP - 1
         };
-        order[slot] = i;
-        trace.top[slot] = (candidates[kept[i] as usize].id, scores[i]);
-        trace.top_len = slot as u8 + 1;
+        while slot > 0 && score > top[slot - 1].1 {
+            top[slot] = top[slot - 1];
+            slot -= 1;
+        }
+        top[slot] = (i, score);
     }
+    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
+        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    }
+    trace.top_len = len as u8;
     trace
 }
 
@@ -301,6 +403,15 @@ struct Set<'a> {
     candidates: &'a [Candidate],
     class: Option<u32>,
     partnered: Option<&'a [u32]>,
+    /// The `epd` plan's filters apply: the pool is the encode pool and the
+    /// rows' compatibility and vision bits are read.
+    encode: bool,
+}
+
+/// The `epd` plan's vision rule: a request carrying images takes an encoder
+/// with a vision encoder; a request without them takes any.
+fn vision_fits(facts: &RequestFacts<'_>, c: &Candidate) -> bool {
+    facts.media.images == 0 || c.vision
 }
 
 /// One profile over one pool: the filters, the scorers, the picker and the
@@ -315,7 +426,7 @@ fn run_profile(
     buf: &mut Buffers,
 ) -> Decision {
     let candidates = set.candidates;
-    if let Some(emptied_by) = filter(profile, facts, cx, &mut buf.kept, set) {
+    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
         return shed(
             reason_of(emptied_by),
             emptied_by,
@@ -343,34 +454,11 @@ fn run_profile(
     if targets.is_empty() {
         return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
     }
-    Decision::Pick(Pick { targets, trace })
-}
-
-impl Profile {
-    /// Decide over `candidates` with this profile alone (the `single` plan).
-    pub fn decide(
-        &self,
-        index: u16,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        cx: &Constraints<'_>,
-        scratch: &mut Scratch,
-    ) -> Decision {
-        run_profile(
-            self,
-            index,
-            facts,
-            pool,
-            Set {
-                candidates,
-                class: None,
-                partnered: None,
-            },
-            cx,
-            &mut scratch.single,
-        )
-    }
+    Decision::Pick(Pick {
+        targets,
+        trace,
+        session: SessionVerdict::None,
+    })
 }
 
 /// The plan: the sequence of profiles a request runs.
@@ -382,6 +470,34 @@ pub enum Plan {
     /// The prefill profile over the open prefills, then the decode profile
     /// over the chosen prefill's partners.
     PdPair,
+    /// The encode profile named here, once per encode item over the encode
+    /// pool with the pair's EC compatibility and the request's vision demand
+    /// as the plan's own filters, then the pair as under `PdPair`: the
+    /// binding's `profile` is the prefill side and `decode_profile` the
+    /// decode side. The encode side rides the plan, so a binding keeps the
+    /// pair's two fields.
+    Epd {
+        /// The encode profile, by position.
+        encode: u16,
+    },
+}
+
+/// The profile a binding resolves a phase to, by position; `None` when the
+/// binding's plan has no side for the phase: a single or an encode request
+/// under the pair plan, a single request under `epd`. The host and the spec
+/// disagree there, and the decision is declined by the binding, as a pair
+/// decision under a single binding is.
+fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
+    match (binding.plan, phase) {
+        (Plan::Single, _) | (Plan::PdPair | Plan::Epd { .. }, Phase::Prefill) => {
+            Some(binding.profile)
+        }
+        (Plan::PdPair | Plan::Epd { .. }, Phase::Decode) => {
+            Some(binding.decode_profile.unwrap_or(binding.profile))
+        }
+        (Plan::Epd { encode }, Phase::Encode) => Some(encode),
+        (Plan::PdPair, Phase::Single | Phase::Encode) | (Plan::Epd { .. }, Phase::Single) => None,
+    }
 }
 
 /// A binding: which profile (or plan of profiles) a request resolves to.
@@ -396,6 +512,9 @@ pub struct Binding {
     pub profile: u16,
     /// The decode profile of the `pd-pair` plan; `None` under `single`.
     pub decode_profile: Option<u16>,
+    /// Sticky sessions: a keyed request of the `single` plan stays on the
+    /// worker its key was placed on (design 4.6).
+    pub sessions: Option<SessionRule>,
 }
 
 impl Binding {
@@ -410,13 +529,86 @@ impl Binding {
     }
 }
 
-/// The engine: validated profiles and the ordered bindings over them.
+/// The engine: validated profiles and the ordered bindings over them, and the
+/// session table the bindings' sessions rules read.
 #[derive(Debug)]
 pub struct Engine {
     profiles: Vec<Profile>,
     bindings: Vec<Binding>,
     generation: u64,
     needs: Needs,
+    /// The needs of every binding that covers a phase, its profile's stages
+    /// and its sessions rule, folded per phase ([`Self::needs_for_phase`]),
+    /// indexed by [`slot`].
+    phase_needs: [Needs; PHASES.len()],
+    sessions: SessionTable,
+    assignment: AssignmentStages,
+    /// Per profile, whether a stage holds a [`DecisionScope`] to open.
+    scoped: Vec<bool>,
+}
+
+/// Every phase, in the order [`Engine::phase_needs`] keeps them.
+const PHASES: [Phase; 4] = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+
+/// A phase's slot in [`Engine::phase_needs`] (and in a plugin's open
+/// decisions, one per side of a pair): total, so no read falls back to
+/// another phase's; [`PHASES`] lists the phases in this order.
+pub(crate) const fn slot(phase: Phase) -> usize {
+    match phase {
+        Phase::Single => 0,
+        Phase::Prefill => 1,
+        Phase::Decode => 2,
+        Phase::Encode => 3,
+    }
+}
+
+// `PHASES` and `slot` agree on every phase's slot, or the crate does not build.
+const _: () = {
+    let mut i = 0;
+    while i < PHASES.len() {
+        assert!(
+            slot(PHASES[i]) == i,
+            "PHASES and slot disagree on a phase's slot"
+        );
+        i += 1;
+    }
+};
+
+/// What a binding's sessions rule reads beyond its profile's stages: the
+/// key under the view's headers, and the per-key counts its assignment and
+/// cap compare; the validator's summary, per binding.
+fn session_needs(binding: &Binding) -> Needs {
+    binding
+        .sessions
+        .as_ref()
+        .map_or_else(Needs::default, |rule| Needs {
+            headers: true,
+            active_sessions: rule.assignment == Assignment::MinGroup,
+            session_in_flight: rule.inflight_cap > 0,
+            ..Needs::default()
+        })
+}
+
+/// The shortest sweep interval among the bindings' sessions rules, the
+/// session table's cadence; `0` when no rule sweeps.
+fn shortest_sweep(bindings: &[Binding]) -> u64 {
+    bindings
+        .iter()
+        .filter_map(|b| b.sessions.as_ref())
+        .map(|rule| rule.sweep_micros)
+        .filter(|sweep| *sweep > 0)
+        .min()
+        .unwrap_or(0)
+}
+
+/// The stages a sessions rule places a key by when its binding's profile does
+/// not decide (every assignment but `delegate`).
+#[derive(Debug, Default)]
+struct AssignmentStages {
+    random: Random,
+    least_requests: LeastRequests,
+    fewest_sessions: FewestSessions,
+    best: Best,
 }
 
 /// The two pools of a pair decision: the open prefills and the decodes, each
@@ -434,11 +626,59 @@ impl Engine {
         generation: u64,
         needs: Needs,
     ) -> Self {
+        // Per phase, the bindings that cover it in the spec's order; a
+        // binding behind a catch-all model glob decides no request of the
+        // phase and adds nothing (the gateway's own document binds every
+        // model's pair phases before its catch-all for the regular ones).
+        let mut phase_needs = [Needs::default(); PHASES.len()];
+        for phase in PHASES {
+            for binding in bindings
+                .iter()
+                .filter(|b| b.phases.is_empty() || b.phases.contains(&phase))
+            {
+                if let Some(profile) =
+                    profile_index(binding, phase).and_then(|i| profiles.get(usize::from(i)))
+                {
+                    phase_needs[slot(phase)] = phase_needs[slot(phase)]
+                        .or(profile.needs())
+                        .or(session_needs(binding));
+                }
+                if binding.model == "*" {
+                    break;
+                }
+            }
+        }
+        // A pair's decode side is decided by the binding its prefill lookup
+        // resolves to ([`Self::decide_pair`]), not by the first binding that
+        // covers the decode phase: the decode slot also carries the decode
+        // profile of every pair binding a prefill lookup can reach.
+        let decode_slot = slot(Phase::Decode);
+        for binding in bindings
+            .iter()
+            .filter(|b| b.phases.is_empty() || b.phases.contains(&Phase::Prefill))
+        {
+            if matches!(binding.plan, Plan::PdPair | Plan::Epd { .. }) {
+                if let Some(profile) =
+                    profile_index(binding, Phase::Decode).and_then(|i| profiles.get(usize::from(i)))
+                {
+                    phase_needs[decode_slot] = phase_needs[decode_slot].or(profile.needs());
+                }
+            }
+            if binding.model == "*" {
+                break;
+            }
+        }
+        let sessions = SessionTable::new(shortest_sweep(&bindings));
+        let scoped = profiles.iter().map(Profile::scoped).collect();
         Self {
             profiles,
             bindings,
             generation,
             needs,
+            phase_needs,
+            sessions,
+            assignment: AssignmentStages::default(),
+            scoped,
         }
     }
 
@@ -446,9 +686,50 @@ impl Engine {
         self.generation
     }
 
-    /// What the host must feed before any request exists.
+    /// The session table: the pins of every key a sessions rule placed.
+    pub fn sessions(&self) -> &SessionTable {
+        &self.sessions
+    }
+
+    /// What the host must feed before any request exists: every profile's
+    /// stages and the view's own list of headers.
     pub fn needs(&self) -> Needs {
         self.needs
+    }
+
+    /// What a decision of `phase` for `model` reads: the needs of the stages
+    /// of the profile its binding resolves to and of the binding's sessions
+    /// rule, nothing when no binding matches. A decode decision may also be the decode side of a pair,
+    /// whose profile the prefill lookup names ([`Self::decide_pair`]); the
+    /// decode answer carries that profile's needs too. The host reads it per
+    /// worker, at registration, to choose the worker's stream.
+    pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
+        let own = self
+            .resolve(model, phase)
+            .map(|(binding, _, profile)| profile.needs().or(session_needs(binding)))
+            .unwrap_or_default();
+        match phase {
+            Phase::Decode => own.or(self.pair_decode_needs(model)),
+            _ => own,
+        }
+    }
+
+    /// The needs of the decode profile of the pair binding `model`'s prefill
+    /// lookup resolves to, nothing when that binding is not a pair.
+    fn pair_decode_needs(&self, model: &str) -> Needs {
+        self.binding(model, Phase::Prefill)
+            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
+            .and_then(|b| profile_index(b, Phase::Decode))
+            .and_then(|i| self.profiles.get(usize::from(i)))
+            .map(Profile::needs)
+            .unwrap_or_default()
+    }
+
+    /// What some decision of `phase` may read, over every binding that
+    /// covers the phase: the host's answer to "does any regular placement
+    /// read the request text" and its kin, read at apply.
+    pub fn needs_for_phase(&self, phase: Phase) -> Needs {
+        self.phase_needs[slot(phase)]
     }
 
     pub fn profiles(&self) -> &[Profile] {
@@ -460,17 +741,28 @@ impl Engine {
         self.bindings.iter().find(|b| b.matches(model, phase))
     }
 
-    /// The profile a request resolves to for its phase.
+    /// The profile a request resolves to for its phase; `None` when no
+    /// binding matches or the binding's plan has no side for the phase.
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {
-        let binding = self.binding(model, phase)?;
-        let index = match (binding.plan, phase) {
-            (Plan::PdPair, Phase::Decode) => binding.decode_profile.unwrap_or(binding.profile),
-            _ => binding.profile,
-        };
-        self.profiles.get(usize::from(index)).map(|p| (index, p))
+        self.resolve(model, phase)
+            .map(|(_, index, profile)| (index, profile))
     }
 
-    /// The `single` plan: one profile over `candidates`.
+    /// The binding a request resolves to, with its profile for the phase: one
+    /// walk of the bindings per decision; `None` when no binding matches or
+    /// the binding's plan has no side for the phase.
+    fn resolve(&self, model: &str, phase: Phase) -> Option<(&Binding, u16, &Profile)> {
+        let binding = self.binding(model, phase)?;
+        let index = profile_index(binding, phase)?;
+        let profile = self.profiles.get(usize::from(index))?;
+        Some((binding, index, profile))
+    }
+
+    /// One profile over `candidates`: the `single` plan, or one encode item
+    /// of the `epd` plan (the request's phase is `Encode` and the plan's
+    /// compatibility and vision rules filter the pool before the profile);
+    /// under a `single` binding's sessions rule a keyed request goes to its
+    /// pinned worker first.
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -479,7 +771,7 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        let Some((index, profile)) = self.profile_for(facts.model, facts.phase) else {
+        let Some((binding, index, profile)) = self.resolve(facts.model, facts.phase) else {
             return shed(
                 ShedReason::PolicyDeclined,
                 "binding",
@@ -490,11 +782,222 @@ impl Engine {
                 },
             );
         };
-        profile.decide(index, facts, pool, candidates, cx, scratch)
+        let _opened =
+            self.scoped[usize::from(index)].then(|| profile.open(facts, candidates, pool));
+        if let Some(rule) = binding.sessions {
+            if binding.plan == Plan::Single && !facts.session_key.is_none() {
+                return self
+                    .decide_session(profile, index, &rule, facts, pool, candidates, cx, scratch);
+            }
+        }
+        let encode = matches!(
+            (binding.plan, facts.phase),
+            (Plan::Epd { .. }, Phase::Encode)
+        );
+        run_profile(
+            profile,
+            index,
+            facts,
+            pool,
+            Set {
+                candidates,
+                class: None,
+                partnered: None,
+                encode,
+            },
+            cx,
+            &mut scratch.single,
+        )
     }
 
-    /// The `pd-pair` plan: the prefill profile over `prefills`, then the
-    /// decode profile over the decodes of the chosen prefill's pair class. A
+    /// A keyed decision under a sessions rule (design 4.6 and the host's
+    /// keyed path before it): the profile's filters narrow the pool; the
+    /// key's preferred pin, or its failover when the preferred one is
+    /// unroutable, is the decision while it is under the in-flight cap; a pin
+    /// over the cap is reassigned by the stages over the candidates under the
+    /// cap (the pin stays when every candidate is over it); a key with no
+    /// routable pin is placed by the stages. The stages are the profile's own
+    /// under `delegate`, else the assignment's. The pin is written by the
+    /// dispatch (`on_dispatched`), never here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the profile run's inputs, as run_profile takes them"
+    )]
+    fn decide_session(
+        &self,
+        profile: &Profile,
+        index: u16,
+        rule: &SessionRule,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        let set = Set {
+            candidates,
+            class: None,
+            partnered: None,
+            encode: false,
+        };
+        let buf = &mut scratch.single;
+        if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
+            return shed(
+                reason_of(emptied_by),
+                emptied_by,
+                trace_of(index, facts, pool, candidates, &[], &[]),
+            );
+        }
+        let key = facts.session_key.hash;
+        let pins = self.sessions.lookup(key, facts.now_micros, rule);
+        // The first pin the filters kept, by the pins' order.
+        let owner = pins
+            .iter()
+            .filter(|p| **p != WorkerId(0))
+            .find_map(|p| buf.kept.iter().find(|&&i| candidates[i as usize].id == *p))
+            .copied();
+        if let Some(i) = owner {
+            let c = &candidates[i as usize];
+            let under_cap = rule.inflight_cap == 0 || c.session_in_flight < rule.inflight_cap;
+            if !under_cap {
+                // Over the cap: the candidates under it decide; with none
+                // under it the key stays on its pin.
+                if buf
+                    .kept
+                    .iter()
+                    .any(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap)
+                {
+                    buf.kept
+                        .retain(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap);
+                    let mut decision =
+                        self.place(profile, index, rule, facts, pool, candidates, buf);
+                    if let Decision::Pick(pick) = &mut decision {
+                        pick.session = SessionVerdict::Respill;
+                    }
+                    return decision;
+                }
+            }
+            let mut targets = Targets::new();
+            targets.push(Target {
+                position: c.position,
+                id: c.id,
+                dp_rank: c.dp_rank,
+                pair: None,
+            });
+            let mut trace = Trace {
+                profile: index,
+                survivors: buf.kept.len() as u32,
+                seed: facts.seed,
+                generation: pool.generation,
+                ..Trace::default()
+            };
+            trace.top[0] = (c.id, 1.0);
+            trace.top_len = 1;
+            return Decision::Pick(Pick {
+                targets,
+                trace,
+                session: SessionVerdict::Pinned,
+            });
+        }
+        let mut decision = self.place(profile, index, rule, facts, pool, candidates, buf);
+        if let Decision::Pick(pick) = &mut decision {
+            pick.session = SessionVerdict::Pinned;
+            // No routable pin (a fresh key, or every pin down): the key is
+            // claimed at the decision, so concurrent requests agree on the
+            // first claim when its worker is among this decision's survivors.
+            if let Some(first) = pick.targets.first().map(|t| t.id) {
+                let owner = match self.sessions.claim(key, pins, first) {
+                    Claim::Made(id) => {
+                        pick.session = SessionVerdict::Claimed(id);
+                        id
+                    }
+                    Claim::Standing(id) => id,
+                };
+                if owner != first {
+                    if let Some(&i) = buf
+                        .kept
+                        .iter()
+                        .find(|&&i| candidates[i as usize].id == owner)
+                    {
+                        let c = &candidates[i as usize];
+                        pick.targets.lead(Target {
+                            position: c.position,
+                            id: c.id,
+                            dp_rank: c.dp_rank,
+                            pair: None,
+                        });
+                    }
+                }
+            }
+        }
+        decision
+    }
+
+    /// The stages of a sessions rule over the survivors in `buf.kept`: the
+    /// profile's own scorers and picker under `delegate`, else the
+    /// assignment's stage over the same survivors.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the profile run's inputs, as run_profile takes them"
+    )]
+    fn place(
+        &self,
+        profile: &Profile,
+        index: u16,
+        rule: &SessionRule,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        buf: &mut Buffers,
+    ) -> Decision {
+        let kept = &buf.kept;
+        let (band, picker): (TieBand, &dyn Picker) = match rule.assignment {
+            Assignment::Delegate => (
+                combine(
+                    profile,
+                    facts,
+                    candidates,
+                    kept,
+                    &mut buf.scores,
+                    &mut buf.stage,
+                ),
+                profile.picker.as_ref(),
+            ),
+            Assignment::Random => {
+                buf.scores.clear();
+                buf.scores.resize(kept.len(), 0.0);
+                (TieBand::NORMALIZED, &self.assignment.random)
+            }
+            Assignment::MinLoad | Assignment::MinGroup => {
+                buf.scores.clear();
+                buf.scores.resize(kept.len(), 0.0);
+                let scorer: &dyn Scorer = if rule.assignment == Assignment::MinLoad {
+                    &self.assignment.least_requests
+                } else {
+                    &self.assignment.fewest_sessions
+                };
+                (
+                    scorer.score(facts, candidates, kept, &mut buf.scores),
+                    &self.assignment.best,
+                )
+            }
+        };
+        let mut targets = Targets::new();
+        picker.pick(facts, candidates, kept, &buf.scores, band, &mut targets);
+        let trace = trace_of(index, facts, pool, candidates, kept, &buf.scores);
+        if targets.is_empty() {
+            return shed(ShedReason::PolicyDeclined, picker.name(), trace);
+        }
+        Decision::Pick(Pick {
+            targets,
+            trace,
+            session: SessionVerdict::None,
+        })
+    }
+
+    /// The `pd-pair` plan, and the pair half of `epd`: the prefill profile
+    /// over `prefills`, then the decode profile over the decodes of the
+    /// chosen prefill's pair class. A
     /// prefill whose partners leave no decode is passed over for the next
     /// prefill target; the targets list carries the chosen pair first and the
     /// alternate decodes of the same prefill after it. Pair class `0` is
@@ -521,7 +1024,7 @@ impl Engine {
         // declines a pair decision: the host and the spec disagree.
         let Some(binding) = self
             .binding(facts.model, Phase::Prefill)
-            .filter(|b| b.plan == Plan::PdPair)
+            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
         else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
@@ -546,6 +1049,13 @@ impl Engine {
             seed: Draw::new(facts.seed).next_u64(),
             ..*facts
         };
+        // One scope per side: the WIT view has one candidate list, so the
+        // prefill stages read the prefill pool and the decode stages the
+        // decode pool, through every decode run and the partner passes.
+        let _prefill_opened = self.scoped[usize::from(binding.profile)]
+            .then(|| prefill_profile.open(&prefill_facts, prefills, pool));
+        let _decode_opened = self.scoped[usize::from(decode_index)]
+            .then(|| decode_profile.open(&decode_facts, decodes, pool));
         // The prefill pool narrows to the prefills with a partner the decode
         // profile's hard filters keep, before the prefill picker truncates to
         // its targets: a pair that exists is found. A decode of class 0 is
@@ -575,6 +1085,7 @@ impl Engine {
                 candidates: prefills,
                 class: None,
                 partnered: Some(&scratch.classes),
+                encode: false,
             },
             cx,
             &mut scratch.single,
@@ -607,34 +1118,40 @@ impl Engine {
                     scratch.classes.sort_unstable();
                     scratch.classes.dedup();
                     if routable == 0 {
-                        let stage = emptied_by(
+                        let stage = filter(
                             prefill_profile,
                             &prefill_facts,
                             cx,
-                            &mut scratch.single.kept,
+                            &mut scratch.single,
                             Set {
                                 candidates: prefills,
                                 class: None,
                                 partnered: None,
+                                encode: false,
                             },
-                        );
+                        )
+                        .unwrap_or("none");
                         return shed(reason_of(stage), stage, prefill_shed.trace);
                     }
                     if scratch.classes.is_empty() {
                         return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace);
                     }
-                    let stage = emptied_by(
+                    // An empty decode pool is that class for every prefill:
+                    // its "none" falls through to the prefill's shed.
+                    if let Some(stage) = filter(
                         decode_profile,
                         &decode_facts,
                         decode_cx,
-                        &mut scratch.decode.kept,
+                        &mut scratch.decode,
                         Set {
                             candidates: decodes,
                             class: None,
                             partnered: Some(&scratch.classes),
+                            encode: false,
                         },
-                    );
-                    if stage != "none" {
+                    )
+                    .filter(|&stage| stage != "none")
+                    {
                         return shed(reason_of(stage), stage, prefill_shed.trace);
                     }
                 }
@@ -663,6 +1180,7 @@ impl Engine {
                     candidates: decodes,
                     class: Some(class),
                     partnered: None,
+                    encode: false,
                 },
                 decode_cx,
                 &mut scratch.decode,
@@ -685,6 +1203,7 @@ impl Engine {
                     return Decision::Pick(Pick {
                         targets,
                         trace: prefill_pick.trace,
+                        session: SessionVerdict::None,
                     });
                 }
                 Decision::Shed(shed) => last_shed = Some(shed),
@@ -715,6 +1234,17 @@ impl Lifecycle for Engine {
         side: Side,
         since_decision_micros: u32,
     ) {
+        // The session pin follows the dispatched worker of the side: the
+        // decode of a pair target on the decode side, the target itself
+        // otherwise.
+        let dispatched = match (side, target.pair) {
+            (Side::Decode, Some(pair)) => pair.decode_id,
+            _ => target.id,
+        };
+        if lease.session != SessionVerdict::None {
+            self.sessions
+                .dispatched(lease.session_key, lease.session, dispatched);
+        }
         for profile in &self.profiles {
             for w in &profile.scorers {
                 w.scorer
@@ -745,6 +1275,12 @@ impl Lifecycle for Engine {
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
+        match change {
+            Membership::Removed(worker) | Membership::Replaced { old: worker, .. } => {
+                self.sessions.forget_worker(*worker);
+            }
+            _ => {}
+        }
         for profile in &self.profiles {
             for w in &profile.scorers {
                 w.scorer.on_membership(change);
@@ -767,15 +1303,17 @@ impl Lifecycle for Engine {
 mod tests {
     use super::*;
     use crate::{
-        builtins::{Best, Healthy, LeastRequests, NotTried},
+        builtins::{Best, Healthy, LeastRequests, NotOverloaded, NotTried},
+        sessions::Recovery,
         spec::PolicySpec,
-        view::{Health, WorkerId},
+        view::{Health, Identity, MediaCounts, Role, WorkerId},
     };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
         Candidate {
             position,
             id: WorkerId(100 + u64::from(position)),
+            key: 100 + position,
             health: Health {
                 healthy: true,
                 ..Health::default()
@@ -806,6 +1344,7 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                sessions: None,
             }],
             1,
             Needs::default(),
@@ -834,6 +1373,37 @@ mod tests {
         assert_eq!(pick.trace.survivors, 3);
         assert_eq!(pick.trace.top[0].0, WorkerId(101));
         assert_eq!(pick.trace.top_len, 3);
+    }
+
+    #[test]
+    fn the_trace_lists_equal_scores_in_the_pools_order_and_keeps_the_three_best() {
+        // Four idle workers behind one busy one: the three idle rows the
+        // trace names come in the pool's order, and the busy row stays out.
+        let engine = engine();
+        let pool = [
+            candidate(0, 3),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+            candidate(4, 0),
+        ];
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let mut scratch = Scratch::new();
+        let decision = engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            &pool,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        let trace = decision.trace();
+        assert_eq!(trace.top_len, 3);
+        let named: Vec<WorkerId> = trace.top.iter().map(|(id, _)| *id).collect();
+        assert_eq!(named, vec![WorkerId(101), WorkerId(102), WorkerId(103)]);
+        assert!(trace.top.iter().all(|(_, score)| *score == 1.0));
     }
 
     #[test]
@@ -890,7 +1460,7 @@ mod tests {
     fn strict_profile() -> Profile {
         Profile {
             name: "strict".into(),
-            filters: vec![Box::new(Healthy), Box::new(crate::builtins::NotOverloaded)],
+            filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
             scorers: vec![],
             picker: Box::new(Best),
         }
@@ -905,6 +1475,7 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                sessions: None,
             }],
             1,
             Needs::default(),
@@ -933,6 +1504,7 @@ mod tests {
             plan: Plan::PdPair,
             profile: 0,
             decode_profile: Some(0),
+            sessions: None,
         }
     }
 
@@ -1195,6 +1767,28 @@ mod tests {
     }
 
     #[test]
+    fn a_pair_with_no_decode_at_all_is_dropped_as_unpartnered() {
+        // An empty decode pool is a class with no decode for every prefill:
+        // the prefill's own "partnered" shed stands, where the decode side's
+        // filter alone would name "none".
+        let engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let mut prefills = [candidate(0, 0)];
+        prefills[0].pair_class = 7;
+        match decide_pair(&engine, &prefills, &[]) {
+            Decision::Shed(shed) => {
+                assert_eq!(shed.emptied_by, "partnered", "no decode of any class");
+                assert_eq!(shed.reason, ShedReason::NoEndpoints);
+            }
+            other => panic!("an empty decode pool answered {other:?}"),
+        }
+    }
+
+    #[test]
     fn the_pair_takes_its_decode_profile_from_the_binding_the_prefill_resolved() {
         // A decode-phase binding to the strict profile sits before the pair
         // binding, whose decode side is lenient; the pair uses its own.
@@ -1213,6 +1807,7 @@ mod tests {
                     plan: Plan::Single,
                     profile: 1,
                     decode_profile: None,
+                    sessions: None,
                 },
                 pair_binding(),
             ],
@@ -1431,6 +2026,7 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                sessions: None,
             }],
             1,
             Needs::default(),
@@ -1473,6 +2069,7 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(0),
+                sessions: None,
             }],
             1,
             Needs::default(),
@@ -1592,6 +2189,7 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(0),
+                sessions: None,
             }],
             1,
             Needs::default(),
@@ -1629,6 +2227,7 @@ mod tests {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            sessions: None,
         };
         assert!(b.matches("pd/a", Phase::Prefill));
         assert!(!b.matches("pd/a", Phase::Single));
@@ -1639,6 +2238,7 @@ mod tests {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            sessions: None,
         };
         assert!(any.matches("anything", Phase::Decode));
         let suffix = Binding {
@@ -1701,5 +2301,622 @@ mod tests {
         assert!(scores
             .iter()
             .all(|&s| (s - (0.75 * 0.5 + 0.25)).abs() < 1e-6));
+    }
+
+    const SESSIONS: SessionRule = SessionRule {
+        assignment: Assignment::Delegate,
+        inflight_cap: 2,
+        ttl_micros: None,
+        sweep_micros: 0,
+        recovery: Recovery::Latest,
+    };
+
+    /// The least-requests profile under a sessions rule.
+    fn session_engine(rule: SessionRule) -> Engine {
+        Engine::new(
+            vec![least_requests_profile()],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Single,
+                profile: 0,
+                decode_profile: None,
+                sessions: Some(rule),
+            }],
+            1,
+            Needs::default(),
+        )
+    }
+
+    /// Decide for `key` at `now` without committing.
+    fn decide_keyed(engine: &Engine, pool: &[Candidate], key: u64, now: u64) -> Decision {
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(key),
+            now_micros: now,
+            ..RequestFacts::default()
+        };
+        let mut scratch = Scratch::new();
+        engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            pool,
+            &Constraints::default(),
+            &mut scratch,
+        )
+    }
+
+    /// Decide for `key` at `now` and dispatch the first target, as a host
+    /// commits it.
+    fn place_keyed(engine: &Engine, pool: &[Candidate], key: u64, now: u64) -> Target {
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(key),
+            now_micros: now,
+            ..RequestFacts::default()
+        };
+        let mut scratch = Scratch::new();
+        let decision = engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            pool,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        let target = *decision
+            .pick()
+            .expect("a pick")
+            .targets
+            .first()
+            .expect("a target");
+        let lease = Lease {
+            session_key: key,
+            session: decision.pick().map_or(SessionVerdict::None, |p| p.session),
+            issued_micros: now,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &target, Side::Single, 0);
+        target
+    }
+
+    /// A key is placed by the profile once, then stays on its pin past the
+    /// load; an unroutable pin hands the key to a failover; once both are
+    /// routable the rule's recovery says which leads.
+    #[test]
+    fn a_keyed_request_stays_on_its_pin_and_recovers_by_the_rule() {
+        for (recovery, back_to_first) in [(Recovery::Latest, false), (Recovery::Original, true)] {
+            let engine = session_engine(SessionRule {
+                recovery,
+                ..SESSIONS
+            });
+            let mut pool = vec![candidate(0, 5), candidate(1, 0), candidate(2, 3)];
+            assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 1);
+            pool[1].in_flight = 9;
+            for t in 1..4 {
+                assert_eq!(
+                    place_keyed(&engine, &pool, 7, 10 + t).position,
+                    1,
+                    "the pin holds past the load ({recovery:?})"
+                );
+            }
+            pool[1].health.healthy = false;
+            assert_eq!(
+                place_keyed(&engine, &pool, 7, 20).position,
+                2,
+                "the emptiest routable worker takes the key"
+            );
+            pool[1].health.healthy = true;
+            let back = place_keyed(&engine, &pool, 7, 30);
+            assert_eq!(back.position == 1, back_to_first, "{recovery:?}");
+            assert_eq!(engine.sessions().len(), 1);
+        }
+    }
+
+    /// Two pins, the owner leading and saturated on the key, the failover
+    /// under the cap: the respill goes to the failover and the pin follows
+    /// it, so the failover leads once the owner is under the cap again.
+    #[test]
+    fn a_saturated_owner_respills_onto_its_failover_and_the_failover_leads_after() {
+        let engine = session_engine(SessionRule {
+            recovery: Recovery::Original,
+            ..SESSIONS
+        });
+        let mut pool = vec![candidate(0, 9), candidate(1, 0), candidate(2, 1)];
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 1);
+        pool[1].health.healthy = false;
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 20).position,
+            2,
+            "the failover"
+        );
+        pool[1].health.healthy = true;
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 30).position,
+            1,
+            "the first owner leads under original recovery"
+        );
+        pool[1].session_in_flight = 2;
+        assert_eq!(place_keyed(&engine, &pool, 7, 40).position, 2);
+        pool[1].session_in_flight = 0;
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 50).position,
+            2,
+            "the respill moved the pin to the failover"
+        );
+    }
+
+    /// With every candidate over the cap the key stays on its owner; one
+    /// candidate under the cap takes the respill.
+    #[test]
+    fn with_every_candidate_over_the_cap_the_key_stays_on_its_owner() {
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![candidate(0, 0), candidate(1, 3), candidate(2, 3)];
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+        for c in &mut pool {
+            c.session_in_flight = 2;
+        }
+        assert_eq!(place_keyed(&engine, &pool, 7, 20).position, 0);
+        pool[2].session_in_flight = 1;
+        assert_eq!(place_keyed(&engine, &pool, 7, 30).position, 2);
+    }
+
+    /// A key with no routable pin is placed by the rule's assignment: the
+    /// profile's own stages under `delegate`, the fewest requests under
+    /// `min_load`, the fewest sessions under `min_group`, any routable worker
+    /// under `random`.
+    #[test]
+    fn a_key_without_a_routable_pin_is_placed_by_the_rules_assignment() {
+        let mut pool = vec![candidate(0, 1), candidate(1, 4), candidate(2, 2)];
+        pool[0].active_sessions = 7;
+        pool[1].active_sessions = 1;
+        pool[2].active_sessions = 3;
+        let by = |assignment| {
+            let engine = session_engine(SessionRule {
+                assignment,
+                ..SESSIONS
+            });
+            place_keyed(&engine, &pool, 7, 10).position
+        };
+        assert_eq!(by(Assignment::Delegate), 0, "the profile's fewest requests");
+        assert_eq!(by(Assignment::MinLoad), 0);
+        assert_eq!(by(Assignment::MinGroup), 1, "the fewest sessions");
+        assert!(by(Assignment::Random) < 3);
+    }
+
+    #[test]
+    fn a_removed_workers_keys_fall_to_their_failover_or_are_placed_afresh() {
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![
+            candidate(0, 1),
+            candidate(1, 4),
+            candidate(2, 2),
+            candidate(3, 3),
+        ];
+        // Key 7 lives on worker 100 alone; key 8 moves to 102 while 100 is
+        // down and keeps 100 as its failover.
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+        assert_eq!(place_keyed(&engine, &pool, 8, 10).position, 0);
+        pool[0].health.healthy = false;
+        assert_eq!(place_keyed(&engine, &pool, 8, 20).position, 2);
+        pool[0].health.healthy = true;
+        pool[0].in_flight = 9;
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 30).position,
+            0,
+            "a pin holds under load"
+        );
+        assert_eq!(place_keyed(&engine, &pool, 8, 30).position, 2);
+        // The host removes 102: key 8's failover is its owner, loaded or not.
+        engine.on_membership(&Membership::Removed(WorkerId(102)));
+        pool.remove(2);
+        assert_eq!(
+            engine.sessions.pins(Identity::hashed(8).hash),
+            Some([WorkerId(100), WorkerId(0)]),
+            "the removed owner left the pins, not just the routable set"
+        );
+        assert_eq!(place_keyed(&engine, &pool, 8, 40).position, 0);
+        // The host replaces 100: both keys have no pin left and are placed
+        // afresh by the rule's assignment (the fewest requests).
+        engine.on_membership(&Membership::Replaced {
+            old: WorkerId(100),
+            new: WorkerId(200),
+        });
+        pool.remove(0);
+        assert_eq!(engine.sessions.pins(Identity::hashed(7).hash), None);
+        assert_eq!(engine.sessions.pins(Identity::hashed(8).hash), None);
+        assert_eq!(place_keyed(&engine, &pool, 7, 50).position, 3);
+        assert_eq!(place_keyed(&engine, &pool, 8, 50).position, 3);
+    }
+
+    #[test]
+    fn two_first_decisions_of_a_fresh_key_agree_on_the_first_claim() {
+        let engine = session_engine(SESSIONS);
+        let key = Identity::hashed(7).hash;
+        let mut pool = vec![candidate(0, 1), candidate(1, 4), candidate(2, 2)];
+        let first = decide_keyed(&engine, &pool, 7, 10);
+        let first_pick = first.pick().expect("a pick");
+        assert_eq!(first_pick.targets.first().map(|t| t.position), Some(0));
+        let claimed = first_pick.targets.first().expect("a target").id;
+        assert_eq!(first_pick.session, SessionVerdict::Claimed(claimed));
+        // Before the first commits, a second decision under a changed load
+        // would place the key elsewhere; it reads the claim as the pin and
+        // takes it as a hit. (Between a decision's own reading and its claim
+        // another claim is followed the same way, when among its survivors.)
+        pool[0].in_flight = 9;
+        let second = decide_keyed(&engine, &pool, 7, 11);
+        let targets = second.pick().expect("a pick").targets;
+        assert_eq!(
+            targets.first().map(|t| t.position),
+            Some(0),
+            "the claim leads"
+        );
+        assert_eq!(targets.len(), 1, "a hit on the claim");
+        assert_eq!(
+            engine.sessions.pins(key),
+            Some([WorkerId(100), WorkerId(0)])
+        );
+        // The commits, in either order, keep the one pin.
+        let lease = |decision: &Decision, now| Lease {
+            session_key: key,
+            session: decision.pick().expect("a pick").session,
+            issued_micros: now,
+            ..Lease::default()
+        };
+        let target = |decision: &Decision| {
+            *decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .first()
+                .expect("a target")
+        };
+        engine.on_dispatched(&lease(&second, 11), &target(&second), Side::Single, 0);
+        engine.on_dispatched(&lease(&first, 10), &target(&first), Side::Single, 0);
+        assert_eq!(
+            engine.sessions.pins(key),
+            Some([WorkerId(100), WorkerId(0)])
+        );
+    }
+
+    /// The owner is down; the decision claims the best survivor, the commit
+    /// refuses it and dispatches the alternate: the owner keeps its pin, the
+    /// alternate is the failover, and the owner leads again once it is back.
+    #[test]
+    fn an_alternate_commit_withdraws_the_claim_and_keeps_the_owner() {
+        let engine = session_engine(SessionRule {
+            recovery: Recovery::Original,
+            ..SESSIONS
+        });
+        let key = Identity::hashed(7).hash;
+        let mut pool = vec![candidate(0, 1), candidate(1, 4), candidate(2, 2)];
+        let owner = place_keyed(&engine, &pool, 7, 10);
+        assert_eq!(owner.position, 0);
+        pool[0].health.healthy = false;
+        let decision = decide_keyed(&engine, &pool, 7, 20);
+        let pick = decision.pick().expect("a pick");
+        let claimed = pick.targets.first().expect("a target").id;
+        let alternate = pick.targets.as_slice()[1];
+        assert_ne!(alternate.id, claimed);
+        assert_eq!(engine.sessions.pins(key), Some([owner.id, claimed]));
+        let lease = Lease {
+            session_key: key,
+            session: pick.session,
+            issued_micros: 20,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &alternate, Side::Single, 0);
+        assert_eq!(
+            engine.sessions.pins(key),
+            Some([owner.id, alternate.id]),
+            "the claim is withdrawn, the owner keeps the lead"
+        );
+        pool[0].health.healthy = true;
+        assert_eq!(place_keyed(&engine, &pool, 7, 30).position, 0);
+    }
+
+    /// Two bindings' rules share the engine's table, which sweeps at the
+    /// shorter of their intervals: once the short rule's TTL and interval
+    /// passed, its idle key is gone from the table while the hourly key
+    /// stays, whichever binding's decision ran the sweep.
+    #[test]
+    fn the_table_sweeps_at_the_shortest_interval_of_the_bindings_rules() {
+        let hourly = SessionRule {
+            ttl_micros: Some(3_600_000_000),
+            sweep_micros: 3_600_000_000,
+            ..SESSIONS
+        };
+        let short = SessionRule {
+            ttl_micros: Some(1_000),
+            sweep_micros: 1_000,
+            ..SESSIONS
+        };
+        let binding = |model: &str, rule: SessionRule| Binding {
+            model: model.into(),
+            phases: vec![],
+            plan: Plan::Single,
+            profile: 0,
+            decode_profile: None,
+            sessions: Some(rule),
+        };
+        let engine = Engine::new(
+            vec![least_requests_profile()],
+            vec![binding("a", hourly), binding("b", short)],
+            1,
+            Needs::default(),
+        );
+        let pool = vec![candidate(0, 1), candidate(1, 4)];
+        let place = |model: &'static str, key: u64, now: u64| {
+            let facts = RequestFacts {
+                model,
+                session_key: Identity::hashed(key),
+                now_micros: now,
+                ..RequestFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut scratch,
+            );
+            let pick = decision.pick().expect("a pick");
+            let target = *pick.targets.first().expect("a target");
+            let lease = Lease {
+                session_key: Identity::hashed(key).hash,
+                session: pick.session,
+                issued_micros: now,
+                ..Lease::default()
+            };
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+        };
+        place("a", 1, 0);
+        place("b", 2, 0);
+        place("b", 3, 2_000);
+        assert_eq!(
+            engine.sessions().len(),
+            2,
+            "the hourly key and the fresh one stay, the short key was swept"
+        );
+        assert!(engine.sessions.pins(Identity::hashed(2).hash).is_none());
+    }
+
+    #[test]
+    fn a_key_whose_pins_are_all_down_is_claimed_at_its_decision_too() {
+        let engine = session_engine(SESSIONS);
+        let key = Identity::hashed(7).hash;
+        let mut pool = vec![candidate(0, 1), candidate(1, 4), candidate(2, 2)];
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+        pool[0].health.healthy = false;
+        // The owner is down: the first decision claims the fewest-requests
+        // worker before any commit; a second decision under a changed load
+        // reads that claim as the pin and takes it.
+        let first = decide_keyed(&engine, &pool, 7, 20);
+        let lead = |d: &Decision| {
+            d.pick()
+                .expect("a pick")
+                .targets
+                .first()
+                .map(|t| t.position)
+        };
+        assert_eq!(lead(&first), Some(2));
+        assert_eq!(
+            engine.sessions.pins(key),
+            Some([WorkerId(102), WorkerId(100)])
+        );
+        pool[2].in_flight = 9;
+        let second = decide_keyed(&engine, &pool, 7, 21);
+        assert_eq!(lead(&second), Some(2), "the claim is the pin");
+    }
+
+    #[test]
+    fn a_keyed_request_under_a_binding_without_a_sessions_rule_pins_nothing() {
+        let engine = Engine::new(
+            vec![least_requests_profile()],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Single,
+                profile: 0,
+                decode_profile: None,
+                sessions: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        let pool = vec![candidate(0, 1), candidate(1, 4)];
+        let decision = decide_keyed(&engine, &pool, 7, 10);
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.session, SessionVerdict::None);
+        let lease = Lease {
+            session_key: Identity::hashed(7).hash,
+            session: pick.session,
+            issued_micros: 10,
+            ..Lease::default()
+        };
+        engine.on_dispatched(
+            &lease,
+            pick.targets.first().expect("a target"),
+            Side::Single,
+            0,
+        );
+        assert!(engine.sessions.is_empty(), "no rule, no row");
+    }
+
+    fn encode_candidate(position: u32, ec_compatible: bool, vision: bool) -> Candidate {
+        Candidate {
+            role: Role::Encode,
+            ec_compatible,
+            vision,
+            ..candidate(position, 0)
+        }
+    }
+
+    /// Profile 0 is the strict pair side, profile 1 the encode profile.
+    fn epd_engine() -> Engine {
+        Engine::new(
+            vec![strict_profile(), least_requests_profile()],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Epd { encode: 1 },
+                profile: 0,
+                decode_profile: Some(0),
+                sessions: None,
+            }],
+            1,
+            Needs::default(),
+        )
+    }
+
+    fn encode_facts(images: u16) -> RequestFacts<'static> {
+        RequestFacts {
+            model: "m",
+            phase: Phase::Encode,
+            media: MediaCounts {
+                images,
+                ..MediaCounts::default()
+            },
+            ..RequestFacts::default()
+        }
+    }
+
+    /// A single or an encode request under the pair plan, and a single one
+    /// under `epd`, resolve to no profile and are declined by the binding,
+    /// as a pair decision under a single binding is; the pair phases and
+    /// `epd`'s encode phase resolve to their sides.
+    #[test]
+    fn a_single_or_encode_request_under_the_pair_plan_is_declined_by_the_binding() {
+        let pair = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        for phase in [Phase::Single, Phase::Encode] {
+            assert!(pair.profile_for("m", phase).is_none(), "{phase:?}");
+            let facts = RequestFacts {
+                model: "m",
+                phase,
+                ..RequestFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            match pair.decide(
+                &facts,
+                &PoolFacts::default(),
+                &[candidate(0, 0)],
+                &Constraints::default(),
+                &mut scratch,
+            ) {
+                Decision::Shed(shed) => {
+                    assert_eq!(shed.reason, ShedReason::PolicyDeclined, "{phase:?}");
+                    assert_eq!(shed.emptied_by, "binding", "{phase:?}");
+                }
+                other => panic!("{phase:?} under the pair plan answered {other:?}"),
+            }
+        }
+        assert!(pair.profile_for("m", Phase::Prefill).is_some());
+        assert!(pair.profile_for("m", Phase::Decode).is_some());
+        let epd = epd_engine();
+        assert!(epd.profile_for("m", Phase::Single).is_none());
+        let side = |phase: Phase| {
+            epd.profile_for("m", phase)
+                .map(|(i, p)| (i, p.name.clone()))
+        };
+        assert_eq!(side(Phase::Encode), Some((1, "least".to_string())));
+        assert_eq!(side(Phase::Prefill), Some((0, "strict".to_string())));
+        assert_eq!(side(Phase::Decode), Some((0, "strict".to_string())));
+    }
+
+    /// The `epd` plan reads the rows' compatibility and vision bits before
+    /// the encode profile's own stages, and a pool they empty names them; a
+    /// single-plan binding never reads the bits.
+    #[test]
+    fn the_epd_plan_filters_encoders_by_ec_compatibility_and_vision_and_names_the_stage() {
+        let epd = epd_engine();
+        let decide = |facts: &RequestFacts<'_>, pool: &[Candidate]| {
+            let mut scratch = Scratch::new();
+            epd.decide(
+                facts,
+                &PoolFacts::default(),
+                pool,
+                &Constraints::default(),
+                &mut scratch,
+            )
+        };
+        let pool = [
+            encode_candidate(0, false, true),
+            encode_candidate(1, true, true),
+            encode_candidate(2, true, false),
+        ];
+        let text = decide(&encode_facts(0), &pool);
+        let pick = text.pick().expect("a pick");
+        assert!(pick.targets.iter().all(|t| t.position != 0), "{pick:?}");
+        assert_eq!(pick.trace.survivors, 2, "the incompatible encoder is out");
+        let image = decide(&encode_facts(1), &pool);
+        let pick = image.pick().expect("a pick");
+        let order: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+        assert_eq!(order, [1], "an image takes the vision encoder alone");
+        let shed_of = |facts: &RequestFacts<'_>, pool: &[Candidate]| match decide(facts, pool) {
+            Decision::Shed(shed) => (shed.emptied_by, shed.reason),
+            other => panic!("an emptied pool answered {other:?}"),
+        };
+        assert_eq!(
+            shed_of(&encode_facts(0), &[encode_candidate(0, false, true)]),
+            ("ec-compatible", ShedReason::NoEndpoints)
+        );
+        assert_eq!(
+            shed_of(&encode_facts(1), &[encode_candidate(0, true, false)]),
+            ("vision", ShedReason::NoEndpoints)
+        );
+        assert!(
+            decide(&encode_facts(0), &[encode_candidate(0, true, false)])
+                .pick()
+                .is_some(),
+            "a request without images takes an encoder without a vision encoder"
+        );
+        let mut sick = encode_candidate(0, true, true);
+        sick.health.healthy = false;
+        assert_eq!(
+            shed_of(&encode_facts(0), &[sick, encode_candidate(1, false, true)]).0,
+            "healthy",
+            "the profile's stage is named after the plan's"
+        );
+        let single = engine();
+        let mut scratch = Scratch::new();
+        let regular = [encode_candidate(0, false, false)];
+        assert!(
+            single
+                .decide(
+                    &encode_facts(1),
+                    &PoolFacts::default(),
+                    &regular,
+                    &Constraints::default(),
+                    &mut scratch,
+                )
+                .pick()
+                .is_some(),
+            "a single-plan binding reads no compatibility bit"
+        );
+    }
+
+    #[test]
+    fn the_epd_binding_serves_its_pair_half_through_decide_pair() {
+        let epd = epd_engine();
+        let mut prefills = [candidate(0, 0)];
+        prefills[0].pair_class = 7;
+        let mut decodes = [candidate(0, 0)];
+        decodes[0].pair_class = 7;
+        let decision = decide_pair(&epd, &prefills, &decodes);
+        let pick = decision
+            .pick()
+            .expect("the epd binding's pair half decides");
+        assert_eq!(
+            pick.targets
+                .first()
+                .and_then(|t| t.pair)
+                .map(|p| p.decode_position),
+            Some(0)
+        );
     }
 }

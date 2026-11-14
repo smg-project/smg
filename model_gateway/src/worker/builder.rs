@@ -19,6 +19,7 @@ use super::{
     metadata::DecodingLabels,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
+    Worker,
 };
 use crate::{
     config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
@@ -93,6 +94,47 @@ impl BasicWorkerBuilder {
             overload_defaults: OverloadThresholds::default(),
             discovered_labels: HashMap::new(),
         }
+    }
+
+    /// A builder over a live worker's resolved state: the spec, HTTP/2, the
+    /// discovered labels, the health config and endpoint, the resilience,
+    /// the breaker config, the ZMQ bounds, the overload block, a
+    /// materialized HTTP client and the current status, so a rebuild keeps
+    /// what registration resolved. The caller applies its own changes, the
+    /// gateway's overload defaults and the connect signal, then shares the
+    /// KV engine state with the worker it replaces.
+    pub(crate) fn carrying(worker: &Arc<dyn Worker>) -> Self {
+        let metadata = worker.metadata();
+        let mut builder = Self::from_spec((*metadata.spec).clone())
+            .http2(worker.http2())
+            .discovered_labels((*metadata.discovered_labels).clone())
+            .health_config(metadata.health_config.clone())
+            .health_endpoint(metadata.health_endpoint.clone())
+            .resilience(worker.resilience().clone())
+            // The resolved thresholds stand as the defaults the spec's block
+            // re-resolves against, so a rebuild without the gateway config at
+            // hand keeps the effective thresholds.
+            .overload(metadata.spec.overload)
+            .overload_defaults(metadata.overload)
+            .zmq_startup_timeout(metadata.zmq_startup_timeout)
+            .status(worker.status());
+        // `from_spec` starts on the built-in breaker config; with the live one
+        // the registry's replacement adopts the live breaker and its state.
+        if let Some(config) = worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .map(BasicWorker::circuit_breaker_config)
+        {
+            builder = builder.circuit_breaker_config(config);
+        }
+        if let Some(timeout) = metadata.zmq_request_timeout {
+            builder = builder.zmq_request_timeout(timeout);
+        }
+        // A never-HTTP worker keeps a deferred client slot.
+        if let Some(client) = worker.http_client_handle_if_initialized() {
+            builder = builder.http_client(client);
+        }
+        builder
     }
 
     /// Set the bootstrap port (for prefill workers in PD disaggregation)
@@ -467,7 +509,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::worker::basic::Worker;
+    use crate::{server::http_client, worker::basic::Worker};
 
     /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
     /// worker, every default written once.
@@ -548,7 +590,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(crate::server::http_client()))
+            .http_client(Arc::new(http_client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }
@@ -826,5 +868,56 @@ mod tests {
 
         // bootstrap_host should be "prefill1", not "3"
         assert_eq!(worker.metadata().spec.bootstrap_host, "prefill1");
+    }
+
+    /// A URL registered with a trailing slash keeps it as the registry's key
+    /// (`url()`), and every join reads one slash: the base URL carries none,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_the_registered_url_is_not_in_the_join_base() {
+        let worker = BasicWorkerBuilder::new("http://h:8000/").build();
+        assert_eq!(worker.url(), "http://h:8000/");
+        assert_eq!(worker.base_url(), "http://h:8000");
+        assert_eq!(
+            worker.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+        assert_eq!(
+            format!("{}/{}", worker.base_url(), "get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+
+        let rank = BasicWorkerBuilder::new("http://h:8000/")
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "http://h:8000");
+        assert_eq!(
+            rank.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+    }
+
+    /// A socket address is not a base routes join to: the ZMQ adapter hashes
+    /// the exact path for its handshake port and socket files, so a trailing
+    /// slash on an `ipc://` or `tcp://` registration stays in `base_url()`,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_a_socket_address_stays_in_the_base() {
+        let ipc = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(ipc.url(), "ipc:///tmp/engine/");
+        assert_eq!(ipc.base_url(), "ipc:///tmp/engine/");
+
+        let rank = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "ipc:///tmp/engine/");
+
+        let tcp = BasicWorkerBuilder::new("tcp://127.0.0.1:5555/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(tcp.base_url(), "tcp://127.0.0.1:5555/");
     }
 }

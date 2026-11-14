@@ -25,8 +25,8 @@ use super::{
         serialize_tokenspeed_encoder_input, serialize_tokenspeed_encoder_input_owned, wire_dtype,
     },
     transport::{
-        mm_encoder_input_dtype, mm_vllm_device_normalizes, mm_vllm_encoder_input_dtype,
-        resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
+        mm_encoder_input_dtype, mm_sglang_encoder_input_dtype, mm_vllm_device_normalizes,
+        mm_vllm_encoder_input_dtype, resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
     },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
@@ -66,6 +66,7 @@ pub(crate) async fn assemble_multimodal_data_after_encode(
     assemble_multimodal_data_impl(intermediate, client, workers, true).await
 }
 
+/// Dispatch assembly using the selected backend and worker metadata.
 async fn assemble_multimodal_data_impl(
     intermediate: MultimodalIntermediate,
     client: &BackendClient,
@@ -78,7 +79,7 @@ async fn assemble_multimodal_data_impl(
     // so assembly can never silently mishandle a modality the backend lacks.
     ensure_client_supports_intermediate(client, &intermediate)?;
     match client {
-        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate),
+        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate, workers),
         BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
             assemble_vllm_batches(intermediate, workers)?,
         )),
@@ -145,7 +146,7 @@ async fn assemble_multimodal_data_impl(
             }
             // The same modality batches the gRPC arm sends the servicer: the
             // adapter frames it as the scheduler's processor output.
-            RuntimeType::Sglang => assemble_sglang_data(intermediate),
+            RuntimeType::Sglang => assemble_sglang_data(intermediate, workers),
             runtime => anyhow::bail!(
                 "multimodal inputs are not supported over the {runtime} ZMQ backend yet"
             ),
@@ -154,10 +155,14 @@ async fn assemble_multimodal_data_impl(
 }
 
 /// Both transports share the same per-modality assembly.
-fn assemble_sglang_data(intermediate: MultimodalIntermediate) -> Result<MultimodalData> {
+/// Write every SGLang batch in the selected worker's declared floating dtype.
+fn assemble_sglang_data(
+    intermediate: MultimodalIntermediate,
+    workers: Option<&WorkerSelection>,
+) -> Result<MultimodalData> {
     Ok(MultimodalData::Sglang(assemble_sglang_batches(
         intermediate,
-        "float32",
+        mm_sglang_encoder_input_dtype(workers).as_str(),
     )?))
 }
 

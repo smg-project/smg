@@ -42,7 +42,7 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
-        testing::{arguments_of, bytes, calls, content, drive, finish, reasoning},
+        testing::{arguments_of, bytes, calls, content, drive, finish, malformed_texts, reasoning},
         Declared,
     };
 
@@ -65,16 +65,6 @@ mod tests {
                     text,
                     why: DropReason::Wrapper,
                 } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -209,7 +199,7 @@ mod tests {
     fn text_in_place_of_the_list_is_malformed_and_the_block_still_closes() {
         // Between the markers prose has no place: the template writes the list and nothing else.
         let events = run(PROMPT, "<TOOLCALL>not a list</TOOLCALL>Done.");
-        assert_eq!(malformed(&events), ["not a list"]);
+        assert_eq!(malformed_texts(&events), ["not a list"]);
         assert_eq!(content(&events), "Done.");
         assert!(calls(&events).is_empty());
         assert_eq!(finish(&events), (FinishReason::Stop, 0));
@@ -220,7 +210,7 @@ mod tests {
         assert_eq!(calls(&events).len(), 1);
         // The text after the list takes the whitespace before it: once text follows, every byte
         // after the `]` is the model's.
-        assert_eq!(malformed(&events), [" tail"]);
+        assert_eq!(malformed_texts(&events), [" tail"]);
         assert_eq!(dropped(&events), ["<TOOLCALL>", "[", "]", "</TOOLCALL>"]);
     }
 
@@ -306,7 +296,7 @@ mod tests {
                 "{\"game\": \"chess\"}".to_string()
             )]
         );
-        assert_eq!(malformed(&events), ["]}]"]);
+        assert_eq!(malformed_texts(&events), ["]}]"]);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed {

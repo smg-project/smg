@@ -79,7 +79,7 @@ pub(crate) const SOURCES_HEADLINE: &str =
 /// Logs the sources record, one INFO, when a secret was given: one field per
 /// secret naming its source, `flag`, `env`, `file` or `launcher`, and whether the key
 /// files are watched for changes (`secrets_auto_reload`: `off`, or `on` with
-/// the count of files watched).
+/// the names of the settings whose files are watched).
 pub(crate) fn log_secret_sources(sources: &SecretSources, secrets_auto_reload: &str) {
     if !sources.any() {
         return;
@@ -517,11 +517,13 @@ mod tests {
                 postgres_db_url: Some(SecretSource::Flag),
                 redis_url: None,
             },
-            "on (2 files)",
+            "on (api-key-file, control-plane-api-keys-file)",
         );
 
         assert!(logs_contain("CREDENTIAL SOURCES"));
-        assert!(logs_contain("secrets_auto_reload=\"on (2 files)\""));
+        assert!(logs_contain(
+            "secrets_auto_reload=\"on (api-key-file, control-plane-api-keys-file)\""
+        ));
         assert!(logs_contain("api_key=\"file\""));
         assert!(logs_contain("tenant_api_keys=\"env (3 entries)\""));
         assert!(logs_contain("control_plane_api_keys=\"file (2 entries)\""));

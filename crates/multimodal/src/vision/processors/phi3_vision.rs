@@ -624,7 +624,10 @@ mod tests {
     fn pixel_values_match_the_checkpoint_processor() {
         use sha2::{Digest, Sha256};
 
-        use crate::{encoder_inputs::EncoderDtype, test_support::lcg_rgb_image};
+        use crate::{
+            encoder_inputs::EncoderDtype,
+            test_support::{hex, lcg_rgb_image},
+        };
 
         let processor = Phi3VisionProcessor::with_config(4);
         for (width, height, seed, size, tokens, f32_digest, bf16_digest) in [
@@ -682,12 +685,7 @@ mod tests {
                 vec![tokens],
                 "{width}x{height}"
             );
-            let digest = |dtype| {
-                Sha256::digest(result.encoder_input.write_as(dtype))
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            };
+            let digest = |dtype| hex(&Sha256::digest(result.encoder_input.write_as(dtype)));
             assert_eq!(
                 digest(EncoderDtype::Float32),
                 f32_digest,

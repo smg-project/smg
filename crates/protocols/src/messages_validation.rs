@@ -8,9 +8,11 @@
 //! role inside `messages` (kept in place for the clients that send one), the
 //! vendor's model-specific couplings of thinking with `temperature` or a
 //! forced `tool_choice` (a served model may take both), and the per-model
-//! output-token cap. The rule that `thinking.budget_tokens` stays under
-//! `max_tokens` reads the `anthropic-beta` header (the interleaved-thinking
-//! beta lifts it), so the gateway's handler applies it.
+//! output-token cap. The rules that read the request's betas beside its body
+//! (`thinking.budget_tokens` under `max_tokens` unless the interleaved-thinking
+//! beta is named; `thread` only with the message-threads beta) are
+//! [`validate_with_betas`], applied by the gateway's Messages handler with the
+//! betas it parsed from the `anthropic-beta` header.
 //!
 //! Tighter than the public API in one place, on purpose: `top_p` is refused
 //! at 0.0 and `top_k` outside 1 to `i32::MAX`, the bounds this gateway's Chat
@@ -29,8 +31,8 @@ use validator::ValidationError;
 use crate::{
     common::invalid,
     messages::{
-        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, Role, ThinkingConfig,
-        Tool,
+        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, MessageThread,
+        MessagesBetas, Role, ThinkingConfig, Tool,
     },
 };
 
@@ -47,11 +49,64 @@ const PASSTHROUGH_CUSTOM_TOOL_FIELDS: &[&str] = &[
 pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError> {
     validate_sampling(req)?;
     validate_message_contents(&req.messages)?;
-    validate_tool_pairing(&req.messages)?;
+    validate_thread(req)?;
     validate_stop_sequences(req.stop_sequences.as_deref())?;
     validate_tools(req.tools.as_deref())?;
     validate_output_format(req)?;
     validate_thinking(req)
+}
+
+/// The rules that read the request's betas ([`MessagesBetas`], the
+/// `anthropic-beta` header parsed once) beside its body, applied by the
+/// gateway's Messages handler after the field-level validation and refused
+/// with the public API's own codes.
+pub fn validate_with_betas(
+    req: &CreateMessageRequest,
+    betas: MessagesBetas,
+) -> Result<(), ValidationError> {
+    validate_thinking_budget(req, betas)?;
+    validate_thread_beta(req, betas)
+}
+
+/// `thinking.budget_tokens` must leave room under `max_tokens` for the
+/// answer, unless the interleaved-thinking beta is on: then the budget covers
+/// every thinking block of the turn and the public API takes a budget at or
+/// above `max_tokens`.
+fn validate_thinking_budget(
+    req: &CreateMessageRequest,
+    betas: MessagesBetas,
+) -> Result<(), ValidationError> {
+    let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking else {
+        return Ok(());
+    };
+    if betas.interleaved_thinking() || *budget_tokens < req.max_tokens {
+        Ok(())
+    } else {
+        Err(invalid(
+            "thinking_budget_exceeds_max_tokens",
+            "`max_tokens` must be greater than `thinking.budget_tokens`",
+        ))
+    }
+}
+
+/// A thread turn names the message-threads beta, as the public API requires
+/// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
+/// the gateway's body layer to parse the request before the route, so a
+/// `thread` field without it is refused on the parsed (buffered) path with
+/// the public API's own 400. A header-less turn on the raw pass-through path
+/// never reaches this rule: it is forwarded unparsed, `thread` and all.
+fn validate_thread_beta(
+    req: &CreateMessageRequest,
+    betas: MessagesBetas,
+) -> Result<(), ValidationError> {
+    if req.thread.is_none() || betas.message_threads() {
+        Ok(())
+    } else {
+        Err(invalid(
+            "thread_beta_required",
+            "`thread` requires the `anthropic-beta: message-threads-2026-08-12` header",
+        ))
+    }
 }
 
 /// `temperature` takes the public API's range, 0 to 1; `top_p` the same range
@@ -97,6 +152,30 @@ fn validate_sampling(req: &CreateMessageRequest) -> Result<(), ValidationError> 
     Ok(())
 }
 
+/// A `continue` request carries the messages since the answer it continues
+/// and nothing the thread keeps from its create request: `system` and
+/// `tools` are refused, as the public API refuses them. Its tool pairing is
+/// judged on the conversation the gateway rebuilds (a `tool_result` that
+/// opens the request answers the stored answer's `tool_use`); every other
+/// request's pairing is judged here.
+fn validate_thread(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    if !matches!(req.thread, Some(MessageThread::Continue { .. })) {
+        return validate_tool_pairing(&req.messages);
+    }
+    let kept = match (req.system.is_some(), req.tools.is_some()) {
+        (false, false) => return Ok(()),
+        (true, false) => "system",
+        (false, true) => "tools",
+        (true, true) => "system or tools",
+    };
+    Err(invalid(
+        "thread_continue_carries_create_fields",
+        format!(
+            "thread: a continue request sends no {kept}: the thread keeps the create request's"
+        ),
+    ))
+}
+
 fn role_name(role: &Role) -> &'static str {
     match role {
         Role::User => "user",
@@ -107,8 +186,9 @@ fn role_name(role: &Role) -> &'static str {
 
 /// Every message carries content, except the optional final assistant
 /// message (a prefill), which may be empty but may not end in whitespace;
-/// every text block carries text. A `system` message in the array is this
-/// gateway's extension and is left to its own rules.
+/// every text block carries text, and every `tool_use` block's `input` is
+/// an object. A `system` message in the array is this gateway's extension
+/// and is left to its own rules.
 fn validate_message_contents(messages: &[InputMessage]) -> Result<(), ValidationError> {
     let last = messages.len().saturating_sub(1);
     for (index, message) in messages.iter().enumerate() {
@@ -137,6 +217,22 @@ fn validate_message_contents(messages: &[InputMessage]) -> Result<(), Validation
                 return Err(invalid(
                     "empty_text_block",
                     format!("messages.{index}: text content blocks must be non-empty"),
+                ));
+            }
+            // A `tool_use` block's `input` is the object the tool was called
+            // with: the public API refuses any other JSON value, and so does
+            // this gateway, before a string would be rendered as the call's
+            // arguments and answered as if the history were well-formed.
+            let not_an_object = blocks.iter().position(|block| {
+                matches!(block, InputContentBlock::ToolUse(tool_use) if !tool_use.input.is_object())
+            });
+            if let Some(position) = not_an_object {
+                return Err(invalid(
+                    "tool_use_input_not_an_object",
+                    format!(
+                        "messages.{index}.content.{position}.tool_use.input: Input should be a \
+                         valid dictionary"
+                    ),
                 ));
             }
         }
@@ -395,9 +491,9 @@ fn validate_output_format(req: &CreateMessageRequest) -> Result<(), ValidationEr
 }
 
 /// `enabled` needs a budget of at least 1024 tokens (that it stays under
-/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
-/// handler checks it); `between_tools` takes `type` alone (the public API
-/// refuses `display`, `budget_tokens` or `block_binding` sent with it).
+/// `max_tokens` depends on the betas, the rule of [`validate_with_betas`]);
+/// `between_tools` takes `type` alone (the public API refuses `display`,
+/// `budget_tokens` or `block_binding` sent with it).
 fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
     match &req.thinking {
         Some(ThinkingConfig::Enabled { budget_tokens, .. }) if *budget_tokens < 1024 => {
@@ -455,7 +551,10 @@ mod tests {
     }
 
     use super::*;
-    use crate::sampling_params::{validate_top_k_value, validate_top_p_value};
+    use crate::{
+        messages::CountMessageTokensRequest,
+        sampling_params::{validate_top_k_value, validate_top_p_value},
+    };
 
     #[test]
     fn sampling_parameters_take_the_public_range() {
@@ -647,6 +746,40 @@ mod tests {
         );
     }
 
+    /// A `tool_use` block's `input` is the arguments object: a string, or any
+    /// other value, is refused naming the block; an object of any shape is
+    /// accepted, and a system prompt in its own field stays accepted beside
+    /// it.
+    #[test]
+    fn a_tool_use_input_is_an_object() {
+        let with_input = |input: Value| {
+            json!({"messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_a", "name": "get_weather", "input": input}
+                ]},
+                {"role": "user", "content": [tool_result("toolu_a")]}
+            ], "system": "You are terse."})
+        };
+        let string = rejection(with_input(json!("Paris")));
+        assert!(
+            string.contains(
+                "messages.1.content.1.tool_use.input: Input should be a valid dictionary"
+            ),
+            "{string}"
+        );
+        for other in [json!(["Paris"]), json!(1), json!(null)] {
+            let refused = rejection(with_input(other.clone()));
+            assert!(
+                refused.contains("messages.1.content.1.tool_use.input"),
+                "{other}: {refused}"
+            );
+        }
+        accepted(with_input(json!({"city": "Paris"})));
+        accepted(with_input(json!({})));
+    }
+
     /// Consecutive messages of one role are one turn, as the public API
     /// combines them: parallel results split over two user messages answer
     /// one assistant turn, and a tool_use followed by more assistant text is
@@ -721,8 +854,8 @@ mod tests {
         accepted(
             json!({"max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
         );
-        // Whether the budget stays under max_tokens depends on the beta
-        // header: the handler decides, not the body alone.
+        // Whether the budget stays under max_tokens depends on the betas:
+        // validate_with_betas decides, not the body alone.
         accepted(
             json!({"max_tokens": 1024, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
         );
@@ -731,6 +864,92 @@ mod tests {
         accepted(
             json!({"max_tokens": 4096, "temperature": 0.6, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
         );
+    }
+
+    /// The betas of a request are its header's dated names: a header that
+    /// repeats or lists several, a longer name that begins with a known one
+    /// and a token without the dated suffix read as the public API reads them.
+    #[test]
+    fn betas_are_the_headers_dated_names() {
+        let none = MessagesBetas::from_header_values([]);
+        assert!(!none.message_threads() && !none.interleaved_thinking());
+        let values = [
+            "fine-grained-tool-streaming-2025-05-14, interleaved-thinking-2025-05-14",
+            "message-threads-2026-08-12",
+        ];
+        let listed = MessagesBetas::from_header_values(values);
+        assert!(listed.interleaved_thinking() && listed.message_threads());
+        assert!(MessagesBetas::values_name(
+            values,
+            "fine-grained-tool-streaming"
+        ));
+        assert!(!MessagesBetas::values_name(values, "fine-grained"));
+        assert!(!MessagesBetas::values_name(values, "threads"));
+        for undated in [
+            "message-threads",
+            "message-threads-2026-8-12",
+            "message-threads-v2-2026-08-12",
+        ] {
+            let betas = MessagesBetas::from_header_values([undated]);
+            assert!(!betas.message_threads(), "{undated}");
+            assert!(
+                !MessagesBetas::values_name([undated], "message-threads"),
+                "{undated}"
+            );
+        }
+        assert!(MessagesBetas::values_name(
+            ["token-counting-2024-11-01"],
+            "token-counting"
+        ));
+        assert!(!MessagesBetas::values_name(
+            ["token-counting-2024-11-01"],
+            "token"
+        ));
+    }
+
+    /// A thinking budget at or above `max_tokens` is refused as the public
+    /// API refuses it, except under the interleaved-thinking beta, where the
+    /// public API takes it.
+    #[test]
+    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
+        let with_budget = |max_tokens: u32, budget_tokens: u32| {
+            request(json!({
+                "max_tokens": max_tokens,
+                "thinking": {"type": "enabled", "budget_tokens": budget_tokens},
+            }))
+        };
+        let plain = MessagesBetas::default();
+        assert!(validate_with_betas(&with_budget(4096, 1024), plain).is_ok());
+        let refused = validate_with_betas(&with_budget(1024, 1024), plain).expect_err("refused");
+        assert_eq!(refused.code, "thinking_budget_exceeds_max_tokens");
+        assert_eq!(
+            refused.message.as_deref(),
+            Some("`max_tokens` must be greater than `thinking.budget_tokens`")
+        );
+        let interleaved = MessagesBetas::from_header_values([
+            "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+        ]);
+        assert!(validate_with_betas(&with_budget(1024, 1024), interleaved).is_ok());
+        assert!(validate_with_betas(&with_budget(1024, 8192), interleaved).is_ok());
+    }
+
+    /// A `thread` field needs the message-threads beta, as the public API
+    /// requires; a request without `thread` needs no beta.
+    #[test]
+    fn a_thread_field_needs_the_message_threads_beta() {
+        let thread = request(json!({"thread": {"type": "create"}}));
+        let plain = MessagesBetas::default();
+        assert!(validate_with_betas(&request(json!({})), plain).is_ok());
+        let refused = validate_with_betas(&thread, plain).expect_err("refused");
+        assert_eq!(refused.code, "thread_beta_required");
+        assert_eq!(
+            refused.message.as_deref(),
+            Some("`thread` requires the `anthropic-beta: message-threads-2026-08-12` header")
+        );
+        let named = MessagesBetas::from_header_values([
+            "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
+        ]);
+        assert!(validate_with_betas(&thread, named).is_ok());
     }
 
     #[test]
@@ -784,5 +1003,85 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    /// The `thread` field reads the public shapes: a create, a continue
+    /// naming its previous message (one without it is refused as the
+    /// field's deserializer refuses a missing field).
+    #[test]
+    fn the_thread_field_reads_the_public_shapes() {
+        assert_eq!(
+            request(json!({"thread": {"type": "create"}})).thread,
+            Some(MessageThread::Create)
+        );
+        assert_eq!(
+            request(json!({"thread": {"type": "continue", "previous_message_id": "msg_1"}})).thread,
+            Some(MessageThread::Continue {
+                previous_message_id: "msg_1".to_string()
+            })
+        );
+        let body = json!({
+            "model": "m", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thread": {"type": "continue"}
+        });
+        let refused = serde_json::from_value::<CreateMessageRequest>(body)
+            .expect_err("a continue names its previous message")
+            .to_string();
+        assert!(refused.contains("previous_message_id"), "{refused}");
+    }
+
+    /// A continue request sends the messages since the answer it continues,
+    /// not the `system` or `tools` the thread keeps; its tool pairing waits
+    /// for the rebuilt conversation, every other request's is judged here.
+    #[test]
+    fn a_continue_request_sends_no_system_or_tools() {
+        let cont = json!({"type": "continue", "previous_message_id": "msg_1"});
+        accepted(json!({"thread": cont}));
+        assert!(rejection(json!({"thread": cont, "system": "be brief"}))
+            .contains("thread: a continue request sends no system:"));
+        let tools = json!([{"name": "f", "input_schema": {"type": "object"}}]);
+        assert!(rejection(json!({"thread": cont, "tools": tools}))
+            .contains("thread: a continue request sends no tools:"));
+        assert!(
+            rejection(json!({"thread": cont, "system": "be brief", "tools": tools}))
+                .contains("thread: a continue request sends no system or tools:")
+        );
+        let result_first = json!([{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "42"}
+        ]}]);
+        accepted(json!({"thread": cont, "messages": result_first}));
+        // The fixed fields a continue request repeats include `tool_choice`,
+        // judged against the thread's tools once the conversation is rebuilt.
+        accepted(json!({"thread": cont, "tool_choice": {"type": "tool", "name": "f"}}));
+        assert!(
+            rejection(json!({"tool_choice": {"type": "tool", "name": "f"}}))
+                .contains("'tool_choice' is only allowed when 'tools' are specified")
+        );
+        assert!(
+            rejection(json!({"thread": {"type": "create"}, "messages": result_first}))
+                .contains("unexpected `tool_use_id`")
+        );
+        assert!(rejection(json!({"messages": result_first})).contains("unexpected `tool_use_id`"));
+    }
+
+    /// A count reads the whole conversation: `thread` is refused there.
+    #[test]
+    fn a_count_takes_no_thread() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thread": {"type": "create"}
+        });
+        let request: CountMessageTokensRequest =
+            serde_json::from_value(body).expect("a well-formed count request");
+        let refused = request
+            .validate()
+            .expect_err("a count takes no thread")
+            .to_string();
+        assert!(
+            refused.contains("thread: count_tokens takes no thread"),
+            "{refused}"
+        );
     }
 }

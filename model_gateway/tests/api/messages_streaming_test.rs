@@ -24,7 +24,7 @@ use serde_json::{json, Value};
     clippy::expect_used,
     reason = "test helper — panicking on bad input is intentional"
 )]
-fn parse_sse_events(raw: &[u8]) -> Vec<(String, Value)> {
+pub(super) fn parse_sse_events(raw: &[u8]) -> Vec<(String, Value)> {
     let text = std::str::from_utf8(raw).expect("UTF-8");
     let mut out = Vec::new();
     for block in text.split("\n\n") {
@@ -222,10 +222,7 @@ fn test_simple_events() {
     assert_eq!(ping["type"], "ping");
 
     let err: Value = serde_json::to_value(&MessageStreamEvent::Error {
-        error: ErrorResponse {
-            error_type: "api_error".to_string(),
-            message: "fail".to_string(),
-        },
+        error: ErrorResponse::new("api_error", "fail"),
     })
     .unwrap();
     assert_eq!(err["type"], "error");

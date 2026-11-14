@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -23,9 +24,11 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
+    rl_adapter,
     routers::{
         common::{
-            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+            openai_bridge::FormatRegistry, overload, pd_admission,
+            prefill_admission::PrefillAdmission, realtime::RealtimeRegistry,
         },
         gateway::Gateway,
         grpc::{
@@ -37,8 +40,8 @@ use crate::{
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
         http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
-        liveness, rl_adapter, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache,
-        WorkerMonitor, WorkerRegistry, WorkerService,
+        liveness, KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
+        WorkerService,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -78,6 +81,17 @@ pub struct AppContext {
     /// operator's request), read where a request finds no tokenizer for its
     /// model.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
+    /// The ids of the tokenizer entries a worker's registration loaded:
+    /// written by the registration workflow's loader under the registry's
+    /// per-name lock, before the entry is published (a reader that sees the
+    /// entry sees the record), read by the removal workflow's release step
+    /// and by the second look of a put-back or a worker's load, which take
+    /// no other entry (the startup entry and an operator's stay however
+    /// their models' workers come and go), and dropped with the entry on
+    /// every removal path, the operator's `DELETE /v1/tokenizers/{id}`
+    /// included: that ends the worker's ownership, and the model's next
+    /// registration loads afresh and records again.
+    pub worker_loaded_tokenizers: Arc<DashSet<String>>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -429,8 +443,10 @@ impl AppContextBuilder {
         // The configuration's liveness budgets (the stall, wedge and stale
         // thresholds and the warm-up slice, see `worker::liveness`) take
         // effect for every context built from it, the server's and a test's
-        // alike, here and nowhere else. They are process-wide and the first
-        // call wins, so the first context built in a process sets them.
+        // alike. They are process-wide and the first call wins, so a
+        // constructor that builds the policy registry itself configures them
+        // before that build (`from_config` and the test harness do).
+        // This call covers a context assembled without such a constructor.
         liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
@@ -496,6 +512,9 @@ impl AppContextBuilder {
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
+        let policy_registry = self
+            .policy_registry
+            .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
@@ -546,13 +565,12 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::new(TokenizerLoadFailures::new()),
+            worker_loaded_tokenizers: Arc::new(DashSet::new()),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
             prefill_admission,
-            policy_registry: self
-                .policy_registry
-                .ok_or(AppContextBuildError::MissingField("policy_registry"))?,
+            policy_registry,
             gateway: self.gateway,
             response_storage: self
                 .response_storage
@@ -602,6 +620,10 @@ impl AppContextBuilder {
                 .iter()
                 .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
         );
+        // The configuration's liveness budgets take effect before the policy
+        // registry is built below (the first call wins; `build` keeps its
+        // call for a context assembled without this constructor).
+        liveness::configure_from(&router_config);
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -920,8 +942,9 @@ impl AppContextBuilder {
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather
-    /// than by the last poll (the `UpdatePoliciesStep` picks the kind per
-    /// worker; HTTP and ZMQ workers are never subscribed). The monitor itself
+    /// than by the last poll (`start_kv_stream` picks the kind per worker,
+    /// for a registration and for an update that rebuilt the worker alike;
+    /// HTTP and ZMQ workers are never subscribed). The monitor itself
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
@@ -931,6 +954,11 @@ impl AppContextBuilder {
         // The load records on the streams are polls of the worker.
         if let Some(worker_monitor) = &self.worker_monitor {
             monitor.set_load_sink(worker_monitor);
+        }
+        // The add reads the registry before it stops or starts a stream: a
+        // worker the registry no longer holds under its URL gets none.
+        if let Some(registry) = &self.worker_registry {
+            monitor.set_worker_registry(registry);
         }
         monitor.start_stats_task();
 
@@ -979,14 +1007,16 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::WorkerStatus;
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::common::prefill_admission::PrefillAdmissionAttempt,
         worker::{
             test_support::{select_worker, worker_of},
-            BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType,
+            BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
         },
     };
 
@@ -1260,6 +1290,26 @@ mod tests {
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
+    /// A dropped context lets its worker monitor go: the monitor holds the
+    /// policy registry, and nothing the context builds holds the monitor
+    /// back.
+    #[tokio::test]
+    async fn a_dropped_context_lets_its_worker_monitor_go() {
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context");
+        let monitor = Arc::downgrade(context.worker_monitor.as_ref().expect("the worker monitor"));
+        drop(context);
+        assert!(
+            monitor.upgrade().is_none(),
+            "the worker monitor outlives its context"
+        );
+    }
+
     #[test]
     fn maybe_rate_limit_manager_disabled_is_ok_none() {
         let config = RouterConfig::default();
@@ -1423,6 +1473,55 @@ policy:
         drop(selected);
         drop(occupied);
     }
+
+    /// The app wires its worker registry into the monitor: an add for a
+    /// gRPC worker the registry does not hold starts no stream, and the
+    /// same worker gets one once registered.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_kv_event_monitor_reads_the_apps_worker_registry() {
+        let config = config_with_policy(PolicyConfig::Random);
+        let builder = AppContextBuilder::new()
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor();
+        let monitor = builder
+            .kv_event_monitor
+            .as_ref()
+            .expect("the monitor is built");
+        let registry = builder
+            .worker_registry
+            .as_ref()
+            .expect("the worker registry is built");
+        // A port that refuses connections at once: the stream's task loops
+        // on reconnects until `stop`, with no engine involved.
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        assert!(logs_contain(
+            "no KV event stream for a worker the registry no longer holds"
+        ));
+        assert!(!logs_contain("Starting KV event subscription"));
+
+        registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        assert!(logs_contain("Starting KV event subscription"));
+        monitor.stop().await;
+    }
 }
 
 #[cfg(test)]
@@ -1505,6 +1604,7 @@ pub(crate) mod testing {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::default(),
+            worker_loaded_tokenizers: Arc::default(),
             wasm_manager: None,
             worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
                 &router_config,

@@ -93,7 +93,9 @@ def _server_args(**overrides):
 
 
 def _model_config(**overrides):
+    """Resolved model configuration shared by both launcher fact producers."""
     config = dict(
+        dtype="torch.bfloat16",
         context_len=4096,
         vocab_size=1024,
         is_generation=True,
@@ -410,10 +412,10 @@ def test_epd_roles_this_process_cannot_serve_are_refused_up_front(monkeypatch):
     language-only launch on a backend the scheduler ranks receive on passes
     (the encode dispatch runs in this process), as do the prefill/decode
     roles with one scheduler rank (the wire carries the bootstrap fields)
-    and a plain worker; a prefill/decode leg with more than one rank passes
-    too (the servicer places a prefill leg's request on the rank of its room
-    and a decode leg's on its pin) but for the one shape the engine cannot
-    serve: a prefill leg of several plain data-parallel replicas, whose KV
+    and a plain worker; a prefill/decode side with more than one rank passes
+    too (the servicer places a prefill side's request on the rank of its room
+    and a decode side's on its pin) but for the one shape the engine cannot
+    serve: a prefill side of several plain data-parallel replicas, whose KV
     sender fails every request of a non-zero room residue (every replica is
     attention-DP rank 0). Attention DP passes (the newer releases'
     ``attn_dp_size`` beside ``dp_size=1``, the pinned release's ``dp_size``
@@ -825,9 +827,14 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     supervised: dict = {}
@@ -860,9 +867,14 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     launched = {}
@@ -927,9 +939,14 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False, args=Non
     if real_facts:
         monkeypatch.setattr(rust, "_model_config", lambda args: _model_config())
     else:
-        monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
         monkeypatch.setattr(
-            rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+            rust.SglangLauncher,
+            "facts",
+            lambda self, args: {
+                "model_path": args.model_path,
+                "data_parallel_size": 1,
+                "sglang_version": "x",
+            },
         )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     monkeypatch.setattr(
@@ -966,9 +983,9 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
 
 
 def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp_path):
-    """A prefill or decode leg plans the warm-up as a single engine does and
+    """A prefill or decode side plans the warm-up as a single engine does and
     holds readiness for it; the plan's inputs carry the engine's stand-in
-    bootstrap host, so the requests are bound for nobody and the leg warms up
+    bootstrap host, so the requests are bound for nobody and the side warms up
     before its peer is there."""
     monkeypatch.setitem(
         sys.modules,
@@ -1230,7 +1247,7 @@ def test_a_language_only_launch_plans_the_warm_up_as_a_plain_worker(monkeypatch)
     the first forward of a fresh scheduler is paid before the health flips,
     not by the first request. The encoder-only role is the engine's own
     server and plans nothing."""
-    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: None)  # no image leg here
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: None)  # no image request here
     launcher = rust.SglangLauncher()
     facts = {"is_generation": True, "max_context_length": 4096, "vocab_size": 1024}
     language_side = launcher.warmup_inputs(
@@ -1253,7 +1270,7 @@ def test_a_language_only_launch_ends_its_warm_up_with_one_image_through_the_enco
     the text shapes of a single engine and ends them with one image through
     the encoders, built from the model's own template (the scheduler's media
     path has a first-use cost no text request reaches); the wire gets that
-    material. A template without an image placeholder leaves the leg out; a
+    material. A template without an image placeholder leaves the media request out; a
     plain worker and the encoder-only role never render the prompt."""
     facts = {"is_generation": True, "max_context_length": 4096, "vocab_size": 1024}
     language = _server_args(
@@ -1294,7 +1311,7 @@ def test_a_language_only_launch_ends_its_warm_up_with_one_image_through_the_enco
     wire.close()
     # A plain worker and the encoder-only role never render the prompt.
     monkeypatch.setattr(
-        rust, "media_warmup", lambda *args, **kwargs: pytest.fail("no image leg on this worker")
+        rust, "media_warmup", lambda *args, **kwargs: pytest.fail("no image request on this worker")
     )
     assert rust.SglangLauncher().warmup_inputs(_server_args(), facts).media_leg is False
     assert rust.SglangLauncher().warmup_inputs(_server_args(encoder_only=True), facts) is None
@@ -1313,9 +1330,14 @@ def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
     launched = {}
@@ -1362,9 +1384,14 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
     monkeypatch.setattr(
-        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+        rust.SglangLauncher,
+        "facts",
+        lambda self, args: {
+            "model_path": args.model_path,
+            "data_parallel_size": 1,
+            "sglang_version": "x",
+        },
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
 
@@ -1447,3 +1474,19 @@ def test_native_media_dtype_rejects_unknown(monkeypatch):
     monkeypatch.setenv("SMG_SGLANG_MM_DTYPE", "fp8")
     with pytest.raises(ValueError, match="SMG_SGLANG_MM_DTYPE"):
         rust.SglangLauncher().server_extras(_server_args(), "/tok")
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_launcher_facts_share_resolved_dtype(monkeypatch, dtype):
+    """Read ModelConfig once and publish its effective dtype in server facts."""
+    calls = []
+
+    def config(args):
+        calls.append(args)
+        return _model_config(dtype="torch." + dtype)
+
+    monkeypatch.setattr(rust, "_model_config", config)
+    args = _server_args()
+    facts = rust.SglangLauncher().facts(args)
+    assert calls == [args]
+    assert json.loads(facts["server_args_json"])["multimodal_encoder_dtype"] == dtype

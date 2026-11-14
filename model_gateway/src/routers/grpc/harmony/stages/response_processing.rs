@@ -180,7 +180,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     )
                     .await?;
 
-                ctx.response.responses_iteration_result = Some(iteration_result);
+                ctx.response.responses_iteration_result = Some(Box::new(iteration_result));
                 // The engine's counts, for the settlement of the iteration's
                 // reservation, as the chat branch records them.
                 ctx.response.engine_counts = Some(counts);

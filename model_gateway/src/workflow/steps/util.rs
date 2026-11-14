@@ -293,11 +293,11 @@ pub(crate) async fn mock_grpc_engine_on(
         tokenizer_path: "probe-model".to_string(),
         ..mock_worker::config::Config::default()
     });
+    // A port an earlier test's engine served on keeps that engine's
+    // overrides; this engine starts from fresh ones.
+    let overrides = mock_worker::overrides::fresh_for_port(port);
     tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-    (
-        format!("grpc://127.0.0.1:{port}"),
-        mock_worker::overrides::for_port(port),
-    )
+    (format!("grpc://127.0.0.1:{port}"), overrides)
 }
 
 #[cfg(test)]

@@ -8,8 +8,8 @@ use crate::routers::{
     grpc::{
         common::stages::helpers,
         context::{
-            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-            ExecutionPlanKind, RequestContext,
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, PlanSettings,
+            RequestContext,
         },
         spec::{GenerateResponseSpec, ResponseSpec},
     },
@@ -19,16 +19,12 @@ use crate::routers::{
 ///
 /// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
 pub(crate) struct GenerateRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl GenerateRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -91,7 +87,7 @@ impl GenerateRequestBuildingStage {
         ctx.state.response.router_stop_obligations = builder_client
             .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
 
-        if self.inject_pd_metadata {
+        if self.settings.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {
                 helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
             }
@@ -104,13 +100,13 @@ impl GenerateRequestBuildingStage {
         }
 
         Ok(BuildOutput {
-            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            plan: ExecutionPlan::generate(self.settings.plan_kind, proto_request),
             spec: ResponseSpec::Generate(GenerateResponseSpec::from(generate_request.as_ref())),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,
                 sampling_baseline,
-                inject_pd_metadata: self.inject_pd_metadata,
+                inject_pd_metadata: self.settings.inject_pd_metadata,
                 tool_constraint: None,
             },
         })
@@ -122,8 +118,8 @@ impl GenerateRequestBuildingStage {
     #[cfg(test)]
     pub(crate) fn signature(&self) -> String {
         format!(
-            "GenerateRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
+            "GenerateRequestBuildingStage({})",
+            self.settings.signature()
         )
     }
 }

@@ -1,0 +1,59 @@
+# Regression gate for `cargo bench -p smg-policy-controller --bench decision`, run by
+# .github/workflows/benchmark-policy-engine.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the whole file: the view build at 8, 64 and 512 workers (`policy_engine/view_build/<n>`),
+# the decision per preset at the same sizes (`policy_engine/decide/<preset>/<n>`), the least-load decision
+# with a credit held per row (`policy_engine/decide/least_load_credited/<n>`) and the spec's
+# parse-and-validate time (`policy_engine/spec/parse_validate`): 22 single-threaded rows, deterministic by
+# construction (a fresh seed per iteration), about four minutes a run, so three interleaved runs a side fit
+# the job's budget.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median
+# of the per-run criterion medians over six pinned runs of one build of main, each from a fresh copy of the
+# binary with a fresh criterion home, on a shared many-core build host at a load of 25 to 45:
+#
+#   rows                                                  identical build   threshold
+#   view_build/{8,64,512}                                 0.8 - 1.1 %       10 %
+#   decide/<preset>/{64,512}, least_load_credited/{64,512} 0.6 - 4.1 %      10 %
+#   spec/parse_validate                                   3.7 %             10 %
+#   decide/<preset>/8, least_load_credited/8 (160-380 ns) 2.4 - 6.2 %       15 %
+#
+# The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never
+# under 10 % (the hosted runner is noisier than the build host). The eight-worker rows are the shortest and
+# read the widest spread, so they take 15 %; every other row takes 10 %. On top of the threshold the gate
+# fails an id only when every pull-request run is slower than every base run (scripts/bench_gate.py), so
+# one slow run cannot fail the job. Read as three base and three head runs, the null case passed at every
+# threshold from 10 % up: 0 failed, 0 suspect of 22 ids.
+#
+# Placement. The workflow builds its binaries, the gate's pair and the summary run's, with every function on
+# a 64-byte boundary (RUSTFLAGS: `-C llvm-args=-align-all-functions=6`, beside the outliner flag of
+# .cargo/config.toml). symphony.toml records why: identical code sits in one of two speed states chosen by
+# where its unchanged hot functions land modulo 64, and a pull request's code size alone moved them. An
+# inserted regression on the decision path (100 dependent multiply-adds plus 12 per candidate before the
+# profile runs, never committed) is caught: 18 of 22 ids failed
+# and 0 were suspect, every decision row at +32 to +85 % (the eight-worker rows +34 to +75 %, the 64- and
+# 512-worker rows +37 to +85 %), confirmed by the re-measure round; the view build and the spec row, which the
+# mutant does not touch, read within 0.5 %.
+#
+# Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
+# own spread can be read from those and the thresholds tightened once it is known.
+
+repeats = 3
+filter = "^policy_engine/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["crates/policy_controller/benches/decision.rs", "crates/policy_controller/benches/common/mod.rs"]
+
+# The first gate whose pattern matches an id decides its threshold.
+[[gate]]
+pattern = "^policy_engine/decide/[a-z_]+/8$"
+threshold = 0.15
+note = "identical build 2.4 - 6.2 % on the 160 to 380 ns rows"
+
+[[gate]]
+pattern = "^policy_engine/"
+threshold = 0.10
+note = "identical build 0.6 - 4.1 %"

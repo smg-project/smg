@@ -16,7 +16,7 @@ use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 
 use crate::{
-    client::{zmq_status, ZmqEngineClient},
+    client::{no_engine, zmq_status, ZmqEngineClient},
     vllm::{finish_reason_str, now_secs},
 };
 
@@ -72,7 +72,7 @@ impl ZmqEngineClient {
             .engines()
             .first()
             .map(|engine| engine.ready_response.max_model_len)
-            .ok_or_else(|| Status::unavailable("no connected ZMQ engine"))?;
+            .ok_or_else(no_engine)?;
         let request = translate_embed_request(req, PoolingParams::embed_for(pooler), max_model_len)
             .map_err(Status::invalid_argument)?;
         // vLLM's frontend refuses a task the model runner does not serve

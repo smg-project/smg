@@ -15,12 +15,9 @@
 //! writer's path pays itself: the burst behind that chunk is decoded only
 //! once the connection holds the frame.
 
-use std::{
-    pin::Pin,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use futures::{future::try_join_all, Stream, StreamExt as _};
+use futures::{future::try_join_all, StreamExt as _};
 use llm_tokenizer::{
     traits::{Decoder, Encoder, Encoding, TokenIdType, Tokenizer},
     SpecialTokens,
@@ -32,7 +29,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use super::{
     super::*,
     eof::{
-        chunk, chunk_of_ids, complete, dispatch, gated_stream, processor, scripted_stream,
+        chunk, chunk_of_ids, complete, dispatch, gated_stream, processor, pull, scripted_stream,
         staged_stream, CharacterTokenizer,
     },
 };
@@ -104,7 +101,7 @@ async fn two_prompt_reading(
     later_stream: ProtoStream,
     tokenizer: Arc<dyn Tokenizer>,
     tx: SseSender,
-) {
+) -> ReadingEnd {
     let processor = processor(false);
     let spec = completion_spec();
     let body_first_frame = AtomicBool::new(false);
@@ -134,6 +131,43 @@ async fn two_prompt_reading(
     ])
     .await;
     assert!(outcomes.is_ok(), "{:?}", outcomes.err());
+    ReadingEnd::Complete
+}
+
+/// Open the gate of [`later_prompt_stream`]'s prompt and read its hand-off on
+/// `body`: its first-token frame (`x`) leaves alone, the pull after it is
+/// pending (the second yield of the hand-off, so the connection writes the
+/// frame before the reading runs on into the burst), and the pull after that
+/// is the burst behind it (`y`, `z`) as one frame.
+async fn a_later_prompts_first_token_yields_twice(
+    body: &mut DrivenBody,
+    gate: oneshot::Sender<()>,
+) {
+    gate.send(()).expect("the later prompt's gate");
+    let later_first = body
+        .next()
+        .await
+        .expect("the body ends only after the later prompt's first token")
+        .expect("a write");
+    let later_first = String::from_utf8(later_first.to_vec()).expect("text");
+    assert!(
+        later_first.contains(r#""text":"x""#) && !later_first.contains(r#""text":"y""#),
+        "the later prompt's first token leaves alone: {later_first}"
+    );
+    let next = pull(body).await;
+    assert!(
+        next.is_pending(),
+        "the pull after a later prompt's first-token frame must be pending, not its burst: {next:?}"
+    );
+    let next = pull(body).await;
+    let Poll::Ready(Some(Ok(burst))) = next else {
+        panic!("the pull after the pending one is the burst's frame: {next:?}");
+    };
+    let burst = String::from_utf8(burst.to_vec()).expect("text");
+    assert!(
+        burst.contains(r#""text":"y""#) && burst.contains(r#""text":"z""#),
+        "the chunks ready behind the later prompt's first token share a frame: {burst}"
+    );
 }
 
 /// The first token's frame reaches the connection before the reading runs on
@@ -176,6 +210,7 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
             )
             .await;
         assert!(result.is_ok(), "{:?}", result.err());
+        ReadingEnd::Complete
     };
     let mut body = DrivenBody::new(Box::pin(reading), rx);
     let first = body
@@ -191,16 +226,16 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
     // The pull after it: pending (the body's own yield after its first
     // frame), so the connection writes the first token's frame before the
     // reading runs on.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    let next = pull(&mut body).await;
     assert!(
-        pull.is_pending(),
-        "the pull after the first token's frame must be pending, not a frame: {pull:?}"
+        next.is_pending(),
+        "the pull after the first token's frame must be pending, not a frame: {next:?}"
     );
     // The pull after that: the burst's frame, the reading having yielded
     // once at the hand-off. Pending here would be a second yield.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    let Poll::Ready(Some(Ok(burst))) = pull else {
-        panic!("the pull after the pending one is the burst's frame: {pull:?}");
+    let next = pull(&mut body).await;
+    let Poll::Ready(Some(Ok(burst))) = next else {
+        panic!("the pull after the pending one is the burst's frame: {next:?}");
     };
     let burst = String::from_utf8(burst.to_vec()).expect("text");
     assert!(
@@ -489,42 +524,16 @@ async fn a_later_prompts_first_token_is_pending_to_the_connection_before_its_bur
         "the body's first frame is the first prompt's first token: {first}"
     );
     // The pull after the body's first frame: pending, the body's own yield.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    let next = pull(&mut body).await;
     assert!(
-        pull.is_pending(),
-        "the pull after the body's first frame must be pending: {pull:?}"
+        next.is_pending(),
+        "the pull after the body's first frame must be pending: {next:?}"
     );
     // The later prompt's messages are ready: its first token's frame leaves
-    // alone, the burst behind it unread.
-    later_tx.send(()).expect("the later prompt's gate");
-    let later_first = body
-        .next()
-        .await
-        .expect("the body ends only after the later prompt's first token")
-        .expect("a write");
-    let later_first = String::from_utf8(later_first.to_vec()).expect("text");
-    assert!(
-        later_first.contains(r#""text":"x""#) && !later_first.contains(r#""text":"y""#),
-        "the later prompt's first token leaves alone: {later_first}"
-    );
-    // The pull after it: pending, the second yield of the hand-off (the
-    // body's own yield went with its first frame), so the connection writes
-    // the frame before the reading runs on into the burst.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    assert!(
-        pull.is_pending(),
-        "the pull after a later prompt's first-token frame must be pending, not its burst: {pull:?}"
-    );
-    // The pull after that: the burst's frame.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    let Poll::Ready(Some(Ok(burst))) = pull else {
-        panic!("the pull after the pending one is the burst's frame: {pull:?}");
-    };
-    let burst = String::from_utf8(burst.to_vec()).expect("text");
-    assert!(
-        burst.contains(r#""text":"y""#) && burst.contains(r#""text":"z""#),
-        "the chunks ready behind the later prompt's first token share a frame: {burst}"
-    );
+    // alone and its hand-off yields twice (the body's own yield went with its
+    // first frame), so the connection writes the frame before the reading
+    // runs on into the burst.
+    a_later_prompts_first_token_yields_twice(&mut body, later_tx).await;
     first_end_tx.send(()).expect("the first prompt's end");
     let rest: Vec<_> = body.collect().await;
     assert!(
@@ -568,38 +577,14 @@ async fn an_earlier_prompts_token_less_finish_is_the_bodys_first_frame_and_a_lat
         "the body's first frame is the first prompt's finish, with no token: {first}"
     );
     // The pull after the body's first frame: pending, the body's own yield.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    let next = pull(&mut body).await;
     assert!(
-        pull.is_pending(),
-        "the pull after the body's first frame must be pending: {pull:?}"
+        next.is_pending(),
+        "the pull after the body's first frame must be pending: {next:?}"
     );
-    later_tx.send(()).expect("the later prompt's gate");
-    let later_first = body
-        .next()
-        .await
-        .expect("the body ends only after the later prompt's first token")
-        .expect("a write");
-    let later_first = String::from_utf8(later_first.to_vec()).expect("text");
-    assert!(
-        later_first.contains(r#""text":"x""#) && !later_first.contains(r#""text":"y""#),
-        "the later prompt's first token leaves alone: {later_first}"
-    );
-    // The pull after it: pending, the second yield of the hand-off, the
-    // body's first frame having been the earlier prompt's finish.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    assert!(
-        pull.is_pending(),
-        "the pull after a later prompt's first-token frame must be pending, not its burst: {pull:?}"
-    );
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    let Poll::Ready(Some(Ok(burst))) = pull else {
-        panic!("the pull after the pending one is the burst's frame: {pull:?}");
-    };
-    let burst = String::from_utf8(burst.to_vec()).expect("text");
-    assert!(
-        burst.contains(r#""text":"y""#) && burst.contains(r#""text":"z""#),
-        "the chunks ready behind the later prompt's first token share a frame: {burst}"
-    );
+    // The later prompt's hand-off yields twice, the body's first frame having
+    // been the earlier prompt's finish.
+    a_later_prompts_first_token_yields_twice(&mut body, later_tx).await;
     let rest: Vec<_> = body.collect().await;
     assert!(
         rest.iter().all(Result::is_ok),
@@ -746,16 +731,16 @@ async fn an_earlier_prompts_echo_past_the_flush_size_is_the_bodys_first_frame_an
         "only the first chunk's token is decoded when the body hands the first frame out"
     );
     // The pull after the body's first frame: pending, the body's own yield.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    let next = pull(&mut body).await;
     assert!(
-        pull.is_pending(),
-        "the pull after the body's first frame must be pending: {pull:?}"
+        next.is_pending(),
+        "the pull after the body's first frame must be pending: {next:?}"
     );
     // The pull after that: the burst behind the first chunk, as one frame
     // (one yield at the writer's hand-off, the body's own made the second).
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    let Poll::Ready(Some(Ok(burst))) = pull else {
-        panic!("the pull after the pending one is the first prompt's burst: {pull:?}");
+    let next = pull(&mut body).await;
+    let Poll::Ready(Some(Ok(burst))) = next else {
+        panic!("the pull after the pending one is the first prompt's burst: {next:?}");
     };
     let burst = String::from_utf8(burst.to_vec()).expect("text");
     assert!(
@@ -764,33 +749,9 @@ async fn an_earlier_prompts_echo_past_the_flush_size_is_the_bodys_first_frame_an
             && !burst.contains(r#""text":"x""#),
         "the chunks ready behind the first prompt's first chunk share a frame: {burst}"
     );
-    later_tx.send(()).expect("the later prompt's gate");
-    let later_first = body
-        .next()
-        .await
-        .expect("the body ends only after the later prompt's first token")
-        .expect("a write");
-    let later_first = String::from_utf8(later_first.to_vec()).expect("text");
-    assert!(
-        later_first.contains(r#""text":"x""#) && !later_first.contains(r#""text":"y""#),
-        "the later prompt's first token leaves alone: {later_first}"
-    );
-    // The pull after it: pending, the second yield of the hand-off, the
-    // body's first frame having been the earlier prompt's.
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    assert!(
-        pull.is_pending(),
-        "the pull after a later prompt's first-token frame must be pending, not its burst: {pull:?}"
-    );
-    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
-    let Poll::Ready(Some(Ok(burst))) = pull else {
-        panic!("the pull after the pending one is the burst's frame: {pull:?}");
-    };
-    let burst = String::from_utf8(burst.to_vec()).expect("text");
-    assert!(
-        burst.contains(r#""text":"y""#) && burst.contains(r#""text":"z""#),
-        "the chunks ready behind the later prompt's first token share a frame: {burst}"
-    );
+    // The later prompt's hand-off yields twice, the body's first frame having
+    // been the earlier prompt's.
+    a_later_prompts_first_token_yields_twice(&mut body, later_tx).await;
     first_end_tx.send(()).expect("the first prompt's end");
     let rest: Vec<_> = body.collect().await;
     assert!(

@@ -4,7 +4,7 @@
 router:
   workerUrls:
     - http://worker-1:8000
-  # The control-plane routes move to this port; <release>-smg-router-admin
+  # The control-plane routes move to this port; <fullname>-router-admin
   # exposes it inside the cluster, the ingress never does.
   adminPort: 9001
   adminService:

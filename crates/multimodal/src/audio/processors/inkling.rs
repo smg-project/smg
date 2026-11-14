@@ -508,6 +508,7 @@ fn quantize_dmel(value: f64, params: &InklingAudioEncoderParams) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn rejects_empty_or_invalid_rate_audio() {
@@ -709,38 +710,9 @@ mod tests {
     /// the chunk boundary (32 frames of 800 samples), either side of it, and
     /// a thirty-second clip; quiet (raised to the floor), ordinary and loud.
     fn waveform_corpus() -> Vec<(String, DecodedAudio)> {
-        let mut corpus = Vec::new();
-        for samples in [
-            1usize, 799, 800, 801, 1600, 16_000, 24_800, 25_600, 25_601, 26_400, 480_000,
-        ] {
-            for (scale, label) in [(0.001_f32, "quiet"), (0.5, "mid"), (1.0, "loud")] {
-                let mut state: u32 = 0x9E37_79B9 ^ samples as u32;
-                let wave: Vec<f32> = (0..samples)
-                    .map(|i| {
-                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                        let noise = (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
-                        ((i as f32 * 0.03).sin() * 0.7 + noise * 0.3) * scale
-                    })
-                    .collect();
-                corpus.push((
-                    format!("{samples} samples {label}"),
-                    DecodedAudio {
-                        samples: wave,
-                        sample_rate: 16_000,
-                    },
-                ));
-            }
-        }
-        // one clip at another rate, through the resampler
-        let wave: Vec<f32> = (0..8_000).map(|i| (i as f32 * 0.05).sin() * 0.4).collect();
-        corpus.push((
-            "8000 samples at 8 kHz".to_string(),
-            DecodedAudio {
-                samples: wave,
-                sample_rate: 8_000,
-            },
-        ));
-        corpus
+        test_support::waveform_corpus(&[
+            1, 799, 800, 801, 1600, 16_000, 24_800, 25_600, 25_601, 26_400, 480_000,
+        ])
     }
 
     fn assert_same_bits(name: &str, actual: &Array2<f32>, expected: &Array2<f32>) {

@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use openai_protocol::common::ResponseFormat;
 use serde_json::Value;
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
@@ -140,6 +141,7 @@ fn retry_reshapes_the_forced_call_for_its_own_workers_engine() {
                 Some(PARSER),
                 false,
                 &request,
+                None,
             ),
         };
         assert!(
@@ -206,6 +208,7 @@ fn a_table_tag_built_for_the_first_token_keeps_its_start_on_a_retry() {
                 Some(PARSER),
                 true,
                 &request,
+                None,
             ),
         };
         let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
@@ -239,14 +242,20 @@ fn a_request_without_the_forced_calls_tag_is_left_as_built() {
         ..Default::default()
     }));
     let schema_constraint = ("json_schema".to_string(), schema.clone());
-    assert!(
-        ToolConstraintStamp::capture(Some(schema_constraint), Some(PARSER), false, &request)
-            .is_none()
-    );
+    assert!(ToolConstraintStamp::capture(
+        Some(schema_constraint),
+        Some(PARSER),
+        false,
+        &request,
+        None
+    )
+    .is_none());
     // The forced call's tag that the backend dropped for the request's
     // response_format: the request carries the schema, not the tag.
     let unshaped = forced_call_on_a_thinking_prompt(&factory, PARSER);
-    assert!(ToolConstraintStamp::capture(Some(unshaped), Some(PARSER), false, &request).is_none());
+    assert!(
+        ToolConstraintStamp::capture(Some(unshaped), Some(PARSER), false, &request, None).is_none()
+    );
 
     request.set_structural_tag("{}".to_string());
     assert_eq!(request.structural_tag(), None);
@@ -523,4 +532,48 @@ fn retry_derives_the_tables_auto_tag_for_its_own_workers_start() {
         ..Default::default()
     }));
     assert!(ToolConstraintStamp::capture_table(tag, &outranked).is_none());
+}
+
+/// The body's own structural tag, kept by a builder that lets the
+/// `response_format` outrank the forced call's grammar, is no forced call's
+/// tag: nothing is stamped, and a retry keeps the client's tag as sent. The
+/// forced call's tag on the request beside the same `response_format` (a
+/// builder that lets the tool constraint win) is stamped as before.
+#[test]
+fn a_request_carrying_the_bodys_own_tag_is_not_stamped() {
+    let factory = ToolParserFactory::new();
+    let unshaped = forced_call_on_a_thinking_prompt(&factory, PARSER);
+    let own: ResponseFormat = serde_json::from_value(serde_json::json!({
+        "type": "structural_tag",
+        "structures": [{"begin": "<w>", "schema": {"type": "object"}, "end": "</w>"}],
+        "triggers": ["<w>"]
+    }))
+    .unwrap();
+    let own_tag = serde_json::to_string(&own).unwrap();
+    for (backend, request) in requests_with_tag(&own_tag) {
+        let stamp = ToolConstraintStamp::capture(
+            Some(unshaped.clone()),
+            Some(PARSER),
+            false,
+            &request,
+            Some(&own),
+        );
+        assert!(
+            stamp.is_none(),
+            "{backend}: the request carries the body's own tag"
+        );
+    }
+    for (backend, request) in requests_with_tag(&unshaped.1) {
+        let stamp = ToolConstraintStamp::capture(
+            Some(unshaped.clone()),
+            Some(PARSER),
+            false,
+            &request,
+            Some(&own),
+        );
+        assert!(
+            stamp.is_some(),
+            "{backend}: the request carries the forced call's tag"
+        );
+    }
 }

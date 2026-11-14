@@ -170,7 +170,7 @@ RUN uv pip install maturin \
     && rm -rf /root/.cache
 
 ######################### ROUTER IMAGE #########################
-FROM base AS router-image
+FROM base AS router
 ARG TARGETARCH
 
 # libjpeg-turbo and libwebp for the media pipeline: the gateway loads
@@ -212,3 +212,32 @@ USER smg
 
 # Set the entrypoint to the main command
 ENTRYPOINT ["python3", "-m", "smg.launch_router"]
+
+######################### ROUTER IMAGE WITH THE SLURM CLIENTS #########################
+# The Slurm discovery provider runs `squeue` and `scontrol` in the router
+# container, so this stage adds Ubuntu's Slurm 23.11 client package to the
+# router image, with the JWT authentication plugin (its own package, which the
+# client does not depend on); the workflows publish it beside the router image
+# as the `-slurm` tag. A controller accepts commands up to two major releases
+# older than itself (three from 24.11 on), so these clients speak to a 23.11,
+# 24.05, 24.11 or 25.05 controller; a newer cluster needs an image with its
+# own clients. The cluster's slurm.conf and authentication still come from the
+# deployment: a running munged's socket (a sidecar or the host; this image
+# never starts one) or auth/jwt with SLURM_JWT. munge's install generates a
+# key, which is removed here so that no deployment runs on a key every pull of
+# this image shares.
+FROM router AS router-slurm-image
+USER root
+RUN apt update -y \
+    && apt install -y --no-install-recommends slurm-client slurm-wlm-jwt-plugin \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt clean \
+    && rm -f /etc/munge/munge.key \
+    && command -v squeue \
+    && command -v scontrol \
+    && ls /usr/lib/*/slurm-wlm/auth_jwt.so
+USER smg
+
+# The last stage is what a build that names no target makes: the router image
+# as before, without the Slurm clients.
+FROM router AS router-image

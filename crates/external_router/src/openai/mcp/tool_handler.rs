@@ -197,23 +197,30 @@ impl StreamingToolHandler {
         self.accumulator.snapshot_final_response()
     }
 
-    /// Process an SSE event and determine what action to take
+    /// Process an SSE event given as its name and data payload: the payload
+    /// is parsed here, once, and handed to [`Self::process_parsed`]. An
+    /// unparsable payload reaches the accumulator (which logs it, as it
+    /// always did) and is forwarded.
     pub fn process_event(&mut self, event_name: Option<&str>, data: &str) -> StreamAction {
+        match serde_json::from_str::<Value>(data) {
+            Ok(parsed) => self.process_parsed(event_name, &parsed),
+            Err(_) => {
+                self.accumulator.ingest_event(event_name, data);
+                StreamAction::Forward
+            }
+        }
+    }
+
+    /// Process an SSE event the reader has parsed already and determine
+    /// what action to take. The accumulator records the same value, so the
+    /// stored record holds exactly what the reader relayed, a data payload
+    /// spanning lines included, and the reader's one parse serves its own
+    /// checks, this gate and the record.
+    pub fn process_parsed(&mut self, event_name: Option<&str>, parsed: &Value) -> StreamAction {
         // Always feed to accumulator for storage
-        self.accumulator.ingest_block(&format!(
-            "{}data: {}",
-            event_name
-                .map(|n| format!("event: {n}\n"))
-                .unwrap_or_default(),
-            data
-        ));
+        self.accumulator.ingest_parsed(event_name, parsed);
 
-        let parsed: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => return StreamAction::Forward,
-        };
-
-        match get_event_type(event_name, &parsed) {
+        match get_event_type(event_name, parsed) {
             ResponseEvent::CREATED => {
                 if self.original_response_id.is_none() {
                     self.original_response_id = parsed
@@ -225,12 +232,12 @@ impl StreamingToolHandler {
                 StreamAction::Forward
             }
             ResponseEvent::COMPLETED => StreamAction::Forward,
-            OutputItemEvent::ADDED => self.handle_output_item_added(&parsed),
-            FunctionCallEvent::ARGUMENTS_DELTA => self.handle_arguments_delta(&parsed),
-            FunctionCallEvent::ARGUMENTS_DONE => self.handle_arguments_done(&parsed),
-            OutputItemEvent::DELTA => self.process_output_delta(&parsed),
+            OutputItemEvent::ADDED => self.handle_output_item_added(parsed),
+            FunctionCallEvent::ARGUMENTS_DELTA => self.handle_arguments_delta(parsed),
+            FunctionCallEvent::ARGUMENTS_DONE => self.handle_arguments_done(parsed),
+            OutputItemEvent::DELTA => self.process_output_delta(parsed),
             OutputItemEvent::DONE => {
-                let done_output_index = extract_output_index(&parsed);
+                let done_output_index = extract_output_index(parsed);
                 if let Some(output_index) = done_output_index {
                     self.ensure_output_index(output_index);
                 }
@@ -259,11 +266,11 @@ impl StreamingToolHandler {
                 // this, a mixed stream that carries a function_call the
                 // handler intercepts plus a native hosted-tool item at a
                 // different output_index could have its hosted-tool
-                // `output_item.done` suppressed via the wrong arm — the
+                // `output_item.done` suppressed via the wrong branch — the
                 // tool loop only re-emits umbrellas for items it
                 // dispatched, so routing a passthrough item through the
-                // MCP-dispatch arm would drop it permanently. The
-                // output_index match ensures the MCP-dispatch arm only
+                // MCP-dispatch branch would drop it permanently. The
+                // output_index match ensures the MCP-dispatch branch only
                 // kicks in for items tracked by `pending_calls`.
                 let belongs_to_pending_call = done_output_index
                     .is_some_and(|idx| self.pending_calls.iter().any(|c| c.output_index == idx));
@@ -277,7 +284,7 @@ impl StreamingToolHandler {
                 // the upstream envelope rather than forwarding it, so the
                 // wire order the client sees satisfies the spec invariant
                 // that `output_item.done` is the LAST event for a given
-                // item. Unlike the MCP-dispatch arm, this path does NOT
+                // item. Unlike the MCP-dispatch branch, this path does NOT
                 // kick the tool loop (there is nothing to dispatch — the
                 // item was not intercepted).
                 //
@@ -532,8 +539,10 @@ mod tests {
     //! L1054-L1072).
 
     use openai_protocol::event_types::ItemType;
+    use serde_json::json;
 
     use super::*;
+    use crate::test_support::counting_alloc;
 
     /// Feed an `output_item.added` for a function_call item so the handler
     /// has a complete pending call registered.
@@ -803,7 +812,7 @@ mod tests {
     // `native_passthrough_tool_call_indices`, and the matching
     // `output_item.done` returns `StreamAction::Drop` so the caller
     // drops the upstream envelope without kicking the tool loop. The
-    // R6.7b MCP-dispatch arm is untouched — both paths coexist.
+    // R6.7b MCP-dispatch branch is untouched — both paths coexist.
     // ========================================================================
 
     /// Feed an `output_item.added` for a hosted tool-call type so the
@@ -867,7 +876,7 @@ mod tests {
         // R6.7c: OpenAI cloud passthrough emits `image_generation_call`
         // directly. With R6.7b alone the mis-ordered umbrella leaked to
         // the wire because the item was not tracked in `pending_calls`.
-        // The R6.7c arm drops it based on the observed `output_item.added`.
+        // The R6.7c branch drops it based on the observed `output_item.added`.
         assert_native_passthrough_done_drops(ItemType::IMAGE_GENERATION_CALL);
     }
 
@@ -888,12 +897,12 @@ mod tests {
 
     #[test]
     fn native_passthrough_gate_coexists_with_mcp_dispatch_gate() {
-        // R6.7c invariant: both arms of the gate must fire correctly when
+        // R6.7c invariant: both branches of the gate must fire correctly when
         // a single stream carries an MCP-dispatched function_call at one
         // output_index AND a native-passthrough hosted tool-call at
         // another. The function_call's done goes through the
-        // `ExecuteTools` arm (R6.7b); the hosted tool-call's done goes
-        // through the `Drop` arm (R6.7c). Neither re-narrows the other.
+        // `ExecuteTools` branch (R6.7b); the hosted tool-call's done goes
+        // through the `Drop` branch (R6.7c). Neither re-narrows the other.
         let mut handler = StreamingToolHandler::with_starting_index(0);
 
         // MCP-dispatch path: function_call at output_index 0.
@@ -924,7 +933,7 @@ mod tests {
         );
 
         // Second done — function_call at output_index 0 should
-        // ExecuteTools (the MCP-dispatch arm). This confirms R6.7c did
+        // ExecuteTools (the MCP-dispatch branch). This confirms R6.7c did
         // not accidentally funnel the function_call into the new branch.
         let function_call_done = r#"{
           "type": "response.output_item.done",
@@ -944,10 +953,10 @@ mod tests {
                 forward_triggering_event,
             } => assert!(
                 !forward_triggering_event,
-                "MCP-dispatch arm must still suppress the upstream umbrella"
+                "MCP-dispatch branch must still suppress the upstream umbrella"
             ),
             other => panic!(
-                "function_call done must go through MCP-dispatch arm (ExecuteTools), got {other:?}"
+                "function_call done must go through the MCP-dispatch branch (ExecuteTools), got {other:?}"
             ),
         }
     }
@@ -959,7 +968,7 @@ mod tests {
         // is true) AND a native passthrough hosted-tool done arrives at
         // a different output_index, the passthrough path must still
         // Drop — `belongs_to_pending_call` for the done's own index is
-        // false, so the R6.7b arm cleanly declines and the R6.7c arm
+        // false, so the R6.7b branch cleanly declines and the R6.7c branch
         // fires.
         let mut handler = StreamingToolHandler::with_starting_index(0);
         bootstrap_function_call_added(&mut handler); // complete pending call @ idx 0
@@ -1022,7 +1031,7 @@ mod tests {
         //
         // The implementation removes the passthrough index from
         // `native_passthrough_tool_call_indices` on the first drop, so
-        // the second done falls through to the `Forward` arm.
+        // the second done falls through to the `Forward` branch.
         let mut handler = StreamingToolHandler::with_starting_index(0);
         bootstrap_native_hosted_tool_added(
             &mut handler,
@@ -1093,4 +1102,94 @@ mod tests {
             );
         }
     }
+
+    /// A relayed event whose data payload spans lines (an upstream that
+    /// indents or splits its JSON over `data:` lines, which the SSE reader
+    /// joins) reaches the stored record whole: the record is built from the
+    /// value the relay parsed, not from a block rebuilt around the payload.
+    #[test]
+    fn an_event_whose_data_spans_lines_reaches_the_record_whole() {
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        let created = "{\n  \"type\": \"response.created\",\n  \"response\": {\"id\": \"resp_lines\", \"output\": []}\n}";
+
+        let action = handler.process_event(Some("response.created"), created);
+
+        assert!(matches!(action, StreamAction::Forward), "{action:?}");
+        assert_eq!(handler.original_response_id(), Some("resp_lines"));
+        let record = handler
+            .snapshot_final_response()
+            .expect("the created event is on record");
+        assert_eq!(record["id"], json!("resp_lines"));
+    }
+
+    /// The relay hands the accumulator the event it parsed: a relayed text
+    /// delta and a relayed `response.completed` of four output items each
+    /// cost the one parse, with no block rebuilt and no second parse behind
+    /// it. The counts are printed for the Numbers table.
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "the count a pin reads is printed for the Numbers table"
+    )]
+    fn a_relayed_event_is_parsed_once() {
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        let delta = serde_json::to_string(&json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 7,
+            "item_id": "msg_0123456789abcdef0123456789abcdef",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "a dozen words of answer text that a model streams per step ",
+        }))
+        .expect("a delta event");
+        let items: Vec<Value> = (0..4)
+            .map(|i| {
+                json!({"type": "message", "id": format!("msg_{i}"), "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": format!("paragraph {i}: a few sentences of answer text, long enough to live on the heap"), "annotations": []}]})
+            })
+            .collect();
+        let completed = serde_json::to_string(&json!({
+            "type": "response.completed",
+            "sequence_number": 8,
+            "response": {"id": "resp_pinned", "object": "response", "status": "completed", "model": "m",
+                "output": items, "usage": {"input_tokens": 120, "output_tokens": 480, "total_tokens": 600}},
+        }))
+        .expect("a completed event");
+
+        let before = counting_alloc::calls();
+        let delta_action = handler.process_event(Some("response.output_text.delta"), &delta);
+        let delta_calls = counting_alloc::calls() - before;
+        let before = counting_alloc::calls();
+        let completed_action = handler.process_event(Some("response.completed"), &completed);
+        let completed_calls = counting_alloc::calls() - before;
+
+        eprintln!(
+            "a relayed text delta: {delta_calls} allocation calls; a relayed response.completed of four output items: {completed_calls} allocation calls"
+        );
+        assert!(
+            matches!(delta_action, StreamAction::Forward),
+            "{delta_action:?}"
+        );
+        assert!(
+            matches!(completed_action, StreamAction::Forward),
+            "{completed_action:?}"
+        );
+        assert_eq!(
+            handler.snapshot_final_response().map(|r| r["id"].clone()),
+            Some(json!("resp_pinned"))
+        );
+        assert_eq!(
+            delta_calls, PINNED_DELTA_CALLS,
+            "the relayed delta's allocation calls changed"
+        );
+        assert_eq!(
+            completed_calls, PINNED_COMPLETED_CALLS,
+            "the relayed response.completed's allocation calls changed"
+        );
+    }
+
+    /// Allocation calls of the relayed text delta above, today.
+    const PINNED_DELTA_CALLS: usize = 13;
+    /// Allocation calls of the relayed `response.completed` above, today.
+    const PINNED_COMPLETED_CALLS: usize = 204;
 }

@@ -41,7 +41,8 @@ use smg_response_template::{
     load_response_template, Event as RegionEvent, ResponseParser, ResponseTemplate,
 };
 use symphony::{
-    adapt, Declared, Engine, EngineFinish, Event, Events, Format, Input, Parser, TokenSpan,
+    adapt, Declared, Engine, EngineFinish, Event, Events, Format, Input, MalformedReason, Parser,
+    TokenSpan,
 };
 
 /// The compiled tables of a fixture directory by template id, each with the literal text of its
@@ -424,6 +425,9 @@ fn replay_sessions(
 ///   transformers reads it.
 /// - X3: the stop text, which the stream does not show, is text transformers keeps. Shown, it
 ///   reads as transformers reads it.
+/// - X4: the stream cut a call inside a parameter; the table says the open parameter's bytes
+///   once as malformed text, which the message keeps as content, where transformers drops them.
+///   With the saying left out, it reads as transformers reads it.
 /// - X1: a field that does not repeat was written more than once; the table keeps every stay
 ///   where transformers keeps the last. The table reads what the template's reader closes in
 ///   each field, joined.
@@ -472,9 +476,17 @@ fn explain(
                 &[],
                 &session.end,
             );
-            let read = ours(&events);
+            let mut read = ours(&events);
             if read == *theirs {
                 return Some(codes.join(" "));
+            }
+            let unsaid = without_the_cut_said(&events);
+            if unsaid != read {
+                codes.push("X4");
+                read = unsaid;
+                if read == *theirs {
+                    return Some(codes.join(" "));
+                }
             }
             let moved = Session {
                 prompt: prompt.to_owned(),
@@ -488,6 +500,26 @@ fn explain(
         }
     }
     None
+}
+
+/// The message with the cut's own saying left out: what the table reads without its
+/// `Malformed { UnterminatedRegion }` events, as transformers reads a call the stream cut inside a
+/// parameter.
+fn without_the_cut_said(events: &[Event]) -> Message {
+    let kept: Vec<Event> = events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                Event::Malformed {
+                    why: MalformedReason::UnterminatedRegion,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect();
+    ours(&kept)
 }
 
 /// What the template's reader closes in each field of the output, every region's value joined in

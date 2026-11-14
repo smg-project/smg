@@ -31,12 +31,56 @@ use tracing::warn;
 
 use crate::routers::grpc::common::responses::{
     history::hosted_call_result,
+    streaming::OutputItemKind,
     utils::{
         custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
         encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
         generation_failure_error, resolve_function_identity, response_status,
     },
 };
+
+/// Why a Responses request does not convert to a chat request, and the code
+/// its refusal is answered under: a content part the chat pipeline has no
+/// form for, in a message or in a function output, is the chat route's own
+/// `unsupported_content_part`; every other refusal keeps
+/// `convert_request_failed`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ConversionError {
+    /// An input item kind this path does not carry.
+    #[error("Unsupported input item type")]
+    UnsupportedItem,
+    /// A content part of a message item the chat pipeline has no form for
+    /// (see `response_parts_to_message_content`).
+    #[error("Unsupported content part type {part:?} for gRPC backends: {why}")]
+    UnsupportedContentPart {
+        part: &'static str,
+        why: &'static str,
+    },
+    /// A function output with a part the text-only chat path cannot carry
+    /// (`StringOrContentParts::to_text_only`).
+    #[error("{0}")]
+    UnsupportedToolOutput(String),
+    #[error("Request must contain at least one message")]
+    NoMessages,
+    /// A tool result no call before it issued (see
+    /// `ProviderProfile::unanswerable_tool_result`).
+    #[error("No tool call found for function call output with call_id '{0}'")]
+    UnansweredToolResult(String),
+}
+
+impl ConversionError {
+    /// The error envelope's code for this refusal.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedContentPart { .. } | Self::UnsupportedToolOutput(_) => {
+                "unsupported_content_part"
+            }
+            Self::UnsupportedItem | Self::NoMessages | Self::UnansweredToolResult(_) => {
+                "convert_request_failed"
+            }
+        }
+    }
+}
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
 ///
@@ -52,7 +96,9 @@ use crate::routers::grpc::common::responses::{
 ///   `top_k`, `min_p`, `repetition_penalty`) → their chat twins; the three the Responses
 ///   request keeps as plain values cross only when set
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
-pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
+pub(crate) fn responses_to_chat(
+    req: &ResponsesRequest,
+) -> Result<ChatCompletionRequest, ConversionError> {
     responses_to_chat_with_tools(req, None)
 }
 
@@ -64,14 +110,14 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
 pub(super) fn responses_to_chat_with_mcp_tools(
     req: &ResponsesRequest,
     mcp_chat_tools: &[Tool],
-) -> Result<ChatCompletionRequest, String> {
+) -> Result<ChatCompletionRequest, ConversionError> {
     responses_to_chat_with_tools(req, Some(mcp_chat_tools))
 }
 
 fn responses_to_chat_with_tools(
     req: &ResponsesRequest,
     mcp_chat_tools: Option<&[Tool]>,
-) -> Result<ChatCompletionRequest, String> {
+) -> Result<ChatCompletionRequest, ConversionError> {
     let mut messages = Vec::new();
 
     // 1. Add system message if instructions provided
@@ -105,7 +151,7 @@ fn responses_to_chat_with_tools(
 
     // Ensure we have at least one message
     if messages.is_empty() {
-        return Err("Request must contain at least one message".to_string());
+        return Err(ConversionError::NoMessages);
     }
 
     // 3. Extract function tools from ResponseTools; the tool loop's MCP tools
@@ -129,9 +175,7 @@ fn responses_to_chat_with_tools(
     // (`history::load_history`), so a result with no call before it here is
     // the client's.
     if let Some(call_id) = ProviderProfile::for_model(&model).unanswerable_tool_result(&messages) {
-        return Err(format!(
-            "No tool call found for function call output with call_id '{call_id}'"
-        ));
+        return Err(ConversionError::UnansweredToolResult(call_id.to_string()));
     }
 
     Ok(chat_request(req, model, messages, tools, tool_choice))
@@ -145,17 +189,17 @@ fn responses_to_chat_with_tools(
 fn push_item(
     messages: &mut Vec<ChatMessage>,
     item: &ResponseInputOutputItem,
-) -> Result<(), String> {
+) -> Result<(), ConversionError> {
     match item {
         ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
             let content = match content {
                 StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
-                StringOrContentParts::Array(parts) => response_parts_to_message_content(parts),
+                StringOrContentParts::Array(parts) => response_parts_to_message_content(parts)?,
             };
             push_role_message(messages, role, content);
         }
         ResponseInputOutputItem::Message { role, content, .. } => {
-            push_role_message(messages, role, response_parts_to_message_content(content));
+            push_role_message(messages, role, response_parts_to_message_content(content)?);
         }
         ResponseInputOutputItem::FunctionToolCall {
             call_id,
@@ -185,6 +229,9 @@ fn push_item(
                 let assistant = ChatMessage::Assistant {
                     content: None,
                     name: None,
+                    refusal: None,
+                    audio: None,
+                    function_call: None,
                     tool_calls: None,
                     reasoning: AssistantReasoning {
                         text: Some(reasoning_text),
@@ -200,7 +247,12 @@ fn push_item(
             // Function call output - add as tool message
             // Note: The function name is looked up from prev_outputs in Harmony path
             // For Chat path, we just use the call_id
-            messages.push(tool_result(call_id, output.to_text_only()?));
+            messages.push(tool_result(
+                call_id,
+                output
+                    .to_text_only()
+                    .map_err(ConversionError::UnsupportedToolOutput)?,
+            ));
         }
         // A hosted tool call of a stored turn replays as the
         // assistant's call and, once it ran, its result: the
@@ -288,11 +340,11 @@ fn push_item(
 
 /// The refusal of an item kind this path does not carry, warned about where
 /// the kind says why.
-fn unsupported(warning: Option<&'static str>) -> Result<(), String> {
+fn unsupported(warning: Option<&'static str>) -> Result<(), ConversionError> {
     if let Some(warning) = warning {
         warn!(function = "responses_to_chat", "{warning}");
     }
-    Err("Unsupported input item type".to_string())
+    Err(ConversionError::UnsupportedItem)
 }
 
 /// A tool's result for the call it answers, as the chat history carries it.
@@ -357,11 +409,12 @@ fn chat_tools(
     mcp_chat_tools: Option<&[Tool]>,
 ) -> (Option<Arc<[Tool]>>, Option<ToolChoice>) {
     let tool_choice = req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice());
-    let function_tools = extract_tools_from_response_tools(req.tools.as_deref());
+    // Under `none` the request's own tools are withheld, so their schemas are
+    // not copied out of the request at all.
     let function_tools = if matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None))) {
         Vec::new()
     } else {
-        function_tools
+        extract_tools_from_response_tools(req.tools.as_deref())
     };
     let tools = match mcp_chat_tools {
         Some(mcp_chat_tools) => {
@@ -437,9 +490,16 @@ fn chat_request(
 }
 
 /// Convert Responses content parts to chat message content. Text, output
-/// text and refusals become text parts, `input_image` becomes an `image_url`
-/// part, and `input_file` is dropped (no chat equivalent on this path).
-fn response_parts_to_message_content(content: &[ResponseContentPart]) -> MessageContent {
+/// text and refusals become text parts and an `input_image` with a URL
+/// becomes an `image_url` part. The parts the chat pipeline has no form for
+/// are refused, never dropped: an `input_file` (chat messages carry text,
+/// image, audio and video parts and no file part, and the gateway keeps no
+/// file store to resolve one from) and an `input_image` that names only a
+/// `file_id`. A request answered as if such a part had not been sent is a
+/// wrong answer the client cannot detect.
+fn response_parts_to_message_content(
+    content: &[ResponseContentPart],
+) -> Result<MessageContent, ConversionError> {
     let mut parts = Vec::new();
     for part in content {
         match part {
@@ -458,21 +518,38 @@ fn response_parts_to_message_content(content: &[ResponseContentPart]) -> Message
             } => {
                 parts.push(ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: url.clone(),
+                        url: url.clone().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
                 });
             }
-            ResponseContentPart::InputImage { .. } | ResponseContentPart::InputFile { .. } => {}
+            ResponseContentPart::InputImage {
+                image_url: None, ..
+            } => {
+                return Err(ConversionError::UnsupportedContentPart {
+                    part: "input_image",
+                    why: "it names no image_url, and a file_id is not resolvable here",
+                });
+            }
+            ResponseContentPart::InputFile { .. } => {
+                return Err(ConversionError::UnsupportedContentPart {
+                    part: "input_file",
+                    why: "the chat pipeline carries no file part",
+                });
+            }
         }
     }
-    // Plain text stays a string, as it did before parts were carried at all.
-    match parts.as_slice() {
-        [] => MessageContent::Text(String::new()),
-        [ContentPart::Text { text }] => MessageContent::Text(text.clone()),
-        _ => MessageContent::Parts(parts),
-    }
+    // Plain text stays a string, as it did before parts were carried at all;
+    // the one text part moves out of the list instead of being copied again.
+    Ok(match parts.pop() {
+        None => MessageContent::Text(String::new()),
+        Some(ContentPart::Text { text }) if parts.is_empty() => MessageContent::Text(text),
+        Some(last) => {
+            parts.push(last);
+            MessageContent::Parts(parts)
+        }
+    })
 }
 
 /// Append a role-tagged input message. A `developer` turn folds into the
@@ -514,6 +591,9 @@ fn assistant_tool_call(
     ChatMessage::Assistant {
         content: None,
         name: None,
+        refusal: None,
+        audio: None,
+        function_call: None,
         tool_calls: Some(vec![ToolCall {
             id: call_id.to_string(),
             tool_type: "function".to_string(),
@@ -604,6 +684,9 @@ fn role_to_chat_message(role: &str, content: MessageContent) -> ChatMessage {
         "assistant" => ChatMessage::Assistant {
             content: Some(content),
             name: None,
+            refusal: None,
+            audio: None,
+            function_call: None,
             tool_calls: None,
             reasoning: Default::default(),
             ext: Default::default(),
@@ -638,14 +721,15 @@ fn map_text_to_response_format(text: Option<&TextConfig>) -> Option<ResponseForm
         TextFormat::JsonSchema {
             name,
             schema,
-            description: _,
+            description,
             strict,
         } => Some(ResponseFormat::JsonSchema {
-            json_schema: JsonSchemaFormat {
+            json_schema: Box::new(JsonSchemaFormat {
+                description: description.clone(),
                 name: name.clone(),
                 schema: schema.clone(),
                 strict: *strict,
-            },
+            }),
         }),
     }
 }
@@ -672,8 +756,8 @@ pub(crate) fn chat_to_responses(
     // The assistant message as output items. Reasoning comes first (OpenAI
     // order), so items replayed in emitted order rebuild the same turn.
     let mut output: Vec<ResponseOutputItem> = Vec::new();
-    output.extend(reasoning_output_item(choice, &chat_resp.id, original_req));
-    output.extend(message_output_item(choice, &chat_resp.id));
+    output.extend(reasoning_output_item(choice, original_req));
+    output.extend(message_output_item(choice));
     // The cut-call read comes before the calls become items: a custom tool's
     // item carries no status.
     let cut = cut_call(
@@ -712,14 +796,13 @@ pub(crate) fn chat_to_responses(
 /// reasoned: with the opaque encrypted copy when the request asked for it.
 fn reasoning_output_item(
     choice: &ChatChoice,
-    chat_id: &str,
     original_req: &ResponsesRequest,
 ) -> Option<ResponseOutputItem> {
     let reasoning = choice.message.reasoning_content.as_ref()?;
     if reasoning.is_empty() {
         return None;
     }
-    let id = format!("reasoning_{chat_id}");
+    let id = OutputItemKind::Reasoning.new_id();
     let content = vec![ReasoningText {
         text: reasoning.clone(),
     }];
@@ -743,13 +826,13 @@ fn reasoning_output_item(
 
 /// The assistant's text as a message item, when it said any; a generation
 /// that failed leaves the message in progress.
-fn message_output_item(choice: &ChatChoice, chat_id: &str) -> Option<ResponseOutputItem> {
+fn message_output_item(choice: &ChatChoice) -> Option<ResponseOutputItem> {
     let content = choice.message.content.as_ref()?;
     if content.is_empty() {
         return None;
     }
     Some(ResponseOutputItem::Message {
-        id: format!("msg_{chat_id}"),
+        id: OutputItemKind::Message.new_id(),
         role: "assistant".to_string(),
         content: vec![ResponseContentPart::OutputText {
             text: content.clone(),
@@ -773,10 +856,10 @@ fn push_tool_call_output_items(
     choice: &ChatChoice,
     original_req: &ResponsesRequest,
 ) {
-    let custom_names = custom_tool_names(original_req.tools.as_deref());
     let Some(tool_calls) = &choice.message.tool_calls else {
         return;
     };
+    let custom_names = custom_tool_names(original_req.tools.as_deref());
     for tool_call in tool_calls {
         let (name, namespace) =
             resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
@@ -787,13 +870,13 @@ fn push_tool_call_output_items(
                     tool_call.function.arguments.as_deref().unwrap_or_default(),
                 ),
                 name,
-                id: Some(tool_call.id.clone()),
+                id: Some(OutputItemKind::CustomToolCall.new_id()),
                 namespace,
             });
             continue;
         }
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id.clone()),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id: tool_call.id.clone(),
             name,
             namespace,
@@ -955,7 +1038,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plain["output"][0]["type"], "reasoning");
-        assert_eq!(plain["output"][0]["id"], "reasoning_chat_test");
+        assert!(
+            plain["output"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rs_")),
+            "{plain}"
+        );
         assert_eq!(plain["output"][0]["content"][0]["text"], "because");
         assert!(
             plain["output"][0]["encrypted_content"].is_null(),
@@ -988,6 +1076,7 @@ mod tests {
     fn refused_under_deepseek(input: serde_json::Value) -> String {
         responses_to_chat(&items_request("deepseek-flash", input))
             .expect_err("a tool result without its call is a malformed history")
+            .to_string()
     }
 
     /// The call ids of the assistant turn at `index` of a converted history.
@@ -1189,6 +1278,9 @@ mod tests {
             reasoning: Some(ResponseReasoningParam {
                 effort: Some(ReasoningEffort::High),
                 summary: None,
+                mode: None,
+                context: None,
+                generate_summary: None,
             }),
             ..Default::default()
         };
@@ -1213,6 +1305,9 @@ mod tests {
                 reasoning: Some(ResponseReasoningParam {
                     effort: Some(effort),
                     summary: None,
+                    mode: None,
+                    context: None,
+                    generate_summary: None,
                 }),
                 ..Default::default()
             };
@@ -1466,6 +1561,34 @@ mod tests {
         );
     }
 
+    /// A Responses request's `json_schema` text format keeps its description in
+    /// the Chat request the gRPC path builds from it.
+    #[test]
+    fn a_json_schema_text_format_keeps_its_description() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Name a city.",
+            "text": {"format": {
+                "type": "json_schema", "name": "city",
+                "description": "A city and its country.",
+                "schema": {"type": "object"}, "strict": true
+            }}
+        }))
+        .unwrap();
+        let chat_req = responses_to_chat(&req).unwrap();
+        let Some(ResponseFormat::JsonSchema { json_schema }) = &chat_req.response_format else {
+            panic!(
+                "expected a json_schema format, got {:?}",
+                chat_req.response_format
+            );
+        };
+        assert_eq!(
+            json_schema.description.as_deref(),
+            Some("A city and its country.")
+        );
+        assert_eq!(json_schema.name, "city");
+    }
+
     #[test]
     fn test_empty_input_error() {
         let req = ResponsesRequest {
@@ -1597,9 +1720,106 @@ mod tests {
         };
 
         let result = responses_to_chat(&req);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Unsupported input item type");
+        assert_eq!(result.unwrap_err(), ConversionError::UnsupportedItem);
     }
+
+    /// A message item's `input_file`, and an `input_image` that names only a
+    /// `file_id`, have no form in the chat pipeline: the conversion refuses
+    /// the request under the chat route's `unsupported_content_part`, naming
+    /// the part, instead of answering as if the part had not been sent. An
+    /// `input_image` with a URL converts to an `image_url` part as before,
+    /// and the refusal of an item kind keeps `convert_request_failed`.
+    #[test]
+    fn a_part_the_chat_pipeline_has_no_form_for_is_refused_not_dropped() {
+        let message = |parts: serde_json::Value| serde_json::json!([{"type": "message", "role": "user", "content": parts}]);
+        let file = responses_to_chat(&items_request(
+            "local-model",
+            message(serde_json::json!([
+                {"type": "input_text", "text": "Summarize the attached document."},
+                {"type": "input_file", "file_data": "JVBERi0xLjQK", "filename": "a.pdf"}
+            ])),
+        ))
+        .expect_err("a file part has no chat form");
+        assert_eq!(file.code(), "unsupported_content_part");
+        assert!(file.to_string().contains("\"input_file\""), "{file}");
+
+        let by_id = responses_to_chat(&items_request(
+            "local-model",
+            message(serde_json::json!([
+                {"type": "input_image", "file_id": "file_123", "detail": "auto"}
+            ])),
+        ))
+        .expect_err("an image named by a file_id alone has no chat form");
+        assert_eq!(by_id.code(), "unsupported_content_part");
+        assert!(by_id.to_string().contains("\"input_image\""), "{by_id}");
+
+        let simple = responses_to_chat(&items_request(
+            "local-model",
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "input_file", "file_id": "file_123"}
+            ]}]),
+        ))
+        .expect_err("a simple input message is read the same way");
+        assert_eq!(simple.code(), "unsupported_content_part");
+
+        let chat = responses_to_chat(&items_request(
+            "local-model",
+            message(serde_json::json!([
+                {"type": "input_text", "text": "What is in the picture?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ])),
+        ))
+        .expect("an image with a URL converts");
+        match &chat.messages[0] {
+            ChatMessage::User {
+                content: MessageContent::Parts(parts),
+                ..
+            } => {
+                assert!(
+                    matches!(&parts[0], ContentPart::Text { text } if text == "What is in the picture?")
+                );
+                assert!(matches!(
+                    &parts[1],
+                    ContentPart::ImageUrl { image_url } if *image_url.url == "data:image/png;base64,iVBORw0KGgo="
+                ));
+            }
+            other => panic!("the user turn carries parts: {other:?}"),
+        }
+        assert_eq!(
+            ConversionError::UnsupportedItem.code(),
+            "convert_request_failed"
+        );
+        assert_eq!(ConversionError::NoMessages.code(), "convert_request_failed");
+        // A function output with a part the text-only chat path cannot carry
+        // is a content-part refusal too (it used to answer convert_request_failed).
+        assert_eq!(
+            ConversionError::UnsupportedToolOutput("image".to_string()).code(),
+            "unsupported_content_part"
+        );
+    }
+
+    /// A function output with a part that has no text (an image, a file, a
+    /// refusal) is refused under the chat route's `unsupported_content_part`,
+    /// and the refusal names the part, as the refusal of a message part does;
+    /// it used to answer one fixed message whatever the part was.
+    #[test]
+    fn a_function_output_part_without_text_is_refused_by_name() {
+        let input = serde_json::json!([
+            {"type": "message", "role": "user", "content": "What is in the picture?"},
+            {"type": "function_call", "call_id": "call_1", "name": "take_picture", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]}
+        ]);
+        let refused = responses_to_chat(&items_request("local-model", input))
+            .expect_err("an image part in a function output has no text form");
+        assert_eq!(refused.code(), "unsupported_content_part");
+        assert_eq!(
+            refused.to_string(),
+            "Unsupported content part type \"input_image\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
+    }
+
     #[test]
     fn namespace_chat_response_roundtrips_identity() {
         let request: ResponsesRequest = namespace_test_request();
@@ -1796,6 +2016,8 @@ mod tests {
                 "{finish_reason}"
             );
             assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+            let id = wire["output"][0]["id"].as_str().unwrap_or_default();
+            assert!(id.starts_with("ctc_"), "{finish_reason}: {wire}");
         }
     }
 
@@ -1842,5 +2064,42 @@ mod tests {
             Some(Vec::new())
         );
         assert_eq!(names(&responses_to_chat(&bare).unwrap()), None);
+    }
+
+    /// The message content of an input item's parts: no part is an empty
+    /// string, one text part is that text, one part of another kind stays a
+    /// one-part list, and several parts stay a list in their order.
+    #[test]
+    fn input_parts_become_text_or_an_ordered_list() {
+        let text = |text: &str| ResponseContentPart::InputText {
+            text: text.to_string(),
+        };
+        let image = ResponseContentPart::InputImage {
+            image_url: Some("https://example.com/a.png".to_string()),
+            file_id: None,
+            detail: None,
+        };
+        assert_eq!(
+            response_parts_to_message_content(&[]).unwrap(),
+            MessageContent::Text(String::new())
+        );
+        assert_eq!(
+            response_parts_to_message_content(&[text("one")]).unwrap(),
+            MessageContent::Text("one".to_string())
+        );
+        let lone_image = response_parts_to_message_content(std::slice::from_ref(&image)).unwrap();
+        assert!(
+            matches!(&lone_image, MessageContent::Parts(parts) if parts.len() == 1 && matches!(parts[0], ContentPart::ImageUrl { .. })),
+            "a lone part of another kind stays a one-part list, got {lone_image:?}"
+        );
+        let several =
+            response_parts_to_message_content(&[text("first"), image, text("last")]).unwrap();
+        let MessageContent::Parts(parts) = several else {
+            panic!("several parts stay a list, got {several:?}");
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text == "first"));
+        assert!(matches!(&parts[1], ContentPart::ImageUrl { .. }));
+        assert!(matches!(&parts[2], ContentPart::Text { text } if text == "last"));
     }
 }

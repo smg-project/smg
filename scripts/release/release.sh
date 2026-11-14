@@ -940,7 +940,7 @@ publish_plan() { # <version> <ref>: the plan for v<version> as read at <ref> (th
     done < <(awk '$1 == "crate" { print $2, $3 }' "$list")
     [ "${REGISTRY:-1}" != 0 ] || say "     (the registries were not read: REGISTRY=0)"
   fi
-  say "$((n += 1)). Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest)"
+  say "$((n += 1)). Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest; the same tags with -slurm appended = the variant with the Slurm clients)"
   say "   gh workflow run release-docker.yml --ref $tagname"
   say "$((n += 1)). Helm chart (oci://ghcr.io/smg-project/charts/smg, version $version)"
   say "   gh workflow run release-helm.yml --ref $tagname"
@@ -956,6 +956,14 @@ publish_plan() { # <version> <ref>: the plan for v<version> as read at <ref> (th
   fi
   say "$((n += 1)). Go module tag (crates/grpc_client/go/v$version)"
   say "   gh workflow run release-go.yml --ref $tagname -f version=$version"
+  # The bindings module resolves through its tag only where its go.mod declares the path it lives at (the releases from that
+  # change on); at an older ref the tag would name a go.mod that go get refuses, so the plan prints the item only where it holds.
+  if [ "$(git show "$ref:bindings/golang/go.mod" 2>/dev/null | sed -n 's/^module //p')" = github.com/smg-project/smg/bindings/golang ]; then
+    say "$((n += 1)). Go bindings module tag (bindings/golang/v$version at the release commit; by hand until release-go.yml pushes it)"
+    say "   git tag bindings/golang/v$version $tagname^{commit} && git push $REMOTE refs/tags/bindings/golang/v$version"
+  else
+    say "   (no Go bindings module tag: bindings/golang/go.mod at $ref does not declare github.com/smg-project/smg/bindings/golang, so a tag there would not resolve)"
+  fi
   say "$((n += 1)). The GitHub release: release.sh notes $version > notes.md, then the gh release create line it prints."
   say ""
   say "Watch a dispatch: gh run list --workflow <file> --branch $tagname"
@@ -1135,7 +1143,7 @@ verifier_rows() { # the provider verifiers: the release owner's lines, as the ga
 
 publish_rule() { # <version>: the gate's line on what the registries take: a candidate never, the final by its dispatches
   if is_candidate "$1"; then
-    say "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi, release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan $1 leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub pre-release"
+    say "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi, release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan $1 leaves them out): its artifacts are the images, the chart, the two Go module tags and the GitHub pre-release"
   else
     say "[note] publish: the final publishes to PyPI and crates.io by its dispatches (release.sh publish-plan $1 lists them; a candidate never does)"
   fi

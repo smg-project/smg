@@ -53,7 +53,9 @@ What the engine decides for every format, and what it leaves open:
   fragments it sent and a `Malformed` event of no bytes, with the region's reason, before its
   end: a cut call is never handed over as a whole one without a word (`json::assembler`), and
   neither is a shaped call whose value never began, the cut or the close right after its header
-  (`json::Arguments::finish`). A tagged
+  (`json::Arguments::finish`), and neither is a shaped call whose tagged parameters the stream cut: its
+  arguments' object closes over the parameters that finished and the cut is said once before the
+  call's end, the bytes of a parameter the cut left open as the marker's text (`shape::Call::finish`). A tagged
   call the end of the stream cut ends the same way whatever stage the cut found, since the object
   the assembler writes closes only at the call's own end, and so does one whose close cut a streamed
   string, in every tag-based syntax (`tagged::end_cut_call`): no closing quote and no closing brace

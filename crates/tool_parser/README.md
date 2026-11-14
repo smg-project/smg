@@ -84,6 +84,16 @@ let parser = factory.get_pooled("command-r-plus");
 let parser = factory.registry().create_for_model("mistral-large");
 ```
 
+### Structured JSON Responses
+
+For a `json_object` or `json_schema` response, call `parser.set_json_mode(true)` before parsing.
+The Inkling parser then treats protocol spellings inside JSON strings as text.
+A quoted tool marker does not start a call, and quoted framing tokens are kept.
+Tool frames outside JSON strings still parse as calls.
+Other parsers ignore the mode.
+`reset` clears the quote state but keeps the selected mode.
+A pooled parser is shared across requests, so set the mode on every use.
+
 ## Architecture
 
 ```

@@ -26,11 +26,12 @@ pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
     config::{
-        AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        AccessLogField, GroupedDpSticky, PowerOfTwoLoadMetric, TurboJpegPolicy,
+        DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
     secrets::SecretFiles,
-    server::{self, posture::SecretSources, ServerConfig},
+    server::{self, posture::SecretSources, ServerConfig, DEFAULT_SHUTDOWN_GRACE_SECS},
     version,
 };
 
@@ -612,6 +613,21 @@ struct RoutingArgs {
     #[arg(long, num_args = 0.., default_value = "x-smg-routing-key", value_parser = parse_routing_key_header, help_heading = "Routing Policy")]
     routing_key_headers: Vec<String>,
 
+    /// Whether, and how, a request that carries a routing key is pinned to
+    /// one engine of a grouped data-parallel worker (a ZMQ worker whose
+    /// socket set several engines dial, as many as --zmq-engine-count says
+    /// or its engines declare), so a conversation keeps one engine's prefix
+    /// cache. The key is the sticky-session key: the first valid
+    /// --routing-key-headers header, or the body rid under
+    /// --routing-key-override
+    #[arg(
+        long,
+        value_enum,
+        default_value = "off",
+        help_heading = "Routing Policy"
+    )]
+    grouped_dp_sticky: GroupedDpSticky,
+
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
@@ -1173,7 +1189,11 @@ struct ServingArgs {
     upstream_pool_idle_timeout_secs: u64,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
-    #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS,
+        help_heading = "Request Handling"
+    )]
     shutdown_grace_period_secs: u64,
 
     /// Keep accepting connections after readiness fails. Defaults to 5 seconds;
@@ -1237,9 +1257,10 @@ struct ServingArgs {
     /// and should retry with backoff; each is counted in
     /// smg_http_connections_rejected_total. Readiness is unaffected. Probes
     /// on the data port are subject to the bound like any connection: point
-    /// them at --health-check-port or --admin-port, which it does not cover
-    /// (the admin listener stays reachable while the data plane is
-    /// saturated). 0 = no bound
+    /// them at --health-check-port, which no bound covers. --admin-port is
+    /// outside this bound (the control plane stays reachable while the data
+    /// plane is saturated) and inside its own, --admin-max-connections. 0 =
+    /// no bound
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     max_connections: usize,
 
@@ -1249,7 +1270,9 @@ struct ServingArgs {
     /// smg_http_connections_rejected_total. 0 = no bound. The bound is the
     /// admin listener's own, so the control plane stays reachable while the
     /// data plane is saturated, and a client that reaches the admin listener
-    /// cannot hold it open without limit
+    /// cannot hold it open without limit. Needs --admin-port. Probes on the
+    /// admin port fall under the bound like any connection: point them at
+    /// --health-check-port, which no bound covers
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     admin_max_connections: usize,
 
@@ -1533,8 +1556,9 @@ struct ModelArgs {
     history_backend: String,
 
     /// Most stored responses the memory history backend keeps; the oldest go
-    /// first, on every write (memory backend only; a stored response takes
-    /// about 12 KB).
+    /// first, on every write (a stored response takes about 12 KB). The
+    /// Messages thread store keeps that many turns under every history
+    /// backend, the oldest evicted first.
     #[arg(long, default_value_t = 10_000, help_heading = "Backend")]
     history_memory_max_responses: usize,
 
@@ -1548,7 +1572,8 @@ struct ModelArgs {
     /// on every write; 0 keeps a record until a count bound drops it. A
     /// conversation is kept that long after its last use (created, read or
     /// updated); a background response still running is not dropped by a
-    /// count bound.
+    /// count bound. The Messages thread store keeps a turn that long after it
+    /// was written, under every history backend.
     #[arg(long, default_value_t = 86_400, help_heading = "Backend")]
     history_memory_retention_secs: u64,
 
@@ -1624,6 +1649,10 @@ struct IntegrationArgs {
     /// Oracle connection pool timeout in seconds
     #[arg(long, env = "ATP_POOL_TIMEOUT_SECS", help_heading = "Oracle Database")]
     oracle_pool_timeout_secs: Option<u64>,
+
+    /// Bound in seconds on each call to the Oracle store (pool wait, connect and the statement); a call past it is answered 503 storage_unavailable (default: 5)
+    #[arg(long, env = "ATP_OP_TIMEOUT_SECS", help_heading = "Oracle Database")]
+    oracle_op_timeout_secs: Option<u64>,
 
     // ==================== PostgreSQL Database ====================
     /// PostgreSQL database connection URL (env: SMG_POSTGRES_DB_URL; or a
@@ -2341,6 +2370,8 @@ mod tests {
             "a=b",
             "--priority-scheduler-config",
             "/dev/null",
+            "--tenant-rate-limit-config",
+            "/dev/null",
         ])
         .ignored_companions(&prefill, &encode);
         for flag in [
@@ -2352,6 +2383,7 @@ mod tests {
             "--encode-policy",
             "--selector",
             "--priority-scheduler-config",
+            "--tenant-rate-limit-config",
         ] {
             assert!(
                 ignored.iter().any(|m| m.starts_with(flag)),
@@ -2412,6 +2444,9 @@ mod tests {
             "a=b",
             "--priority-scheduler-enabled",
             "--priority-scheduler-config",
+            "/dev/null",
+            "--tenant-rate-limit-enabled",
+            "--tenant-rate-limit-config",
             "/dev/null",
         ])
         .ignored_companions(&prefill, &[]);
@@ -2489,10 +2524,17 @@ mod tests {
             "postgres://u:p@h:5432/d",
             "--redis-url",
             "redis://h:6379",
+            "--oracle-dsn",
+            "tcps://h:1522/s",
+            "--oracle-user",
+            "u",
+            "--oracle-password",
+            "p",
         ];
         let args = cli_args_from(&stores);
         assert_eq!(args.build_postgres_config(None).unwrap().op_timeout_secs, 5);
         assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 5);
+        assert_eq!(args.build_oracle_config(None).unwrap().op_timeout_secs, 5);
 
         let mut argv = stores.to_vec();
         argv.extend([
@@ -2500,6 +2542,8 @@ mod tests {
             "12",
             "--redis-op-timeout-secs",
             "3",
+            "--oracle-op-timeout-secs",
+            "7",
         ]);
         let args = cli_args_from(&argv);
         assert_eq!(
@@ -2507,6 +2551,7 @@ mod tests {
             12
         );
         assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 3);
+        assert_eq!(args.build_oracle_config(None).unwrap().op_timeout_secs, 7);
 
         let mut argv = stores.to_vec();
         argv.extend([
@@ -2514,11 +2559,15 @@ mod tests {
             "0",
             "--redis-op-timeout-secs",
             "0",
+            "--oracle-op-timeout-secs",
+            "0",
         ]);
         let args = cli_args_from(&argv);
         let err = args.build_postgres_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
         let err = args.build_redis_config(None).unwrap_err().to_string();
+        assert!(err.contains("op_timeout_secs"), "{err}");
+        let err = args.build_oracle_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
     }
 
@@ -3135,7 +3184,7 @@ mod tests {
     /// flow into `RouterConfig`; without the flag there is no bound.
     #[test]
     fn admin_max_connections_flag_flows_into_router_config() {
-        let bounded = cli_args_from(&["--admin-max-connections", "64"])
+        let bounded = cli_args_from(&["--admin-max-connections", "64", "--admin-port", "9001"])
             .to_router_config(vec![], vec![])
             .unwrap();
         assert_eq!(bounded.admin_max_connections, 64);
@@ -3211,6 +3260,34 @@ mod tests {
             assert!(
                 Cli::try_parse_from(argv).is_err(),
                 "--routing-key-headers {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_dp_sticky_flag_flows_into_router_config() {
+        // Off by default: no request is pinned to an engine of a grouped worker.
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        for (flag, sticky) in [
+            ("off", GroupedDpSticky::Off),
+            ("hash", GroupedDpSticky::Hash),
+        ] {
+            let config = cli_args_from(&["--grouped-dp-sticky", flag])
+                .to_router_config(vec![], vec![])
+                .unwrap();
+            assert_eq!(
+                config.grouped_dp_sticky, sticky,
+                "--grouped-dp-sticky {flag}"
+            );
+        }
+
+        for bad in ["", "on", "1", "least_load", "HASH"] {
+            let argv = ["smg", "--grouped-dp-sticky", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--grouped-dp-sticky {bad:?} should be rejected"
             );
         }
     }

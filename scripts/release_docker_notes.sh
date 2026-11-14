@@ -115,7 +115,7 @@ registry = '${REGISTRY}'
 version = '${VERSION}'
 
 tags = [line.strip() for line in sys.stdin if line.strip()]
-engines = {'sglang': [], 'vllm': [], 'trtllm': [], 'other': []}
+engines = {'sglang': [], 'vllm': [], 'trtllm': [], 'slurm': [], 'other': []}
 
 for tag in tags:
     suffix = tag[len(version) + 1:]  # strip 'VERSION-'
@@ -125,14 +125,14 @@ for tag in tags:
     else:
         engines['other'].append(tag)
 
-labels = {'sglang': 'SGLang', 'vllm': 'vLLM', 'trtllm': 'TensorRT-LLM', 'other': 'Other'}
+labels = {'sglang': 'SGLang', 'vllm': 'vLLM', 'trtllm': 'TensorRT-LLM', 'slurm': 'Gateway with the Slurm clients', 'other': 'Other'}
 
 print('### Docker Images')
 print()
 print(f'Pre-built engine images on [GitHub Container Registry](https://github.com/orgs/smg-project/packages/container/package/smg):')
 print()
 
-for engine in ['sglang', 'vllm', 'trtllm', 'other']:
+for engine in ['sglang', 'vllm', 'trtllm', 'slurm', 'other']:
     engine_tags = engines[engine]
     if not engine_tags:
         continue

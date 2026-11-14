@@ -1504,6 +1504,76 @@ async fn a_cancelled_workflow_stops_before_the_next_attempt() {
     assert_eq!(state.status, WorkflowStatus::Cancelled);
 }
 
+/// A workflow cancelled while a step waits out its backoff ends then, not
+/// when the backoff does: the wait reads the cancellation.
+#[tokio::test]
+async fn a_cancelled_workflow_ends_its_step_s_backoff_wait() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let first_attempt_running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let workflow = WorkflowDefinition::new("cancel_in_backoff_workflow", "Cancel In Backoff")
+        .add_step(
+            StepDefinition::new(
+                "held_step",
+                "Step held in its first attempt",
+                Arc::new(HeldFailingStep {
+                    attempts: Arc::clone(&attempts),
+                    first_attempt_running: Arc::clone(&first_attempt_running),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(30)),
+            })
+            .with_timeout(Duration::from_secs(5)),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), first_attempt_running.notified())
+        .await
+        .expect("the first attempt runs");
+    release.notify_one();
+
+    // The first attempt's failure puts the step into its 30 s backoff.
+    let mut retrying = false;
+    for _ in 0..250 {
+        let state = engine.get_status(instance_id).await.unwrap();
+        if state.step_states[&StepId::new("held_step")].status == StepStatus::Retrying {
+            retrying = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(retrying, "the step waits out its backoff");
+
+    let cancelled_at = std::time::Instant::now();
+    engine.cancel_workflow(instance_id).await.unwrap();
+
+    // The workflow's task ends inside the backoff, not after it.
+    for _ in 0..100 {
+        if engine.active_workflow_count() == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        engine.active_workflow_count(),
+        0,
+        "the workflow's task ended {:?} after the cancellation, inside the 30 s backoff",
+        cancelled_at.elapsed()
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no attempt after the cancellation"
+    );
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+}
+
 /// A `RetryIndefinitely` step keeps retrying past its policy's attempts: the
 /// policy's `max_attempts` bounds the other failure actions only.
 #[tokio::test]

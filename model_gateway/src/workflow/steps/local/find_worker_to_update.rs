@@ -37,7 +37,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
         if workers_to_update.is_empty() {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("find_worker_to_update"),
-                message: format!("Worker {worker_url} not found"),
+                message: format!("Worker {} not found", Endpoint::redacted_str(worker_url)),
             });
         }
 

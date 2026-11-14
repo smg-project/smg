@@ -683,39 +683,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::event::{DropReason, MalformedReason, Text};
-
-    fn call(index: u32, name: &str) -> Event<'static> {
-        Event::ToolCallStart {
-            index,
-            id: format!("call_{index}"),
-            name: name.into(),
-            source: Text::default(),
-        }
-    }
-
-    fn arguments(index: u32, json: &str) -> Event<'static> {
-        Event::ToolCallArguments {
-            index,
-            json: json.to_owned().into(),
-            source: Text::default(),
-        }
-    }
-
-    fn end(index: u32) -> Event<'static> {
-        Event::ToolCallEnd {
-            index,
-            source: Text::default(),
-        }
-    }
-
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
-        Event::Finish {
-            reason,
-            tool_calls,
-            reasoning_tokens: 0,
-        }
-    }
+    use crate::{
+        event::{DropReason, MalformedReason, Text},
+        testing::events::{arguments, call, end, finish},
+    };
 
     fn wire(items: &[ResponseOutputItem]) -> Value {
         serde_json::to_value(items).expect("serializable")

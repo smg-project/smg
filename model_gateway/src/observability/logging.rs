@@ -689,8 +689,10 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
                 layers.push(file_layer);
             }
             Err(message) => {
-                // Logger is not yet initialized; stderr is the only output channel
-                #[expect(clippy::print_stderr)]
+                #[expect(
+                    clippy::print_stderr,
+                    reason = "the logger is not up yet; stderr is its only channel"
+                )]
                 {
                     eprintln!("{message}");
                 }
@@ -703,8 +705,10 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .and_then(|_| match get_otel_layer_at(log_level) {
             Ok(otel_layer) => Some(otel_layer),
             Err(e) => {
-                // Logger may not be fully initialized yet; use stderr as fallback
-                #[expect(clippy::print_stderr)]
+                #[expect(
+                    clippy::print_stderr,
+                    reason = "the logger may not be up yet; stderr is the fallback"
+                )]
                 {
                     eprintln!("Failed to initialize OpenTelemetry: {e}");
                 }

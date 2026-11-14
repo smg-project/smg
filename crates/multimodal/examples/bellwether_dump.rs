@@ -344,7 +344,12 @@ fn process(
             dtype: EncoderDtype::Uint8,
             ..
         } => Some(bytes.clone()),
-        EncoderInput::Wire { .. } | EncoderInput::F32(_) => None,
+        EncoderInput::SharedWire {
+            bytes,
+            dtype: EncoderDtype::Uint8,
+            ..
+        } => Some(bytes.as_slice().to_vec()),
+        EncoderInput::Wire { .. } | EncoderInput::SharedWire { .. } | EncoderInput::F32(_) => None,
     };
     Ok(Artifacts {
         width,

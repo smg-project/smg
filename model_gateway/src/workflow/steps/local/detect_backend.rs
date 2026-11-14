@@ -394,7 +394,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{detect_grpc_backend, detect_http_backend};
-    use crate::{worker::test_support::RefusedAddress, workflow::steps::util::mock_grpc_engine};
+    use crate::{
+        server::http_client, worker::test_support::RefusedAddress,
+        workflow::steps::util::mock_grpc_engine,
+    };
 
     /// A runtime that answers its health RPC with `healthy: false` (its
     /// engine still loading) is identified all the same, with and without
@@ -459,7 +462,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::server::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -475,7 +478,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::server::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -496,7 +499,7 @@ mod tests {
         );
         let (url, server) = serve_router(router).await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::server::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -512,14 +515,13 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn http_detection_failures_name_the_worker_masked() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
 
         let err = detect_http_backend(
             &format!("http://user:secret@127.0.0.1:{port}"),
             1,
-            &crate::server::http_client(),
+            &http_client(),
             None,
         )
         .await
@@ -544,14 +546,9 @@ mod tests {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
 
-        let err = detect_http_backend(
-            &format!("http://{addr}"),
-            1,
-            &crate::server::http_client(),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = detect_http_backend(&format!("http://{addr}"), 1, &http_client(), None)
+            .await
+            .unwrap_err();
 
         assert!(err.contains("Could not detect HTTP backend"), "got: {err}");
     }
@@ -562,7 +559,7 @@ mod tests {
         // retries instead of registering a backend with nothing to serve.
         let (url, server) = serve_router(models_route(json!({"object": "list", "data": []}))).await;
 
-        let result = detect_http_backend(&url, 5, &crate::server::http_client(), None).await;
+        let result = detect_http_backend(&url, 5, &http_client(), None).await;
         server.abort();
 
         result.unwrap_err();
@@ -576,7 +573,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::server::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();

@@ -81,7 +81,10 @@ impl MessagePreparationStage {
         // narrowed by tool_choice and shared with count_tokens so both render
         // the same prompt; the constraints read the narrowed tools too, the
         // parsers read them all from the spec.
-        let spec = Box::new(MessagesResponseSpec::from(request));
+        let spec = Box::new(MessagesResponseSpec::with_tools(
+            request,
+            ctx.state.messages_tools.clone(),
+        ));
         let filtered_tools =
             message_utils::template_tools(&spec.chat_tools, request.tool_choice.as_ref());
         let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
@@ -163,6 +166,7 @@ impl MessagePreparationStage {
             symphony::Asks::Messages {
                 request,
                 continues: request.continues_final_assistant(),
+                has_tools: spec.has_tools,
             },
             &filtered_tools,
             &processed_messages.text,
@@ -280,6 +284,7 @@ mod tests {
         use serde_json::{json, Value};
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -301,7 +306,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
@@ -314,7 +319,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),
@@ -334,10 +339,10 @@ mod tests {
     }
 
     /// The stage derives the request model's profile once, keeps it on the
-    /// request state and hands that one to the render: under a MiniMax model
-    /// id `output_config.effort: none` leaves the template's default, under a
-    /// self-hosted id it switches thinking off, and the stored profile is the
-    /// model's in both cases.
+    /// request state and hands that one to the render: `output_config.effort:
+    /// none` switches thinking off under both, renders no effort under a
+    /// MiniMax model id and renders as sent under a self-hosted id, and the
+    /// stored profile is the model's in both cases.
     #[tokio::test]
     async fn the_stage_hands_the_render_the_request_models_profile() {
         use std::sync::Arc;
@@ -347,6 +352,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -357,7 +363,8 @@ mod tests {
 
         let (_dir, tokenizer) = byte_tokenizer_with_template(
             "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
-             thinking={{ enable_thinking | default('unset') }}",
+             thinking={{ enable_thinking | default('unset') }} \
+             effort={{ reasoning_effort | default('unset') }}",
         );
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         for model in ["MiniMax-M3", "self-hosted-model"] {
@@ -370,14 +377,18 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (model, profile, rendered) in [
-            ("MiniMax-M3", ProviderProfile::Minimax, "thinking=unset"),
+            (
+                "MiniMax-M3",
+                ProviderProfile::Minimax,
+                "thinking=False effort=unset",
+            ),
             (
                 "self-hosted-model",
                 ProviderProfile::Generic,
-                "thinking=False",
+                "thinking=False effort=none",
             ),
         ] {
             let request: CreateMessageRequest = serde_json::from_value(json!({
@@ -385,7 +396,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 model.into(),
@@ -421,6 +432,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -444,7 +456,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         let schema = json!({
             "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]
@@ -464,7 +476,7 @@ mod tests {
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),

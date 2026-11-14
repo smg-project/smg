@@ -10,6 +10,7 @@
 
 use crate::{
     decision::{Decision, Target},
+    sessions::SessionVerdict,
     view::{Health, LoadRow, WorkerId},
 };
 
@@ -51,6 +52,9 @@ pub struct Lease {
     /// The fingerprint of the session key, so a sticky in-flight cap counts
     /// per key per worker from leases; `0` when none.
     pub session_key: u64,
+    /// What the decision did with the session key, copied from its pick, so
+    /// the commit moves the key's pins by its own decision alone.
+    pub session: SessionVerdict,
     /// The host's clock at issue, microseconds since its origin. In-process
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,
@@ -83,6 +87,7 @@ pub struct Outcome {
     pub ttft_micros: u32,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    /// Microseconds the dispatch took, saturating at `u32::MAX`, never wrapping.
     pub duration_micros: u32,
 }
 
@@ -97,6 +102,10 @@ pub enum ReleaseReason {
     ClientGone,
     /// The commit refused every target (a removed worker, a lost room).
     CommitFailed,
+    /// The stream rule's grace passed without a completion.
+    Expired,
+    /// An immediate deregistration released the worker's leases.
+    WorkerRemoved,
 }
 
 /// A membership change the host reports.

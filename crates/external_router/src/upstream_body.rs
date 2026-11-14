@@ -88,7 +88,7 @@ enum Unread {
 /// warn; the copy kept for the client loses the provider's account
 /// identifiers ([`error::sanitize_error_body`]).
 pub async fn read_error(resp: reqwest::Response, model: &str) -> UpstreamError {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = resp.status();
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
     let body = match read_response_body_limited(resp, MAX_ERROR_RESPONSE_SIZE).await {
         ReadBodyResult::Ok(body) => {

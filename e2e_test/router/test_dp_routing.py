@@ -22,8 +22,8 @@ Requirements (the engine class):
     - 2 GPUs (one per DP rank)
 
 Usage:
-    E2E_RUNTIME=vllm pytest e2e_test/router/test_dp_routing.py -v
-    E2E_RUNTIME=mock pytest e2e_test/router/test_dp_routing.py -v
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm pytest e2e_test/router/test_dp_routing.py -v
+    E2E_RUNTIME=mock E2E_ENGINE=mock pytest e2e_test/router/test_dp_routing.py -v
 """
 
 from __future__ import annotations

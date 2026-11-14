@@ -16,6 +16,8 @@ pub mod error;
 #[cfg(feature = "gemini")]
 pub mod gemini;
 pub mod header_utils;
+#[cfg(any(feature = "gemini", feature = "openai"))]
+mod json_utils;
 pub mod mcp_utils;
 pub mod metrics;
 #[cfg(feature = "openai")]

@@ -23,7 +23,16 @@ pub enum Role {
 
 /// Which phase of a request a decision is for.
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -172,6 +181,13 @@ impl LoadRow {
     pub fn kv_usage(&self) -> f32 {
         f32::from(self.kv_usage_permille) / 1000.0
     }
+
+    /// The running requests' share of the KV cache as a ratio, `0.0` to
+    /// `1.0`: the occupancy a request waits on, the reclaimable prefix
+    /// cache left out (a report without the split carries its usage here).
+    pub fn active_kv(&self) -> f32 {
+        f32::from(self.active_kv_permille) / 1000.0
+    }
 }
 
 /// A tenant or a session key as the view carries it: its fingerprint, and the
@@ -204,6 +220,20 @@ impl<'a> Identity<'a> {
     /// A key the host holds as its fingerprint alone.
     pub const fn hashed(hash: u64) -> Self {
         Self { hash, plain: None }
+    }
+
+    /// A key within a scope (a model and a phase, fingerprinted by the host):
+    /// the fingerprint mixes the scope in, so one key names one session per
+    /// scope, and the plain form is kept. Never `0` for a present key.
+    pub fn scoped(key: &'a str, scope: u64) -> Self {
+        let mut h = fingerprint(key.as_bytes()) ^ scope.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        Self {
+            hash: if h == 0 { 1 } else { h },
+            plain: Some(key),
+        }
     }
 
     pub const fn is_none(&self) -> bool {
@@ -274,7 +304,8 @@ pub struct Candidate {
     /// Host-supplied admission bit: the decode's running window has a room
     /// nobody waiting at its gate is in line for.
     pub has_room: bool,
-    /// Milliseconds since the worker was admitted to the pool.
+    /// Milliseconds since the worker was admitted to the pool, saturating at
+    /// `u32::MAX` as `report_age_ms` does; never wrapping.
     pub admitted_age_ms: u32,
     /// Blocks the index learned about the worker since admission.
     pub indexed_growth: u32,
@@ -290,6 +321,26 @@ pub struct Candidate {
     pub vision: bool,
     /// Reachable from one gateway only (a host-local wire).
     pub host_local: bool,
+    /// Session keys with a request in flight on this worker. Last because the
+    /// wire numbers its fields in the record's order and this one came after
+    /// the contract's first cut.
+    pub active_sessions: u16,
+    /// The worker's stable identity for placement: its registration key's
+    /// fingerprint (the low 32 bits), equal across the handles of one worker
+    /// and across gateway replicas, where the id is the handle's. A ring
+    /// positions a member by it, so a replaced handle keeps its
+    /// predecessor's positions and every replica agrees on a key's owner.
+    /// Two members with equal keys share positions and the lower member
+    /// index owns first: by the birthday bound, n(n - 1) / 2 over 2^32, about
+    /// one chance in 8,600 over a pool of a thousand and one in 870,000 over
+    /// a hundred; the 64-bit form waits for the candidate's byte budget.
+    /// Zero when the host carries none. After the contract's first cut (the
+    /// wire numbers its fields in the record's order).
+    pub key: u32,
+    /// Blocks the index holds for the worker: what a warm-up stage reads
+    /// thinness from, against the fleet's level. Last in the record, after
+    /// `key`, for the same reason.
+    pub indexed_blocks: u32,
 }
 
 /// Media on the request: counts and bytes, for workers that take media.
@@ -336,7 +387,8 @@ pub struct RequestFacts<'a> {
     pub attempt: u8,
     /// Candidates earlier attempts of this request already tried.
     pub tried: &'a [WorkerId],
-    /// Time left for the decision, relative to the host's receipt.
+    /// Time left for the whole decision, relative to the host's receipt; a
+    /// plugin's own share of it rides its frame, clamped to at most this.
     pub budget_micros: u32,
     /// Allow-listed headers only.
     pub headers: &'a [Header<'a>],
@@ -344,6 +396,11 @@ pub struct RequestFacts<'a> {
     /// The per-decision seed, recorded in the trace: the only randomness a
     /// stage gets.
     pub seed: u64,
+    /// The size in tokens of one of the request's blocks as the host
+    /// counted them: an index's learned block size on an event-fed request,
+    /// the configured one on a tree-fed request; `0` reads the view's. Last
+    /// on the wire (the numbering follows the record's order).
+    pub block_size: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,

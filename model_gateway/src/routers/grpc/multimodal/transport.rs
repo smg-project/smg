@@ -16,13 +16,15 @@ use std::{
 };
 
 use llm_multimodal::{EncoderDtype, Modality};
-use openai_protocol::worker::{RuntimeType, TransportMode};
-use smg_mm_rdma::{RdmaConfig, RdmaExporter};
+use openai_protocol::worker::{ConnectionMode, RuntimeType, TransportMode};
+use smg_mm_rdma::{RdmaConfig, RdmaExporter, STAGES_OVER_RDMA};
 use tracing::{error, info, warn};
 
-use super::{serialize::wire_dtype, settings::mm_settings};
+use super::{encoder_budget::WIRE_MESSAGE_CAP, serialize::wire_dtype, settings::mm_settings};
 use crate::{
-    routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable},
+    routers::grpc::{
+        backend_client::BackendClient, context::WorkerSelection, proto_wrapper::mm_shm_dev_writable,
+    },
     worker::{RoutingPool, Worker, WorkerRegistry},
 };
 
@@ -365,6 +367,20 @@ fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn Worker>>
     }
 }
 
+/// SGLang's declared floating encoder dtype, with float32 for older workers.
+pub(super) fn mm_sglang_encoder_input_dtype(workers: Option<&WorkerSelection>) -> EncoderDtype {
+    sglang_wire_dtype(mm_encoder_input_dtype_from_worker(workers).as_deref())
+}
+
+/// Accept only floating encoder inputs; unknown labels retain the legacy wire.
+fn sglang_wire_dtype(label: Option<&str>) -> EncoderDtype {
+    match label {
+        Some("bfloat16") => EncoderDtype::BFloat16,
+        Some("float16") => EncoderDtype::Float16,
+        _ => EncoderDtype::Float32,
+    }
+}
+
 /// The wire dtype for the vLLM encoder input.
 ///
 /// Defaults to float32 rather than to the narrower width the TokenSpeed path
@@ -467,15 +483,38 @@ fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Opti
     encoder_dtype_label(primary_worker(workers)?.as_ref())
 }
 
-/// The `multimodal_encoder_dtype` label a worker advertises, when it does.
+/// An explicit encoder dtype label wins; a direct SGLang worker otherwise
+/// reads the current connection's declaration, including after reconnects.
 fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
-    worker
-        .metadata()
-        .spec
+    let backend = worker.backend_client_if_initialized();
+    encoder_dtype_label_with_backend(worker, backend.as_deref())
+}
+
+/// Preserve explicit labels; infer a dtype only when all connected engines agree.
+fn encoder_dtype_label_with_backend(
+    worker: &dyn Worker,
+    backend: Option<&BackendClient>,
+) -> Option<String> {
+    let spec = &worker.metadata().spec;
+    if let Some(dtype) = spec
         .labels
         .get("multimodal_encoder_dtype")
         .filter(|dtype| !dtype.is_empty())
-        .cloned()
+    {
+        return Some(dtype.clone());
+    }
+    if spec.runtime_type != RuntimeType::Sglang {
+        return None;
+    }
+    let BackendClient::Zmq(client) = backend? else {
+        return None;
+    };
+    let dtype = client.ready_response()?.multimodal_encoder_dtype.as_ref()?;
+    client
+        .engines()
+        .iter()
+        .all(|engine| engine.ready_response.multimodal_encoder_dtype.as_ref() == Some(dtype))
+        .then(|| dtype.clone())
 }
 
 /// The router's own encoder dtype overrides, read once from the environment.
@@ -540,18 +579,15 @@ fn shared_image_wire_dtype_over(
     shared_image_wire_dtype(&workers, overrides)
 }
 
+/// Defer one-pass writes until every destination has a known, matching dtype.
 fn shared_image_wire_dtype(
     workers: &[Arc<dyn Worker>],
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let mut shared = None;
     for worker in workers {
-        let dtype = image_wire_dtype(
-            worker.metadata().spec.runtime_type,
-            encoder_dtype_label(worker.as_ref()),
-            device_normalizes(worker.as_ref()),
-            overrides,
-        )?;
+        let backend = worker.backend_client_if_initialized();
+        let dtype = image_wire_dtype_with_backend(worker.as_ref(), overrides, backend.as_deref())?;
         match shared {
             None => shared = Some(dtype),
             Some(existing) if existing == dtype => {}
@@ -559,6 +595,124 @@ fn shared_image_wire_dtype(
         }
     }
     shared
+}
+
+/// The byte bound a request's pixel tensors must stay within before any image
+/// is decoded, when every worker the selection can pick (over `pools`) takes
+/// them inline in the gateway's own Generate message: the gRPC framing's
+/// [`WIRE_MESSAGE_CAP`]. `None` when any candidate may take them another way
+/// (an SHM handle, the RDMA lane, a TRT-LLM worker's file bytes, a ZMQ wire
+/// with no such framing) or when no candidate is known: the framing itself
+/// still refuses a message it cannot carry, as the request's own size.
+pub(crate) fn mm_image_wire_cap_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+) -> Option<usize> {
+    image_wire_cap_over(registry, model_id, pools, &rdma_lane_stages)
+}
+
+/// Whether the RDMA lane stages pixels in this process: a build with the real
+/// exporter ([`STAGES_OVER_RDMA`]; the default build's exporter constructs but
+/// exports nothing, so its bytes ride inline) and the exporter built (the lane
+/// on, a listener IP, NIXL up). The build is asked first, so a build without
+/// the lane never constructs the exporter from this reading.
+fn rdma_lane_stages() -> bool {
+    STAGES_OVER_RDMA && mm_rdma_exporter().is_some()
+}
+
+/// [`mm_image_wire_cap_over`] with the RDMA lane's reading given as a closure,
+/// evaluated only when a TokenSpeed candidate comes up (the exporter is built
+/// lazily on its first read, an arena and its registration, which a fleet
+/// without TokenSpeed never needs), and so that a test reads both states.
+fn image_wire_cap_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+    rdma_lane_stages: &dyn Fn() -> bool,
+) -> Option<usize> {
+    let workers: Vec<Arc<dyn Worker>> = pools
+        .iter()
+        .flat_map(|pool| {
+            registry
+                .get_routing_pool(model_id, *pool)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (!workers.is_empty()
+        && workers
+            .iter()
+            .all(|worker| pixels_ride_in_the_message(worker, rdma_lane_stages)))
+    .then_some(WIRE_MESSAGE_CAP)
+}
+
+/// Whether `worker` takes a request's pixel tensors inline in the Generate
+/// message the gateway encodes: a gRPC worker whose runtime reads them from
+/// the message. SGLang always does. TokenSpeed stages every encoder input
+/// over the RDMA lane whenever the lane stages in this process
+/// (`rdma_lane_stages`, read only here: the dispatch's `into_proto(true)` and
+/// the EPD encode stage read no per-worker mode); otherwise it and vLLM follow the
+/// transport mode (the per-worker override or the router default, read as
+/// the SHM path reads it): `inline` rides in the message, and so does `rdma`
+/// (vLLM never pulls RDMA, and TokenSpeed without a staging lane falls back
+/// to inline); `shm`, and `auto` on a shared `/dev/shm`, send a handle
+/// instead. A TRT-LLM worker takes the files' bytes and a ZMQ wire has no
+/// such framing.
+fn pixels_ride_in_the_message(
+    worker: &Arc<dyn Worker>,
+    rdma_lane_stages: &dyn Fn() -> bool,
+) -> bool {
+    let spec = &worker.metadata().spec;
+    if spec.connection_mode != ConnectionMode::Grpc {
+        return false;
+    }
+    match spec.runtime_type {
+        RuntimeType::Sglang => true,
+        RuntimeType::TokenSpeed if rdma_lane_stages() => false,
+        RuntimeType::Vllm | RuntimeType::TokenSpeed => match spec
+            .multimodal_tensor_transport
+            .unwrap_or_else(|| mm_transport_defaults().mode)
+        {
+            TransportMode::Inline | TransportMode::Rdma => true,
+            TransportMode::Shm => !mm_shm_dev_writable(),
+            TransportMode::Auto => {
+                !(mm_shm_dev_writable()
+                    && local_shm_namespace_id()
+                        .is_some_and(|local| worker_matches_shm_namespace(worker, local)))
+            }
+        },
+        RuntimeType::Trtllm
+        | RuntimeType::Mlx
+        | RuntimeType::External
+        | RuntimeType::Generic
+        | RuntimeType::Unspecified => false,
+    }
+}
+
+/// Use one connection snapshot for both the dtype and pending-handshake check.
+/// Initialization between those decisions must not freeze a float32 layout.
+fn image_wire_dtype_with_backend(
+    worker: &dyn Worker,
+    overrides: &DtypeOverrides,
+    backend: Option<&BackendClient>,
+) -> Option<EncoderDtype> {
+    let label = encoder_dtype_label_with_backend(worker, backend);
+    let spec = &worker.metadata().spec;
+    if spec.runtime_type == RuntimeType::Sglang
+        && spec.connection_mode == ConnectionMode::Zmq
+        && label.is_none()
+        && backend.is_none()
+    {
+        return None;
+    }
+    image_wire_dtype(
+        spec.runtime_type,
+        label,
+        device_normalizes(worker),
+        overrides,
+    )
 }
 
 /// One worker's image wire dtype under assembly's rules; `None` when no
@@ -570,8 +724,7 @@ fn image_wire_dtype(
     overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let dtype = match runtime {
-        // Pinned on that wire, as its assembly pins it.
-        RuntimeType::Sglang => EncoderDtype::Float32,
+        RuntimeType::Sglang => sglang_wire_dtype(label.as_deref()),
         RuntimeType::Vllm if device_normalizes => return None,
         RuntimeType::Vllm => wire_dtype(
             &resolve_mm_vllm_encoder_input_dtype(overrides.vllm.clone(), label),
@@ -720,13 +873,14 @@ mod tests {
         Arc::new(builder.build())
     }
 
+    /// Pool planning agrees with assembly, including SGLang worker labels.
     #[test]
     fn a_worker_image_wire_dtype_is_what_its_assembly_writes() {
         let plain = DtypeOverrides::default();
         let bf16 = || Some("bfloat16".to_string());
         assert_eq!(
             image_wire_dtype(RuntimeType::Sglang, bf16(), false, &plain),
-            Some(EncoderDtype::Float32)
+            Some(EncoderDtype::BFloat16)
         );
         assert_eq!(
             image_wire_dtype(RuntimeType::Vllm, None, false, &plain),
@@ -778,7 +932,7 @@ mod tests {
         );
         assert_eq!(
             image_wire_dtype(RuntimeType::Sglang, bf16(), false, &overridden),
-            Some(EncoderDtype::Float32)
+            Some(EncoderDtype::BFloat16)
         );
     }
 
@@ -843,6 +997,122 @@ mod tests {
         );
     }
 
+    /// Disagreeing SGLang workers must defer the wire write until selection.
+    #[test]
+    fn sglang_mixed_precision_fleet_defers_the_wire_write() {
+        let narrow = worker(
+            "http://half",
+            RuntimeType::Sglang,
+            &[("multimodal_encoder_dtype", "float16")],
+        );
+        let legacy = worker("http://legacy", RuntimeType::Sglang, &[]);
+        let policy = DtypeOverrides::default();
+        assert_eq!(
+            shared_image_wire_dtype(std::slice::from_ref(&narrow), &policy),
+            Some(EncoderDtype::Float16)
+        );
+        assert_eq!(shared_image_wire_dtype(&[narrow, legacy], &policy), None);
+    }
+
+    /// A real ZMQ handshake supplies SGLang's dtype without an explicit label;
+    /// overrides win and old or disagreeing schedulers retain float32. Before the handshake,
+    /// the one-pass planner must not freeze a layout in the legacy precision.
+    #[tokio::test]
+    async fn sglang_zmq_dtype_comes_from_the_handshake_unless_overridden() {
+        use engine_zmq_client::{
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::handshake::EngineCoreReadyResponse,
+            EngineId,
+        };
+
+        use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+        let pending: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///pending")
+                .runtime_type(RuntimeType::Sglang)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let policy = DtypeOverrides::default();
+        let pending_backend = pending.backend_client_if_initialized();
+        assert_eq!(shared_image_wire_dtype(&[pending], &policy), None);
+
+        for (advertised, explicit, expected) in [
+            (vec![Some("bfloat16")], None, EncoderDtype::BFloat16),
+            (vec![Some("float16"); 2], None, EncoderDtype::Float16),
+            (vec![Some("bfloat16"); 2], None, EncoderDtype::BFloat16),
+            (vec![None; 2], None, EncoderDtype::Float32),
+            (
+                vec![Some("bfloat16"), Some("float32")],
+                None,
+                EncoderDtype::Float32,
+            ),
+            (
+                vec![Some("float16"), Some("bfloat16")],
+                None,
+                EncoderDtype::Float32,
+            ),
+            (vec![Some("bfloat16"), None], None, EncoderDtype::Float32),
+            (vec![None, Some("bfloat16")], None, EncoderDtype::Float32),
+            (
+                vec![Some("bfloat16"), Some("float32")],
+                Some("float16"),
+                EncoderDtype::Float16,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+            let (handshake, input, output) = (ep("hs"), ep("in"), ep("out"));
+            let count = advertised.len();
+            let ranks = advertised.into_iter().enumerate().map(|(rank, dtype)| {
+                connect_to_frontend(
+                    &handshake,
+                    EngineId::from_engine_index(rank as u32),
+                    EngineCoreReadyResponse {
+                        multimodal_encoder_dtype: dtype.map(str::to_string),
+                        ..default_ready_response()
+                    },
+                )
+            });
+            let (client, engines) = tokio::join!(
+                ZmqEngineClient::connect(
+                    &handshake,
+                    &input,
+                    &output,
+                    count,
+                    "m".to_string(),
+                    EosTokenIds::default(),
+                    RuntimeType::Sglang,
+                    Duration::from_secs(10)
+                ),
+                futures::future::join_all(ranks),
+            );
+            let _engines: Vec<_> = engines.into_iter().map(Result::unwrap).collect();
+            let mut builder = BasicWorkerBuilder::new(ep("worker"))
+                .runtime_type(RuntimeType::Sglang)
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .backend_client(BackendClient::Zmq(client.unwrap()));
+            if let Some(dtype) = explicit {
+                builder = builder.label("multimodal_encoder_dtype", dtype);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let workers = WorkerSelection::Single {
+                worker: Arc::clone(&worker),
+            };
+            assert_eq!(mm_sglang_encoder_input_dtype(Some(&workers)), expected);
+            // Retain the snapshot from before initialization while the worker
+            // now has a live backend. The planner must not resample that backend.
+            assert!(worker.backend_client_if_initialized().is_some());
+            assert_eq!(
+                image_wire_dtype_with_backend(worker.as_ref(), &policy, pending_backend.as_deref()),
+                explicit.map(|_| expected),
+            );
+            assert_eq!(shared_image_wire_dtype(&[worker], &policy), Some(expected));
+        }
+    }
+
     /// The stages see the fleet's wire dtype by default: the one-pass wire
     /// write is on unless its switch turns it off, and then they get no
     /// dtype whatever the fleet agrees on (every request takes the two-pass
@@ -891,6 +1161,146 @@ mod tests {
             mm_shared_image_wire_dtype_over(&registry, "qwen3-vl", pools),
             expected,
             "the stages see the fleet's wire dtype unless the switch turns the one-pass write off"
+        );
+    }
+
+    /// The up-front pixel bound holds only where every worker the selection
+    /// can pick takes the tensors inline in the gateway's gRPC message: one
+    /// worker on the SHM transport, a TRT-LLM pool or a ZMQ wire drops it.
+    #[test]
+    fn the_image_wire_cap_holds_only_for_an_inline_grpc_fleet() {
+        use openai_protocol::worker::WorkerSpec;
+
+        use crate::{
+            routers::grpc::{mode::Mode, proto_wrapper::mm_shm_dev_writable},
+            worker::{ConnectionMode, WorkerRegistry},
+        };
+
+        let pools = Mode::Regular.multimodal_wire_pools();
+        let fleet = |specs: Vec<WorkerSpec>, rdma_lane_stages: &dyn Fn() -> bool| {
+            let registry = WorkerRegistry::new();
+            for spec in specs {
+                registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::from_spec(spec)
+                            .model(ModelCard::new("qwen3-vl"))
+                            .worker_type(WorkerType::Regular)
+                            .health_config(no_health_check())
+                            .build(),
+                    ))
+                    .expect("register");
+            }
+            image_wire_cap_over(&registry, "qwen3-vl", pools, rdma_lane_stages)
+        };
+        let grpc = |url: &str, runtime: RuntimeType, transport: Option<TransportMode>| WorkerSpec {
+            connection_mode: ConnectionMode::Grpc,
+            runtime_type: runtime,
+            multimodal_tensor_transport: transport,
+            ..WorkerSpec::new(url)
+        };
+        let inline_fleet = || {
+            vec![
+                grpc(
+                    "grpc://inline-1:8000",
+                    RuntimeType::Vllm,
+                    Some(TransportMode::Inline),
+                ),
+                grpc(
+                    "grpc://inline-2:8000",
+                    RuntimeType::TokenSpeed,
+                    Some(TransportMode::Inline),
+                ),
+                grpc("grpc://inline-3:8000", RuntimeType::Sglang, None),
+            ]
+        };
+        assert_eq!(
+            fleet(inline_fleet(), &|| false),
+            Some(WIRE_MESSAGE_CAP),
+            "an inline gRPC fleet keeps the bound"
+        );
+        assert_eq!(
+            fleet(inline_fleet(), &|| true),
+            None,
+            "a live RDMA exporter takes every TokenSpeed input over NIXL, whatever the worker's mode"
+        );
+        assert_eq!(
+            fleet(
+                vec![
+                    grpc(
+                        "grpc://inline-1:8000",
+                        RuntimeType::Vllm,
+                        Some(TransportMode::Inline),
+                    ),
+                    grpc("grpc://rdma-1:8000", RuntimeType::Vllm, Some(TransportMode::Rdma)),
+                ],
+                &|| true,
+            ),
+            Some(WIRE_MESSAGE_CAP),
+            "vLLM never pulls RDMA: its pixels ride inline under a live exporter and the rdma mode alike"
+        );
+        if mm_shm_dev_writable() {
+            assert_eq!(
+                fleet(
+                    vec![
+                        grpc(
+                            "grpc://inline-1:8000",
+                            RuntimeType::Vllm,
+                            Some(TransportMode::Inline)
+                        ),
+                        grpc(
+                            "grpc://shm-1:8000",
+                            RuntimeType::Vllm,
+                            Some(TransportMode::Shm)
+                        ),
+                    ],
+                    &|| false
+                ),
+                None,
+                "one worker on the SHM transport drops it"
+            );
+        }
+        assert_eq!(
+            fleet(
+                vec![grpc("grpc://trt-1:8000", RuntimeType::Trtllm, None)],
+                &|| false
+            ),
+            None,
+            "a TRT-LLM pool takes the files' bytes"
+        );
+        assert_eq!(
+            fleet(
+                vec![WorkerSpec {
+                    connection_mode: ConnectionMode::Zmq,
+                    runtime_type: RuntimeType::Vllm,
+                    ..WorkerSpec::new("ipc:///vllm-1")
+                }],
+                &|| false
+            ),
+            None,
+            "a ZMQ wire has no such framing"
+        );
+        assert_eq!(fleet(vec![], &|| false), None, "no candidate, no bound");
+    }
+
+    /// A build without the lane (the default build: the exporter constructs but
+    /// exports nothing, so every byte rides inline) never reads the lane as
+    /// staging, whatever the lane's switches and listener say, and so keeps
+    /// the bound for TokenSpeed; the build is asked before any exporter is
+    /// built. The build's own answer is pinned at compile time (a const
+    /// block, as clippy asks of an assertion on a constant), the reading's
+    /// at run time.
+    #[cfg(not(feature = "mm-rdma"))]
+    #[test]
+    fn a_build_without_the_rdma_lane_keeps_the_bound() {
+        const {
+            assert!(
+                !STAGES_OVER_RDMA,
+                "the default build carries the no-op exporter"
+            );
+        };
+        assert!(
+            !rdma_lane_stages(),
+            "the inert exporter is never read as a staging lane"
         );
     }
 

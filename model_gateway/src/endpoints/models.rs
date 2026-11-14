@@ -34,6 +34,7 @@ use axum::{
 };
 use futures::future::select_all;
 use openai_protocol::{messages, model_card::ModelCard, models::ListModelsResponse};
+use serde::Deserialize;
 use serde_json::Value;
 use smg_external_router::{known, ExternalRouterSpec};
 use tracing::{debug, warn};
@@ -242,9 +243,7 @@ pub(crate) async fn retrieve_model_with(
 ) -> Response {
     let canonical = registry.resolve_model_alias(model_id);
     let wanted = canonical.as_deref().unwrap_or(model_id);
-    let card = self_hosted_cards(registry)
-        .into_iter()
-        .find(|card| card.id == wanted);
+    let card = self_hosted_card(registry, wanted);
     let shape = ModelShape::from_headers(headers);
     match card {
         Some(card) => shape.single(card),
@@ -259,8 +258,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|h| {
-            let lower = h.to_ascii_lowercase();
-            lower.starts_with("bearer ").then(|| h[7..].to_string())
+            // The scheme compared on the header's first seven bytes; no
+            // lowercased copy of the whole header.
+            let (scheme, token) = h.split_at_checked(7)?;
+            scheme
+                .eq_ignore_ascii_case("bearer ")
+                .then(|| token.to_string())
         })
         .or_else(|| {
             headers
@@ -268,6 +271,28 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
                 .and_then(|h| h.to_str().ok())
                 .map(String::from)
         })
+}
+
+/// The first self-hosted card with id `wanted`, read in place through the
+/// worker's card reader: only the match is copied, no worker's card list.
+fn self_hosted_card(registry: &WorkerRegistry, wanted: &str) -> Option<ModelCard> {
+    let mut card = None;
+    for worker in &registry.get_all() {
+        if matches!(worker.metadata().spec.runtime_type, RuntimeType::External) {
+            continue;
+        }
+        let found = worker.any_model(&mut |candidate| {
+            let hit = candidate.id == wanted;
+            if hit {
+                card = Some(candidate.clone());
+            }
+            hit
+        });
+        if found {
+            break;
+        }
+    }
+    card
 }
 
 /// The self-hosted inventory: every model card of every non-external worker.
@@ -465,7 +490,7 @@ fn upstream_models(
 ) -> Option<UpstreamModels> {
     if let Some(query) = page {
         if json.get("has_more").is_some_and(Value::is_boolean) {
-            return match serde_json::from_value::<messages::ListModelsResponse>(json.clone()) {
+            return match messages::ListModelsResponse::deserialize(json) {
                 Ok(list) if !list.data.is_empty() || query.narrows() => {
                     Some(UpstreamModels::Page(list))
                 }
@@ -499,6 +524,7 @@ mod tests {
     use crate::{
         config::types::TenantApiKeyEntry,
         middleware::test_support::json_of,
+        server::http_client,
         worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
     };
 
@@ -591,7 +617,7 @@ mod tests {
         );
         registry.register(internal_worker);
 
-        let client = crate::server::http_client();
+        let client = http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(
             Some("shared-secret".to_string()),
             &[TenantApiKeyEntry {
@@ -712,7 +738,7 @@ mod tests {
             "runtime_type": "external",
             "provider": "anthropic",
         })));
-        let client = crate::server::http_client();
+        let client = http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
         let mut openai_style = HeaderMap::new();
@@ -810,7 +836,7 @@ mod tests {
             headers: &HeaderMap,
             query: Option<&str>,
         ) -> Response {
-            let client = crate::server::http_client();
+            let client = http_client();
             let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
             list_models_with(registry, &client, &gateway_auth, headers, query, rid()).await
         }
@@ -895,7 +921,7 @@ mod tests {
             "runtime_type": "external",
             "provider": "anthropic",
         })));
-        let client = crate::server::http_client();
+        let client = http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
@@ -1045,7 +1071,7 @@ mod tests {
         let mut card = ModelCard::new("m1");
         card.display_name = Some("Model One".to_owned());
         let registry = registry_with(vec![card]);
-        let client = crate::server::http_client();
+        let client = http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
         let openai = json_of(
@@ -1114,7 +1140,7 @@ mod tests {
             headers: &HeaderMap,
             query: Option<&str>,
         ) -> (StatusCode, Value) {
-            let client = crate::server::http_client();
+            let client = http_client();
             let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
             let response =
                 list_models_with(registry, &client, &gateway_auth, headers, query, rid()).await;
@@ -1386,5 +1412,68 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_of(response).await;
         assert_eq!(body["id"], "org/second");
+    }
+
+    /// The in-place walk skips external workers and reads past the first
+    /// self-hosted one: an external worker's card is not in the self-hosted
+    /// inventory (404), each self-hosted worker's card is (200), whichever of
+    /// the two the walk visits first.
+    #[tokio::test]
+    async fn the_card_walk_skips_external_workers_and_reads_every_self_hosted_one() {
+        let registry = WorkerRegistry::new();
+        let external_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://external.invalid:8000")
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .models(vec![ModelCard::new("m1")])
+                .health_config(no_health_check())
+                .build(),
+        );
+        registry.register(external_worker);
+        register_worker(
+            &registry,
+            "http://internal-a.invalid:8000",
+            vec![ModelCard::new("m0")],
+        );
+        register_worker(
+            &registry,
+            "http://internal-b.invalid:8000",
+            vec![ModelCard::new("m2")],
+        );
+
+        let response = retrieve_model_with(&registry, &HeaderMap::new(), "m1", rid()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // `get_all` order is the DashMap's, not registration order: looking
+        // up both cards means one of them always sits on the second
+        // self-hosted worker the walk visits.
+        for id in ["m0", "m2"] {
+            let response = retrieve_model_with(&registry, &HeaderMap::new(), id, rid()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_of(response).await;
+            assert_eq!(body["id"], id);
+        }
+    }
+
+    /// The bearer scheme is matched without regard to case on the header's
+    /// first seven bytes; a header too short for a scheme and a space is no
+    /// bearer token and the lookup falls through to `x-api-key`.
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive_and_a_short_header_falls_through() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("BEARER abc"),
+        );
+        assert_eq!(bearer_token(&headers).as_deref(), Some("abc"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer xyz"),
+        );
+        assert_eq!(bearer_token(&headers).as_deref(), Some("xyz"));
+
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer"));
+        assert_eq!(bearer_token(&headers), None);
+        headers.insert("x-api-key", HeaderValue::from_static("key-1"));
+        assert_eq!(bearer_token(&headers).as_deref(), Some("key-1"));
     }
 }

@@ -1,0 +1,284 @@
+## Runner scale set for the automated code reviews: .github/workflows/claude-code-review.yml and
+## codex-code-review.yml run on it when the repository variable SMG_RUNNER_REVIEW names it.
+## A set of its own, so a review never waits behind the test jobs that fill k8s-runner-cpu: on
+## 2026-11-12 a review job waited 52 minutes for a runner there and then worked for three, and
+## the next push cancelled the reviews that never got one. A review mostly waits on the model,
+## so the pod is small (a quarter of a test runner's request) and keeps four runners warm for
+## the status notes. No docker: the reviews use none, so no container of this pod is privileged.
+## The `ai-key-proxy` sidecar is the one of runner-values-cpu.yaml, which documents it, without
+## the xAI key that no review uses; scripts/tests/test_runner_values_policy.py holds the two
+## copies equal, so change both together. Re-apply with the `helm upgrade` in README.md.
+controllerServiceAccount:
+  name: arc-gha-rs-controller
+  namespace: org-actions-runner
+githubConfigSecret: github-arc-secret
+githubConfigUrl: https://github.com/smg-project/smg
+keyVault: {}
+maxRunners: 32
+minRunners: 4
+resourceMeta: {}
+runnerScaleSetName: k8s-runner-review
+template:
+  spec:
+    containers:
+    - command:
+      - /home/runner/run.sh
+      image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
+      name: runner
+      resources:
+        limits:
+          cpu: '4'
+          memory: 8Gi
+        requests:
+          cpu: '2'
+          memory: 4Gi
+      volumeMounts:
+      - mountPath: /home/runner/_work
+        name: work
+    dnsConfig:
+      options:
+      - name: ndots
+        value: '1'
+    initContainers:
+    - name: ai-key-proxy
+      image: docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+      restartPolicy: Always
+      command:
+      - /bin/sh
+      - -c
+      - |
+        RESOLVER=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)
+        export RESOLVER
+        printf '%s' "$NGINX_TEMPLATE" | envsubst '${ANTHROPIC_API_KEY} ${OPENAI_API_KEY} ${XAI_API_KEY} ${RESOLVER}' > /etc/nginx/conf.d/default.conf
+        printf '%s' "$NGINX_JS" > /etc/nginx/app_token.js
+        unset ANTHROPIC_API_KEY OPENAI_API_KEY XAI_API_KEY NGINX_TEMPLATE NGINX_JS RESOLVER
+        sed -i 's/^worker_processes .*/worker_processes 1;/' /etc/nginx/nginx.conf
+        { echo 'load_module modules/ngx_http_js_module.so;'; cat /etc/nginx/nginx.conf; } > /tmp/nginx.conf
+        cat /tmp/nginx.conf > /etc/nginx/nginx.conf
+        exec nginx -g 'daemon off;'
+      env:
+      - name: ANTHROPIC_API_KEY
+        valueFrom:
+          secretKeyRef:
+            key: ANTHROPIC_API_KEY
+            name: anthropic-api-key
+      - name: OPENAI_API_KEY
+        valueFrom:
+          secretKeyRef:
+            key: OPENAI_API_KEY
+            name: openai-api-key
+      - name: NGINX_TEMPLATE
+        value: |
+          js_import app_token from /etc/nginx/app_token.js;
+          js_fetch_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+          map $http_upgrade $smg_connection_upgrade {
+            default upgrade;
+            '' close;
+          }
+          server {
+            listen 127.0.0.1:8787;
+            resolver ${RESOLVER} valid=30s ipv6=off;
+            access_log off;
+            client_max_body_size 64m;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_read_timeout 900s;
+            proxy_send_timeout 900s;
+            proxy_ssl_server_name on;
+            proxy_ssl_verify on;
+            proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+            proxy_ssl_protocols TLSv1.2 TLSv1.3;
+            location = /healthz { return 200 "ok"; }
+            location = /github/app-token { js_content app_token.mint; }
+            location /anthropic/ {
+              proxy_pass https://api.anthropic.com/;
+              proxy_set_header Host api.anthropic.com;
+              proxy_set_header x-api-key "${ANTHROPIC_API_KEY}";
+              proxy_set_header Authorization "";
+            }
+            location /openai/ {
+              proxy_pass https://api.openai.com/;
+              proxy_set_header Host api.openai.com;
+              proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection $smg_connection_upgrade;
+            }
+            location /xai/ {
+              set $xai_key "${XAI_API_KEY}";
+              if ($xai_key = "") { return 503 "xAI proxy credential is not configured\n"; }
+              proxy_pass https://api.x.ai/;
+              proxy_set_header Host api.x.ai;
+              proxy_set_header Authorization "Bearer $xai_key";
+            }
+          }
+      # Mints one-hour installation tokens for the SMG Codex Review GitHub App from the key in
+      # the codex-github-app secret, so a job only ever sees a token. POST /github/app-token
+      # with the calling job's GitHub Actions OIDC token as a bearer: the signature is checked
+      # against GitHub's keys and the claims pin the audience, this repository and the Codex
+      # workflow file, so a fork's run (which gets no OIDC token) or another workflow's job on
+      # the same pod cannot mint.
+      - name: NGINX_JS
+        value: |
+          import fs from 'fs';
+
+          const DIR = '/run/secrets/codex-github-app/';
+          const ISSUER = 'https://token.actions.githubusercontent.com';
+          const JWKS_URL = 'https://token.actions.githubusercontent.com/.well-known/jwks';
+          const AUDIENCE = 'ai-key-proxy';
+          const REPO = 'smg-project/smg';
+          const WORKFLOW = '.github/workflows/codex-code-review.yml@';
+          let jwks = null;
+          let jwksAt = 0;
+
+          function read(name) {
+            return fs.readFileSync(DIR + name).toString().trim();
+          }
+
+          function b64url(data) {
+            return Buffer.from(data).toString('base64url');
+          }
+
+          function decodeJson(part) {
+            return JSON.parse(Buffer.from(part, 'base64url').toString());
+          }
+
+          async function signingKey(kid) {
+            if (!jwks || Date.now() - jwksAt > 600000) {
+              const reply = await ngx.fetch(JWKS_URL, { headers: { 'User-Agent': 'smg-ai-key-proxy' } });
+              if (reply.status !== 200) {
+                throw new Error('jwks fetch ' + reply.status);
+              }
+              jwks = await reply.json();
+              jwksAt = Date.now();
+            }
+            const jwk = jwks.keys.find((k) => k.kid === kid);
+            if (!jwk) {
+              throw new Error('unknown signing key');
+            }
+            return crypto.subtle.importKey('jwk', { kty: jwk.kty, n: jwk.n, e: jwk.e },
+              { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+          }
+
+          // Why the caller is not our post job, or null when it is: a GitHub Actions OIDC
+          // token for this repository and the Codex workflow file, asked for with our audience.
+          async function refusal(r) {
+            const auth = r.headersIn.Authorization || '';
+            if (!auth.startsWith('Bearer ')) {
+              return 'no bearer token';
+            }
+            const parts = auth.slice(7).split('.');
+            if (parts.length !== 3) {
+              return 'malformed token';
+            }
+            let header;
+            let claims;
+            try {
+              header = decodeJson(parts[0]);
+              claims = decodeJson(parts[1]);
+            } catch (e) {
+              return 'malformed token';
+            }
+            if (header.alg !== 'RS256') {
+              return 'unexpected algorithm';
+            }
+            let key;
+            try {
+              key = await signingKey(header.kid);
+            } catch (e) {
+              return 'cannot verify: ' + e.message;
+            }
+            const valid = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, key,
+              Buffer.from(parts[2], 'base64url'), Buffer.from(parts[0] + '.' + parts[1]));
+            if (!valid) {
+              return 'bad signature';
+            }
+            const now = Math.floor(Date.now() / 1000);
+            if (claims.iss !== ISSUER) {
+              return 'wrong issuer';
+            }
+            if (claims.aud !== AUDIENCE) {
+              return 'wrong audience';
+            }
+            if (!(claims.exp > now) || (claims.nbf && claims.nbf > now + 60)) {
+              return 'token not valid now';
+            }
+            if (claims.repository !== REPO) {
+              return 'wrong repository';
+            }
+            if (!(claims.job_workflow_ref || '').startsWith(REPO + '/' + WORKFLOW)) {
+              return 'not the Codex review workflow';
+            }
+            return null;
+          }
+
+          async function mint(r) {
+            if (r.method !== 'POST') {
+              r.return(405, 'POST only\n');
+              return;
+            }
+            try {
+              const why = await refusal(r);
+              if (why) {
+                r.return(401, JSON.stringify({ error: 'unauthorized: ' + why }) + '\n');
+                return;
+              }
+              const pem = read('private-key').replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+              const key = await crypto.subtle.importKey('pkcs8', Buffer.from(pem, 'base64'),
+                { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+              const now = Math.floor(Date.now() / 1000);
+              const unsigned = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' })) + '.'
+                + b64url(JSON.stringify({ iat: now - 60, exp: now + 540, iss: read('app-id') }));
+              const signature = await crypto.subtle.sign({ name: 'RSASSA-PKCS1-v1_5' }, key, Buffer.from(unsigned));
+              const jwt = unsigned + '.' + b64url(signature);
+              const url = 'https://api.github.com/app/installations/' + read('installation-id') + '/access_tokens';
+              const reply = await ngx.fetch(url, {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + jwt, Accept: 'application/vnd.github+json', 'User-Agent': 'smg-ai-key-proxy' },
+                body: JSON.stringify({ permissions: { pull_requests: 'write', issues: 'write', metadata: 'read' } }),
+              });
+              const text = await reply.text();  // njs: no await inside a call's arguments
+              r.headersOut['Content-Type'] = 'application/json';
+              r.return(reply.status, text);
+            } catch (e) {
+              r.return(500, JSON.stringify({ error: String(e) }) + '\n');
+            }
+          }
+
+          export default { mint };
+      # The nginx workers run as the nginx user, so the files must be readable beyond root;
+      # only this container mounts the volume.
+      volumeMounts:
+      - name: codex-github-app
+        mountPath: /run/secrets/codex-github-app
+        readOnly: true
+      startupProbe:
+        exec:
+          command:
+          - wget
+          - -qO-
+          - http://127.0.0.1:8787/healthz
+        periodSeconds: 1
+        failureThreshold: 30
+      securityContext:
+        allowPrivilegeEscalation: false
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+    restartPolicy: Never
+    terminationGracePeriodSeconds: 600
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - emptyDir: {}
+      name: work
+    - name: codex-github-app
+      secret:
+        secretName: codex-github-app
+        defaultMode: 0444

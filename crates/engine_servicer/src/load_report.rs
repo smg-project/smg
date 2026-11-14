@@ -8,6 +8,8 @@
 
 use openai_protocol::worker::SchedulerLoadSnapshot;
 
+use crate::servicer::Shared;
+
 /// One rank's load as the report states it.
 pub(crate) struct RankFigures {
     pub(crate) dp_rank: i32,
@@ -31,6 +33,24 @@ impl RankFigures {
             total: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
             used_tokens: used_tokens.clamp(0.0, f64::from(i32::MAX)) as i32,
             usage: load.token_usage,
+        }
+    }
+}
+
+/// The capacity figures every rank's entry carries: the running window and
+/// the KV capacity the servicer knows.
+pub(crate) struct Capacity {
+    pub(crate) max_running_requests: i32,
+    pub(crate) max_total_num_tokens: i32,
+}
+
+impl Capacity {
+    /// The figures from the shared state; `launcher_running_window` is the
+    /// launcher's running-window figure, zero when it reported none.
+    pub(crate) fn of(shared: &Shared, launcher_running_window: i32) -> Self {
+        Self {
+            max_running_requests: shared.running_window(launcher_running_window),
+            max_total_num_tokens: shared.kv_capacity_tokens(),
         }
     }
 }

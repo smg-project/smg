@@ -15,14 +15,14 @@
 //! vocab, so decoded text is empty by construction -- the assertions are on
 //! token accounting and stream shape, not on text.
 
-use std::{sync::Arc, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use common::grpc_harness::{build_grpc_router, grpc_router_config, health_checks_off};
 use openai_protocol::{generate::GenerateRequest, model_card::ModelCard};
 use portpicker::pick_unused_port;
 use serial_test::serial;
 use smg::{
-    config::ParserChoice,
+    config::{GroupedDpSticky, ParserChoice},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{grpc::backend_client::BackendClient, RouterTrait},
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
@@ -71,11 +71,18 @@ fn start_mock_zmq_engines(handshake: &str, count: u16) {
 /// [`start_mock_zmq_engines`] with `gen_delay` ahead of every canned token:
 /// an engine that holds a request's first token for that long is silent on
 /// its stream from the dispatch on.
+fn start_mock_zmq_engines_with_delay(handshake: &str, count: u16, gen_delay: Duration) {
+    start_mock_zmq_engines_from(handshake, 0, count, gen_delay);
+}
+
+/// [`start_mock_zmq_engines_with_delay`] with the ranks' engine indices (their
+/// ZMQ identities) counted from `first`, as a headless vLLM group launched at
+/// data-parallel start rank `first` numbers its engines.
 #[expect(
     clippy::disallowed_methods,
     reason = "test helper - the mock engine tasks are fire-and-forget for the test process's lifetime"
 )]
-fn start_mock_zmq_engines_with_delay(handshake: &str, count: u16, gen_delay: Duration) {
+fn start_mock_zmq_engines_from(handshake: &str, first: u32, count: u16, gen_delay: Duration) {
     let cfg = Arc::new(mock_worker::config::Config {
         admin_port: None,
         context_length: 32768,
@@ -86,7 +93,7 @@ fn start_mock_zmq_engines_with_delay(handshake: &str, count: u16, gen_delay: Dur
         grpc_count: 0,
         zmq_handshake: Some(handshake.to_string()),
         zmq_count: count,
-        zmq_start_index: 0,
+        zmq_start_index: first,
         model_id: MODEL.to_string(),
         tokenizer_path: MODEL.to_string(),
         gen_delay,
@@ -95,11 +102,11 @@ fn start_mock_zmq_engines_with_delay(handshake: &str, count: u16, gen_delay: Dur
         engine: mock_worker::engine::EngineParams::default(),
         ..mock_worker::config::Config::default()
     });
-    for rank in 0..u32::from(count) {
+    for index in first..first + u32::from(count) {
         tokio::spawn(mock_worker::zmq::serve(
             cfg.clone(),
             handshake.to_string(),
-            rank,
+            index,
         ));
     }
 }
@@ -108,24 +115,33 @@ fn start_mock_zmq_engines_with_delay(handshake: &str, count: u16, gen_delay: Dur
 /// against `fixture`. `engine_count > 1` registers a grouped worker: one
 /// worker, one socket set, N engines dialing in.
 async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn RouterTrait> {
-    build_router_with(fixture, engine_count, Duration::from_secs(60))
-        .await
-        .0
+    build_router_with(
+        fixture,
+        engine_count,
+        Duration::from_secs(60),
+        GroupedDpSticky::Off,
+    )
+    .await
+    .0
 }
 
 /// [`build_router`] under `request_timeout` (`--request-timeout-secs`), the
 /// bound the registration step hands the ZMQ worker's link from the router
-/// config; here the worker is built directly, so the test hands it over. The
-/// retry layer is off: one attempt answers the client. The worker comes back
-/// with the router, for a look at its load and its link.
+/// config; here the worker is built directly, so the test hands it over; and
+/// with sticky requests to a grouped worker pinned to its engines as
+/// `grouped_dp_sticky` says (`--grouped-dp-sticky`). The retry layer is off:
+/// one attempt answers the client. The worker comes back with the router,
+/// for a look at its load and its link.
 async fn build_router_with(
     fixture: &ZmqFixture,
     engine_count: usize,
     request_timeout: Duration,
+    grouped_dp_sticky: GroupedDpSticky,
 ) -> (Box<dyn RouterTrait>, Arc<BasicWorker>) {
     let config = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
+        .grouped_dp_sticky(grouped_dp_sticky)
         .request_timeout_secs(request_timeout.as_secs())
         .worker_startup_timeout_secs(5)
         .worker_startup_check_interval_secs(1)
@@ -330,6 +346,134 @@ async fn grouped_zmq_worker_serves_requests_from_either_rank() {
     }
 }
 
+/// The first token of a scripted answer that names the engine serving a
+/// request: the engine of index `i` answers `ENGINE_MARK + i`.
+const ENGINE_MARK: u32 = 900;
+
+/// Scripted answers that name the engine serving a request: the engine of
+/// each index in `engines` answers its next `requests` requests with the one
+/// token [`ENGINE_MARK`] plus its index. Dropped, the answers left are taken
+/// back, so no later test is answered by them.
+struct EngineMarks {
+    engines: Range<u32>,
+}
+
+impl EngineMarks {
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    fn script(engines: Range<u32>, requests: usize) -> Self {
+        for index in engines.clone() {
+            let answers = (0..requests)
+                .map(|_| {
+                    mock_worker::script::Answer::parse(&serde_json::json!({
+                        "output_ids": [ENGINE_MARK + index],
+                        "finish_reason": "stop",
+                    }))
+                    .expect("a scripted answer")
+                })
+                .collect();
+            mock_worker::script::enqueue(&format!("zmq:{index}"), answers)
+                .expect("the engine is registered");
+        }
+        Self { engines }
+    }
+
+    /// The index of the engine that answered `response`.
+    #[expect(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    async fn engine_of(&self, response: axum::response::Response) -> u32 {
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let ids = json
+            .pointer("/0/output_ids")
+            .or_else(|| json.pointer("/output_ids"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("no output ids in {json}"));
+        let [mark] = ids.as_slice() else {
+            panic!("one scripted token expected in {json}");
+        };
+        let mark = mark
+            .as_u64()
+            .and_then(|mark| u32::try_from(mark).ok())
+            .expect("a token id");
+        let index = mark.checked_sub(ENGINE_MARK).expect("an engine's mark");
+        assert!(self.engines.contains(&index), "{json}");
+        index
+    }
+}
+
+impl Drop for EngineMarks {
+    fn drop(&mut self) {
+        for index in self.engines.clone() {
+            mock_worker::script::clear(&format!("zmq:{index}"));
+        }
+    }
+}
+
+/// Under `--grouped-dp-sticky hash` every request that carries a routing key
+/// reaches the engine of a grouped worker its key hashes to,
+/// `xxh3(key) % dp_size`, turn after turn: the gateway pins the request's
+/// `data_parallel_rank` and the connector honours the pin. Each engine
+/// answers with a token of its own, which names it.
+#[tokio::test]
+#[serial]
+async fn a_routing_key_keeps_its_engine_of_a_grouped_worker() {
+    const KEYS: [&str; 6] = ["conv-a", "conv-b", "conv-c", "conv-d", "conv-e", "conv-f"];
+    const TURNS: usize = 3;
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 2);
+    let (router, _worker) =
+        build_router_with(&fixture, 2, Duration::from_secs(60), GroupedDpSticky::Hash).await;
+    let marks = EngineMarks::script(0..2, KEYS.len() * TURNS);
+    for key in KEYS {
+        let hashed = (xxhash_rust::xxh3::xxh3_64(key.as_bytes()) % 2) as u32;
+        for turn in 0..TURNS {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-smg-routing-key", http::HeaderValue::from_static(key));
+            let response = router
+                .route_generate(Some(&headers), &test_meta(), generate_request(false), MODEL)
+                .await;
+            assert_eq!(
+                marks.engine_of(response).await,
+                hashed,
+                "{key}, turn {turn}"
+            );
+        }
+    }
+}
+
+/// A vLLM group whose engines are indexed from 2 (a headless group launched
+/// at data-parallel start rank 2) has no engine of index 0 or 1, the ranks
+/// its keys hash to. vLLM's connector matches a pin against the engine's
+/// index and would refuse such a pin, so under `--grouped-dp-sticky hash`
+/// the group's keyed requests are left unpinned and still served.
+#[tokio::test]
+#[serial]
+async fn a_vllm_group_indexed_from_a_later_rank_serves_its_keys_unpinned() {
+    const KEYS: [&str; 4] = ["conv-a", "conv-b", "conv-c", "conv-d"];
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines_from(&fixture.handshake, 2, 2, Duration::ZERO);
+    let (router, _worker) =
+        build_router_with(&fixture, 2, Duration::from_secs(60), GroupedDpSticky::Hash).await;
+    let marks = EngineMarks::script(2..4, KEYS.len());
+    for key in KEYS {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", http::HeaderValue::from_static(key));
+        let response = router
+            .route_generate(Some(&headers), &test_meta(), generate_request(false), MODEL)
+            .await;
+        marks.engine_of(response).await;
+    }
+}
+
 /// An engine that goes silent on a request (here: one that holds the first
 /// token well past the bound) no longer keeps the client waiting: the
 /// gateway ends the request at `--request-timeout-secs` counted from its
@@ -350,7 +494,8 @@ async fn a_silent_zmq_engine_ends_the_request_at_the_request_timeout() {
     const FIRST_TOKEN_AFTER: Duration = Duration::from_secs(20);
     let fixture = zmq_fixture();
     start_mock_zmq_engines_with_delay(&fixture.handshake, 1, FIRST_TOKEN_AFTER);
-    let (router, worker) = build_router_with(&fixture, 1, REQUEST_TIMEOUT).await;
+    let (router, worker) =
+        build_router_with(&fixture, 1, REQUEST_TIMEOUT, GroupedDpSticky::Off).await;
 
     let dispatched = tokio::time::Instant::now();
     let response = router
@@ -648,6 +793,311 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
             assert!(
                 text.contains("\"choices\""),
                 "stream {stream}, {grammar:?}: {text}"
+            );
+        }
+    }
+}
+
+/// A completion budget the window could never hold is refused at the gateway
+/// on the direct ZMQ lane too, where no engine frontend sits behind the
+/// gateway to refuse it: `400 context_length_exceeded` naming the window,
+/// the budget and the field, before the engine is asked; a budget that fits
+/// is served.
+#[tokio::test]
+#[serial]
+async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
+    const WINDOW: u32 = 64;
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 1);
+    let config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .max_concurrent_requests(64)
+        .queue_timeout_secs(60)
+        .disable_retries()
+        .build_unchecked();
+    let worker = Arc::new(
+        BasicWorkerBuilder::new(fixture.worker_url.clone())
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Zmq)
+            .runtime_type(RuntimeType::Vllm)
+            .zmq_handshake_address(fixture.handshake.clone())
+            .zmq_request_timeout(Duration::from_secs(60))
+            .model(ModelCard::new(MODEL).with_context_length(WINDOW))
+            .health_config(health_checks_off())
+            .build(),
+    );
+    let router =
+        build_grpc_router(config, MODEL, vec![Arc::clone(&worker) as Arc<dyn Worker>]).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ZMQ handshake never completed against the mock engine"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let chat = |max_tokens: u32| -> openai_protocol::chat::ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello world"}],
+            "max_tokens": max_tokens,
+        }))
+        .expect("a chat request")
+    };
+
+    let response = router
+        .route_chat(None, &test_meta(), chat(WINDOW + 1), MODEL)
+        .await;
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .expect("response body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("a json error");
+    assert_eq!(json["error"]["code"], "context_length_exceeded", "{json}");
+    let message = json["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains(&format!("{WINDOW} tokens"))
+            && message.contains(&format!("{} tokens for the completion", WINDOW + 1))
+            && message.contains("max_tokens"),
+        "the refusal names the window, the budget and the field: {message}"
+    );
+
+    let response = router
+        .route_chat(None, &test_meta(), chat(WINDOW), MODEL)
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+}
+
+/// Usage over the direct ZMQ lane, on every route: the prompt count is the
+/// number of ids the gateway sent when the engine's first output carries no
+/// prefill stats (an engine's silence is not a zero), and the engine's own
+/// count once it reports one. The engine is a raw mock EngineCore answering
+/// each request with one token and a stop, with the stats or without, and
+/// the ids it was sent are read off its inbound add.
+#[tokio::test]
+#[serial]
+async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_one() {
+    use std::collections::BTreeSet;
+
+    use engine_zmq_client::{
+        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
+        protocol::vllm::{
+            output::{
+                EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
+            },
+            stats::PrefillStats,
+        },
+        EngineId,
+    };
+    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
+    use openai_protocol::{
+        chat::ChatCompletionRequest, completion::CompletionRequest, messages::CreateMessageRequest,
+        responses::ResponsesRequest,
+    };
+
+    let fixture = zmq_fixture();
+    let config = grpc_router_config()
+        .regular_mode(vec![])
+        .random_policy()
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .max_concurrent_requests(64)
+        .queue_timeout_secs(60)
+        .disable_retries()
+        .build_unchecked();
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let worker = Arc::new(
+        BasicWorkerBuilder::new(fixture.worker_url.clone())
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Zmq)
+            .runtime_type(RuntimeType::Vllm)
+            .zmq_handshake_address(fixture.handshake.clone())
+            .zmq_request_timeout(Duration::from_secs(60))
+            .model(ModelCard::new(MODEL))
+            .health_config(health_checks_off())
+            .build(),
+    );
+    let context = common::grpc_harness::grpc_test_context_with_tokenizer(config, MODEL, tokenizer);
+    let (engine, router) = tokio::join!(
+        connect_to_frontend(
+            &fixture.handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response(),
+        ),
+        async {
+            let context = context.await;
+            let router = common::grpc_harness::grpc_router(
+                &context,
+                vec![Arc::clone(&worker) as Arc<dyn Worker>],
+            )
+            .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "ZMQ handshake never completed against the mock engine"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            router
+        },
+    );
+    let (mut input, mut output) = engine.expect("the mock engine connects").split();
+    // The engine's whole answer to a request: one token and the stop, the
+    // prefill stats as the case says.
+    let answer = |request_id: &str, reported: Option<u32>| {
+        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: request_id.into(),
+                new_token_ids: vec![1],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                prefill_stats: reported.map(|num_prompt_tokens| PrefillStats {
+                    num_prompt_tokens,
+                    num_computed_tokens: num_prompt_tokens,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            finished_requests: Some(BTreeSet::from([request_id.to_string()])),
+            ..Default::default()
+        })
+    };
+    let meta = test_meta();
+    let user = "Hello world";
+    for route in [
+        "chat",
+        "chat stream",
+        "completions",
+        "messages",
+        "responses",
+        "generate",
+    ] {
+        for reported in [None, Some(5)] {
+            let stream = route == "chat stream";
+            let mut request = match route {
+                "chat" | "chat stream" => {
+                    let mut body = serde_json::json!({
+                        "model": MODEL,
+                        "messages": [{"role": "user", "content": user}],
+                        "max_tokens": 2,
+                        "stream": stream,
+                    });
+                    if stream {
+                        body["stream_options"] = serde_json::json!({"include_usage": true});
+                    }
+                    let body: ChatCompletionRequest =
+                        serde_json::from_value(body).expect("a chat request");
+                    router.route_chat(None, &meta, body, MODEL)
+                }
+                "completions" => {
+                    let body: CompletionRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "prompt": user,
+                        "max_tokens": 2,
+                    }))
+                    .expect("a completion request");
+                    router.route_completion(None, &meta, body, MODEL)
+                }
+                "messages" => {
+                    let body: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "max_tokens": 2,
+                        "messages": [{"role": "user", "content": user}],
+                    }))
+                    .expect("a messages request");
+                    router.route_messages(None, &meta, body, MODEL)
+                }
+                "responses" => {
+                    let body: ResponsesRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "input": user,
+                        "store": false,
+                        "max_output_tokens": 2,
+                    }))
+                    .expect("a responses request");
+                    router.route_responses(None, &meta, body, MODEL)
+                }
+                "generate" => {
+                    let body: GenerateRequest = serde_json::from_value(serde_json::json!({
+                        "model": MODEL,
+                        "text": user,
+                        "sampling_params": {"max_new_tokens": 2},
+                    }))
+                    .expect("a generate request");
+                    router.route_generate(None, &meta, body, MODEL)
+                }
+                other => panic!("no such route: {other}"),
+            };
+            // A streamed answer's response goes out once the request is at
+            // the engine, before the engine answers; a plain one only after.
+            let (inbound, early) = if stream {
+                let response = (&mut request).await;
+                (input.recv().await, Some(response))
+            } else {
+                let inbound = tokio::select! {
+                    inbound = input.recv() => inbound,
+                    response = &mut request => {
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                            .await
+                            .expect("response body");
+                        panic!(
+                            "{route}: answered before the engine saw it: {status} {}",
+                            String::from_utf8_lossy(&body)
+                        );
+                    }
+                };
+                (inbound, None)
+            };
+            let sent = match inbound.expect("the engine's next inbound") {
+                EngineInbound::Add(sent) => sent,
+                other => panic!("{route}: expected an add-request, got {other:?}"),
+            };
+            let sent_ids = sent.prompt_token_ids.as_ref().map_or(0, Vec::len);
+            assert!(sent_ids > 0, "{route}: the gateway sends the prompt's ids");
+            let expected = reported.map_or(sent_ids as u64, u64::from);
+            output
+                .send_outputs(&answer(&sent.request_id, reported))
+                .await
+                .expect("the answer is sent");
+            let response = match early {
+                Some(response) => response,
+                None => (&mut request).await,
+            };
+            assert_eq!(response.status(), http::StatusCode::OK, "{route}");
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("response body");
+            let text = String::from_utf8_lossy(&body);
+            let usage: serde_json::Value = if stream {
+                // The usage rides the last data chunk before `[DONE]`.
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                    .rfind(|chunk| !chunk["usage"].is_null())
+                    .unwrap_or_else(|| panic!("{route}: no usage chunk in {text}"))
+            } else {
+                serde_json::from_str(&text)
+                    .unwrap_or_else(|error| panic!("{route}: {error} in {text}"))
+            };
+            let prompt_tokens = [
+                "/usage/prompt_tokens",
+                "/usage/input_tokens",
+                "/meta_info/prompt_tokens",
+                "/0/meta_info/prompt_tokens",
+            ]
+            .iter()
+            .find_map(|pointer| usage.pointer(pointer))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("{route}: no prompt count in {usage}"));
+            assert_eq!(
+                prompt_tokens, expected,
+                "{route}, prefill stats {reported:?}: the usage's prompt count is the gateway's \
+                 {sent_ids} ids unless the engine reports its own"
             );
         }
     }

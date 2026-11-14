@@ -46,7 +46,7 @@ fn check_batch(
                 if registry.get_by_url(worker.url()).is_some() {
                     return Err(step_failed(format!(
                         "Worker {} already exists",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
                 // The registry is keyed by URL, so a batch that repeats one
@@ -54,7 +54,7 @@ fn check_batch(
                 if !batch_urls.insert(worker.url()) {
                     return Err(step_failed(format!(
                         "Worker {} appears twice in the same registration",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
             }
@@ -89,14 +89,14 @@ fn register_worker(
             expected_revision,
         } => {
             let worker_id = WorkerId::from_string(worker_id.clone());
-            let url = worker.url().to_string();
+            let address = worker.redacted_url().to_string();
             // Fails when the ID is gone or the worker moved on, which covers
             // the concurrent DELETE, DELETE + POST, and second-PUT cases.
             if registry.replace_claiming_local(&worker_id, worker, *expected_revision) {
                 Ok(worker_id)
             } else {
                 Err(step_failed(format!(
-                    "Worker {} at {url} is no longer at revision {expected_revision}, \
+                    "Worker {} at {address} is no longer at revision {expected_revision}, \
                      so the replacement was dropped",
                     worker_id.as_str()
                 )))

@@ -9,7 +9,8 @@ use rand::RngExt as _;
 
 use crate::{
     config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
+    policies::hash_ring::HashRing,
+    worker::{load_state::LoadReceiver, runtime::RoutingState, Worker, UNKNOWN_MODEL_ID},
 };
 
 mod bucket;
@@ -18,7 +19,9 @@ mod cache_namespace;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
+pub mod expected_wait;
 mod factory;
+pub mod hash_ring;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -402,7 +405,7 @@ pub(crate) fn draw_eligible(
 #[inline]
 pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     if model_id.is_empty() {
-        crate::worker::UNKNOWN_MODEL_ID
+        UNKNOWN_MODEL_ID
     } else {
         model_id
     }
@@ -497,7 +500,8 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerType,
+        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerLoadGuard,
+        WorkerType,
     };
 
     #[test]
@@ -595,7 +599,7 @@ mod tests {
         );
 
         // A busy worker is still eligible: load alone is not the veto.
-        let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        let _guard = WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
         assert_eq!(
             get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
             vec![0, 1, 2]

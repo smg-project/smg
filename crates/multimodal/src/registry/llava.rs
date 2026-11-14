@@ -4,7 +4,10 @@ use serde_json::Value;
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        layouts::batched_with_image_sizes, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{
         LlavaNextProcessor, LlavaProcessor, PixtralProcessor, PreProcessorConfig,
@@ -215,10 +218,7 @@ impl ModelProcessorSpec for LlavaSpec {
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // pixel_values is [num_images, C, H, W]; the Pixtral tower's
         // image_sizes is [num_images, 2] (a CLIP tower emits none).
-        HashMap::from([
-            ("pixel_values".to_string(), FieldLayout::Batched),
-            ("image_sizes".to_string(), FieldLayout::Batched),
-        ])
+        batched_with_image_sizes()
     }
 }
 
@@ -295,10 +295,7 @@ impl ModelProcessorSpec for LlavaNextSpec {
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // encoder_input is [num_images, max_patches, C, H, W] (5D, batched).
         // image_sizes is [num_images, 2] (batched), matching the reference processor's kwargs.
-        HashMap::from([
-            ("pixel_values".to_string(), FieldLayout::Batched),
-            ("image_sizes".to_string(), FieldLayout::Batched),
-        ])
+        batched_with_image_sizes()
     }
 }
 
@@ -309,6 +306,7 @@ mod tests {
     use crate::{
         registry::{test_helpers::*, ModelMetadata, ModelRegistry},
         types::ImageSize,
+        vision::PreProcessorConfig,
     };
 
     #[test]
@@ -396,8 +394,6 @@ mod tests {
 
     #[test]
     fn llava_spec_has_no_audio_processor() {
-        use crate::vision::PreProcessorConfig;
-
         let tokenizer = TestTokenizer::new(&[("<image>", 32000)]);
         let config = json!({"model_type": "llava", "image_token_index": 32000});
         let metadata = ModelMetadata {
@@ -419,7 +415,7 @@ mod tests {
     /// the LLaVA processor and `<image>`.
     #[test]
     fn the_vision_tower_picks_the_processor_and_the_placeholder() {
-        use crate::{types::FieldLayout, vision::PreProcessorConfig, Modality};
+        use crate::{types::FieldLayout, Modality};
 
         let registry = ModelRegistry::new();
         let tokenizer = pixtral_tokenizer();
@@ -631,8 +627,8 @@ mod tests {
     }
 
     /// Its `preprocessor_config.json`.
-    fn pixtral_preprocessor_config() -> crate::vision::PreProcessorConfig {
-        crate::vision::PreProcessorConfig::from_json(
+    fn pixtral_preprocessor_config() -> PreProcessorConfig {
+        PreProcessorConfig::from_json(
             r#"{"image_processor_type":"PixtralImageProcessor","size":{"longest_edge":1024},
                 "patch_size":{"height":16,"width":16},"resample":3,
                 "image_mean":[0.48145466,0.4578275,0.40821073],

@@ -4,7 +4,10 @@ use serde_json::Value;
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        layouts::batched_with_image_sizes, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{Phi3VisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
@@ -40,10 +43,7 @@ impl ModelProcessorSpec for Phi3VisionSpec {
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        HashMap::from([
-            ("pixel_values".to_string(), FieldLayout::Batched),
-            ("image_sizes".to_string(), FieldLayout::Batched),
-        ])
+        batched_with_image_sizes()
     }
 
     fn vision_processor(

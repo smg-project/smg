@@ -555,10 +555,14 @@ def wait_for_workers_ready(
         api_key: Optional API key for auth header
         process: The router's process, when the caller launched it; its exit
             ends the wait at once with :class:`ProcessExitedError`.
-        expected_urls: The worker URLs the router was started with; the ones
-            still missing at the deadline are named in the error (a
-            data-parallel worker counts as registered once any of its ranks
-            is).
+        expected_urls: The worker URLs the router was started with. Given,
+            they are the registration gate: the wait goes on until each is
+            registered, since the router lists and counts rank entries and a
+            data-parallel worker's ranks would satisfy a worker count while
+            another worker is still absent (a worker counts as registered
+            once any of its ranks is: a rank entry names its base in
+            dp_base_url). The ones still missing at the deadline are named in
+            the error. Without them the count is the gate.
         workers: The workers behind those URLs, when the caller launched them;
             a worker's exit ends the wait at once with its death report. An
             engine that dials the router in loads its model inside this wait,
@@ -568,6 +572,7 @@ def wait_for_workers_ready(
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     connected_workers = 0
     registered_urls: list[str] = []
+    absent: list[str] = list(expected_urls or [])
     readiness_reason = "not checked"
 
     with requests.Session() as session:
@@ -588,7 +593,14 @@ def wait_for_workers_ready(
                         for w in listed
                         if isinstance(w, dict) and "url" in w
                     ]
-                    if connected_workers >= expected_workers:
+                    registered = {url.rstrip("/") for url in registered_urls}
+                    absent = [
+                        url for url in expected_urls or () if url.rstrip("/") not in registered
+                    ]
+                    all_registered = (
+                        not absent if expected_urls else connected_workers >= expected_workers
+                    )
+                    if all_registered:
                         readiness_resp = session.get(
                             f"{router_url}/readiness", headers=headers, timeout=5
                         )
@@ -630,15 +642,11 @@ def wait_for_workers_ready(
                 pass
             _sleep_watching(process, 2, "Router", router_url, start)
 
-    missing = ""
-    if expected_urls:
-        registered = {url.rstrip("/") for url in registered_urls}
-        absent = [url for url in expected_urls if url.rstrip("/") not in registered]
-        if absent:
-            missing = f", missing: {', '.join(absent)}"
+    missing = f", missing: {', '.join(absent)}" if absent else ""
+    connected = len(expected_urls) - len(absent) if expected_urls else connected_workers
     raise TimeoutError(
         f"Router at {router_url} did not become ready within {timeout}s "
-        f"(workers: {connected_workers}/{expected_workers}{missing}, "
+        f"(workers: {connected}/{expected_workers}{missing}, "
         f"readiness: {readiness_reason})"
     )
 

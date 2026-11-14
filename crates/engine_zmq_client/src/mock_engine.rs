@@ -79,6 +79,7 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         block_size: 16,
         dp_stats_address: None,
         dtype: ModelDtype::Float32,
+        multimodal_encoder_dtype: None,
         vllm_version: "test-vllm-version".to_string(),
         world_size: 1,
         data_parallel_size: 1,

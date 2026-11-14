@@ -1,9 +1,9 @@
 """The disaggregated gRPC path on each scheduler wire the mock serves, on the CPU row.
 
 The gateway speaks one prefill-decode protocol per scheduler proto
-(``pd_protocol.rs``). SGLang dispatches both legs in parallel and writes the
+(``pd_protocol.rs``). SGLang dispatches both sides in parallel and writes the
 gateway-minted bootstrap host, port and room into each; vLLM dispatches the
-prefill leg, then the decode leg, with no rendezvous; TokenSpeed dispatches in
+prefill side, then the decode side, with no rendezvous; TokenSpeed dispatches in
 parallel over a bootstrap room. The disaggregated topology classes run on the
 mock's default wire, TokenSpeed, so the SGLang and vLLM branches ran only on
 the card lanes. Each class here starts one prefill and one decode mock worker
@@ -100,7 +100,7 @@ class _DisaggregatedWireTurns:
         assert by_role["decode"]["url"] in {w.base_url for w in gateway.decode_workers}
 
     def test_a_chat_turn_runs_this_wire_s_protocol(self, setup_backend, mock_answers):
-        """A chat turn runs the two legs of this wire's protocol: the gateway
+        """A chat turn runs the two sides of this wire's protocol: the gateway
         pairs the prefill and the decode worker (its log says so) and the
         decode side's scripted text comes back with a stop and a usage."""
         _backend, model, client, gateway = setup_backend
@@ -124,7 +124,7 @@ class _DisaggregatedWireTurns:
     def test_a_streamed_turn_runs_this_wire_s_protocol(self, setup_backend, mock_answers):
         """The streamed deltas join to the scripted text, the stream ends on
         ``stop`` and its usage chunk counts the completion as the non-streamed
-        turn does, through this wire's two-leg protocol."""
+        turn does, through this wire's prefill-decode protocol."""
         _backend, model, client, _gateway = setup_backend
         mock_answers.enqueue(_ANSWER)
         whole = client.chat.completions.create(

@@ -155,7 +155,11 @@ spec:
     spec:
       containers:
         - name: brave-search-mcp
-          image: docker.io/mcp/brave-search:latest
+          # Pinned by digest so a push of the floating tag cannot change the
+          # server under the e2e rows unannounced: this is the registry's
+          # latest as of 2026-06-25, pinned 2026-11-10. Move the digest on
+          # purpose, with a note of what changed.
+          image: docker.io/mcp/brave-search@sha256:f58a5c22c1196ec7bd1ca586ce216f2334fc298550ddcf652c0e8adb6d256d78
           ports:
             - containerPort: 8080
           env:

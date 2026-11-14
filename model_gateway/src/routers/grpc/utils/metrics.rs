@@ -294,11 +294,14 @@ mod tests {
         use metrics_labels::*;
         use smg_grpc_client::constraint_failed_status;
 
-        use crate::routers::{
-            common::{overload, placement},
-            error,
-            grpc::{common::responses::background, utils::tonic_ext::TonicStatusExt},
-            prefill_queue_full, prefill_queue_timeout,
+        use crate::{
+            rate_limit::rejection_response,
+            routers::{
+                common::{overload, placement},
+                error,
+                grpc::{common::responses::background, utils::tonic_ext::TonicStatusExt},
+                prefill_queue_full, prefill_queue_timeout,
+            },
         };
 
         // A worker's status, whatever code the answer is minted under.
@@ -369,10 +372,7 @@ mod tests {
             ),
             (background::limit_reached(4), REASON_OVERLOAD_SHED),
             (error::model_not_found("m"), REASON_MODEL_NOT_FOUND),
-            (
-                crate::rate_limit::rejection_response(3),
-                REASON_RATE_LIMITED,
-            ),
+            (rejection_response(3), REASON_RATE_LIMITED),
             (
                 placement::no_media_ref_capable_worker("no vision worker"),
                 REASON_NO_CAPABLE_WORKER,
@@ -386,14 +386,14 @@ mod tests {
                 REASON_DEADLINE,
             ),
             (
-                error::internal_error("call_upstream_connection_failed", "refused"),
+                error::bad_gateway("call_upstream_connection_failed", "refused"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             // The client files a reset or a close before the head as a
             // request fault, and a body cut short as a body fault: both are
             // the worker's connection failing under the call.
             (
-                error::internal_error("call_upstream_request_error", "reset"),
+                error::bad_gateway("call_upstream_request_error", "reset"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             (
@@ -404,7 +404,7 @@ mod tests {
             // it was whole is the connection's fault, one over the limit the
             // answer's.
             (
-                error::internal_error("read_response_body_failed", "cut"),
+                error::bad_gateway("read_response_body_failed", "cut"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             (

@@ -199,6 +199,24 @@ mod tests {
         }
     }
 
+    /// Three alive nodes, `node1` to `node3`, on consecutive local ports.
+    fn three_alive_nodes() -> BTreeMap<String, NodeState> {
+        let mut cluster_state = BTreeMap::new();
+        cluster_state.insert(
+            "node1".to_string(),
+            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
+        );
+        cluster_state.insert(
+            "node2".to_string(),
+            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
+        );
+        cluster_state.insert(
+            "node3".to_string(),
+            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
+        );
+        cluster_state
+    }
+
     #[test]
     fn test_partition_config_default() {
         let config = PartitionConfig::default();
@@ -235,19 +253,7 @@ mod tests {
         let config = create_test_config();
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for all nodes
         detector.update_last_seen("node1");
@@ -264,19 +270,7 @@ mod tests {
         let config = create_test_config();
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for node1 and node2 (quorum)
         detector.update_last_seen("node1");
@@ -304,19 +298,7 @@ mod tests {
         config.quorum_threshold = 2;
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for all nodes first
         detector.update_last_seen("node1");
@@ -351,19 +333,7 @@ mod tests {
         let config = create_test_config();
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for all nodes
         detector.update_last_seen("node1");

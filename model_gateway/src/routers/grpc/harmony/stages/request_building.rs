@@ -15,8 +15,8 @@ use crate::routers::{
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
         context::{
-            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-            ExecutionPlanKind, PreparationOutput, RequestContext, RequestType,
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, PlanSettings,
+            PreparationOutput, RequestContext, RequestType,
         },
         proto_wrapper::ProtoGenerateRequest,
         regular::stages::token_ids,
@@ -31,17 +31,13 @@ use crate::routers::{
 /// Takes the Harmony-encoded input_ids from preparation and builds a proto::GenerateRequest.
 /// Unlike regular request building, this uses token_ids directly (Harmony encoding handles messages).
 pub(crate) struct HarmonyRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl HarmonyRequestBuildingStage {
     /// Create a new Harmony request building stage
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -218,14 +214,14 @@ impl BuildStage for HarmonyRequestBuildingStage {
         ctx.state.response.router_stop_obligations = builder_client
             .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
 
-        if self.inject_pd_metadata {
+        if self.settings.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {
                 helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
             }
         }
 
         Ok(BuildOutput {
-            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
+            plan: ExecutionPlan::generate(self.settings.plan_kind, proto_request),
             spec: ResponseSpec::Harmony(harmony_spec),
             stamp: AttemptStamp {
                 id: id_stamp,
@@ -233,7 +229,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 // retries must not start applying them.
                 sampling_mask: None,
                 sampling_baseline: None,
-                inject_pd_metadata: self.inject_pd_metadata,
+                inject_pd_metadata: self.settings.inject_pd_metadata,
                 // Harmony's constraint is never shaped per worker; retries
                 // carry it as built.
                 tool_constraint: None,
@@ -247,10 +243,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
 
     #[cfg(test)]
     fn signature(&self) -> String {
-        format!(
-            "HarmonyRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
-        )
+        format!("HarmonyRequestBuildingStage({})", self.settings.signature())
     }
 }
 

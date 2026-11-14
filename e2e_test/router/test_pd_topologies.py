@@ -41,7 +41,7 @@ engines' own metrics (HTTP workers send no load reports), checks that decode
 computed none of a long prompt, and expects SMG to refuse ``n>1``.
 
 Usage:
-    E2E_RUNTIME=tokenspeed pytest e2e_test/router/test_pd_topologies.py -v -k 2p2d
+    E2E_RUNTIME=tokenspeed E2E_ENGINE=tokenspeed pytest e2e_test/router/test_pd_topologies.py -v -k 2p2d
 """
 
 from __future__ import annotations

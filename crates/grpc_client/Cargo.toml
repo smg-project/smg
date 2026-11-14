@@ -31,6 +31,8 @@ prost-types.workspace = true
 
 # Async/concurrency
 futures.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
 
 # The HTTP/2 layer the channel runs on (`channel`): the connection, its
 # streams and pings; also the type of the transport fault a `tonic::Status`

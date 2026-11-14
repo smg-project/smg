@@ -2177,7 +2177,7 @@ def test_model_info_carries_the_structural_tag_vocabulary_of_an_older_xgrammar(m
 
 def test_model_info_advertises_the_encoder_cache_connector():
     # Without an encoder-cache connector the four fields are bare (and the
-    # Rust servicer refuses a leg that names one).
+    # Rust servicer refuses a request that names one).
     bare = rust.model_info_from_config(_config())
     assert (
         bare["supports_ec_transfer"],

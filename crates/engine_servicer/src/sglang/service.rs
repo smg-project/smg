@@ -12,7 +12,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{embed, generate, info, State};
-use crate::{kv_events, rpc, servicer::RequestOrigin, BoxStream};
+use crate::{admin, kv_events, rpc, servicer::RequestOrigin, trace_context, BoxStream};
 
 /// What neither servicer serves: the msgpack wire has no adapter-loading
 /// message, and the Python servicer does not implement these RPCs either.
@@ -39,7 +39,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let trace_headers = crate::trace_context::trace_headers(request.metadata());
+        let trace_headers = trace_context::trace_headers(request.metadata());
         let stream = generate::generate(
             &self.state,
             request.into_inner(),
@@ -117,7 +117,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        crate::admin::flush_cache(&self.state.shared, request)
+        admin::flush_cache(&self.state.shared, request)
             .await
             .map(Response::new)
     }
@@ -126,7 +126,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        crate::admin::start_profile(&self.state.shared, request.into_inner())
+        admin::start_profile(&self.state.shared, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -135,7 +135,7 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        crate::admin::stop_profile(&self.state.shared)
+        admin::stop_profile(&self.state.shared)
             .await
             .map(Response::new)
     }
@@ -172,6 +172,9 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<sg::ListLoadedLoRaAdaptersRequest>,
     ) -> Result<Response<sg::ListLoadedLoRaAdaptersResponse>, Status> {
-        Err(no_control_wire("ListLoadedLoRAAdapters"))
+        self.state.shared.engine()?;
+        Ok(Response::new(sg::ListLoadedLoRaAdaptersResponse {
+            loaded_adapters: self.state.loras.adapters.clone(),
+        }))
     }
 }

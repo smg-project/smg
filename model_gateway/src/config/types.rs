@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -95,6 +96,10 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (header keys, rid-lineage fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// Whether, and how, a request's sticky key pins it to one engine of a
+    /// grouped data-parallel worker; see [`GroupedDpSticky`].
+    #[serde(default)]
+    pub grouped_dp_sticky: GroupedDpSticky,
     /// How strictly PD placement pairs a prefill with a decode on their KV
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
@@ -123,7 +128,10 @@ pub struct RouterConfig {
     /// counted in the same `smg_http_connections_rejected_total`. `0` is no
     /// bound. The bound is the admin listener's own, so the control plane
     /// stays reachable while the data plane is saturated, and a client that
-    /// reaches the admin listener cannot hold it open without limit.
+    /// reaches the admin listener cannot hold it open without limit. Needs
+    /// `admin_port` (the validator refuses the bound without it). Probes on
+    /// the admin port fall under the bound like any connection;
+    /// `health_check_port` is the listener no bound covers.
     #[serde(default)]
     pub admin_max_connections: usize,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
@@ -177,10 +185,12 @@ pub struct RouterConfig {
     /// a TLS handshake and upgraded connections included). A connection
     /// beyond the bound is closed at once, before any TLS handshake and
     /// without a response, and counted in
-    /// `smg_http_connections_rejected_total`. The admin listener
-    /// (`admin_port`) and the probe listener (`health_check_port`) are
-    /// outside the bound, so the control plane and the probes stay reachable
-    /// while the data plane is saturated. `0` is no bound.
+    /// `smg_http_connections_rejected_total`. Probes on the data port fall
+    /// under the bound like any connection; `health_check_port` is the
+    /// listener no bound covers. The admin listener (`admin_port`) is outside
+    /// this bound, so the control plane stays reachable while the data plane
+    /// is saturated, and inside its own, `admin_max_connections`. `0` is no
+    /// bound.
     #[serde(default)]
     pub max_connections: usize,
     /// Seconds a request may take: the read of its body overall (`408` past
@@ -581,7 +591,9 @@ pub struct RouterConfig {
     /// Bounds of the memory history backend (`history_backend = "memory"`):
     /// the most stored responses and conversation items it keeps and how long
     /// it keeps a record; unset = the defaults (10,000 responses, 100,000
-    /// items, one day).
+    /// items, one day). The Messages route's thread store, in memory under
+    /// every backend, keeps at most `max_responses` turns for the same
+    /// retention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
@@ -1305,6 +1317,52 @@ impl Default for RoutingKeyOverrideConfig {
             max_idle_secs: default_manual_max_idle_secs(),
             assignment_mode: default_override_assignment_mode(),
             headers: default_routing_key_headers(),
+        }
+    }
+}
+
+/// How a request with a sticky key is placed on the engines (data-parallel
+/// ranks) of a grouped worker: one worker URL whose socket set several
+/// engines dial (as many as `--zmq-engine-count` above one or `dp_size` on
+/// its spec says, or, given no count, as its engines declare at the
+/// handshake). Routing policies see the group as one worker, and its
+/// connection otherwise sends each request to its least-loaded engine,
+/// which scatters one conversation's turns over the engines' separate
+/// prefix caches. The key is the one sticky routing reads: the first valid
+/// routing-key header, or the body `rid` under the routing-key override.
+/// Only a single generate request is pinned: one without a key, a batch's
+/// prompts and an embedding keep the connection's pick under every mode, and
+/// so does a request whose rank is not among the ranks, counted from 0, that
+/// its connection places a pin on (on vLLM, the engine indices from 0 up to
+/// the first the group lacks). On a disaggregated pair the pin is the
+/// bootstrap room of a single TokenSpeed request: a grouped prefill worker
+/// places the request on the rank its room's residue names, modulo the
+/// engines its connection connected, so the room is moved into the residue
+/// class of the key's rank, and the decode side takes the same room. A
+/// batched or EPD request, or one on another runtime, keeps its random room.
+///
+/// The flag and the configuration file take one spelling: the flag's values
+/// are this enum's clap [`ValueEnum`] names, and serde writes the same ones.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupedDpSticky {
+    /// No pinning: every request goes to the connection's least-loaded
+    /// engine.
+    #[default]
+    Off,
+    /// Every request of a key to its hash engine, `xxh3(key) % ranks` (the
+    /// worker's engines; on a disaggregated pair, the engines the prefill
+    /// connection connected): the same engine across requests, gateway
+    /// restarts and replicas, however unevenly the keys fall.
+    Hash,
+}
+
+impl GroupedDpSticky {
+    /// The spelling of the flag and the configuration file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Hash => "hash",
         }
     }
 }
@@ -2168,6 +2226,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            grouped_dp_sticky: GroupedDpSticky::default(),
             pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
@@ -2307,6 +2366,31 @@ impl RouterConfig {
         ConfigValidator::validate(self)
     }
 
+    /// Connection attempts per health-check success stamped on a worker
+    /// named at startup or an external API endpoint.
+    pub(crate) const CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 10;
+
+    /// Connection attempts per health-check success stamped on a worker a
+    /// discovery provider registers: twice a configured worker's, since a
+    /// discovered engine is often published while it is still loading.
+    pub(crate) const DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 20;
+
+    /// The value the gateway stamps on `WorkerSpec::max_connection_attempts`
+    /// for a worker it registers itself (named at startup, an external API
+    /// endpoint, published by a discovery provider): `attempts_per_success`
+    /// for each health-check success the worker must then show, one success
+    /// counted at least, with the path's own multiplier
+    /// ([`Self::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS`],
+    /// [`Self::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS`]). A worker added
+    /// through the worker API keeps the spec's default instead. The value
+    /// rides on the spec and shows in the connection-detection step's debug
+    /// line; the step's retries follow the registration workflow's retry
+    /// policy, whose attempt count comes from the worker startup timeout and
+    /// check interval, so no behaviour reads this value today.
+    pub(crate) fn connection_attempt_budget(&self, attempts_per_success: u32) -> u32 {
+        self.health_check.success_threshold.max(1) * attempts_per_success
+    }
+
     /// Which Failed workers the health checker removes: the setting as
     /// given, resolved against whether a discovery provider is selected. The
     /// CLI, the Python binding and a configuration file all keep the setting
@@ -2333,19 +2417,6 @@ impl RouterConfig {
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
         self.discovery.is_some()
-    }
-
-    /// Check if metrics are enabled
-    pub fn has_metrics(&self) -> bool {
-        self.metrics.is_some()
-    }
-
-    /// Check if tracing is enabled
-    pub fn has_tracing(&self) -> bool {
-        match &self.trace_config {
-            Some(trace_config) => trace_config.enable_trace,
-            None => false,
-        }
     }
 
     pub fn effective_prefill_queue_size(&self) -> usize {
@@ -2999,6 +3070,33 @@ mod tests {
             RoutingKeyOverrideConfig::default().assignment_mode,
             ManualAssignmentMode::Delegate
         );
+    }
+
+    #[test]
+    fn grouped_dp_sticky_is_off_unless_configured_and_spelled_as_the_flag() {
+        // A configuration file that leaves the key out pins nothing.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        assert_eq!(json["grouped_dp_sticky"], "off");
+        json.as_object_mut().unwrap().remove("grouped_dp_sticky");
+        let read: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        // One spelling everywhere: the flag's values are the file's.
+        let flag_values: Vec<String> = GroupedDpSticky::value_variants()
+            .iter()
+            .filter_map(GroupedDpSticky::to_possible_value)
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        assert_eq!(flag_values, ["off", "hash"]);
+        for &sticky in GroupedDpSticky::value_variants() {
+            let json = serde_json::to_value(sticky).unwrap();
+            assert_eq!(json, sticky.as_str());
+            assert_eq!(
+                serde_json::from_value::<GroupedDpSticky>(json).unwrap(),
+                sticky
+            );
+        }
+        assert!(serde_json::from_value::<GroupedDpSticky>(serde_json::json!("sticky")).is_err());
     }
 
     #[test]
@@ -3712,28 +3810,6 @@ discovery:
     }
 
     #[test]
-    fn test_has_metrics() {
-        let config = RouterConfig::default();
-        assert!(!config.has_metrics());
-
-        let config = RouterConfig::builder()
-            .metrics_config(MetricsConfig::default())
-            .build_unchecked();
-        assert!(config.has_metrics());
-    }
-
-    #[test]
-    fn test_has_tracing() {
-        let config = RouterConfig::default();
-        assert!(!config.has_tracing());
-
-        let config = RouterConfig::builder()
-            .enable_trace("localhost:4317")
-            .build_unchecked();
-        assert!(config.has_tracing());
-    }
-
-    #[test]
     fn test_large_worker_lists() {
         let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{i}")).collect();
 
@@ -3829,8 +3905,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 4);
         assert_eq!(config.policy.name(), "power_of_two");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3871,8 +3950,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 3);
         assert_eq!(config.policy.name(), "cache_aware");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3917,8 +3999,11 @@ discovery:
             .build_unchecked();
 
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
         assert_eq!(config.mode_type(), "regular");
 
         let json = serde_json::to_string_pretty(&config).unwrap();

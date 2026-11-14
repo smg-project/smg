@@ -45,7 +45,7 @@ The runner container of every scale set carries no API key, and none may be adde
 every workflow runs in that container, so a key in its environment is readable by any pull request
 that reaches a runner. The keys the automated reviews and the scheduled Claude workflows use stay in
 the Kubernetes secrets (`openai-api-key`, `anthropic-api-key`) and are mounted only into the
-`ai-key-proxy` sidecar of `runner-values-cpu.yaml`: an nginx container that listens on
+`ai-key-proxy` sidecar of `runner-values-cpu.yaml` and `runner-values-review.yaml`: an nginx container that listens on
 `127.0.0.1:8787`, pod-local, and puts the real key on each request it forwards to
 `api.anthropic.com`, `api.openai.com`, or `api.x.ai`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
 Codex action (`responses-api-endpoint`) at it with placeholder keys. A separate container's
@@ -200,6 +200,27 @@ helm upgrade --install 4-gpu-h100 \
   -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-4-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
+`k8s-runner-review` runs the automated code reviews, apart from the test jobs: on the shared CPU
+set a review job waited 52 minutes for a runner and then worked for three, and the next push
+cancelled the reviews that never got one (2026-11-12). The review workflows select the set through
+the repository variable `SMG_RUNNER_REVIEW` and fall back to `k8s-runner-cpu` while it is unset, so
+install the set first and set the variable second; deleting the variable sends the reviews back.
+Its pods request 2 CPU and 4 GiB, carry no docker and so no privileged container, and four stay
+warm so a review's status note appears within seconds. They run the key proxy of the CPU set
+without the xAI key; change the proxy in both values files together, which
+`scripts/tests/test_runner_values_policy.py` enforces.
+
+```bash
+helm upgrade --install k8s-runner-review \
+  --namespace actions-runner-system \
+  --create-namespace \
+  --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-review.yaml \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+
+gh variable set SMG_RUNNER_REVIEW --repo smg-project/smg --body k8s-runner-review
 ```
 
 `bellwether-record` runs bellwether's `record` workflow, one job per checkpoint group. It is registered to the

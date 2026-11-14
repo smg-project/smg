@@ -153,8 +153,6 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         worker.record_outcome(status.as_u16());
 
         if !status.is_success() {
-            let status =
-                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let body = response.text().await.unwrap_or_default();
             let body = error::sanitize_error_body(&body);
             return (status, body).into_response();

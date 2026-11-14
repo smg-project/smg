@@ -26,7 +26,9 @@ use llm_multimodal::{
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
 use crate::routers::{
-    common::retry::mark_non_retryable, error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS,
+    common::retry::mark_non_retryable,
+    error,
+    grpc::{proto_wrapper::VLLM_MROPE_GRID_KEYS, utils::message_utils::invalid_multimodal_request},
 };
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
@@ -105,7 +107,8 @@ pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transparency::engine_transparency_policy;
 pub(crate) use transport::{
-    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype_over,
+    init_mm_transport_defaults, mm_image_wire_cap_over, mm_rdma_exporter,
+    mm_shared_image_wire_dtype_over,
 };
 
 /// The response for an error of assembling or planning a request's
@@ -147,7 +150,8 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// the connector's verdict on it, the same the worker-side pipeline reports
 /// for the same failure: a failure of the request's own media (a reference it
 /// got wrong, an origin that refuses or answers 4xx, a clip over a size cap)
-/// is a 400 under the media's code (`media_fetch_failed`, `media_too_large`);
+/// is a 400 under the media's code (`invalid_multimodal_request` for media
+/// refused as the request sent it, `media_fetch_failed`, `media_too_large`);
 /// a failure of the media's host for now (an origin that does not deliver
 /// within the fetch budget, answers 5xx or breaks the transfer) a 502 under
 /// the same code, so a client can tell what to fix from what to retry, and
@@ -158,13 +162,19 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// `multimodal_processing_failed`.
 /// An item the engine could never place ([`encoder_budget::ItemOverEncoderBudget`])
 /// is a 400 under a code of its own, so a client can tell the item's size from a
-/// fetch or a decode that failed. A configuration file the model's hub failed
-/// to serve is answered by [`config_unavailable_response`].
+/// fetch or a decode that failed. A video part on a process without a video
+/// decoder ([`process::VideoDecoderUnavailable`], known at start-up) is the
+/// media stage's own refusal, `400 invalid_multimodal_request` in the words
+/// of a modality the model does not take. A configuration file the model's
+/// hub failed to serve is answered by [`config_unavailable_response`].
 pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     const PIPELINE_CODE: &str = "multimodal_processing_failed";
     let message = processing_failed_message(error);
     if encoder_budget::ItemOverEncoderBudget::is(error) {
         return error::bad_request(encoder_budget::ITEM_OVER_ENCODER_BUDGET_CODE, message);
+    }
+    if process::VideoDecoderUnavailable::is(error) {
+        return invalid_multimodal_request(format!("{error:#}"));
     }
     if let Some(response) = config_unavailable_response(error) {
         return response;
@@ -241,6 +251,13 @@ pub(crate) struct MultimodalIntermediate {
     /// The format the spec's processors emitted the batches in
     /// (`ModelProcessorSpec::encoder_input_format`).
     encoder_input_format: EncoderInputFormat,
+    /// The tokens the expansion wrote into the prompt for the request's
+    /// images, summed over them (each image's whole replacement; the
+    /// template's own markers around an anchor are text tokens): what the
+    /// chat usage reports as `prompt_tokens_details.image_tokens`. `None`
+    /// when no batch is images; a video's or an audio clip's placeholders
+    /// are not image tokens.
+    image_prompt_tokens: Option<u32>,
 }
 
 impl MultimodalIntermediate {
@@ -264,6 +281,7 @@ impl MultimodalIntermediate {
         Ok(Self {
             batches,
             encoder_input_format: EncoderInputFormat::Reference,
+            image_prompt_tokens: None,
         })
     }
 
@@ -274,6 +292,15 @@ impl MultimodalIntermediate {
 
     pub(crate) fn encoder_input_format(&self) -> EncoderInputFormat {
         self.encoder_input_format
+    }
+
+    pub(crate) fn with_image_prompt_tokens(mut self, image_prompt_tokens: Option<u32>) -> Self {
+        self.image_prompt_tokens = image_prompt_tokens;
+        self
+    }
+
+    pub(crate) fn image_prompt_tokens(&self) -> Option<u32> {
+        self.image_prompt_tokens
     }
 
     pub(crate) fn batches(&self) -> &[PrecomputedMultimodalIntermediate] {
@@ -404,6 +431,13 @@ pub(crate) fn report_jpeg_decoder() {
             None => tracing::info!(
                 "libwebp not found: WebP files decode with the pure-Rust decoder (the same \
                  pixels, several times the cost); install libwebp for the faster decode"
+            ),
+        }
+        match llm_multimodal::missing_video_decoder() {
+            None => tracing::info!("video decode has its decoder"),
+            Some(why) => tracing::warn!(
+                "video input cannot be decoded by this process: {why}; a request with a video \
+                 part is refused up front until it can"
             ),
         }
     });
@@ -557,7 +591,10 @@ mod tests {
     /// A fetch that ran out of its budget and an origin that answered 5xx are
     /// the media host's trouble for now, a 502 `server_error` under
     /// `media_fetch_failed`; a host that cannot be resolved is the request's
-    /// own input, a 400 `invalid_request_error` under the same code; a clip
+    /// own input, a 400 `invalid_request_error` under the same code; a
+    /// malformed data URL, a parameter out of range and a host the policy
+    /// refuses are the request's own as sent, 400s under
+    /// `invalid_multimodal_request`; a clip
     /// over the decoded-size cap and an item over the input cap are 400s
     /// under `media_too_large`; a scratch file that failed on this side and
     /// a preprocessing task that died are 500 `server_error`s; a failure with
@@ -618,6 +655,33 @@ mod tests {
                 "invalid_request_error",
             ),
             (
+                finalize(MediaConnectorError::DataUrl(
+                    "missing comma in data url".to_string(),
+                )),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::InvalidMaxLongSidePixel {
+                    value: 0,
+                    factor: 28,
+                }),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DisallowedAddress {
+                    host: "127.0.0.1".to_string(),
+                    address: std::net::IpAddr::from([127, 0, 0, 1]),
+                    class: "loopback",
+                }),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
                 finalize(MediaConnectorError::DecodedTooLarge {
                     media: "video RGB",
                     bytes: 2_208_384_000,
@@ -674,6 +738,26 @@ mod tests {
             assert_eq!(body["error"]["type"], kind, "{message}: {body}");
             assert_eq!(body["error"]["message"], message, "{body}");
         }
+    }
+
+    /// A video part on a process without a video decoder is the media
+    /// stage's own refusal: a 400 `invalid_multimodal_request` whose message
+    /// names what is missing, never a server error.
+    #[tokio::test]
+    async fn a_video_part_without_a_decoder_is_the_media_stages_refusal() {
+        let refused = anyhow::Error::new(super::process::VideoDecoderUnavailable {
+            why: "ffmpeg executable not found; install ffmpeg to decode video_url inputs",
+        });
+        let (status, header, body) = answer(processing_failed_response(&refused)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(header, "invalid_multimodal_request");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            "Invalid multimodal request: video input cannot be decoded by this process: ffmpeg \
+             executable not found; install ffmpeg to decode video_url inputs",
+            "{body}"
+        );
     }
 
     /// The media host's trouble is answered as the host's (a 502) and is

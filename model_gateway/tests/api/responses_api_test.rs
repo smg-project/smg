@@ -936,9 +936,13 @@ async fn test_conversations_crud_basic() {
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
-    let create_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_body.clone())
-            .await;
+    let create_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_body.clone(),
+    )
+    .await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
@@ -1012,8 +1016,13 @@ async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
@@ -1036,8 +1045,13 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1134,8 +1148,13 @@ async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1219,6 +1238,9 @@ fn test_responses_request_creation() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::Medium),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Auto),
         store: Some(true),
@@ -1328,6 +1350,9 @@ fn test_usage_conversion() {
         prompt_tokens_details: Some(openai_protocol::common::PromptTokenUsageInfo {
             cached_tokens: 3,
             audio_tokens: None,
+            text_tokens: None,
+            image_tokens: None,
+            cache_write_tokens: None,
         }),
     };
     let response_usage = usage_info.to_response_usage();
@@ -1377,6 +1402,9 @@ fn test_reasoning_param_default() {
     let param = ResponseReasoningParam {
         effort: Some(ReasoningEffort::Medium),
         summary: None,
+        mode: None,
+        context: None,
+        generate_summary: None,
     };
 
     let json = serde_json::to_string(&param).unwrap();
@@ -1416,6 +1444,9 @@ fn test_json_serialization() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::High),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Priority),
         store: Some(false),
@@ -1936,6 +1967,11 @@ async fn test_streaming_with_mcp_tool_calls() {
     let mut found_mcp_call_arguments_done = false;
     let mut found_mcp_call_done = false;
     let mut found_response_completed = false;
+    // The one change a client sees from the kept items: the `mcp_list_tools`
+    // item the stream announces and the item in the final response are the
+    // same item, with the same id.
+    let mut announced_list_tools_ids: Vec<String> = Vec::new();
+    let mut completed_list_tools_ids: Vec<String> = Vec::new();
 
     for (event_name, data) in &events {
         let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1947,6 +1983,12 @@ async fn test_streaming_with_mcp_tool_calls() {
                     if item.get("type").and_then(|v| v.as_str()) == Some("mcp_list_tools") {
                         found_mcp_list_tools = true;
                         println!("✓ Found mcp_list_tools added event");
+                        announced_list_tools_ids.push(
+                            item["id"]
+                                .as_str()
+                                .expect("the announced mcp_list_tools item carries its id")
+                                .to_string(),
+                        );
 
                         // Verify tools array is present (should be empty in added event)
                         assert!(
@@ -2055,6 +2097,14 @@ async fn test_streaming_with_mcp_tool_calls() {
             "response.completed" => {
                 found_response_completed = true;
                 println!("✓ Found response.completed event");
+                if let Some(output) = data["response"]["output"].as_array() {
+                    completed_list_tools_ids.extend(
+                        output
+                            .iter()
+                            .filter(|item| item["type"] == "mcp_list_tools")
+                            .filter_map(|item| item["id"].as_str().map(str::to_string)),
+                    );
+                }
             }
             _ => {
                 println!("  Other event: {event_type}");
@@ -2078,6 +2128,15 @@ async fn test_streaming_with_mcp_tool_calls() {
     println!("MCP call arguments done: {found_mcp_call_arguments_done}");
     println!("MCP call done: {found_mcp_call_done}");
     println!("Response completed: {found_response_completed}");
+
+    assert!(
+        !announced_list_tools_ids.is_empty(),
+        "the stream announces an mcp_list_tools item with an id"
+    );
+    assert_eq!(
+        completed_list_tools_ids, announced_list_tools_ids,
+        "the mcp_list_tools item in response.completed carries the id the stream announced"
+    );
 
     // Assert critical events are present
     assert!(
@@ -2213,8 +2272,13 @@ async fn test_conversation_items_create_and_get() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
@@ -2319,6 +2383,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
         let conv = conversation_json(
             conversations::create_conversation(
                 &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
                 None,
                 serde_json::json!({}),
             )
@@ -2468,8 +2533,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
     };
 
     let conv = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2505,8 +2575,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 
     // The same reference into another conversation links the item there, once.
     let other = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2548,8 +2623,13 @@ async fn test_conversation_items_delete() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2649,8 +2729,13 @@ async fn test_conversation_items_max_limit() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2695,8 +2780,13 @@ async fn test_conversation_items_unsupported_type() {
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2739,18 +2829,26 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
-    let conv_a_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_a_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
     let conv_a_id = conv_a_json["id"].as_str().unwrap();
 
-    let conv_b_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_b_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -3596,4 +3694,110 @@ async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
     );
     assert!(event["param"].is_null(), "{body}");
     mcp.stop().await;
+}
+
+/// The Conversations routes refuse a body the way the typed routes do: in
+/// the gateway's envelope with a code, not with the framework's text/plain
+/// answer.
+mod conversation_body_refusals {
+    use axum::{
+        body::Body,
+        http::{header::CONTENT_TYPE, Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use crate::common::{
+        mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+        AppTestContext,
+    };
+
+    /// The status, the content type and the body of `body` posted to `path`
+    /// under `content_type` (no header when `None`); a body that is not JSON
+    /// is kept under `not_json`, so an assertion names it. A request that
+    /// cannot be built or a body that cannot be read is the caller's error.
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<(StatusCode, String, serde_json::Value), Box<dyn std::error::Error>> {
+        let mut req = Request::builder().method("POST").uri(path);
+        if let Some(content_type) = content_type {
+            req = req.header(CONTENT_TYPE, content_type);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_vec()))?)
+            .await?;
+        let status = resp.status();
+        let response_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let answer = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({"not_json": String::from_utf8_lossy(&bytes)}));
+        Ok((status, response_type, answer))
+    }
+
+    /// Create, update and create-items each refuse a truncated object, an
+    /// empty body, a body that is not UTF-8 and a body under another or no
+    /// content type with 400 in the envelope: `invalid_json` for a body that
+    /// does not parse, `json_parse_error` for the content type, the codes
+    /// the typed routes carry.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_malformed_body_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18131,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let cases: [(Option<&str>, &[u8], &str); 5] = [
+            (Some("application/json"), br#"{"metadata":"#, "invalid_json"),
+            (Some("application/json"), b"", "invalid_json"),
+            (
+                Some("application/json"),
+                b"{\"metadata\":\"\xff\"}",
+                "invalid_json",
+            ),
+            (None, br#"{"metadata":{}}"#, "json_parse_error"),
+            (
+                Some("text/plain"),
+                br#"{"metadata":{}}"#,
+                "json_parse_error",
+            ),
+        ];
+        for path in [
+            "/v1/conversations",
+            "/v1/conversations/conv_missing",
+            "/v1/conversations/conv_missing/items",
+        ] {
+            for (content_type, body, code) in cases.iter().copied() {
+                let case = format!(
+                    "{path} {content_type:?} {:?}",
+                    String::from_utf8_lossy(body)
+                );
+                let (status, response_type, answer) = post(&app, path, content_type, body)
+                    .await
+                    .expect("an answer from the route");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+                assert!(
+                    response_type.starts_with("application/json"),
+                    "{case}: {response_type} {answer}"
+                );
+                assert_eq!(
+                    answer["error"]["type"], "invalid_request_error",
+                    "{case}: {answer}"
+                );
+                assert_eq!(answer["error"]["code"], code, "{case}: {answer}");
+            }
+        }
+        ctx.shutdown().await;
+    }
 }

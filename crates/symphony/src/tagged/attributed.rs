@@ -60,10 +60,11 @@ use super::object::{Mode, Object};
 use crate::{
     engine::part,
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
-    markers::{Piece, Scanner},
+    markers::Scanner,
     tagged::{
-        end_cut_call, held_text, take_owned,
+        end_cut_call, held_text,
         value::{cut as cut_json, json, Kind},
+        TaggedAssembler,
     },
     Declared,
 };
@@ -395,19 +396,6 @@ impl Assembler {
         self.tags.invoke_close
     }
 
-    /// Append the next bytes of the invoke and push the events they complete. Every byte is the
-    /// invoke's until the engine says otherwise, so this takes them all.
-    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
-        if self.done {
-            return;
-        }
-        let scanned = self.scanner.feed(bytes);
-        for piece in scanned.pieces_of_delta() {
-            self.take(piece, declared, out);
-        }
-        self.scanner.reclaim(scanned);
-    }
-
     /// The invoke's end: `terminal` is the closing tag the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. After the last parameter the
     /// object is closed and the call ends, when the syntax read the call whole; inside a value
@@ -731,21 +719,6 @@ impl Assembler {
         self.object.close_member("\"".to_string(), "", out);
         self.stage = Stage::Between;
         cut_tag
-    }
-
-    fn take<'d>(&mut self, piece: Piece<'d>, declared: &Declared, out: &mut Events<'d>) {
-        match piece {
-            Piece::Text(Cow::Borrowed(text)) => self.text(text, declared, out),
-            // The join's part after a hold is a copy, nobody's delta: its events go out owned.
-            Piece::Text(Cow::Owned(text)) => {
-                let mut scratch = std::mem::take(&mut self.scratch);
-                take_owned(&text, &mut scratch, out, |text, out| {
-                    self.text(text, declared, out);
-                });
-                self.scratch = scratch;
-            }
-            Piece::Marker(tag) => self.tag(tag, declared, out),
-        }
     }
 
     fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
@@ -1247,9 +1220,31 @@ fn typed(tail: &str) -> Option<&str> {
         .filter(|kind| TYPES.contains(kind))
 }
 
+impl TaggedAssembler for Assembler {
+    fn done(&self) -> bool {
+        self.done
+    }
+
+    fn scanner(&mut self) -> &mut Scanner {
+        &mut self.scanner
+    }
+
+    fn scratch(&mut self) -> &mut Events<'static> {
+        &mut self.scratch
+    }
+
+    fn text<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) {
+        Assembler::text(self, text, declared, out);
+    }
+
+    fn tag(&mut self, tag: usize, declared: &Declared, out: &mut Events) {
+        Assembler::tag(self, tag, declared, out);
+    }
+}
+
 impl crate::engine::CallAssembler for Assembler {
     fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
-        self.feed(text, declared, out);
+        TaggedAssembler::feed(self, text, declared, out);
         text.len()
     }
 

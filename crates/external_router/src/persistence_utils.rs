@@ -48,45 +48,61 @@ pub const ITEM_TYPE_FIELDS: &[(&str, &[&str])] = &[
 // JSON Serialization
 // ============================================================================
 
-/// Convert a ConversationItem to JSON, extracting specified fields based on item type
-/// or including content as-is for standard message types.
-pub fn item_to_json(item: &ConversationItem) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("id".to_string(), json!(item.id.0));
-    obj.insert("type".to_string(), json!(item.item_type));
-
-    if let Some(role) = &item.role {
-        obj.insert("role".to_string(), json!(role));
-    }
+/// The object the Conversations API answers for a stored item: its id, type
+/// and role, then the fields of its stored content by the item's type (the
+/// listed fields of a tool item; a message's content with its phase hoisted; the
+/// fields of an item stored whole, hoisted back; the legacy `content` wrap of a
+/// row written before whole items were stored), then its status. The item is
+/// taken by value: every caller answers an item it owns (a page of a
+/// conversation's items, an item just created, referenced or looked up), so its
+/// content moves into the object instead of being copied part by part.
+pub fn item_to_json(item: ConversationItem) -> Value {
+    let ConversationItem {
+        id,
+        item_type,
+        role,
+        content,
+        status,
+        ..
+    } = item;
 
     // Find field mappings for this item type
     let fields = ITEM_TYPE_FIELDS
         .iter()
-        .find(|(t, _)| *t == item.item_type)
+        .find(|(t, _)| *t == item_type)
         .map(|(_, fields)| *fields);
+    let is_message = item_type == "message";
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), Value::String(id.0));
+    obj.insert("type".to_string(), Value::String(item_type));
+
+    if let Some(role) = role {
+        obj.insert("role".to_string(), Value::String(role));
+    }
 
     if let Some(fields) = fields {
         // Extract specific fields from content
-        if let Some(content_obj) = item.content.as_object() {
+        if let Value::Object(mut content_obj) = content {
             for field in fields {
-                if let Some(value) = content_obj.get(*field) {
-                    obj.insert((*field).to_string(), value.clone());
+                if let Some(value) = content_obj.remove(*field) {
+                    obj.insert((*field).to_string(), value);
                 }
             }
         }
-    } else if item.item_type == "message" {
+    } else if is_message {
         // Message items may store either a bare content array (legacy) or an
         // object `{content: [...], phase: "..."}` when the message carried a
         // phase label (P3). Either way, expose `content` and hoist `phase`
         // back to the message level so round-trip is transparent to callers.
-        let (content_value, phase) = split_stored_message_content(item.content.clone());
+        let (content_value, phase) = split_stored_message_content(content);
         obj.insert("content".to_string(), content_value);
         if let Some(phase) = phase {
             if let Ok(phase_value) = serde_json::to_value(phase) {
                 obj.insert("phase".to_string(), phase_value);
             }
         }
-    } else if let Some(content_obj) = item.content.as_object() {
+    } else if let Value::Object(content_obj) = content {
         // Whole-item store path (`store_whole_item` in
         // `item_to_new_conversation_item`): `content` is the original item
         // value with its fields at the top level. Hoist them back rather
@@ -97,17 +113,17 @@ pub fn item_to_json(item: &ConversationItem) -> Value {
             if matches!(k.as_str(), "id" | "type" | "role" | "status") {
                 continue;
             }
-            obj.insert(k.clone(), v.clone());
+            obj.insert(k, v);
         }
     } else {
         // Pre-fix rows for non-listed types stored `[]` instead of the
         // whole item; preserve the legacy `{"content": …}` wrapping so we
         // don't drop data that came in under the old write path.
-        obj.insert("content".to_string(), item.content.clone());
+        obj.insert("content".to_string(), content);
     }
 
-    if let Some(status) = &item.status {
-        obj.insert("status".to_string(), json!(status));
+    if let Some(status) = status {
+        obj.insert("status".to_string(), Value::String(status));
     }
 
     Value::Object(obj)
@@ -347,12 +363,15 @@ pub fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> 
     Ok(items)
 }
 
-/// Convert a JSON item to NewConversationItem
+/// The record one of a turn's items is stored under, from the item by value:
+/// the item is the persist's own (the response record took its copy of the
+/// input before, and the output array is the persist's copy of the response's),
+/// so its content moves into the record instead of being copied once more.
 ///
 /// For input items: function_call/function_call_output store whole item as content
 /// For output items: message extracts content field, others store whole item
 fn item_to_new_conversation_item(
-    item_value: &Value,
+    item_value: Value,
     response_id: Option<String>,
     _is_input: bool,
     tenant: Option<&str>,
@@ -360,7 +379,20 @@ fn item_to_new_conversation_item(
     let item_type = item_value
         .get("type")
         .and_then(|v| v.as_str())
-        .unwrap_or("message");
+        .unwrap_or("message")
+        .to_string();
+    let id = item_value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(ConversationItemId::from);
+    let role = item_value
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let status = item_value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     // Non-message items carry their fields at the top level (no `content`
     // field on the wire), so reading `content` on the input side would
@@ -369,45 +401,46 @@ fn item_to_new_conversation_item(
     let store_whole_item = item_type != "message";
 
     let content = if store_whole_item {
-        item_value.clone()
-    } else if item_type == "message" && item_value.get("phase").is_some_and(|v| !v.is_null()) {
-        // Message carries a phase label: wrap the content array alongside
-        // `phase` so multi-turn retrieval preserves it (P3). `item_to_json`
-        // and the history load paths both recognize this shape.
-        let content_value = item_value.get("content").cloned().unwrap_or(json!([]));
-        let phase_value = item_value.get("phase").cloned().unwrap_or(Value::Null);
-        json!({ "content": content_value, "phase": phase_value })
+        item_value
     } else {
-        item_value.get("content").cloned().unwrap_or(json!([]))
+        let (content, phase) = match item_value {
+            Value::Object(mut fields) => (fields.remove("content"), fields.remove("phase")),
+            _ => (None, None),
+        };
+        let content = content.unwrap_or_else(|| json!([]));
+        match phase {
+            // Message carries a phase label: wrap the content array alongside
+            // `phase` so multi-turn retrieval preserves it (P3). `item_to_json`
+            // and the history load paths both recognize this shape.
+            Some(phase) if !phase.is_null() => {
+                let mut wrapped = serde_json::Map::new();
+                wrapped.insert("content".to_string(), content);
+                wrapped.insert("phase".to_string(), phase);
+                Value::Object(wrapped)
+            }
+            _ => content,
+        }
     };
 
     NewConversationItem {
-        id: item_value
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(ConversationItemId::from),
+        id,
         response_id,
-        item_type: item_type.to_string(),
-        role: item_value
-            .get("role")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        item_type,
+        role,
         content,
-        status: item_value
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        status,
         tenant: tenant.map(str::to_string),
     }
 }
 
 /// Link all input and output items to a conversation; the items carry the
-/// caller's `tenant`.
+/// caller's `tenant`. The two vectors are the turn's own: each item moves into
+/// the record it is stored under.
 async fn link_items_to_conversation(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &ConversationId,
-    input_items: &[Value],
-    output_items: &[Value],
+    input_items: Vec<Value>,
+    output_items: Vec<Value>,
     response_id: &str,
     tenant: Option<&str>,
 ) -> Result<(), String> {
@@ -741,13 +774,14 @@ async fn persist_conversation_items_inner(
         None
     };
 
-    // If conversation exists, link items to it
+    // If conversation exists, link items to it (the items move into their records)
+    let (input_count, output_count) = (input_items.len(), output_items.len());
     if let Some(conv_id) = conv_id_opt {
         link_items_to_conversation(
             &item_storage,
             &conv_id,
-            &input_items,
-            &output_items,
+            input_items,
+            output_items,
             &response_id_str,
             tenant,
         )
@@ -756,15 +790,15 @@ async fn persist_conversation_items_inner(
         info!(
             conversation_id = %conv_id.0,
             response_id = %response_id.0,
-            input_count = input_items.len(),
-            output_count = output_items.len(),
+            input_count = input_count,
+            output_count = output_count,
             "Persisted response and linked items to conversation"
         );
     } else {
         info!(
             response_id = %response_id.0,
-            input_count = input_items.len(),
-            output_count = output_items.len(),
+            input_count = input_count,
+            output_count = output_count,
             "Persisted response without conversation linking"
         );
     }
@@ -803,7 +837,7 @@ mod tests {
             }),
         );
 
-        let serialized = item_to_json(&stored);
+        let serialized = item_to_json(stored);
         assert_eq!(serialized["type"], json!("image_generation_call"));
         assert_eq!(serialized["revised_prompt"], json!("cat"));
         assert!(
@@ -818,7 +852,7 @@ mod tests {
         // Pre-fix rows for non-listed types may have stored `[]`. Preserve
         // the legacy wrapping so old data still round-trips.
         let stored = stored_item("image_generation_call", json!([]));
-        let serialized = item_to_json(&stored);
+        let serialized = item_to_json(stored);
         assert_eq!(serialized["content"], json!([]));
     }
 
@@ -832,7 +866,7 @@ mod tests {
         });
 
         let new_item =
-            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
+            item_to_new_conversation_item(input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "image_generation_call");
         assert_eq!(
             new_item
@@ -858,11 +892,180 @@ mod tests {
         });
 
         let new_item =
-            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
+            item_to_new_conversation_item(input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "message");
         assert_eq!(
             new_item.content,
             json!([{"type": "input_text", "text": "hi"}])
+        );
+    }
+
+    /// The object `item_to_json` answers for each stored content shape, byte
+    /// for byte: the listed fields of a tool item in the list's order, a
+    /// message's content with its phase hoisted, a legacy message array, the
+    /// fields of an item stored whole (its own id, type and status left to the
+    /// record's), the legacy `content` wrap of a row that is not an object.
+    #[test]
+    fn item_to_json_writes_the_same_bytes_for_every_content_shape() {
+        let item =
+            |id: &str, item_type: &str, role: Option<&str>, content: Value| ConversationItem {
+                id: ConversationItemId::from(id),
+                response_id: None,
+                item_type: item_type.to_string(),
+                role: role.map(str::to_string),
+                content,
+                status: Some("completed".to_string()),
+                created_at: Utc::now(),
+                tenant: None,
+            };
+        let cases = [
+            (
+                item(
+                    "mcp_1",
+                    "mcp_call",
+                    None,
+                    json!({
+                        "server_label": "s", "name": "n", "arguments": "{}", "output": "o", "extra": 1
+                    }),
+                ),
+                r#"{"id":"mcp_1","type":"mcp_call","name":"n","arguments":"{}","output":"o","server_label":"s","status":"completed"}"#,
+            ),
+            (
+                item(
+                    "msg_1",
+                    "message",
+                    Some("user"),
+                    json!({"content": [{"type": "input_text", "text": "hi"}], "phase": "commentary"}),
+                ),
+                r#"{"id":"msg_1","type":"message","role":"user","content":[{"type":"input_text","text":"hi"}],"phase":"commentary","status":"completed"}"#,
+            ),
+            (
+                item(
+                    "msg_2",
+                    "message",
+                    Some("assistant"),
+                    json!([{"type": "output_text", "text": "hello", "annotations": []}]),
+                ),
+                r#"{"id":"msg_2","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}],"status":"completed"}"#,
+            ),
+            (
+                item(
+                    "ig_1",
+                    "image_generation_call",
+                    None,
+                    json!({
+                        "id": "ig_1", "type": "image_generation_call", "status": "completed",
+                        "revised_prompt": "cat", "result": null
+                    }),
+                ),
+                r#"{"id":"ig_1","type":"image_generation_call","revised_prompt":"cat","result":null,"status":"completed"}"#,
+            ),
+            (
+                item("ws_1", "web_search_call", None, json!([])),
+                r#"{"id":"ws_1","type":"web_search_call","content":[],"status":"completed"}"#,
+            ),
+        ];
+        for (item, expected) in cases {
+            let written = serde_json::to_string(&item_to_json(item)).unwrap();
+            assert_eq!(written, expected);
+        }
+    }
+
+    /// The content each of a turn's items is stored under, byte for byte,
+    /// through the persist and back from the store (a tool item whole, a
+    /// message with a phase as its content beside the phase, a plain message
+    /// as its content array), and the objects the API answers for them.
+    #[tokio::test]
+    async fn persisted_items_store_the_same_bytes_for_every_shape() {
+        use smg_data_connector::{
+            ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
+            MemoryResponseStorage, NewConversation, SortOrder,
+        };
+
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let responses: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let conversation = conversations
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "conversation": conversation.id.0,
+        }))
+        .unwrap();
+        let response = json!({
+            "id": "resp_bytes",
+            "object": "response",
+            "model": "m",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "f",
+                    "arguments": "{\"a\":1}", "status": "completed"
+                },
+                {
+                    "type": "message", "id": "msg_p", "role": "assistant", "status": "completed",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "thinking", "annotations": []}]
+                },
+                {
+                    "type": "message", "id": "msg_f", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+                }
+            ]
+        });
+        persist_conversation_items(
+            conversations,
+            items.clone(),
+            responses,
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = items
+            .list_items(
+                &conversation.id,
+                ListParams {
+                    limit: 20,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        let contents: Vec<String> = stored
+            .iter()
+            .map(|item| serde_json::to_string(&item.content).unwrap())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                r#"[{"type":"input_text","text":"hi"}]"#,
+                r#"{"type":"function_call","id":"fc_1","call_id":"call_1","name":"f","arguments":"{\"a\":1}","status":"completed"}"#,
+                r#"{"content":[{"type":"output_text","text":"thinking","annotations":[]}],"phase":"commentary"}"#,
+                r#"[{"type":"output_text","text":"hello","annotations":[]}]"#,
+            ]
+        );
+        let answered: Vec<String> = stored
+            .into_iter()
+            .skip(1)
+            .map(|item| serde_json::to_string(&item_to_json(item)).unwrap())
+            .collect();
+        assert_eq!(
+            answered,
+            [
+                r#"{"id":"fc_1","type":"function_call","call_id":"call_1","name":"f","arguments":"{\"a\":1}","status":"completed"}"#,
+                r#"{"id":"msg_p","type":"message","role":"assistant","content":[{"type":"output_text","text":"thinking","annotations":[]}],"phase":"commentary","status":"completed"}"#,
+                r#"{"id":"msg_f","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}],"status":"completed"}"#,
+            ]
         );
     }
 

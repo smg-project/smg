@@ -1,8 +1,9 @@
 //! What the crate's capture tests drive a request through: a worker at an
 //! address of the test's choosing, a worker source over such workers, the
 //! HTTP client they share, an address nothing answers at, a provider's
-//! answer of the test's making, and how a test reads an answer's body back
-//! as text.
+//! answer of the test's making, how a test reads an answer's body back as
+//! text, and the counting allocator every unit test of the crate runs
+//! under (the allocation pins read it).
 
 use std::{
     fmt,
@@ -23,7 +24,7 @@ use tokio::net::TcpSocket;
 
 use crate::{
     error,
-    worker::{ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
+    worker::{self, ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
     RetryConfig,
 };
 
@@ -83,7 +84,7 @@ impl StubWorker {
     pub(crate) fn at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
-            redacted: crate::worker::redacted_url(url).into_owned(),
+            redacted: worker::redacted_url(url).into_owned(),
             healthy: true,
             client: http_client(),
         })
@@ -97,7 +98,7 @@ impl StubWorker {
     pub(crate) fn unhealthy_at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
-            redacted: crate::worker::redacted_url(url).into_owned(),
+            redacted: worker::redacted_url(url).into_owned(),
             healthy: false,
             client: http_client(),
         })
@@ -247,5 +248,85 @@ mod tests {
         let taken = TcpListener::bind(refused.addr()).expect_err("the port is held");
         assert_eq!(taken.kind(), ErrorKind::AddrInUse, "{taken}");
         assert_eq!(refused.addr().port(), refused.port());
+    }
+}
+
+/// The crate's unit tests run under a counting allocator, so an allocation
+/// pin can read what a call allocated: the system allocator with a
+/// per-thread count of allocation and reallocation calls. Test builds only.
+pub(crate) mod counting_alloc {
+    #![expect(
+        unsafe_code,
+        reason = "a counting global allocator is the only way to see what a call allocated; test builds only"
+    )]
+
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    thread_local! {
+        /// Allocation and reallocation calls this thread made.
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        /// Bytes this thread requested, the growth of a reallocation once.
+        static BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Allocation and reallocation calls this thread made so far.
+    pub(crate) fn calls() -> usize {
+        CALLS.with(Cell::get)
+    }
+
+    /// Bytes this thread requested so far (the growth of a reallocation
+    /// counts once).
+    pub(crate) fn bytes() -> usize {
+        BYTES.with(Cell::get)
+    }
+
+    fn count(bytes: usize) {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+        BYTES.with(|total| total.set(total.get() + bytes));
+    }
+
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count(layout.size());
+            // SAFETY: the caller's layout contract, forwarded to the system allocator.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from `alloc` or `realloc` with this layout.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            count(new_size.saturating_sub(layout.size()));
+            // SAFETY: `ptr` came from this allocator with `layout`; the new size is the caller's.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+
+    /// The count moves by one for one allocation and one reallocation,
+    /// and not for a free, and the bytes by what was requested, a
+    /// reallocation's growth once: what every pin in the crate reads.
+    #[test]
+    fn the_count_follows_this_threads_allocation_calls() {
+        let before = calls();
+        let before_bytes = bytes();
+        let mut bytes_held: Vec<u8> = Vec::with_capacity(8);
+        assert_eq!(calls() - before, 1, "one allocation");
+        assert_eq!(bytes() - before_bytes, 8, "the allocation's bytes");
+        bytes_held.extend(std::iter::repeat_n(0u8, 64));
+        assert_eq!(calls() - before, 2, "one reallocation on top");
+        assert_eq!(bytes() - before_bytes, 64, "the reallocation's growth once");
+        drop(bytes_held);
+        assert_eq!(calls() - before, 2, "a free is not counted");
+        assert_eq!(bytes() - before_bytes, 64, "a free takes nothing back");
     }
 }

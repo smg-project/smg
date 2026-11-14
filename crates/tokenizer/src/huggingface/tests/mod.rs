@@ -438,6 +438,12 @@ fn other_checkpoints_keep_their_file_pipeline() {
     fs::write(&path, LLAMA_STYLE_TOKENIZER_JSON).unwrap();
     let no_configuration = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
     assert_eq!(ids_of(&no_configuration, "<|im_start|>a"), [3, 6, 7]);
+    // Under the file's `Prepend` normalizer the normalized `</think>` sits in
+    // the pipeline's added vocabulary as `▁</think>`; the lookups answer the
+    // file's spelling both ways.
+    assert_eq!(no_configuration.id_to_token(5).as_deref(), Some("</think>"));
+    assert_eq!(no_configuration.token_to_id("</think>"), Some(5));
+    assert_eq!(no_configuration.token_to_id("▁</think>"), None);
 }
 
 /// The table the gate reads is searched by `binary_search`, so it stays
@@ -620,6 +626,48 @@ fn a_llama_class_checkpoint_shipped_without_config_json_encodes_as_its_class() {
     .unwrap();
     let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
     assert_eq!(ids_of(&tokenizer, text), class);
+}
+
+/// Written with a `config.json` whose model type the reference reads as
+/// the file (`phi3`), the same fixture keeps its `Prepend` normalizer and
+/// takes the direct path, with the file's ids: the marker before the space
+/// after `<s>` (`▁▁`, 259) is what the normalizer adds and the class's
+/// `Always` scheme does not. The direct path needs the byte tokens a
+/// byte-fallback vocabulary carries, so the test adds the 256 of them at
+/// the ids such a vocabulary gives them (3..=258), below every id the
+/// fixture's pieces have. Under the opt-in v1 pipeline every file takes
+/// that pipeline, so the test runs without it.
+#[cfg(not(feature = "tokenizers-v1"))]
+#[test]
+fn a_file_kept_for_its_model_type_takes_the_direct_path_with_the_files_ids() {
+    let temp = TempDir::new().unwrap();
+    let mut file: serde_json::Value = serde_json::from_str(BYTE_FALLBACK_TOKENIZER_JSON).unwrap();
+    let vocab = file["model"]["vocab"].as_object_mut().unwrap();
+    for byte in 0..=255u32 {
+        vocab.insert(format!("<0x{byte:02X}>"), json!(3 + byte));
+    }
+    let path = temp.path().join("tokenizer.json");
+    fs::write(&path, file.to_string()).unwrap();
+    fs::write(
+        temp.path().join("tokenizer_config.json"),
+        json!({
+            "tokenizer_class": "LlamaTokenizer", "legacy": false, "bos_token": "<s>",
+            "eos_token": "</s>", "unk_token": "<unk>", "clean_up_tokenization_spaces": false,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("config.json"),
+        json!({"model_type": "phi3", "architectures": ["Phi3ForCausalLM"]}).to_string(),
+    )
+    .unwrap();
+    let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+    assert_eq!(tokenizer.encode_path(), EncodePath::Native);
+    assert_eq!(
+        ids_of(&tokenizer, "> <s> </s> <|"),
+        [1405, 29871, 1, 259, 2, 29871, 529, 29989]
+    );
 }
 
 #[test]

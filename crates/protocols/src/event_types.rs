@@ -1,3 +1,18 @@
+//! The names the Responses and Realtime streams give their events and items, one enum per family.
+//!
+//! Each family ([`ResponseEvent`], [`OutputItemEvent`], [`FunctionCallEvent`],
+//! [`ContentPartEvent`], [`OutputTextEvent`], [`McpEvent`], [`WebSearchCallEvent`],
+//! [`CodeInterpreterCallEvent`], [`FileSearchCallEvent`], [`ImageGenerationCallEvent`],
+//! [`RealtimeClientEvent`], [`RealtimeServerEvent`]) lists its events as variants and spells each
+//! one's wire name once, as an associated `const` ([`ResponseEvent::CREATED`] is
+//! `"response.created"`); `as_str` maps a variant to its name and `Display` prints it. [`ItemType`]
+//! holds the `type` discriminators of output items the same way.
+//! The writers of a Responses stream put these constants in an event's `type` field and its readers
+//! match an incoming `type` against the same constants. A serde-tagged enum spells its names again
+//! in `#[serde(rename)]`, which cannot take a `const` ([`crate::realtime_events`] does so for the
+//! Realtime events), and some Realtime relays match raw literals, so these constants are the shared
+//! spelling of a name, not its only one.
+
 use std::fmt;
 
 /// Response lifecycle events

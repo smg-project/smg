@@ -112,7 +112,6 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         OnceLock,
@@ -122,6 +121,7 @@ use std::{
 
 use metrics::{Counter, Key, Label, Level, Metadata};
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use smg_external_router::metrics::handles::keep_handles;
 use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
 use tracing::{debug, warn, Span};
@@ -1006,7 +1006,7 @@ thread_local! {
     /// the process's life, so its address names it): built on the first record once a recorder
     /// is installed, as the gateway's other recorders keep theirs. Registering a handle on the
     /// exporter per record costs it an allocation each time; the kept one costs a map read.
-    static KEPT_COUNTERS: RefCell<HashMap<usize, Counter>> = RefCell::new(HashMap::new());
+    static KEPT_COUNTERS: RefCell<FxHashMap<usize, Counter>> = RefCell::new(FxHashMap::default());
 }
 
 /// The counter under `key`, registered on the installed recorder.
@@ -1031,7 +1031,7 @@ fn increment(key: &Key, by: u64) {
 /// For tests: this thread's kept handles dropped, so a later test's recorder gets its own.
 #[cfg(test)]
 fn reset_kept() {
-    KEPT_COUNTERS.with_borrow_mut(HashMap::clear);
+    KEPT_COUNTERS.with_borrow_mut(|kept| kept.clear());
 }
 
 /// One observation on the histogram under `key`.
@@ -1104,7 +1104,7 @@ thread_local! {
     /// [`OwnSeries`]: by the index a name resolves to in [`SERIES`], so an unregistered name
     /// folds onto [`OTHER_TABLE`] here as it does there; built on first use and kept for the
     /// process's life as the shared ones are (a key's address names its kept counter).
-    static OWN_SERIES: RefCell<Option<HashMap<usize, &'static Series>>> =
+    static OWN_SERIES: RefCell<Option<FxHashMap<usize, &'static Series>>> =
         const { RefCell::new(None) };
 }
 
@@ -1158,7 +1158,7 @@ pub(crate) fn own_series() -> OwnSeries {
     let owner = OWN_SERIES.with_borrow_mut(|own| {
         let first = own.is_none();
         if first {
-            *own = Some(HashMap::new());
+            *own = Some(FxHashMap::default());
         }
         first
     });
@@ -3078,7 +3078,7 @@ mod tests {
             record_refused(table);
             force_on_this_thread(None);
         });
-        assert_eq!(KEPT_COUNTERS.with_borrow(HashMap::len), 2);
+        assert_eq!(KEPT_COUNTERS.with_borrow(|kept| kept.len()), 2);
         reset_kept();
         let rendered = handle.render();
         assert!(

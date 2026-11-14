@@ -13,10 +13,10 @@ stays off): the first use of a prefill length between two classes has only
 cost this engine a kernel search, never a hang, and at its default step of
 16,384 tokens a pass over every length would take an hour.
 
-A prefill or decode leg of a disaggregated pair plans as a single engine
+A prefill or decode side of a disaggregated pair plans as a single engine
 does: its requests carry the engine's own stand-in bootstrap (what the
 engine's warm-up sets in disaggregation mode: the fake-transfer host and room
-0), a transfer to nobody on either side, so the leg warms up without its peer
+0), a transfer to nobody on either side, so the side warms up without its peer
 and no first request of a prompt-length class pays a kernel compile under the
 Router's prefill-liveness bound. The prefill side plans one request only,
 and the media step when the launcher asks for one
@@ -37,8 +37,8 @@ encoders, the plan ends its shapes with one image through them
 (:func:`media_warmup`: the prompt the model's own chat template renders around
 one image item, its token ids, and the engine's own minimal warm-up image as a
 data URL), the production path once, before SERVING. A template that renders
-no image placeholder leaves the leg out, and a leg the encoders cannot serve
-yet is a logged step, never the end of the start. The encoder-only role takes
+no image placeholder leaves the media request out, and one the encoders cannot
+serve yet is a logged step, never the end of the start. The encoder-only role takes
 no plan: the engine's entrypoint runs it on its own encoder server, never on a
 servicer.
 """
@@ -56,7 +56,7 @@ from smg_grpc_servicer.warmup import WarmupInputs, WarmupRequest, refused, unser
 logger = logging.getLogger(__name__)
 
 WARMUP_ENV = "SMG_SGLANG_SERVICER_WARMUP"
-#: The image of the media leg: the engine's own minimal warm-up image (a
+#: The image of the media request: the engine's own minimal warm-up image (a
 #: 32x32 black PNG, what its frontend sends its vision models at start),
 #: carried as a data URL so the encoders fetch nothing.
 WARMUP_IMAGE_PNG_BASE64 = (
@@ -64,7 +64,7 @@ WARMUP_IMAGE_PNG_BASE64 = (
     "he3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpke"
     "I77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 )
-#: The text beside the image in the media leg's prompt.
+#: The text beside the image in the media request's prompt.
 WARMUP_IMAGE_QUESTION = "Describe the image."
 #: The engine's own prefill budget when the arguments carry neither a chunk
 #: size nor a prefill budget as a count.
@@ -87,7 +87,7 @@ def warmup_inputs(
     the running window (``--max-running-requests``; unknown when the scheduler
     sizes it itself), the step budget (the chunk size under chunked prefill,
     else the prefill budget, else the engine's default), the context, and on
-    a prefill or decode leg the engine's stand-in bootstrap host for the
+    a prefill or decode side the engine's stand-in bootstrap host for the
     requests to carry (the prefill side, which runs prefill alone, plans one
     request only). ``None`` for a model that generates nothing and for the
     encoder-only role, which the engine runs on its own server; the language
@@ -95,7 +95,7 @@ def warmup_inputs(
     warm-up requests carry no media). On a wire that carries the rank pin
     (``pins_ranks``: the Rust servicer's) the plan covers every scheduler
     rank: each request is pinned to its rank, where the servicer places it (on
-    a prefill leg by the stand-in room, whose residue is that rank), so under
+    a prefill side by the stand-in room, whose residue is that rank), so under
     data parallelism every prefill shape reaches every rank before the Router
     sends anything. On the Python servicer's wire, which forwards no pin, the
     plan is one rank's, placed by the engine's own load balancing, and under
@@ -108,7 +108,7 @@ def warmup_inputs(
     lone_leg_bootstrap = None
     if args.disaggregation_mode != "null":
         # The engine's own warm-up convention for a disaggregation role: a
-        # request bound for this host is a transfer to nobody on either leg.
+        # request bound for this host is a transfer to nobody on either side.
         from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 
         lone_leg_bootstrap = FAKE_BOOTSTRAP_HOST
@@ -139,7 +139,7 @@ def warmup_inputs(
 
 @dataclasses.dataclass(frozen=True)
 class MediaWarmup:
-    """What the media leg's request carries: the prompt the model's own chat
+    """What the media request carries: the prompt the model's own chat
     template renders around one image item, its token ids, and the image as a
     data URL."""
 
@@ -164,16 +164,18 @@ def media_warmup(
     load_tokenizer: Callable[[str], Any] | None = None,
     log: logging.Logger = logger,
 ) -> MediaWarmup | None:
-    """The media leg's request material, or ``None`` with the reason logged.
+    """The media request's material, or ``None`` with the reason logged.
     Two expected omissions are INFO lines: no tokenizer directory to render
     the prompt from, or a chat template that renders no image placeholder
-    (the leg would be a text request). A render that raises (a tokenizer that
+    (the request would carry text alone). A render that raises (a tokenizer that
     does not load, a template that fails, a tokenization error) is a WARNING
     with its traceback. The prompt is what the template renders around one
     image item and :data:`WARMUP_IMAGE_QUESTION`, unexpanded, as a client
     sends it to a language-side worker; the ids are its tokens."""
     if not tokenizer_dir:
-        log.info("Planned warm-up: no image leg (no tokenizer directory to render the prompt from)")
+        log.info(
+            "Planned warm-up: no image request (no tokenizer directory to render the prompt from)"
+        )
         return None
     try:
         if load_tokenizer is None:
@@ -187,18 +189,18 @@ def media_warmup(
         without_image = _render(tokenizer, with_image=False)
         if with_image == without_image:
             log.info(
-                "Planned warm-up: no image leg (the chat template renders no image placeholder)"
+                "Planned warm-up: no image request (the chat template renders no image placeholder)"
             )
             return None
         input_ids = tuple(
             int(t) for t in tokenizer(with_image, add_special_tokens=False)["input_ids"]
         )
-    except Exception as error:  # noqa: BLE001 -- the leg is an optimisation; the fault is logged
+    except Exception as error:  # noqa: BLE001 -- the image request is an optimisation; the fault is logged
         # Unlike the two expected omissions above, a render that raises is a
         # fault worth a look (a tokenizer that does not load, a template that
         # fails, a tokenization error): a WARNING with its traceback.
         log.warning(
-            "Planned warm-up: no image leg (the prompt could not be rendered: %s)",
+            "Planned warm-up: no image request (the prompt could not be rendered: %s)",
             error,
             exc_info=error,
         )
@@ -213,7 +215,7 @@ def media_warmup(
 class GrpcWire:
     """The warm-up's requests over the servicer's own port, as a client sends
     them: tokenized input, greedy sampling with the stop ignored, so a request
-    produces exactly the output it asked for; the media leg's request with
+    produces exactly the output it asked for; the media request with
     its image reference and the prompt rendered around it (``media``)."""
 
     def __init__(self, target: str, channel: Any = None, media: MediaWarmup | None = None) -> None:
@@ -237,7 +239,7 @@ class GrpcWire:
 
         if request.media:
             if self._media is None:
-                raise RuntimeError("the plan's media leg has nothing to send on this wire")
+                raise RuntimeError("the plan's media request has nothing to send on this wire")
             tokenized = sglang_scheduler_pb2.TokenizedInput(
                 input_ids=list(self._media.input_ids), original_text=self._media.prompt
             )
@@ -266,7 +268,7 @@ class GrpcWire:
         if request.lone_leg_bootstrap is not None:
             # As the engine's own warm-up sends it in disaggregation mode: the
             # stand-in host and a room, which is the request's rank (0 on one
-            # rank, as the engine sends it): a prefill leg places a
+            # rank, as the engine sends it): a prefill side places a
             # disaggregated request on the rank of its room's residue, so the
             # request runs on the rank the plan pinned it to.
             message.disaggregated_params.CopyFrom(
@@ -321,5 +323,5 @@ class GrpcWire:
 def warmup_wire(target: str, channel: Any = None, media: MediaWarmup | None = None) -> GrpcWire:
     """The wire to the servicer at ``target`` (a loopback ``host:port``), or
     over a ``channel`` the caller already holds and closes; ``media`` is what
-    the plan's media leg sends, when the plan has one."""
+    the plan's media request sends, when the plan has one."""
     return GrpcWire(target, channel, media)

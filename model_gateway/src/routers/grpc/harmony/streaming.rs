@@ -34,6 +34,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
+            prefill_admission::PrefillLoadGuard,
             sse::{SseEncoder, SseSender},
         },
         grpc::{
@@ -45,7 +46,7 @@ use crate::{
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
-                    Reading,
+                    Reading, ReadingEnd,
                 },
             },
             context,
@@ -57,7 +58,6 @@ use crate::{
             utils,
         },
     },
-    worker::PrefillLoadGuard,
 };
 
 /// Whether a tool call of this `ResponseFormat` streams its arguments via
@@ -181,11 +181,12 @@ impl HarmonyStreamingProcessor {
                 .await
                 .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                if let Err(failure) = result {
-                    utils::send_stream_failure(&tx, &failure, &source).await;
+                if let Err(failure) = &result {
+                    utils::send_stream_failure(&tx, failure, &source).await;
                 }
 
                 let _ = tx.send(Ok(SseEncoder::done())).await;
+                ReadingEnd::of(&result)
             }),
             context::ExecutionResult::PrefillDecode {
                 prefill,
@@ -208,11 +209,12 @@ impl HarmonyStreamingProcessor {
                 .await
                 .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                if let Err(failure) = result {
-                    utils::send_stream_failure(&tx, &failure, &source).await;
+                if let Err(failure) = &result {
+                    utils::send_stream_failure(&tx, failure, &source).await;
                 }
 
                 let _ = tx.send(Ok(SseEncoder::done())).await;
+                ReadingEnd::of(&result)
             }),
             context::ExecutionResult::Embedding { .. } => {
                 error!("Harmony streaming not supported for embeddings");
@@ -224,6 +226,7 @@ impl HarmonyStreamingProcessor {
                     )
                     .await;
                     let _ = tx.send(Ok(SseEncoder::done())).await;
+                    ReadingEnd::Failed
                 })
             }
             // Batch results exist only on the completions pipeline.
@@ -237,6 +240,7 @@ impl HarmonyStreamingProcessor {
                     )
                     .await;
                     let _ = tx.send(Ok(SseEncoder::done())).await;
+                    ReadingEnd::Failed
                 })
             }
         };
@@ -404,7 +408,7 @@ impl HarmonyStreamingProcessor {
     /// Emit a chunk delta from Harmony channels
     #[expect(clippy::too_many_arguments)]
     async fn emit_chunk_delta(
-        delta: &HarmonyChannelDelta,
+        delta: HarmonyChannelDelta,
         index: u32,
         is_first: bool,
         dispatch: &context::DispatchMetadata,
@@ -418,37 +422,38 @@ impl HarmonyStreamingProcessor {
             Self::emit_role_chunk(index, dispatch, original_request, tx, encoder).await?;
         }
 
-        // Emit content delta (role is always None for content chunks)
+        // Emit content delta (role is always None for content chunks); the
+        // delta's texts move into the chunk.
         let chat_delta = ChatMessageDelta {
             role: None,
-            content: delta.final_delta.clone(),
-            tool_calls: delta.commentary_delta.as_ref().map(|tc_delta| {
+            content: delta.final_delta,
+            tool_calls: delta.commentary_delta.map(|tc_delta| {
+                let tool_type = tc_delta.id.is_some().then(|| "function".to_string());
                 vec![ToolCallDelta {
                     index: tc_delta.index as u32,
-                    id: tc_delta.id.clone(),
-                    tool_type: tc_delta.id.as_ref().map(|_| "function".to_string()),
-                    function: tc_delta.function.as_ref().map(|f| FunctionCallDelta {
-                        name: f.name.clone(),
-                        arguments: f.arguments.clone(),
+                    id: tc_delta.id,
+                    tool_type,
+                    function: tc_delta.function.map(|f| FunctionCallDelta {
+                        name: f.name,
+                        arguments: f.arguments,
                     }),
                 }]
             }),
-            reasoning_content: delta.analysis_delta.clone(),
+            reasoning_content: delta.analysis_delta,
         };
 
         // Build and emit chunk
-        let chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .add_choice(ChatStreamChoice {
-                    index,
-                    delta: chat_delta,
-                    logprobs,
-                    finish_reason: None,
-                    matched_stop: None,
-                })
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
+        let chunk = ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .add_choice(ChatStreamChoice {
+                index,
+                delta: chat_delta,
+                logprobs,
+                finish_reason: None,
+                matched_stop: None,
+            })
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
 
         let sse_data = encoder
             .encode_data(&ChatChunkWithUsage::new(
@@ -474,7 +479,7 @@ impl HarmonyStreamingProcessor {
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let role_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
                 .created(dispatch.created)
                 .add_choice_role(index, "assistant")
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
@@ -504,12 +509,11 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
+        let chunk = ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
 
         let sse_data = encoder
             .encode_data(&ChatChunkWithUsage::new(
@@ -532,12 +536,11 @@ impl HarmonyStreamingProcessor {
         counts: TokenCounts,
         parsed_reasoning_tokens: u32,
         dispatch: &context::DispatchMetadata,
-        original_request: &ChatCompletionRequest,
         tx: &SseSender,
         encoder: &mut SseEncoder,
     ) -> Result<(), String> {
         let usage_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
                 .created(dispatch.created)
                 .usage(chat_usage(counts, parsed_reasoning_tokens))
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
@@ -991,8 +994,11 @@ impl ResponsesDecode {
                 "role": "assistant",
                 "content": []
             });
-            let event = emitter.emit_output_item_added(output_index, &item);
-            emitter.send_event_best_effort(&event, tx).await;
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_output_item_added(output_index, &item, tx)
+                    .await,
+            );
             self.message = Some((output_index, item_id));
         }
         let Some((output_index, item_id)) = &self.message else {
@@ -1000,12 +1006,16 @@ impl ResponsesDecode {
         };
         let content_index = 0; // Single content part
         if !self.content_part_added {
-            let event = emitter.emit_content_part_added(*output_index, item_id, content_index);
-            emitter.send_event_best_effort(&event, tx).await;
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_content_part_added(*output_index, item_id, content_index, tx)
+                    .await,
+            );
             self.content_part_added = true;
         }
-        let event = emitter.emit_text_delta(text, *output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
+        emitter
+            .send_text_delta_best_effort(text, *output_index, item_id, content_index, tx)
+            .await;
         self.final_text.push_str(text);
     }
 
@@ -1089,8 +1099,11 @@ impl ResponsesDecode {
             .map(|s| s.resolve_tool_server_label(tool_name))
             .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
         attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
-        let event = emitter.emit_output_item_added(output_index, &item);
-        emitter.send_event_best_effort(&event, tx).await;
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_added(output_index, &item, tx)
+                .await,
+        );
 
         // Emit in_progress event for MCP tools
         if let Some(fmt) = response_format {
@@ -1231,9 +1244,10 @@ impl ResponsesDecode {
                 .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
             attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
 
-            let event = emitter.emit_output_item_done(*output_index, &item);
+            ResponseStreamEventEmitter::sent(
+                emitter.send_output_item_done(*output_index, item, tx).await,
+            );
             emitter.complete_output_item(*output_index);
-            emitter.send_event_best_effort(&event, tx).await;
         }
     }
 
@@ -1244,10 +1258,16 @@ impl ResponsesDecode {
             return;
         };
         let content_index = 0;
-        let event = emitter.emit_text_done(*output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
-        let event = emitter.emit_content_part_done(*output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_text_done(*output_index, item_id, content_index, tx)
+                .await,
+        );
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_content_part_done(*output_index, item_id, content_index, tx)
+                .await,
+        );
         let item = json!({
             "id": item_id,
             "type": "message",
@@ -1260,10 +1280,12 @@ impl ResponsesDecode {
             // typed read keeps an item only with one.
             "status": emitter.message_status()
         });
-        let event = emitter.emit_output_item_done(*output_index, &item);
-        // Mark as completed before sending (so it's included in final output even if send fails)
+        // The sender keeps the item before the frame goes out: the item is in the final output
+        // whether or not the frame reached the client.
+        ResponseStreamEventEmitter::sent(
+            emitter.send_output_item_done(*output_index, item, tx).await,
+        );
         emitter.complete_output_item(*output_index);
-        emitter.send_event_best_effort(&event, tx).await;
     }
 
     /// After the loop: a stream that brought frames but no calls from a terminal frame has its
@@ -1619,7 +1641,7 @@ impl ChatDecode {
         let is_first = self.is_firsts.get(&index).copied().unwrap_or(false);
         if has_payload || is_first || bare_logprobs {
             HarmonyStreamingProcessor::emit_chunk_delta(
-                &delta,
+                delta,
                 index,
                 is_first,
                 dispatch,
@@ -1773,7 +1795,7 @@ impl ChatDecode {
         };
         if flushed.analysis_delta.is_some() || flushed.final_delta.is_some() {
             HarmonyStreamingProcessor::emit_chunk_delta(
-                &flushed,
+                flushed,
                 index,
                 false,
                 dispatch,
@@ -1870,7 +1892,6 @@ impl ChatDecode {
                 counts,
                 self.parsed_reasoning_tokens,
                 dispatch,
-                original_request,
                 tx,
                 &mut self.encoder,
             )

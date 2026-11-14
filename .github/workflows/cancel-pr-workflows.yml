@@ -36,6 +36,8 @@ jobs:
             group: benchmark-request-processing-refs/pull/{0}/merge
           - workflow: Benchmark - Manual Policy
             group: benchmark-manual-policy-refs/pull/{0}/merge
+          - workflow: Benchmark - Policy Engine
+            group: benchmark-policy-engine-refs/pull/{0}/merge
           - workflow: Bellwether Fixtures
             group: bellwether-fixtures-pr-{0}
           - workflow: Release SMG+Engine Docker Image

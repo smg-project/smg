@@ -5,8 +5,11 @@ use std::{
 
 use anyhow::Result;
 
-use crate::chat_template::{
-    ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+use crate::{
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+    },
+    decode_activity::note_prefix_mismatch,
 };
 
 /// Type alias for token IDs
@@ -82,6 +85,31 @@ pub struct RendererCapabilities {
     /// message is forwarded in place, for the templates that render a
     /// system turn anywhere.
     pub leading_system_only: bool,
+    /// JSON constraints require reasoning outside the response body.
+    pub json_requires_separate_reasoning: bool,
+    /// JSON constraints start at an empty assistant body, not a partial value.
+    pub json_requires_empty_assistant_prefix: bool,
+}
+
+impl RendererCapabilities {
+    /// Validate reasoning separation and the optional continued assistant text
+    /// for a JSON response. Return an error for an unsupported combination.
+    pub fn validate_json_response(
+        self,
+        separate_reasoning: bool,
+        assistant_prefix: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.json_requires_separate_reasoning || separate_reasoning,
+            "JSON response formats require separate_reasoning=true"
+        );
+        anyhow::ensure!(
+            !self.json_requires_empty_assistant_prefix
+                || assistant_prefix.is_none_or(str::is_empty),
+            "JSON response formats cannot continue a nonempty assistant message"
+        );
+        Ok(())
+    }
 }
 
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
@@ -129,8 +157,9 @@ pub trait Encoder: Send + Sync {
 ///
 /// Implementations own whatever they need (pending bytes, a decode window)
 /// and must produce, over a whole stream, steps and finish together, the
-/// text [`Decoder::decode`] gives for all of its ids, except for a character
-/// the stream's end cut short, for which the finish releases nothing (see
+/// text [`Decoder::decode`] gives for all of its ids, a character the
+/// stream's end cut short included, as the replacement character (the one
+/// exception, a ByteFallback vocabulary's window, is named at
 /// [`finish_into`](Self::finish_into)).
 pub trait IncrementalDecoder: Send + Sync {
     /// Feed one token; returns the text that became final with it (empty when
@@ -149,13 +178,15 @@ pub trait IncrementalDecoder: Send + Sync {
     }
 
     /// The stream's end: appends the text the decoder still holds, rendered
-    /// as [`Decoder::decode`] renders the end of the same ids (a complete
-    /// character as it is, a stray invalid byte as the replacement
-    /// character), except an incomplete trailing sequence, the start of a
-    /// character the model never finished: nothing is appended for it, where
-    /// `decode` would render a replacement character. Says whether anything
-    /// was appended. The default is for a decoder that holds nothing back
-    /// between steps.
+    /// as [`Decoder::decode`] renders the end of the same ids: a complete
+    /// character as it is, a stray invalid byte and an incomplete trailing
+    /// sequence (the start of a character the model never finished) as the
+    /// replacement character. The one exception is a ByteFallback
+    /// vocabulary's window, which keeps a cut character's byte tokens off
+    /// its end: its decoder renders the whole byte run around them as
+    /// replacement characters, rewriting text already sent. Says whether
+    /// anything was appended. The default is for a decoder that holds
+    /// nothing back between steps.
     fn finish_into(&mut self, out: &mut String) -> Result<bool> {
         let _ = out;
         Ok(false)
@@ -224,7 +255,7 @@ pub(crate) fn past_emitted(decoded: &str, prefix: &str) -> DecodeStep {
                 .zip(prefix.chars())
                 .find(|((_, a), b)| a != b)
                 .map_or_else(|| decoded.len().min(prefix.len()), |((index, _), _)| index);
-            crate::decode_activity::note_prefix_mismatch(false);
+            note_prefix_mismatch(false);
             (decoded[common..].to_string(), true)
         }
     };
@@ -247,14 +278,13 @@ pub trait Decoder: Send + Sync {
     /// decoder whose final text no longer starts with what it emitted reports
     /// `prefix_mismatch` and returns the remainder instead of failing. The
     /// default releases what [`decode_step`](Self::decode_step) holds: the
-    /// window's decode past the emitted prefix, and leaves the window empty.
-    /// A window of whole-character tokens holds back only a literal
-    /// replacement character, which is text; the decoders whose window can
-    /// hold the bytes of an unfinished character (a tiktoken vocabulary
-    /// without its per-id table, a Hugging Face vocabulary with byte fallback
-    /// or with a byte-level decoder inside a sequence) override this so that
-    /// a character the end cut short is released as nothing, not as the
-    /// replacement character `decode` renders for it.
+    /// window's decode past the emitted prefix, and leaves the window empty;
+    /// a window that holds the bytes of a character the end cut short (a
+    /// tiktoken vocabulary without its per-id table) releases them as
+    /// `decode` renders them, the replacement character. A Hugging Face
+    /// vocabulary with byte fallback overrides this: its window keeps a cut
+    /// character's byte tokens off its end (see
+    /// [`IncrementalDecoder::finish_into`]).
     fn finish_decode(
         &self,
         ids: &mut Vec<TokenIdType>,
@@ -541,6 +571,14 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()
+    }
+
+    /// Whether the renderer reads the template kwarg `name`. The gateway hands
+    /// a request's controls to the template as kwargs (`tool_choice`,
+    /// `response_format`) and leaves out one the renderer never reads: it
+    /// could not reach the prompt. `true` where the answer is not known.
+    fn template_reads(&self, _name: &str) -> bool {
+        true
     }
 
     /// The thinking mode this tokenizer's renderer renders for the template

@@ -21,7 +21,7 @@
 //! each later one); the decode side keeps the pin.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
-//! works as behind the engine's own frontend: a request's image references
+//! works as behind the engine's own frontend: a request's media references
 //! go to the encoders through the dispatcher the launcher supplies (SGLang's
 //! own receiver, in the launcher process) before the request reaches the
 //! scheduler, the scheduler's request carries what that dispatch set (its
@@ -34,6 +34,7 @@ mod embed;
 mod engine;
 mod generate;
 mod info;
+mod lora;
 mod media_identity;
 mod service;
 #[cfg(test)]
@@ -51,7 +52,7 @@ use tonic::service::Routes;
 use crate::{
     engine_link::EngineLink,
     health_probe,
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads},
     metrics::{Identity, ServicerMetrics},
     proto_json,
     servicer::{self, Shared, WireState},
@@ -261,7 +262,7 @@ pub struct SglangServicerConfig {
     pub servicer: ServicerConfig,
     pub model: SglangModelInfo,
     /// The encode dispatch of a language-side worker under encode/prefill
-    /// disaggregation (`--language-only`): a request's image references go
+    /// disaggregation (`--language-only`): a request's media references go
     /// to the encoders through it before the request reaches the scheduler,
     /// as the engine's own frontend sends them ([`SglangEncodeDispatcher`]).
     /// `None` on every other worker: a request of references is refused.
@@ -282,18 +283,13 @@ impl std::fmt::Debug for SglangServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         // A connected rank reads its own entry (zero-filled until its first
         // load tail), never another rank's figures; a rank past the
         // connected ones gets no record.
         let load = info::rank_load(self, dp_rank)?;
-        // The queued token-work is this servicer's own estimate for the
-        // rank (see `info::rank_load`), so every rank's record reports it.
-        let mut record = smg_grpc_client::common_proto::EngineLoad::from(&load);
-        record.waiting_uncached_tokens =
-            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
-        Some(record)
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {
@@ -307,6 +303,7 @@ impl crate::kv_events::RankLoads for State {
 
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
+    loras: lora::PreloadedLoras,
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
@@ -414,6 +411,7 @@ impl SglangServicerServer {
                         .map(str::to_owned)
                 });
         let state = Arc::new(State {
+            loras: lora::PreloadedLoras::from_server_args(&config.model.server_args_json)?,
             media_identity_key,
             media_disaggregation_mode,
             model: config.model,

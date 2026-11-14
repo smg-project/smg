@@ -14,8 +14,7 @@
 //!   length, so a later request sharing `d` leading blocks finds the placement at the deepest power
 //!   of two not above `d` with `O(log d)` lookups and no per-block index.
 //!
-//! Both expire after `ttl`, which should be a little longer than the engine's event lag. Output
-//! blocks can be credited as generation crosses block boundaries through `on_output_blocks`.
+//! Both expire after `ttl`, which should be a little longer than the engine's event lag.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -40,7 +39,6 @@ struct Placement {
 #[derive(Debug, Default)]
 struct State {
     booked: HashMap<Arc<str>, VecDeque<Booking>>,
-    output_blocks: HashMap<Arc<str>, f64>,
     /// Prefix chain hash → workers predicted to hold that prefix, newest last.
     predicted: HashMap<u64, Vec<Placement>>,
     /// Insertion order of prediction keys, for bounded eviction.
@@ -233,38 +231,10 @@ impl OptimisticAccounting {
         found
     }
 
-    /// Credit `blocks` of generated output on `url` (decode-side growth the engine will report
-    /// later); `release_output` forgets it when the request ends.
-    pub fn on_output_blocks(&self, url: &str, blocks: f64) {
-        let mut state = self.state.lock();
-        let key = Self::intern(&state, url);
-        *state.output_blocks.entry(key).or_default() += blocks;
-    }
-
-    pub fn release_output(&self, url: &str, blocks: f64) {
-        let mut state = self.state.lock();
-        if let Some(current) = state.output_blocks.get_mut(url) {
-            *current = (*current - blocks).max(0.0);
-            if *current == 0.0 {
-                state.output_blocks.remove(url);
-            }
-        }
-    }
-
-    pub fn output_blocks(&self, url: &str) -> f64 {
-        self.state
-            .lock()
-            .output_blocks
-            .get(url)
-            .copied()
-            .unwrap_or(0.0)
-    }
-
     /// Drop every booking and prediction for a worker that left the fleet.
     pub fn forget_worker(&self, url: &str) {
         let mut state = self.state.lock();
         state.booked.remove(url);
-        state.output_blocks.remove(url);
         for placements in state.predicted.values_mut() {
             placements.retain(|p| &*p.url != url);
         }
@@ -407,17 +377,5 @@ mod tests {
         assert_eq!(acc.predicted_overlaps(&[1, 2, 3, 4]).len(), 1);
         std::thread::sleep(Duration::from_millis(40));
         assert!(acc.predicted_overlaps(&[1, 2, 3, 4]).is_empty());
-    }
-
-    #[test]
-    fn output_blocks_accumulate_and_release() {
-        let acc = OptimisticAccounting::new(Duration::from_secs(1));
-        acc.on_output_blocks("w1", 2.0);
-        acc.on_output_blocks("w1", 3.0);
-        assert_eq!(acc.output_blocks("w1"), 5.0);
-        acc.release_output("w1", 4.0);
-        assert_eq!(acc.output_blocks("w1"), 1.0);
-        acc.release_output("w1", 4.0);
-        assert_eq!(acc.output_blocks("w1"), 0.0);
     }
 }

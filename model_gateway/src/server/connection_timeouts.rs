@@ -104,8 +104,9 @@ impl Timeout {
     }
 }
 
-/// Connections closed by each bound, readable in process; the counter
-/// `smg_http_connection_timeouts_total{timeout}` carries the same counts.
+/// Connections closed by each bound, counted beside the counter
+/// `smg_http_connection_timeouts_total{timeout}` (the same figures); the
+/// readers are the tests'.
 #[derive(Debug, Default)]
 pub struct ConnectionTimeoutStats {
     header_read: AtomicU64,
@@ -114,12 +115,14 @@ pub struct ConnectionTimeoutStats {
 
 impl ConnectionTimeoutStats {
     /// Connections closed because no complete request head arrived in time.
-    pub fn closed_by_header_read_timeout(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn closed_by_header_read_timeout(&self) -> u64 {
         self.header_read.load(Ordering::Relaxed)
     }
 
     /// Keep-alive connections closed for carrying no request for too long.
-    pub fn closed_by_idle_timeout(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn closed_by_idle_timeout(&self) -> u64 {
         self.idle.load(Ordering::Relaxed)
     }
 
@@ -227,7 +230,8 @@ impl<A> ConnectionTimeoutAcceptor<A> {
     }
 
     /// The counters of connections closed by each bound.
-    pub fn stats(&self) -> Arc<ConnectionTimeoutStats> {
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> Arc<ConnectionTimeoutStats> {
         Arc::clone(&self.stats)
     }
 }
@@ -675,7 +679,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::server::bind_http_server;
+    use crate::server::{bind_http_server, http_client_builder};
 
     /// The bound under test, in seconds; the other one sits out of reach.
     const SHORT: u64 = 1;
@@ -890,7 +894,7 @@ mod tests {
     /// An HTTP/2 client over the plain port, with prior knowledge; one
     /// connection, kept alive between requests.
     fn http2_client() -> reqwest::Client {
-        crate::server::http_client_builder()
+        http_client_builder()
             .http2_prior_knowledge()
             .build()
             .expect("the HTTP/2 client")

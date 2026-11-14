@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
@@ -69,12 +69,12 @@ use super::{
         },
         streaming, symphony,
     },
-    spec::ResponseSpec,
+    spec::{MessagesTools, ResponseSpec},
     utils,
     utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
-    config::{types::RetryConfig, ParserChoice},
+    config::{types::RetryConfig, GroupedDpSticky, ParserChoice},
     middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
@@ -84,12 +84,14 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
+            json_response,
             placement::{self, Candidates, WireConstraint},
+            prefill_admission::PrefillAdmission,
             retry::{is_retryable_response, BackoffCalculator},
         },
         error,
     },
-    worker::{PrefillAdmission, RoutingPool, WorkerRegistry},
+    worker::{RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -131,6 +133,9 @@ pub(crate) struct PipelineDeps {
     /// its workers and of the streams they open, counted from the dispatch;
     /// `None` leaves them unbounded.
     request_timeout: Option<Duration>,
+    /// `--grouped-dp-sticky`: whether, and how, an attempt pins a sticky
+    /// request to one engine of a grouped data-parallel worker.
+    grouped_dp_sticky: GroupedDpSticky,
 }
 
 impl PipelineDeps {
@@ -162,6 +167,7 @@ impl PipelineDeps {
             rate_limit_manager,
             queue_timeout,
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 
@@ -185,6 +191,7 @@ impl PipelineDeps {
             rate_limit_manager,
             queue_timeout,
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 
@@ -194,6 +201,14 @@ impl PipelineDeps {
     #[must_use]
     pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
+    }
+
+    /// Pin each attempt's sticky request to one engine of a grouped
+    /// data-parallel worker as `sticky` says (`--grouped-dp-sticky`).
+    #[must_use]
+    pub(crate) fn with_grouped_dp_sticky(mut self, sticky: GroupedDpSticky) -> Self {
+        self.grouped_dp_sticky = sticky;
         self
     }
 
@@ -265,6 +280,7 @@ impl PipelineDeps {
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 }
@@ -298,6 +314,9 @@ pub(crate) struct RequestPipeline {
     tool_parser_factory: ToolParserFactory,
     /// The deadline of each attempt's dispatch and streams, when set.
     request_timeout: Option<Duration>,
+    /// How each attempt pins a sticky request to an engine of a grouped
+    /// data-parallel worker.
+    grouped_dp_sticky: GroupedDpSticky,
 }
 
 /// Outcome of one full pipeline run.
@@ -334,8 +353,7 @@ impl RequestPipeline {
             deps.prefill_admission.clone(),
         )
         .with_queue_timeout(deps.queue_timeout);
-        let plan_kind = mode.plan_kind();
-        let inject_pd_metadata = mode.inject_pd_metadata();
+        let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
         let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
@@ -363,8 +381,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode,
                     request_building: Box::new(ChatGenerateRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(ChatGenerateResponseProcessingStage::new(
                         processor,
@@ -381,10 +398,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(MessageRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(MessageRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(MessageResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -399,10 +413,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(CompletionRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(CompletionRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(CompletionResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -420,8 +431,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode: None,
                     request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(
                         harmony::stages::HarmonyResponseProcessingStage::new(),
@@ -484,6 +494,7 @@ impl RequestPipeline {
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
             request_timeout: deps.request_timeout,
+            grouped_dp_sticky: deps.grouped_dp_sticky,
         })
     }
 
@@ -491,6 +502,13 @@ impl RequestPipeline {
     #[cfg(test)]
     pub(crate) fn request_timeout(&self) -> Option<Duration> {
         self.request_timeout
+    }
+
+    /// How each attempt pins a sticky request to an engine of a grouped
+    /// data-parallel worker.
+    #[cfg(test)]
+    pub(crate) fn grouped_dp_sticky(&self) -> GroupedDpSticky {
+        self.grouped_dp_sticky
     }
 
     /// Ingress phase: run the request-owning stages through request building.
@@ -548,12 +566,7 @@ impl RequestPipeline {
         )?;
         step!(
             "OutputBudget",
-            enforce_output_budget(
-                &ctx.input.request_type,
-                workers,
-                &ctx.input.model_id,
-                ctx.state.provider,
-            )
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
         )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
@@ -641,7 +654,14 @@ impl RequestPipeline {
             dctx.created,
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
+        execute_plan(
+            dctx,
+            attempt_plan,
+            last_attempt,
+            self.request_timeout,
+            self.grouped_dp_sticky,
+        )
+        .await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
@@ -1164,7 +1184,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -1225,7 +1245,7 @@ impl RequestPipeline {
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     let body = generate_response_body(single_prompt, n, response);
-                    Self::routed_response(&dctx, axum::Json(body).into_response())
+                    Self::routed_response(&dctx, json_response(&body))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -1269,7 +1289,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -1289,6 +1309,7 @@ impl RequestPipeline {
     pub async fn execute_messages(
         &self,
         request: Arc<CreateMessageRequest>,
+        tools: MessagesTools,
         headers: Option<http::HeaderMap>,
         model_id: String,
         components: Arc<SharedComponents>,
@@ -1298,7 +1319,8 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
         let run = {
-            let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+            let mut ctx =
+                RequestContext::for_messages(request, tools, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1316,7 +1338,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -1363,7 +1385,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_decisions",
@@ -1407,7 +1429,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -1508,7 +1530,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",
@@ -1608,17 +1630,18 @@ impl RequestPipeline {
     /// per iteration. Each iteration takes the tenant rate-limit reservation
     /// a chat request takes: reserved at ingress under a charge id of its own,
     /// settled with the engine's counts the response stage recorded, closed
-    /// unsettled when the iteration fails.
+    /// unsettled when the iteration fails. The request is the loop's shared
+    /// one: the iteration's context takes a reference to it, not a copy.
     pub async fn execute_harmony_responses(
         &self,
-        request: &openai_protocol::responses::ResponsesRequest,
+        request: &Arc<openai_protocol::responses::ResponsesRequest>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
-                Arc::new(request.clone()),
+                Arc::clone(request),
                 None,                  // No headers needed for internal pipeline execution
                 request.model.clone(), // Model ID from request
                 harmony_ctx.components.clone(),
@@ -1641,7 +1664,7 @@ impl RequestPipeline {
                         rate_limit_cell
                             .settle(Self::recorded_settlement(&dctx.response))
                             .await;
-                        Ok(iteration_result)
+                        Ok(*iteration_result)
                     }
                     None => {
                         error!(
@@ -1674,10 +1697,12 @@ impl RequestPipeline {
     /// reservation with the counts the stream brought
     /// ([`RateLimitCell::settle`]) or closes it when the stream broke
     /// ([`RateLimitCell::close_unsettled`]); a cell dropped before either
-    /// (the client left) abandons the reservation, its debit kept.
+    /// (the client left) abandons the reservation, its debit kept. The
+    /// request is the loop's shared one: the iteration's context takes a
+    /// reference to it, not a copy.
     pub async fn execute_harmony_responses_streaming(
         &self,
-        request: &openai_protocol::responses::ResponsesRequest,
+        request: &Arc<openai_protocol::responses::ResponsesRequest>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
@@ -1693,7 +1718,7 @@ impl RequestPipeline {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
-                Arc::new(request.clone()),
+                Arc::clone(request),
                 None,
                 request.model.clone(),
                 harmony_ctx.components.clone(),

@@ -1,5 +1,5 @@
 //! Early media identity, before either scheduler waits for its KV peer.
-use smg_grpc_client::{sglang_media_identity as contract, sglang_proto as sg};
+use smg_grpc_client::{media_identity::sglang as contract, sglang_proto as sg};
 
 use super::State;
 

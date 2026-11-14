@@ -106,8 +106,9 @@ impl ScopeBucket {
     /// at most empty: the new counter goes no deeper below zero than the
     /// old one had gone (settlement debt, carried in full), so the scope is
     /// admitted again within one refill window instead of paying the old
-    /// window's spending off at the new rate. Nothing is debited twice. The
-    /// new bucket starts untouched. It is named this bucket's successor
+    /// window's spending off at the new rate. The new counters start
+    /// refilling from the old bucket's final refill timestamp. The new
+    /// bucket starts untouched. It is named this bucket's successor
     /// under this bucket's lock, so a settlement that takes the lock next
     /// finds it and follows it (`settle_live`): no debit lands on a bucket
     /// after its spending was carried over.
@@ -123,6 +124,7 @@ impl ScopeBucket {
             new_state.available_tokens = (replacement.token_capacity - used_tokens).max(token_debt);
             new_state.available_requests =
                 (replacement.request_capacity - used_requests).max(request_debt);
+            new_state.last_refill = state.last_refill;
         }
         self.succeeded_by(Arc::clone(&replacement));
         drop(state);
@@ -272,6 +274,23 @@ mod tests {
             tokens_per_minute: tpm,
             requests_per_minute: rpm,
         }
+    }
+
+    #[test]
+    fn replacement_refills_from_the_old_buckets_final_refill() {
+        let old = Arc::new(ScopeBucket::new(limits(1200, 120)));
+        old.debit(&mut old.lock_and_refill(), 300.0, 30.0);
+
+        let replacement = old.with_limits(limits(600, 60));
+        let cutover = old.state.lock().last_refill;
+        let mut state = replacement.state.lock();
+        assert_eq!(state.last_refill, cutover);
+
+        let tokens = state.available_tokens;
+        let requests = state.available_requests;
+        replacement.refill_at(&mut state, cutover + Duration::from_secs(1));
+        assert_eq!(state.available_tokens, (tokens + 10.0).min(600.0));
+        assert_eq!(state.available_requests, (requests + 1.0).min(60.0));
     }
 
     #[test]

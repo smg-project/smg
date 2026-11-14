@@ -40,9 +40,6 @@
 
 use std::{borrow::Cow, ops::Deref};
 
-#[path = "minimax_sglang_video.rs"]
-mod sglang_video;
-
 use image::DynamicImage;
 
 use super::{
@@ -50,6 +47,7 @@ use super::{
     qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
 };
 use crate::{
+    minimax_resize::{IMAGE_MAX_TOTAL_PIXELS, RESIZED_KEY, SGLANG_RESIZE_KEY},
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -58,6 +56,9 @@ use crate::{
     },
     EncoderDtype,
 };
+
+#[path = "minimax_sglang_video.rs"]
+mod sglang_video;
 
 /// Default patch size.
 pub const DEFAULT_PATCH_SIZE: usize = 14;
@@ -234,9 +235,7 @@ impl MiniMaxM3VisionProcessor {
             .unwrap_or_else(|| self.inner.merge_size());
         let temporal_patch_size = Self::declared_temporal_patch_size(config)?
             .unwrap_or_else(|| self.inner.temporal_patch_size());
-        let source_resized = config
-            .get_extra::<bool>(crate::minimax_resize::RESIZED_KEY)
-            .unwrap_or(false);
+        let source_resized = config.get_extra::<bool>(RESIZED_KEY).unwrap_or(false);
         if source_resized
             && config
                 .get_patch_size(self.inner.patch_size())
@@ -249,7 +248,7 @@ impl MiniMaxM3VisionProcessor {
         }
         // Source planning already aligned and checked the fixed image budget.
         let max_pixels = if source_resized {
-            crate::minimax_resize::IMAGE_MAX_TOTAL_PIXELS as usize
+            IMAGE_MAX_TOTAL_PIXELS as usize
         } else {
             config.max_pixels.unwrap_or_else(|| self.inner.max_pixels())
         };
@@ -273,9 +272,7 @@ impl MiniMaxM3VisionProcessor {
             video_max_pixels,
         );
         layered.inner = layered.inner.with_preprocessor_config(config);
-        layered.sglang_resize = config
-            .get_extra::<bool>(crate::minimax_resize::SGLANG_RESIZE_KEY)
-            .unwrap_or(false);
+        layered.sglang_resize = config.get_extra::<bool>(SGLANG_RESIZE_KEY).unwrap_or(false);
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
         Ok(layered)
     }
@@ -307,6 +304,11 @@ impl Deref for MiniMaxM3VisionProcessor {
 }
 
 impl VisionPreProcessor for MiniMaxM3VisionProcessor {
+    /// Each image contributes independent BF16 patch rows and metadata.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        true
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
@@ -326,9 +328,8 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess(images)
     }
 
-    /// Write BF16 image batches in one pass; only BF16 was benchmarked here.
-    /// Single images retain neutral U8 pixels to preserve pixel-cache entry
-    /// sizes. This guard also applies when no cache is present.
+    /// Write multi-image BF16 batches in one pass. Single images fall back to
+    /// neutral U8 pixels, which the gateway converts when filling its BF16 cache.
     fn preprocess_wire(
         &self,
         images: &[&DynamicImage],
@@ -373,6 +374,11 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         self.inner.calculate_num_tokens(width, height)
+    }
+
+    /// The rows cover each resized RGB image once per temporal copy.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
     }
 
     fn model_name(&self) -> &'static str {
@@ -422,10 +428,9 @@ mod tests {
             }))
         });
         let mut resized = m3_config();
-        resized.extra.insert(
-            crate::minimax_resize::RESIZED_KEY.to_owned(),
-            serde_json::json!(true),
-        );
+        resized
+            .extra
+            .insert(RESIZED_KEY.to_owned(), serde_json::json!(true));
         let mut unnormalized = m3_config();
         unnormalized.do_normalize = Some(false);
         for config in [
@@ -440,6 +445,15 @@ mod tests {
                 vec![&images[2], &images[0], &images[1], &images[2]],
             ] {
                 let neutral = processor.preprocess(&refs).unwrap();
+                let elements: usize = refs
+                    .iter()
+                    .map(|image| {
+                        processor
+                            .image_input_elements(image.width(), image.height())
+                            .unwrap()
+                    })
+                    .sum();
+                assert_eq!(elements, neutral.encoder_input.len());
                 let wire = processor
                     .preprocess_wire(&refs, EncoderDtype::BFloat16)
                     .unwrap()
@@ -478,10 +492,8 @@ mod tests {
                     .preprocess_wire(&[&images[0], &images[1]], dtype)
                     .is_none());
             }
-            assert!(
-                !processor.supports_per_image_preprocessing(),
-                "this change does not enable the multi-image cache"
-            );
+            assert!(processor.supports_bf16_batch_cache());
+            assert!(!processor.supports_per_image_preprocessing());
         }
     }
 

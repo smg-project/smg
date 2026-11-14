@@ -17,7 +17,10 @@ use std::{
 use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{channel::Channel, BoxedTraceInjector, NoopTraceInjector};
+use crate::{
+    channel::{connect_channel, Channel},
+    BoxedTraceInjector, NoopTraceInjector,
+};
 
 /// Process-global cache of connected channels, keyed by encode-worker endpoint.
 ///
@@ -42,7 +45,10 @@ const ENCODE_CONNS_PER_ENDPOINT: usize = 4;
 /// Round-robin cursor over an endpoint's connection pool.
 static ENCODE_CONN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod tokenspeed_encoder_proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("tokenspeed.grpc.encoder");
@@ -85,7 +91,7 @@ impl TokenSpeedEncoderClient {
         );
         let mut built = Vec::with_capacity(ENCODE_CONNS_PER_ENDPOINT);
         for _ in 0..ENCODE_CONNS_PER_ENDPOINT {
-            built.push(crate::channel::connect_channel(endpoint).await?);
+            built.push(connect_channel(endpoint).await?);
         }
         {
             let mut cache = channel_cache()

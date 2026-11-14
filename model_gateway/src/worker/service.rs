@@ -12,14 +12,15 @@ use axum::{
     Json,
 };
 use openai_protocol::worker::{
-    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerUpdateRequest,
+    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
+    WorkerUpdateRequest,
 };
 use serde_json::json;
 use smg_auth::AuditResource;
 use tracing::warn;
 
 use crate::{
-    config::{validate_worker_url, RouterConfig},
+    config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     routers::provider_support,
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
@@ -38,7 +39,11 @@ use crate::{
 fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
     validate_worker_url(url).map_err(|e| WorkerServiceError::BadRequest {
         message: e.to_string(),
-    })
+    })?;
+    if let Some(warning) = unused_credentials_warning(url) {
+        warn!("{warning}");
+    }
+    Ok(())
 }
 
 /// Longest URL a registration takes: longer ones are not addresses of a
@@ -251,8 +256,21 @@ pub enum WorkerServiceError {
     BadRequest { message: String },
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
+    /// A worker at this URL is being removed: its removal drains it for
+    /// `drain_secs` before the URL is free (a POST inside that window)
+    RemovalInProgress {
+        url: String,
+        worker_id: WorkerId,
+        drain_secs: u64,
+    },
     /// A create for this URL is still in flight (concurrent POST)
-    CreateInProgress { url: String, worker_id: WorkerId },
+    /// `worker_id` is the reservation of the `POST` in flight, or `None` when
+    /// the registration in flight has no id to poll: a startup or discovery
+    /// one, or a `POST`'s before its reservation or after its release.
+    CreateInProgress {
+        url: String,
+        worker_id: Option<WorkerId>,
+    },
     /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
     /// discovered worker)
     DiscoveryOwned { url: String, provider: String },
@@ -275,6 +293,9 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::BadRequest { .. } => "BAD_REQUEST",
             Self::Conflict { .. } => "WORKER_ALREADY_EXISTS",
+            // The worker is still registered at the URL while it drains: the
+            // code the window answered before; the message says what holds.
+            Self::RemovalInProgress { .. } => "WORKER_ALREADY_EXISTS",
             Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
             Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
@@ -289,6 +310,7 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::RemovalInProgress { .. } => StatusCode::CONFLICT,
             Self::CreateInProgress { .. } => StatusCode::CONFLICT,
             Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
@@ -317,7 +339,23 @@ impl std::fmt::Display for WorkerServiceError {
                     Use PUT /workers/{id} to replace or PATCH /workers/{id} to update."
                 )
             }
-            Self::CreateInProgress { url, worker_id } => {
+            Self::RemovalInProgress {
+                url,
+                worker_id,
+                drain_secs,
+            } => {
+                let id = worker_id.as_str();
+                write!(
+                    f,
+                    "Worker at URL '{url}' with ID {id} is being removed; its removal drains \
+                    it for {drain_secs}s, the worker's configured drain, before the URL is \
+                    free. Retry once GET /workers/{id} answers 404."
+                )
+            }
+            Self::CreateInProgress {
+                url,
+                worker_id: Some(worker_id),
+            } => {
                 let id = worker_id.as_str();
                 write!(
                     f,
@@ -325,6 +363,14 @@ impl std::fmt::Display for WorkerServiceError {
                     Poll GET /workers/{id}."
                 )
             }
+            Self::CreateInProgress {
+                url,
+                worker_id: None,
+            } => write!(
+                f,
+                "Worker registration already in progress for URL '{url}', with no id to \
+                poll yet. Retry once it has ended."
+            ),
             Self::DiscoveryOwned { url, provider } => write!(
                 f,
                 "Worker '{url}' is owned by the '{provider}' discovery provider. \
@@ -350,11 +396,24 @@ impl std::error::Error for WorkerServiceError {}
 
 impl IntoResponse for WorkerServiceError {
     fn into_response(self) -> Response {
+        // A registration refused for a removal in progress says when to
+        // retry: the drain window, a second at least.
+        let retry_after = if let Self::RemovalInProgress { drain_secs, .. } = &self {
+            Some(http::HeaderValue::from((*drain_secs).max(1)))
+        } else {
+            None
+        };
         let error = WorkerErrorResponse {
             error: self.to_string(),
             code: self.error_code().to_string(),
         };
-        (self.status_code(), Json(error)).into_response()
+        let mut response = (self.status_code(), Json(error)).into_response();
+        if let Some(retry_after) = retry_after {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, retry_after);
+        }
+        response
     }
 }
 
@@ -541,13 +600,26 @@ impl WorkerService {
         let worker_url = config.url.clone();
         let queue = self.get_job_queue()?;
 
-        // Reserve (or retrieve) a stable ID for the 202 response.
-        // If this URL already has an active worker, reject with 409.
-        let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
-        if self.worker_registry.get(&worker_id).is_some() {
-            return Err(WorkerServiceError::Conflict {
-                url: worker_url,
-                worker_id,
+        // A URL with a worker behind its mapping is a 409. A worker its
+        // removal is draining holds the URL for the drain window; that answer
+        // says so and when to retry, instead of offering a PUT or a PATCH of
+        // a worker that is leaving.
+        let live = self
+            .worker_registry
+            .get_id_by_url_or_reservation(&worker_url)
+            .and_then(|id| self.worker_registry.get(&id).map(|worker| (id, worker)));
+        if let Some((worker_id, existing)) = live {
+            return Err(if existing.status() == WorkerStatus::Draining {
+                WorkerServiceError::RemovalInProgress {
+                    url: worker_url,
+                    worker_id,
+                    drain_secs: existing.metadata().health_config.drain_settle_secs,
+                }
+            } else {
+                WorkerServiceError::Conflict {
+                    url: worker_url,
+                    worker_id,
+                }
             });
         }
 
@@ -556,21 +628,36 @@ impl WorkerService {
             registration_mode: WorkerRegistrationMode::CreateOnly,
         };
 
-        // Exactly one create per URL is in flight at a time, so that attempt alone
-        // owns the reservation and a failed one can safely release it. A second
-        // create is told to poll the first rather than silently merged into it,
-        // since its spec may differ (#1533).
-        let submitted = queue.submit_if_idle(job).await.map_err(|e| {
-            // No 202 goes out, so nothing may keep this URL reserved (#1533).
-            self.worker_registry.release_reservation(&worker_url);
-            WorkerServiceError::QueueSubmitFailed { message: e }
-        })?;
-        if !submitted {
+        // Exactly one create per URL is in flight at a time, so that attempt
+        // alone owns the reservation and a failed one can safely release it;
+        // a second create is told to poll the first rather than silently
+        // merged into it, since its spec may differ (#1533). The queue's claim
+        // comes before the reservation: a POST refused here reserves nothing,
+        // so no id without a job behind it is left for a DELETE to mark, and
+        // names the id in flight when the registration is a POST's (a startup
+        // or discovery one reserves none; a POST's before its reservation or
+        // after its release leaves none to name).
+        if !queue.claim_if_idle(&job) {
+            let worker_id = self
+                .worker_registry
+                .get_id_by_url_or_reservation(&worker_url);
             return Err(WorkerServiceError::CreateInProgress {
                 url: worker_url,
                 worker_id,
             });
         }
+
+        // The stable id for the 202, reserved behind the claim. A mapping
+        // found here has no job behind it: a reservation left over (a
+        // data-parallel registration leaves its base URL's once its ranks are
+        // registered under their own URLs), adopted as it always was.
+        let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
+
+        queue.submit_claimed(job).await.map_err(|e| {
+            // No 202 goes out, so nothing may keep this URL reserved (#1533).
+            self.worker_registry.release_reservation(&worker_url);
+            WorkerServiceError::QueueSubmitFailed { message: e }
+        })?;
 
         let location = format!("/workers/{}", worker_id.as_str());
 
@@ -761,13 +848,32 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
+        let job_queue = self.get_job_queue()?;
+
+        // An id with no worker behind it is a POST's registration still in
+        // flight: queued, or polling an engine unreachable or still starting
+        // for the startup timeout. Its removal is that poll's cancellation; the
+        // cancelled job releases the id and the URL when it ends, and nothing
+        // is registered to drain or remove. A registration that reached the
+        // registry meanwhile is removed below as any worker. A startup or
+        // discovery registration reserves no id, and a POST reserves only
+        // once it holds the queue's claim (one refused for a registration in
+        // flight reserves nothing), so no DELETE reaches this path for such a
+        // registration before its worker exists.
+        if self.worker_registry.get(&worker_id).is_none() {
+            let cancelled = job_queue
+                .cancel_registration(&url, &worker_id)
+                .await
+                .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
+            if cancelled > 0 && self.worker_registry.get(&worker_id).is_none() {
+                return Ok(DeleteWorkerResult { worker_id, url });
+            }
+        }
 
         let job = Job::RemoveWorker {
             url: url.clone(),
             expected_revisions: None,
         };
-
-        let job_queue = self.get_job_queue()?;
         job_queue
             .submit(job)
             .await
@@ -801,17 +907,39 @@ impl WorkerService {
         if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
-
         let job = Job::UpdateWorker {
             url: url.clone(),
             update: Box::new(update),
         };
-
         let job_queue = self.get_job_queue()?;
-        job_queue
-            .submit(job)
-            .await
-            .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        if worker.is_some() {
+            job_queue
+                .submit(job)
+                .await
+                .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        } else {
+            // An id whose URL's registration job is still in the queue is a
+            // registration in flight: it is polled (GET) or ended (DELETE), not
+            // edited. An update job for it would write its status over the
+            // registration's entry in the job queue, and with it the claim that
+            // keeps a second POST of the URL off the same id. An id with no
+            // worker under its URL and no such job is a completed data-parallel
+            // group (its ranks stand under the rank URLs, the POST's id maps to
+            // the base), whose update reaches every rank through the URL. The
+            // check and the update's claim are one entry operation, and the
+            // update writes only over its own entry once it holds a slot, so a
+            // registration that claims the URL in between keeps its entry.
+            let admitted = job_queue
+                .submit_unless_registering(job)
+                .await
+                .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
+            if !admitted {
+                return Err(WorkerServiceError::CreateInProgress {
+                    url,
+                    worker_id: Some(worker_id),
+                });
+            }
+        }
 
         Ok(UpdateWorkerResult { worker_id, url })
     }
@@ -823,6 +951,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        app_context::testing::app_context_for_tests,
         worker::{BasicWorkerBuilder, WorkerType},
         workflow::JobQueueConfig,
     };
@@ -968,6 +1097,333 @@ mod tests {
 
         // The 202 was never sent, so nothing may keep the URL reserved (#1533).
         assert!(registry.get_url_by_id(&reserved).is_none());
+    }
+
+    /// The job a `POST` of `url` claims the queue with (the claim reads the
+    /// job's type and URL, not its registration mode).
+    fn registration(url: &str) -> Job {
+        Job::AddWorker {
+            config: Box::new(worker_spec(url)),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        }
+    }
+
+    /// A registration in flight holds the queue's claim for its URL, and a
+    /// POST's has reserved the id its 202 named: a POST refused by that claim
+    /// is told to poll that id and leaves the mapping and the queue alone (a
+    /// queue with no context behind it fails any submission, so reaching it
+    /// would show).
+    #[tokio::test]
+    async fn a_post_under_a_posts_registration_in_flight_is_told_to_poll_its_id_and_leaves_it() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.5:8000";
+        let queue = JobQueue::new(JobQueueConfig::default(), std::sync::Weak::new());
+        // The first POST's claim, then its reservation: create_worker's order.
+        assert!(queue.claim_if_idle(&registration(url)));
+        let reserved = registry.reserve_id_for_url(url);
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("another POST's registration is in flight");
+        let WorkerServiceError::CreateInProgress { worker_id, .. } = err else {
+            panic!("expected CreateInProgress, got {err:?}");
+        };
+        assert_eq!(
+            worker_id,
+            Some(reserved.clone()),
+            "the id in flight is the one to poll"
+        );
+        assert_eq!(
+            registry.get_id_by_url_or_reservation(url),
+            Some(reserved),
+            "the refused POST released a mapping that is not its own"
+        );
+    }
+
+    /// A POST refused by the queue's claim reserves nothing: the registration
+    /// in flight here is a startup or discovery one, which reserves no id, so
+    /// there is none to poll, and none outlives the refusal for a DELETE to
+    /// find.
+    #[tokio::test]
+    async fn a_post_refused_for_a_registration_of_another_kind_leaves_no_reservation() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.5:8000";
+        let queue = JobQueue::new(JobQueueConfig::default(), std::sync::Weak::new());
+        // The discovery registration's claim, with no reservation behind it.
+        assert!(queue.claim_if_idle(&registration(url)));
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("the discovery registration is in flight");
+        let WorkerServiceError::CreateInProgress { worker_id, .. } = err else {
+            panic!("expected CreateInProgress, got {err:?}");
+        };
+        assert_eq!(worker_id, None, "no id of a POST's is in flight to poll");
+        assert_eq!(
+            registry.get_id_by_url_or_reservation(url),
+            None,
+            "the refused POST's reservation outlived the refusal"
+        );
+    }
+
+    /// A mapping with no job behind it is a reservation left over (a
+    /// data-parallel registration leaves its base URL's once its ranks are
+    /// registered under their own URLs, and nothing releases it): the next
+    /// POST adopts it and is admitted under that id, as it was before the
+    /// queue's claim moved in front of the reservation.
+    #[tokio::test]
+    async fn a_leftover_reservation_with_no_job_in_flight_is_admitted_under_its_id() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.5:8000";
+        let reserved = registry.reserve_id_for_url(url);
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        // A queue that accepts a job and never runs it: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+        let admitted = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect("a leftover reservation is no registration in flight");
+        assert_eq!(admitted.worker_id, reserved, "the 202 names the adopted id");
+        assert_eq!(registry.get_id_by_url_or_reservation(url), Some(reserved));
+    }
+
+    /// An id with no worker behind it is a registration in flight: a PATCH
+    /// of it is told to poll the id and submits nothing, so the registration's
+    /// entry in the job queue, and with it the claim that keeps a second POST
+    /// off its id, stay its own. Before this, the update job's status took
+    /// the entry and the second POST was admitted under the same id; a DELETE
+    /// then cancelled the first registration alone, whose end released the
+    /// shared reservation, and the second registered under a fresh id.
+    #[tokio::test]
+    async fn a_patch_of_a_registration_in_flight_is_told_to_poll_it_and_leaves_its_claim() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.5:8000";
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        // A queue that accepts jobs and never runs one: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+        let id = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect("the first POST is admitted")
+            .worker_id;
+        let patch: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"tier": "a"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), patch)
+            .await
+            .expect_err("the registration is in flight");
+        assert!(
+            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
+            "{err:?}"
+        );
+        let err = service
+            .create_worker(worker_spec(url))
+            .await
+            .expect_err("the registration still holds the URL");
+        assert!(
+            matches!(&err, WorkerServiceError::CreateInProgress { worker_id: Some(in_flight), .. } if *in_flight == id),
+            "a second POST was admitted beside the registration: {err:?}"
+        );
+    }
+
+    /// A successful data-parallel POST leaves its id mapped to the base URL,
+    /// the ranks registered under the rank URLs and no job in flight: a PATCH
+    /// by that id is admitted and reaches every rank, as before the in-flight
+    /// guard, which read the empty base as a registration in flight and
+    /// refused the group's PATCH on every try.
+    #[tokio::test]
+    async fn a_patch_of_a_completed_data_parallel_group_by_its_post_id_reaches_every_rank() {
+        use crate::workflow::{steps::local::find_workers_by_url, WorkflowEngines};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "http://10.0.0.6:8000";
+        let router_config = RouterConfig::default();
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        assert!(
+            context
+                .workflow_engines
+                .set(WorkflowEngines::new(&router_config))
+                .is_ok(),
+            "the engines are set once"
+        );
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        assert!(
+            context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
+            "the queue is set once"
+        );
+        // The group as its POST leaves it: the id reserved for the base URL,
+        // the ranks registered under the rank URLs, the job over.
+        let id = registry.reserve_id_for_url(url);
+        for rank in 0..2 {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("served"))
+                .dp_config(rank, 2)
+                .build();
+            registry
+                .register(Arc::new(worker))
+                .expect("a rank registers");
+        }
+        assert!(
+            registry.get_by_url(url).is_none(),
+            "nothing stands under the base URL itself"
+        );
+        assert_eq!(find_workers_by_url(&registry, url).len(), 2);
+
+        let patch: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"tier": "a"}})).expect("an update");
+        let updated = context
+            .worker_service
+            .update_worker(id.as_str(), patch)
+            .await
+            .expect("the group's PATCH is admitted");
+        assert_eq!(updated.worker_id, id);
+
+        // The update job reaches both ranks.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ranks = find_workers_by_url(&registry, url);
+            if ranks.len() == 2
+                && ranks.iter().all(|worker| {
+                    worker
+                        .metadata()
+                        .spec
+                        .labels
+                        .get("tier")
+                        .map(String::as_str)
+                        == Some("a")
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the update did not reach every rank: {:?}",
+                queue.get_status(url)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The status, the body and the Retry-After header of an error's answer.
+    async fn answer(err: WorkerServiceError) -> (StatusCode, serde_json::Value, Option<String>) {
+        let response = err.into_response();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .map(|value| value.to_str().expect("a visible header").to_string());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("a JSON body"),
+            retry_after,
+        )
+    }
+
+    /// A registration of a URL whose worker is being removed is refused for
+    /// the drain window under the code it had, with an answer that says what
+    /// holds: the removal in progress, the drain, when to retry, and a
+    /// Retry-After of the drain. A live worker's refusal keeps its hint to
+    /// replace or update it.
+    #[tokio::test]
+    async fn create_worker_names_the_removal_in_progress_of_a_draining_worker() {
+        use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "grpc://10.0.0.8:8000";
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 7,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(Arc::clone(&worker)).unwrap();
+        let id = registry.reserve_id_for_url(url);
+
+        let (status, body, retry_after) = answer(
+            service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err("a live worker holds the URL"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains(&format!("Use PUT /workers/{}", id.as_str())),
+            "a live worker's refusal hints at the replacement: {message}"
+        );
+        assert_eq!(retry_after, None, "a live worker's refusal has no retry");
+
+        worker.set_status(WorkerStatus::Draining);
+        let (status, body, retry_after) = answer(
+            service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err("a draining worker holds the URL for its drain"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains("is being removed")
+                && message.contains("for 7s, the worker's configured drain"),
+            "the refusal names the removal and its drain: {message}"
+        );
+        assert!(
+            message.contains(&format!("GET /workers/{} answers 404", id.as_str())),
+            "the refusal says when to retry: {message}"
+        );
+        assert!(
+            !message.contains("PUT"),
+            "no replacement of a worker that is leaving: {message}"
+        );
+        assert_eq!(
+            retry_after.as_deref(),
+            Some("7"),
+            "Retry-After carries the drain window"
+        );
     }
 
     /// A registration whose labels or fields the routers could not read is
