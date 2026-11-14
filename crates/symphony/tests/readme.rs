@@ -280,6 +280,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "arete-27b",
+        model: "NousResearch/Arete-27B",
+        also: &[],
+        released: "2026-11-06",
+        smg: (None, None),
+        table: Some(Table::Qwen3Tagged),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "arex-2",
         model: "BAAI/AREX-2",
         also: &[],
