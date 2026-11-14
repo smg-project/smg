@@ -94,6 +94,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Realtime session and a `response.create` keep the fields the public API added: `reasoning`
+  (its `effort`, `minimal` to `xhigh`) and `parallel_tool_calls`; an input transcription's
+  `languages`, `keywords` and `delay`; and an MCP tool's `tunnel_id`, `allowed_callers` and
+  `defer_loading`. Each was dropped on the way to the upstream, so a reasoning model ran at its
+  default effort and the transcription lost its hints. The session answer
+  (`RealtimeSessionCreateResponse`) keeps the `reasoning` it echoes. Breaking:
+  `RealtimeSessionCreateRequest` and `RealtimeResponseCreateParams` gain `reasoning` and
+  `parallel_tool_calls`, `RealtimeSessionCreateResponse` gains `reasoning`, `AudioTranscription`
+  gains `languages`, `keywords` and `delay`, and `RealtimeToolsConfig::McpTool` gains the three
+  keys.
 - An embeddings answer whose usage has only `prompt_tokens` and `total_tokens`, as the public API
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
