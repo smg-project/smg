@@ -2761,6 +2761,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "ripple-65b-preview",
+        model: "ricursiveAI/Ripple-65B-Preview",
+        also: &[],
+        released: "2026-11-04",
+        smg: (None, None),
+        table: Some(Table::Qwen3),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "seed-oss-36b-instruct",
         model: "ByteDance-Seed/Seed-OSS-36B-Instruct",
         also: &["Seed-OSS-36B-Base-woSyn"],
