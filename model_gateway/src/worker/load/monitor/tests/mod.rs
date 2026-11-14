@@ -14,8 +14,8 @@ use crate::{
     observability::metrics::test_support::render_with_recorder,
     policies::PolicyRegistry,
     worker::{
-        health::overload::OverloadThresholds, test_support::ready_worker, BasicWorkerBuilder,
-        ConnectionMode, WorkerType,
+        health::overload::OverloadThresholds, runtime::StallReason, test_support::ready_worker,
+        BasicWorkerBuilder, ConnectionMode, WorkerType,
     },
 };
 
@@ -475,10 +475,7 @@ async fn a_pushed_record_with_the_engines_silence_vetoes_the_worker() {
     record.engine_silence_ms = Some(5_000);
     record.engine_reports_steps = Some(true);
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-    assert_eq!(
-        worker.stall_reason(),
-        Some(super::super::super::identity::basic::StallReason::Wedged)
-    );
+    assert_eq!(worker.stall_reason(), Some(StallReason::Wedged));
     assert!(!worker.is_healthy_and_eligible());
     record.engine_silence_ms = None;
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
@@ -510,7 +507,7 @@ async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
-        Some(super::super::super::identity::basic::StallReason::Wedged),
+        Some(StallReason::Wedged),
         "silent past twice the prefill at the cold prior"
     );
     record.engine_silence_ms = None;
@@ -522,7 +519,7 @@ async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
-        Some(super::super::super::identity::basic::StallReason::Wedged),
+        Some(StallReason::Wedged),
         "a frozen engine with nothing to prefill"
     );
 }
@@ -601,10 +598,7 @@ async fn the_first_record_a_worker_pushes_is_judged_before_any_event_batch() {
         ..Default::default()
     };
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
-    assert_eq!(
-        worker.stall_reason(),
-        Some(super::super::super::identity::basic::StallReason::Wedged)
-    );
+    assert_eq!(worker.stall_reason(), Some(StallReason::Wedged));
     assert!(!worker.is_healthy_and_eligible());
 }
 

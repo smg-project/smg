@@ -42,6 +42,7 @@ use crate::{
             },
             http_client::LazyHttpClient,
         },
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         pd::pairing::PdPairing,
         registry::event::WorkerConnected,
         runtime::{
@@ -453,7 +454,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     }
 
     /// Get the current circuit breaker state for observability/debugging.
-    fn circuit_breaker_state(&self) -> super::super::health::circuit_breaker::CircuitState;
+    fn circuit_breaker_state(&self) -> CircuitState;
 
     /// Check whether the current circuit breaker state allows execution.
     fn circuit_breaker_can_execute(&self) -> bool;
@@ -1322,9 +1323,7 @@ impl BasicWorker {
 
     /// The circuit breaker configuration this worker runs with: the gateway
     /// defaults plus its own overrides, as resolved at registration.
-    pub(crate) fn circuit_breaker_config(
-        &self,
-    ) -> super::super::health::circuit_breaker::CircuitBreakerConfig {
+    pub(crate) fn circuit_breaker_config(&self) -> CircuitBreakerConfig {
         self.circuit_breaker.load().config().clone()
     }
 
@@ -1451,8 +1450,7 @@ impl BasicWorker {
             rt.status(),
             rt.is_overloaded(),
             rt.stall_reason(),
-            self.circuit_breaker.load().peek_state()
-                == super::super::health::circuit_breaker::CircuitState::Open,
+            self.circuit_breaker.load().peek_state() == CircuitState::Open,
         );
         let code = index as u8 + 1;
         let previous = rt.swap_published_state(code) & !STALE_BIT;
@@ -1755,7 +1753,7 @@ impl Worker for BasicWorker {
         &self.metadata
     }
 
-    fn circuit_breaker_state(&self) -> super::super::health::circuit_breaker::CircuitState {
+    fn circuit_breaker_state(&self) -> CircuitState {
         self.circuit_breaker.load().state()
     }
 
@@ -2067,7 +2065,7 @@ impl Worker for BasicWorker {
         // returns early under the lock when the series already says
         // circuit_open. A record that left a closed or half-open breaker
         // where it was publishes nothing, so the steady path takes no lock.
-        if after != before || after == super::super::health::circuit_breaker::CircuitState::Open {
+        if after != before || after == CircuitState::Open {
             self.publish_state();
         }
     }

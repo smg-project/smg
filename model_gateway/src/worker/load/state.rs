@@ -114,7 +114,7 @@ impl LoadSnapshot {
         let entries = loads
             .into_iter()
             .map(|(url, load)| {
-                let dangling: Weak<super::super::identity::basic::BasicWorker> = Weak::new();
+                let dangling: Weak<crate::worker::BasicWorker> = Weak::new();
                 let entry = LoadEntry {
                     sampled_at: load.sampled_at.unwrap_or(published_at),
                     load: Arc::new(load),
