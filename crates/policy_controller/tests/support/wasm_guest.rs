@@ -78,6 +78,10 @@ pub mod mode {
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
     pub const INIT_ASKS_THE_CLOCK: u8 = 1;
+    /// A third config byte: how many times a burning call repeats its fixed
+    /// loop (one when the byte is absent), so a case at the slow calibration
+    /// can put seconds of fuel-time behind a burn.
+    pub const BURNS: usize = 2;
     /// `init` fails.
     pub const REFUSE_INIT: u8 = 255;
 }
@@ -280,6 +284,7 @@ fn guest_wat(guest: Guest) -> String {
   (table $t 1 funcref)
   (global $heap (mut i32) (i32.const 1024))
   (global $mode (mut i32) (i32.const 0))
+  (global $burns (mut i32) (i32.const 1))
   (data (i32.const 16) "refused")
   (data (i32.const 32) "observed")
 
@@ -334,6 +339,9 @@ fn guest_wat(guest: Guest) -> String {
               (then (loop $spin (br $spin))))
             (if (i64.eq (local.get $asked) (i64.const 3))
               (then unreachable))))))
+    ;; A third config byte, when set: how many times a burn repeats its loop.
+    (if (i32.gt_u (local.get $len) (i32.const 2))
+      (then (global.set $burns (i32.load8_u offset=2 (local.get $ptr)))))
     (if (i32.eq (global.get $mode) (i32.const {burn_init}))
       (then
         (local.set $k (i32.const 8))
@@ -357,9 +365,10 @@ fn guest_wat(guest: Guest) -> String {
     (if (i32.eq (global.get $mode) (i32.const {burn_ctor})) (then (call $burn)))
     (if (i32.eq (global.get $mode) (i32.const {spin_ctor})) (then (loop $spin (br $spin)))))
 
-  ;; A fixed amount of work, so a call's fuel is the same every time.
+  ;; A fixed amount of work, so a call's fuel is the same every time: twenty
+  ;; thousand turns of the loop, times the third config byte (one when absent).
   (func $burn (local $i i32)
-    (local.set $i (i32.const 20000))
+    (local.set $i (i32.mul (i32.const 20000) (global.get $burns)))
     (loop $more
       (local.set $i (i32.sub (local.get $i) (i32.const 1)))
       (br_if $more (local.get $i))))

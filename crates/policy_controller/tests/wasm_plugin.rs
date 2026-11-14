@@ -82,6 +82,18 @@ fn load_slow(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, mode: u8) -
     Plugin::load(runtime, spec).expect("the guest loads")
 }
 
+/// `spec` with its burning calls `times` as long: the guest's third config
+/// byte. A burn at the slow calibration is near 118 milliseconds of
+/// fuel-time against near a tenth of one on the wall, and a call is charged
+/// the larger of its fuel and its elapsed time, so a case whose arithmetic
+/// is in burns holds only while no call is held off its core for longer
+/// than its slack; ten loops to a burn turn a slack of sixty milliseconds
+/// into one of six hundred.
+fn burns(spec: &mut PluginSpec, times: u8) {
+    spec.config.resize(mode::BURNS, 0);
+    spec.config.push(times);
+}
+
 /// A profile whose three stages are the plugin's, each with the given
 /// fallback: the one profile of its build that binds the plugin.
 fn plugin_profile(
@@ -1216,8 +1228,11 @@ fn the_decisions_budget_bounds_the_sum_of_its_calls() {
     // The frame is the request's: each call may take all of what is left.
     burner.budget_micros = 0;
     // The budgets below are burns of fuel: at the slow calibration a call
-    // held off its core is still charged its fuel.
+    // held off its core is still charged its fuel, and with ten loops to a
+    // burn the arithmetic holds under a stall short of six hundred
+    // milliseconds.
     burner.fuel_per_micro = SLOW_CALIBRATION;
+    burns(&mut burner, 10);
     let fuel_per_micro = burner.fuel_per_micro;
     let plugin = Plugin::load(&runtime, burner).expect("the guest loads");
     let engine = plugin_engine(&plugin);
@@ -1242,7 +1257,7 @@ fn the_decisions_budget_bounds_the_sum_of_its_calls() {
     };
     let before = plugin.stats().fuel_used;
     assert!(matches!(
-        decide_under(SLOW_FRAME_MICROS, 1),
+        decide_under(SLOW_FRAME_MICROS * 10, 1),
         Decision::Pick(_)
     ));
     let one = plugin.stats();
@@ -3140,17 +3155,23 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
 /// no stage sample: the call the remainder ended is sampled all the same, so
 /// its one sample per decision opens the breaker at the window. Its scope
 /// first, the constructor had its whole frame and the failure count opens it.
+/// Both at the slow calibration under a one-second budget: the honest
+/// plugin's call is charged its elapsed time too, and on a loaded runner one
+/// call held off its core for the ten milliseconds of the budget spent the
+/// whole remainder, so the spinner's open behind it was bypassed, took no
+/// sample, and the sixty-fourth sample that reads the window never came;
+/// under a second of budget only a stall of a second does that.
 #[test]
 fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_order() {
     for spinner_first in [false, true] {
         let runtime = runtime();
-        let honest = load(
+        let honest = load_slow(
             &runtime,
             "honest",
             guest::record_guest(),
             mode::LEAST_IN_FLIGHT,
         );
-        let spinner = load(
+        let spinner = load_slow(
             &runtime,
             "ctor-spinner",
             guest::record_guest(),
@@ -3173,7 +3194,10 @@ fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_
         });
         let decide = |seed: u64| {
             engine.decide(
-                &facts(seed),
+                &RequestFacts {
+                    budget_micros: SLOW_FRAME_MICROS,
+                    ..facts(seed)
+                },
                 &four(),
                 &pool(4),
                 &Constraints::default(),
