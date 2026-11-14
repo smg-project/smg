@@ -507,7 +507,7 @@ mod tests {
 
     /// A relayed store as the hybrid-batch test reads it: the group and the (hash, token count) of every block.
     type RelayedStore = (Option<u32>, Vec<(i64, usize)>);
-    use tokio::time::timeout;
+    use tokio::{sync::mpsc, time::timeout};
     use zeromq::{DealerSocket, SubSocket};
 
     use super::*;
@@ -769,7 +769,7 @@ mod tests {
             .collect();
         assert_eq!(kinds, ["stored", "removed", "cleared"]);
         let Some(common::kv_cache_event::Data::Stored(stored)) = &relayed.events[0].data else {
-            unreachable!()
+            panic!("the first relayed event is the stored batch")
         };
         assert_eq!(
             stored
@@ -783,7 +783,7 @@ mod tests {
         assert_eq!(stored.parent_block_hash, Some(10));
         assert_eq!(stored.blocks[1].token_ids, [5, 6, 7, 8]);
         let Some(common::kv_cache_event::Data::Removed(removed)) = &relayed.events[1].data else {
-            unreachable!()
+            panic!("the second relayed event is the removal")
         };
         assert_eq!(removed.block_hashes, [11]);
     }
@@ -1122,7 +1122,7 @@ mod tests {
         let mut receivers = Vec::new();
         let mut first = None;
         for i in 0..200 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GenEvent>();
+            let (tx, rx) = mpsc::unbounded_channel::<GenEvent>();
             receivers.push(rx);
             engine.submit(NewRequest {
                 request_id: format!("r{i}"),
@@ -1187,7 +1187,7 @@ mod tests {
         engine.restart_publisher().await;
         let mut restarted = None;
         for i in 200..400 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GenEvent>();
+            let (tx, rx) = mpsc::unbounded_channel::<GenEvent>();
             receivers.push(rx);
             engine.submit(NewRequest {
                 request_id: format!("r{i}"),

@@ -216,7 +216,7 @@ impl VllmEngine for MockScheduler {
             supports_vision: self
                 .overrides
                 .info_bool("supports_vision")
-                .unwrap_or(self.cfg.role == Some(Role::Encode)),
+                .unwrap_or_else(|| self.cfg.role == Some(Role::Encode)),
             served_model_name: self.cfg.model_id.clone(),
             tokenizer_path: self.cfg.tokenizer_path.clone(),
             model_type: "mock".to_string(),
@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(frames.len(), 4, "three chunks and the completion");
         let chunk = match &frames[1] {
             GenResp::Chunk(chunk) => chunk,
-            other => panic!("not a chunk: {other:?}"),
+            other @ GenResp::Complete(_) => panic!("not a chunk: {other:?}"),
         };
         assert_eq!(chunk.token_ids, vec![8]);
         assert_eq!((chunk.prompt_tokens, chunk.completion_tokens), (4, 2));
@@ -735,7 +735,7 @@ mod tests {
                     3
                 );
             }
-            other => panic!("not a completion: {other:?}"),
+            other @ GenResp::Chunk(_) => panic!("not a completion: {other:?}"),
         }
     }
 
@@ -762,7 +762,9 @@ mod tests {
             .iter()
             .map(|frame| match frame {
                 GenResp::Complete(complete) => (complete.index, complete.output_ids.clone()),
-                other => panic!("a non-streaming request reads completions only: {other:?}"),
+                other @ GenResp::Chunk(_) => {
+                    panic!("a non-streaming request reads completions only: {other:?}")
+                }
             })
             .collect();
         assert_eq!(completions, vec![(0, vec![11]), (1, vec![12, 13])]);

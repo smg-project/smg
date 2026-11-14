@@ -732,7 +732,10 @@ mod tests {
     use validator::Validate;
 
     use super::*;
-    use crate::chat::{ChatCompletionRequest, ChatMessage};
+    use crate::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{invalid, invalid_at},
+    };
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct TestRequest {
@@ -1416,14 +1419,14 @@ mod tests {
 
     fn crossed(request: &CrossRequest) -> Result<(), ValidationError> {
         if request.top && !request.base {
-            return Err(crate::common::invalid_at(
+            return Err(invalid_at(
                 "top",
                 "top_requires_base",
                 "top is only allowed when base is set",
             ));
         }
         if request.whole {
-            return Err(crate::common::invalid(
+            return Err(invalid(
                 "whole_request_refused",
                 "the request as a whole is refused",
             ));
@@ -1500,6 +1503,47 @@ mod tests {
         assert!(lines[0].starts_with("name: "), "{json}");
         assert!(lines[1].starts_with("value: "), "{json}");
         assert_eq!(json["error"]["param"], "name", "{json}");
+    }
+
+    /// A content part whose `type` the gateway knows but whose body does not
+    /// fit it is refused at serde's reason for the field: the code is the
+    /// reason's, the param the message serde's path stops at, with the part's
+    /// place and the missing field under it when a field is the one missing;
+    /// never the gRPC routes' `unsupported_content_part`.
+    #[tokio::test]
+    async fn a_malformed_known_content_part_is_refused_at_its_field() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (part, code, param) in [
+            (
+                r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","max_long_side_pixel":-1}}"#,
+                "integer_below_min_value",
+                "messages[0]",
+            ),
+            (
+                r#"{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AA==","fps":"1"}}"#,
+                "invalid_type",
+                "messages[0]",
+            ),
+            (
+                r#"{"type":"image_url","image_url":{"detail":"high"}}"#,
+                "missing_required_parameter",
+                "messages[0].content[1].image_url.url",
+            ),
+            (
+                r#"{"type":"image_url"}"#,
+                "missing_required_parameter",
+                "messages[0].content[1].image_url",
+            ),
+        ] {
+            let body = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}},{part}]}}]}}"#
+            );
+            let (status, json) = rejected::<ChatCompletionRequest>(&body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+        }
     }
 
     /// The Chat Completions rules checked across fields name their field;

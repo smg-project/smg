@@ -132,6 +132,7 @@ pub(super) mod test_helpers {
 
     use crate::{
         encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
+        registry::Tokenizer,
         types::ImageSize,
     };
 
@@ -163,7 +164,7 @@ pub(super) mod test_helpers {
         }
     }
 
-    impl crate::registry::Tokenizer for TestTokenizer {
+    impl Tokenizer for TestTokenizer {
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.vocab.get(token).copied()
         }

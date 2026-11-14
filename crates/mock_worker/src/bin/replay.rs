@@ -20,7 +20,11 @@
 //! of TTFT on an otherwise idle gateway.
 
 // A command-line tool: the summary goes to stdout, progress to stderr.
-#![allow(clippy::print_stdout, clippy::print_stderr)]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool reports on its standard streams"
+)]
 
 use std::{
     collections::{BTreeMap, HashMap},
