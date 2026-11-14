@@ -108,6 +108,21 @@ where
     Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
+/// Deserialize a map that also accepts JSON `null` (mapped to the empty map).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_map")]`
+/// on always-present maps an upstream may write as `null`.
+pub fn deserialize_null_as_empty_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<HashMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    Option::<HashMap<K, V>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
 ///
 /// Use with `#[serde(default = "default_true", deserialize_with = "deserialize_null_as_true")]`
@@ -326,7 +341,7 @@ pub(crate) fn on_field(
 }
 
 /// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
-pub(crate) fn json_type_name(value: &Value) -> &'static str {
+pub fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",
@@ -2078,6 +2093,8 @@ pub enum PromptVariableTyped {
     },
     #[serde(rename = "input_file")]
     ResponseInputFile {
+        /// The file's detail level, as an input file part takes it.
+        detail: Option<crate::responses::FileDetail>,
         file_data: Option<String>,
         file_id: Option<String>,
         file_url: Option<String>,
@@ -2104,10 +2121,11 @@ pub enum Detail {
 
 /// Retention policy for prompt-cache entries on the Responses API.
 ///
-/// Spec: `prompt_cache_retention: "in-memory" | "24h"`.
+/// Spec: `prompt_cache_retention: "in_memory" | "24h"` (`PromptCacheRetentionEnum`).
+/// `in-memory`, the spelling this crate wrote before, still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PromptCacheRetention {
-    #[serde(rename = "in-memory")]
+    #[serde(rename = "in_memory", alias = "in-memory")]
     InMemory,
     #[serde(rename = "24h")]
     Duration24h,
