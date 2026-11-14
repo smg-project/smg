@@ -323,6 +323,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "qwen3.8-27b-w4a16-autoround-rtx3090",
         GenerationPrompt::OpensTheThought,
     ),
+    // OvisOCR3 writes Qwen 3.5's tagged calls under ChatML with a template of its own: the thought
+    // opened in the prompt only when the request turns thinking on, closed as an empty block otherwise.
+    ("ovisocr3", GenerationPrompt::OpensTheThoughtWhenAsked),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
