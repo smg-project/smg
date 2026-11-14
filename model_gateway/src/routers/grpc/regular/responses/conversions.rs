@@ -409,11 +409,12 @@ fn chat_tools(
     mcp_chat_tools: Option<&[Tool]>,
 ) -> (Option<Arc<[Tool]>>, Option<ToolChoice>) {
     let tool_choice = req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice());
-    let function_tools = extract_tools_from_response_tools(req.tools.as_deref());
+    // Under `none` the request's own tools are withheld, so their schemas are
+    // not copied out of the request at all.
     let function_tools = if matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None))) {
         Vec::new()
     } else {
-        function_tools
+        extract_tools_from_response_tools(req.tools.as_deref())
     };
     let tools = match mcp_chat_tools {
         Some(mcp_chat_tools) => {
@@ -517,7 +518,7 @@ fn response_parts_to_message_content(
             } => {
                 parts.push(ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: url.clone(),
+                        url: url.clone().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -539,11 +540,15 @@ fn response_parts_to_message_content(
             }
         }
     }
-    // Plain text stays a string, as it did before parts were carried at all.
-    Ok(match parts.as_slice() {
-        [] => MessageContent::Text(String::new()),
-        [ContentPart::Text { text }] => MessageContent::Text(text.clone()),
-        _ => MessageContent::Parts(parts),
+    // Plain text stays a string, as it did before parts were carried at all;
+    // the one text part moves out of the list instead of being copied again.
+    Ok(match parts.pop() {
+        None => MessageContent::Text(String::new()),
+        Some(ContentPart::Text { text }) if parts.is_empty() => MessageContent::Text(text),
+        Some(last) => {
+            parts.push(last);
+            MessageContent::Parts(parts)
+        }
     })
 }
 
@@ -851,10 +856,10 @@ fn push_tool_call_output_items(
     choice: &ChatChoice,
     original_req: &ResponsesRequest,
 ) {
-    let custom_names = custom_tool_names(original_req.tools.as_deref());
     let Some(tool_calls) = &choice.message.tool_calls else {
         return;
     };
+    let custom_names = custom_tool_names(original_req.tools.as_deref());
     for tool_call in tool_calls {
         let (name, namespace) =
             resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
@@ -1769,7 +1774,7 @@ mod tests {
                 );
                 assert!(matches!(
                     &parts[1],
-                    ContentPart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,iVBORw0KGgo="
+                    ContentPart::ImageUrl { image_url } if *image_url.url == "data:image/png;base64,iVBORw0KGgo="
                 ));
             }
             other => panic!("the user turn carries parts: {other:?}"),
@@ -2053,5 +2058,42 @@ mod tests {
             Some(Vec::new())
         );
         assert_eq!(names(&responses_to_chat(&bare).unwrap()), None);
+    }
+
+    /// The message content of an input item's parts: no part is an empty
+    /// string, one text part is that text, one part of another kind stays a
+    /// one-part list, and several parts stay a list in their order.
+    #[test]
+    fn input_parts_become_text_or_an_ordered_list() {
+        let text = |text: &str| ResponseContentPart::InputText {
+            text: text.to_string(),
+        };
+        let image = ResponseContentPart::InputImage {
+            image_url: Some("https://example.com/a.png".to_string()),
+            file_id: None,
+            detail: None,
+        };
+        assert_eq!(
+            response_parts_to_message_content(&[]).unwrap(),
+            MessageContent::Text(String::new())
+        );
+        assert_eq!(
+            response_parts_to_message_content(&[text("one")]).unwrap(),
+            MessageContent::Text("one".to_string())
+        );
+        let lone_image = response_parts_to_message_content(std::slice::from_ref(&image)).unwrap();
+        assert!(
+            matches!(&lone_image, MessageContent::Parts(parts) if parts.len() == 1 && matches!(parts[0], ContentPart::ImageUrl { .. })),
+            "a lone part of another kind stays a one-part list, got {lone_image:?}"
+        );
+        let several =
+            response_parts_to_message_content(&[text("first"), image, text("last")]).unwrap();
+        let MessageContent::Parts(parts) = several else {
+            panic!("several parts stay a list, got {several:?}");
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text == "first"));
+        assert!(matches!(&parts[1], ContentPart::ImageUrl { .. }));
+        assert!(matches!(&parts[2], ContentPart::Text { text } if text == "last"));
     }
 }

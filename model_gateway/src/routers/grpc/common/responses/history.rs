@@ -91,7 +91,11 @@ pub(crate) async fn load_history(
 
     let mut loaded = request.clone();
     if continues {
-        history.extend(current_input_items(&request.input));
+        // The copy of the request's own input made just above is the one that
+        // joins the history, moved out of the loaded request; the normaliser
+        // reshapes it in place instead of copying every item a second time.
+        let own_input = std::mem::replace(&mut loaded.input, ResponseInput::Items(Vec::new()));
+        history.extend(current_input_items(own_input));
         loaded.input = ResponseInput::Items(history);
         loaded.previous_response_id = None;
     }
@@ -150,17 +154,18 @@ pub(crate) async fn load_history(
 
 /// The request's own input as items: a text input is the user message it
 /// stands for; an item list is normalized (a bare `{role, content}` message
-/// becomes a message item), every other item kept as it came.
-pub(crate) fn current_input_items(input: &ResponseInput) -> Vec<ResponseInputOutputItem> {
+/// becomes a message item), every other item kept as it came. The input is
+/// taken by value: what is not reshaped moves, nothing is copied.
+pub(crate) fn current_input_items(input: ResponseInput) -> Vec<ResponseInputOutputItem> {
     match input {
         ResponseInput::Text(text) => vec![ResponseInputOutputItem::Message {
             id: generate_id("msg"),
             role: "user".to_string(),
-            content: vec![ResponseContentPart::InputText { text: text.clone() }],
+            content: vec![ResponseContentPart::InputText { text }],
             status: Some("completed".to_string()),
             phase: None,
         }],
-        ResponseInput::Items(items) => items.iter().map(normalize_input_item).collect(),
+        ResponseInput::Items(items) => items.into_iter().map(normalize_input_item).collect(),
     }
 }
 
@@ -1364,7 +1369,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let user = normalize_input_item(
-            &serde_json::from_value(json!({"role": "user", "content": "continue"})).unwrap(),
+            serde_json::from_value(json!({"role": "user", "content": "continue"})).unwrap(),
         );
 
         let resolved = resolve_item_references(&storage, vec![reference("msg_stored"), user], None)
