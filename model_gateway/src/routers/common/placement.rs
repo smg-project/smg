@@ -279,12 +279,8 @@ pub(crate) fn select_from(
         routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
-        // Cached hash ring for consistent hashing (O(log n) lookup), when a
-        // policy of this registry may read one (`hash_ring_wanted`).
-        hash_ring: policies
-            .hash_ring_wanted()
-            .then(|| registry.get_hash_ring(model_id))
-            .flatten(),
+        // Cached hash ring for consistent hashing (O(log n) lookup).
+        hash_ring: registry.get_hash_ring(model_id),
         role: WorkerRole::Single,
         overload_lifted: false,
     };
@@ -1230,10 +1226,7 @@ pub(crate) fn select_pair(
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
-    let hash_ring = policies
-        .hash_ring_wanted()
-        .then(|| registry.get_hash_ring(model_id))
-        .flatten();
+    let hash_ring = registry.get_hash_ring(model_id);
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
         tokens: inputs.tokens,

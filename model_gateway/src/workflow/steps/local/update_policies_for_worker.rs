@@ -92,7 +92,8 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
         for worker in updated_workers {
             let needs_kv_events = app_context
                 .policy_registry
-                .worker_needs_kv_events(worker.as_ref());
+                .policy_for_worker(worker.as_ref())
+                .needs_kv_events();
             start_kv_stream(app_context, worker, needs_kv_events).await;
         }
 

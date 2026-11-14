@@ -196,12 +196,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
             // The worker's stream follows the policy that places it, the
             // role's policy for a prefill, decode or encode worker rather than
-            // the model's (see `start_kv_stream`). The registry answers from
-            // the engine's needs for the worker's model and phase when the
-            // engine serves that policy.
+            // the model's (see `start_kv_stream`).
             let needs_kv_events = app_context
                 .policy_registry
-                .worker_needs_kv_events(worker.as_ref());
+                .policy_for_worker(worker.as_ref())
+                .needs_kv_events();
             start_kv_stream(&app_context, worker, needs_kv_events).await;
 
             Self::warn_on_cache_aware_without_kv_events(&model_id, worker, needs_kv_events);
@@ -250,10 +249,7 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        policies::{
-            as_cache_aware, engine_host::Decider, test_support::decider_over, PolicyFactory,
-            PolicyRegistry,
-        },
+        policies::{as_cache_aware, PolicyFactory},
         worker::{BasicWorkerBuilder, KvEventMonitor, ModelCard, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
@@ -308,49 +304,6 @@ mod tests {
         // As the app wires the pair: the add reads the registry.
         monitor.set_worker_registry(&context.worker_registry);
         (Arc::new(context), monitor)
-    }
-
-    /// An app context hosting `decider` as `--policy-engine engine` does,
-    /// over a round-robin default policy, with a KV event monitor and no
-    /// worker monitor ([`context_over`]).
-    fn context_hosting(decider: Decider) -> (Arc<AppContext>, Arc<KvEventMonitor>) {
-        let config = RouterConfig::builder()
-            .policy(PolicyConfig::RoundRobin)
-            .build_unchecked();
-        let mut context = AppContext::clone(&app_context_for_tests(
-            config,
-            Arc::new(WorkerRegistry::new()),
-            None,
-        ));
-        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin).with_decider(decider);
-        let monitor = Arc::new(KvEventMonitor::new());
-        registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
-        context.policy_registry = Arc::new(registry);
-        context.kv_event_monitor = Some(Arc::clone(&monitor));
-        (Arc::new(context), monitor)
-    }
-
-    /// Under the engine a worker's stream kind is the engine's need for the
-    /// worker's model and phase, read through the registry: a regular worker
-    /// whose profile reads the prefix index streams its KV events though the
-    /// legacy default policy reads none, and a prefill worker whose profile
-    /// prices loads alone streams none.
-    #[tokio::test]
-    async fn under_the_engine_a_workers_stream_kind_is_the_engines_need_for_its_phase() {
-        let engine = || decider_over(&["prefix-affinity"], &["least-load"], &[]);
-        let (context, monitor) = context_hosting(engine());
-        register(&context, grpc_worker(WorkerType::Regular), &[]).await;
-        assert!(
-            monitor.get_indexer(MODEL).is_some(),
-            "the regular placement's profile reads the index"
-        );
-
-        let (context, monitor) = context_hosting(engine());
-        register(&context, grpc_worker(WorkerType::Prefill), &[]).await;
-        assert!(
-            monitor.get_indexer(MODEL).is_none(),
-            "the prefill profile prices loads alone"
-        );
     }
 
     /// Register `worker` with `labels` and run the step over it.
