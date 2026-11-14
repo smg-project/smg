@@ -497,7 +497,6 @@ impl<'a> SelectionInputs<'a> {
             cache_namespace: self.cache_namespace,
             candidate_filter,
             tried: &[],
-            sequence: None,
         }
     }
 }
@@ -818,7 +817,6 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     candidate_filter: Some(&pinned),
                     tried: &[],
-                    sequence: None,
                 };
                 let (pair, guard) = self
                     .admit_pd_pair(
@@ -1772,12 +1770,6 @@ impl WorkerSelectionStage {
             } else {
                 candidate_filter
             };
-        // The request's sequence before the pool read: see
-        // `PlacementInputs::sequence`.
-        let sequence = self
-            .policy_registry
-            .decider()
-            .map(|decider| decider.begin());
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
         let candidates = placement::candidates(
@@ -1805,7 +1797,6 @@ impl WorkerSelectionStage {
                 cache_namespace,
                 candidate_filter,
                 tried,
-                sequence,
             },
         )
     }
