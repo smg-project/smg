@@ -1789,12 +1789,31 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.add_filter("lower", python_lower_filter);
     env.add_filter("capitalize", python_capitalize_filter);
     env.add_filter("title", python_title_filter);
+    // Jinja2's `random` filter draws one element of a sequence or one character
+    // of a string, afresh on every render, as the reference renderer draws it: a
+    // template that draws a nonce after every role renders here too, its bytes
+    // its own on each render by design. minijinja-contrib's filter also seeds
+    // from a `RAND_SEED` integer in the render context, which a request's
+    // `chat_template_kwargs` can supply; Jinja2's has no such seed.
+    env.add_filter("random", python_random_filter);
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
     env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// Jinja2's `random` filter is `random.choice(seq)`, a draw from any sized
+/// sequence; minijinja-contrib's draws from a sequence or a string, so an
+/// iterable (minijinja's `range()`, capped at 100,000 items) is drawn from as
+/// its items.
+fn python_random_filter(state: &State, value: &Value) -> Result<Value, MinijinjaError> {
+    if value.kind() == ValueKind::Iterable {
+        let items: Vec<Value> = value.try_iter()?.collect();
+        return minijinja_contrib::filters::random(state, &Value::from(items));
+    }
+    minijinja_contrib::filters::random(state, value)
 }
 
 /// `str(value)` as Jinja2's string filters apply it: a string is itself, a
