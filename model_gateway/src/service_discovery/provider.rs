@@ -12,7 +12,7 @@ use openai_protocol::worker::WorkerType;
 use crate::{
     config::RoutingMode,
     observability::metrics::metrics_labels,
-    worker::{endpoint::Endpoint, EndpointError},
+    worker::{identity::endpoint::Endpoint, EndpointError},
 };
 
 /// Which provider produced a snapshot.

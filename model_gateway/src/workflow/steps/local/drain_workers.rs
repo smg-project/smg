@@ -13,7 +13,7 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
+use crate::{worker::identity::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
 
 /// Step that transitions Ready workers to `Draining` and waits for the
 /// resolved drain settle window before downstream steps remove them.
@@ -311,7 +311,7 @@ mod tests {
     /// Checked outside the lock, the step wrote `NotReady -> Draining` here.
     #[tokio::test]
     async fn test_drain_workers_step_keeps_a_demotion_written_between_its_read_and_its_write() {
-        use crate::worker::event::WorkerEvent;
+        use crate::worker::registry::event::WorkerEvent;
 
         let worker = build_worker("http://w1:8080", 0, WorkerStatus::Ready);
         let app_ctx = make_app_context(&[Arc::clone(&worker)]);

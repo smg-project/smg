@@ -24,9 +24,11 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
+    rl_adapter,
     routers::{
         common::{
-            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+            openai_bridge::FormatRegistry, overload, pd_admission,
+            prefill_admission::PrefillAdmission, realtime::RealtimeRegistry,
         },
         gateway::Gateway,
         grpc::{
@@ -37,9 +39,11 @@ use crate::{
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
-        liveness, rl_adapter, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache,
-        WorkerMonitor, WorkerRegistry, WorkerService,
+        connection::http_client::{
+            build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
+        },
+        health::liveness,
+        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -439,7 +443,7 @@ impl AppContextBuilder {
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
         // The configuration's liveness budgets (the stall, wedge and stale
-        // thresholds and the warm-up slice, see `worker::liveness`) take
+        // thresholds and the warm-up slice, see `worker::health::liveness`) take
         // effect for every context built from it, the server's and a test's
         // alike. They are process-wide and the first call wins, so a
         // constructor that builds the policy registry itself configures them
@@ -705,7 +709,7 @@ impl AppContextBuilder {
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
                 // Below the request timeout, as the worker clients keep it
-                // (`worker::http_client::connect_timeout_secs_below`): a dark
+                // (`worker::connection::http_client::connect_timeout_secs_below`): a dark
                 // external host fails as a connect timeout, not as the
                 // request's own (except under a 1 s request timeout, where the
                 // two timers race).
@@ -1011,10 +1015,10 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::common::prefill_admission::PrefillAdmissionAttempt,
         worker::{
             test_support::{select_worker, worker_of},
-            BasicWorkerBuilder, ConnectionMode, PrefillAdmissionAttempt, SubscriptionKind, Worker,
-            WorkerType,
+            BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
         },
     };
 
@@ -1037,11 +1041,11 @@ mod tests {
     }
 
     /// Child-process body of the root-store test below (see
-    /// `worker::http_client::no_root_store`); a no-op unless the case
+    /// `worker::connection::http_client::no_root_store`); a no-op unless the case
     /// variable is set.
     #[test]
     fn child_with_client_without_native_roots() {
-        use crate::worker::http_client::no_root_store;
+        use crate::worker::connection::http_client::no_root_store;
 
         if std::env::var(no_root_store::CASE).is_err() {
             return;
@@ -1057,7 +1061,7 @@ mod tests {
         ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
     )]
     fn the_gateway_client_builds_without_a_native_root_store() {
-        use crate::worker::http_client::no_root_store;
+        use crate::worker::connection::http_client::no_root_store;
 
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),

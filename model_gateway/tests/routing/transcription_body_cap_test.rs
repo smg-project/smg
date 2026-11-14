@@ -27,7 +27,8 @@ use smg::{
     routers::{router::Router as HttpRouter, RouterTrait},
     tenant::{RouteRequestMeta, TenantKey},
     worker::{
-        circuit_breaker::CircuitState, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard, Worker,
+        health::circuit_breaker::CircuitState, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard,
+        Worker,
     },
 };
 use smg_external_router::{error::extract_error_code_from_response, retry::is_retryable_response};

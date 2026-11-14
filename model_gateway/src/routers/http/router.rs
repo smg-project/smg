@@ -82,6 +82,7 @@ use crate::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
             sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
+            stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -107,7 +108,7 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        endpoint::Endpoint, ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker,
+        identity::endpoint::Endpoint, ConnectionMode, RoutingPool, RuntimeType, Worker,
         WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
 };
@@ -2925,7 +2926,7 @@ mod tests {
         service_discovery::testing::create_test_app_context,
         tenant::TenantKey,
         worker::{
-            circuit_breaker::CircuitState,
+            health::circuit_breaker::CircuitState,
             test_support::{no_health_check, RefusedAddress},
             BasicWorker, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard,
         },

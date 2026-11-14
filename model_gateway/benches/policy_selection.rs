@@ -24,16 +24,17 @@ use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
+        hash_ring::HashRing,
         CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
         LoadBalancingPolicy, ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy,
         PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
     routers::common::bench_support::PairPath,
     worker::{
-        kv_event_monitor::bench_support::IndexFeed,
-        load_state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, ConnectionMode, HashRing, KvEventMonitor, KvIndex, ModelCard,
-        RuntimeType, Worker, WorkerRegistry, WorkerType,
+        kv::event_monitor::bench_support::IndexFeed,
+        load::state::{one_rank_load, TestFeed},
+        BasicWorkerBuilder, ConnectionMode, KvEventMonitor, KvIndex, ModelCard, RuntimeType,
+        Worker, WorkerRegistry, WorkerType,
     },
 };
 use smg_grpc_client::common_proto::{

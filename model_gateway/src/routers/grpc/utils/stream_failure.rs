@@ -49,7 +49,10 @@ use crate::{
         error::error_type_for_status,
         grpc::context::{DispatchMetadata, WorkerSelection},
     },
-    worker::{basic::WorkerTypeExt, endpoint::Endpoint, ConnectionModeExt, Worker},
+    worker::{
+        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
+        ConnectionModeExt, Worker,
+    },
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's
@@ -555,7 +558,7 @@ mod tests {
     use crate::{
         routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
         worker::{
-            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
             test_support::{no_health_check, RefusedAddress},
             BasicWorkerBuilder, ConnectionMode,
         },

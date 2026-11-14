@@ -11,7 +11,7 @@ use wfaas::{
 use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::{common::pd_admission, grpc::regular::symphony::telemetry},
-    worker::{bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
+    worker::{health::bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
     workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
 };
 
@@ -233,7 +233,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         }
 
         // WorkerMonitor subscribes to registry events directly (see
-        // `worker::monitor::WorkerMonitor::start_event_loop`), so this
+        // `worker::load::monitor::WorkerMonitor::start_event_loop`), so this
         // step no longer has to push group-add notifications. The
         // monitor's event loop reconciles the impacted groups as soon as the
         // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.

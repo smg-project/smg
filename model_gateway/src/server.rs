@@ -64,6 +64,10 @@ pub(crate) mod tls;
 pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
 
 use crate::{
+    admin::{
+        json::AdminJson,
+        params::{AdminPath, AdminQuery},
+    },
     app_context::AppContext,
     config::{redacted, ParserChoice, RouterConfig},
     endpoints::{
@@ -98,10 +102,8 @@ use crate::{
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
-        admin_json::AdminJson,
-        admin_params::{AdminPath, AdminQuery},
-        endpoint::Endpoint,
-        manager::{WorkerManager, WorkerManagerConfig},
+        health::manager::{WorkerManager, WorkerManagerConfig},
+        identity::endpoint::Endpoint,
         ConnectionMode,
     },
     workflow::{
