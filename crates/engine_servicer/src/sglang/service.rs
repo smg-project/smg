@@ -172,6 +172,9 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<sg::ListLoadedLoRaAdaptersRequest>,
     ) -> Result<Response<sg::ListLoadedLoRaAdaptersResponse>, Status> {
-        Err(no_control_wire("ListLoadedLoRAAdapters"))
+        self.state.shared.engine()?;
+        Ok(Response::new(sg::ListLoadedLoRaAdaptersResponse {
+            loaded_adapters: self.state.loras.adapters.clone(),
+        }))
     }
 }
