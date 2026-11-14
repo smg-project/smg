@@ -7,8 +7,10 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use super::{Worker, WorkerLoadGuard};
-use crate::observability::metrics::Metrics;
+use crate::{
+    observability::metrics::Metrics,
+    worker::{Worker, WorkerLoadGuard},
+};
 
 const HEAD_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
