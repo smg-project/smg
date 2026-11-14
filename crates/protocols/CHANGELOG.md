@@ -235,6 +235,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
   `text.format` description into the Chat request it builds, but a gRPC engine still gets only the
   format's schema, as before. Breaking: `JsonSchemaFormat` gains `description: Option<String>`.
+- A Responses request's reasoning config keeps `mode`, `context` and the deprecated
+  `generate_summary`, as the public API's `Reasoning` takes them, when the request is written back
+  for an upstream, and a Response's `reasoning` echoes the ones the request set. The crate dropped
+  all three, so a `pro`-mode request reached the upstream in its default mode. Breaking:
+  `ResponseReasoningParam` gains `mode: Option<String>`, `context: Option<ReasoningContext>` and
+  `generate_summary: Option<ReasoningSummary>`, `ReasoningInfo` gains the three as
+  `Option<String>`, and the crate gains `ReasoningContext`.
 - A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
   cached, as the public API defaults the key. The crate refused the whole usage, and the
   completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream
