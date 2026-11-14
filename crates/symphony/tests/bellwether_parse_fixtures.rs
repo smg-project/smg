@@ -291,6 +291,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // MemT-1.0-Nano writes Qwen 3.5's tagged calls under ChatML with the thought opened in the
     // prompt (`<think>\n`) and closed there as an empty block when the request turns thinking off.
     ("memt-1.0-nano", GenerationPrompt::OpensTheThought),
+    // Sage-A1.5 writes Qwen 3.5's tagged calls under ChatML with the thought opened in the
+    // prompt (`<think>\n`) and closed there as an empty block when the request turns thinking off.
+    ("sage-a1.5", GenerationPrompt::OpensTheThought),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
