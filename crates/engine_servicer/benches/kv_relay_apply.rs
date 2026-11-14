@@ -24,7 +24,6 @@
 
 use std::{
     fs,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -121,11 +120,10 @@ impl Path {
             .expect("decodes")
             .0;
         self.seq += 1;
-        let batch = Arc::new(
-            self.normalizer
-                .normalize_batch(wire, self.seq, &mut self.event_id),
-        );
-        self.history.push(self.seq, Arc::clone(&batch));
+        let batch = self
+            .normalizer
+            .normalize_batch(wire, self.seq, &mut self.event_id);
+        self.history.push(self.seq, &batch);
         if let Some(state) = &mut self.state {
             state.apply(&batch);
         }

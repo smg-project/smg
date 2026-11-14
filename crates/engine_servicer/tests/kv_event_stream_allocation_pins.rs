@@ -2,8 +2,9 @@
 //! at two subscribers of one relay, over a ZMQ publisher of 64-block batches
 //! (the batch `benches/kv_relay_apply.rs` publishes). The relay's own work per
 //! batch (decode, normalize, history, state) is the no-subscriber figure;
-//! every subscriber adds what its stream does with the shared batch before it
-//! goes out. Printed and pinned, so a change in what a subscriber costs per
+//! every subscriber adds what its stream does with the batch before it goes
+//! out: the last stream to claim a batch takes it as it is, a further stream
+//! copies it. Printed and pinned, so a change in what a subscriber costs per
 //! batch fails a test rather than moving a bench inside its noise. A separate
 //! executable, so it can declare the counting allocator.
 #![expect(
@@ -34,12 +35,17 @@ const BLOCK_SIZE: usize = 16;
 const TOKENS_PER_BATCH: usize = BLOCKS_PER_BATCH * BLOCK_SIZE;
 /// Batches counted at each subscriber count.
 const BATCHES: u64 = 64;
-/// The allocation calls one subscriber may add per relayed batch. Today a
-/// stream copies the whole batch to attach its load record: one call for the
-/// event list, one for the block list, one per block's token ids and one per
-/// string the stored event carries; the pin below is the measured figure
-/// rounded up, replaced by the envelope-only figure when the copy goes.
-const PER_SUBSCRIBER_CEILING: usize = 4_096;
+/// The allocation calls the one stream of a relay adds per relayed batch: the
+/// slot the batch rides the live channel in and the stream's own bookkeeping,
+/// nothing of the batch itself (3 measured, plus one for the
+/// window's rounding). Before the relay handed the batch over, every stream
+/// copied it to attach its load record: one call for the event list, one for
+/// the block list, one per block's token ids and one per string the stored
+/// event carries, 70 in all over the relay's own 247.
+const TAKER_CEILING: usize = 4;
+/// What a second stream of the same relay adds: one copy of the batch and its
+/// own bookkeeping (68 measured, plus two).
+const COPIER_CEILING: usize = 70;
 
 fn hashes(chain: u64) -> Vec<i64> {
     let first = chain * BLOCKS_PER_BATCH as u64 + 1;
@@ -234,8 +240,13 @@ fn a_subscriber_stream_allocates_this_much_per_relayed_batch() {
          {second}"
     );
     assert!(
-        first <= PER_SUBSCRIBER_CEILING && second <= PER_SUBSCRIBER_CEILING,
-        "a subscriber adds {first} / {second} allocation calls per batch (ceiling \
-         {PER_SUBSCRIBER_CEILING})"
+        first <= TAKER_CEILING,
+        "the one stream of a relay adds {first} allocation calls per batch (ceiling \
+         {TAKER_CEILING}: the batch goes out as it is, uncopied)"
+    );
+    assert!(
+        second <= COPIER_CEILING,
+        "a second stream adds {second} allocation calls per batch (ceiling {COPIER_CEILING}: \
+         one copy of the batch)"
     );
 }
