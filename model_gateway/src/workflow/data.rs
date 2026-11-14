@@ -262,6 +262,23 @@ pub struct WorkerRemovalWorkflowData {
     pub removed_workers: Vec<Arc<dyn Worker>>,
 }
 
+impl WorkerRemovalWorkflowData {
+    /// Narrows the job to `kept`, the workers it still holds: the selection's
+    /// result, or what a step left after it found some of them standing on
+    /// their own (a pin that moved, a registration under the URL since the
+    /// selection). The worker list, the URLs and the affected models move
+    /// together, so the steps after it touch nothing of the others.
+    pub fn keep_only(&mut self, kept: Vec<Arc<dyn Worker>>) {
+        self.worker_urls = kept.iter().map(|worker| worker.url().to_string()).collect();
+        self.affected_models = kept
+            .iter()
+            .map(|worker| worker.model_id().to_string())
+            .collect();
+        self.workers_to_remove = Some(WorkerList::from_workers(&kept));
+        self.actual_workers_to_remove = Some(kept);
+    }
+}
+
 impl WorkflowData for WorkerRemovalWorkflowData {
     fn workflow_type() -> &'static str {
         "worker_removal"

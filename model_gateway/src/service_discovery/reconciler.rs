@@ -409,7 +409,7 @@ pub(super) async fn reconcile(
                 target
                     .guards
                     .iter()
-                    .map(|(id, revision)| (id.as_str().to_string(), *revision))
+                    .map(|(id, revision)| (id.as_str().to_string(), Some(*revision)))
                     .collect(),
             ),
         };

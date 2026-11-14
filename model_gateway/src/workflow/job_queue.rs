@@ -30,8 +30,9 @@ use crate::{
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode,
+        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
+        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        WorkerRegistrationMode,
     },
 };
 
@@ -58,9 +59,10 @@ pub enum Job {
         url: String,
         /// Per-worker revision guards keyed by registry worker id. A DP group
         /// shares one canonical URL but each rank holds its own revision, so
-        /// one scalar cannot guard the group. `None` removes every match
-        /// unguarded.
-        expected_revisions: Option<HashMap<String, u64>>,
+        /// one scalar cannot guard the group. An id mapped to `None` is
+        /// removed at any revision (a `DELETE`'s pin: the id it names, not
+        /// the build under it). `None` removes every match unguarded.
+        expected_revisions: Option<HashMap<String, Option<u64>>>,
     },
     InitializeWorkersFromConfig {
         router_config: Box<RouterConfig>,
@@ -174,9 +176,10 @@ pub struct JobQueue {
     /// The next waiter's id: what tells a caller's waiter from a later one
     /// under the same key.
     next_waiter_id: AtomicU64,
-    /// One job per URL, kept while another holds the URL
-    /// (`submit_or_defer`) and run by that job's completion (`run_kept`).
-    kept: Arc<DashMap<String, Job>>,
+    /// The jobs kept per URL while another job holds the URL (a removal
+    /// and one of any other kind, `submit_or_defer`), run in turn by that
+    /// job's completion (`run_kept`).
+    kept: Arc<DashMap<String, Kept>>,
     /// The ids (the ones their `POST /workers` reserved) whose registration a
     /// `DELETE` ended before the job had saved a workflow state
     /// (`cancel_registration`): the `POST`'s job reads its own id here before
@@ -259,6 +262,98 @@ impl std::fmt::Debug for JobQueue {
     }
 }
 
+/// The jobs kept for one URL while another job holds it
+/// ([`JobQueue::submit_or_defer`]): at most one removal and one job of any
+/// other kind, the latest of the other kind and one removal for all the
+/// removals kept (`place` merges their pins). The removal runs first: a
+/// refresh kept beside it would refresh what the removal takes out, and
+/// when the removal leaves its worker standing (a guarded removal that
+/// skipped a worker registered since its `DELETE`) the refresh runs after
+/// it, so neither a `DELETE` nor a worker's one refresh is lost to the
+/// other.
+#[derive(Default)]
+struct Kept {
+    removal: Option<Job>,
+    other: Option<Job>,
+}
+
+impl Kept {
+    fn slot(&mut self, job: &Job) -> &mut Option<Job> {
+        if matches!(job, Job::RemoveWorker { .. }) {
+            &mut self.removal
+        } else {
+            &mut self.other
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.removal.is_none() && self.other.is_none()
+    }
+
+    /// The next job to run: the removal, then the other.
+    fn take_next(&mut self) -> Option<Job> {
+        self.removal.take().or_else(|| self.other.take())
+    }
+
+    /// Puts `job` in the slot of its kind, under the entry's lock. Two
+    /// removals meet as one: unguarded when either is (a removal without
+    /// pins takes whatever stands under the URL), otherwise the union of
+    /// their pins, an id pinned `None` on either side (the id as it stands,
+    /// the wider pin) staying `None`. Of two jobs of the other kind the
+    /// newer stays when `newer_wins`, else the one held.
+    fn place(&mut self, job: Job, newer_wins: bool) {
+        let slot = self.slot(&job);
+        *slot = Some(match (slot.take(), job) {
+            (
+                Some(Job::RemoveWorker {
+                    url,
+                    expected_revisions: held,
+                }),
+                Job::RemoveWorker {
+                    expected_revisions: other,
+                    ..
+                },
+            ) => Job::RemoveWorker {
+                url,
+                expected_revisions: Self::merge_pins(held, other),
+            },
+            (Some(held), job) => {
+                if newer_wins {
+                    job
+                } else {
+                    held
+                }
+            }
+            (None, job) => job,
+        });
+    }
+
+    fn merge_pins(
+        held: Option<HashMap<String, Option<u64>>>,
+        other: Option<HashMap<String, Option<u64>>>,
+    ) -> Option<HashMap<String, Option<u64>>> {
+        let (Some(mut pins), Some(other)) = (held, other) else {
+            return None;
+        };
+        for (id, revision) in other {
+            let pin = pins.entry(id).or_insert(revision);
+            if revision.is_none() {
+                *pin = None;
+            }
+        }
+        Some(pins)
+    }
+}
+
+/// How a failed registration's cleanup removal went in: queued as the URL's
+/// own job, or behind a removal in flight at the URL (kept to run on its
+/// heels, merged with a removal kept there already).
+#[derive(Debug, PartialEq, Eq)]
+enum CleanupRemoval {
+    Queued,
+    Behind,
+}
+
 /// A claimed submission's hold on its own status entry while it waits for a
 /// slot: dropped with its caller before the slot is held (a cancelled request
 /// on a full queue) or ended by a refused submission, it takes the claim back
@@ -294,7 +389,7 @@ impl JobQueue {
         let status_map = Arc::new(DashMap::new());
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let outcomes: Outcomes = Arc::new(DashMap::new());
-        let kept: Arc<DashMap<String, Job>> = Arc::new(DashMap::new());
+        let kept: Arc<DashMap<String, Kept>> = Arc::new(DashMap::new());
         let cancelled_before_start = Arc::new(DashSet::new());
 
         let queue = Arc::new(Self {
@@ -454,24 +549,40 @@ impl JobQueue {
 
     /// `submit_unless_in_flight` for a submission that must not be lost: a
     /// job that finds another of any type in flight under its URL is kept
-    /// (one per URL, the latest) and run by that job's completion
-    /// (`run_kept`), after it and never beside it. Returns `Ok(false)` for a
-    /// kept job. A job still kept once nothing is in flight (the holder ended
-    /// between the claim and the keeping, its completion finding nothing) is
-    /// this call's to submit.
+    /// (one of each kind per URL: one removal carrying the merged pins of
+    /// every removal kept, and the latest of any other kind, `keep`) and run
+    /// by that job's completion (`run_kept`), after it and never beside it,
+    /// the removal first. Returns `Ok(false)` for a kept job. A job still
+    /// kept once nothing is in flight (the holder ended between the claim and
+    /// the keeping, its completion finding nothing) is this call's to submit,
+    /// in the run order: the type is read per iteration, as the job taken
+    /// back may be of the other kind, a job taken back and refused again goes
+    /// back to its slot (`put_back`, as the runner does: a removal merging
+    /// with one kept since, another kind yielding to a newer one), and
+    /// `Ok(true)` says this call's own job was submitted.
     pub async fn submit_or_defer(&self, mut job: Job) -> Result<bool, String> {
         let worker_url = job.worker_url().to_string();
-        let job_type = job.job_type();
+        let own_kind_is_removal = matches!(job, Job::RemoveWorker { .. });
+        let mut taken_back = false;
         loop {
+            let job_type = job.job_type();
+            let own = matches!(job, Job::RemoveWorker { .. }) == own_kind_is_removal;
             if Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
-                return self.submit_inner(job, true, None).await.map(|()| true);
+                return self.submit_inner(job, true, None).await.map(|()| own);
             }
-            self.kept.insert(worker_url.clone(), job);
+            if taken_back {
+                Self::put_back(&self.kept, &worker_url, job);
+            } else {
+                Self::keep(&self.kept, &worker_url, job);
+            }
             if Self::has_in_flight(&self.status_map, &worker_url) {
                 return Ok(false);
             }
-            match self.kept.remove(&worker_url) {
-                Some((_, taken_back)) => job = taken_back,
+            match Self::take_next(&self.kept, &worker_url) {
+                Some(next) => {
+                    job = next;
+                    taken_back = true;
+                }
                 None => return Ok(false),
             }
         }
@@ -484,21 +595,52 @@ impl JobQueue {
             .is_some_and(|entry| matches!(entry.status.as_str(), "pending" | "processing"))
     }
 
-    /// The job kept for `worker_url` (`submit_or_defer`), run on the heels of
-    /// the job that held the URL, on its task and under its own status; a job
-    /// queued for the URL in the meantime holds it first, and its completion
-    /// runs the kept one. Nothing waits on a kept job's outcome.
+    /// Keeps `job` for `url` in the slot of its kind: the latest of a kind
+    /// takes that slot, a removal merging with a removal kept there
+    /// (`Kept::place`), and the other kind's slot is left as it is.
+    fn keep(kept: &DashMap<String, Kept>, url: &str, job: Job) {
+        kept.entry(url.to_string()).or_default().place(job, true);
+    }
+
+    /// The next job kept for `url` in the run order (the removal, then the
+    /// other); the URL's entry goes once both slots are empty.
+    fn take_next(kept: &DashMap<String, Kept>, url: &str) -> Option<Job> {
+        let mut entry = kept.get_mut(url)?;
+        let job = entry.take_next();
+        let emptied = entry.is_empty();
+        drop(entry);
+        if emptied {
+            kept.remove_if(url, |_, slots| slots.is_empty());
+        }
+        job
+    }
+
+    /// `job` goes back to the slot of its kind (`run_kept`, its claim
+    /// refused): a job of that kind kept there since is the newer and stays,
+    /// a removal kept since taking the pins of the one going back
+    /// (`Kept::place`).
+    fn put_back(kept: &DashMap<String, Kept>, url: &str, job: Job) {
+        kept.entry(url.to_string()).or_default().place(job, false);
+    }
+
+    /// The jobs kept for `worker_url` (`submit_or_defer`), run in turn on the
+    /// heels of the job that held the URL (the removal first), on its task
+    /// and under their own status; a job queued for the URL in the meantime
+    /// holds it first, and its completion runs the kept ones, a job whose
+    /// claim is refused going back to its slot (`put_back`: a removal merges
+    /// with one kept since, another kind yields to a newer one). Nothing
+    /// waits on a kept job's outcome.
     async fn run_kept(
         worker_url: &str,
         context: &Arc<AppContext>,
         status_map: &Arc<DashMap<String, JobStatus>>,
-        kept: &DashMap<String, Job>,
+        kept: &DashMap<String, Kept>,
         cancelled_before_start: &DashSet<WorkerId>,
     ) {
-        while let Some((_, job)) = kept.remove(worker_url) {
+        while let Some(job) = Self::take_next(kept, worker_url) {
             let job_type = job.job_type();
             if !Self::claim_unless_in_flight(status_map, worker_url, job_type) {
-                kept.insert(worker_url.to_string(), job);
+                Self::put_back(kept, worker_url, job);
                 if Self::has_in_flight(status_map, worker_url) {
                     return;
                 }
@@ -552,7 +694,7 @@ impl JobQueue {
     /// Whether a job is kept for `url` (`submit_or_defer`).
     #[cfg(test)]
     pub(crate) fn kept_for(&self, url: &str) -> bool {
-        self.kept.contains_key(url)
+        self.kept.get(url).is_some_and(|slots| !slots.is_empty())
     }
 
     /// Any in-flight job under the key blocks the claim, whatever its type.
@@ -845,7 +987,7 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
-        kept: Arc<DashMap<String, Job>>,
+        kept: Arc<DashMap<String, Kept>>,
         cancelled_before_start: Arc<DashSet<WorkerId>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
@@ -948,6 +1090,48 @@ impl JobQueue {
         }
     }
 
+    /// Queues the removal of a registration's workers under `url`, pinned to
+    /// `entries` (their ids and revisions as the registry holds them now, so
+    /// a worker registered or replaced since is left alone): the job a
+    /// `DELETE` of a live worker queues, drain and bookkeeping included.
+    /// Behind a removal in flight at the URL (a `DELETE`'s, an earlier end's)
+    /// it runs on that one's heels, as a `DELETE`'s does: that one takes the
+    /// workers it was queued for and leaves these standing when they are
+    /// not among its pins, so a second is needed, and finds nothing left
+    /// when they were. Kept for the URL, these entries merge with those of a
+    /// removal kept there already (`Kept::place`), displacing nothing.
+    async fn queue_removal(
+        context: &Arc<AppContext>,
+        url: &str,
+        entries: HashMap<String, u64>,
+    ) -> Result<CleanupRemoval, String> {
+        let queue = context
+            .worker_job_queue
+            .get()
+            .ok_or_else(|| "Worker job queue not initialized".to_string())?;
+        let job = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: Some(
+                entries
+                    .into_iter()
+                    .map(|(id, revision)| (id, Some(revision)))
+                    .collect(),
+            ),
+        };
+        if queue.claim_if_idle(&job) {
+            return queue
+                .submit_claimed(job)
+                .await
+                .map(|()| CleanupRemoval::Queued);
+        }
+        let submitted = queue.submit_or_defer(job).await?;
+        Ok(if submitted {
+            CleanupRemoval::Queued
+        } else {
+            CleanupRemoval::Behind
+        })
+    }
+
     /// Takes the mark under `own_id`, if there is one: true when a `DELETE`
     /// ended this registration before its job had saved a workflow state.
     fn take_mark(marks: &DashSet<WorkerId>, own_id: Option<&WorkerId>) -> bool {
@@ -1012,10 +1196,54 @@ impl JobQueue {
                     instance_id
                 );
 
-                engines
+                let state = engines
                     .worker_registration
-                    .wait_for_completion(instance_id, &config.url, timeout_duration)
-                    .await
+                    .wait_for_terminal_state(instance_id, &config.url, timeout_duration)
+                    .await?;
+                let outcome = wfaas::completion_outcome(&state, &config.url);
+                // A POST's registration that put its worker in the registry
+                // and did not finish (a DELETE's cancel landing after the
+                // registry step, a later step's failure) leaves no worker
+                // behind: it goes out through the removal job, as a DELETE of
+                // a live worker sends it. A startup or discovery registration
+                // is its own pass's to reconcile.
+                let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
+                match outcome {
+                    Err(failure) if create_only => {
+                        // The registry says what this registration left in it
+                        // (its workers still the entries under their URLs, by
+                        // id and revision): a worker registered or replaced
+                        // since is not this job's to remove, and the step
+                        // record alone can be read before the step's end.
+                        let entries = registered_entries(&context.worker_registry, &state);
+                        Err(if entries.is_empty() {
+                            if registered_in(&state) {
+                                format!(
+                                    "{failure}; its workers were registered and are no longer \
+                                    the entries under their URLs (removed or replaced since)"
+                                )
+                            } else {
+                                failure
+                            }
+                        } else {
+                            match Self::queue_removal(context, &config.url, entries).await {
+                                Ok(CleanupRemoval::Queued) => format!(
+                                    "{failure}; its workers were registered and leave through \
+                                    a queued removal"
+                                ),
+                                Ok(CleanupRemoval::Behind) => format!(
+                                    "{failure}; its workers were registered and leave through \
+                                    a removal queued behind the one in flight"
+                                ),
+                                Err(submit) => format!(
+                                    "{failure}; its workers were registered and their removal \
+                                    could not be queued: {submit}"
+                                ),
+                            }
+                        })
+                    }
+                    outcome => outcome,
+                }
             }
             Job::UpdateWorker { url, update } => {
                 let engines = context
@@ -2276,6 +2504,275 @@ mod tests {
         }
     }
 
+    /// A label refresh kept while a DELETE's removal is kept for the URL is
+    /// kept beside it (one slot per kind), and both run at the holder's end,
+    /// the removal first: the refresh's worker may be the one leaving, or
+    /// the one a guarded removal leaves standing. Each runs under its own
+    /// status, so the URL's last status is the refresh's. Before this the
+    /// one slot per URL held the latest job, and a refresh kept while the
+    /// DELETE waited dropped the accepted DELETE.
+    #[tokio::test]
+    async fn a_refresh_kept_beside_a_kept_removal_runs_after_it() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let url = "http://w:8002";
+        queue.hold_url_for_tests(url, "AddWorker");
+        let removal = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: None,
+        };
+        assert_eq!(queue.submit_or_defer(removal).await, Ok(false));
+        let refresh = Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        assert_eq!(
+            queue.submit_or_defer(refresh).await,
+            Ok(false),
+            "the refresh is kept, neither submitted nor dropped"
+        );
+        assert!(queue.kept_for(url));
+
+        JobQueue::record_job_completion(
+            "AddWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "both kept jobs ran");
+        assert_eq!(
+            queue
+                .get_status(url)
+                .expect("the last kept job's own status")
+                .job_type,
+            "RefreshWorkerLabels",
+            "the refresh ran after the removal, under its own status"
+        );
+    }
+
+    /// A DELETE's removal kept while a label refresh is kept for the URL
+    /// takes the removal's slot beside it (the refresh stays), and the run
+    /// order is the removal first, then the refresh, whichever was kept
+    /// first.
+    #[tokio::test]
+    async fn a_removal_kept_beside_a_kept_refresh_runs_first() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let url = "http://w:8003";
+        queue.hold_url_for_tests(url, "AddWorker");
+        let refresh = Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        assert_eq!(queue.submit_or_defer(refresh).await, Ok(false));
+        let removal = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: None,
+        };
+        assert_eq!(queue.submit_or_defer(removal).await, Ok(false));
+        assert!(queue.kept_for(url));
+        // The run order, read off the slots and put back as it was.
+        let first = JobQueue::take_next(&queue.kept, url).expect("the removal is next");
+        let second = JobQueue::take_next(&queue.kept, url).expect("the refresh follows");
+        assert_eq!(
+            (first.job_type(), second.job_type()),
+            ("RemoveWorker", "RefreshWorkerLabels"),
+            "the removal runs first, the refresh after it"
+        );
+        assert!(
+            JobQueue::take_next(&queue.kept, url).is_none() && !queue.kept_for(url),
+            "two slots, nothing else"
+        );
+        JobQueue::put_back(&queue.kept, url, second);
+        JobQueue::put_back(&queue.kept, url, first);
+
+        JobQueue::record_job_completion(
+            "AddWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "both kept jobs ran");
+        assert_eq!(
+            queue
+                .get_status(url)
+                .expect("the last kept job's own status")
+                .job_type,
+            "RefreshWorkerLabels",
+            "the refresh ran last: the removal ran first and did not displace it"
+        );
+    }
+
+    /// A repeated DELETE's removal, pinned to the id it saw, kept behind the
+    /// job that took the URL after the first removal, and the refresh of
+    /// the worker registered since under a fresh id, kept behind the same
+    /// job: both are kept, the removal first, and both run at the holder's
+    /// end. Before this the removal took the one slot and the refresh was
+    /// dropped, and the worker the removal's pin then skipped kept its
+    /// provisional labels until another transition into service.
+    #[tokio::test]
+    async fn a_fresh_workers_refresh_kept_beside_an_old_id_removal_runs_after_it() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let url = "http://w:8005";
+        queue.hold_url_for_tests(url, "UpdateWorker");
+        let old_id_removal = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: Some(HashMap::from([("old-id".to_string(), None)])),
+        };
+        assert_eq!(queue.submit_or_defer(old_id_removal).await, Ok(false));
+        let fresh_workers_refresh = Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        assert_eq!(
+            queue.submit_or_defer(fresh_workers_refresh).await,
+            Ok(false),
+            "the refresh is kept beside the removal, not dropped for it"
+        );
+        let next = JobQueue::take_next(&queue.kept, url).expect("the removal is next");
+        assert!(
+            matches!(
+                next,
+                Job::RemoveWorker {
+                    expected_revisions: Some(_),
+                    ..
+                }
+            ),
+            "the old-id removal runs first"
+        );
+        JobQueue::put_back(&queue.kept, url, next);
+
+        JobQueue::record_job_completion(
+            "UpdateWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "the removal and the refresh both ran");
+        assert_eq!(
+            queue
+                .get_status(url)
+                .expect("the last kept job's own status")
+                .job_type,
+            "RefreshWorkerLabels",
+            "the fresh worker's refresh ran after the removal"
+        );
+    }
+
+    /// A kept job whose claim the runner could not take goes back to the
+    /// slot of its kind: a job of the other kind kept meanwhile keeps its own
+    /// slot, and a removal kept meanwhile merges with the one going back (an
+    /// unguarded side wins). The URL's entry goes with its last job.
+    #[test]
+    fn a_kept_job_put_back_merges_with_the_removal_kept_meanwhile() {
+        let url = "http://w:8004";
+        let removal = || Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: None,
+        };
+        let refresh = || Job::RefreshWorkerLabels {
+            url: url.to_string(),
+        };
+        let kinds = |kept: &DashMap<String, Kept>| {
+            kept.get(url).map_or((None, None), |slots| {
+                (
+                    slots.removal.as_ref().map(Job::job_type),
+                    slots.other.as_ref().map(Job::job_type),
+                )
+            })
+        };
+
+        let kept: DashMap<String, Kept> = DashMap::new();
+        JobQueue::put_back(&kept, url, refresh());
+        assert_eq!(
+            kinds(&kept),
+            (None, Some("RefreshWorkerLabels")),
+            "an empty slot takes the job back"
+        );
+
+        JobQueue::put_back(
+            &kept,
+            url,
+            Job::RemoveWorker {
+                url: url.to_string(),
+                expected_revisions: Some(HashMap::new()),
+            },
+        );
+        assert_eq!(
+            kinds(&kept),
+            (Some("RemoveWorker"), Some("RefreshWorkerLabels")),
+            "a removal put back beside a kept refresh keeps both"
+        );
+
+        JobQueue::keep(
+            &kept,
+            url,
+            Job::RemoveWorker {
+                url: url.to_string(),
+                expected_revisions: Some(HashMap::new()),
+            },
+        );
+        JobQueue::put_back(&kept, url, removal());
+        assert!(
+            kept.get(url).is_some_and(|slots| matches!(
+                slots.removal,
+                Some(Job::RemoveWorker {
+                    expected_revisions: None,
+                    ..
+                })
+            )),
+            "a removal put back merges with the removal kept meanwhile, the unguarded side winning"
+        );
+        assert_eq!(
+            kinds(&kept).1,
+            Some("RefreshWorkerLabels"),
+            "the other kind's slot is untouched"
+        );
+
+        assert_eq!(
+            JobQueue::take_next(&kept, url).map(|job| job.job_type()),
+            Some("RemoveWorker"),
+            "the removal is taken first"
+        );
+        assert_eq!(
+            JobQueue::take_next(&kept, url).map(|job| job.job_type()),
+            Some("RefreshWorkerLabels"),
+            "the refresh follows"
+        );
+        assert!(
+            JobQueue::take_next(&kept, url).is_none() && !kept.contains_key(url),
+            "the URL's entry goes with its last job"
+        );
+    }
+
     /// A same-URL registration job of another kind started under a cancelled
     /// `POST`'s reservation (a `PUT` queued before the `POST`, a discovery
     /// pass over the URL) owns no mark and leaves the `POST`'s for the
@@ -2314,6 +2811,116 @@ mod tests {
         );
         assert!(JobQueue::take_mark(&marks, own.as_ref()));
         assert!(marks.is_empty());
+    }
+
+    /// A registration's cleanup removal is one per URL at a time: a second
+    /// submission (a DELETE's, or a second end) finds the first in flight and
+    /// is kept to run on its heels with its own pins; the entry under the URL
+    /// is the first removal's own.
+    #[tokio::test]
+    async fn a_registrations_cleanup_removal_is_queued_once_per_url() {
+        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        // A queue that accepts jobs and never runs one: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        context.worker_job_queue.set(queue).ok();
+        let url = "http://w:8000";
+        let entries = || HashMap::from([("worker-id".to_string(), 1u64)]);
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, entries()).await,
+            Ok(CleanupRemoval::Queued)
+        );
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, entries()).await,
+            Ok(CleanupRemoval::Behind),
+            "a removal in flight owns the URL; the second runs on its heels"
+        );
+        let status = context
+            .worker_job_queue
+            .get()
+            .and_then(|queue| queue.get_status(url))
+            .expect("the removal's entry");
+        assert_eq!(status.job_type, "RemoveWorker");
+        assert_eq!(status.status, "pending");
+        let queue = context.worker_job_queue.get().expect("the queue");
+        let slots = queue
+            .kept
+            .get(url)
+            .expect("a removal kept behind the one in flight");
+        let Some(Job::RemoveWorker {
+            expected_revisions: Some(pins),
+            ..
+        }) = slots.removal.as_ref()
+        else {
+            panic!("the kept job is the cleanup's pinned removal")
+        };
+        assert_eq!(
+            pins,
+            &HashMap::from([("worker-id".to_string(), Some(1u64))]),
+            "the kept removal carries the second cleanup's entries"
+        );
+    }
+
+    /// A removal in flight at the URL pinned to other workers does not own a
+    /// failed registration's: the cleanup's removal is kept to run on its
+    /// heels with its own pins, and a later cleanup's entries join the kept
+    /// removal's pins instead of displacing it.
+    #[tokio::test]
+    async fn a_cleanup_behind_a_removal_of_other_workers_keeps_its_own_pins() {
+        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        context.worker_job_queue.set(queue).ok();
+        let url = "http://w:8000";
+        let one = |id: &str, revision: u64| HashMap::from([(id.to_string(), revision)]);
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, one("old", 1)).await,
+            Ok(CleanupRemoval::Queued)
+        );
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, one("new", 3)).await,
+            Ok(CleanupRemoval::Behind),
+            "a removal of other workers in flight: the cleanup runs on its heels"
+        );
+        assert_eq!(
+            JobQueue::queue_removal(&context, url, one("third", 5)).await,
+            Ok(CleanupRemoval::Behind),
+            "a later cleanup joins the kept removal"
+        );
+        let queue = context.worker_job_queue.get().expect("the queue");
+        let slots = queue
+            .kept
+            .get(url)
+            .expect("a removal kept behind the one in flight");
+        let Some(Job::RemoveWorker {
+            expected_revisions: Some(pins),
+            ..
+        }) = slots.removal.as_ref()
+        else {
+            panic!("the kept job is a pinned removal")
+        };
+        assert_eq!(
+            pins,
+            &HashMap::from([
+                ("new".to_string(), Some(3u64)),
+                ("third".to_string(), Some(5u64)),
+            ]),
+            "both cleanups' entries, none of the in-flight removal's"
+        );
     }
 
     /// A submission that fails must not leave its claim behind, or the next
@@ -2556,6 +3163,438 @@ mod tests {
             (entry.job_type.as_str(), entry.status.as_str()),
             ("UpdateWorker", "processing"),
             "the entry survives the dropped plain submission"
+        );
+    }
+
+    /// A `DELETE` whose cancel is written while the registration's registry
+    /// step runs (past the step's cancel read, before its registry write)
+    /// finds nothing registered to remove, and the step then writes its
+    /// worker: the job's end reads it from the registry and it leaves through
+    /// the removal the end queues, so the URL takes a new registration. The
+    /// window is held open by the registry step's test hold; on the base the
+    /// worker stayed under the URL, under a fresh id.
+    #[tokio::test]
+    async fn a_registration_cancelled_as_its_registry_step_writes_leaves_no_worker_under_its_url() {
+        use http::StatusCode;
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            worker::WorkerRegistry,
+            workflow::{
+                steps::{local::test_support::serve_json_routes, shared::registration_hold},
+                WorkflowEngines,
+            },
+        };
+
+        let url = serve_json_routes(vec![
+            ("/health", StatusCode::OK, serde_json::json!({})),
+            (
+                "/get_server_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model"}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "served"}]}),
+            ),
+        ])
+        .await;
+        let router_config = RouterConfig::default();
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        assert!(
+            context
+                .workflow_engines
+                .set(WorkflowEngines::new(&router_config))
+                .is_ok(),
+            "the engines are set once"
+        );
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        assert!(
+            context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
+            "the queue is set once"
+        );
+        let hold = registration_hold::place(&url);
+
+        // The POST: the id it reserves, its job, and a waiter for the job's
+        // outcome.
+        let id = registry.reserve_id_for_url(&url);
+        let mut spec = WorkerSpec::new(url.as_str());
+        spec.runtime_type = RuntimeType::Sglang;
+        let post = queue.submit_and_wait(
+            Job::AddWorker {
+                config: Box::new(spec),
+                registration_mode: WorkerRegistrationMode::CreateOnly,
+            },
+            Duration::from_secs(60),
+        );
+        // The DELETE lands in the window: the registration's cancel is
+        // written while its registry step runs, and nothing is registered to
+        // remove.
+        let delete = async {
+            tokio::time::timeout(Duration::from_secs(30), hold.reached.notified())
+                .await
+                .expect("the registration reaches its registry step");
+            assert!(
+                registry.get(&id).is_none(),
+                "the registry step wrote before its hold"
+            );
+            let deleted = context
+                .worker_service
+                .delete_worker(id.as_str())
+                .await
+                .expect("the DELETE ends a registration in flight");
+            assert!(
+                registry.get(&id).is_none(),
+                "the DELETE found a worker to remove"
+            );
+            // Whatever the DELETE set in motion is over before the step
+            // writes: a removal it queued under the URL (none on this head,
+            // where the cancel answers it) must not meet the worker's write.
+            while queue.get_status(&url).is_some_and(|status| {
+                status.job_type == "RemoveWorker"
+                    && matches!(status.status.as_str(), "pending" | "processing")
+            }) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            hold.release.notify_one();
+            deleted
+        };
+        let (outcome, deleted) = tokio::join!(post, delete);
+        assert_eq!(deleted.url, url);
+
+        // The worker the step wrote leaves through the removal the job's end
+        // queued (a job of its own), and the URL is free.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while (registry.get_by_url(&url).is_some() || queue.get_status(&url).is_some())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            registry.get_by_url(&url).is_none(),
+            "the worker stays under the URL after the DELETE: {outcome:?}"
+        );
+        assert!(
+            registry.get_url_by_id(&id).is_none(),
+            "the id still names the URL"
+        );
+        assert!(
+            queue.get_status(&url).is_none(),
+            "a job entry is left under the URL"
+        );
+        let failure = match outcome {
+            Err(JobOutcomeError::Failed(reason)) => reason,
+            other => panic!("the cancelled registration's job ended otherwise: {other:?}"),
+        };
+        assert!(
+            failure.contains("leave through a queued removal"),
+            "the outcome does not name the removal: {failure}"
+        );
+    }
+
+    /// What `a_delete_setting` builds: the context, its queue and registry,
+    /// the worker under the URL and that worker's id.
+    type DeleteSetting = (
+        Arc<AppContext>,
+        Arc<JobQueue>,
+        Arc<crate::worker::WorkerRegistry>,
+        Arc<dyn crate::worker::Worker>,
+        WorkerId,
+    );
+
+    /// A running queue over live engines, a registry, and a worker under
+    /// `url` with no drain window, the setting a DELETE's kept removal runs in.
+    fn a_delete_setting(url: &str) -> DeleteSetting {
+        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+            workflow::WorkflowEngines,
+        };
+        let router_config = RouterConfig::default();
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        assert!(
+            context
+                .workflow_engines
+                .set(WorkflowEngines::new(&router_config))
+                .is_ok(),
+            "the engines are set once"
+        );
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        assert!(
+            context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
+            "the queue is set once"
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("served"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 0,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let id = registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        (context, queue, registry, worker, id)
+    }
+
+    /// A DELETE's removal kept behind a removal in flight removes the worker
+    /// the DELETE saw once it runs: the worker a guarded cleanup skipped as
+    /// replaced since its snapshot leaves through the DELETE's own removal.
+    #[tokio::test]
+    async fn a_kept_delete_removal_removes_the_worker_the_delete_saw() {
+        let url = "http://10.0.0.9:8000";
+        let (context, queue, registry, _worker, id) = a_delete_setting(url);
+        queue.hold_url_for_tests(url, "RemoveWorker");
+        context
+            .worker_service
+            .delete_worker(id.as_str())
+            .await
+            .expect("the DELETE is admitted");
+        assert!(
+            queue.kept_for(url),
+            "the DELETE's removal waits for the holder"
+        );
+        JobQueue::record_job_completion(
+            "RemoveWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "the kept removal ran");
+        assert!(
+            registry.get_by_url(url).is_none(),
+            "the DELETE's removal removed the worker it saw"
+        );
+    }
+
+    /// A DELETE's removal kept behind a job in flight is pinned to the ids
+    /// the DELETE saw and to no revision: the job it waited for (an update
+    /// here; a PUT's replacement and a label refresh rebuild the same way)
+    /// replaces the worker under its id, and the kept removal takes the
+    /// rebuild out, where a revision pin skipped it every time.
+    #[tokio::test]
+    async fn a_kept_delete_removal_removes_the_worker_rebuilt_under_its_id_since_the_delete() {
+        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+        use crate::worker::{BasicWorkerBuilder, Worker, WorkerType};
+        let url = "http://10.0.0.10:8000";
+        let (context, queue, registry, first, id) = a_delete_setting(url);
+        queue.hold_url_for_tests(url, "UpdateWorker");
+        context
+            .worker_service
+            .delete_worker(id.as_str())
+            .await
+            .expect("the DELETE is admitted");
+        assert!(
+            queue.kept_for(url),
+            "the DELETE's removal waits for the holder"
+        );
+        // The update rebuilds the worker under its id before the kept removal
+        // runs.
+        let rebuilt: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("served"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 0,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        assert!(
+            registry.replace_claiming_local(&id, Arc::clone(&rebuilt), first.revision()),
+            "the update replaces the worker"
+        );
+        JobQueue::record_job_completion(
+            "UpdateWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "the kept removal ran");
+        assert!(
+            registry.get_by_url(url).is_none(),
+            "the DELETE's removal removed the worker rebuilt under the id it named"
+        );
+    }
+
+    /// A DELETE's removal kept behind a job in flight leaves a worker
+    /// registered under a fresh id since the DELETE: the holder took the
+    /// worker the DELETE named out, and the registration that followed under
+    /// the URL is not the one the DELETE named.
+    #[tokio::test]
+    async fn a_kept_delete_removal_leaves_a_worker_registered_under_a_fresh_id_since_the_delete() {
+        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+        use crate::worker::{BasicWorkerBuilder, Worker, WorkerType};
+        let url = "http://10.0.0.11:8000";
+        let (context, queue, registry, _first, id) = a_delete_setting(url);
+        queue.hold_url_for_tests(url, "RemoveWorker");
+        context
+            .worker_service
+            .delete_worker(id.as_str())
+            .await
+            .expect("the DELETE is admitted");
+        assert!(
+            queue.kept_for(url),
+            "the DELETE's removal waits for the holder"
+        );
+        // The holder takes the worker out, and a registration lands under the
+        // URL with a fresh id before the kept removal runs.
+        assert!(
+            registry.remove(&id).is_some(),
+            "the holder removes the worker the DELETE named"
+        );
+        let fresh: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("served"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 0,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let fresh_id = registry
+            .register(Arc::clone(&fresh))
+            .expect("the fresh registration lands");
+        assert_ne!(
+            fresh_id.as_str(),
+            id.as_str(),
+            "the registration has a fresh id"
+        );
+        JobQueue::record_job_completion(
+            "RemoveWorker",
+            url,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            url,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(url), "the kept removal ran");
+        let standing = registry
+            .get_by_url(url)
+            .expect("the fresh worker stays under the URL");
+        assert!(
+            Arc::ptr_eq(&standing, &fresh),
+            "the worker standing is the fresh registration"
+        );
+    }
+
+    fn removal(url: &str, pins: Option<&[(&str, Option<u64>)]>) -> Job {
+        Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: pins.map(|pins| {
+                pins.iter()
+                    .map(|(id, revision)| (id.to_string(), *revision))
+                    .collect()
+            }),
+        }
+    }
+
+    fn pins(pins: &[(&str, Option<u64>)]) -> HashMap<String, Option<u64>> {
+        pins.iter()
+            .map(|(id, revision)| (id.to_string(), *revision))
+            .collect()
+    }
+
+    fn kept_removal_pins(
+        kept: &DashMap<String, Kept>,
+        url: &str,
+    ) -> Option<HashMap<String, Option<u64>>> {
+        let slots = kept.get(url).expect("an entry kept for the URL");
+        let Some(Job::RemoveWorker {
+            expected_revisions, ..
+        }) = &slots.removal
+        else {
+            panic!("a removal kept for the URL");
+        };
+        expected_revisions.clone()
+    }
+
+    #[test]
+    fn a_removal_kept_over_a_kept_removal_merges_the_pins_the_wider_pin_staying() {
+        let kept = DashMap::new();
+        let url = "http://w:8000";
+        JobQueue::keep(
+            &kept,
+            url,
+            removal(url, Some(&[("a", Some(1)), ("b", None)])),
+        );
+        JobQueue::keep(
+            &kept,
+            url,
+            removal(url, Some(&[("b", Some(2)), ("c", Some(3))])),
+        );
+        assert_eq!(
+            kept_removal_pins(&kept, url),
+            Some(pins(&[("a", Some(1)), ("b", None), ("c", Some(3))]))
+        );
+        // A `None` pin on the newer side widens the held one.
+        JobQueue::keep(&kept, url, removal(url, Some(&[("a", None)])));
+        assert_eq!(
+            kept_removal_pins(&kept, url),
+            Some(pins(&[("a", None), ("b", None), ("c", Some(3))]))
+        );
+    }
+
+    #[test]
+    fn an_unguarded_removal_kept_in_either_order_leaves_the_kept_removal_unguarded() {
+        let url = "http://w:8000";
+        // The `DELETE`'s unguarded removal first, the cleanup's pins over it.
+        let kept = DashMap::new();
+        JobQueue::keep(&kept, url, removal(url, None));
+        JobQueue::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        assert_eq!(kept_removal_pins(&kept, url), None);
+        // The cleanup's pins first, the `DELETE`'s unguarded removal over them.
+        let kept = DashMap::new();
+        JobQueue::keep(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        JobQueue::keep(&kept, url, removal(url, None));
+        assert_eq!(kept_removal_pins(&kept, url), None);
+    }
+
+    #[test]
+    fn a_removal_put_back_merges_with_the_removal_kept_since() {
+        let kept = DashMap::new();
+        let url = "http://w:8000";
+        JobQueue::keep(&kept, url, removal(url, Some(&[("b", Some(2))])));
+        JobQueue::put_back(&kept, url, removal(url, Some(&[("a", Some(1))])));
+        assert_eq!(
+            kept_removal_pins(&kept, url),
+            Some(pins(&[("a", Some(1)), ("b", Some(2))]))
         );
     }
 }

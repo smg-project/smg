@@ -294,6 +294,10 @@ type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>, FxBuildHasher>>;
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 
+/// The read a conditional removal makes of the worker as it stands, under its
+/// lock ([`WorkerRegistry::remove_if`]).
+type RemovalCondition<'a> = &'a dyn Fn(&Arc<dyn Worker>) -> bool;
+
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct HashRingTestHooks {
@@ -1891,19 +1895,36 @@ impl WorkerRegistry {
     /// mutation lock for the whole teardown so it cannot race a
     /// concurrent `replace()`.
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
-        self.remove_inner(worker_id, None)
+        self.remove_inner(worker_id, None, None)
     }
 
-    /// Core removal shared by [`Self::remove`] and [`Self::remove_remote`].
-    /// When `expect_origin` is set, the origin is re-checked after the
-    /// per-worker mutation lock is acquired and the removal aborts on a
-    /// mismatch — a lock-free pre-check alone races `replace_inner`'s
-    /// promotion (check Mesh, block on the lock, promotion lands, then
-    /// delete a now locally-owned worker).
+    /// Remove the worker only while `condition` reads true of the worker as
+    /// it stands, the read and the removal under the same per-worker lock.
+    /// The removal workflow's final step removes the incarnation it drained
+    /// (the pinned revision, or a rebuild of it that still reads `Draining`:
+    /// that state is the removal's own mark, inherited through a rebuild
+    /// nothing re-activated) and leaves a replacement that stands on its own.
+    /// Returns `None` when the worker is gone or the condition reads false.
+    pub fn remove_if<F>(&self, worker_id: &WorkerId, condition: F) -> Option<Arc<dyn Worker>>
+    where
+        F: Fn(&Arc<dyn Worker>) -> bool,
+    {
+        self.remove_inner(worker_id, None, Some(&condition))
+    }
+
+    /// Core removal shared by [`Self::remove`], [`Self::remove_remote`] and
+    /// [`Self::remove_if`]. When `expect_origin` is set, the origin is
+    /// re-checked after the per-worker mutation lock is acquired and the
+    /// removal aborts on a mismatch — a lock-free pre-check alone races
+    /// `replace_inner`'s promotion (check Mesh, block on the lock, promotion
+    /// lands, then delete a now locally-owned worker). When `condition` is
+    /// set, it is read of the worker under the same lock and the removal
+    /// returns `None` unless it holds.
     fn remove_inner(
         &self,
         worker_id: &WorkerId,
         expect_origin: Option<WorkerOrigin>,
+        condition: Option<RemovalCondition<'_>>,
     ) -> Option<Arc<dyn Worker>> {
         // Acquire the same per-worker lock used by replace() to prevent
         // remove racing with a concurrent replace that has already snapshot
@@ -1914,6 +1935,16 @@ impl WorkerRegistry {
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
+
+        if let Some(condition) = condition {
+            let holds = self
+                .workers
+                .get(worker_id)
+                .map(|entry| condition(entry.value()));
+            if holds != Some(true) {
+                return None;
+            }
+        }
 
         if let Some(expected) = expect_origin {
             if self.origin_of(worker_id) != Some(expected) {
@@ -2030,7 +2061,9 @@ impl WorkerRegistry {
     /// `None` if the id is unknown or locally owned.
     pub fn remove_remote(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         match self.origin_of(worker_id) {
-            Some(WorkerOrigin::Mesh) => self.remove_inner(worker_id, Some(WorkerOrigin::Mesh)),
+            Some(WorkerOrigin::Mesh) => {
+                self.remove_inner(worker_id, Some(WorkerOrigin::Mesh), None)
+            }
             Some(WorkerOrigin::Local) => {
                 tracing::warn!(
                     worker_id = %worker_id.as_str(),

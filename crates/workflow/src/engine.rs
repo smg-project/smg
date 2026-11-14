@@ -231,9 +231,18 @@ impl Completion {
                 signal: StepResult::Success,
                 state: None,
             },
+            // A skip in the attempt is recorded as a gate's skip is: the attempt
+            // began the step as running, and nothing else writes its end.
             Ok(StepResult::Skip) => Self {
                 signal: StepResult::Skip,
-                state: None,
+                state: Some((StepStatus::Skipped, None)),
+            },
+            // Cancelled between attempts: the step's record says so, where
+            // its last attempt left it running or retrying. A waiter reading
+            // the cancelled workflow sees no step still on its task then.
+            Err(WorkflowError::Cancelled(_)) => Self {
+                signal: StepResult::Failure,
+                state: Some((StepStatus::Cancelled, None)),
             },
             Ok(StepResult::Failure) | Err(_) => match on_failure {
                 FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => Self {
@@ -1096,15 +1105,25 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// The attempt's start: the step state (running, or retrying from the
-    /// second attempt on) and the started event.
+    /// second attempt on) and the started event. A workflow cancelled by
+    /// then starts no attempt.
     async fn begin_attempt(
         &self,
         instance_id: WorkflowInstanceId,
         step: &StepDefinition<D>,
         attempt: u32,
     ) -> WorkflowResult<()> {
+        // The cancel read and the attempt's start are one store update: a
+        // step never moves to running once the cancel is written, so a
+        // waiter's snapshot after the cancel sees every step on its task
+        // (the `is_cancelled` read before this is the fast path).
+        let mut cancelled = false;
         self.state_store
             .update(instance_id, |s| {
+                if s.status == WorkflowStatus::Cancelled {
+                    cancelled = true;
+                    return;
+                }
                 s.current_step = Some(step.id.clone());
                 if let Some(step_state) = s.step_states.get_mut(&step.id) {
                     step_state.status = if attempt == 1 {
@@ -1117,6 +1136,9 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 }
             })
             .await?;
+        if cancelled {
+            return Err(WorkflowError::Cancelled(instance_id));
+        }
 
         self.event_bus
             .publish(WorkflowEvent::StepStarted {
@@ -1358,11 +1380,30 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         label: &str,
         timeout_duration: Duration,
     ) -> Result<String, String> {
+        let state = self
+            .wait_for_terminal_state(instance_id, label, timeout_duration)
+            .await?;
+        completion_outcome(&state, label)
+    }
+
+    /// Waits for the workflow to reach a terminal status and returns that
+    /// state, its step states included, read before the terminal cleanup. A
+    /// cancellation is written at once while a step past its cancel read is
+    /// still on its task, so a cancelled workflow is terminal here only once
+    /// no step reads running or retrying: that step's own end is in the
+    /// state (succeeded or failed), and a step cancelled before its next
+    /// attempt reads cancelled. The timeout is an error and leaves a
+    /// still-running workflow to the periodic cleanup.
+    pub async fn wait_for_terminal_state(
+        &self,
+        instance_id: WorkflowInstanceId,
+        label: &str,
+        timeout_duration: Duration,
+    ) -> Result<WorkflowState<D>, String> {
         let start = std::time::Instant::now();
         let mut poll_interval = Duration::from_millis(100);
         let max_poll_interval = Duration::from_millis(2000);
         let poll_backoff = Duration::from_millis(200);
-
         loop {
             if start.elapsed() > timeout_duration {
                 // Only removes already-terminal state; a still-running
@@ -1375,37 +1416,28 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     label
                 ));
             }
-
             let state = self
                 .get_status(instance_id)
                 .await
                 .map_err(|e| format!("Failed to get workflow status: {e:?}"))?;
-
-            let result = match state.status {
-                WorkflowStatus::Completed => {
-                    Ok(format!("{label} completed successfully via workflow"))
+            let step_on_its_task = state
+                .step_states
+                .values()
+                .any(|step| matches!(step.status, StepStatus::Running | StepStatus::Retrying));
+            match state.status {
+                WorkflowStatus::Cancelled if step_on_its_task => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
                 }
-                WorkflowStatus::Failed => {
-                    let current_step = state.current_step.as_ref();
-                    let step_name = current_step
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let error_msg = current_step
-                        .and_then(|step_id| state.step_states.get(step_id))
-                        .and_then(|s| s.last_error.as_deref())
-                        .unwrap_or("Unknown error");
-                    Err(format!("Workflow failed at step {step_name}: {error_msg}"))
+                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                    self.state_store.cleanup_if_terminal(instance_id).await;
+                    return Ok(state);
                 }
-                WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
                 WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
                     tokio::time::sleep(poll_interval).await;
                     poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
-                    continue;
                 }
-            };
-
-            self.state_store.cleanup_if_terminal(instance_id).await;
-            return result;
+            }
         }
     }
 
@@ -1480,6 +1512,32 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> std::fmt::Debug for WorkflowEn
         f.debug_struct("WorkflowEngine")
             .field("definitions_count", &self.definitions.read().len())
             .finish()
+    }
+}
+
+/// The outcome a terminal state reads as: the completion line, the
+/// failing step's error, or the cancellation.
+pub fn completion_outcome<D: WorkflowData>(
+    state: &WorkflowState<D>,
+    label: &str,
+) -> Result<String, String> {
+    match state.status {
+        WorkflowStatus::Completed => Ok(format!("{label} completed successfully via workflow")),
+        WorkflowStatus::Failed => {
+            let current_step = state.current_step.as_ref();
+            let step_name = current_step
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let error_msg = current_step
+                .and_then(|step_id| state.step_states.get(step_id))
+                .and_then(|s| s.last_error.as_deref())
+                .unwrap_or("Unknown error");
+            Err(format!("Workflow failed at step {step_name}: {error_msg}"))
+        }
+        WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
+        WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+            Err(format!("Workflow still running for {label}"))
+        }
     }
 }
 

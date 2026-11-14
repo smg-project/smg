@@ -1,16 +1,13 @@
 //! Step to find workers to remove based on URL.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::{
-    worker::endpoint::Endpoint,
-    workflow::data::{WorkerList, WorkerRemovalWorkflowData},
-};
+use crate::{worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
 
 /// Request structure for worker removal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -26,8 +23,12 @@ pub struct WorkerRemovalRequest {
     /// silently leave the rest registered against a Pod that is already gone.
     ///
     /// A worker missing from the map is a different incarnation than the one
-    /// observed, so it is left alone. `None` removes every match unguarded.
-    pub expected_revisions: Option<HashMap<String, u64>>,
+    /// observed, so it is left alone. An id mapped to `None` is removed at
+    /// whatever revision it holds: a `DELETE` names the id, and a worker
+    /// rebuilt under it since (a `PATCH`, a `PUT`, a label refresh) is the
+    /// one the `DELETE` named. `None` for the map removes every match
+    /// unguarded.
+    pub expected_revisions: Option<HashMap<String, Option<u64>>>,
 }
 
 /// Step to find workers to remove based on URL.
@@ -56,12 +57,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             // was registered after the snapshot; a revision that moved was
             // replaced since. Either way that worker is skipped and the next
             // reconcile pass re-evaluates it, while its siblings still drain.
+            // An id pinned at no revision is removed as it stands.
             workers_to_remove.retain(|worker| {
                 app_context
                     .worker_registry
                     .get_id_by_url(worker.url())
                     .and_then(|id| expected_revisions.get(id.as_str()).copied())
-                    .is_some_and(|expected| expected == worker.revision())
+                    .is_some_and(|expected| {
+                        expected.is_none_or(|revision| revision == worker.revision())
+                    })
             });
             if workers_to_remove.is_empty() {
                 debug!(
@@ -69,10 +73,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
                     ?expected_revisions,
                     "Skipping stale worker removal job after same-URL replacement"
                 );
-                context.data.workers_to_remove = Some(WorkerList::new());
-                context.data.actual_workers_to_remove = Some(Vec::new());
-                context.data.worker_urls = Vec::new();
-                context.data.affected_models = HashSet::new();
+                context.data.keep_only(Vec::new());
                 return Ok(StepResult::Success);
             }
         } else if workers_to_remove.is_empty() {
@@ -88,22 +89,8 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             Endpoint::redacted_str(&request.url)
         );
 
-        // Store workers and their model IDs for subsequent steps
-        let worker_urls: Vec<String> = workers_to_remove
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect();
-
-        let affected_models: HashSet<String> = workers_to_remove
-            .iter()
-            .map(|w| w.model_id().to_string())
-            .collect();
-
-        // Update workflow data
-        context.data.workers_to_remove = Some(WorkerList::from_workers(&workers_to_remove));
-        context.data.actual_workers_to_remove = Some(workers_to_remove);
-        context.data.worker_urls = worker_urls;
-        context.data.affected_models = affected_models;
+        // The workers, their URLs and their models for the steps after this one.
+        context.data.keep_only(workers_to_remove);
 
         Ok(StepResult::Success)
     }
