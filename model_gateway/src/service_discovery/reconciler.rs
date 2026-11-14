@@ -29,6 +29,7 @@ use tracing::{error, info, warn};
 use super::provider::{DiscoveredWorker, DiscoveryKind};
 use crate::{
     app_context::AppContext,
+    config::RouterConfig,
     observability::metrics::{metrics_labels, Metrics},
     worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
@@ -323,10 +324,7 @@ fn build_worker_spec(
     spec.api_key.clone_from(&app_context.router_config.api_key);
     spec.max_connection_attempts = app_context
         .router_config
-        .health_check
-        .success_threshold
-        .max(1)
-        * 20;
+        .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS);
     spec
 }
 
@@ -464,10 +462,13 @@ mod tests {
     use openai_protocol::worker::WorkerType;
 
     use super::*;
-    use crate::service_discovery::testing::create_test_app_context;
+    use crate::{
+        server::http_client, service_discovery::testing::create_test_app_context,
+        worker::endpoint_key,
+    };
 
     fn key(url: &str) -> EndpointKey {
-        crate::worker::endpoint_key(url).expect(url)
+        endpoint_key(url).expect(url)
     }
 
     /// A published worker with nothing but an endpoint and an instance id.
@@ -878,6 +879,15 @@ mod tests {
             spec.labels.get(DISCOVERY_ID_LABEL).map(String::as_str),
             Some("uid-1:8081")
         );
+        // The discovered budget: the context's default success threshold
+        // of 2, twenty attempts per success.
+        assert_eq!(
+            spec.max_connection_attempts,
+            app_context
+                .router_config
+                .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS)
+        );
+        assert_eq!(spec.max_connection_attempts, 40);
         // Taken from the record, so the API key and retry budget injected into
         // the spec cannot move it.
         assert_eq!(
@@ -1009,7 +1019,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
+        data.http_client_handle = Some(Arc::new(http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),

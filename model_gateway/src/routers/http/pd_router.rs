@@ -42,6 +42,7 @@ use super::{
     tenant_rate_limit::{self, TenantCharge},
 };
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::{
@@ -49,7 +50,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, Decider, PolicyRegistry, WorkerRole},
+    policies::{CacheNamespace, PolicyRegistry, WorkerRole},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -389,12 +390,16 @@ impl PDRouter {
         let url = format!("{}/{endpoint}", worker.base_url());
         let mut request_builder = worker.http_client().get(&url);
 
-        // A public route outside the auth middleware: the caller's headers go
-        // as they are and nothing is added (a configured worker key here would
-        // authenticate an anonymous caller as the worker).
+        // A public route outside the auth middleware: the allow-listed caller
+        // headers go as they are and nothing is added (a configured worker key
+        // here would authenticate an anonymous caller as the worker). The rest
+        // stays behind, the caller's `accept-encoding` among them: the worker
+        // reads the client factory's `identity`.
         if let Some(headers) = headers {
             for (name, value) in headers {
-                request_builder = request_builder.header(name, value);
+                if header_utils::should_forward_request_header(&name) {
+                    request_builder = request_builder.header(name, value);
+                }
             }
         }
 
@@ -473,7 +478,7 @@ impl PDRouter {
         clippy::unused_async,
         reason = "async for API consistency with other router constructors"
     )]
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -847,7 +852,6 @@ impl PDRouter {
                     cache_namespace,
                     candidate_filter: None,
                     tried: &[],
-                    sequence: None,
                 },
                 sticky_key,
             )
@@ -2179,26 +2183,18 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue, under the lock
-    /// on both paths: the legacy policies, or the engine's decision and
-    /// commit ([`Self::place_pd_pair_through_engine`]).
+    /// the selection runs at the head of the admission queue.
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let decider = placement::pair_decider(&self.policy_registry, &inputs);
         let ((prefill, decode), prefill_guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _): &PdPair| prefill,
-            |capacity| match decider {
-                Some(decider) => {
-                    self.place_pd_pair_through_engine(decider, model_id, inputs, capacity)
-                }
-                None => self.select_pd_pair(model_id, inputs, capacity),
-            },
+            |capacity| self.select_pd_pair(model_id, inputs, capacity),
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
@@ -2207,37 +2203,6 @@ impl PDRouter {
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
         };
         Ok(((prefill, decode), guards))
-    }
-
-    /// [`Self::select_pd_pair`] through the policy engine under
-    /// `--policy-engine engine`, inside the admission callback as the legacy
-    /// selection runs: the pair decided over the window as the lock reads it
-    /// and committed under the same hold, by the request the queue lets
-    /// select; a commit every target of which missed re-decides once with
-    /// the misses excluded, then the request waits for a slot.
-    fn place_pd_pair_through_engine(
-        &self,
-        decider: &Decider,
-        model_id: &str,
-        inputs: PlacementInputs<'_>,
-        capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
-        let pairs = self.pd_pairs(model_id);
-        let has_capacity = |worker: &Arc<dyn Worker>| {
-            capacity.is_none_or(|capacity| capacity.has_capacity(worker))
-        };
-        placement::place_pair_through_engine(
-            &self.worker_registry,
-            &self.policy_registry,
-            decider,
-            model_id,
-            &pairs,
-            None,
-            false,
-            &has_capacity,
-            inputs,
-        )
-        .map(|pair| (pair.prefill, pair.decode))
     }
 
     /// The pair index `model_id` routes within. Shared HTTP-transport
@@ -2959,7 +2924,6 @@ impl RouterTrait for PDRouter {
                     cache_namespace: None,
                     candidate_filter: None,
                     tried: &[],
-                    sequence: None,
                 },
             ) else {
                 return error::service_unavailable(
@@ -3131,17 +3095,18 @@ mod tests {
         middleware::{test_support::json_of, ReportedRefusal},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::{common::sse::SSE_CHANNEL_BUFFER, http::test_support},
+        server::http_client_builder,
         tenant::TenantKey,
         worker::{
             circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
-            WorkerType,
+            CircuitBreakerConfig, WorkerType,
         },
     };
 
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
-        crate::server::http_client_builder()
+        http_client_builder()
             .no_proxy()
             .build()
             .unwrap()
@@ -3199,7 +3164,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
-        let error = crate::server::http_client_builder()
+        let error = http_client_builder()
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .unwrap()
@@ -3851,6 +3816,71 @@ mod tests {
         );
     }
 
+    /// The public GET forwards the caller's allow-listed headers only: the
+    /// caller's `accept-encoding` is not among them, so the worker reads the
+    /// client factory's `identity`; a cookie does not cross; `authorization`
+    /// does.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn a_public_get_forwards_only_the_allow_listed_caller_headers() {
+        type Seen = (Option<String>, Option<String>, Option<String>);
+        let seen: Arc<std::sync::Mutex<Vec<Seen>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let header = |name: &str| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string)
+                };
+                log.lock().unwrap().push((
+                    header("authorization"),
+                    header("accept-encoding"),
+                    header("cookie"),
+                ));
+                ([(CONTENT_TYPE, "application/json")], "{}")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+
+        let response = PDRouter::proxy_to_worker(
+            &worker,
+            "get_model_info",
+            Some(vec![
+                (
+                    "authorization".to_string(),
+                    "Bearer callers-own-key".to_string(),
+                ),
+                ("accept-encoding".to_string(), "gzip, deflate".to_string()),
+                ("cookie".to_string(), "session=1".to_string()),
+            ]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(
+                Some("Bearer callers-own-key".to_string()),
+                Some("identity".to_string()),
+                None
+            )]
+        );
+    }
+
     /// A worker that closes the connection after its head, before the body
     /// it announced, failed below HTTP: the proxied GET answers a bad gateway
     /// under the read's code, as the typed routes' buffered reads do, not a
@@ -3895,7 +3925,7 @@ mod tests {
     async fn a_worker_body_the_request_timeout_cuts_is_proxied_as_the_timeout() {
         let url = spawn_stalled_body_stub().await;
         let client = Arc::new(
-            crate::server::http_client_builder()
+            http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -4063,7 +4093,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(
-                crate::server::http_client_builder()
+                http_client_builder()
                     .timeout(std::time::Duration::from_secs(1))
                     .build()
                     .unwrap(),
@@ -4076,7 +4106,7 @@ mod tests {
                     .worker_type(worker_type)
                     .runtime_type(runtime)
                     .http_client(Arc::clone(&client))
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         success_threshold: 1,
                         timeout_duration: std::time::Duration::from_secs(60),
@@ -4167,7 +4197,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(
-            crate::server::http_client_builder()
+            http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -4384,7 +4414,7 @@ mod tests {
                 BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
                     .worker_type(WorkerType::Prefill)
                     .api_key("worker-key".to_string())
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         ..Default::default()
                     })
@@ -4465,7 +4495,7 @@ mod tests {
         for head_sent in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Arc::new(
-                crate::server::http_client_builder()
+                http_client_builder()
                     .timeout(std::time::Duration::from_millis(100))
                     .build()
                     .unwrap(),
@@ -4476,7 +4506,7 @@ mod tests {
                 BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
                     .worker_type(WorkerType::Prefill)
                     .http_client(client)
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         ..Default::default()
                     })
@@ -4742,7 +4772,7 @@ mod tests {
     /// breaker with a threshold above one.
     #[test]
     fn a_drained_prefill_outcome_is_not_overwritten_by_the_attempt_status() {
-        let breaker = crate::worker::CircuitBreakerConfig {
+        let breaker = CircuitBreakerConfig {
             failure_threshold: 2,
             ..Default::default()
         };
@@ -4927,7 +4957,7 @@ mod tests {
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(spawn_stub(prefill).await)
                 .worker_type(WorkerType::Prefill)
-                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold: 1,
                     ..Default::default()
                 })
@@ -6564,61 +6594,6 @@ mod tests {
         router
     }
 
-    /// Under `--policy-engine engine` the pair is decided and committed
-    /// through the engine under the admission lock: the admitted
-    /// request holds its prefill seat, nobody is queued, and the next
-    /// request is decided and admitted once the seat is released.
-    #[tokio::test]
-    async fn the_engine_decides_the_pair_at_the_admission_head() {
-        use std::time::Duration;
-
-        use crate::config::PolicyEngineMode;
-
-        let round_robin = PolicyConfig::RoundRobin;
-        let router = PDRouter {
-            policy_registry: Arc::new(PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-                PolicyEngineMode::Engine,
-                &round_robin,
-                &round_robin,
-            )),
-            prefill_admission: Some(Arc::new(PrefillAdmission::new(
-                1,
-                1,
-                Duration::from_secs(5),
-            ))),
-            ..create_test_pd_router()
-        };
-        for (url, role) in [
-            ("http://prefill-1:8000", WorkerType::Prefill),
-            ("http://decode-1:8000", WorkerType::Decode),
-        ] {
-            router
-                .worker_registry
-                .register_or_replace(Arc::from(create_test_worker(url.to_string(), role, true)));
-        }
-        let decider = router.policy_registry.decider().expect("hosted");
-        let ((prefill, decode), guards) = router
-            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
-            .await
-            .expect("a pair is admitted");
-        assert_eq!(prefill.url(), "http://prefill-1:8000");
-        assert_eq!(decode.url(), "http://decode-1:8000");
-        assert_eq!(decider.decisions(), 1, "the engine decided the pair");
-        assert_eq!(prefill.load(), 1, "the admitted request holds its seat");
-        assert_eq!(
-            router.prefill_admission.as_ref().unwrap().queued_requests(),
-            0
-        );
-        drop(guards);
-        assert_eq!(prefill.load(), 0, "the seat is released with the guards");
-        let ((_, _), guards) = router
-            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
-            .await
-            .expect("the next request is admitted");
-        assert_eq!(decider.decisions(), 2);
-        drop(guards);
-    }
-
     /// The prefill side's answer frees its seat before the decode side's
     /// head: a request queued behind it is admitted once the prefill stub is
     /// released, while the dispatch still waits for the decode stub. Both
@@ -6883,8 +6858,8 @@ mod tests {
 
     /// A breaker that opens on two failures, whose timeout is over at once
     /// and which closes again after `successes` successes.
-    fn breaker_closing_after(successes: u32) -> crate::worker::CircuitBreakerConfig {
-        crate::worker::CircuitBreakerConfig {
+    fn breaker_closing_after(successes: u32) -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
             failure_threshold: 2,
             success_threshold: successes,
             timeout_duration: std::time::Duration::ZERO,
@@ -7331,7 +7306,7 @@ mod tests {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(worker_type)
-                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold: 1,
                     ..Default::default()
                 })

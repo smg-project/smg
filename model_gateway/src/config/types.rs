@@ -104,11 +104,6 @@ pub struct RouterConfig {
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
     pub pd_pairing_mode: PdPairingMode,
-    /// Which implementation decides worker selection (`--policy-engine`):
-    /// the policies over worker handles, or the policy engine over its
-    /// bounded view. The switch of the migration and its rollback.
-    #[serde(default)]
-    pub policy_engine: PolicyEngineMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -1222,30 +1217,6 @@ pub enum ManualAssignmentMode {
     Delegate,
 }
 
-/// Which implementation decides worker selection (`--policy-engine`): the
-/// policies over worker handles, or the policy engine over its bounded
-/// view. `legacy` until the migration flips the default; the flag is the
-/// rollback. Under `engine` the validator refuses a policy whose stages the
-/// engine does not carry in this build.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PolicyEngineMode {
-    #[default]
-    Legacy,
-    Engine,
-}
-
-impl PolicyEngineMode {
-    /// Parse the CLI spelling (`legacy` / `engine`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "legacy" => Some(Self::Legacy),
-            "engine" => Some(Self::Engine),
-            _ => None,
-        }
-    }
-}
-
 /// How strictly PD placement pairs a prefill with a decode on their KV
 /// transfer protocol (#2483). A descriptor component an engine does not report
 /// is "unknown".
@@ -1444,12 +1415,6 @@ impl PowerOfTwoLoadMetric {
         }
     }
 }
-
-/// The encode policy of an encode-prefill-decode deployment that names none:
-/// consistent hashing, because encode routing is item-cache affinity and not
-/// the request-level main policy. The one place the default is spelled; the
-/// router factory, the policy registry and the engine's validator read it.
-pub const DEFAULT_ENCODE_POLICY: PolicyConfig = PolicyConfig::ConsistentHashing;
 
 /// Policy configuration for routing.
 ///
@@ -2263,7 +2228,6 @@ impl Default for RouterConfig {
             routing_key_override: RoutingKeyOverrideConfig::default(),
             grouped_dp_sticky: GroupedDpSticky::default(),
             pd_pairing_mode: PdPairingMode::default(),
-            policy_engine: PolicyEngineMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             pd_readiness: None,
@@ -2402,6 +2366,31 @@ impl RouterConfig {
         ConfigValidator::validate(self)
     }
 
+    /// Connection attempts per health-check success stamped on a worker
+    /// named at startup or an external API endpoint.
+    pub(crate) const CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 10;
+
+    /// Connection attempts per health-check success stamped on a worker a
+    /// discovery provider registers: twice a configured worker's, since a
+    /// discovered engine is often published while it is still loading.
+    pub(crate) const DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 20;
+
+    /// The value the gateway stamps on `WorkerSpec::max_connection_attempts`
+    /// for a worker it registers itself (named at startup, an external API
+    /// endpoint, published by a discovery provider): `attempts_per_success`
+    /// for each health-check success the worker must then show, one success
+    /// counted at least, with the path's own multiplier
+    /// ([`Self::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS`],
+    /// [`Self::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS`]). A worker added
+    /// through the worker API keeps the spec's default instead. The value
+    /// rides on the spec and shows in the connection-detection step's debug
+    /// line; the step's retries follow the registration workflow's retry
+    /// policy, whose attempt count comes from the worker startup timeout and
+    /// check interval, so no behaviour reads this value today.
+    pub(crate) fn connection_attempt_budget(&self, attempts_per_success: u32) -> u32 {
+        self.health_check.success_threshold.max(1) * attempts_per_success
+    }
+
     /// Which Failed workers the health checker removes: the setting as
     /// given, resolved against whether a discovery provider is selected. The
     /// CLI, the Python binding and a configuration file all keep the setting
@@ -2462,28 +2451,6 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The switch reads the CLI's two spellings, any case, and nothing else;
-    /// a configuration without the field is the legacy path.
-    #[test]
-    fn policy_engine_mode_parses_its_two_spellings_and_defaults_to_legacy() {
-        assert_eq!(
-            PolicyEngineMode::parse("engine"),
-            Some(PolicyEngineMode::Engine)
-        );
-        assert_eq!(
-            PolicyEngineMode::parse(" Legacy "),
-            Some(PolicyEngineMode::Legacy)
-        );
-        assert_eq!(PolicyEngineMode::parse("remote"), None);
-        assert_eq!(
-            RouterConfig::default().policy_engine,
-            PolicyEngineMode::Legacy
-        );
-        let parsed: RouterConfig =
-            serde_json::from_value(serde_json::to_value(RouterConfig::default()).unwrap()).unwrap();
-        assert_eq!(parsed.policy_engine, PolicyEngineMode::Legacy);
-    }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is
     /// never written there, the rest of the derive's form is kept.
