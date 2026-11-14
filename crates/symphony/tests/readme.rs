@@ -2053,6 +2053,16 @@ const GROUPS: &[Group] = &[
         status: Status::AwaitingFixtures,
     },
     Group {
+        slug: "naive-n0.5-flash",
+        model: "NaiveAI/Naive-N0.5-Flash",
+        also: &[],
+        released: "2026-09-27",
+        smg: (None, None),
+        table: Some(Table::Qwen3TaggedDirect),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "nanbeige4.2-3b",
         model: "Nanbeige/Nanbeige4.2-3B",
         also: &[],

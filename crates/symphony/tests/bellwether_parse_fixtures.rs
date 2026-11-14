@@ -294,6 +294,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Sage-A1.5 writes Qwen 3.5's tagged calls under ChatML with the thought opened in the
     // prompt (`<think>\n`) and closed there as an empty block when the request turns thinking off.
     ("sage-a1.5", GenerationPrompt::OpensTheThought),
+    // Naive-N0.5-Flash writes MiMo's tagged calls under ChatML (the value between the tags
+    // directly, nothing after the close); its prompt ends bare (the model writes its own thought),
+    // and thinking off closes it in the prompt as `<think></think>`.
+    ("naive-n0.5-flash", GenerationPrompt::ModelWritesTheThought),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
