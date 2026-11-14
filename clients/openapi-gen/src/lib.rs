@@ -3,6 +3,10 @@
 //! `document` is the whole document; the binary writes it as YAML. The
 //! control-plane routes are listed as data (`CONTROL_PLANE_ROUTES`), so the
 //! gateway's route-table test and this crate's document test read one list.
+//! The serving routes the document describes are listed as data too
+//! (`SERVING_ROUTES`), with the serving key's scheme optional on them; the
+//! document test alone reads that list, the route table's test reads the
+//! control-plane one.
 
 use std::collections::BTreeMap;
 
@@ -37,7 +41,8 @@ struct Components {
     security_schemes: BTreeMap<String, SecurityScheme>,
 }
 
-/// The credential a route takes: the control plane's bearer.
+/// A credential a route takes: an HTTP bearer, the control plane's or the
+/// serving key.
 #[derive(Serialize)]
 struct SecurityScheme {
     #[serde(rename = "type")]
@@ -46,20 +51,43 @@ struct SecurityScheme {
     description: String,
 }
 
-/// The name of the bearer scheme in `components` and on the operations.
+/// The name of the control plane's bearer scheme in `components` and on the
+/// control-plane operations.
 const BEARER_SCHEME: &str = "bearerAuth";
 
-fn bearer_scheme() -> BTreeMap<String, SecurityScheme> {
-    BTreeMap::from([(
-        BEARER_SCHEME.to_string(),
-        SecurityScheme {
-            scheme_type: "http".to_string(),
-            scheme: "bearer".to_string(),
-            description: "A control-plane API key or JWT. The admin role reaches every \
-                          method, the user role GET and HEAD."
-                .to_string(),
-        },
-    )])
+/// The name of the serving key's bearer scheme in `components` and on the
+/// serving operations, where it is optional: the gateway reads the key only
+/// when one is configured.
+const SERVING_SCHEME: &str = "servingBearerAuth";
+
+fn http_bearer(description: &str) -> SecurityScheme {
+    SecurityScheme {
+        scheme_type: "http".to_string(),
+        scheme: "bearer".to_string(),
+        description: description.to_string(),
+    }
+}
+
+fn security_schemes() -> BTreeMap<String, SecurityScheme> {
+    BTreeMap::from([
+        (
+            BEARER_SCHEME.to_string(),
+            http_bearer(
+                "A control-plane API key or JWT. The admin role reaches every \
+                 method, the user role GET and HEAD.",
+            ),
+        ),
+        (
+            SERVING_SCHEME.to_string(),
+            http_bearer(
+                "The serving key: the gateway's shared key (`--api-key`, or its \
+                 environment and file forms) or one of its tenant keys \
+                 (`--tenant-api-key`, `--tenant-api-keys-file`). Required once one \
+                 is configured; a gateway without one takes the serving routes \
+                 with no credential.",
+            ),
+        ),
+    ])
 }
 
 #[derive(Default, Serialize)]
@@ -103,7 +131,9 @@ struct Operation {
     responses: BTreeMap<String, Response>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     deprecated: bool,
-    /// The credential the route takes: set on every control-plane route.
+    /// The credentials the route takes: the control plane's bearer on every
+    /// control-plane route, the serving key as an option on every serving
+    /// route, none on the public ones.
     #[serde(skip_serializing_if = "Option::is_none")]
     security: Option<Vec<BTreeMap<String, Vec<String>>>>,
 }
@@ -426,8 +456,51 @@ pub const RL_CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/rl/engine/{path}"),
 ];
 
-/// The whole document. Fails when a listed control-plane route has no
-/// operation to carry the bearer scheme.
+/// The serving routes the document describes, (method, path) as the gateway
+/// mounts them behind its serving authentication. A serving key is optional
+/// at the gateway (with none configured, every request passes), so the
+/// document declares the scheme optional on them. The documented routes in
+/// neither list are the public ones, behind no credential.
+pub const SERVING_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/v1/chat/completions"),
+    ("POST", "/v1/completions"),
+    ("POST", "/v1/embeddings"),
+    ("POST", "/v1/rerank"),
+    ("POST", "/v1/messages"),
+    ("POST", "/v1/messages/count_tokens"),
+    ("POST", "/v1/responses"),
+    ("GET", "/v1/responses/{response_id}"),
+    ("DELETE", "/v1/responses/{response_id}"),
+    ("POST", "/v1/responses/{response_id}/cancel"),
+    ("GET", "/v1/responses/{response_id}/input_items"),
+    ("POST", "/v1/classify"),
+    ("POST", "/generate"),
+    ("POST", "/v1/tokenize"),
+    ("POST", "/v1/detokenize"),
+];
+
+/// Sets `security` on the operation of every listed route. Fails when a
+/// listed route has no operation to carry it.
+fn attach_security<'a>(
+    paths: &mut BTreeMap<String, PathItem>,
+    routes: impl IntoIterator<Item = &'a (&'a str, &'a str)>,
+    security: &[BTreeMap<String, Vec<String>>],
+    group: &str,
+) -> anyhow::Result<()> {
+    for (method, path) in routes {
+        let operation = paths
+            .get_mut(*path)
+            .and_then(|item: &mut PathItem| item.operation_mut(method))
+            .ok_or_else(|| {
+                anyhow::anyhow!("{method} {path} is a {group} route without an operation")
+            })?;
+        operation.security = Some(security.to_vec());
+    }
+    Ok(())
+}
+
+/// The whole document. Fails when a listed control-plane or serving route
+/// has no operation to carry its scheme.
 pub fn document() -> anyhow::Result<OpenApiDoc> {
     let mut schemas = BTreeMap::new();
     let mut paths = BTreeMap::new();
@@ -1528,17 +1601,23 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         get_endpoint("listModels", "List available models", &resp_name),
     );
 
-    // ---- The control-plane routes take the bearer ----
-    let bearer = vec![BTreeMap::from([(BEARER_SCHEME.to_string(), Vec::new())])];
-    for (method, path) in CONTROL_PLANE_ROUTES.iter().chain(RL_CONTROL_PLANE_ROUTES) {
-        let operation = paths
-            .get_mut(*path)
-            .and_then(|item: &mut PathItem| item.operation_mut(method))
-            .ok_or_else(|| {
-                anyhow::anyhow!("{method} {path} is a control-plane route without an operation")
-            })?;
-        operation.security = Some(bearer.clone());
-    }
+    // ---- The control-plane routes take the bearer, the serving routes the
+    // serving key as an option ----
+    attach_security(
+        &mut paths,
+        CONTROL_PLANE_ROUTES.iter().chain(RL_CONTROL_PLANE_ROUTES),
+        &[BTreeMap::from([(BEARER_SCHEME.to_string(), Vec::new())])],
+        "control-plane",
+    )?;
+    attach_security(
+        &mut paths,
+        SERVING_ROUTES,
+        &[
+            BTreeMap::new(),
+            BTreeMap::from([(SERVING_SCHEME.to_string(), Vec::new())]),
+        ],
+        "serving",
+    )?;
 
     // ---- Assemble OpenAPI document ----
     Ok(OpenApiDoc {
@@ -1552,7 +1631,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         paths,
         components: Components {
             schemas,
-            security_schemes: bearer_scheme(),
+            security_schemes: security_schemes(),
         },
     })
 }
@@ -1569,12 +1648,20 @@ mod tests {
         serde_json::to_value(document().expect("the document builds")).expect("it serializes")
     }
 
-    fn listed_routes() -> BTreeSet<(String, String)> {
-        CONTROL_PLANE_ROUTES
-            .iter()
-            .chain(RL_CONTROL_PLANE_ROUTES)
+    /// The documented routes behind no credential.
+    const PUBLIC_ROUTES: &[(&str, &str)] = &[("GET", "/loads"), ("GET", "/v1/models")];
+
+    fn routes<'a>(
+        listed: impl IntoIterator<Item = &'a (&'a str, &'a str)>,
+    ) -> BTreeSet<(String, String)> {
+        listed
+            .into_iter()
             .map(|(method, path)| (method.to_lowercase(), path.to_string()))
             .collect()
+    }
+
+    fn listed_routes() -> BTreeSet<(String, String)> {
+        routes(CONTROL_PLANE_ROUTES.iter().chain(RL_CONTROL_PLANE_ROUTES))
     }
 
     #[test]
@@ -1597,17 +1684,50 @@ mod tests {
     }
 
     #[test]
-    fn only_the_listed_routes_take_the_bearer() {
+    fn every_serving_route_has_an_operation_that_takes_the_serving_key_as_an_option() {
         let doc = document_value();
-        let listed = listed_routes();
+
+        for (method, path) in routes(SERVING_ROUTES) {
+            let operation = &doc["paths"][&path][&method];
+            assert!(operation.is_object(), "{method} {path} has no operation");
+            assert_eq!(
+                operation["security"],
+                json!([{}, { SERVING_SCHEME: [] }]),
+                "{method} {path} does not take the serving key as an option"
+            );
+        }
+        assert_eq!(
+            doc["components"]["securitySchemes"][SERVING_SCHEME]["scheme"],
+            json!("bearer")
+        );
+    }
+
+    #[test]
+    fn every_route_is_control_plane_serving_or_public() {
+        let doc = document_value();
+        let control_plane = listed_routes();
+        let serving = routes(SERVING_ROUTES);
+        let public = routes(PUBLIC_ROUTES);
+        assert!(control_plane.is_disjoint(&serving), "a route in both lists");
+        assert!(public.is_disjoint(&control_plane) && public.is_disjoint(&serving));
 
         for (path, item) in doc["paths"].as_object().expect("the paths") {
             for (method, operation) in item.as_object().expect("a path item") {
-                let takes_bearer = operation.get("security").is_some();
+                let route = (method.clone(), path.clone());
+                let expected = if control_plane.contains(&route) {
+                    json!([{ BEARER_SCHEME: [] }])
+                } else if serving.contains(&route) {
+                    json!([{}, { SERVING_SCHEME: [] }])
+                } else {
+                    assert!(
+                        public.contains(&route),
+                        "{method} {path} is listed as neither control-plane, serving nor public"
+                    );
+                    Value::Null
+                };
                 assert_eq!(
-                    takes_bearer,
-                    listed.contains(&(method.clone(), path.clone())),
-                    "{method} {path}: takes the bearer {takes_bearer}, listed otherwise"
+                    operation["security"], expected,
+                    "{method} {path}: the scheme differs from its group's"
                 );
             }
         }
