@@ -236,7 +236,7 @@ pub async fn create_conversation(
     info!(conversation_id = %conversation.id.0, "Created conversation");
     let mut answer = conversation_to_json(&conversation);
     if !prepared.is_empty() {
-        match store_items(item_storage, &conversation.id, prepared).await {
+        match store_items(item_storage, &conversation.id, prepared, tenant).await {
             Ok((_, warnings)) => {
                 if !warnings.is_empty() {
                     if let Some(obj) = answer.as_object_mut() {
@@ -420,7 +420,7 @@ pub async fn create_conversation_items(
         Err(response) => return response,
     };
     let (created_items, warnings) =
-        match store_items(item_storage, &conversation_id, prepared).await {
+        match store_items(item_storage, &conversation_id, prepared, tenant).await {
             Ok(stored) => stored,
             Err(response) => return response,
         };
@@ -606,6 +606,25 @@ async fn prepare_item_with_id(
     }
 }
 
+/// The refusal of an item a write under a caller-supplied id answered that the
+/// caller may not see: the store keeps the item it already holds under an id,
+/// so a caller that prepared the id as absent and lost the race to another
+/// caller's write is answered that caller's item. It is refused as the prepare
+/// step refuses such an id, before anything of the batch is linked.
+fn refuse_an_item_the_caller_may_not_see(
+    item: &ConversationItem,
+    tenant: Option<&str>,
+) -> Result<(), Response> {
+    if item.is_visible_to(tenant) {
+        Ok(())
+    } else {
+        Err(bad_request(format!(
+            "Item id '{}' cannot be used",
+            item.id.0
+        )))
+    }
+}
+
 /// The refusal of an item the conversation already has; nothing is linked to a
 /// conversation that does not exist yet.
 async fn refuse_an_item_the_conversation_has(
@@ -639,11 +658,15 @@ async fn refuse_an_item_the_conversation_has(
 /// under that id, as the write-as-you-go order answered, and every entry of
 /// the answer that names that id (the adoption, a reference to it, a repeat
 /// of it) lists the item as it is stored then. A batch without a new item
-/// asks the stores nothing more.
+/// asks the stores nothing more. A write under a caller-supplied id answers
+/// the item the store already holds under it: one another caller wrote since
+/// the batch was prepared, which `tenant` may not see, is refused before any
+/// link, as the prepare step refuses such an id.
 async fn store_items(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
     items: Vec<PreparedItem>,
+    tenant: Option<&str>,
 ) -> Result<(Vec<Value>, Vec<String>), Response> {
     let mut created_items: Vec<Value> = Vec::with_capacity(items.len());
     let mut item_ids: Vec<ConversationItemId> = Vec::with_capacity(items.len());
@@ -679,6 +702,7 @@ async fn store_items(
                     .create_item(new_item)
                     .await
                     .map_err(|e| store_error("Failed to create item", &e))?;
+                refuse_an_item_the_caller_may_not_see(&created, tenant)?;
                 let id = created.id.clone();
                 (item_to_json(created), id, warning)
             }
@@ -713,6 +737,7 @@ async fn store_items(
                             .create_item(new_item)
                             .await
                             .map_err(|e| store_error("Failed to create item", &e))?;
+                        refuse_an_item_the_caller_may_not_see(&created, tenant)?;
                         let written = item_to_json(created);
                         for (entry, id) in created_items.iter_mut().zip(&item_ids) {
                             if *id == item_id {
