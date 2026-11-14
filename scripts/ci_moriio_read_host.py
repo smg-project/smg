@@ -840,6 +840,8 @@ source .venv/bin/activate
 pip uninstall -y smg || true
 pip install wheel/*.whl
 bash scripts/ci_install_e2e_deps.sh
+# Keep this READ-only test runner on the qualified fixture/retry cohort.
+python3 -m pip install --no-deps "pytest==9.1.0" "pytest-rerunfailures==16.4" "pluggy==1.7.0"
 python3 scripts/ci_moriio_read_image.py verify --image "$1" --qualification-env "$GITHUB_ENV"
 bash scripts/ci_download_model.sh --gpu-tier 4
 """
@@ -913,6 +915,8 @@ bash scripts/ci_download_model.sh --gpu-tier 4
         raise RuntimeError(
             "Insufficient remaining budget for original full150-minute test; do not shrink it"
         )
+    # Only the original READ pytest subtree inherits the same-rail setting.
+    env["MORI_IO_RAIL_AFFINITY"] = "1"
     command = [
         sys.executable,
         "-I",
