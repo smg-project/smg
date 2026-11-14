@@ -414,6 +414,12 @@ fn assembler(
             json::named::After::Arguments,
         )),
         Some(CallSyntax::ForcedArguments) => Box::new(json::forced::Assembler::new(index, id())),
+        // The required call's list under the schema: the list reader, with an open list no prose.
+        Some(CallSyntax::ForcedList) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            json::list::Framing::Forced,
+        )),
         Some(CallSyntax::Gemma(spelling)) => Box::new(gemma::Assembler::new(index, id(), spelling)),
         // A shaped call opens through its terminal's header, which the engine reads before it
         // enters the call's state with that assembler (`Engine::open_shaped`); a table that

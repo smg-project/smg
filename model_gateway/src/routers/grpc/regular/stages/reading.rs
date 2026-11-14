@@ -488,7 +488,8 @@ mod tests {
     /// `response_format` (whose request builder carries the schema), so the decision hands the
     /// engine the request's own JSON-schema constraint, and the table's tag stays for the stamp;
     /// Symphony's assignment read the table's constraint, not the schema (a `json_schema` pair
-    /// there is the older path's forced call), so the table still reads the response.
+    /// there is the older registry's, which the table reads without its calls whatever the
+    /// request declares), so the table reads the response as the request's asks make it.
     #[test]
     fn a_messages_answer_schema_the_table_leaves_alone_is_the_engines_constraint() {
         let schema = json!({
@@ -543,6 +544,14 @@ mod tests {
         assert!(
             decided.assignment.is_some(),
             "the table reads the response, not the legacy parsers"
+        );
+        assert_eq!(
+            decided
+                .assignment
+                .as_ref()
+                .and_then(|read| read.format.call_syntax()),
+            None,
+            "a request that declares no tools reads without the table's calls"
         );
         assert!(matches!(ctx.state.parser, Some(ParserChoice::Symphony)));
     }

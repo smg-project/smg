@@ -195,6 +195,13 @@ pub enum CallSyntax {
     /// than from the model. The table's one state is an arguments state entered at the output's
     /// start; the object's close ends the call, and what follows is wrapping or malformed.
     ForcedArguments,
+    /// The list of `{"name": …, "parameters": …}` objects alone: what the engine writes under the
+    /// JSON-schema constraint the gateway builds for a required call. Read as
+    /// [`Self::JsonAlone`] reads a list with no marker, but for what the end of the stream leaves
+    /// of an open one: the engine held the output to the list, so its separators, an object cut
+    /// before its arguments began and what a started call's object held behind its arguments are
+    /// refused, never content.
+    ForcedList,
     /// Gemma's `call:NAME{key:value,…}`: keys bare, a string between two tokens, numbers and
     /// words bare, lists and objects nested the same way, the keys sorted by the template, in the
     /// family's spelling of the string token and the null word (Gemma 4: `<|"|>` and `null`;
@@ -246,6 +253,7 @@ impl CallSyntax {
             | Self::JsonList
             | Self::JsonAlone(_)
             | Self::ForcedArguments
+            | Self::ForcedList
             | Self::Xml => Vec::new(),
         }
     }
@@ -282,7 +290,7 @@ pub enum ForcedCall {
     /// ([`CallSyntax::ForcedArguments`]).
     Arguments,
     /// A list of `{"name": …, "parameters": …}` objects, as a required call writes them
-    /// ([`CallSyntax::JsonAlone`]).
+    /// ([`CallSyntax::ForcedList`]).
     List,
 }
 
@@ -993,7 +1001,9 @@ impl Format {
     /// name outside the JSON and no answer. The thought's states stay, with every row into, out
     /// of and between them; every other state is one arguments state, the first, which reads
     /// the JSON as `written` says: the arguments of the function the request names
-    /// ([`Declared::forcing`](crate::Declared::forcing)), or the list a required call writes.
+    /// ([`Declared::forcing`](crate::Declared::forcing)), or the list a required call writes
+    /// ([`CallSyntax::ForcedList`]: what the end of the stream leaves of an open list is refused,
+    /// never content).
     /// So the output starts in the call unless the prompt's replay, an anchor or the unopened
     /// row leaves it inside the thought, and the thought's close, wherever the table's own row
     /// led, opens the call.
@@ -1074,7 +1084,7 @@ impl Format {
         self.recovery_transitions = Vec::new();
         self.calls = Some(match written {
             ForcedCall::Arguments => CallSyntax::ForcedArguments,
-            ForcedCall::List => CallSyntax::JsonAlone(None),
+            ForcedCall::List => CallSyntax::ForcedList,
         });
         self.call_id = CallId::Minted;
         self.layout = None;

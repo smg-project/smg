@@ -122,7 +122,7 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
             continue;
         };
         assert!(
-            !matches!(syntax, CallSyntax::ForcedArguments),
+            !matches!(syntax, CallSyntax::ForcedArguments | CallSyntax::ForcedList),
             "{}: the forced table is not a registry table",
             table.name()
         );

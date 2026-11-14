@@ -904,8 +904,9 @@ impl Format {
                 )
             }
             // The forced call's constraint is the request's own schema, which the gateway writes
-            // for the function `tool_choice` names; the format derives nothing of its own.
-            CallSyntax::ForcedArguments => return None,
+            // for the function `tool_choice` names or for a required call's list; the format
+            // derives nothing of its own.
+            CallSyntax::ForcedArguments | CallSyntax::ForcedList => return None,
         };
         // The calls' tag takes what the template writes after the thought's close where it starts
         // there; an answer's keeps the schema alone, the engine's own constraint

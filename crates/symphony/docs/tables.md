@@ -735,14 +735,18 @@ it): the whitespace before it is dropped, a fragment for every byte, a JSON pref
 `Malformed { InvalidArguments }` event of no bytes says where it stopped being one, and the call's
 end where the value is whole or where the stream ends; the engine reports text after a whole value
 as text after the object. A required call
-under the same path is a list of `{"name": …, "parameters": …}` objects, which the `json` table
-reads.
+under the same path is a list of `{"name": …, "parameters": …}` objects, read as the `json` table
+reads a list with no marker (`CallSyntax::ForcedList`) but for the end of the stream. The engine
+held the output to the list, so what an open list still held there (the separators after a call, an
+object cut before its arguments began, what a started call's object held behind its arguments) is
+refused and counted, never content. A call whose arguments began keeps the argument bytes that
+arrived, and the bracket alone, with no object after it, reads as the `json` table reads it.
 
 A model that thinks first writes its thought before the JSON, where the engine holds the output to
 the schema only once the thought is over. `Format::with_forced_call` makes the variant of the
 model's own table that reads such an output: the thought's states stay, with every row into, out
 of and between them, and every other state is one arguments state, the first, which reads the JSON
-as this format does (`ForcedCall::Arguments`) or as the `json` table reads a required call's list
+as this format does (`ForcedCall::Arguments`) or as the required call's list above is read
 (`ForcedCall::List`). A row out of that state is taken only before the JSON's first byte: the
 thought's opener enters the thought, and any other marker with a row is the template's framing,
 dropped. From the first byte on every marker is the call's text, as a JSON string may hold any:

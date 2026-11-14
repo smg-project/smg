@@ -43,7 +43,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{Event, Events, FinishReason, MalformedReason},
+        event::{DropReason, Event, Events, FinishReason, MalformedReason},
         format::ForcedCall,
         formats::{qwen3, Table},
         grammar::{GrammarStart, Options},
@@ -144,6 +144,17 @@ mod tests {
         assert_eq!(format.name(), "forced");
         assert_eq!(format.turn_opener(), None);
         assert!(format.grammar(&[], true, false).is_none());
+        // With tools to write, neither it nor a table's forced variant derives one: the
+        // request's own schema is the constraint, for a named call and a required list alike.
+        let tools = weather_tools();
+        assert!(format.grammar(&tools, true, false).is_none());
+        for written in [ForcedCall::Arguments, ForcedCall::List] {
+            let variant = qwen3(CallSyntax::Json).with_forced_call(written);
+            assert!(
+                variant.grammar(&tools, true, false).is_none(),
+                "{written:?}"
+            );
+        }
     }
 
     const ARGUMENTS: &str = "{\"q\": 1}";
@@ -579,6 +590,93 @@ mod tests {
         }
     }
 
+    /// A required call's list the end of the stream leaves open is no prose: the engine held
+    /// the output to the list. What the list still held (the separators after a call, the next
+    /// call's object the end cut before its arguments began, a started call's object behind
+    /// its arguments) is refused: counted once a run and never content, behind a whole call or
+    /// with none before it, however the bytes were cut. A call whose arguments began keeps the
+    /// argument bytes that arrived.
+    #[test]
+    fn a_required_list_the_end_leaves_open_says_its_calls_and_no_content() {
+        let whole = "[{\"name\": \"lookup\", \"parameters\": {\"q\": 1}}";
+        let lookup = ("lookup".to_string(), ARGUMENTS.to_string());
+        for (output, expected, refused) in [
+            (format!("{whole},"), vec![lookup.clone()], vec![","]),
+            (format!("{whole} ,\n"), vec![lookup.clone()], vec![" ,\n"]),
+            (
+                format!("{whole}, {{\"name\": \"fet"),
+                vec![lookup.clone()],
+                vec!["{\"name\": \"fet"],
+            ),
+            // The next call's name is whole and its arguments never began: no call started.
+            (
+                format!("{whole}, {{\"name\": \"fetch\", \"parameters\":"),
+                vec![lookup.clone()],
+                vec!["{\"name\": \"fetch\", \"parameters\":"],
+            ),
+            (
+                "[{\"name\": \"loo".to_string(),
+                vec![],
+                vec!["{\"name\": \"loo"],
+            ),
+            (
+                format!("{whole}, {{\"name\": \"fetch\", \"parameters\": {{\"u"),
+                vec![lookup.clone(), ("fetch".to_string(), "{\"u".to_string())],
+                vec![],
+            ),
+            // A started call the end cut before its item's closing brace keeps its arguments,
+            // and what its object held behind them is refused: the newline and the indent an
+            // indented list writes there, or the name written after the parameters.
+            (
+                "[\n  {\"name\": \"lookup\", \"parameters\": {\"q\": 1}\n  ".to_string(),
+                vec![lookup.clone()],
+                vec!["\n  "],
+            ),
+            (
+                "[{\"parameters\": {\"q\": 1}, \"name\": \"lookup\"".to_string(),
+                vec![lookup.clone()],
+                vec![", \"name\": \"lookup\""],
+            ),
+        ] {
+            let said = the_same_at_every_cut(forced_qwen3(ForcedCall::List, TURN), &output);
+            assert_eq!(said.calls, expected, "{output}");
+            let events = forced_qwen3(ForcedCall::List, TURN)(&[&output]);
+            // What a chat client reads as content: the content and the malformed text.
+            assert_eq!(crate::tagged::shown(&events), "", "{output}");
+            assert_eq!(crate::tagged::refused(&events), refused, "{output}");
+            // Each refused run is counted once: the event of no bytes stands right before it.
+            let counted = events
+                .windows(2)
+                .filter(|pair| {
+                    matches!(
+                        pair,
+                        [
+                            Event::Malformed {
+                                text,
+                                why: MalformedReason::UnterminatedRegion,
+                            },
+                            Event::Dropped {
+                                why: DropReason::MalformedCall,
+                                ..
+                            },
+                        ] if text.text.is_empty()
+                    )
+                })
+                .count();
+            assert_eq!(counted, refused.len(), "{output}: {events:?}");
+        }
+        // The bracket alone, with no object after it, is what the list with no marker says of
+        // it: the model's text, as before.
+        let events = forced_qwen3(ForcedCall::List, TURN)(&["["]);
+        assert_eq!(crate::tagged::shown(&events), "[");
+        assert!(crate::tagged::refused(&events).is_empty(), "{events:?}");
+        // One call written as an object alone, with no bracket, is a call too, as the list
+        // with no marker reads it.
+        let alone = "{\"name\": \"lookup\", \"parameters\": {\"q\": 1}}";
+        let said = the_same_at_every_cut(forced_qwen3(ForcedCall::List, TURN), alone);
+        assert_eq!(said.calls, vec![lookup]);
+    }
+
     #[test]
     fn a_thought_the_output_ends_inside_is_the_thought_and_no_call() {
         let read = forced_qwen3(ForcedCall::Arguments, THINKING);
@@ -617,19 +715,21 @@ mod tests {
 
     /// The thoughts a forced variant keeps, each with a way into it and a marker that closes it:
     /// the prompt and the output's first bytes that leave the engine inside the thought, and
-    /// the text of a terminal with a row from the thought to the call.
+    /// the text of a terminal with a row from the thought to the call, once for every such row
+    /// (a recovery row the table lists beside the thought's own close is one).
     fn thoughts(format: &Format) -> Vec<(String, String, String)> {
         let thought = |state: usize| format.emits(state) == Emits::Reasoning;
-        let close = |state: usize| {
+        let closes = |state: usize| -> Vec<String> {
             format
                 .transitions()
-                .find(|&(from, _, to)| from == state && to == 0)
+                .filter(|&(from, _, to)| from == state && to == 0)
                 .map(|(_, on, _)| format.terminal_text(on).to_string())
+                .collect()
         };
         let mut found = Vec::new();
         for (from, on, to) in format.transitions() {
             if from == 0 && thought(to) {
-                if let Some(close) = close(to) {
+                for close in closes(to) {
                     found.push((String::new(), format.terminal_text(on).to_string(), close));
                 }
             }
@@ -640,7 +740,7 @@ mod tests {
             }
             let state = format.prompt_state(anchor);
             if thought(state) {
-                if let Some(close) = close(state) {
+                for close in closes(state) {
                     found.push((anchor.to_string(), String::new(), close));
                 }
             }
@@ -719,6 +819,30 @@ mod tests {
         }
         with_a_thought.dedup();
         assert!(with_a_thought.len() >= 20, "{with_a_thought:?}");
+    }
+
+    /// A table's recovery rows are rows of its variant too: Kimi K3 reads a thought the model
+    /// closed with the answer's close tag, and the variant reads the JSON after it as the call,
+    /// as after the thought's own close. The sweep above reads the variant's own rows, so a
+    /// variant made without them would pass it: this case names the row.
+    #[test]
+    fn a_thought_a_recovery_row_closes_is_the_thought_and_then_the_call() {
+        for (written, json) in [(ForcedCall::Arguments, ARGUMENTS), (ForcedCall::List, LIST)] {
+            for close in ["<|close|>think<|sep|>", "<|close|>response<|sep|>"] {
+                let format = Table::KimiK3.format().with_forced_call(written);
+                let output = format!("<|open|>think<|sep|>plan{close}{json}");
+                let read = |pieces: &[&str]| {
+                    let mut engine =
+                        Engine::new(format.clone(), Declared::default().forcing("lookup"));
+                    drive(&mut engine, "", pieces)
+                };
+                assert_eq!(
+                    the_same_at_every_cut(read, &output),
+                    one_call("plan"),
+                    "{written:?} after {close}"
+                );
+            }
+        }
     }
 
     /// The cells of the sweep that `holds` picks: every table of the registry, the prompt's
