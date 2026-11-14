@@ -140,6 +140,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
   read the same way; a usage the gateway writes is unchanged.
+- `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
+  (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
+  request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public
+  API does not list, in the requests and responses it serialized.
 - `StringOrContentParts::to_text_only` names the part it cannot carry: a function output with an
   `input_image`, an `input_file` or a `refusal` part is refused as `Unsupported content part type
   "input_image" in a function output for text-only backends: only text parts are carried as a tool
