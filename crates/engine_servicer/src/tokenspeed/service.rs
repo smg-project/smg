@@ -17,7 +17,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, rpc, servicer::RequestOrigin, BoxStream};
+use crate::{admin, kv_events, rpc, servicer::RequestOrigin, BoxStream};
 
 #[derive(Clone)]
 pub(super) struct TokenSpeedService {
@@ -120,7 +120,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
         self.refuse_control_in_encode_role("FlushCache")?;
-        crate::admin::flush_cache(&self.state.shared, request)
+        admin::flush_cache(&self.state.shared, request)
             .await
             .map(Response::new)
     }
@@ -130,7 +130,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
         self.refuse_control_in_encode_role("StartProfile")?;
-        crate::admin::start_profile(&self.state.shared, request.into_inner())
+        admin::start_profile(&self.state.shared, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -140,7 +140,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
         self.refuse_control_in_encode_role("StopProfile")?;
-        crate::admin::stop_profile(&self.state.shared)
+        admin::stop_profile(&self.state.shared)
             .await
             .map(Response::new)
     }
