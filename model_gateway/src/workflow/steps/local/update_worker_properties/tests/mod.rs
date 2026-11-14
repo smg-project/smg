@@ -1664,3 +1664,70 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
         Some("pythonic")
     );
 }
+
+/// A registration whose label carries an empty role registers no role (the
+/// empty value is none, as the refresh reads it), so the refresh that reads
+/// the engine's real role and connector fills both fields; a field holding
+/// `Some("")` was never filled.
+#[tokio::test]
+async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
+    use openai_protocol::worker::WorkerModels;
+
+    use crate::{
+        server::http_client,
+        workflow::{
+            data::{WorkerKind, WorkerRegistrationMode},
+            steps::{create_worker_workflow_data, local::CreateLocalWorkerStep},
+        },
+    };
+
+    let app_ctx = make_app_context(&[]);
+    let mut spec = WorkerSpec::new("http://worker:8000");
+    spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+    spec.labels = labels_of(&[("kv_role", "")]);
+    let mut data =
+        create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, Arc::clone(&app_ctx));
+    data.worker_kind = Some(WorkerKind::Local);
+    data.connection_mode = Some(ConnectionMode::Http);
+    data.http_client_handle = Some(Arc::new(http_client()));
+    let mut registration = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    assert_eq!(
+        CreateLocalWorkerStep
+            .execute(&mut registration)
+            .await
+            .unwrap(),
+        StepResult::Success
+    );
+    let worker = Arc::clone(&registration.data.actual_workers.as_ref().unwrap()[0]);
+    assert_eq!(
+        worker.metadata().spec.kv_role,
+        None,
+        "an empty label value registers no role"
+    );
+    assert!(!worker.metadata().spec.labels.contains_key("kv_role"));
+    app_ctx
+        .worker_registry
+        .register(Arc::clone(&worker))
+        .expect("the worker registers");
+
+    let fresh = labels_of(&[
+        ("kv_connector", "MooncakeConnector"),
+        ("kv_role", "kv_consumer"),
+    ]);
+    let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
+    let rebuilt = app_ctx
+        .worker_registry
+        .get_by_url("http://worker:8000")
+        .expect("the worker stays registered");
+    assert_eq!(
+        rebuilt.metadata().spec.kv_role.as_deref(),
+        Some("kv_consumer"),
+        "the refresh fills the role the empty label left unset"
+    );
+    assert_eq!(
+        rebuilt.metadata().spec.kv_connector.as_deref(),
+        Some("MooncakeConnector")
+    );
+    assert!(!rebuilt.metadata().spec.labels.contains_key("kv_role"));
+}

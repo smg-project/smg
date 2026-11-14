@@ -215,7 +215,7 @@ fn test_transform_messages_string_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -253,7 +253,7 @@ fn test_transform_messages_string_format_without_placeholders_omits_media() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
+                    url: "https://example.com/image.png".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -278,7 +278,7 @@ fn test_transform_messages_string_format_with_video_placeholder() {
             },
             ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "https://example.com/video.mp4".to_string(),
+                    url: "https://example.com/video.mp4".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
@@ -309,14 +309,14 @@ fn test_transform_messages_string_format_uses_per_modality_placeholders() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
             },
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "audio".to_string(),
+                    url: "audio".to_string().into(),
                 },
             },
         ]),
@@ -356,7 +356,7 @@ fn test_transform_messages_input_audio_uses_audio_placeholder() {
             },
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             },
@@ -388,7 +388,7 @@ fn test_transform_messages_string_format_rejects_missing_modality_placeholder() 
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::AudioUrl {
             audio_url: AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
             },
         }]),
         name: None,
@@ -411,7 +411,7 @@ fn test_transform_messages_openai_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: Some("high".to_string()),
                     max_long_side_pixel: None,
                 },
@@ -474,7 +474,7 @@ fn test_transform_messages_multiple_messages() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -509,7 +509,7 @@ fn test_transform_messages_empty_text_parts() {
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
-                url: "https://example.com/image.jpg".to_string(),
+                url: "https://example.com/image.jpg".to_string().into(),
                 detail: None,
                 max_long_side_pixel: None,
             },
@@ -544,7 +544,7 @@ fn test_transform_messages_mixed_content_types() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: Some("low".to_string()),
                         max_long_side_pixel: None,
                     },
@@ -592,7 +592,7 @@ fn parts_reach_a_parts_template_in_the_requests_order_whatever_the_media_order()
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -619,7 +619,7 @@ fn test_media_hoisted_before_text_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -651,7 +651,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i1".to_string(),
+                    url: "i1".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -661,7 +661,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i2".to_string(),
+                    url: "i2".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -781,7 +781,7 @@ fn test_tml_preserves_authored_multipart_order_openai() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1005,7 +1005,7 @@ fn test_tml_preserves_authored_multipart_order_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1485,7 +1485,7 @@ fn test_render_image_before_question_real_template() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1631,6 +1631,98 @@ fn flat_renderer_joins_the_prefill_and_reports_from_text() {
 
 // --- renderer-capability gates on the render path ------------------------
 
+fn json_renderer() -> llm_tokenizer::MockTokenizer {
+    llm_tokenizer::MockTokenizer::new()
+        .with_renderer_capabilities(RendererCapabilities {
+            native_assistant_continuation: true,
+            json_requires_separate_reasoning: true,
+            json_requires_empty_assistant_prefix: true,
+            ..Default::default()
+        })
+        .with_json_chat_template()
+}
+
+#[test]
+fn json_reasoning_separation_follows_the_renderer_contract() {
+    for format in [
+        json!({"type":"json_object"}),
+        json!({"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}),
+    ] {
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"user","content":"Hi"}],
+            "response_format":format, "separate_reasoning":false
+        }))
+        .unwrap();
+        let render = |request: &ChatCompletionRequest, tokenizer: &dyn Tokenizer| {
+            process_with_derived_profile(request, tokenizer, None, MediaPartOrder::MediaFirst)
+        };
+        assert!(render(&request, &json_renderer())
+            .unwrap_err()
+            .contains("separate_reasoning=true"));
+        assert!(render(&request, &llm_tokenizer::MockTokenizer::new()).is_ok());
+        request.separate_reasoning = true;
+        assert!(render(&request, &json_renderer()).is_ok());
+    }
+}
+
+#[test]
+fn json_continuation_checks_the_effective_flag_and_actual_response_format() {
+    for top_level in [false, true] {
+        for prefix in ["", "{\"answer\":"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"m", "messages":[{"role":"assistant","content":prefix}],
+                "response_format":{"type":"json_object"},
+                "continue_final_message":top_level,
+                "chat_template_kwargs":{
+                    "continue_final_message":true,
+                    "response_format":{"type":"text"}
+                }
+            }))
+            .unwrap();
+            let result = process_with_derived_profile(
+                &request,
+                &json_renderer(),
+                None,
+                MediaPartOrder::MediaFirst,
+            );
+            if prefix.is_empty() {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().contains("nonempty assistant"));
+            }
+        }
+    }
+}
+
+#[test]
+fn json_contract_does_not_restrict_text_responses_or_closed_history() {
+    for format in [Value::Null, json!({"type":"text"})] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"assistant","content":"Partial"}],
+            "response_format":format, "continue_final_message":true,
+            "separate_reasoning":false
+        }))
+        .unwrap();
+        assert!(process_with_derived_profile(
+            &request,
+            &json_renderer(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .is_ok());
+    }
+    let mut request = prefill_request();
+    request.continue_final_message = false;
+    request.response_format = Some(ResponseFormat::JsonObject);
+    assert!(process_with_derived_profile(
+        &request,
+        &json_renderer(),
+        None,
+        MediaPartOrder::MediaFirst,
+    )
+    .is_ok());
+}
+
 /// Render `request` through a mock that declares `capabilities` and
 /// hands back the message list it received as JSON, so both gates are
 /// observable without a checkpoint: which messages reach the template,
@@ -1659,6 +1751,8 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
@@ -1666,6 +1760,8 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 
 /// Without the capability the trailing assistant message is popped and its

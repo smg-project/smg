@@ -486,7 +486,7 @@ fn test_template_with_multimodal_content() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
