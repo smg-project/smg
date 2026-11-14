@@ -484,6 +484,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
     // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    // OTel-2.0-LLM-31B-IT (a Gemma 4 stack) writes Gemma 4's template with a comment block added at
+    // the generation prompt and nothing else: the prompt is the turn's opener alone; the model
+    // writes `<|channel>thought` or not.
+    ("otel-2.0-llm-31b-it", GenerationPrompt::ModelDecides),
     // Nemotron 3.5 Bolt-E4B writes a Nemotron-modified Gemma 4 template: the prompt is the turn's opener
     // alone, and a request that turns thinking on puts `<|think|>` in a system turn instead.
     (

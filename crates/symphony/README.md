@@ -242,6 +242,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 |---|---|---|---|---|---:|---|---|
 | 2026-11-04 | [longcat-2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/longcat-2.5) | meituan-longcat/LongCat-2.5 |  | `longcat` | 19 | replaying the set | none |
 | 2026-10-30 | [mage-vl-cowork](https://github.com/smg-project/bellwether/tree/main/fixtures/mage-vl-cowork) | microsoft/Mage-VL-Cowork |  | `qwen3` | 28 | replaying the set | none |
+| 2026-10-26 | [otel-2.0-llm-31b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/otel-2.0-llm-31b-it) | RedHatAI/OTel-2.0-LLM-31B-IT |  | `gemma4` | 28 | replaying the set | none |
 | 2026-10-24 | [d1-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-2b) | LiquidAI/d1-2B |  | `qwen3`, tagged calls | 9 | replaying the set | none |
 | 2026-10-24 | [d1-omni-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-omni-2b) | LiquidAI/d1-Omni-2B |  | `qwen3`, tagged calls | — | awaiting fixtures | none |
 | 2026-10-24 | [nanbeige4.3-33b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.3-33b) | Nanbeige/Nanbeige4.3-33B |  | `qwen3`, tagged calls | 28 | replaying the set | none |

@@ -2140,6 +2140,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "otel-2.0-llm-31b-it",
+        model: "RedHatAI/OTel-2.0-LLM-31B-IT",
+        also: &[],
+        released: "2026-10-26",
+        smg: (None, None),
+        table: Some(Table::Gemma4),
+        set: Some(28),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "phi-4-mini-instruct",
         model: "microsoft/Phi-4-mini-instruct",
         also: &[],
