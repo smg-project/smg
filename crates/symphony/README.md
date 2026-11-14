@@ -240,6 +240,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
+| 2026-11-08 | [minimax-h3-image-pe](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-h3-image-pe) | MiniMaxAI/MiniMax-H3-Image-PE |  | `qwen3`, tagged calls | 28 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-11-06 | [arete-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/arete-27b) | NousResearch/Arete-27B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-11-06 | [cola2](https://github.com/smg-project/bellwether/tree/main/fixtures/cola2) | ByteDance-Seed/Cola2 |  | `qwen3` | — | awaiting fixtures | none |
 | 2026-11-04 | [longcat-2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/longcat-2.5) | meituan-longcat/LongCat-2.5 |  | `longcat` | 19 | replaying the set | none |
@@ -265,7 +266,9 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-05 | [nld-uni](https://github.com/smg-project/bellwether/tree/main/fixtures/nld-uni) | nvidia/NLD-Uni |  | `qwen3`, tagged calls | 27 | replaying the set | none |
 | 2026-10-05 | [nvidia-nemotron-3.5-bolt-e4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-bolt-e4b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 |  | `gemma4` | 28 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-10-03 | [colgrep-agent-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/colgrep-agent-2b) | lightonai/colgrep-agent-2B |  | `minicpm5` | 28 | replaying the set | none |
+| 2026-10-02 | [flora-rewarder](https://github.com/smg-project/bellwether/tree/main/fixtures/flora-rewarder) | nvidia/Flora-Rewarder |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-02 | [h2o-lightning-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/h2o-lightning-4b) | h2oai/h2o-lightning-4b |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
+| 2026-10-01 | [flora-captioner](https://github.com/smg-project/bellwether/tree/main/fixtures/flora-captioner) | nvidia/Flora-Captioner |  | `plain` | 2 | replaying the set | none |
 | 2026-10-01 | [userlm-2.0](https://github.com/smg-project/bellwether/tree/main/fixtures/userlm-2.0) | microsoft/UserLM-2.0 |  | `plain` | — | awaiting fixtures | none |
 | 2026-09-30 | [mistral-large-4-1t-a52b](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-large-4-1t-a52b) | mistralai/Mistral-Large-4-1T-A52B | Mistral-Large-4-1T-A52B-NVFP4 | `mistral_v13` | 28 | replaying the set | `mistral`, none |
 | 2026-09-29 | [arex-2](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-2) | BAAI/AREX-2 |  | `qwen3`, tagged calls | 474,563 | replaying the set | none |
@@ -277,6 +280,8 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-09-21 | [mimo-v2.6-distill-qwen-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-distill-qwen-9b) | XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B |  | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-21 | [mimo-v2.6-flash-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-flash-rl) | XiaomiMiMo/MiMo-V2.6-Flash-RL |  | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
 | 2026-09-21 | [mimo-v2.6-pro-rl](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.6-pro-rl) | XiaomiMiMo/MiMo-V2.6-Pro-RL | MiMo-V2.6-Flash-MOPD, MiMo-V2.6-Pro-MOPD | `qwen3`, tagged calls, the value between the tags | 589,298 | replaying the set | none |
+| 2026-09-20 | [step-5-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/step-5-preview) | stepfun-ai/Step-5-Preview |  | `qwen3`, tagged calls | 3 | replaying the set | none |
+| 2026-09-17 | [nvidia-nemotronlabs-ai-for-media-sports-basketball](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotronlabs-ai-for-media-sports-basketball) | nvidia/NVIDIA-NemotronLabs-AI-for-Media-Sports-Basketball |  | `qwen3`, tagged calls | 11 | replaying the set | none |
 | 2026-09-11 | [atria-dawn-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/atria-dawn-preview) | internlm/Atria-Dawn-Preview | Atria-Dawn-Preview-Ascend-w8a8 | `glm` | 503,273 | replaying the set | none |
 | 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash | DeepSeek-V4.1-Flash-1017, nvidia/DeepSeek-V4.1-Flash-1017-NVFP4, nvidia/DeepSeek-V4.1-Flash-NVFP4 | `deepseek_v4.1` | 589,671 | replaying the set | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | `minicpm5` | 589,289 | replaying the set | none |
