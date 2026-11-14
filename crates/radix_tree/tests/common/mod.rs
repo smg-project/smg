@@ -16,6 +16,11 @@
 // Each integration-test binary compiles this module independently and
 // uses a different slice of it; unused-in-this-binary is expected.
 #![allow(dead_code)]
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helpers: a broken step ends the test"
+)]
 
 pub mod model;
 pub mod oracle;
@@ -52,7 +57,6 @@ impl Op {
     /// Whether reordering this op against its holder's stores is
     /// outside the §7 convergence scope. (Used by the R1 convergence
     /// suite; the R0 reinterleaver conservatively keeps all order.)
-    #[allow(dead_code)]
     pub fn orders_holder(&self) -> bool {
         matches!(self, Op::Remove { .. } | Op::Clear { .. })
     }

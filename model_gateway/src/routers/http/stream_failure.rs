@@ -295,10 +295,13 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::worker::{
-        circuit_breaker::CircuitBreakerConfig,
-        test_support::{no_health_check, RefusedAddress},
-        BasicWorkerBuilder,
+    use crate::{
+        server::http_client_builder,
+        worker::{
+            circuit_breaker::CircuitBreakerConfig,
+            test_support::{no_health_check, RefusedAddress},
+            BasicWorkerBuilder,
+        },
     };
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
@@ -348,7 +351,7 @@ mod tests {
     async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let error = crate::server::http_client_builder()
+        let error = http_client_builder()
             .no_proxy()
             .build()
             .unwrap()

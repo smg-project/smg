@@ -20,7 +20,7 @@ fn user(text: &str) -> JsonValue {
 /// absent.
 #[test]
 fn the_render_context_answers_the_names_a_template_reads() {
-    let tokens = crate::traits::SpecialTokens {
+    let tokens = SpecialTokens {
         bos_token: Some("<s>".to_string()),
         ..Default::default()
     };
@@ -47,7 +47,7 @@ fn the_render_context_answers_the_names_a_template_reads() {
 /// as the merge of the two context maps read them: the render's map first.
 #[test]
 fn a_template_kwarg_reads_beside_the_base_and_fills_an_unset_token() {
-    let tokens = crate::traits::SpecialTokens {
+    let tokens = SpecialTokens {
         bos_token: Some("<s>".to_string()),
         ..Default::default()
     };
