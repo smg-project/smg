@@ -15,7 +15,11 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer as HfTokenizer;
 
-use crate::{byte_level::max_token_id, traits::TokenIdType};
+use crate::{
+    byte_level::max_token_id,
+    traits::TokenIdType,
+    word_cache::{token_of, Listing},
+};
 
 /// What an id contributes to a decode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,7 +62,7 @@ impl PieceTable {
     pub(crate) fn build_with_max_id(
         tokenizer: &HfTokenizer,
         model_max_id: Option<u32>,
-        listing: Option<&crate::word_cache::Listing>,
+        listing: Option<&Listing>,
     ) -> Option<Arc<Self>> {
         let chain = serde_json::to_value(tokenizer.get_decoder()?).ok()?;
         let decoders = chain.get("decoders")?.as_array()?;
@@ -91,7 +95,7 @@ impl PieceTable {
         let mut text = Vec::with_capacity(ids * 4);
         let mut piece = Vec::with_capacity(ids);
         for id in 0..=max_id {
-            let kind = match crate::word_cache::token_of(tokenizer, listing, id) {
+            let kind = match token_of(tokenizer, listing, id) {
                 None => Piece::Absent,
                 Some(token) => match byte_token(&token) {
                     Some(byte) => Piece::Byte(byte),

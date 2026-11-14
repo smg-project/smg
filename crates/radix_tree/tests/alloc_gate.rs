@@ -3,6 +3,16 @@
 //! RSS gate cannot catch a regression to per-block heap sets (the
 //! §13.4 risk), so this counts allocations directly.
 
+#![expect(
+    unsafe_code,
+    reason = "a counting global allocator needs the unsafe GlobalAlloc trait"
+)]
+#![expect(
+    clippy::expect_used,
+    clippy::print_stdout,
+    reason = "test helpers: a failed store ends the test; the counts are printed beside the verdict"
+)]
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::atomic::{AtomicU64, Ordering},
@@ -20,7 +30,7 @@ unsafe impl GlobalAlloc for Counting {
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        System.dealloc(ptr, layout);
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
