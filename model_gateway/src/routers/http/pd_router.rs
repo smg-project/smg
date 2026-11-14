@@ -2812,12 +2812,18 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Prefill {} returned status {}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     res.status()
                 ));
             }
+            // The client's error names the request's address, its query
+            // kept: the masked address beside it names the side.
             Err(e) => {
-                errors.push(format!("Prefill {} error: {}", prefill.url(), e));
+                errors.push(format!(
+                    "Prefill {} error: {}",
+                    prefill.redacted_url(),
+                    e.without_url()
+                ));
             }
         }
 
@@ -2831,12 +2837,16 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Decode {} returned status {}",
-                    decode.url(),
+                    decode.redacted_url(),
                     res.status()
                 ));
             }
             Err(e) => {
-                errors.push(format!("Decode {} error: {}", decode.url(), e));
+                errors.push(format!(
+                    "Decode {} error: {}",
+                    decode.redacted_url(),
+                    e.without_url()
+                ));
             }
         }
 
@@ -2845,8 +2855,8 @@ impl RouterTrait for PDRouter {
                 StatusCode::OK,
                 format!(
                     "Health generate passed on selected pair: prefill={}, decode={}",
-                    prefill.url(),
-                    decode.url()
+                    prefill.redacted_url(),
+                    decode.redacted_url()
                 ),
             )
                 .into_response()
@@ -4682,6 +4692,79 @@ mod tests {
                 .worker_registry
                 .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
         }
+    }
+
+    /// The health-generate probe names the pair it tried with each address
+    /// masked, whether a side answers, answers an error or refuses the
+    /// connection: a worker registered with a password and a token in its
+    /// query is named by its scheme, host and port, and a refused
+    /// connection's error does not name the request's address. The route is
+    /// public. The stubs answer every path: the probe's route joins such an
+    /// address after its query.
+    #[tokio::test]
+    async fn health_generate_names_the_pair_it_tried_with_masked_addresses() {
+        async fn probe(prefill: &str, decode: &str) -> (StatusCode, String) {
+            let with_secrets = |url: &str| {
+                let with_password = url.replacen("http://", "http://user:s3cret@", 1);
+                format!("{with_password}/?token=s3cret")
+            };
+            let router = create_test_pd_router();
+            register_pd_pair(&router, with_secrets(prefill), with_secrets(decode));
+            let request = Request::builder().body(Body::empty()).unwrap();
+            let response = tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+                .await
+                .expect("the probe answers");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+        let answering = |status: StatusCode| {
+            spawn_stub(axum::Router::new().fallback(move || async move { status }))
+        };
+        let (healthy_prefill, healthy_decode) = (
+            answering(StatusCode::OK).await,
+            answering(StatusCode::OK).await,
+        );
+        let (failing_prefill, failing_decode) = (
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+        );
+        let (refused_prefill, refused_decode) =
+            (RefusedAddress::reserve(), RefusedAddress::reserve());
+        let (refused_prefill, refused_decode) =
+            (refused_prefill.http_url(), refused_decode.http_url());
+
+        let mut carrying = Vec::new();
+        for (prefill, decode, wanted) in [
+            (&healthy_prefill, &healthy_decode, StatusCode::OK),
+            (
+                &failing_prefill,
+                &refused_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                &refused_prefill,
+                &failing_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (status, body) = probe(prefill, decode).await;
+            assert_eq!(status, wanted, "{body}");
+            if body.contains("s3cret") {
+                carrying.push(body);
+                continue;
+            }
+            for side in [prefill, decode] {
+                let masked = side.replacen("http://", "http://***@", 1);
+                assert!(body.contains(&masked), "{masked} is not named in: {body}");
+            }
+        }
+        assert!(
+            carrying.is_empty(),
+            "bodies of the probe that carry the secret: {carrying:#?}"
+        );
     }
 
     fn streaming_chat() -> ChatCompletionRequest {
