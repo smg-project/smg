@@ -246,6 +246,54 @@ fn reasoning_items_preserve_empty_summary_arrays() {
     assert_eq!(serialized, input_payload);
 }
 
+/// The public API writes a reasoning item as `{id, type, summary,
+/// encrypted_content}`, often with no `content`, which it does not require:
+/// such an item parses with no content, alone and in a Response's output, and
+/// is written back with an empty `content`, as the gateway writes its own.
+#[test]
+fn a_reasoning_output_item_without_content_parses() {
+    let hosted = json!({
+        "type": "reasoning",
+        "id": "rs_hosted",
+        "summary": [{"type": "summary_text", "text": "Weighing the options."}],
+        "encrypted_content": "gAAAAB-opaque"
+    });
+    let item: ResponseOutputItem =
+        serde_json::from_value(hosted.clone()).expect("a reasoning item without content parses");
+    let written = serde_json::to_value(&item).expect("serialize the reasoning item");
+    assert_eq!(written["content"], json!([]), "{written}");
+    assert_eq!(written["summary"], hosted["summary"], "{written}");
+    assert_eq!(written["encrypted_content"], hosted["encrypted_content"]);
+
+    let response: ResponsesResponse = serde_json::from_value(json!({
+        "id": "resp_reasoning",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.4",
+        "output": [hosted],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": true,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null,
+        "user": null,
+        "metadata": {}
+    }))
+    .expect("a Response carrying a reasoning item without content parses");
+    assert_eq!(response.output.len(), 1);
+}
+
 #[test]
 fn legacy_vec_string_summary_fails_to_deserialize() {
     let legacy = r#"{"type":"reasoning","id":"r_x","summary":["text"]}"#;
@@ -295,6 +343,51 @@ fn test_responses_request_explicit_top_p_preserved() {
     .expect("request should deserialize");
 
     assert_eq!(request.top_p, Some(0.9));
+}
+
+/// The public API's function tool takes `async`, `defer_loading`,
+/// `output_schema` and `allowed_callers` beside the function object's own
+/// keys: a request declaring them parses and writes them back for the upstream
+/// as sent, the chat template's copy leaves them out, and a key outside the
+/// spec is still refused. A custom tool takes `async` and `allowed_callers`
+/// too.
+#[test]
+fn a_function_tool_keeps_the_public_apis_tool_keys() {
+    let tool = json!({
+        "type": "function",
+        "name": "lookup",
+        "parameters": {"type": "object", "properties": {}},
+        "strict": true,
+        "async": true,
+        "defer_loading": true,
+        "output_schema": {"type": "object"},
+        "allowed_callers": ["direct", "programmatic"]
+    });
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.6", "input": "hi", "tools": [tool.clone()]
+    }))
+    .expect("a function tool with the spec's tool keys parses");
+    assert_eq!(serde_json::to_value(&request).unwrap()["tools"][0], tool);
+    let Some(ResponseTool::Function(function_tool)) =
+        request.tools.as_deref().and_then(<[_]>::first)
+    else {
+        panic!("a function tool: {:?}", request.tools);
+    };
+    assert!(function_tool.chat_function().extra.is_empty());
+
+    let refused = serde_json::from_value::<ResponsesRequest>(json!({
+        "model": "gpt-5.6", "input": "hi",
+        "tools": [{"type": "function", "name": "lookup", "parameters": null, "not_a_tool_key": 1}]
+    }));
+    assert!(refused.is_err(), "a key outside the spec is refused");
+
+    let custom =
+        json!({"type": "custom", "name": "shell", "async": false, "allowed_callers": ["direct"]});
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.6", "input": "hi", "tools": [custom.clone()]
+    }))
+    .expect("a custom tool with async and allowed_callers parses");
+    assert_eq!(serde_json::to_value(&request).unwrap()["tools"][0], custom);
 }
 
 #[test]
@@ -656,24 +749,30 @@ fn test_responses_request_new_top_level_fields_round_trip() {
     );
 }
 
-/// `prompt_cache_retention` accepts the other spec value and serializes
-/// back with the hyphenated rename.
+/// `prompt_cache_retention` reads the public API's `in_memory`, and the
+/// hyphenated `in-memory` this crate wrote before, and writes `in_memory`.
 #[test]
 fn test_prompt_cache_retention_in_memory_round_trip() {
-    let request: ResponsesRequest = serde_json::from_value(json!({
-        "model": "gpt-5.4",
-        "input": "hello",
-        "prompt_cache_retention": "in-memory"
-    }))
-    .expect("should deserialize");
+    for spelling in ["in_memory", "in-memory"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "prompt_cache_retention": spelling
+        }))
+        .expect(spelling);
 
-    assert_eq!(
-        request.prompt_cache_retention,
-        Some(PromptCacheRetention::InMemory)
-    );
+        assert_eq!(
+            request.prompt_cache_retention,
+            Some(PromptCacheRetention::InMemory),
+            "{spelling}"
+        );
 
-    let reserialized = serde_json::to_value(&request).expect("should serialize");
-    assert_eq!(reserialized["prompt_cache_retention"], "in-memory");
+        let reserialized = serde_json::to_value(&request).expect("should serialize");
+        assert_eq!(
+            reserialized["prompt_cache_retention"], "in_memory",
+            "{spelling}"
+        );
+    }
 }
 
 /// Absent fields must stay absent on the wire (no `"prompt": null` etc.),
@@ -4698,6 +4797,57 @@ fn metadata_limits_are_enforced() {
     );
 }
 
+/// A Response reads as the public API writes one: its `metadata` may be
+/// `null`, which reads as the empty map, and `incomplete_details.reason` may be
+/// any of the four reasons the public API lists.
+#[test]
+fn a_response_with_null_metadata_or_any_listed_incomplete_reason_parses() {
+    let mut response = json!({
+        "id": "resp_incomplete",
+        "object": "response",
+        "created_at": 1,
+        "status": "incomplete",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.6",
+        "output": [],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": true,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null,
+        "user": null,
+        "metadata": null
+    });
+    for reason in [
+        "max_output_tokens",
+        "max_messages",
+        "content_filter",
+        "steered",
+    ] {
+        response["incomplete_details"] = json!({"reason": reason});
+        let parsed: ResponsesResponse = serde_json::from_value(response.clone())
+            .unwrap_or_else(|e| panic!("a Response incomplete for {reason}: {e}"));
+        assert!(parsed.metadata.is_empty());
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["incomplete_details"], json!({"reason": reason}));
+        assert_eq!(written["metadata"], json!({}));
+    }
+
+    // A populated map still reads as sent.
+    response["metadata"] = json!({"k": "v"});
+    let parsed: ResponsesResponse = serde_json::from_value(response).unwrap();
+    assert_eq!(parsed.metadata.get("k"), Some(&json!("v")));
+}
+
 #[test]
 fn function_tool_parameters_must_be_an_object() {
     let request = plain_request(json!({
@@ -4710,6 +4860,85 @@ fn function_tool_parameters_must_be_an_object() {
         code.contains("invalid_type") && code.contains("tools[0].parameters"),
         "{code}"
     );
+}
+
+/// The public API's function-tool keys are checked for shape as the custom
+/// tool's typed fields are: `async` and `defer_loading` a boolean,
+/// `allowed_callers` an array of strings, `output_schema` an object, each also
+/// `null`, on a function tool alone or in a namespace.
+#[test]
+fn function_tool_keys_must_have_the_spec_shapes() {
+    use serde_json::Value;
+    let tool = |key: &str, value: &Value| {
+        let mut tool = json!({"type": "function", "name": "f", "parameters": {}});
+        tool[key] = value.clone();
+        tool
+    };
+    for (key, value, expected) in [
+        (
+            "async",
+            json!("yes"),
+            "expected a boolean, but got a string",
+        ),
+        (
+            "defer_loading",
+            json!(1),
+            "expected a boolean, but got a number",
+        ),
+        (
+            "allowed_callers",
+            json!("direct"),
+            "expected an array of strings, but got a string",
+        ),
+        (
+            "allowed_callers",
+            json!(["direct", 1]),
+            "expected an array of strings, but got a number",
+        ),
+        (
+            "output_schema",
+            json!("object"),
+            "expected an object, but got a string",
+        ),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [tool(key, &value)]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(
+            code.contains("invalid_type")
+                && code.contains(&format!("tools[0].{key}"))
+                && code.contains(expected),
+            "{key}={value}: {code}"
+        );
+
+        let namespaced = plain_request(json!({
+            "model": "m", "input": "hi",
+            "tools": [{"type": "namespace", "name": "ns", "description": "d",
+                       "tools": [tool(key, &value)]}]
+        }))
+        .unwrap();
+        let code = validation_code(&namespaced);
+        assert!(
+            code.contains(&format!("tools[0].tools[0].{key}")),
+            "{key}={value}: {code}"
+        );
+    }
+    for (key, value) in [
+        ("async", json!(false)),
+        ("defer_loading", Value::Null),
+        ("allowed_callers", json!(["programmatic"])),
+        ("allowed_callers", Value::Null),
+        ("output_schema", json!({"type": "object"})),
+        ("output_schema", Value::Null),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [tool(key, &value)]
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{key}={value}");
+    }
 }
 
 /// One of OpenAI's own models: the public API's structured-output rules apply.

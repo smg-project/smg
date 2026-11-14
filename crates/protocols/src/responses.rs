@@ -19,7 +19,9 @@ use super::{
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
-    builders::ResponsesResponseBuilder, common::invalid, profile::is_openai_vendor_model,
+    builders::ResponsesResponseBuilder,
+    common::{deserialize_null_as_empty_map, invalid},
+    profile::is_openai_vendor_model,
     validated::Normalizable,
 };
 
@@ -404,7 +406,7 @@ pub enum ResponseTool {
 
     /// User-defined custom tool with optional grammar-constrained input.
     ///
-    /// Spec: `{ name, type: "custom", defer_loading?, description?, format? }`.
+    /// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
     /// `format` constrains the model's free-form `input` payload — `Text` is
     /// unconstrained, `Grammar` enforces a Lark or regex production at decode
     /// time. The model returns a `custom_tool_call` output item carrying the
@@ -531,17 +533,63 @@ pub struct FunctionTool {
     pub function: Function,
 }
 
+impl FunctionTool {
+    /// The public API's function-tool keys beyond the function object's own
+    /// (`FunctionTool` in the spec): how the API calls the tool rather than
+    /// what the model calls. They are kept in [`Function::extra`] and
+    /// forwarded as given.
+    pub const TOOL_KEYS: &'static [&'static str] =
+        &["async", "defer_loading", "output_schema", "allowed_callers"];
+
+    /// Every key a function tool takes, as its refusal of another key lists
+    /// them: the function object's own, then [`Self::TOOL_KEYS`].
+    const FIELDS: &'static [&'static str] = &[
+        "name",
+        "description",
+        "parameters",
+        "strict",
+        "async",
+        "defer_loading",
+        "output_schema",
+        "allowed_callers",
+    ];
+
+    /// The function object a chat template is handed: the tool's function
+    /// without [`Self::TOOL_KEYS`], which describe the call, not the function.
+    pub fn chat_function(&self) -> Function {
+        let mut function = self.function.clone();
+        function
+            .extra
+            .retain(|key, _| !Self::TOOL_KEYS.contains(&key.as_str()));
+        function
+    }
+
+    /// Whether the model may call the tool itself: `allowed_callers` is absent,
+    /// `null` or names `direct`. A tool only code may call (`["programmatic"]`)
+    /// needs a router that runs programmatic tool calls.
+    pub fn allows_direct_calls(&self) -> bool {
+        match self.function.extra.get("allowed_callers") {
+            Some(Value::Array(callers)) => callers.iter().any(|caller| caller == "direct"),
+            _ => true,
+        }
+    }
+}
+
 /// A function tool rejects keys outside its schema, as the sibling tool
 /// structs do with `deny_unknown_fields`. The function object collects such
 /// keys in [`Function::extra`] (the chat API keeps them for the template), and
 /// serde does not support `deny_unknown_fields` on a struct that flattens a
-/// struct with a flattened map of its own, so the check is made here.
+/// struct with a flattened map of its own, so the check is made here. The
+/// public API's own tool keys ([`FunctionTool::TOOL_KEYS`]) stay in `extra`.
 impl<'de> Deserialize<'de> for FunctionTool {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        const FIELDS: &[&str] = &["name", "description", "parameters", "strict"];
         let function = Function::deserialize(deserializer)?;
-        if let Some(key) = function.extra.keys().next() {
-            return Err(serde::de::Error::unknown_field(key, FIELDS));
+        if let Some(key) = function
+            .extra
+            .keys()
+            .find(|key| !FunctionTool::TOOL_KEYS.contains(&key.as_str()))
+        {
+            return Err(serde::de::Error::unknown_field(key, FunctionTool::FIELDS));
         }
         Ok(Self { function })
     }
@@ -672,7 +720,7 @@ pub enum FileSearchRanker {
 
 /// User-defined custom tool definition.
 ///
-/// Spec: `{ name, type: "custom", defer_loading?, description?, format? }`.
+/// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
 /// The discriminator (`type: "custom"`) is enforced by the parent
 /// [`ResponseTool`] enum; this struct only carries the payload fields so the
 /// `flatten`-style wire shape survives a round-trip.
@@ -691,6 +739,23 @@ pub struct CustomTool {
     /// Optional input-format constraint — `text` (unconstrained) or
     /// `grammar` (Lark / regex production).
     pub format: Option<CustomToolInputFormat>,
+    /// Whether the tool's response may come back asynchronously rather than
+    /// on the next response creation.
+    #[serde(rename = "async")]
+    pub r#async: Option<bool>,
+    /// The contexts the tool may be invoked from (`CallableToolAllowedCaller`:
+    /// `direct`, `programmatic`), forwarded as given.
+    pub allowed_callers: Option<Vec<String>>,
+}
+
+impl CustomTool {
+    /// Whether the model may call the tool itself: `allowed_callers` is absent
+    /// or names `direct` (see [`FunctionTool::allows_direct_calls`]).
+    pub fn allows_direct_calls(&self) -> bool {
+        self.allowed_callers
+            .as_ref()
+            .is_none_or(|callers| callers.iter().any(|caller| caller == "direct"))
+    }
 }
 
 /// Input-format constraint applied to a [`CustomTool`].
@@ -2365,6 +2430,10 @@ pub enum ResponseOutputItem {
         id: String,
         #[serde(default)]
         summary: Vec<SummaryTextContent>,
+        /// The reasoning text. The public API does not require the key and
+        /// often leaves it out, so an item written without it reads as
+        /// having none.
+        #[serde(default)]
         content: Vec<ResponseReasoningContent>,
         /// Encrypted reasoning payload for gpt-5 / o-series round-trip.
         /// Opaque to SMG; preserved verbatim.
@@ -2864,25 +2933,34 @@ pub enum ResponseStatus {
     Cancelled,
 }
 
-/// Why a response stopped before producing complete output.
+/// Why a response stopped before producing complete output: the public API's
+/// `incomplete_details.reason`.
 ///
-/// Mirrors OpenAI's `incomplete_details.reason`: reserved strictly for the two
-/// truncation semantics. Any other stop condition (wall-clock timeout,
-/// `max_tool_calls` exhaustion, provider errors) is surfaced as a `failed`
-/// status with an `error` payload instead.
+/// The gateway's own Responses report `max_output_tokens` alone: any other stop
+/// condition of its own (wall-clock timeout, `max_tool_calls` exhaustion,
+/// provider errors) is surfaced as a `failed` status with an `error` payload
+/// instead. The other reasons are an upstream's, which a typed reader of its
+/// Response parses.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum IncompleteReason {
     /// Output was truncated because it hit `max_output_tokens`.
     MaxOutputTokens,
+    /// An upstream's `max_messages`, which the public API lists without
+    /// describing it.
+    MaxMessages,
     /// Output was truncated by the content filter.
     ContentFilter,
+    /// The response stopped at a safe output boundary after a WebSocket
+    /// `response.steer` event; the server may then create a successor response
+    /// with the queued input.
+    Steered,
 }
 
 /// Structured detail attached to a response whose status is `incomplete`.
 ///
-/// Wire shape: `{ "reason": "max_output_tokens" | "content_filter" }`.
+/// Wire shape: `{ "reason": "max_output_tokens" | "max_messages" | "content_filter" | "steered" }`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IncompleteDetails {
     /// The reason the response is incomplete.
@@ -3303,7 +3381,7 @@ pub struct ResponsesRequest {
     pub prompt_cache_key: Option<String>,
 
     /// Retention policy for prompt-cache entries.
-    /// Spec: body param `prompt_cache_retention` (`"in-memory"` | `"24h"`).
+    /// Spec: body param `prompt_cache_retention` (`"in_memory"` | `"24h"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
 
@@ -3796,17 +3874,38 @@ const MAX_METADATA_PAIRS: usize = 16;
 const MAX_METADATA_KEY_CHARS: usize = 64;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
 
+/// The request's `metadata` under the public API's bounds (the field's custom
+/// rule; see [`validate_metadata_pairs`]).
 fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
-    if metadata.len() > MAX_METADATA_PAIRS {
+    validate_metadata_pairs(metadata.iter())
+}
+
+/// The public API's bound on the number of `metadata` pairs (16) for a count
+/// read on its own (a stored object once a patch is merged into it):
+/// `object_above_max_properties` above it.
+pub fn validate_metadata_pair_count(count: usize) -> Result<(), ValidationError> {
+    if count > MAX_METADATA_PAIRS {
         return Err(invalid(
             "object_above_max_properties",
             format!(
-                "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
-                metadata.len()
+                "Invalid 'metadata': too many properties. The object has {count} properties, but the maximum is {MAX_METADATA_PAIRS}."
             ),
         ));
     }
-    for (key, value) in metadata {
+    Ok(())
+}
+
+/// The public API's bounds on a `metadata` object, for any map of its pairs:
+/// at most 16 pairs (`object_above_max_properties`), keys of at most 64
+/// characters and string values of at most 512 (`string_above_max_length`),
+/// and every value a string (`invalid_type`). The Responses request validates
+/// its `metadata` with this rule; a route that reads a metadata object of its
+/// own (the gateway's Conversations routes) validates it the same way.
+pub fn validate_metadata_pairs<'a>(
+    pairs: impl ExactSizeIterator<Item = (&'a String, &'a Value)>,
+) -> Result<(), ValidationError> {
+    validate_metadata_pair_count(pairs.len())?;
+    for (key, value) in pairs {
         if key.chars().count() > MAX_METADATA_KEY_CHARS {
             return Err(invalid(
                 "string_above_max_length",
@@ -3816,16 +3915,23 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
                 ),
             ));
         }
-        if let Some(text) = value.as_str() {
-            if text.chars().count() > MAX_METADATA_VALUE_CHARS {
-                return Err(invalid(
-                    "string_above_max_length",
-                    format!(
-                        "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
-                        text.chars().count()
-                    ),
-                ));
-            }
+        let Value::String(text) = value else {
+            return Err(invalid(
+                "invalid_type",
+                format!(
+                    "Invalid type for 'metadata.{key}': expected a string, but got {} instead.",
+                    json_type_name(value)
+                ),
+            ));
+        };
+        if text.chars().count() > MAX_METADATA_VALUE_CHARS {
+            return Err(invalid(
+                "string_above_max_length",
+                format!(
+                    "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
+                    text.chars().count()
+                ),
+            ));
         }
     }
     Ok(())
@@ -3834,7 +3940,12 @@ fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), Validation
 /// The roles an input message may carry.
 const INPUT_MESSAGE_ROLES: [&str; 4] = ["assistant", "system", "developer", "user"];
 
-fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
+/// An input message's `role` under the public API's set (`assistant`,
+/// `system`, `developer`, `user`; `invalid_value` otherwise). The Responses
+/// request validates its message items with this rule; a route that stores
+/// message items of its own (the gateway's Conversations routes) validates
+/// them the same way.
+pub fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
     if INPUT_MESSAGE_ROLES.contains(&role) {
         return Ok(());
     }
@@ -3973,6 +4084,41 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
     Ok(())
 }
 
+/// The public API's function-tool keys ([`FunctionTool::TOOL_KEYS`]) are kept
+/// untyped in the function's `extra`, so their shapes are checked here, as the
+/// custom tool's typed fields check theirs: `async` and `defer_loading` a
+/// boolean, `allowed_callers` an array of strings, `output_schema` an object,
+/// each of them also `null`.
+fn validate_function_tool_keys(function: &Function, at: &str) -> Result<(), ValidationError> {
+    for key in FunctionTool::TOOL_KEYS {
+        let Some(value) = function.extra.get(*key) else {
+            continue;
+        };
+        let (expected, got) = match *key {
+            "async" | "defer_loading" if !(value.is_boolean() || value.is_null()) => {
+                ("a boolean", json_type_name(value))
+            }
+            "allowed_callers" => match value {
+                Value::Null => continue,
+                Value::Array(callers) => match callers.iter().find(|caller| !caller.is_string()) {
+                    Some(caller) => ("an array of strings", json_type_name(caller)),
+                    None => continue,
+                },
+                _ => ("an array of strings", json_type_name(value)),
+            },
+            "output_schema" if !(value.is_object() || value.is_null()) => {
+                ("an object", json_type_name(value))
+            }
+            _ => continue,
+        };
+        return Err(invalid(
+            "invalid_type",
+            format!("Invalid type for '{at}.{key}': expected {expected}, but got {got} instead."),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates ResponseTool structure based on tool type
 fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
@@ -3993,6 +4139,17 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                             json_type_name(function.parameters_schema())
                         ),
                     ));
+                }
+                validate_function_tool_keys(function, &format!("tools[{idx}]"))?;
+            }
+            ResponseTool::Namespace(namespace) => {
+                for (member_idx, member) in namespace.tools.iter().enumerate() {
+                    if let NamespaceTool::Function(function_tool) = member {
+                        validate_function_tool_keys(
+                            &function_tool.function,
+                            &format!("tools[{idx}].tools[{member_idx}]"),
+                        )?;
+                    }
                 }
             }
             // The hosted local_shell tool is not served by the gateway, and the
@@ -4386,8 +4543,9 @@ pub struct ResponsesResponse {
     #[serialize_always]
     pub presence_penalty: Option<f32>,
 
-    /// Additional metadata
-    #[serde(default)]
+    /// Additional metadata. An upstream may write `null`, as the public API's
+    /// `Metadata` allows, which reads as the empty map.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_map")]
     pub metadata: HashMap<String, Value>,
 }
 
@@ -4567,6 +4725,13 @@ impl ResponseReasoningContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A function tool's refusal of an unknown key lists the public API's tool
+    /// keys among those it takes.
+    #[test]
+    fn a_function_tools_fields_end_with_its_tool_keys() {
+        assert!(FunctionTool::FIELDS.ends_with(FunctionTool::TOOL_KEYS));
+    }
 
     /// The three sampling knobs the request keeps as plain values read as set
     /// only off their serde defaults: absent is unset, a value is set, and a
@@ -4874,6 +5039,59 @@ mod tests {
             plain["output_tokens_details"],
             serde_json::json!({"reasoning_tokens": 0})
         );
+    }
+
+    /// `validate_metadata_pairs` holds the public API's bounds for any map of
+    /// pairs: the pair count, the key and value lengths, and strings only,
+    /// each under the public code; a map at the bounds passes.
+    #[test]
+    fn metadata_pairs_are_bounded_as_the_public_api_bounds_them() {
+        let code = |pairs: Vec<(String, Value)>| {
+            let map: serde_json::Map<String, Value> = pairs.into_iter().collect();
+            validate_metadata_pairs(map.iter()).map_err(|error| error.code.to_string())
+        };
+        assert_eq!(
+            code(
+                (0..16)
+                    .map(|i| (format!("{i:0>64}"), serde_json::json!("v".repeat(512))))
+                    .collect()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            code(
+                (0..17)
+                    .map(|i| (format!("k{i}"), serde_json::json!("v")))
+                    .collect()
+            ),
+            Err("object_above_max_properties".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".repeat(65), serde_json::json!("v"))]),
+            Err("string_above_max_length".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".to_string(), serde_json::json!("v".repeat(513)))]),
+            Err("string_above_max_length".to_string())
+        );
+        for (value, named) in [
+            (serde_json::json!({"nested": 1}), "an object"),
+            (serde_json::json!(5), "a number"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(null), "null"),
+            (serde_json::json!(["v"]), "an array"),
+        ] {
+            let map: serde_json::Map<String, Value> =
+                [("k".to_string(), value)].into_iter().collect();
+            let error = validate_metadata_pairs(map.iter())
+                .expect_err("a value that is not a string is refused");
+            assert_eq!(error.code, "invalid_type");
+            let message = error.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("'metadata.k'") && message.contains(named),
+                "{message}"
+            );
+        }
     }
 
     /// Codex puts `client_metadata` on every request: it must parse, and it
