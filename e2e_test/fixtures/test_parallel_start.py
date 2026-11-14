@@ -4,6 +4,7 @@ from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
+from infra import worker as worker_module
 from infra.constants import ENV_STARTUP_TIMEOUT, ConnectionMode, WorkerType
 
 setup = import_module("fixtures.setup_backend")
@@ -14,7 +15,12 @@ def fleet(monkeypatch):
     events = []
     clock = [100.0]
     monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
-    monkeypatch.setattr(setup, "get_model_spec", lambda _: {"tp": 1, "startup_timeout": 10})
+
+    def fake_model_spec(_):
+        return {"tp": 1, "startup_timeout": 10}
+
+    monkeypatch.setattr(setup, "get_model_spec", fake_model_spec)
+    monkeypatch.setattr(worker_module, "get_model_spec", fake_model_spec)
     monkeypatch.setattr(setup.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(setup, "_worker_start_failures", {})
 

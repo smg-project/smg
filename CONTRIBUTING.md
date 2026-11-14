@@ -142,17 +142,17 @@ Agents are welcome and useful. Three ground rules:
 
 ## Running CI on your own runners
 
-Every self-hosted `runs-on` label in `.github/workflows/` reads from a repository
-variable with the upstream label as its fallback, e.g.
+Most self-hosted `runs-on` labels in `.github/workflows/` read a repository
+variable with an upstream fallback, e.g.
 
 ```yaml
 runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
 ```
 
-Upstream sets none of these variables, so CI keeps using the labels above with no
-change. A fork that runs CI on its own runners only has to set the variables it
-needs (**Settings → Secrets and variables → Actions → Variables**) — no workflow
-edits, so upstream syncs stay conflict-free.
+Unset variables keep the fallback labels; the opt-in AMD lanes below instead
+stay off until their required labels are nonempty. A fork that runs CI on its own
+runners only has to set the variables it needs (**Settings → Secrets and variables
+→ Actions → Variables**) — no workflow edits, so upstream syncs stay conflict-free.
 
 | Variable | Upstream fallback | Used for |
 | --- | --- | --- |
@@ -160,13 +160,65 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
 | `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
 | `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
-| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` (some lanes only) | AMD 1-GPU e2e jobs require `SMG_RUN_AMD_LEGS=true`. The original chat, vLLM API and Responses core lanes retain the fallback. SGLang, Python-servicer, worker-MM, single-GPU ZMQ, legacy and Symphony opt-ins require a nonempty label and skip while it is blank |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
+| `SMG_RUNNER_AMD_GPU_2` | None (required) | Explicit AMD DP2 route; an existing `4-gpu-mi300x` label can carry logical two-GPU work under the full-host lease. Blank disables the lane |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
-| `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`) |
+| `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` (benchmarks only) | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`); the opt-in TP4 lane requires a nonempty label and has no fallback |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
+| `SMG_RUN_AMD_LEGS` | `false` (when unset) | Enables AMD 1-GPU chat, nightly benchmark and automatic BFCL/PD selection; also required by the AMD opt-in lanes below |
+| `SMG_RUN_AMD_ON_PRS` | `false` (when unset) | Additional gate for AMD pull-request lanes; not required for push or manual runs |
+| `SMG_RUN_AMD_SGLANG_RESPONSES` | `false` | Full original SGLang Responses suite on AMD, floor 92, with agentic services and the original MCP coverage; LEGS, nonempty existing GPU1 and ON_PRS gates apply. Retains default gRPC/Rust and provider-key opt-out, fixed cohort/numeric checks; 60-minute job / 45-minute test engineering limits. This does not replace or expand the separate partial vLLM 41-case row |
+| `SMG_RUN_AMD_SGLANG_PYTHON_SERVICER` | `false` | Original SGLang Python-servicer full chat, admin ops and decisions on AMD; requires LEGS, the existing nonempty GPU1 route and ON_PRS for PRs. Preserves the original chat-one-engine path gate and 40-minute job / 32-minute tests, with the fixed SGLang cohort and numeric preflight; first normal CI qualification remains required |
+| `SMG_RUN_AMD_SGLANG_COMPLETIONS` | `false` | Original SGLang completions suite on AMD, floor 15; requires LEGS, the existing nonempty GPU1 route and ON_PRS for PRs. Uses the fixed SGLang cohort with prepared/final checks and numeric preflight; first normal CI qualification remains required |
+| `SMG_RUN_AMD_SGLANG_EMBEDDINGS` | `false` | Original SGLang embeddings suite and sentence-transformers dependency on AMD, floor 18; same gates, cohort checks and numeric preflight |
+| `SMG_RUN_AMD_SGLANG_GATEWAY` | `false` | Original SGLang router suite on AMD, floor 23; same gates and cohort checks, retaining the chat-one-engine path gate and SGLang's default enabled selection |
+| `SMG_RUN_AMD_SGLANG_ZMQ` | `false` | Original single-engine SGLang headless ZMQ full-chat suite on AMD, floor 209 and engine count 1; same LEGS/existing GPU1/ON_PRS gates. Retains original 60-minute job / 48-minute tests, engine-gated servicer tests and fixed cohort/numeric checks. No gRPC servicer or startup-profile substitution; actual scheduler/plugin API compatibility and first normal GPU qualification remain unproven |
+| `SMG_RUN_AMD_VLLM_PYTHON_SERVICER` | `false` | Original vLLM gRPC Python-servicer full chat plus flush-cache admin case on AMD; requires `SMG_RUN_AMD_LEGS=true`, the existing nonempty AMD GPU1 route and `SMG_RUN_AMD_ON_PRS=true` for PRs. Both original path gates apply; 60-minute job and 45-minute tests await first normal CI qualification |
+| `SMG_RUN_AMD_VLLM_MM_WORKER` | `false` | Original vLLM worker-side multimodal file on AMD, with the default servicer and current parser/sampling; requires the same LEGS/GPU1/PR gates. Original 28-minute job and 20-minute tests; first normal CI must establish actual case results, not just the selection floor |
+| `SMG_RUN_AMD_VLLM_ZMQ` | `false` | Original single-GPU vLLM ZMQ full-chat qualification; requires `SMG_RUN_AMD_LEGS=true`, a nonempty existing `SMG_RUNNER_AMD_GPU_1`, and `SMG_RUN_AMD_ON_PRS=true` for PRs. One engine, current parser/sampling, 86-minute job and 80-minute tests; shared-host full lifecycle admission still applies |
+| `SMG_RUN_AMD_VLLM_ZMQ_DP2` | `false` | AMD DP2 chat opt-in; requires `SMG_RUN_AMD_LEGS=true` and the AMD GPU2 label; PRs also require `SMG_RUN_AMD_ON_PRS=true` |
+| `SMG_RUN_AMD_VLLM_CHAT_TP4` | `false` | AMD TP4 chat opt-in; requires `SMG_RUN_AMD_LEGS=true` and the AMD GPU4 label; PRs also require `SMG_RUN_AMD_ON_PRS=true` |
+| `SMG_RUN_AMD_VLLM_COMPLETIONS` | `false` | Opt in to AMD vLLM completions e2e; requires `SMG_RUN_AMD_LEGS=true`, plus `SMG_RUN_AMD_ON_PRS=true` for PRs. Keep off until model/image compatibility, shared-host admission and the execution budget are qualified and approved |
+| `SMG_RUN_AMD_VLLM_EMBEDDINGS` | `false` | Opt in to AMD vLLM embeddings e2e; requires `SMG_RUN_AMD_LEGS=true`, plus `SMG_RUN_AMD_ON_PRS=true` for PRs. Keep off until model/image compatibility, shared-host admission and the execution budget are qualified and approved |
+| `SMG_RUN_AMD_VLLM_GATEWAY` | `false` | Opt in to AMD vLLM gateway e2e; requires `SMG_RUN_AMD_LEGS=true`, plus `SMG_RUN_AMD_ON_PRS=true` for PRs. Keep off until model/image compatibility, shared-host admission and the execution budget are qualified and approved |
+| `SMG_AMD_MOONCAKE_IMAGE` | Unset | Shared image for `e2e-2gpu-pd-vllm-mooncake-amd` (`SMG_RUN_AMD_VLLM_PD2_MOONCAKE`) and `e2e-4gpu-pd-vllm-nixl-amd` (`SMG_RUN_AMD_NIXL_PD4`); both skip when this image is unset, even if their opt-in is true. Supply a digest-pinned image with NIXL and HIP Mooncake, qualified separately for each caller. Stock `749f6f3` is rejected; input checks do not prove native transfers, and image approval and each caller's enablement require separate authorization |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
 | `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
+| `SMG_RUN_AMD_PR_BENCHMARK_NATIVE_V1` | `false` | Opt in to the existing AMD PR benchmark caller with prepared/final native checks; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep the legacy benchmark flag off to avoid selecting older callers |
+
+This opt-in selects the complete original HTTP/gRPC benchmark; the first normal
+CI run must establish its actual native and measurement qualification. It does
+not establish prior qualification or a security boundary. Main integration and
+weekly performance acceptance remain separate.
+
+The six SGLang caller opt-ins above add no variables or new runner labels. All use
+same-source prepared/final cohort verification and the existing original GPTOSS
+numeric preflight in the fixed image, with full tier-1 model acquisition. The
+Python-servicer row keeps its original 40-minute job / 32-minute tests; single
+ZMQ keeps 60/48 minutes. The completions, embeddings and gateway rows use 60/45
+minute AMD engineering limits, versus unchanged NVIDIA job limits 20/20/30 and
+its reusable 25-minute test default. The full Responses row uses 60/45 minutes
+versus the original NVIDIA 32/24, without filtering its full folder or dropping
+agentic/MCP cases. Its provider-key input stays at the original false default;
+OpenAI/XAI cloud-only classes are not enabled as a workaround. The full Responses
+selection still includes the original Brave and public DeepWiki MCP cases and
+Qwen2.5-14B/GPTOSS20B models. Before activation, verify the original MCP service
+DNS/network access and Brave service/account/charging ownership; source preparation
+makes no provider calls. Native compatibility and complete case outcomes remain
+first-normal-run qualification, not prior identical-pass activation gates.
+Selection floors are guards, not pass counts. Every row retains the shared-host
+390-minute lifecycle, current Router/ownership/lease admission and owned cleanup.
+A local source candidate or passing CPU controls does not establish GPU quality.
+The pure-CPU `finish` gate runs on `ubuntu-24.04` with a five-minute timeout,
+retaining `always()` and all failure/cancelled/unknown result checks.
+
+The DP2 and TP4 opt-ins require the shared switch, their dedicated switch and a
+nonempty runner label for pull requests, pushes to `main` or `release/**`, and
+manual `workflow_dispatch` runs. Pull requests additionally require
+`SMG_RUN_AMD_ON_PRS=true`. TP4 also requires the existing AMD 1-GPU chat job
+(`e2e-1gpu-chat-amd`) to succeed; that job uses `SMG_RUNNER_AMD_GPU_1`, with
+`1-gpu-mi300x` as its fallback. Other job conditions still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.

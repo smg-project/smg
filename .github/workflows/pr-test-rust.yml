@@ -4,7 +4,6 @@ on:
   push:
     branches: [ main, release/** ]
     paths-ignore:
-      - "docs/**"
       - "*.md"
   pull_request:
     branches: [ main, release/** ]
@@ -680,7 +679,7 @@ jobs:
       !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
       && vars.SMG_RUN_AMD_ON_PRS == 'true'
-      && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
+      && (vars.SMG_RUN_AMD_PR_BENCHMARK == 'true' || vars.SMG_RUN_AMD_PR_BENCHMARK_NATIVE_V1 == 'true')
       && github.event_name == 'pull_request'
       && needs.build-wheel.result == 'success'
       && needs.detect-changes.result == 'success'
@@ -696,6 +695,7 @@ jobs:
       contents: read
     env:
       E2E_RUNTIME: sglang
+      SMG_SGLANG_ROCM_IMAGE: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
       E2E_MIN_SELECTED: '2'
       GENAI_BENCH_TEST_TIMEOUT: '600'
       E2E_AMD_REQUIRE_PASSING_CALL: '1'
@@ -708,6 +708,7 @@ jobs:
       - name: Mark owned processes
         run: echo "E2E_JOB_MARKER=benchmark-amd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
       - name: Setup SGLang in its ROCm image
+        id: setup
         run: bash scripts/ci_setup_sglang_rocm_image.sh
       - uses: ./.github/actions/download-build-artifacts
         with:
@@ -729,9 +730,21 @@ jobs:
           python3 -m pip freeze > benchmark-logs-amd/runtime-versions.txt
           "$RUNNER_TEMP/genai-bench/bin/pip" freeze > benchmark-logs-amd/benchmark-versions.txt
           printf '%s\n' "head=$GITHUB_SHA" "runner=$RUNNER_NAME" 'workers=4 protocol=http,grpc engine=sglang gpu=MI300' > benchmark-logs-amd/context.txt
+      - name: Verify prepared SGLang environment
+        id: prepared
+        run: |
+          mkdir -p benchmark-logs-amd
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only benchmark-logs-amd/prepared-environment.json
       - name: Run regular HTTP and gRPC benchmarks
+        id: benchmark
         run: |
           SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks/test_regular_perf.py -s -vv --junitxml=benchmark-logs-amd/junit.xml
+      - name: Verify final SGLang environment
+        id: final
+        if: always() && steps.setup.outcome == 'success'
+        run: |
+          mkdir -p benchmark-logs-amd
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only benchmark-logs-amd/final-environment.json
       - name: Explain measurement scope
         if: always()
         run: echo 'AMD initial slice measures request throughput and latency for regular HTTP/gRPC. The existing NVML utilization sampler cannot measure AMD utilization; its utilization output is not acceptance evidence. PD performance remains a separate gap.' >> "$GITHUB_STEP_SUMMARY"
@@ -740,7 +753,7 @@ jobs:
         if: always()
         run: python3 scripts/ci/validate_pr_benchmark.py --output benchmark-logs-amd/qualification.json
       - name: Summarize AMD results
-        if: always() && steps.qualify.outcome == 'success'
+        if: always() && steps.benchmark.outcome == 'success' && steps.qualify.outcome == 'success' && steps.prepared.outcome == 'success' && steps.final.outcome == 'success'
         run: python3 e2e_test/benchmarks/summarize.py
       - name: Reap owned processes
         if: always() && env.E2E_JOB_MARKER != ''
@@ -1456,6 +1469,37 @@ jobs:
       enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
 
+  # Retain the NVIDIA SGLang row's original 36/28-minute budgets.
+  # Full cold-image preparation, execution and cleanup fit on MI300X is unverified.
+  e2e-1gpu-chat-sglang-amd:
+    name: e2e-1gpu-chat-sglang-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_CHAT == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "sglang"
+      gpu_tier: "1"
+      timeout: 36
+      test_timeout: 28
+      test_dirs: "e2e_test/chat_completions"
+      min_selected: 204
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      gpu_vendor: "amd"
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+      parser: ""
+    secrets: inherit
+
   # The vLLM row of e2e-1gpu-chat on an AMD Instinct self-hosted runner, in
   # vLLM's ROCm image of the CI's vLLM pin (scripts/ci_install_vllm.sh). Off
   # until AMD's runner is registered and SMG_RUN_AMD_LEGS is "true"; then it
@@ -1625,6 +1669,98 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'sglang' }}
     secrets: inherit
 
+  # Default-off AMD counterparts of the original Python-servicer and worker-MM rows.
+  e2e-1gpu-chat-python-servicer-vllm-amd:
+    name: e2e-1gpu-chat-python-servicer-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_PYTHON_SERVICER == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+      min_selected: 202
+      servicer_impl: python
+      enabled: ${{ needs.detect-changes.outputs.skip-chat-completions != 'true' }}
+      gpu_vendor: amd
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  e2e-1gpu-chat-mm-worker-vllm-amd:
+    name: e2e-1gpu-chat-mm-worker-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_MM_WORKER == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 28
+      test_timeout: 20
+      test_dirs: e2e_test/chat_completions/test_multimodal.py
+      min_selected: 5
+      mm_processing: worker
+      gpu_vendor: amd
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # AMD counterpart of the original single-GPU vLLM ZMQ chat row.
+  # A first reviewed normal CI run qualifies the unchanged suite within these caps.
+  e2e-1gpu-chat-zmq-vllm-amd:
+    name: e2e-1gpu-chat-zmq-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_ZMQ == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "vllm"
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      # Eight 300s model starts plus the original 40-minute test allowance.
+      # These engineering caps are not measured AMD duration or coverage.
+      timeout: 86
+      test_timeout: 80
+      test_dirs: "e2e_test/chat_completions"
+      min_selected: 202
+      connection_mode: "zmq"
+      zmq_engine_count: "1"
+      startup_profile: "vllm-zmq1-chat"
+      gpu_vendor: "amd"
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   e2e-2gpu-chat-zmq-dp:
     name: e2e-2gpu-chat-zmq-dp (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -1669,6 +1805,126 @@ jobs:
       zmq_engine_count: "2"
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+    secrets: inherit
+
+  # AMD counterpart of e2e-2gpu-chat-zmq-dp, using vllm-zmq-dp2-chat.
+  # Enable with SMG_RUN_AMD_LEGS, SMG_RUN_AMD_VLLM_ZMQ_DP2 and SMG_RUNNER_AMD_GPU_2.
+  e2e-2gpu-chat-zmq-dp-vllm-amd:
+    name: e2e-2gpu-chat-zmq-dp-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    # Tier1 selects tests/models; the runner requests two GPU devices for DP ranks0/1.
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_ZMQ_DP2 == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_2 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "vllm"
+      gpu_tier: "1"
+      # Reference-lane limits; AMD timings remain unqualified.
+      # Keep this lane off until the full suite passes within these limits.
+      # One startup pass (40 min) plus the prior test-step allowance (40 min).
+      # Planning budget only; measure AMD duration before enabling this lane.
+      timeout: 86
+      test_timeout: 80
+      test_dirs: "e2e_test/chat_completions"
+      min_selected: 202
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 }}
+      gpu_vendor: "amd"
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      connection_mode: "zmq"
+      zmq_engine_count: "2"
+      startup_profile: "vllm-zmq-dp2-chat"
+    secrets: inherit
+
+  # Independent opt-in; ordinary AMD chat does not enable this API lane.
+  e2e-1gpu-completions-vllm-amd:
+    name: e2e-1gpu-completions-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_COMPLETIONS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/completions
+      min_selected: 15
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # Independent opt-in; ordinary AMD chat does not enable this API lane.
+  e2e-1gpu-embeddings-vllm-amd:
+    name: e2e-1gpu-embeddings-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_EMBEDDINGS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-embeddings != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/embeddings
+      min_selected: 20
+      extra_deps: sentence-transformers
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # Independent opt-in; ordinary AMD chat does not enable this API lane.
+  e2e-1gpu-gateway-vllm-amd:
+    name: e2e-1gpu-gateway-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_GATEWAY == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/router
+      min_selected: 3
+      enabled: ${{ needs.detect-changes.outputs.skip-chat-completions != 'true' }}
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
   e2e-1gpu-completions:
@@ -1788,6 +2044,185 @@ jobs:
   # e2e-2gpu-chat was retired: all chat_completions tests are tp=1 now
   # and run under e2e-1gpu-chat above.
 
+  # Independently opt-in original SGLang business callers on the fixed AMD cohort.
+  e2e-1gpu-chat-python-servicer-sglang-amd:
+    name: e2e-1gpu-chat-python-servicer-sglang-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_PYTHON_SERVICER == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "sglang"
+      gpu_tier: "1"
+      timeout: 40
+      test_timeout: 32
+      test_dirs: "e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py"
+      min_selected: 204
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      gpu_vendor: "amd"
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+      parser: ""
+      servicer_impl: python
+      servicer_unit_tests: true
+    secrets: inherit
+
+  e2e-1gpu-completions-sglang-amd:
+    name: e2e-1gpu-completions-sglang-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_COMPLETIONS == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/completions
+      min_selected: 15
+      gpu_vendor: amd
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+    secrets: inherit
+
+  e2e-1gpu-embeddings-sglang-amd:
+    name: e2e-1gpu-embeddings-sglang-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_EMBEDDINGS == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-embeddings != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/embeddings
+      min_selected: 18
+      extra_deps: sentence-transformers
+      gpu_vendor: amd
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+    secrets: inherit
+
+  e2e-1gpu-gateway-sglang-amd:
+    name: e2e-1gpu-gateway-sglang-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_GATEWAY == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/router
+      min_selected: 23
+      gpu_vendor: amd
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+    secrets: inherit
+
+  e2e-1gpu-chat-zmq-sglang-amd:
+    name: e2e-1gpu-chat-zmq-sglang-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_ZMQ == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 60
+      test_timeout: 48
+      test_dirs: e2e_test/chat_completions
+      min_selected: 209
+      connection_mode: zmq
+      zmq_engine_count: "1"
+      servicer_unit_tests: true
+      gpu_vendor: amd
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+    secrets: inherit
+
+  # Full original SGLang Responses contract; the partial vLLM41 row stays separate.
+  e2e-1gpu-responses-sglang-amd:
+    name: e2e-1gpu-responses-sglang-amd (sglang; full original suite)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_RESPONSES == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-agentic != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      # Engineering allowance, not measured duration or a reduced selection.
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/responses
+      min_selected: 92
+      setup_agentic_deps: true
+      gpu_vendor: amd
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+    secrets: inherit
+
   e2e-1gpu-responses:
     needs: [build-wheel, detect-changes]
     if: >-
@@ -1806,6 +2241,119 @@ jobs:
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+    secrets: inherit
+
+  # Partial local Responses tests for vLLM on AMD, selected by the paths below.
+  # The full SGLang e2e-1gpu-responses job remains separate and unchanged.
+  # Off unless SMG_RUN_AMD_RESPONSES_CORE is true; PRs also need SMG_RUN_AMD_ON_PRS.
+  # Validate collected cases and shared-runner admission before enabling it.
+  e2e-1gpu-responses-memory-core-amd:
+    name: e2e-1gpu-responses-memory-core-amd (vllm; partial local core)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_RESPONSES_CORE == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-agentic != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 32
+      test_timeout: 24
+      # Require all 41 cases in this partial local Responses selection.
+      # The full e2e-1gpu-responses job retains its min_selected: 92 floor.
+      test_dirs: >-
+        e2e_test/responses/test_background.py::TestBackgroundResponsesGptOss
+        e2e_test/responses/test_sampling_params.py::TestSamplingParamsHarmony
+        e2e_test/responses/test_state_management.py::TestStateManagementGptOss
+        e2e_test/responses/test_streaming_events.py::TestStreamingEventsGptOss
+        e2e_test/responses/test_structured_output.py::TestStructuredOutputGptOss
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_auto
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_required
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_specific_function
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_tool_choice_streaming
+        e2e_test/responses/test_tools_call.py::TestToolChoiceGptOss::test_basic_function_call
+      test_filter: ""
+      min_selected: 41
+      setup_agentic_deps: false
+      provider_api_keys: false
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  e2e-2gpu-pd-vllm-nixl-amd:
+    # Includes the local Messages gRPC cases in the full router selection.
+    # Qualify selection and shared-runner admission before enabling this lane.
+    name: e2e-2gpu-pd-vllm-nixl-amd (vllm)
+    needs: [e2e-1gpu-gateway, detect-changes]
+    # Require an explicit AMD route; a generic GPU fallback may select NVIDIA.
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_NIXL_PD == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_2 != ''
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "2"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 }}
+      timeout: 50
+      test_timeout: 34
+      test_dirs: e2e_test/router
+      vllm_kv_backend: nixl
+      # Rank-pin and placement cases inspect the per-request servicer log.
+      worker_log_filter: info,engine_servicer::request=debug
+      min_selected: 15 # Selection floor; the full applicable router suite is required
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # HIP Mooncake availability in this image is unqualified; keep this lane off.
+  # Image/transfer qualification and shared-runner admission are separate requirements.
+  e2e-2gpu-pd-vllm-mooncake-amd:
+    name: e2e-2gpu-pd-vllm-mooncake-amd (vllm)
+    needs: [build-wheel, e2e-1gpu-gateway, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_AMD_MOONCAKE_IMAGE != ''
+      && vars.SMG_RUN_AMD_VLLM_PD2_MOONCAKE == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_2 != ''
+      && needs.build-wheel.result == 'success'
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && (github.event_name != 'pull_request' || vars.SMG_RUN_AMD_ON_PRS == 'true')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "2"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 }}
+      timeout: 50
+      test_timeout: 34
+      test_dirs: e2e_test/router
+      test_filter: ""
+      min_selected: 15 # Selection floor; all applicable router cases remain required.
+      vllm_kv_backend: mooncake
+      startup_profile: "vllm-mooncake-pd2"
+      worker_log_filter: info,engine_servicer::request=debug
+      gpu_vendor: amd
+      container_image: ${{ vars.SMG_AMD_MOONCAKE_IMAGE }}
+      container_options: ${{ format('{0} --ulimit memlock=-1:-1', vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') }}
     secrets: inherit
 
   e2e-2gpu-pd:
@@ -1930,6 +2478,41 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
+  # AMD vLLM counterpart of e2e-4gpu-chat, using vllm-4gpu-chat.
+  # Enable with SMG_RUN_AMD_LEGS, SMG_RUN_AMD_VLLM_CHAT_TP4 and SMG_RUNNER_AMD_GPU_4.
+  e2e-4gpu-chat-vllm-amd:
+    name: e2e-4gpu-chat-vllm-amd (vllm)
+    needs: [e2e-1gpu-chat-amd, detect-changes]
+    # The existing AMD vLLM chat is the same-engine prerequisite for TP4.
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_CHAT_TP4 == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_4 != ''
+      && needs.e2e-1gpu-chat-amd.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "vllm"
+      gpu_tier: "4"
+      # Reference-lane limits; AMD timings remain unqualified.
+      # Keep this lane off until the full suite passes within these limits.
+      # One startup pass (30 min) plus the prior test-step allowance (25 min).
+      # Planning budget only; measure AMD duration before enabling this lane.
+      timeout: 60
+      test_timeout: 55
+      startup_profile: "vllm-4gpu-chat"
+      test_dirs: "e2e_test/chat_completions"
+      min_selected: 32
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_4 }}
+      gpu_vendor: "amd"
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
     needs: [e2e-1gpu-gateway, detect-changes]
@@ -2046,6 +2629,42 @@ jobs:
       vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
       servicer_impl: ${{ matrix.servicer_impl || '' }}
+    secrets: inherit
+
+  # AMD counterpart of the full vLLM/NIXL four-GPU PD topology slice.
+  # Its opt-in is independent of the two-GPU NIXL lane.
+  # This mixed-transport slice also needs Mooncake, hence SMG_AMD_MOONCAKE_IMAGE.
+  e2e-4gpu-pd-vllm-nixl-amd:
+    name: e2e-4gpu-pd-vllm-nixl-amd (vllm)
+    needs: [e2e-1gpu-gateway, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_AMD_MOONCAKE_IMAGE != ''
+      && vars.SMG_RUN_AMD_NIXL_PD4 == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_4 != ''
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "4"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_4 }}
+      timeout: 50
+      test_timeout: 42
+      test_dirs: e2e_test/router/test_pd_topologies.py
+      test_filter: '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"'
+      # Preserve the mixed-transport and refusal cases, not only pure NIXL.
+      vllm_kv_backend: nixl
+      vllm_extra_kv_backends: mooncake
+      worker_log_filter: info,engine_servicer::request=debug
+      min_selected: 14 # Full original17-ID coverage is separate from this floor.
+      gpu_vendor: amd
+      container_image: ${{ vars.SMG_AMD_MOONCAKE_IMAGE }}
+      container_options: ${{ format('{0} --ulimit memlock=-1:-1', vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') }}
     secrets: inherit
 
   # --- CPU E2E: the classes on the scripted mock worker ---
@@ -2490,10 +3109,122 @@ jobs:
           name: genai-bench-results-go-bindings
           path: benchmark_go_bindings/
 
+  # Frozen original38 index1 / ordinal2; published Source definition; dedicated opt-in OFF by default.
+  e2e-1gpu-chat-legacy-vllm-amd:
+    name: e2e-1gpu-chat-legacy-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_CHAT_LEGACY == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && (github.event_name != 'pull_request'
+          || vars.SMG_RUN_AMD_ON_PRS == 'true')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "vllm"
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 32
+      test_timeout: 24
+      test_dirs: "e2e_test/chat_completions"
+      test_filter: ""
+      extra_models: ""
+      connection_mode: ""
+      servicer_impl: ""
+      parser: "legacy"
+      sampling_profile: "original1"
+      startup_profile: "original1-vllm-chat-legacy"
+      min_selected: 202
+      servicer_unit_tests: true
+      setup_agentic_deps: false
+      gpu_vendor: "amd"
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # Frozen original38 index4 / ordinal5; published Source definition; dedicated opt-in OFF by default.
+  e2e-1gpu-chat-symphony-sglang-amd:
+    name: e2e-1gpu-chat-symphony-sglang-amd (sglang)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_CHAT_SYMPHONY == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && (github.event_name != 'pull_request'
+          || vars.SMG_RUN_AMD_ON_PRS == 'true')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "sglang"
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 36
+      test_timeout: 28
+      test_dirs: "e2e_test/chat_completions"
+      test_filter: ""
+      extra_models: ""
+      connection_mode: ""
+      servicer_impl: ""
+      parser: "symphony"
+      min_selected: 204
+      servicer_unit_tests: false
+      setup_agentic_deps: false
+      gpu_vendor: "amd"
+      container_image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      final_environment_check: true
+    secrets: inherit
+
+  # Frozen original38 index5 / ordinal6; published Source definition; dedicated opt-in OFF by default.
+  e2e-1gpu-chat-symphony-vllm-amd:
+    name: e2e-1gpu-chat-symphony-vllm-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_CHAT_SYMPHONY == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_1 != ''
+      && needs.build-wheel.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && (github.event_name != 'pull_request'
+          || vars.SMG_RUN_AMD_ON_PRS == 'true')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: "vllm"
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 }}
+      timeout: 32
+      test_timeout: 24
+      test_dirs: "e2e_test/chat_completions"
+      test_filter: ""
+      extra_models: ""
+      connection_mode: ""
+      servicer_impl: ""
+      parser: "symphony"
+      min_selected: 202
+      servicer_unit_tests: false
+      setup_agentic_deps: false
+      gpu_vendor: "amd"
+      container_image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer-vllm-amd, e2e-1gpu-chat-mm-worker-vllm-amd, e2e-1gpu-chat-zmq-vllm-amd, e2e-1gpu-chat-sglang-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd-vllm-nixl-amd, e2e-2gpu-pd-vllm-mooncake-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-4gpu-pd-vllm-nixl-amd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-chat-legacy-vllm-amd, e2e-1gpu-chat-symphony-sglang-amd, e2e-1gpu-chat-symphony-vllm-amd, e2e-1gpu-completions-vllm-amd, e2e-1gpu-embeddings-vllm-amd, e2e-1gpu-gateway-vllm-amd, e2e-1gpu-chat-python-servicer-sglang-amd, e2e-1gpu-completions-sglang-amd, e2e-1gpu-embeddings-sglang-amd, e2e-1gpu-gateway-sglang-amd, e2e-1gpu-chat-zmq-sglang-amd, e2e-1gpu-responses-sglang-amd]
     if: always()
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -2542,6 +3273,36 @@ jobs:
 
       - name: Check CI result
         run: |
+          # Keep optional AMD verdicts closed, including empty or unknown results.
+          while read -r job result; do
+            case "$result" in
+              success|skipped) ;;
+              failure|cancelled)
+                echo "$job failed or was cancelled"
+                exit 1 ;;
+              *)
+                echo "$job returned an unknown CI result: ${result:-<empty>}"
+                exit 1 ;;
+            esac
+          done <<'AMD_RESULTS'
+          e2e-1gpu-chat-python-servicer-vllm-amd ${{ needs.e2e-1gpu-chat-python-servicer-vllm-amd.result }}
+          e2e-1gpu-chat-mm-worker-vllm-amd ${{ needs.e2e-1gpu-chat-mm-worker-vllm-amd.result }}
+          e2e-1gpu-chat-zmq-vllm-amd ${{ needs.e2e-1gpu-chat-zmq-vllm-amd.result }}
+          e2e-1gpu-chat-sglang-amd ${{ needs.e2e-1gpu-chat-sglang-amd.result }}
+          e2e-1gpu-responses-memory-core-amd ${{ needs.e2e-1gpu-responses-memory-core-amd.result }}
+          e2e-2gpu-pd-vllm-nixl-amd ${{ needs.e2e-2gpu-pd-vllm-nixl-amd.result }}
+          e2e-2gpu-pd-vllm-mooncake-amd ${{ needs.e2e-2gpu-pd-vllm-mooncake-amd.result }}
+          e2e-4gpu-pd-vllm-nixl-amd ${{ needs.e2e-4gpu-pd-vllm-nixl-amd.result }}
+          e2e-1gpu-chat-legacy-vllm-amd ${{ needs.e2e-1gpu-chat-legacy-vllm-amd.result }}
+          e2e-1gpu-chat-symphony-sglang-amd ${{ needs.e2e-1gpu-chat-symphony-sglang-amd.result }}
+          e2e-1gpu-chat-symphony-vllm-amd ${{ needs.e2e-1gpu-chat-symphony-vllm-amd.result }}
+          e2e-1gpu-chat-python-servicer-sglang-amd ${{ needs.e2e-1gpu-chat-python-servicer-sglang-amd.result }}
+          e2e-1gpu-completions-sglang-amd ${{ needs.e2e-1gpu-completions-sglang-amd.result }}
+          e2e-1gpu-embeddings-sglang-amd ${{ needs.e2e-1gpu-embeddings-sglang-amd.result }}
+          e2e-1gpu-gateway-sglang-amd ${{ needs.e2e-1gpu-gateway-sglang-amd.result }}
+          e2e-1gpu-chat-zmq-sglang-amd ${{ needs.e2e-1gpu-chat-zmq-sglang-amd.result }}
+          e2e-1gpu-responses-sglang-amd ${{ needs.e2e-1gpu-responses-sglang-amd.result }}
+          AMD_RESULTS
           # A job that runs into its timeout-minutes ends "cancelled", not
           # "failure", and fails this gate the same way (smg-project/smg-lab#171).
           # A run cancelled as a whole ends with this gate failed too: it did
@@ -2564,6 +3325,22 @@ jobs:
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-python-servicer-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-completions-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-embeddings-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-zmq-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-python-servicer-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-mm-worker-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-zmq-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-completions-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-embeddings-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-legacy-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-symphony-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-symphony-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-chat-zmq-dp-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-chat-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-python-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
@@ -2573,12 +3350,17 @@ jobs:
                 "${{ needs.e2e-1gpu-realtime.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-gateway.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-responses.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-responses-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-responses-memory-core-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd-vllm-nixl-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd-vllm-mooncake-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-pd.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-pd-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-gateway.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-epd.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-pd-vllm-nixl-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-cpu-mock.result }}" =~ $bad || \
                 "${{ needs.e2e-vendor.result }}" =~ $bad || \
                 "${{ needs.go-unit-tests.result }}" =~ $bad || \

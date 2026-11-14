@@ -1,0 +1,19 @@
+{
+  "sdk_files": {
+    "srt/layers/quantization/__init__.py": "70ae391b2635b04a613f5195169337d186c681467fb3b486dfc827224a98814e",
+    "srt/layers/quantization/mxfp4.py": "77170fb5097e5623276e8a70201bb39aea1b07fd078fb75a589173ccad2fa2ce",
+    "srt/layers/quantization/fp8_utils.py": "e6c68b647baf3b8ea2275cd9c2fccb514082387440f4e82765a606f3b7f81064",
+    "srt/layers/quantization/mxfp4_tensor.py": "2fa61ad1e7c0d8eabb521458fd431f1a710faf79e7f1b88461c3a9911921a76a",
+    "srt/layers/moe/moe_runner/triton.py": "e45a86545e9140dbe31d85683396de57722f477ee5e0b2b0b42cbee42e8d2e1e",
+    "srt/layers/moe/moe_runner/base.py": "971b370e1903c9c6fde4a6649b502b7372eef672773357242cbe27339de91b85",
+    "srt/layers/moe/moe_runner/triton_utils/fused_moe.py": "e4ddc6c14bfe63cd0894bcbe6347392bbc96784afd18b5fb83ef2ac95e003a3b",
+    "srt/layers/moe/utils.py": "e1203dcdb047a041273716f8f791c9ea152f47e642afebee87d1e2c328259c0a",
+    "srt/models/gpt_oss.py": "4386dd1b4a711e58644a342c7ab6e2bc509c9d9bcf8ff6ccc4aac0d2e591c0e1",
+    "srt/server_args.py": "1dc6d150bf7c4ef5c2316c2ce21ca28ea557ac26fcdb150d21ac48fff1a784e6",
+    "srt/runtime_context.py": "50f1e87490d0b5c2bb1ddf820d65719cd1c9b876d265e902934692cd3719b10e",
+    "srt/distributed/parallel_state.py": "8c2cdbbe98ae59894f1ff682a038cb21581421d2f889aa36604cd51542395da8"
+  },
+  "model": "openai/gpt-oss-20b",
+  "revision": "6cee5e81ee83917806bbde320786a8fb61efebee",
+  "cohort": "Exact copied lmsysorg/sglang image4420 plus reviewed P14twofile patch; not unmodified official SDK. Native files unchanged; no version==ABI inference."
+}

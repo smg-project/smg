@@ -6,6 +6,7 @@ on:
       - .github/workflows/ci-tooling-tests.yml
       - .github/workflows/pr-test-rust.yml
       - .github/workflows/e2e-gpu-job.yml
+      - .github/workflows/nightly-benchmark-amd.yml
       - .github/workflows/nightly-bfcl.yml
       - .github/workflows/pr-naming-check.yml
       - .pre-commit-config.yaml

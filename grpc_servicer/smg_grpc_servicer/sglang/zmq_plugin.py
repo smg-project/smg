@@ -34,10 +34,12 @@ servicer's scheduler ranks.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import os
 import pkgutil
+from array import array
 from typing import Any
 
 from smg_grpc_servicer.sglang import (
@@ -122,6 +124,9 @@ def register() -> None:
     HookRegistry.register(f"{_SCHEDULER}.maybe_init_rust_server", after_rust_server, HookType.AFTER)
     HookRegistry.register(f"{_RECEIVER}._pull_raw_reqs", pull_raw_reqs, HookType.AROUND)
     HookRegistry.register(f"{_SCHEDULER}.run_event_loop", run_event_loop, HookType.AROUND)
+    target = f"{_SCHEDULER}._maybe_compute_mrope_positions"
+    if _resolves(target):
+        HookRegistry.register(target, mrope_from_unpadded, HookType.AROUND)
     from smg_grpc_servicer.sglang import mm_broadcast
 
     if mm_broadcast.enabled():
@@ -132,6 +137,29 @@ def register() -> None:
             logger.info("SMG plugin: %s is unavailable; using inline media broadcast", target)
 
     logger.info("SMG ZMQ plugin: scheduler will dial %s", handshake_address())
+
+
+def mrope_from_unpadded(original, scheduler, req, *args, **kwargs):
+    """Let the SDK compute positions from image anchors, keeping hash tokens for KV identity."""
+    mm = getattr(req, "multimodal_inputs", None)
+    unpadded = getattr(req, "origin_input_ids_unpadded", None)
+    padded = getattr(req, "origin_input_ids", None)
+    if (
+        mm is not None
+        and getattr(mm, "mrope_positions", None) is None
+        and getattr(scheduler, "_mm_processor", None) is not None
+        and (isinstance(unpadded, array) and unpadded.typecode == "q" or isinstance(unpadded, list))
+        and len(unpadded) > 0
+        and isinstance(padded, (array, list))
+        and len(unpadded) == len(padded)
+        and all(type(token) is int and 0 <= token < 2**63 for token in unpadded)
+    ):
+        # The scheduler pads first; its saved buffer still has the expanded image anchors.
+        # A shallow view shares multimodal results without rewriting the caller's cache tokens.
+        req_view = copy.copy(req)
+        req_view.origin_input_ids = unpadded
+        return original(scheduler, req_view, *args, **kwargs)
+    return original(scheduler, req, *args, **kwargs)
 
 
 def create_channels(original, cls, *args, **kwargs):

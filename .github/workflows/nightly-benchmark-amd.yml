@@ -112,6 +112,7 @@ jobs:
       # compiles its kernels: SGLang's first Qwen3-30B-A3B worker takes about
       # 300 s on MI300X, the default startup wait. Raise the floor on every
       # startup wait (effective_startup_timeout in e2e_test/infra).
+      SMG_SGLANG_ROCM_IMAGE: ${{ matrix.variant.runtime == 'sglang' && matrix.variant.image || '' }}
       E2E_STARTUP_TIMEOUT: "900"
     strategy:
       fail-fast: false
@@ -148,6 +149,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup ${{ matrix.variant.id }} backend (in its ROCm image)
+        id: setup
         if: steps.filter.outputs.skip != 'true'
         run: bash scripts/${{ matrix.variant.setup }}
 
@@ -175,6 +177,23 @@ jobs:
           bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}" "truststore<0.10.5"
           echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
 
+      - name: Record SGLang runtime versions
+        if: steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'
+        run: |
+          mkdir -p nightly_gateway_logs
+          python3 -m pip freeze > nightly_gateway_logs/runtime-versions.txt
+          "$RUNNER_TEMP/genai-bench/bin/pip" freeze > nightly_gateway_logs/benchmark-versions.txt
+
+      - name: Verify prepared SGLang ROCm cohort
+        id: prepared
+        if: steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'
+        timeout-minutes: 2
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ matrix.variant.image }}
+        run: |
+          mkdir -p nightly_gateway_logs
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only nightly_gateway_logs/sglang-native-environment-prepared.json
+
       - name: Run benchmark
         if: steps.filter.outputs.skip != 'true'
         env:
@@ -192,6 +211,16 @@ jobs:
             pytest e2e_test/benchmarks/test_nightly_perf.py \
               -k "${{ matrix.model.test_class }}" \
               -s -vv -o log_cli=true --log-cli-level=INFO
+
+      # Native verification failure keeps this job failed. Partial raw results
+      # remain available for diagnosis; they are not qualified measurements.
+      - name: Verify final SGLang ROCm cohort
+        id: final
+        if: always() && steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang' && steps.setup.outcome == 'success'
+        timeout-minutes: 2
+        run: |
+          mkdir -p nightly_gateway_logs
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only nightly_gateway_logs/sglang-native-environment-final.json
 
       - name: Upload benchmark results
         if: always() && steps.filter.outputs.skip != 'true'
@@ -222,6 +251,7 @@ jobs:
     # and wait if the whole occupancy would cross Router's 05:00 UTC start.
     timeout-minutes: 360
     env:
+      SMG_SGLANG_ROCM_IMAGE: ${{ matrix.variant.runtime == 'sglang' && matrix.variant.image || '' }}
       E2E_STARTUP_TIMEOUT: "900" # as in single-worker
     strategy:
       fail-fast: false
@@ -255,6 +285,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup ${{ matrix.variant.id }} backend (in its ROCm image)
+        id: setup
         if: steps.filter.outputs.skip != 'true'
         run: bash scripts/${{ matrix.variant.setup }}
 
@@ -278,6 +309,23 @@ jobs:
           bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}" "truststore<0.10.5"
           echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
 
+      - name: Record SGLang runtime versions
+        if: steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'
+        run: |
+          mkdir -p nightly_gateway_logs
+          python3 -m pip freeze > nightly_gateway_logs/runtime-versions.txt
+          "$RUNNER_TEMP/genai-bench/bin/pip" freeze > nightly_gateway_logs/benchmark-versions.txt
+
+      - name: Verify prepared SGLang ROCm cohort
+        id: prepared
+        if: steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang'
+        timeout-minutes: 2
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ matrix.variant.image }}
+        run: |
+          mkdir -p nightly_gateway_logs
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only nightly_gateway_logs/sglang-native-environment-prepared.json
+
       - name: Run benchmark
         if: steps.filter.outputs.skip != 'true'
         env:
@@ -294,6 +342,16 @@ jobs:
             pytest e2e_test/benchmarks/test_nightly_perf.py \
               -k "${{ matrix.model.test_class }}" \
               -s -vv -o log_cli=true --log-cli-level=INFO
+
+      # Native verification failure keeps this job failed. Partial raw results
+      # remain available for diagnosis; they are not qualified measurements.
+      - name: Verify final SGLang ROCm cohort
+        id: final
+        if: always() && steps.filter.outputs.skip != 'true' && matrix.variant.runtime == 'sglang' && steps.setup.outcome == 'success'
+        timeout-minutes: 2
+        run: |
+          mkdir -p nightly_gateway_logs
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only nightly_gateway_logs/sglang-native-environment-final.json
 
       - name: Upload benchmark results
         if: always() && steps.filter.outputs.skip != 'true'
