@@ -128,6 +128,7 @@ use crate::{
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::{cache_trace, metrics::Metrics},
     worker::{
+        endpoint::Endpoint,
         liveness,
         load_state::{LoadReceiver, LoadSnapshot},
         KvEventMonitor, KvIndex, Worker,
@@ -969,7 +970,7 @@ impl CacheAwarePolicy {
 
         debug!(
             branch = "kv_pressure_expected_wait",
-            worker = worker_url,
+            worker = workers[selected].redacted_url(),
             model_id,
             "Cache-aware selection"
         );
@@ -1430,7 +1431,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if released > 0 {
             Metrics::record_policy_inflight_reconciled(self.name(), released);
             debug!(
-                worker = worker_url,
+                worker = Endpoint::redacted_url(worker_url).as_str(),
                 in_flight, released, "Released bookings whose completion never arrived"
             );
         }
@@ -2567,7 +2568,7 @@ impl CacheAwarePolicy {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 observe(overlap_of(idx));
                 debug!(
-                    worker = workers[idx].url(),
+                    worker = workers[idx].redacted_url(),
                     branch = "warmup_slice",
                     request_blocks = content_hashes.len(),
                     "Cache miss routed to a warming worker"
@@ -2585,7 +2586,7 @@ impl CacheAwarePolicy {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
             observe(overlap_of(idx));
             debug!(
-                worker = workers[idx].url(),
+                worker = workers[idx].redacted_url(),
                 branch = "warmup_divert",
                 overlap_blocks = best_overlap as u64,
                 request_blocks = content_hashes.len(),
@@ -2618,7 +2619,7 @@ impl CacheAwarePolicy {
         Metrics::record_worker_cache_aware_policy_branch(branch);
         observe(overlap);
         debug!(
-            worker = workers[idx].url(),
+            worker = workers[idx].redacted_url(),
             branch,
             overlap_blocks,
             request_blocks = content_hashes.len(),
@@ -3023,7 +3024,11 @@ impl CacheAwarePolicy {
         debug!(
             index = "tree",
             branch,
-            worker = selected_url.or(fallback_url).unwrap_or("none"),
+            worker = selected_url
+                .or(fallback_url)
+                .map(Endpoint::redacted_url)
+                .as_deref()
+                .unwrap_or("none"),
             model_id,
             matched_ratio = f64::from(matched_ratio),
             threshold = f64::from(self.config.cache_threshold),
@@ -3035,7 +3040,8 @@ impl CacheAwarePolicy {
     }
 
     /// One decision line per hash-mode selection. `level` is the matched
-    /// boundary (0 for the fallback branches).
+    /// boundary (0 for the fallback branches), `worker` the selected worker's
+    /// masked address.
     fn log_hash_decision(branch: &'static str, level: usize, worker: &str, model_id: &str) {
         if cache_trace::enabled() {
             cache_trace::prediction(serde_json::json!({
@@ -3140,7 +3146,7 @@ impl CacheAwarePolicy {
                 workers[selected].url(),
                 now,
             );
-            Self::log_hash_decision(branch, boundary, workers[selected].url(), model_id);
+            Self::log_hash_decision(branch, boundary, workers[selected].redacted_url(), model_id);
             return Some(selected);
         }
 
@@ -3184,7 +3190,7 @@ impl CacheAwarePolicy {
                 now,
             );
         }
-        Self::log_hash_decision(branch, 0, workers[idx].url(), model_id);
+        Self::log_hash_decision(branch, 0, workers[idx].redacted_url(), model_id);
         Some(idx)
     }
 

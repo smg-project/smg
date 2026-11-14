@@ -38,7 +38,10 @@ use crate::{
         extract_routing_key_hint, extract_routing_key_hint_named, parse_routing_tokens_hint,
         ROUTING_KEY_HINT_MAX_BYTES,
     },
-    worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
+    worker::{
+        endpoint::Endpoint, load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink,
+        Worker, WorkerType,
+    },
 };
 
 /// Routes a request completion to the policy that placed the request: the
@@ -675,7 +678,7 @@ impl PolicyRegistry {
                 source,
                 key,
                 branch = branch.as_str(),
-                worker = result.map_or("none", |idx| workers[idx].url()),
+                worker = result.map_or("none", |idx| workers[idx].redacted_url()),
                 model_id = result.map_or("none", |idx| workers[idx].model_id()),
                 "Sticky routing decision"
             );
@@ -1325,7 +1328,8 @@ impl PolicyRegistry {
                 cache_aware.remove_worker_by_url(worker_url);
                 debug!(
                     "Removed worker {} from cache-aware policy for model {}",
-                    worker_url, model_id
+                    Endpoint::redacted_url(worker_url),
+                    model_id
                 );
             }
         }
@@ -1344,7 +1348,8 @@ impl PolicyRegistry {
                     cache_aware.remove_worker_by_url(worker_url);
                     debug!(
                         "Removed worker {} from {} cache-aware policy",
-                        worker_url, worker_type
+                        Endpoint::redacted_url(worker_url),
+                        worker_type
                     );
                 }
             }
@@ -2430,6 +2435,82 @@ mod tests {
         assert!(logs_contain("vacant"));
         reg.select_worker(&policy, &workers, &info).unwrap();
         assert!(logs_contain("occupied_hit"));
+    }
+
+    /// The sticky decision line and the two removal lines name a worker
+    /// registered with a password and a query token by its masked address.
+    #[test]
+    #[traced_test]
+    fn the_debug_lines_name_a_worker_masked() {
+        // What tells each line among the test's lines.
+        const LINES: [(&str, &str); 3] = [
+            ("the sticky decision", "Sticky routing decision"),
+            (
+                "the removal from a model's policy",
+                "from cache-aware policy for model",
+            ),
+            (
+                "the removal from a role's policy",
+                "from prefill cache-aware policy",
+            ),
+        ];
+        let address = |host: &str| format!("http://user:s3cret@{host}:8000/v1?token=s3cret");
+
+        let registry = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let workers = vec![
+            worker_of(&address("w1"), WorkerType::Regular),
+            worker_of(&address("w2"), WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("conv1"),
+            ..Default::default()
+        };
+        registry
+            .select_worker(&registry.get_default_policy(), &workers, &info)
+            .unwrap();
+
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.on_worker_added("llama-3", Some("cache_aware"));
+        registry.remove_worker_from_cache_aware("llama-3", &address("w3"));
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.remove_worker_from_pd_cache_aware(&address("w4"));
+
+        logs_assert(|lines: &[&str]| {
+            let written = |told_by: &str| -> Vec<&str> {
+                lines
+                    .iter()
+                    .copied()
+                    .filter(|line| line.contains(told_by))
+                    .collect()
+            };
+            let unwritten: Vec<&str> = LINES
+                .iter()
+                .filter(|(_, told_by)| written(told_by).is_empty())
+                .map(|(line, _)| *line)
+                .collect();
+            if !unwritten.is_empty() {
+                return Err(format!("lines nothing wrote: {unwritten:#?}"));
+            }
+            let whole: Vec<&str> = LINES
+                .iter()
+                .filter(|(_, told_by)| {
+                    written(told_by)
+                        .iter()
+                        .any(|line| !line.contains("http://***@") || line.contains("s3cret"))
+                })
+                .map(|(line, _)| *line)
+                .collect();
+            if whole.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "lines that do not name their worker masked: {whole:#?}"
+                ))
+            }
+        });
     }
 
     /// An overloaded pin must respill through the existing reassignment path.
