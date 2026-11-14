@@ -443,12 +443,7 @@ impl PolicyRegistry {
     /// keyed request keeps the keyed path when the sticky routing-key
     /// override places it on either side or a side's policy pins the key
     /// itself (`manual`: the engine's pair binding pins no session), and
-    /// the pins move behind the engine's view in a later step. A pair with
-    /// a `cache_aware` side keeps the legacy path as well: the pair request
-    /// carries no affinity facts yet, so the engine would place that side
-    /// by load alone and record no route; the legacy policy's own match
-    /// places it until the pair path carries the facts the single request
-    /// does.
+    /// the pins move behind the engine's view in a later step.
     pub(crate) fn pair_engine_for(&self, info: &SelectWorkerInfo<'_>) -> Option<&Arc<Decider>> {
         let decider = self.decider.as_ref()?;
         let (prefill, decode) = (self.get_prefill_policy(), self.get_decode_policy());
@@ -457,9 +452,7 @@ impl PolicyRegistry {
             || ((Self::pins_its_own_key(prefill.as_ref())
                 || Self::pins_its_own_key(decode.as_ref()))
                 && Self::carries_its_own_key(info));
-        let affine =
-            as_cache_aware(prefill.as_ref()).is_some() || as_cache_aware(decode.as_ref()).is_some();
-        (!keyed && !affine).then_some(decider)
+        (!keyed).then_some(decider)
     }
 
     /// Whether `policy` pins a keyed request itself (`manual` and
@@ -3603,35 +3596,5 @@ mod tests {
             assert!(policies.pair_engine_for(&keyed).is_none());
             assert!(policies.pair_engine_for(&by_rid).is_none());
         }
-    }
-
-    /// A pair with a `cache_aware` side keeps the legacy path under the
-    /// engine, keyed or not: the pair request carries no affinity facts, so
-    /// the legacy policy's own match places that side. A pair of other
-    /// presets takes the engine.
-    #[test]
-    fn a_pair_with_a_cache_aware_side_keeps_the_legacy_path() {
-        let round_robin = PolicyConfig::RoundRobin;
-        let cache_aware = cache_aware_config();
-        for (prefill, decode) in [(&cache_aware, &round_robin), (&round_robin, &cache_aware)] {
-            let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-                PolicyEngineMode::Engine,
-                prefill,
-                decode,
-            );
-            policies.set_prefill_policy(PolicyFactory::create_from_config(prefill));
-            policies.set_decode_policy(PolicyFactory::create_from_config(decode));
-            assert!(policies
-                .pair_engine_for(&SelectWorkerInfo::default())
-                .is_none());
-        }
-        let plain = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
-            PolicyEngineMode::Engine,
-            &round_robin,
-            &round_robin,
-        );
-        assert!(plain
-            .pair_engine_for(&SelectWorkerInfo::default())
-            .is_some());
     }
 }

@@ -429,11 +429,8 @@ impl AppContextBuilder {
         // The configuration's liveness budgets (the stall, wedge and stale
         // thresholds and the warm-up slice, see `worker::liveness`) take
         // effect for every context built from it, the server's and a test's
-        // alike. They are process-wide and the first call wins, so a
-        // constructor that builds the policy registry itself configures them
-        // before that build (`from_config` and the test harness do): the
-        // engine's warm-up stage is tuned from them as the registry is built.
-        // This call covers a context assembled without such a constructor.
+        // alike, here and nowhere else. They are process-wide and the first
+        // call wins, so the first context built in a process sets them.
         liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
@@ -618,11 +615,6 @@ impl AppContextBuilder {
                 .iter()
                 .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
         );
-        // The policy engine's warm-up stage is tuned from the liveness budgets
-        // when the policy registry is built below, so the configuration's
-        // budgets take effect first (the first call wins; `build` keeps its
-        // call for a context assembled without this constructor).
-        liveness::configure_from(&router_config);
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)

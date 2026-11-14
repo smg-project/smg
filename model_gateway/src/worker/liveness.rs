@@ -622,11 +622,10 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
 
 /// Apply every liveness budget the configuration carries: the stall, wedge
 /// and stale thresholds and the warm-up slice. The one place the budgets
-/// are read from a configuration, for the server's start-up and, as
-/// `worker::configure_liveness`, for a host that builds the context without
-/// the builder (the test harness today); the first call in a process wins,
-/// as for the thresholds' own setter.
-pub fn configure_from(config: &RouterConfig) {
+/// are read from a configuration, for the server's start-up and for a
+/// context built by hand (the test harness); the first call in a process
+/// wins, as for [`configure`].
+pub(crate) fn configure_from(config: &RouterConfig) {
     configure(
         Duration::from_secs(config.worker_stall_secs),
         Duration::from_secs(config.worker_wedge_secs),
