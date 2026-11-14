@@ -2108,7 +2108,7 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "nvidia-nemotron-3-nano-4b-bf16",
         model: "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
-        also: &[],
+        also: &["h2oai/h2o-lightning-4b-nemotron-nano"],
         released: "2026-03-07",
         smg: (Some("qwen_xml"), Some("nano_v3")),
         table: Some(Table::Qwen3Tagged),
