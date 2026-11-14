@@ -28,6 +28,7 @@ use common::{
     test_certs::TestCertificates,
 };
 use openssl::ssl::{HandshakeError, SslConnector, SslFiletype, SslMethod};
+use smg::worker::test_support::RefusedAddress;
 
 use crate::{
     common,
@@ -994,9 +995,15 @@ fn unusable_mesh_tls_material_refuses_the_start() {
 fn a_gateway_joins_through_its_second_peer_url_when_the_first_is_dead() {
     let certs = TestCertificates::generate().expect("test certificates");
     let probe = certs.node_identity("probe").expect("probe identity");
-    // A port nobody listens on, picked and released like the gateways' own.
-    let [dead] = free_ports();
-    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[dead], &[]);
+    // A port nobody listens on, held by the case: a released one could be
+    // handed to another listener, the gateways' own among them. It is drawn
+    // under the launch guard: a draw outside it could take the port another
+    // case has just released for its own gateway to bind.
+    let dead = {
+        let _serial = serial();
+        RefusedAddress::reserve()
+    };
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[dead.port()], &[]);
     assert!(
         wait_until(MESH_TIMEOUT, || status_on(&a, "nodeb").as_deref()
             == Some("Alive")),

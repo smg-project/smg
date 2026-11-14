@@ -1,7 +1,5 @@
 //! Worker domain — identity, registry, health, resilience, monitoring, service.
 
-pub(crate) mod admin_json;
-pub(crate) mod admin_params;
 pub mod basic;
 pub(crate) mod bootstrap_probe;
 pub mod builder;
@@ -11,8 +9,6 @@ pub mod endpoint;
 mod engine_admin;
 pub mod error;
 pub mod event;
-pub mod expected_wait;
-pub mod hash_ring;
 pub mod http_client;
 pub mod kv_event_monitor;
 mod kv_event_recovery;
@@ -27,14 +23,11 @@ pub mod monitor;
 pub mod overload;
 pub mod pd_pair_index;
 pub mod pd_pairing;
-pub mod prefill_admission;
 pub mod registry;
 pub mod resilience;
-pub mod rl_adapter;
 pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;
-pub mod stream;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
@@ -52,7 +45,6 @@ pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 // already occupies that name at this level and means an API route, not an address.
 pub use endpoint::{endpoint_key, EndpointError, EndpointKey};
 pub use error::{WorkerError, WorkerResult};
-pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::{KvEventMonitor, SubscriptionKind};
 pub use kv_index_backend::{KvIndex, WorkerBlocks};
@@ -73,14 +65,8 @@ pub use openai_protocol::{
 pub use overload::OverloadThresholds;
 pub(crate) use pd_pair_index::{PdPairIndex, PdWire};
 pub use pd_pairing::{PairingMismatch, PdPairing, PdPairingMode};
-pub use prefill_admission::{
-    acquire_prefill, AdmittedPrefill, PrefillAcquireError, PrefillAdmission,
-    PrefillAdmissionAttempt, PrefillAdmissionRejection, PrefillCandidateError, PrefillLoadGuard,
-    PrefillReservation, PrefillSelection, PrefillSelectionContext,
-};
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
 pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
-pub use stream::GuardedStream;

@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 pub use self::{
     output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Turn},
-    spelling::{GrammarBackend, Spelling, Unspelled},
+    spelling::{AddedTokens, GrammarBackend, Inexpressible, Lark, Spelling, Unspelled},
 };
 use crate::{
     format::{CallSyntax, Emits, Format, Whitespace},

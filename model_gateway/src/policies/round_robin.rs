@@ -1,7 +1,7 @@
 //! Round-robin load balancing policy
 
 use std::{
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::Hasher,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -9,6 +9,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use rustc_hash::FxHasher;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
@@ -57,16 +58,23 @@ impl RoundRobinPolicy {
         }
     }
 
-    /// The identity of a candidate set: its healthy workers' URLs, in
-    /// order. A worker that re-registers under the same URL resumes its
-    /// sets' rotations, which is harmless; the hashing is a short string
-    /// per healthy candidate, on every selection.
+    /// The identity of a candidate set: its healthy workers in order, each
+    /// by its handle's address, one word hashed a candidate. Nothing of a
+    /// worker is read, so a selection's cost does not grow with its
+    /// workers' URLs. A worker replaced under its URL is a new handle: its
+    /// sets start again from the shared position, which is harmless, as is
+    /// a freed address that a later worker takes over.
     fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        for &i in healthy {
-            workers[i].url().hash(&mut hasher);
-        }
+        let mut hasher = FxHasher::default();
+        Self::feed_set(workers, healthy, &mut hasher);
         hasher.finish()
+    }
+
+    /// Feeds `hasher` what [`Self::set_key`] hashes.
+    fn feed_set(workers: &[Arc<dyn Worker>], healthy: &[usize], hasher: &mut impl Hasher) {
+        for &i in healthy {
+            hasher.write_usize(Arc::as_ptr(&workers[i]).cast::<()>() as usize);
+        }
     }
 
     /// This set's next position, creating its rotation on first sight.
@@ -306,5 +314,53 @@ mod tests {
             indep_decode[d] += 1;
         }
         assert_even_two_pool_coverage(indep_prefill, indep_decode);
+    }
+
+    #[test]
+    fn a_set_is_its_handles_in_order() {
+        // The same handles are one set whatever list holds them. Another
+        // order, a part of them, or other workers under the same URLs are
+        // other sets.
+        let workers = make_regular_workers("w", 3);
+        let key = RoundRobinPolicy::set_key(&workers, &[0, 1, 2]);
+        let again: Vec<Arc<dyn Worker>> = workers.iter().map(Arc::clone).collect();
+        assert_eq!(key, RoundRobinPolicy::set_key(&again, &[0, 1, 2]));
+        let reversed: Vec<Arc<dyn Worker>> = workers.iter().rev().map(Arc::clone).collect();
+        assert_ne!(key, RoundRobinPolicy::set_key(&reversed, &[0, 1, 2]));
+        assert_ne!(key, RoundRobinPolicy::set_key(&workers, &[0, 2]));
+        let replaced = make_regular_workers("w", 3);
+        assert_ne!(key, RoundRobinPolicy::set_key(&replaced, &[0, 1, 2]));
+    }
+
+    /// Counts what it is fed and hashes nothing.
+    #[derive(Default)]
+    struct Fed {
+        writes: usize,
+        bytes: usize,
+    }
+
+    impl Hasher for Fed {
+        fn write(&mut self, bytes: &[u8]) {
+            self.writes += 1;
+            self.bytes += bytes.len();
+        }
+
+        fn finish(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_set_is_hashed_as_one_word_a_healthy_worker() {
+        // Every selection pays the key: one word a healthy candidate,
+        // however long the workers' URLs are.
+        let workers = make_regular_workers("a-worker-under-a-long-host-name-", 8);
+        workers[3].set_status(WorkerStatus::NotReady);
+        let healthy = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
+        assert_eq!(healthy, [0, 1, 2, 4, 5, 6, 7]);
+        let mut fed = Fed::default();
+        RoundRobinPolicy::feed_set(&workers, &healthy, &mut fed);
+        assert_eq!(fed.writes, healthy.len());
+        assert_eq!(fed.bytes, healthy.len() * size_of::<usize>());
     }
 }
