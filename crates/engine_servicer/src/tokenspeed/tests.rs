@@ -3743,8 +3743,6 @@ async fn link_error(server: &TokenSpeedServicerServer, rank: &str) -> String {
 /// tick.
 #[tokio::test]
 async fn an_encode_worker_reports_no_scheduler_load() {
-    use crate::kv_events::RankLoads;
-
     let mut generate = harness(model_info(), None).await;
     assert!(
         generate.server.state.rank_load(Some(0)).is_some(),
@@ -4224,8 +4222,6 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
 /// connected ones has no record.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let record_of = |load: &ts::SchedulerLoad| {
         let mut record = common::EngineLoad::from(load);
         record.waiting_uncached_tokens =
