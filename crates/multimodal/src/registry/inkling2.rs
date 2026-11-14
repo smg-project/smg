@@ -141,7 +141,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::registry::{test_helpers::TestTokenizer, ModelRegistry};
+    use crate::{
+        registry::{test_helpers::TestTokenizer, ModelRegistry},
+        types::PlaceholderRange,
+    };
 
     #[test]
     fn exact_model_metadata_selects_new_spec_before_old_family() {
@@ -198,7 +201,7 @@ mod tests {
             assert_eq!(replacement.structural_prefix, 1);
             assert_eq!(
                 replacement.feature_ranges.as_ref().unwrap(),
-                &vec![crate::types::PlaceholderRange {
+                &vec![PlaceholderRange {
                     offset: 0,
                     length: count
                 }]

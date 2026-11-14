@@ -214,6 +214,13 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          a call history, not the encoder's (the cases without a call history match)",
     ),
     (
+        "granite-4.1-3b-llmon-preview/render/*",
+        "the checkpoint's template draws a nonce after every role with Jinja's `random` \
+         filter, which the gateway's renderer does not provide, so each render fails before \
+         its first byte; a renderer with the filter would still not reproduce the \
+         reference's draw byte for byte",
+    ),
+    (
         "hermes-4-14b/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \

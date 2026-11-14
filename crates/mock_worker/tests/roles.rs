@@ -2,6 +2,12 @@
 //! and the HTTP wire: what each side answers, what it advertises, and the
 //! port a prefill worker binds.
 
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a test binary: a failed step panics with what failed"
+)]
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -381,7 +387,7 @@ async fn encoder_completion(
 
 /// The worker's fault counters (`failed_total`, `cut_total`).
 async fn fault_counts(http: &reqwest::Client, fault: &str) -> (u64, u64) {
-    let state: serde_json::Value = http
+    let state: Value = http
         .get(fault)
         .send()
         .await

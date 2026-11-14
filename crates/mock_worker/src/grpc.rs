@@ -36,9 +36,12 @@ use tonic_health::pb::{
 
 use crate::{
     admin_ops::{AdminOps, ProfileOptions},
+    bootstrap::{accept_and_close, bind},
     config::{Config, Role, SchedulerWire},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
+    kv_zmq,
+    overrides::{self, for_port, WorkerOverrides},
     replay::Capture,
     script::{self, Answer, MatchedStop},
 };
@@ -111,7 +114,7 @@ pub async fn serve_with_listener_until(
         .map(|a| a.port())
         .and_then(|port| port.checked_sub(cfg.grpc_base_port))
         .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+    let bootstrap = match bind(&cfg.host, bootstrap_port).await {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!("grpc worker {addr:?} {e}");
@@ -131,7 +134,7 @@ pub async fn serve_with_listener_until(
         let port = addr.map(|a| a.port())?;
         let index = port.checked_sub(cfg.grpc_base_port)?;
         cfg.kv_zmq_for(index, 0)
-            .map(|kv| crate::kv_zmq::serve(rank.engine.clone(), kv))
+            .map(|kv| kv_zmq::serve(rank.engine.clone(), kv))
     });
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
@@ -142,15 +145,14 @@ pub async fn serve_with_listener_until(
         shutdown.await;
         let _ = stop.send(true);
     };
-    let overrides = crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0));
+    let overrides = for_port(addr.map(|a| a.port()).unwrap_or(0));
     let wire = cfg.grpc_wire;
     let health = MockHealth {
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
         service: health_service_name(wire, cfg.role),
     };
-    let bootstrap =
-        bootstrap.map(|listener| crate::bootstrap::accept_and_close(listener, stopped.clone()));
+    let bootstrap = bootstrap.map(|listener| accept_and_close(listener, stopped.clone()));
     let service = MockScheduler {
         cfg,
         name,
@@ -298,7 +300,7 @@ struct MockScheduler {
     ops: Arc<AdminOps>,
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
-    overrides: Arc<crate::overrides::WorkerOverrides>,
+    overrides: Arc<WorkerOverrides>,
     /// The bootstrap port this worker bound and advertises: a prefill
     /// worker's, when it was given one.
     bootstrap_port: Option<u16>,
@@ -1035,7 +1037,7 @@ impl MockScheduler {
         if let Some(protocol) = &self.cfg.pairing_protocol {
             fields.insert("pairing_protocol".to_string(), string(protocol.clone()));
         }
-        fields.extend(crate::overrides::server_args(&self.overrides.info()).fields);
+        fields.extend(overrides::server_args(&self.overrides.info()).fields);
         (!fields.is_empty()).then_some(prost_types::Struct { fields })
     }
 
@@ -1177,7 +1179,7 @@ impl MockScheduler {
             capture: None,
             stopped,
             in_flight: WorkerInFlight::default(),
-            overrides: crate::overrides::for_port(port),
+            overrides: for_port(port),
             bootstrap_port: cfg.bootstrap_base_port,
             ops: AdminOps::register(&name),
             name,
@@ -1202,7 +1204,7 @@ type HealthWatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, S
 /// engine servicer hosts it.
 #[derive(Clone)]
 struct MockHealth {
-    overrides: Arc<crate::overrides::WorkerOverrides>,
+    overrides: Arc<WorkerOverrides>,
     /// Flips when the worker stops: ends the watch streams, which have no
     /// end of their own, so the server's drain can finish.
     stopped: watch::Receiver<bool>,
@@ -1271,7 +1273,7 @@ impl Health for MockHealth {
                         ));
                     }
                     let stopping = tokio::select! {
-                        _ = tokio::time::sleep(HEALTH_WATCH_INTERVAL) => false,
+                        () = tokio::time::sleep(HEALTH_WATCH_INTERVAL) => false,
                         _ = stopped.wait_for(|stop| *stop) => true,
                     };
                     if stopping {
@@ -1555,13 +1557,13 @@ fn scripted_stream(
     struct Choice {
         index: u32,
         answer: Answer,
-        frames: std::collections::VecDeque<script::Frame>,
+        frames: VecDeque<script::Frame>,
         /// Output tokens sent so far (the chunks' running `completion_tokens`).
         sent: u32,
         started: bool,
     }
     struct Scripted {
-        choices: std::collections::VecDeque<Choice>,
+        choices: VecDeque<Choice>,
         prompt_len: usize,
         stream_chunks: bool,
         logprobs: Option<usize>,
@@ -1724,7 +1726,7 @@ fn pending_u32(counter: &AtomicU64) -> u32 {
 
 /// The engine's silence on its in-flight requests, as the Rust servicer's
 /// record carries it (`EngineLoad.engine_silence_ms`).
-fn silence_ms(engine: &engine::Engine) -> Option<u32> {
+fn silence_ms(engine: &Engine) -> Option<u32> {
     engine
         .output_silence()
         .map(|silence| u32::try_from(silence.as_millis()).unwrap_or(u32::MAX))
@@ -1769,7 +1771,7 @@ const HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
 /// Where a rank's load record comes from: its engine and the prompt tokens
 /// handed to it with no token yet.
 struct RankLoadSource {
-    engine: engine::Engine,
+    engine: Engine,
     prefill_pending: Arc<AtomicU64>,
 }
 
@@ -1810,7 +1812,7 @@ struct LoadRecordsOnly {
     clocks: Vec<RankClock>,
     like: LoadsLike,
     step_reports: bool,
-    pending: std::collections::VecDeque<common::KvEventBatch>,
+    pending: VecDeque<common::KvEventBatch>,
     next_tick: Instant,
     sample: u64,
 }
@@ -1886,7 +1888,7 @@ fn load_records_only(
         ranks,
         like,
         step_reports,
-        pending: std::collections::VecDeque::new(),
+        pending: VecDeque::new(),
         next_tick: Instant::now(),
         sample: 0,
     };
@@ -2073,6 +2075,7 @@ fn profile_response(result: Result<String, String>) -> common::ProfileResponse {
 #[cfg(test)]
 mod tests {
     use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
+    use tokio::sync::oneshot;
     use tonic::{transport::Channel, Code};
     use tonic_health::pb::health_client::HealthClient;
     use ts::{
@@ -2081,6 +2084,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::engine::{FaultScope, RequestFault};
 
     /// The next item of a health watch, within the test's patience.
     async fn next(watch: &mut tonic::Streaming<HealthCheckResponse>) -> ServingStatus {
@@ -2099,7 +2103,7 @@ mod tests {
     async fn an_open_watch_ends_when_the_worker_stops() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (stop, stopped) = oneshot::channel::<()>();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test joins the server's task: its drain is what it checks"
@@ -2197,13 +2201,13 @@ mod tests {
         // The override map is process-wide and keyed by port: put the entry
         // back on the way out (a failed assertion included), or a later test
         // that draws the same ephemeral port would start out not serving.
-        struct Restore(Arc<crate::overrides::WorkerOverrides>);
+        struct Restore(Arc<WorkerOverrides>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 self.0.set_serving(true);
             }
         }
-        let overrides = crate::overrides::for_port(addr.port());
+        let overrides = for_port(addr.port());
         let _restore = Restore(Arc::clone(&overrides));
         overrides.set_serving(false);
         assert_eq!(check("").await.expect("check"), ServingStatus::NotServing);
@@ -2340,7 +2344,7 @@ mod tests {
     fn chunk_ids(item: Option<Result<Frame, Status>>) -> Vec<u32> {
         match item.expect("an item").expect("ok") {
             Frame::Chunk(chunk) => chunk.token_ids,
-            other => panic!("not a chunk: {other:?}"),
+            other @ Frame::Complete(_) => panic!("not a chunk: {other:?}"),
         }
     }
 
@@ -2730,15 +2734,13 @@ mod tests {
     #[tokio::test]
     async fn the_first_cut_ends_a_fanned_out_request_before_the_next_choice_is_read() {
         let (service, _stop) = scheduler_with_ranks(1, 65_113);
-        service.ranks[0]
-            .engine
-            .fault_fail(Some(crate::engine::RequestFault {
-                status: 503,
-                stall: std::time::Duration::ZERO,
-                after_tokens: Some(1),
-                finish_error: true,
-                scope: crate::engine::FaultScope::Requests(1),
-            }));
+        service.ranks[0].engine.fault_fail(Some(RequestFault {
+            status: 503,
+            stall: Duration::ZERO,
+            after_tokens: Some(1),
+            finish_error: true,
+            scope: FaultScope::Requests(1),
+        }));
         let mut request = generate_request("two-choices-cut", None, 4);
         request.stream = false;
         request.sampling_params = Some(ts::SamplingParams {
@@ -3131,7 +3133,7 @@ mod tests {
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
-        assert!(matches!(cut, Err(ref status) if status.code() == tonic::Code::Unavailable));
+        assert!(matches!(cut, Err(ref status) if status.code() == Code::Unavailable));
         assert!(stream.next().await.is_none(), "nothing after the cut");
         assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
     }
@@ -3164,7 +3166,7 @@ mod tests {
                 );
                 assert_eq!(complete.completion_tokens, 2);
             }
-            other => panic!("not an error completion: {other:?}"),
+            other @ Frame::Chunk(_) => panic!("not an error completion: {other:?}"),
         }
         assert!(stream.next().await.is_none(), "nothing after the cut");
         assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
@@ -3196,22 +3198,22 @@ mod tests {
 
     #[test]
     fn injected_statuses_map_to_the_closest_grpc_code() {
-        assert_eq!(injected_status(503).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(500).code(), tonic::Code::Internal);
-        assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
-        assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
-        assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
-        assert_eq!(injected_status(499).code(), tonic::Code::Cancelled);
+        assert_eq!(injected_status(503).code(), Code::Unavailable);
+        assert_eq!(injected_status(502).code(), Code::Unavailable);
+        assert_eq!(injected_status(500).code(), Code::Internal);
+        assert_eq!(injected_status(429).code(), Code::ResourceExhausted);
+        assert_eq!(injected_status(504).code(), Code::DeadlineExceeded);
+        assert_eq!(injected_status(400).code(), Code::InvalidArgument);
+        assert_eq!(injected_status(499).code(), Code::Cancelled);
         // The three non-inverse cases (408 and 502 read back as 504 and 503,
         // 499 as 502) and a 4xx without its own code (read back as 400).
-        assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
-        assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(418).code(), tonic::Code::InvalidArgument);
+        assert_eq!(injected_status(408).code(), Code::DeadlineExceeded);
+        assert_eq!(injected_status(502).code(), Code::Unavailable);
+        assert_eq!(injected_status(418).code(), Code::InvalidArgument);
         // 422 is the engine's report that it could not continue the request
         // under its constraint, which the gateway reads back as its 422.
         let constraint = injected_status(422);
-        assert_eq!(constraint.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(constraint.code(), Code::FailedPrecondition);
         assert!(smg_grpc_client::is_constraint_failure(&constraint));
     }
 
@@ -3255,15 +3257,13 @@ mod tests {
     #[tokio::test]
     async fn an_n_above_the_gateways_bound_is_refused_before_the_fault_hook() {
         let (service, _stop) = scheduler_with_ranks(1, 65_114);
-        service.ranks[0]
-            .engine
-            .fault_fail(Some(crate::engine::RequestFault {
-                status: 503,
-                stall: std::time::Duration::ZERO,
-                after_tokens: None,
-                finish_error: false,
-                scope: crate::engine::FaultScope::Requests(1),
-            }));
+        service.ranks[0].engine.fault_fail(Some(RequestFault {
+            status: 503,
+            stall: Duration::ZERO,
+            after_tokens: None,
+            finish_error: false,
+            scope: FaultScope::Requests(1),
+        }));
         let mut request = generate_request("too-many-choices", None, 2);
         request.sampling_params = Some(ts::SamplingParams {
             max_new_tokens: Some(2),
@@ -3275,7 +3275,7 @@ mod tests {
             .await
             .err()
             .expect("refused");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error:?}");
+        assert_eq!(error.code(), Code::InvalidArgument, "{error:?}");
         let status = service.ranks[0].engine.fault_status();
         assert_eq!(status.failed_total, 0, "the fault hook was not consulted");
         assert!(

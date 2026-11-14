@@ -606,19 +606,6 @@ struct RoutingArgs {
     )]
     pd_pairing_mode: String,
 
-    /// Which implementation decides worker selection: `legacy`, the
-    /// policies over worker handles, or `engine`, the policy engine over its
-    /// bounded view. Under `engine` the policy must be one the engine
-    /// carries: random, round_robin, passthrough, power_of_two (expected_wait,
-    /// requests, least_requests) or least_load
-    #[arg(
-        long,
-        value_parser = ["legacy", "engine"],
-        default_value = "legacy",
-        help_heading = "Routing Policy"
-    )]
-    policy_engine: String,
-
     /// Ordered header names checked for the routing key; the first header
     /// present with a valid value wins. Header keys get the same
     /// per-turn/per-retry suffix stripping as rid-derived keys when the
@@ -2017,8 +2004,7 @@ mod tests {
         config::{
             CacheIndexKind, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
             FileDiscoveryConfig, ManualAssignmentMode, ParserChoice, PolicyConfig,
-            PolicyEngineMode, SlurmDiscoveryConfig, UnhealthyRemovalScope,
-            DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+            SlurmDiscoveryConfig, UnhealthyRemovalScope, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
         },
         server::posture::SecretSource,
         service_discovery::RuntimeDiscoveryConfig,
@@ -4134,29 +4120,6 @@ mod tests {
         assert!(router_config.worker_overload_protection);
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(server_config.router_config.worker_overload_shed);
-    }
-
-    /// `--policy-engine` defaults to the legacy path and its `engine` value
-    /// survives into `ServerConfig.router_config`.
-    #[test]
-    fn policy_engine_defaults_to_legacy_and_the_switch_flows_into_both_configs() {
-        let cli = cli_args_from(&[]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.policy_engine, PolicyEngineMode::Legacy);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.router_config.policy_engine,
-            PolicyEngineMode::Legacy
-        );
-
-        let cli = cli_args_from(&["--policy-engine", "engine", "--policy", "round_robin"]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.policy_engine, PolicyEngineMode::Engine);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.router_config.policy_engine,
-            PolicyEngineMode::Engine
-        );
     }
 
     /// Both thresholds are `>=` comparisons, so the excluded ends of their
