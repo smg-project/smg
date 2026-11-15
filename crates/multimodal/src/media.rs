@@ -31,6 +31,7 @@ use url::Url;
 use crate::opencv_buffer::{open_capture, BufferedCapture, RgbOutputBuffer};
 use crate::{
     audio::decode_audio_mono_f32,
+    data_url::{base64_payload, data_url_payload},
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
     hasher::{hash_audio, hash_image_with_transparency, hash_video_with_sampling},
     jpeg_turbo::{decode_jpeg_rgb, end_is_served, is_jpeg},
@@ -618,7 +619,8 @@ impl MediaConnector {
         data: &str,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let decoded = decode_base64_with_limit(data.trim(), image_max_input_bytes(), "image")?;
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, image_max_input_bytes(), "image")?;
         Self::decode_image(
             decoded.into(),
             cfg.detail,
@@ -642,7 +644,8 @@ impl MediaConnector {
         data: &str,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let decoded = decode_base64_with_limit(data.trim(), video_max_input_bytes(), "video")?;
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, video_max_input_bytes(), "video")?;
         self.decode_video(decoded.into(), cfg, VideoSource::DataUrl)
             .await
     }
@@ -655,7 +658,8 @@ impl MediaConnector {
     }
 
     async fn fetch_audio_base64(&self, data: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let decoded = decode_base64_with_limit(data.trim(), audio_max_input_bytes(), "audio")?;
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, audio_max_input_bytes(), "audio")?;
         self.decode_audio(decoded.into(), AudioSource::DataUrl)
             .await
     }
@@ -1119,19 +1123,6 @@ fn checked_payload_length(
         .checked_add(additional)
         .filter(|length| *length <= limit)
         .ok_or(MediaConnectorError::PayloadTooLarge { media, limit })
-}
-
-/// The base64 payload of `data_url`, as every data URL fetch reads it.
-fn data_url_payload(data_url: &str) -> Result<&str, MediaConnectorError> {
-    let (metadata, data) = data_url
-        .split_once(',')
-        .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
-    if !metadata.ends_with(";base64") {
-        return Err(MediaConnectorError::DataUrl(
-            "only base64 encoded data URLs are supported".into(),
-        ));
-    }
-    Ok(data)
 }
 
 fn decode_base64_with_limit(
