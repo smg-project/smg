@@ -241,9 +241,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `GenerateRequest` does. A model-less classify body is served as a model-less `/generate` body
   is: by any worker on the HTTP router, as the one model the fleet serves on the gRPC router, and
   refused as `missing_model` under IGW routing. A model-less tokenize or detokenize body is served
-  by the one loaded tokenizer, its `max_model_len` that model's context window, and refused as
-  `missing_model` while more than one is loaded; the fallback took the first by name, so a body
-  naming `""` or `unknown` is refused there too.
+  by the tokenizer of the one model the workers serve, else by the one loaded tokenizer, its
+  `max_model_len` that model's context window, and refused as `missing_model` when neither picks
+  one; the fallback took the first tokenizer by name, so a body naming `""` or `unknown` is
+  refused there too.
 - A replayed `computer_call_output` input item with `acknowledged_safety_checks: null`, which the
   public API allows (`ComputerCallOutputItemParam`), parses as none acknowledged. The crate refused
   the request whole, as matching no variant of `ResponseInput`.

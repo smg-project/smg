@@ -2389,6 +2389,32 @@ fn test_contains_model_accepts_canonical_id_and_alias() {
     assert!(!registry.contains_model("GLM-5.2-Coding"));
 }
 
+/// The sole served model is the one model the workers serve: none while
+/// no worker serves one, the model while one does (an untagged worker
+/// beside it is no second model), none again once a second model is served.
+#[test]
+fn the_sole_served_model_is_the_one_model_the_workers_serve() {
+    let registry = WorkerRegistry::new();
+    assert_eq!(registry.sole_served_model(), None);
+
+    let worker = |url: &str, model: Option<&str>| -> Arc<dyn Worker> {
+        let builder = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check());
+        let builder = match model {
+            Some(model) => builder.model(ModelCard::new(model)),
+            None => builder,
+        };
+        Arc::new(builder.build())
+    };
+    registry.register(worker("http://a:8000", Some("alpha")));
+    registry.register(worker("http://untagged:8000", None));
+    assert_eq!(registry.sole_served_model().as_deref(), Some("alpha"));
+
+    registry.register(worker("http://b:8000", Some("beta")));
+    assert_eq!(registry.sole_served_model(), None);
+}
+
 /// smg-lab #288: the request metric families take the served model's id,
 /// or `other` for a name no worker serves, as their `model` label.
 #[test]

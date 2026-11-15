@@ -304,33 +304,25 @@ impl GrpcRouter {
 
     /// The model a body that names none is served as: it lands here carrying
     /// the wildcard placeholder, and when the fleet serves exactly one real
-    /// model there is only one sane target, so it defaults to that model
+    /// model there is only one sane target
+    /// ([`WorkerRegistry::sole_served_model`]), so it defaults to that model
     /// instead of 404ing a request the registry could otherwise route
     /// without ambiguity. Zero or several served models keep the
-    /// placeholder, and so the answer `model_not_found`. An untagged worker
-    /// (no model card, no `model_id` label) registers under the wildcard
-    /// itself (`Worker::model_id`'s fallback), so it is filtered out here:
-    /// otherwise it would mask a real single-model fleet behind a spurious
-    /// second entry. A named model is returned as given.
+    /// placeholder, and so the answer `model_not_found`. A named model is
+    /// returned as given.
     fn model_less_target<'a>(&self, model_id: &'a str) -> Cow<'a, str> {
         if model_id != UNKNOWN_MODEL_ID {
             return Cow::Borrowed(model_id);
         }
-        let served_models: Vec<String> = self
-            .worker_registry
-            .get_models()
-            .into_iter()
-            .filter(|served| served != UNKNOWN_MODEL_ID)
-            .collect();
-        match served_models.as_slice() {
-            [only] => {
+        match self.worker_registry.sole_served_model() {
+            Some(only) => {
                 debug!(
                     "Defaulting a model-less request to the single served model: {}",
                     only
                 );
-                Cow::Owned(only.clone())
+                Cow::Owned(only)
             }
-            _ => Cow::Borrowed(model_id),
+            None => Cow::Borrowed(model_id),
         }
     }
 

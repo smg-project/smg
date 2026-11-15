@@ -1156,6 +1156,21 @@ impl WorkerRegistry {
             .count()
     }
 
+    /// The one model the workers serve, when they serve exactly one: the
+    /// model a body that names none is served as, on the routes that take
+    /// such a body (a model-less `/generate` or classify body on the gRPC
+    /// router, a model-less tokenize or detokenize body). An untagged worker
+    /// (no model card, no `model_id` label) is filed under the placeholder
+    /// (`Worker::model_id`'s fallback) and is no second model.
+    pub fn sole_served_model(&self) -> Option<String> {
+        let mut served = self
+            .get_models()
+            .into_iter()
+            .filter(|model| model != UNKNOWN_MODEL_ID);
+        let only = served.next()?;
+        served.next().is_none().then_some(only)
+    }
+
     /// Whether at least one worker serves this name, as a canonical model ID
     /// or as an alias.
     ///
