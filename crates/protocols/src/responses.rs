@@ -4141,30 +4141,27 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
     Ok(())
 }
 
-/// The public OpenAI API's structured-output rules: a strict function schema or
-/// a strict `json_schema` text format pins `additionalProperties: false` on
-/// every object node, and a `json_object` format needs the word "json"
-/// somewhere in the prompt (instructions or input text).
+/// The public OpenAI API's structured-output rules: a strict function schema
+/// (a top-level function's or a namespace member's) or a strict `json_schema`
+/// text format pins `additionalProperties: false` on every object node, and a
+/// `json_object` format needs the word "json" somewhere in the prompt
+/// (instructions or input text).
 fn validate_openai_structured_output_rules(
     request: &ResponsesRequest,
 ) -> Result<(), ValidationError> {
     for tool in request.tools.as_deref().unwrap_or_default() {
-        let ResponseTool::Function(function_tool) = tool else {
-            continue;
-        };
-        let function = &function_tool.function;
-        if function.strict == Some(true) {
-            if let Some(path) =
-                strict_schema_missing_additional_properties(function.parameters_schema())
-            {
-                return Err(invalid(
-                    "invalid_function_parameters",
-                    format!(
-                        "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
-                        function.name
-                    ),
-                ));
+        match tool {
+            ResponseTool::Function(function_tool) => {
+                validate_strict_function_schema(&function_tool.function)?;
             }
+            ResponseTool::Namespace(namespace) => {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Function(function_tool) = member {
+                        validate_strict_function_schema(&function_tool.function)?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4193,6 +4190,25 @@ fn validate_openai_structured_output_rules(
         _ => {}
     }
     Ok(())
+}
+
+/// A strict function's schema pins `additionalProperties: false` on every
+/// object node; a function that is not strict is not judged.
+fn validate_strict_function_schema(function: &Function) -> Result<(), ValidationError> {
+    if function.strict != Some(true) {
+        return Ok(());
+    }
+    let Some(path) = strict_schema_missing_additional_properties(function.parameters_schema())
+    else {
+        return Ok(());
+    };
+    Err(invalid(
+        "invalid_function_parameters",
+        format!(
+            "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
+            function.name
+        ),
+    ))
 }
 
 /// Whether the instructions or any input text mention "json" (case-insensitive).
@@ -4435,12 +4451,35 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
     Ok(())
 }
 
+/// A function's place in `tools` as a refusal names it: a top-level function's
+/// index, or its namespace's index and its own inside the namespace. It is
+/// written only into a refusal, so a function that passes formats no place.
+#[derive(Clone, Copy)]
+enum FunctionPlace {
+    Tool(usize),
+    Member(usize, usize),
+}
+
+impl std::fmt::Display for FunctionPlace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            Self::Tool(tool) => write!(formatter, "tools[{tool}]"),
+            Self::Member(namespace, member) => {
+                write!(formatter, "tools[{namespace}].tools[{member}]")
+            }
+        }
+    }
+}
+
 /// The public API's function-tool keys ([`FunctionTool::TOOL_KEYS`]) are kept
 /// untyped in the function's `extra`, so their shapes are checked here, as the
 /// custom tool's typed fields check theirs: `async` and `defer_loading` a
 /// boolean, `allowed_callers` an array of strings, `output_schema` an object,
 /// each of them also `null`.
-fn validate_function_tool_keys(function: &Function, at: &str) -> Result<(), ValidationError> {
+fn validate_function_tool_keys(
+    function: &Function,
+    at: FunctionPlace,
+) -> Result<(), ValidationError> {
     for key in FunctionTool::TOOL_KEYS {
         let Some(value) = function.extra.get(*key) else {
             continue;
@@ -4470,6 +4509,26 @@ fn validate_function_tool_keys(function: &Function, at: &str) -> Result<(), Vali
     Ok(())
 }
 
+/// A function's `parameters` are a JSON Schema object, a top-level function's
+/// and a namespace member's alike: the model is handed either as a function of
+/// its own.
+fn validate_function_parameters(
+    function: &Function,
+    at: FunctionPlace,
+) -> Result<(), ValidationError> {
+    let schema = function.parameters_schema();
+    if schema.is_object() {
+        return Ok(());
+    }
+    Err(invalid(
+        "invalid_type",
+        format!(
+            "Invalid type for '{at}.parameters': expected an object, but got {} instead.",
+            json_type_name(schema)
+        ),
+    ))
+}
+
 /// Validates ResponseTool structure based on tool type
 fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
@@ -4486,16 +4545,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                 if function.name.is_empty() {
                     return Err(empty_tool_name(&format!("tools[{idx}].name")));
                 }
-                if !function.parameters_schema().is_object() {
-                    return Err(invalid(
-                        "invalid_type",
-                        format!(
-                            "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
-                            json_type_name(function.parameters_schema())
-                        ),
-                    ));
-                }
-                validate_function_tool_keys(function, &format!("tools[{idx}]"))?;
+                let at = FunctionPlace::Tool(idx);
+                validate_function_parameters(function, at)?;
+                validate_function_tool_keys(function, at)?;
             }
             // A custom tool has a name: the model is given a function of that
             // name for it.
@@ -4505,7 +4557,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                 }
             }
             // A namespace has a name, and so has each of its members: the
-            // model addresses a member as `namespace.member`.
+            // model addresses a member as `namespace.member`. A function
+            // member is handed to the model as a function of its own, so its
+            // parameters are held to a top-level function's rule.
             ResponseTool::Namespace(namespace) => {
                 if namespace.name.is_empty() {
                     return Err(empty_tool_name(&format!("tools[{idx}].name")));
@@ -4521,10 +4575,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                         )));
                     }
                     if let NamespaceTool::Function(function_tool) = member {
-                        validate_function_tool_keys(
-                            &function_tool.function,
-                            &format!("tools[{idx}].tools[{member_idx}]"),
-                        )?;
+                        let at = FunctionPlace::Member(idx, member_idx);
+                        validate_function_parameters(&function_tool.function, at)?;
+                        validate_function_tool_keys(&function_tool.function, at)?;
                     }
                 }
             }
