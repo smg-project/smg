@@ -150,6 +150,8 @@ message LeaseAssertion {
 
 // A session pin the gateway holds.
 message Pin {
+  // The session's value (Identity in policy_plugin.proto: the key within
+  // `model` and its phase), never the key's own fingerprint.
   fixed64 key = 1;
   fixed64 worker_id = 2;
   uint32 dp_rank = 3;
@@ -664,6 +666,7 @@ message LoadSample {
 }
 
 message SessionRow {
+  // The session's value, as in Pin.
   fixed64 key = 1;
   fixed64 worker_id = 2;
   uint32 dp_rank = 3;

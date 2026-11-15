@@ -9,7 +9,7 @@ use smg_policy_controller::{
     WorkerId,
 };
 
-use crate::{verdict, Outcome};
+use crate::{Outcome, Recorded, Replayed};
 
 /// The classic policy these rows record, as a sheet's head names it.
 pub const POLICY: &str = "power_of_two";
@@ -45,7 +45,7 @@ enum Step {
 }
 
 #[derive(Debug, Deserialize)]
-struct Row {
+pub struct Row {
     name: String,
     /// The load metric in the gateway's command-line spelling.
     metric: String,
@@ -54,11 +54,6 @@ struct Row {
     prompt_tokens: Option<u32>,
     steps: Vec<Step>,
     outcome: Outcome,
-}
-
-#[derive(Debug, Deserialize)]
-struct Sheet {
-    rows: Vec<Row>,
 }
 
 fn metric_of(text: &str) -> PowerOfTwoMetric {
@@ -247,25 +242,20 @@ fn replay(row: &Row) -> Outcome {
     }
 }
 
-/// The rows of a sheet replayed: how many, and what did not replay.
-pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
-    let sheet: Sheet = match serde_json::from_str(text) {
-        Ok(sheet) => sheet,
-        Err(err) => {
-            return (
-                0,
-                vec![format!("{source} is not a sheet of {POLICY} rows: {err}")],
-            )
-        }
-    };
-    let defects = sheet
-        .rows
-        .iter()
-        .filter_map(|row| {
-            verdict(&row.outcome, &replay(row)).map(|why| format!("{source}: {}: {why}", row.name))
-        })
-        .collect();
-    (sheet.rows.len(), defects)
+impl Recorded for Row {
+    const POLICY: &'static str = POLICY;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn outcome(&self) -> &Outcome {
+        &self.outcome
+    }
+
+    fn replay(&self) -> Replayed {
+        Replayed::Ran(replay(self))
+    }
 }
 
 /// Rows copied from the recorded sheet, one or more of each form.

@@ -4,8 +4,9 @@
 //! of picks when no draw decides, or how often each worker won over a number
 //! of single decisions when one does. The rows are recorded by running that
 //! policy code, not written by hand, and each sheet names the commit it was
-//! recorded from. One module a classic policy holds its rows' shape and
-//! their replay.
+//! recorded from. A drawn row is one sample: a second recording of the same
+//! commit draws other counts within the same spread. One module a classic
+//! policy holds its rows' shape and their replay.
 //!
 //! The sheets live outside this repository, with the recorder:
 //! `SMG_POLICY_CLASSIC_ROWS` names their directory for the ignored test. A
@@ -15,14 +16,18 @@
 //! A sequence row must replay pick for pick. A drawn row must give each
 //! worker the recorded share within the spread of two samples of that size,
 //! and a worker never picked on one side must never be picked on the other.
-//! No row is excused.
+//! No row is decided differently. A row whose form this crate does not
+//! build yet is owed: [`OWED`] names it with the validator's words and the
+//! change that builds it, and the replay fails once the row is no longer
+//! refused in those words.
 #![expect(clippy::expect_used, reason = "a replay that stops on a broken setup")]
 
 use std::{fs, path::PathBuf};
 
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 
 mod classic {
+    pub mod manual;
     pub mod power_of_two;
 }
 
@@ -35,6 +40,31 @@ enum Outcome {
     Sequence(Vec<usize>),
     Counts { draws: u32, counts: Vec<u32> },
 }
+
+/// What a row's replay gives: its outcome in the recorded shape, or the
+/// validator's words when this crate refuses to build the row's form.
+enum Replayed {
+    Ran(Outcome),
+    Refused(String),
+}
+
+/// A recorded row whose form this crate does not build yet: validation
+/// refuses it in the words `refused`, and `by` names the change that builds
+/// it. The row passes while it is refused that way and fails the day it is
+/// not, so an entry cannot outlive its debt.
+struct Owed {
+    row: &'static str,
+    refused: &'static str,
+    by: &'static str,
+}
+
+/// The owed rows. The classic manual policy keeps a key's pins apart under
+/// each role of a pair; here a sessions rule runs under the single plan.
+const OWED: &[Owed] = &[Owed {
+    row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
+    refused: "sessions run under the single plan",
+    by: "sessions on the sides of a pair, which read the pair's partner lists",
+}];
 
 fn shares(counts: &[u32], draws: u32) -> Vec<f64> {
     counts
@@ -57,9 +87,10 @@ fn same_shares(here: &[f64], there: &[f64], draws: u32) -> bool {
         })
 }
 
-/// `None` when a row's replay is its recorded outcome; the two otherwise.
-fn verdict(recorded: &Outcome, here: &Outcome) -> Option<String> {
-    let same = match (here, recorded) {
+/// Whether a replayed outcome is the recorded one: pick for pick, or share
+/// for share.
+fn same_outcome(recorded: &Outcome, here: &Outcome) -> bool {
+    match (here, recorded) {
         (Outcome::Sequence(a), Outcome::Sequence(b)) => a == b,
         (
             Outcome::Counts { draws, counts },
@@ -68,8 +99,81 @@ fn verdict(recorded: &Outcome, here: &Outcome) -> Option<String> {
             },
         ) => same_shares(&shares(counts, *draws), &shares(recorded, *draws), *draws),
         _ => false,
+    }
+}
+
+/// `None` when a row's replay is its recorded outcome, or when the row is
+/// owed and refused in its entry's words; the reason otherwise.
+fn verdict(name: &str, recorded: &Outcome, replayed: &Replayed) -> Option<String> {
+    let owed = OWED.iter().find(|owed| owed.row == name);
+    match (replayed, owed) {
+        (Replayed::Refused(why), Some(owed)) if why.contains(owed.refused) => None,
+        (Replayed::Refused(why), _) => Some(format!("refused here: {why}")),
+        (Replayed::Ran(_), Some(owed)) => Some(format!(
+            "its form is built now ({}): take the row out of OWED",
+            owed.by
+        )),
+        (Replayed::Ran(here), None) => (!same_outcome(recorded, here))
+            .then(|| format!("recorded {recorded:?}, replayed {here:?}")),
+    }
+}
+
+/// A recorded row of one classic policy, as its module reads it: what was
+/// recorded, and what this crate's decision gives for the row.
+trait Recorded: DeserializeOwned {
+    /// The classic policy the rows record, as a sheet's head names it.
+    const POLICY: &'static str;
+
+    fn name(&self) -> &str;
+
+    fn outcome(&self) -> &Outcome;
+
+    /// This crate's outcome for the row in the shape of the recorded one,
+    /// or its refusal of the row's form.
+    fn replay(&self) -> Replayed;
+}
+
+/// The rows of a sheet, in one policy's shape.
+#[derive(Deserialize)]
+#[serde(bound = "R: Recorded")]
+struct Rows<R> {
+    rows: Vec<R>,
+}
+
+/// The rows of one policy's sheet replayed: how many, and what did not
+/// replay.
+fn replay_rows<R: Recorded>(text: &str, source: &str) -> (usize, Vec<String>) {
+    let sheet: Rows<R> = match serde_json::from_str(text) {
+        Ok(sheet) => sheet,
+        Err(err) => {
+            return (
+                0,
+                vec![format!(
+                    "{source} is not a sheet of {} rows: {err}",
+                    R::POLICY
+                )],
+            )
+        }
     };
-    (!same).then(|| format!("recorded {recorded:?}, replayed {here:?}"))
+    let defects = sheet
+        .rows
+        .iter()
+        .filter_map(|row| {
+            verdict(row.name(), row.outcome(), &row.replay())
+                .map(|why| format!("{source}: {}: {why}", row.name()))
+        })
+        .collect();
+    (sheet.rows.len(), defects)
+}
+
+/// The names of the rows of one policy's sheet.
+fn row_names<R: Recorded>(text: &str) -> Vec<String> {
+    let sheet: Rows<R> = serde_json::from_str(text).expect("a sheet of rows");
+    sheet
+        .rows
+        .iter()
+        .map(|row| row.name().to_string())
+        .collect()
 }
 
 /// A sheet's head: the commit its rows were recorded from, and the classic
@@ -88,7 +192,8 @@ fn replay_sheet(text: &str, source: &str) -> (usize, Vec<String>) {
         Err(err) => return (0, vec![format!("{source} is not a sheet of rows: {err}")]),
     };
     let (rows, mut defects) = match head.policy.as_str() {
-        classic::power_of_two::POLICY => classic::power_of_two::replay_rows(text, source),
+        classic::manual::POLICY => replay_rows::<classic::manual::Row>(text, source),
+        classic::power_of_two::POLICY => replay_rows::<classic::power_of_two::Row>(text, source),
         other => (
             0,
             vec![format!(
@@ -107,6 +212,23 @@ fn the_classic_power_of_two_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::power_of_two::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_manual_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::manual::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+/// Every owed row is in an inline subset, so every run of the suite checks
+/// that it is still refused, not the ignored test alone.
+#[test]
+fn every_owed_row_is_an_inline_row() {
+    let inline = row_names::<classic::manual::Row>(classic::manual::INLINE);
+    for owed in OWED {
+        assert!(inline.iter().any(|name| name == owed.row), "{}", owed.row);
+    }
 }
 
 /// Ignored by default because the sheets live in the test-data repository,
