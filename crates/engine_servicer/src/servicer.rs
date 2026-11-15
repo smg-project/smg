@@ -330,6 +330,28 @@ pub(crate) struct Server {
     metrics_listener: Option<MetricsListener>,
 }
 
+/// How long the shutdown waits for an `ipc://` handshake endpoint file to
+/// disappear after the connect task is gone: the socket library unlinks it
+/// from a task of this runtime, a few polls away even on a starved host.
+const HANDSHAKE_RELEASE_BOUND: Duration = Duration::from_secs(2);
+
+/// Wait until the handshake endpoint file at `path` is gone, or `bound` has
+/// passed; a file still there is reported, never an error (the server stops
+/// either way).
+async fn await_handshake_release(path: &str, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while std::fs::metadata(path).is_ok() {
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                path,
+                "the handshake endpoint file outlived the servicer's stop"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 impl Server {
     /// Bind `config.bind_address` and serve `routes` (the wire's service) with
     /// the health service beside it, on a dedicated runtime thread named
@@ -413,11 +435,13 @@ impl Server {
                     .local_addr()
                     .map(|address| address.to_string())
                     .unwrap_or_default();
+                let handshake_endpoint =
+                    handshake_address.strip_prefix("ipc://").map(str::to_owned);
                 #[expect(
                     clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
+                    reason = "engine connect runs in the background; the shutdown aborts it below"
                 )]
-                let _connect = tokio::spawn(connect(ConnectInputs {
+                let connect_task = tokio::spawn(connect(ConnectInputs {
                     ipc_base_url,
                     handshake_address,
                     engine_count,
@@ -462,13 +486,24 @@ impl Server {
                     let grace = shutdown.await;
                     tokio::time::sleep(grace).await;
                 };
-                tokio::select! {
+                let result = tokio::select! {
                     result = graceful => result.map_err(|error| error.to_string()),
                     () = forced => {
                         warn!("gRPC servicer closed its remaining connections after the drain grace");
                         Ok(())
                     }
+                };
+                // The handshake endpoint goes with the server, not with the
+                // runtime: a connect still waiting for its engine is ended
+                // here, so its socket drops while the runtime can still run
+                // the release of an `ipc://` endpoint file, and that release
+                // is awaited before the thread ends and `stop` returns.
+                connect_task.abort();
+                let _ = connect_task.await;
+                if let Some(path) = handshake_endpoint {
+                    await_handshake_release(&path, HANDSHAKE_RELEASE_BOUND).await;
                 }
+                result
             },
         )?;
         Ok(Self {
