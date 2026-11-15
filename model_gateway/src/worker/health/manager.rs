@@ -50,6 +50,7 @@ use crate::{
             event::{WorkerConnected, WorkerEvent},
             WorkerId,
         },
+        runtime::WorkerRuntime,
         ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
         WorkerType,
     },
@@ -800,12 +801,16 @@ async fn apply_probe_completion(
 
     let Some(((), transition)) =
         registry.apply_if_revision(&worker_id, expected_revision, |current_worker| {
+            let state = current_worker.runtime_state();
+            let state = state.as_deref();
             if launched_status == WorkerStatus::Pending {
-                current_worker.total_pending_probes_increment();
+                if let Some(state) = state {
+                    state.total_pending_probes_increment();
+                }
             }
             (
                 (),
-                compute_next_status(current_worker, probe_ok, health_config),
+                compute_next_status(current_worker, state, probe_ok, health_config),
             )
         })
     else {
@@ -1128,6 +1133,7 @@ async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue
 ///   - Failed stays Failed on failure; Draining never transitions here
 fn compute_next_status(
     worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
     probe_ok: bool,
     health_config: &HealthCheckConfig,
 ) -> Option<WorkerStatus> {
@@ -1141,16 +1147,20 @@ fn compute_next_status(
     let max_pending_probes = failure_threshold * 10;
 
     if probe_ok {
-        worker.consecutive_failures_reset();
-        let successes = worker.consecutive_successes_increment();
+        if let Some(state) = state {
+            state.consecutive_failures_reset();
+        }
+        let successes = state.map_or(0, WorkerRuntime::consecutive_successes_increment);
 
         if matches!(
             current_status,
             WorkerStatus::Pending | WorkerStatus::NotReady | WorkerStatus::Failed
         ) && successes >= success_threshold
         {
-            worker.consecutive_successes_reset();
-            worker.total_pending_probes_reset();
+            if let Some(state) = state {
+                state.consecutive_successes_reset();
+                state.total_pending_probes_reset();
+            }
             return Some(WorkerStatus::Ready);
         }
 
@@ -1158,34 +1168,44 @@ fn compute_next_status(
         // that flaps F,S,F,S,... never reaches success_threshold and would
         // otherwise grow `total_pending_probes` without bound.
         if current_status == WorkerStatus::Pending
-            && worker.total_pending_probes() >= max_pending_probes
+            && state.map_or(0, WorkerRuntime::total_pending_probes) >= max_pending_probes
         {
-            worker.consecutive_successes_reset();
-            worker.consecutive_failures_reset();
+            if let Some(state) = state {
+                state.consecutive_successes_reset();
+                state.consecutive_failures_reset();
+            }
             return Some(WorkerStatus::Failed);
         }
 
         None
     } else {
-        worker.consecutive_successes_reset();
-        let failures = worker.consecutive_failures_increment();
+        if let Some(state) = state {
+            state.consecutive_successes_reset();
+        }
+        let failures = state.map_or(0, WorkerRuntime::consecutive_failures_increment);
 
         match current_status {
             WorkerStatus::Ready => {
                 if failures >= failure_threshold {
-                    worker.consecutive_failures_reset();
+                    if let Some(state) = state {
+                        state.consecutive_failures_reset();
+                    }
                     return Some(WorkerStatus::NotReady);
                 }
             }
             WorkerStatus::NotReady => {
                 if failures >= liveness_threshold {
-                    worker.consecutive_failures_reset();
+                    if let Some(state) = state {
+                        state.consecutive_failures_reset();
+                    }
                     return Some(WorkerStatus::Failed);
                 }
             }
             WorkerStatus::Pending => {
-                if worker.total_pending_probes() >= max_pending_probes {
-                    worker.consecutive_failures_reset();
+                if state.map_or(0, WorkerRuntime::total_pending_probes) >= max_pending_probes {
+                    if let Some(state) = state {
+                        state.consecutive_failures_reset();
+                    }
                     return Some(WorkerStatus::Failed);
                 }
             }
