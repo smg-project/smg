@@ -317,6 +317,22 @@ impl Default for VideoFetchConfig {
     }
 }
 
+/// Encoded media bytes and the source metadata needed to decode them with
+/// the same identity as the fused fetch path.
+#[derive(Debug, Clone)]
+pub struct RawMedia<S> {
+    pub bytes: Bytes,
+    pub source: S,
+}
+
+#[derive(Debug)]
+enum RawFetchSource {
+    Url(String),
+    DataUrl,
+    InlineBytes,
+    File(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub enum MediaSource {
     /// A URL fetched over the network, shared with the request.
@@ -501,6 +517,107 @@ impl MediaConnector {
             fetch_timeout: config.fetch_timeout,
             video_fetch_timeout: config.video_fetch_timeout,
         })
+    }
+
+    /// Fetch encoded image bytes without parsing the image header or pixels.
+    pub async fn fetch_image_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<ImageSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(source, self.fetch_timeout, image_max_input_bytes(), "image")
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => ImageSource::Url { url },
+            RawFetchSource::DataUrl => ImageSource::DataUrl,
+            RawFetchSource::InlineBytes => ImageSource::InlineBytes,
+            RawFetchSource::File(path) => ImageSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    /// Fetch encoded video bytes without decoding or sampling its frames.
+    pub async fn fetch_video_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<VideoSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(
+                source,
+                self.video_fetch_timeout,
+                video_max_input_bytes(),
+                "video",
+            )
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => VideoSource::Url { url },
+            RawFetchSource::DataUrl => VideoSource::DataUrl,
+            RawFetchSource::InlineBytes => VideoSource::InlineBytes,
+            RawFetchSource::File(path) => VideoSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    /// Fetch encoded audio bytes without decoding its samples.
+    pub async fn fetch_audio_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<AudioSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(source, self.fetch_timeout, audio_max_input_bytes(), "audio")
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => AudioSource::Url { url },
+            RawFetchSource::DataUrl => AudioSource::DataUrl,
+            RawFetchSource::InlineBytes => AudioSource::InlineBytes,
+            RawFetchSource::File(path) => AudioSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    async fn fetch_raw_bytes(
+        &self,
+        source: MediaSource,
+        budget: Duration,
+        limit: usize,
+        media: &'static str,
+    ) -> Result<(Bytes, RawFetchSource), MediaConnectorError> {
+        match source {
+            MediaSource::Url(url) => {
+                let parsed = Url::parse(url.as_str())
+                    .map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
+                let bytes = self.fetch_http_bytes(&parsed, budget, limit, media).await?;
+                Ok((bytes, RawFetchSource::Url(parsed.to_string())))
+            }
+            MediaSource::DataUrl(data_url) => {
+                let bytes =
+                    decode_base64_with_limit(data_url_payload(&data_url)?.trim(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::DataUrl))
+            }
+            MediaSource::Base64 { data, .. } => {
+                let bytes = decode_base64_with_limit(data.trim(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::DataUrl))
+            }
+            MediaSource::InlineBytes(bytes) => {
+                ensure_input_byte_limit(bytes.len(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::InlineBytes))
+            }
+            MediaSource::File(path) => {
+                let allowed_root = self.allowed_local_media_path.as_ref().ok_or_else(|| {
+                    MediaConnectorError::DisallowedLocalPath(path.display().to_string())
+                })?;
+                let canonical = fs::canonicalize(&path)
+                    .await
+                    .map_err(MediaConnectorError::Io)?;
+                if !canonical.starts_with(allowed_root) {
+                    return Err(MediaConnectorError::DisallowedLocalPath(
+                        path.display().to_string(),
+                    ));
+                }
+                let bytes = read_file_with_limit(&canonical, limit, media).await?;
+                Ok((bytes, RawFetchSource::File(canonical)))
+            }
+        }
     }
 
     pub async fn fetch_image(
@@ -886,7 +1003,7 @@ impl MediaConnector {
             .await
     }
 
-    fn decode_image(
+    pub fn decode_image(
         bytes: Bytes,
         detail: ImageDetail,
         max_long_side_pixel: Option<u32>,
@@ -910,7 +1027,7 @@ impl MediaConnector {
         ))
     }
 
-    async fn decode_audio(
+    pub async fn decode_audio(
         &self,
         bytes: Bytes,
         source: AudioSource,
@@ -921,7 +1038,7 @@ impl MediaConnector {
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
 
-    async fn decode_video(
+    pub async fn decode_video(
         &self,
         bytes: Bytes,
         cfg: VideoFetchConfig,
