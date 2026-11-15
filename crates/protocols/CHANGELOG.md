@@ -231,10 +231,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A `/generate` request's `text` may be a batch of prompts, a list of texts, as SGLang's
   `/generate` takes it (`Union[List[str], str]`). A list was refused as `invalid_type` on every
   router that parses the body. An empty list is refused as an empty `input_ids` is
-  (`empty_array`, param `text`). A batch routes on its texts joined, as a batch of ids routes on
-  its ids, and the PD router counts its prompts for the bootstrap rooms. The gRPC path refuses a
-  batch of texts by name, as it refuses a batch of `input_ids`. Breaking: `GenerateRequest.text`
-  is an `Option<StringOrArray>`.
+  (`empty_array`, param `text`), and a list beside `input_ids` is refused (`invalid_value`, param
+  `text`): SGLang sizes such a batch from the texts, where the gRPC path would serve the ids. A
+  batch routes on its texts joined, as a batch of ids routes on its ids, and the PD router counts
+  its prompts for the bootstrap rooms. The gRPC path refuses a batch of texts by name, as it
+  refuses a batch of `input_ids`. Breaking: `GenerateRequest.text` is an `Option<StringOrArray>`.
 - A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
   (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
   `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
