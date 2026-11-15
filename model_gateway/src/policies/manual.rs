@@ -1065,9 +1065,55 @@ mod tests {
 
         assert_eq!(policy.routing_map.len(), 1);
 
-        std::thread::sleep(Duration::from_secs(4));
+        assert!(policy._eviction_task.is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !policy.routing_map.is_empty() || policy.entry_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the background task did not evict the idle key: map={}, entries={}",
+                policy.routing_map.len(),
+                policy.entry_count()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         assert_eq!(policy.routing_map.len(), 0);
+        assert_eq!(policy.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_manual_ttl_boundary_is_strict() {
+        let max_idle = Duration::from_secs(2);
+        let stamp = Instant::now();
+        let workers = make_workers(&["http://w1:8000"]);
+        let headers = headers_with_routing_key("ttl-boundary");
+        let info = with_headers(&headers);
+
+        // This controlled clock complements the live background-task test above.
+        for (age, expected_removed) in [
+            (max_idle - Duration::from_nanos(1), 0),
+            (max_idle, 1),
+            (max_idle + Duration::from_nanos(1), 1),
+        ] {
+            let policy = ManualPolicy::with_config(ManualConfig {
+                eviction_interval_secs: 0,
+                max_idle_secs: 2,
+                assignment_mode: ManualAssignmentMode::Random,
+            });
+            policy.select_worker_impl(&workers, &info);
+            policy
+                .routing_map
+                .get_mut(&RoutingId::new("ttl-boundary"))
+                .expect("the selected key")
+                .last_access = stamp;
+
+            assert_eq!(
+                evict_idle(&policy.routing_map, &policy.entries, max_idle, stamp + age),
+                expected_removed
+            );
+            assert_eq!(policy.routing_map.len(), 1 - expected_removed);
+            assert_eq!(policy.entry_count(), 1 - expected_removed);
+        }
     }
 
     #[test]
