@@ -177,6 +177,18 @@ impl ProtoGenerateRequest {
         matches!(self, Self::TokenSpeed(_))
     }
 
+    /// The runtime whose message type this request is.
+    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
+        use crate::worker::RuntimeType;
+        match self {
+            Self::Sglang(_) => RuntimeType::Sglang,
+            Self::Vllm(_) => RuntimeType::Vllm,
+            Self::Trtllm(_) => RuntimeType::Trtllm,
+            Self::Mlx(_) => RuntimeType::Mlx,
+            Self::TokenSpeed(_) => RuntimeType::TokenSpeed,
+        }
+    }
+
     /// Sanitize sampling params for the prefill-only side (vLLM PD mode).
     /// max_tokens=1 computes KV without generating; min_tokens is cleared so the
     /// engine accepts it; n=1 so the prefill returns a single kv_transfer_params dict.

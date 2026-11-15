@@ -517,6 +517,47 @@ mod history_tests {
         load_history, ReplayInto,
     };
 
+    /// The request the rebuild tests load: one completed user message and
+    /// nothing else, so a rebuilt request's items read as that message
+    /// followed by the calls recorded since.
+    fn one_message_request() -> ResponsesRequest {
+        ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::Message {
+                id: "msg_1".to_string(),
+                role: "user".to_string(),
+                content: vec![responses::ResponseContentPart::InputText {
+                    text: "What is 6*7?".to_string(),
+                }],
+                status: Some("completed".to_string()),
+                phase: None,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// Records in the state the executed call `call_<tag>` of the tool
+    /// `search`, answered `found`: what the loop records between a response
+    /// and the rebuild that follows it. The call id is what `shape` prints,
+    /// so the tests assert it (two tags tell a second rebuild's calls
+    /// apart); the output item's id `fc_<tag>` is read by none of them.
+    fn record_search_call(state: &mut ToolLoopState, request: &ResponsesRequest, tag: &str) {
+        state.record_call(
+            request.tools.as_deref(),
+            format!("call_{tag}"),
+            "search".to_string(),
+            "{}".to_string(),
+            "found".to_string(),
+            ResponseOutputItem::new_function_tool_call(
+                format!("fc_{tag}"),
+                format!("call_{tag}"),
+                "search".to_string(),
+                "{}".to_string(),
+                None,
+                "completed".to_string(),
+            ),
+        );
+    }
+
     /// Turn 2 answers the call a stored turn issued: the engine sees the
     /// question, the call and its answer on the first iteration, and the
     /// request rebuilt after a call this loop executed still carries them,
@@ -558,21 +599,7 @@ mod history_tests {
         assert_eq!(turns, ["user", "assistant+tool_calls", "tool"]);
 
         let mut state = ToolLoopState::default();
-        state.record_call(
-            loaded.tools.as_deref(),
-            "call_B".to_string(),
-            "search".to_string(),
-            "{}".to_string(),
-            "found".to_string(),
-            ResponseOutputItem::new_function_tool_call(
-                "fc_B".to_string(),
-                "call_B".to_string(),
-                "search".to_string(),
-                "{}".to_string(),
-                None,
-                "completed".to_string(),
-            ),
-        );
+        record_search_call(&mut state, &loaded, "B");
         let next = build_next_request(&mut state, loaded);
 
         let ResponseInput::Items(items) = &next.input else {
@@ -600,18 +627,7 @@ mod history_tests {
     /// thread that the bed's counts would show only as drift.
     #[test]
     fn the_rebuild_moves_the_loaded_items_instead_of_copying_them() {
-        let loaded = ResponsesRequest {
-            input: ResponseInput::Items(vec![ResponseInputOutputItem::Message {
-                id: "msg_1".to_string(),
-                role: "user".to_string(),
-                content: vec![responses::ResponseContentPart::InputText {
-                    text: "What is 6*7?".to_string(),
-                }],
-                status: Some("completed".to_string()),
-                phase: None,
-            }]),
-            ..Default::default()
-        };
+        let loaded = one_message_request();
         let ResponseInput::Items(items) = &loaded.input else {
             panic!("the loaded request's input is an item list");
         };
@@ -621,21 +637,7 @@ mod history_tests {
         let content_before = content.as_ptr();
 
         let mut state = ToolLoopState::default();
-        state.record_call(
-            loaded.tools.as_deref(),
-            "call_B".to_string(),
-            "search".to_string(),
-            "{}".to_string(),
-            "found".to_string(),
-            ResponseOutputItem::new_function_tool_call(
-                "fc_B".to_string(),
-                "call_B".to_string(),
-                "search".to_string(),
-                "{}".to_string(),
-                None,
-                "completed".to_string(),
-            ),
-        );
+        record_search_call(&mut state, &loaded, "B");
         let next = build_next_request(&mut state, loaded);
 
         let ResponseInput::Items(items) = &next.input else {
@@ -655,6 +657,39 @@ mod history_tests {
         assert!(
             state.calls_to_carry.is_empty(),
             "the executed call was copied into the next request instead of moved"
+        );
+    }
+
+    /// An earlier iteration's calls stay in every later request: the second
+    /// rebuild takes the first rebuild's output as it is and moves only the
+    /// calls recorded since in behind it, so the loaded items are followed by
+    /// both calls in order and the state carries nothing over. Pinned so a
+    /// rebuild from anything but the previous request (a fresh copy of the
+    /// loaded input, say) fails here instead of dropping the earlier calls.
+    #[test]
+    fn calls_recorded_in_earlier_iterations_stay_in_every_later_request() {
+        let loaded = one_message_request();
+        let mut state = ToolLoopState::default();
+
+        record_search_call(&mut state, &loaded, "B");
+        let second = build_next_request(&mut state, loaded);
+        record_search_call(&mut state, &second, "C");
+        let third = build_next_request(&mut state, second);
+
+        let ResponseInput::Items(items) = &third.input else {
+            panic!("the third request's input is an item list");
+        };
+        assert_eq!(
+            shape(items),
+            [
+                "message:user",
+                "function_call:call_B+output",
+                "function_call:call_C+output",
+            ]
+        );
+        assert!(
+            state.calls_to_carry.is_empty(),
+            "a call recorded before a build stayed in the state"
         );
     }
 

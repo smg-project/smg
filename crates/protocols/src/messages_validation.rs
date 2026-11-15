@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use validator::ValidationError;
 
 use crate::{
-    common::invalid,
+    common::{invalid, json_type_name},
     messages::{
         CreateMessageRequest, InputContent, InputContentBlock, InputMessage, MessageThread,
         MessagesBetas, Role, ThinkingConfig, Tool,
@@ -223,15 +223,25 @@ fn validate_message_contents(messages: &[InputMessage]) -> Result<(), Validation
             // with: the public API refuses any other JSON value, and so does
             // this gateway, before a string would be rendered as the call's
             // arguments and answered as if the history were well-formed.
-            let not_an_object = blocks.iter().position(|block| {
-                matches!(block, InputContentBlock::ToolUse(tool_use) if !tool_use.input.is_object())
-            });
-            if let Some(position) = not_an_object {
+            let not_an_object =
+                blocks
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, block)| match block {
+                        InputContentBlock::ToolUse(tool_use) if !tool_use.input.is_object() => {
+                            Some((position, tool_use))
+                        }
+                        _ => None,
+                    });
+            if let Some((position, tool_use)) = not_an_object {
                 return Err(invalid(
                     "tool_use_input_not_an_object",
                     format!(
                         "messages.{index}.content.{position}.tool_use.input: Input should be a \
-                         valid dictionary"
+                         valid dictionary (the tool_use block {} for {} carries {})",
+                        tool_use.id,
+                        tool_use.name,
+                        json_type_name(&tool_use.input)
                     ),
                 ));
             }
@@ -765,14 +775,22 @@ mod tests {
         let string = rejection(with_input(json!("Paris")));
         assert!(
             string.contains(
-                "messages.1.content.1.tool_use.input: Input should be a valid dictionary"
+                "messages.1.content.1.tool_use.input: Input should be a valid dictionary \
+                 (the tool_use block toolu_a for get_weather carries a string)"
             ),
             "{string}"
         );
-        for other in [json!(["Paris"]), json!(1), json!(null)] {
+        for (other, kind) in [
+            (json!(["Paris"]), "an array"),
+            (json!(1), "a number"),
+            (json!(null), "null"),
+        ] {
             let refused = rejection(with_input(other.clone()));
             assert!(
-                refused.contains("messages.1.content.1.tool_use.input"),
+                refused.contains(&format!(
+                    "messages.1.content.1.tool_use.input: Input should be a valid dictionary \
+                     (the tool_use block toolu_a for get_weather carries {kind})"
+                )),
                 "{other}: {refused}"
             );
         }
