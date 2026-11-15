@@ -2638,7 +2638,7 @@ impl PDRouter {
                 .worker_registry
                 .get_routing_snapshot(UNKNOWN_MODEL_ID)
                 .pd_pairs(PdWire::Http, mode),
-            _ => Arc::new(PdPairIndex::empty()),
+            _ => Arc::new(PdPairIndex::empty(PdWire::Http)),
         }
     }
 
@@ -2656,7 +2656,6 @@ impl PDRouter {
             model_id,
             &pairs,
             None,
-            false,
             prefill_capacity,
             inputs,
         )?;
