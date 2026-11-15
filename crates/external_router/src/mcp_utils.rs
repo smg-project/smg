@@ -462,6 +462,7 @@ mod tests {
     };
     use serde_json::json;
     use smg_mcp::{McpConfig, McpToolSession, ResponseFormatConfig, ToolConfig};
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -532,15 +533,25 @@ mod tests {
     /// What the local MCP server answers to `tools/list`: `tools` (each with
     /// an empty schema), or a JSON-RPC error when `tools` is `None`, when the
     /// request carries the `refused_bearer` token, or while `refusing` is
-    /// set; the answer comes after `list_delay` (while `slow` is set, when
-    /// it is given).
+    /// set. `arrived` is signalled when a `tools/list` arrives, after its
+    /// refusal is decided; a listing arriving while `hold` is holding waits
+    /// for its release; the answer comes after `list_delay`.
     #[derive(Clone, Default)]
     struct LocalServer {
         tools: Option<&'static [&'static str]>,
         refused_bearer: Option<&'static str>,
         refusing: Option<Arc<AtomicBool>>,
         list_delay: Duration,
-        slow: Option<Arc<AtomicBool>>,
+        arrived: Option<Arc<Notify>>,
+        hold: Option<Arc<Hold>>,
+    }
+
+    /// A gate the local server's `tools/list` waits at while `holding` is
+    /// set, until `release` is signalled.
+    #[derive(Default)]
+    struct Hold {
+        holding: AtomicBool,
+        release: Notify,
     }
 
     /// A local MCP server over HTTP that initializes and answers `tools/list`
@@ -581,12 +592,17 @@ mod tests {
                                 .and_then(|value| value.to_str().ok())
                                 .is_some_and(|value| value == format!("Bearer {token}"))
                         });
-                    let delayed = !server.list_delay.is_zero()
-                        && server
-                            .slow
-                            .as_ref()
-                            .is_none_or(|flag| flag.load(Ordering::SeqCst));
-                    if delayed {
+                    let held = server
+                        .hold
+                        .as_ref()
+                        .filter(|hold| hold.holding.load(Ordering::SeqCst));
+                    if let Some(arrived) = &server.arrived {
+                        arrived.notify_one();
+                    }
+                    if let Some(hold) = held {
+                        hold.release.notified().await;
+                    }
+                    if !server.list_delay.is_zero() {
                         tokio::time::sleep(server.list_delay).await;
                     }
                     match server.tools {
@@ -864,10 +880,11 @@ mod tests {
     }
 
     /// A listing's record is the listing connection's. With a pool of one,
-    /// the first connection is evicted during its slowed listing, a second
-    /// is pooled under the same key and its listing refused; the first's
-    /// late success does not stand for the second: the next caller under the
-    /// key lists again and carries the refusal instead of a hit's silence.
+    /// the first connection is evicted while its listing is held at the
+    /// server, a second is pooled under the same key and its listing
+    /// refused; the first's late success does not stand for the second: the
+    /// next caller under the key lists again and carries the refusal instead
+    /// of a hit's silence. The server's signals order the steps, no timer.
     #[tokio::test]
     async fn an_evicted_connections_late_listing_is_not_its_successors() {
         let mut config = McpConfig::default();
@@ -875,12 +892,16 @@ mod tests {
         let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
         let format_registry = FormatRegistry::new();
         let refusing = Arc::new(AtomicBool::new(false));
-        let slow = Arc::new(AtomicBool::new(true));
+        let arrived = Arc::new(Notify::new());
+        let hold = Arc::new(Hold {
+            holding: AtomicBool::new(true),
+            release: Notify::new(),
+        });
         let url = serve_local_mcp_server(LocalServer {
             tools: Some(&["echo"]),
             refusing: Some(Arc::clone(&refusing)),
-            list_delay: Duration::from_millis(600),
-            slow: Some(Arc::clone(&slow)),
+            arrived: Some(Arc::clone(&arrived)),
+            hold: Some(Arc::clone(&hold)),
             ..Default::default()
         })
         .await;
@@ -904,14 +925,19 @@ mod tests {
         let (first, second) = tokio::join!(
             connect_mcp_servers(&orchestrator, &format_registry, &first_input),
             async {
-                // The first connection is listing: another key's connect
-                // evicts it, then the same key's connect pools a second
-                // connection whose listing the server refuses at once.
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                slow.store(false, Ordering::SeqCst);
+                // The first connection's listing has arrived and is held:
+                // another key's connect evicts the connection, the same
+                // key's connect pools a second whose listing the server
+                // refuses at once; the held listing is released after that
+                // and completes last.
+                arrived.notified().await;
+                hold.holding.store(false, Ordering::SeqCst);
                 refusing.store(true, Ordering::SeqCst);
                 connect_mcp_servers(&orchestrator, &format_registry, &evicting_input).await;
-                connect_mcp_servers(&orchestrator, &format_registry, &second_input).await
+                let second =
+                    connect_mcp_servers(&orchestrator, &format_registry, &second_input).await;
+                hold.release.notify_one();
+                second
             }
         );
         assert_eq!(item_error(first), None, "the first connection listed");

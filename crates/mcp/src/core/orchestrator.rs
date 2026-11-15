@@ -841,16 +841,17 @@ impl McpOrchestrator {
                             };
                             let prompts = prompts_of(client.as_ref(), key).await;
                             let resources = resources_of(client.as_ref(), key).await;
-                            tool_inventory.clear_server_tool_entries(key);
-                            // The error cleared is this connection's: a
-                            // recovery during the listings replaced the entry,
-                            // and its own load's outcome stands.
-                            if let Some(mut entry) = static_servers
-                                .get_mut(key)
-                                .filter(|entry| Arc::ptr_eq(&entry.client, &client))
-                            {
-                                entry.list_error = None;
+                            // The write-back is this connection's: a recovery
+                            // during the listings replaced the entry (or a
+                            // removal dropped it), and its own load's tools
+                            // and outcome stand, not a stale listing's.
+                            match static_servers.get_mut(key) {
+                                Some(mut entry) if Arc::ptr_eq(&entry.client, &client) => {
+                                    entry.list_error = None;
+                                }
+                                _ => continue,
                             }
+                            tool_inventory.clear_server_tool_entries(key);
                             for entry in tools {
                                 tool_inventory.insert_entry(entry);
                             }
