@@ -12,7 +12,13 @@ use crate::{
     middleware::scheduler,
     policies::cost as selection_cost,
     tenant::MAX_TENANT_ID_LEN,
-    worker::{identity::endpoint::Endpoint, ConnectionMode},
+    worker::{
+        identity::{
+            endpoint::{Endpoint, EndpointError, Host as EndpointHost, Scheme},
+            metadata::join_base,
+        },
+        ConnectionMode,
+    },
 };
 
 /// The credential header names `routing_key_override.headers` may not carry
@@ -208,8 +214,11 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     Ok(())
 }
 
-/// Validate a single worker URL: non-empty, an allowed scheme, and a
-/// parseable host. Shared by `ConfigValidator::validate_urls` (startup
+/// Validate a single worker URL: non-empty, an allowed scheme, a parseable
+/// host, and one address to both of its readers (`read_two_ways`: the URL
+/// library a client dials by and the gateway's own type every line names
+/// by), as written and in the form routes are joined to. Shared by
+/// `ConfigValidator::validate_urls` (startup
 /// config) and the worker-management API so both reject schemeless or
 /// unparsable URLs identically. Rejecting at the API boundary prevents
 /// the orphaned `url_to_id` reservation from #1533: the AddWorker
@@ -241,7 +250,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     if scheme == "grpcs" {
         return Err(ConfigError::invalid_value(
             "worker_url",
-            Endpoint::redacted_str(url),
+            named_in_a_refusal(url),
             "grpcs:// workers are not supported: the gateway's gRPC channel speaks plain \
              HTTP/2 and holds no certificate store to validate an engine's; use grpc://"
                 .to_string(),
@@ -253,10 +262,11 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // schemeless address, a known scheme in upper case) is written with
     // its userinfo masked and its scheme lowercase; what it refuses (an
     // unknown scheme, no host, a parse failure) reads `<unparsable
-    // address>`. The scheme is what this refusal is about and the masked
-    // address no longer shows it as written, so the reason names it when
-    // it is one (RFC 3986 scheme characters): the prefix before a `://`
-    // further into a URL could be a userinfo, and is left out.
+    // address>`; what it reads with a rank shows its scheme alone
+    // (`named_in_a_refusal`). The scheme is what this refusal is about and
+    // the masked address no longer shows it as written, so the reason names
+    // it when it is one (RFC 3986 scheme characters): the prefix before a
+    // `://` further into a URL could be a userinfo, and is left out.
     if !ALLOWED_SCHEMES.contains(&scheme) {
         let rule =
             "URL must start with a lowercase http://, https://, grpc://, ipc://, or tcp:// scheme";
@@ -271,7 +281,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         };
         return Err(ConfigError::invalid_value(
             "worker_url",
-            Endpoint::redacted_str(url),
+            named_in_a_refusal(url),
             reason,
         ));
     }
@@ -283,31 +293,30 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         if path.is_empty() {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                Endpoint::redacted_str(url),
+                named_in_a_refusal(url),
                 "ipc:// worker URL must include a socket path",
             ));
         }
         return Ok(());
     }
 
-    match ::url::Url::parse(url) {
-        Ok(parsed) => {
-            if parsed.host_str().is_none() {
-                return Err(ConfigError::invalid_value(
-                    "worker_url",
-                    Endpoint::redacted_str(url),
-                    "URL must have a valid host",
-                ));
-            }
+    let dialled = match ::url::Url::parse(url) {
+        Ok(parsed) if parsed.host_str().is_some() => parsed,
+        Ok(_) => {
+            return Err(ConfigError::invalid_value(
+                "worker_url",
+                named_in_a_refusal(url),
+                "URL must have a valid host",
+            ));
         }
         Err(e) => {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                Endpoint::redacted_str(url),
+                named_in_a_refusal(url),
                 format!("Invalid URL format: {e}"),
             ));
         }
-    }
+    };
     // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
     // (`user:secret@`) has no meaning at all: refused, by the adapter's own
     // reading (an `@` anywhere after the scheme), so that nothing the
@@ -321,12 +330,151 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     {
         return Err(ConfigError::invalid_value(
             "worker_url",
-            Endpoint::redacted_str(url),
+            named_in_a_refusal(url),
             "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets at the \
              host and port",
         ));
     }
+    // Routes join to the address less its trailing slashes (`join_base`),
+    // and a line may name the worker by that form, so both readers find one
+    // host and one port there too. A client reads one authority in both
+    // forms. The gateway's type reads a rank in the second that the first
+    // does not show: `http://token@8080/` is a userinfo and a host as
+    // written, and its base is a host and its rank.
+    let base = join_base(url);
+    let read_apart = read_two_ways(url, &dialled).or_else(|| {
+        (base.len() != url.len())
+            .then(|| read_two_ways(base, &dialled))
+            .flatten()
+    });
+    if let Some(reason) = read_apart {
+        // No part of the address is shown. What one reading takes for a
+        // host the other may take for a credential, and the gateway's own
+        // rendering trusts its own reading: `http://token@8080` is a host
+        // and its rank to it, written whole.
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            format!("{scheme}://***"),
+            reason,
+        ));
+    }
     Ok(())
+}
+
+/// How a refusal of the worker URL door names the address: by the gateway's
+/// masked rendering, and by its scheme alone when that rendering reads a
+/// rank. No caller's address carries a rank, and what stands before the `@`
+/// may be a credential the rendering takes for a host: `tcp://token@8080`
+/// is a host and its rank to it, written whole.
+fn named_in_a_refusal(url: &str) -> String {
+    match Endpoint::parse_with_rank(url) {
+        Ok((ranked, Some(_))) => {
+            format!("{}***", ranked.scheme().map_or("", Scheme::as_prefix))
+        }
+        _ => Endpoint::redacted_str(url),
+    }
+}
+
+/// Why a worker URL the URL library took is refused all the same, `None`
+/// when the gateway's own address type reads it as the library does.
+///
+/// The address is read twice after this door. The health probe and the gRPC
+/// channel dial what a URL client reads, `dialled` here. Every log line,
+/// masked name and identity key follows [`Endpoint`]. Where the two part, a
+/// line names one host and the gateway dials another:
+/// `http://10.0.0.5:8000@2130706433` is rank 2130706433 of `10.0.0.5:8000`
+/// to the gateway's type, and the host 127.0.0.1 behind a userinfo to a
+/// client. So the door takes an address only when both read one host and
+/// one port in it, and the userinfo the gateway's type reads holds no
+/// character at which a client ends the authority. A rank suffix is the
+/// registration's own, appended to a data-parallel worker's address after
+/// this door, never a caller's.
+///
+/// Neither the refusal nor its reason names a part of the address: what
+/// one reading takes for a host the other may take for a credential.
+fn read_two_ways(url: &str, dialled: &::url::Url) -> Option<&'static str> {
+    let named = match Endpoint::parse(url) {
+        Ok(named) => named,
+        Err(EndpointError::UnexpectedRank { .. }) => {
+            return Some(
+                "a worker URL cannot end in '@' and digits, trailing slashes aside: the gateway \
+                 reads them as a rank suffix, which only its own registration appends",
+            );
+        }
+        Err(_) => {
+            return Some(
+                "the gateway cannot read this address as a host and a port, though a URL \
+                 client can: write it as scheme://host:port, with a port from 1 to 65535",
+            );
+        }
+    };
+    let same_host = match (dialled.host(), named.host()) {
+        (Some(::url::Host::Ipv4(dialled)), EndpointHost::Ip(IpAddr::V4(named))) => {
+            dialled == *named
+        }
+        (Some(::url::Host::Ipv6(dialled)), EndpointHost::Ip(IpAddr::V6(named))) => {
+            dialled == *named
+        }
+        // A client reads an IPv4 address in more notations than the
+        // gateway's type does (`2130706433`, `0x7f.1`): one host, when the
+        // name is that address to the library.
+        (Some(::url::Host::Ipv4(dialled)), EndpointHost::Name(named)) => {
+            matches!(::url::Host::parse(named), Ok(::url::Host::Ipv4(same)) if same == dialled)
+        }
+        // The library keeps the host of a `grpc://` or `tcp://` URL as
+        // text, an address literal included.
+        (Some(::url::Host::Domain(dialled)), EndpointHost::Ip(named)) => {
+            dialled.parse::<IpAddr>().is_ok_and(|ip| ip == *named)
+        }
+        // One name, whatever its case; or the form the library gives the
+        // name: an internationalized or a percent-encoded one under `http`
+        // and `https`, one kept as text with its bytes outside ASCII
+        // percent-encoded under `grpc` and `tcp`. The library keeps the
+        // ASCII case of that text and the gateway's type lowers it, so the
+        // third compare takes no account of it either.
+        (Some(::url::Host::Domain(dialled)), EndpointHost::Name(named)) => {
+            dialled.eq_ignore_ascii_case(named)
+                || matches!(
+                    ::url::Host::parse(named),
+                    Ok(::url::Host::Domain(same)) if same == dialled
+                )
+                || matches!(
+                    ::url::Host::parse_opaque(named),
+                    Ok(::url::Host::Domain(same)) if same.eq_ignore_ascii_case(dialled)
+                )
+        }
+        _ => false,
+    };
+    // A client fills a missing port from the scheme and drops one that
+    // equals the scheme's own.
+    let same_port = match (dialled.port(), named.port()) {
+        (dialled, named) if dialled == named => true,
+        (None, Some(named)) => dialled.port_or_known_default() == Some(named),
+        _ => false,
+    };
+    if !(same_host && same_port) {
+        return Some(
+            "the address reads two ways: a client would dial one host and port and the gateway \
+             would name another; percent-encode an '@' or a '\\' inside a userinfo",
+        );
+    }
+    // The two also end the authority apart. A client ends it at the first
+    // `/`, `?` or `#`, and under `http` and `https` at a backslash too. The
+    // gateway's type ends it at the first `/`, `?` or `#` behind a
+    // bracketed host: it reads on past a backslash, and past all four
+    // before the first `]` of an authority that opens with a bracket. With
+    // one host and port on both sides (`http://w:1\@w:1`,
+    // `http://[u@w:1/]@w:1`) the two still part: a client joins every route
+    // under the rest as a path, and the gateway's type reads a userinfo
+    // that is not there. So the userinfo it reads holds none of them.
+    let ends_a_clients_authority = |c: char| {
+        matches!(c, '/' | '?' | '#') || (c == '\\' && matches!(dialled.scheme(), "http" | "https"))
+    };
+    named.userinfo_holds(ends_a_clients_authority).then_some(
+        "the address reads two ways: a client ends the authority inside what the gateway \
+         reads as a userinfo, and joins its routes under the rest as a path; percent-encode \
+         a '/', a '?', a '#' or a '\\' inside a userinfo",
+    )
 }
 
 /// The warning for a `grpc://` worker URL that carries userinfo
@@ -3553,7 +3701,10 @@ mod tests {
     /// What the ZMQ adapter refuses for a userinfo, the validator refuses
     /// first: a `tcp://` URL with an `@` that the endpoint grammar reads as
     /// something else (a rank suffix after it, an empty userinfo) is refused
-    /// here, masked, instead of passing to a refusal at registration.
+    /// here, masked, instead of passing to a refusal at registration. The
+    /// one the grammar reads with a rank shows its scheme alone: that
+    /// reading is not a caller's, so its rendering is not trusted with what
+    /// stands before the `@`.
     #[test]
     fn a_tcp_worker_url_the_adapter_refuses_is_refused_by_the_validator() {
         for url in ["tcp://user:secret@host:1@2", "tcp://@host:31000"] {
@@ -3564,7 +3715,10 @@ mod tests {
         let text = validate_worker_url("tcp://user:secret@host:1@2")
             .expect_err("refused")
             .to_string();
-        assert!(text.contains("tcp://***@host:1@2"), "{text}");
+        assert!(
+            text.starts_with("Invalid value for field 'worker_url': tcp://*** - "),
+            "{text}"
+        );
     }
 
     /// A `grpc://` worker URL with userinfo stays accepted and earns the one
@@ -3624,6 +3778,247 @@ mod tests {
     #[test]
     fn worker_url_rejects_unparsable() {
         assert!(validate_worker_url("http://").is_err());
+    }
+
+    /// An address the URL library and the gateway's own type read apart is
+    /// refused: a client would dial one host while every line named another,
+    /// or join its routes under a path the gateway's type takes for a
+    /// userinfo. The refusal names the address by its scheme alone and its
+    /// reason names no part of it.
+    #[test]
+    fn a_worker_url_read_two_ways_is_refused() {
+        // The refusal of `url`: the scheme and no other part of the address,
+        // then the reason, whose text is the same for every address.
+        let refused = |url: &str, reason: &str| {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+            let shown = format!("Invalid value for field 'worker_url': {scheme}://*** - {reason}");
+            assert!(text.starts_with(&shown), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        };
+        // A caller's rank suffix. A client dials the digits as the host, or
+        // reads them as the end of the path or the query (the fifth and the
+        // sixth). The last two have no userinfo to the gateway's type, which
+        // reads a host and its rank: a token alone, a user and a password of
+        // digits.
+        for url in [
+            "http://127.0.0.1:35099@2130706433",
+            "http://user:s3cret@127.0.0.1:52605@2130706433",
+            "grpc://127.0.0.1:61845@2130706433",
+            "http://user:s3cret@127.0.0.1:57697@3",
+            "http://10.0.0.1:30000/v1@2",
+            "grpc://worker:50051?token=s3cret@3",
+            "http://s3cret-token@8080",
+            "http://s3cret-user:8080@2130706433",
+        ] {
+            refused(url, "a worker URL cannot end in '@' and digits");
+        }
+        // What a client reads and the gateway's type does not: an empty
+        // port, port 0, a tab a client drops, a userinfo before a host of
+        // digits alone.
+        for url in [
+            "http://user:s3cret@worker:/v1",
+            "http://user:s3cret@worker:0",
+            "http://user:s3cret@wor\tker:8000",
+            "http://user:s3cret@8080",
+        ] {
+            refused(
+                url,
+                "the gateway cannot read this address as a host and a port",
+            );
+        }
+        // Two addresses in one: a backslash ends the authority for an HTTP
+        // client and not for the gateway's type. The hosts part in the
+        // first, the ports alone in the second. In the third a bracket
+        // parts two names under `grpc` that differ beyond their ASCII
+        // case.
+        for url in [
+            "http://s3cret-dialled\\@named.example",
+            "http://worker\\@worker:8000",
+            "grpc://[u@W\u{f6}rker.example:50051/]@w\u{f6}rk\u{e9}r.example:50051",
+        ] {
+            refused(
+                url,
+                "the address reads two ways: a client would dial one host and port",
+            );
+        }
+        // One host and port to both readers, which end the authority
+        // apart: a client joins every route under the rest as a path, and
+        // the gateway's type reads a userinfo that is not there. At a
+        // backslash under `http` and `https`: alone, with a path behind it,
+        // with a userinfo before it, under `https`. At a slash, a question
+        // mark or a hash before the first `]` of an authority that opens
+        // with a bracket: with a backslash behind the bracket, without one,
+        // with a path behind it, under `grpc`.
+        for url in [
+            "http://worker:8000\\@worker:8000",
+            "http://worker:8000\\@worker:8000/v1",
+            "http://user:s3cret@worker:8000\\@worker:8000",
+            "https://worker.example.com\\@worker.example.com",
+            "http://[u@worker:8000/]\\@worker:8000",
+            "http://[u@worker:8000/]@worker:8000",
+            "http://[u@worker:8000/]@worker:8000/v1",
+            "http://[u@worker:8000?x]@worker:8000",
+            "http://[u@worker:8000#x]@worker:8000",
+            "grpc://[u@worker:50051/]@worker:50051",
+        ] {
+            refused(
+                url,
+                "the address reads two ways: a client ends the authority inside what the gateway",
+            );
+        }
+    }
+
+    /// An earlier rule of the door names the address it refuses by the
+    /// gateway's masked rendering, which reads a token before an `@` and
+    /// digits as a host and its rank: such an address shows its scheme alone
+    /// in the refusal, whichever rule refuses it.
+    #[test]
+    fn a_refusal_shows_the_scheme_alone_of_an_address_read_with_a_rank() {
+        for (url, shown, reason) in [
+            (
+                "tcp://s3cret-token@8080",
+                "tcp://***",
+                "a tcp:// worker URL takes no userinfo",
+            ),
+            (
+                "grpcs://s3cret-token@8080",
+                "grpcs://***",
+                "grpcs:// workers are not supported",
+            ),
+            (
+                "HTTP://s3cret-token@8080",
+                "http://***",
+                "scheme 'HTTP://' is not allowed",
+            ),
+            (
+                "s3cret-token@8080",
+                "***",
+                "URL must start with a lowercase",
+            ),
+            (
+                "http://s3cret-token@99999999999",
+                "http://***",
+                "Invalid URL format",
+            ),
+        ] {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let named = format!("Invalid value for field 'worker_url': {shown} - {reason}");
+            assert!(text.starts_with(&named), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        }
+        // No rank, no change: the masked rendering, as before.
+        let text = validate_worker_url("tcp://user:s3cret@10.0.0.5:31000")
+            .expect_err("a tcp userinfo")
+            .to_string();
+        assert!(
+            text.starts_with("Invalid value for field 'worker_url': tcp://***@10.0.0.5:31000 - "),
+            "{text}"
+        );
+    }
+
+    /// What the two readings agree on stays accepted, however it is
+    /// written: a userinfo (an `@` inside it too), the scheme's own port
+    /// written out or left out, a name in upper case or percent-encoded,
+    /// an IPv4 address as one number, an IPv6 literal, a query that holds
+    /// an `@`, a name outside ASCII under `tcp` or `grpc` in either case, a
+    /// backslash behind the authority or under `grpc`.
+    #[test]
+    fn a_worker_url_both_readings_agree_on_is_accepted() {
+        for url in [
+            "http://user:pass@worker:3000",
+            "http://a@b:pass@worker:3000",
+            "http://worker:3000/v1",
+            "http://10.0.0.5:8000",
+            "http://worker:80",
+            "https://worker.example.com:443/v1",
+            "http://Worker.Example:8000",
+            "http://w%6frker:8000",
+            "http://2130706433:8000",
+            "https://[::1]:8443",
+            "grpc://10.0.0.5:50051",
+            "grpc://Worker:50051",
+            "grpc://[fd00::1]:50051",
+            "grpc://worker:50051?token=a@b",
+            "http://worker:8000?x=a\\@b",
+            "grpc://user\\@worker:50051",
+            "tcp://10.0.0.5:31000",
+            "tcp://w\u{f6}rker.example:31000",
+            "tcp://W\u{f6}rker.example:31000",
+            "grpc://W\u{f6}rker.example:50051",
+        ] {
+            validate_worker_url(url).expect(url);
+        }
+    }
+
+    /// Routes join to the address less its trailing slashes, and a line may
+    /// name a worker by that form: the door reads it both ways too. An
+    /// address that is one host to both readers as written, and a rank or
+    /// no address at all to the gateway's type without its trailing slashes,
+    /// is refused and named by its scheme alone.
+    #[test]
+    fn a_worker_url_read_two_ways_without_its_trailing_slashes_is_refused() {
+        for (url, reason) in [
+            (
+                "http://s3cret-token@2130706433/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://s3cret-token@2130706433//",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "https://10.0.0.5:8000@2130706433/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://127.0.0.1:8000/?token=s3cret@123456/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://127.0.0.1:8000?token=s3cret@42/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://s3cret-user:s3cret@2130706433/",
+                "the gateway cannot read this address as a host and a port",
+            ),
+        ] {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+            let shown = format!("Invalid value for field 'worker_url': {scheme}://*** - {reason}");
+            assert!(text.starts_with(&shown), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        }
+        // A trailing slash alone changes nothing: what both read as one in
+        // both forms stays accepted.
+        for url in [
+            "http://worker:3000/",
+            "http://worker:3000//",
+            "http://user:pass@worker:3000/",
+            "https://worker.example.com/v1/",
+            "http://worker:3000/?token=a@b/",
+            "http://2130706433:8000/",
+        ] {
+            validate_worker_url(url).expect(url);
+        }
+    }
+
+    /// The refusal ends a start too: the configuration's worker URLs go
+    /// through the one door.
+    #[test]
+    fn a_start_refuses_a_worker_url_read_two_ways() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://user:s3cret@127.0.0.1:52605@2130706433".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        let text = ConfigValidator::validate(&config)
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("cannot end in '@' and digits"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 
     #[test]
