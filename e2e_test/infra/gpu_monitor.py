@@ -226,7 +226,11 @@ def _amd_monitor_loop(pid: int, output_path: str, interval: float, gpu_ids: list
     initialized = False
     samples: list[float] = []
     per_gpu: dict[str, list[float]] = {}
-    metadata = {"backend": "amdsmi", "status": "unavailable", "sample_times_monotonic": []}
+    metadata: dict[str, Any] = {
+        "backend": "amdsmi",
+        "status": "unavailable",
+        "sample_times_monotonic": [],
+    }
     try:
         # Only the sampler child imports the runtime. CPU tests inject fakes.
         import amdsmi

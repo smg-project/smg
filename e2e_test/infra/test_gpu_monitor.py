@@ -13,6 +13,7 @@ import pytest
 _SPEC = importlib.util.spec_from_file_location(
     "monitor_under_test", Path(__file__).with_name("gpu_monitor.py")
 )
+assert _SPEC is not None and _SPEC.loader is not None
 monitor = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(monitor)
 
