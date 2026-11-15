@@ -1534,11 +1534,13 @@ class RouterArgs:
             choices=["off", "hash"],
             default=RouterArgs.grouped_dp_sticky,
             help=(
-                "Pin every request that carries a routing key to one engine of a grouped"
-                " data-parallel worker (a ZMQ worker several engines dial, as many as"
-                " --zmq-engine-count says or its engines declare), so a conversation keeps"
-                " one engine's prefix cache: hash sends a key's requests to the engine its"
-                " hash picks; off leaves each request to the least-loaded engine"
+                "Whether, and how, a request that carries a routing key is pinned to one"
+                " engine of a grouped data-parallel worker (a ZMQ worker several engines"
+                " dial, as many as --zmq-engine-count says or its engines declare), so a"
+                " conversation keeps one engine's prefix cache. The key is the first valid"
+                " --routing-key-headers header, or the body rid under --routing-key-override."
+                " hash sends a key's requests to the engine its hash picks; off leaves each"
+                " request to the least-loaded engine"
             ),
         )
         routing_group.add_argument(
