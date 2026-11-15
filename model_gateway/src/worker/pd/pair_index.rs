@@ -39,6 +39,37 @@ impl PdWire {
             Self::Http => (RoutingPool::HttpPrefill, RoutingPool::HttpDecode),
         }
     }
+
+    /// Whether a pair on this wire must share a runtime. The gRPC wire
+    /// builds one request for the pair, in the message type of the prefill's
+    /// runtime, and each worker's client sends only its own runtime's type:
+    /// a pair of two runtimes cannot be dispatched at all. The HTTP wire
+    /// forwards one JSON body to both sides and has no such fact.
+    pub(crate) const fn runtime_specific(self) -> bool {
+        match self {
+            Self::Grpc => true,
+            Self::Http => false,
+        }
+    }
+
+    /// Why `prefill` and `decode` cannot pair on this wire under `mode`: the
+    /// wire's own fact first, then the mode's rule over the descriptors
+    /// ([`PdPairing::mismatch`]). The pairing mode says how much of the KV
+    /// handoff is compared and `Off` compares none of it; a known runtime
+    /// difference on a runtime-specific wire is not the handoff's fact but
+    /// the wire's, so no mode switches it off. An unknown runtime is not a
+    /// different one and pairs as the mode says.
+    fn mismatch(
+        self,
+        prefill: &PdPairing,
+        decode: &PdPairing,
+        mode: PdPairingMode,
+    ) -> Option<PairingMismatch> {
+        if self.runtime_specific() && prefill.runtime_differs(decode) {
+            return Some(PairingMismatch::Runtime);
+        }
+        prefill.mismatch(decode, mode)
+    }
 }
 
 /// Why no prefill in a snapshot can pair with any decode: each pool's distinct
@@ -54,6 +85,9 @@ pub(crate) struct PairingRefusal {
 /// least one compatible decode, that prefill's partners.
 #[derive(Debug)]
 pub(crate) struct PdPairIndex {
+    /// The wire the pairs were made for. Placement reads the wire's facts
+    /// from here, so they are the ones the lists were built by.
+    pub wire: PdWire,
     /// The prefill pool as the snapshot holds it, for role verdicts.
     pub prefill_pool: Arc<[Arc<dyn Worker>]>,
     /// The decode pool as the snapshot holds it, for role verdicts.
@@ -68,10 +102,14 @@ pub(crate) struct PdPairIndex {
 }
 
 impl PdPairIndex {
-    /// Pair every prefill with its compatible decodes under `mode`.
+    /// Pair every prefill with the decodes it can pair with on `wire` under
+    /// `mode` (see [`PdWire::mismatch`]). Every placement of the wire reads
+    /// these lists, the overload default included, so a pair the wire cannot
+    /// carry is handed out by none of them.
     pub(crate) fn build(
         prefill_pool: Arc<[Arc<dyn Worker>]>,
         decode_pool: Arc<[Arc<dyn Worker>]>,
+        wire: PdWire,
         mode: PdPairingMode,
     ) -> Self {
         let mut by_descriptor: Vec<(&PdPairing, Workers)> = Vec::new();
@@ -82,15 +120,18 @@ impl PdPairIndex {
             let list = match by_descriptor.iter().find(|(d, _)| *d == descriptor) {
                 Some((_, list)) => Arc::clone(list),
                 None => {
-                    let list: Workers = if mode == PdPairingMode::Off {
-                        Arc::clone(&decode_pool)
-                    } else {
-                        decode_pool
-                            .iter()
-                            .filter(|d| descriptor.compatible(d.pd_pairing(), mode))
-                            .cloned()
-                            .collect()
+                    let pairs = |d: &Arc<dyn Worker>| {
+                        wire.mismatch(descriptor, d.pd_pairing(), mode).is_none()
                     };
+                    // `Off` sorts nothing of the handoff: where the wire
+                    // keeps no decode apart either, the pool itself is the
+                    // list and none is built.
+                    let list: Workers =
+                        if mode == PdPairingMode::Off && decode_pool.iter().all(pairs) {
+                            Arc::clone(&decode_pool)
+                        } else {
+                            decode_pool.iter().filter(|d| pairs(d)).cloned().collect()
+                        };
                     by_descriptor.push((descriptor, Arc::clone(&list)));
                     list
                 }
@@ -104,9 +145,10 @@ impl PdPairIndex {
             .then(|| PairingRefusal {
                 prefill: pairing_keys(&prefill_pool),
                 decode: pairing_keys(&decode_pool),
-                mismatches: pairing_mismatches(&prefill_pool, &decode_pool, mode),
+                mismatches: pairing_mismatches(&prefill_pool, &decode_pool, wire, mode),
             });
         Self {
+            wire,
             prefill_pool,
             decode_pool,
             prefill: prefill.into(),
@@ -121,9 +163,16 @@ impl PdPairIndex {
         !self.prefill.is_empty()
     }
 
-    /// An index over two empty pools.
-    pub(crate) fn empty() -> Self {
-        Self::build(Arc::from([]), Arc::from([]), PdPairingMode::Off)
+    /// An index over two empty pools of `wire`.
+    pub(crate) fn empty(wire: PdWire) -> Self {
+        Self {
+            wire,
+            prefill_pool: Arc::from([]),
+            decode_pool: Arc::from([]),
+            prefill: Arc::from([]),
+            partners: Vec::new(),
+            refusal: None,
+        }
     }
 }
 
@@ -135,10 +184,11 @@ fn pairing_keys(pool: &[Arc<dyn Worker>]) -> Vec<String> {
     keys
 }
 
-/// The distinct components on which the pools' descriptors disagree, sorted.
+/// The distinct components on which the pools' workers cannot pair, sorted.
 fn pairing_mismatches(
     prefill: &[Arc<dyn Worker>],
     decode: &[Arc<dyn Worker>],
+    wire: PdWire,
     mode: PdPairingMode,
 ) -> Vec<String> {
     let mut mismatches: Vec<String> = prefill
@@ -146,7 +196,7 @@ fn pairing_mismatches(
         .flat_map(|p| {
             decode
                 .iter()
-                .filter_map(move |d| p.pd_pairing().mismatch(d.pd_pairing(), mode))
+                .filter_map(move |d| wire.mismatch(p.pd_pairing(), d.pd_pairing(), mode))
         })
         .map(PairingMismatch::describe)
         .collect();
@@ -203,6 +253,7 @@ mod tests {
         let index = PdPairIndex::build(
             Arc::clone(&prefill),
             Arc::clone(&decode),
+            PdWire::Grpc,
             PdPairingMode::Lenient,
         );
         assert_eq!(
@@ -222,6 +273,7 @@ mod tests {
         let strict = PdPairIndex::build(
             Arc::clone(&prefill),
             Arc::clone(&decode),
+            PdWire::Grpc,
             PdPairingMode::Strict,
         );
         assert_eq!(
@@ -229,8 +281,14 @@ mod tests {
             ["grpc://p:nixl", "grpc://p:mooncake"]
         );
 
-        // Off pairs everything: every prefill shares the whole decode pool.
-        let off = PdPairIndex::build(prefill, Arc::clone(&decode), PdPairingMode::Off);
+        // Off compares nothing of the handoff: every prefill of this
+        // one-runtime fleet shares the whole decode pool.
+        let off = PdPairIndex::build(
+            prefill,
+            Arc::clone(&decode),
+            PdWire::Grpc,
+            PdPairingMode::Off,
+        );
         assert_eq!(off.prefill.len(), 3);
         assert!(off.partners.iter().all(|list| Arc::ptr_eq(list, &decode)));
     }
@@ -246,7 +304,7 @@ mod tests {
             WorkerType::Decode,
             Some("NixlConnector"),
         )]);
-        let index = PdPairIndex::build(prefill, decode, PdPairingMode::Lenient);
+        let index = PdPairIndex::build(prefill, decode, PdWire::Grpc, PdPairingMode::Lenient);
         assert!(Arc::ptr_eq(&index.partners[0], &index.partners[1]));
     }
 
@@ -262,7 +320,7 @@ mod tests {
             WorkerType::Decode,
             Some("MooncakeConnector"),
         )]);
-        let index = PdPairIndex::build(prefill, decode, PdPairingMode::Lenient);
+        let index = PdPairIndex::build(prefill, decode, PdWire::Grpc, PdPairingMode::Lenient);
         assert!(index.prefill.is_empty());
         assert_eq!(
             index.refusal,
@@ -273,6 +331,130 @@ mod tests {
             })
         );
         // A pool with no workers at all is not a refusal.
-        assert!(PdPairIndex::empty().refusal.is_none());
+        assert!(PdPairIndex::empty(PdWire::Grpc).refusal.is_none());
+    }
+
+    fn worker_on(url: &str, worker_type: WorkerType, runtime: RuntimeType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(runtime)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// Three prefills on three runtimes over decodes on two of them.
+    fn three_runtimes() -> (Workers, Workers) {
+        let prefill = Arc::from([
+            worker_on("grpc://p:a", WorkerType::Prefill, RuntimeType::Vllm),
+            worker_on("grpc://p:b", WorkerType::Prefill, RuntimeType::Sglang),
+            worker_on("grpc://p:c", WorkerType::Prefill, RuntimeType::TokenSpeed),
+        ]);
+        let decode = Arc::from([
+            worker_on("grpc://d:a", WorkerType::Decode, RuntimeType::Vllm),
+            worker_on("grpc://d:b", WorkerType::Decode, RuntimeType::Sglang),
+        ]);
+        (prefill, decode)
+    }
+
+    #[test]
+    fn pairing_off_keeps_known_runtimes_apart_where_the_wire_is_runtime_specific() {
+        let (prefill, decode) = three_runtimes();
+        let index = PdPairIndex::build(
+            Arc::clone(&prefill),
+            Arc::clone(&decode),
+            PdWire::Grpc,
+            PdPairingMode::Off,
+        );
+        // Each prefill lists the decodes of its own runtime; the one with no
+        // decode on its runtime is in no pair, though the pool has decodes.
+        assert_eq!(urls(&index.prefill), ["grpc://p:a", "grpc://p:b"]);
+        assert_eq!(urls(&index.partners[0]), ["grpc://d:a"]);
+        assert_eq!(urls(&index.partners[1]), ["grpc://d:b"]);
+        assert!(index.refusal.is_none());
+
+        // The other wire forwards one body to both sides: off pairs
+        // everything there, as it did.
+        let http = PdPairIndex::build(
+            prefill,
+            Arc::clone(&decode),
+            PdWire::Http,
+            PdPairingMode::Off,
+        );
+        assert_eq!(http.prefill.len(), 3);
+        assert!(http.partners.iter().all(|list| Arc::ptr_eq(list, &decode)));
+    }
+
+    #[test]
+    fn a_fleet_with_no_shared_runtime_is_refused_under_pairing_off_as_under_lenient() {
+        let pools = || -> (Workers, Workers) {
+            (
+                Arc::from([worker_on(
+                    "grpc://p:1",
+                    WorkerType::Prefill,
+                    RuntimeType::Vllm,
+                )]),
+                Arc::from([worker_on(
+                    "grpc://d:1",
+                    WorkerType::Decode,
+                    RuntimeType::Sglang,
+                )]),
+            )
+        };
+        let build = |wire: PdWire, mode: PdPairingMode| {
+            let (prefill, decode) = pools();
+            PdPairIndex::build(prefill, decode, wire, mode)
+        };
+        let off = build(PdWire::Grpc, PdPairingMode::Off);
+        assert!(!off.can_pair());
+        assert_eq!(
+            off.refusal,
+            Some(PairingRefusal {
+                prefill: vec!["vllm/?/?".to_string()],
+                decode: vec!["sglang/?/?".to_string()],
+                mismatches: vec!["runtime".to_string()],
+            })
+        );
+        // One cause, one answer: the mode's own refusal of the same fleet.
+        assert_eq!(
+            off.refusal,
+            build(PdWire::Grpc, PdPairingMode::Lenient).refusal
+        );
+        // Where the wire has no such fact the pair stands under off.
+        let http = build(PdWire::Http, PdPairingMode::Off);
+        assert!(http.can_pair());
+        assert!(http.refusal.is_none());
+    }
+
+    #[test]
+    fn an_unknown_runtime_pairs_as_the_mode_says() {
+        let build = |mode: PdPairingMode| {
+            PdPairIndex::build(
+                Arc::from([worker_on(
+                    "grpc://p:1",
+                    WorkerType::Prefill,
+                    RuntimeType::Unspecified,
+                )]),
+                Arc::from([worker_on(
+                    "grpc://d:1",
+                    WorkerType::Decode,
+                    RuntimeType::Vllm,
+                )]),
+                PdWire::Grpc,
+                mode,
+            )
+        };
+        // Unknown is not different: the wire's fact holds nothing apart.
+        assert!(build(PdPairingMode::Off).can_pair());
+        assert!(build(PdPairingMode::Lenient).can_pair());
+        let strict = build(PdPairingMode::Strict);
+        assert!(!strict.can_pair());
+        assert_eq!(
+            strict.refusal.map(|refusal| refusal.mismatches),
+            Some(vec!["unknown runtime".to_string()])
+        );
     }
 }

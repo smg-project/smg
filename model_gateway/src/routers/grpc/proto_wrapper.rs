@@ -71,7 +71,10 @@ pub use self::{
 pub(crate) use self::{
     multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
-    shm::{cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request},
+    shm::{
+        cleanup_generate_request_shm, cleanup_tokenspeed_items_encoder_shm,
+        finish_tokenspeed_request, finish_vllm_request,
+    },
 };
 
 /// Helper macro to convert input logprobs from proto types to unified type.

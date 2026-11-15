@@ -1866,7 +1866,6 @@ impl WorkerSelectionStage {
                 model_id,
                 &pairs,
                 wire,
-                true,
                 prefill_capacity,
                 inputs,
             )
@@ -2115,7 +2114,6 @@ impl WorkerSelectionStage {
             model_id,
             &pairs,
             demand.wire,
-            true,
             prefill_capacity,
             PlacementInputs {
                 candidate_filter: Some(&eligible),

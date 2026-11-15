@@ -15,6 +15,10 @@
 //! working and a rolling engine upgrade keeps pairing;
 //! [`PdPairingMode::Strict`] also refuses a component one side does not
 //! report and a version difference; [`PdPairingMode::Off`] pairs on nothing.
+//! The mode judges the KV handoff alone. What a wire cannot carry at all, a
+//! pair of two known runtimes where the requests are runtime-specific, is
+//! that wire's fact: it holds in every mode, where the pairs are made
+//! ([`super::pair_index`]).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -227,7 +231,22 @@ impl PdPairing {
         )
     }
 
+    /// How the two workers' runtimes compare. A worker whose runtime probe
+    /// failed has an unknown runtime, not a different one.
+    fn runtime_agreement(&self, other: &Self) -> Agreement {
+        let runtime = |runtime: RuntimeType| runtime.is_specified().then(|| runtime.as_str());
+        Agreement::of(runtime(self.runtime), runtime(other.runtime))
+    }
+
+    /// Whether both workers' runtimes are known and differ: the one fact no
+    /// pairing mode switches off on a wire whose requests are
+    /// runtime-specific (see `PdWire::mismatch`).
+    pub(crate) fn runtime_differs(&self, other: &Self) -> bool {
+        self.runtime_agreement(other) == Agreement::Differ
+    }
+
     /// Whether the two workers may form a PD pair under `mode`.
+    #[cfg(test)]
     pub fn compatible(&self, other: &Self, mode: PdPairingMode) -> bool {
         self.mismatch(other, mode).is_none()
     }
@@ -247,17 +266,12 @@ impl PdPairing {
         }
         let strict = mode == PdPairingMode::Strict;
         // The hard facts, judged in this order by [`Agreement::hard_fact`].
-        // A worker whose runtime probe failed has an unknown runtime, not a
-        // different one.
-        let runtime = |runtime: RuntimeType| runtime.is_specified().then(|| runtime.as_str());
-        if let Some(mismatch) = Agreement::of(runtime(self.runtime), runtime(other.runtime))
-            .hard_fact(
-                PairingMismatch::Runtime,
-                "runtime",
-                strict,
-                Unreported::Unknown,
-            )
-        {
+        if let Some(mismatch) = self.runtime_agreement(other).hard_fact(
+            PairingMismatch::Runtime,
+            "runtime",
+            strict,
+            Unreported::Unknown,
+        ) {
             return Some(mismatch);
         }
         // Two explicit protocols are the operators' assertion, compared
