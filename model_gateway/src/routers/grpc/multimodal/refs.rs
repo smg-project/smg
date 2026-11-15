@@ -198,8 +198,9 @@ impl std::fmt::Display for MmRefsError {
                     "the selected worker does not fetch '{scheme}' URLs (accepts: {accepted})"
                 )?;
                 // The remedy is the refused scheme's own: a file URL needs the
-                // worker's local-media flag; any other scheme has none to name
-                // beyond the accepted list.
+                // worker's local-media flag; any other scheme, the empty one of
+                // a bare path or a port-less host written without a scheme
+                // included, has none to name beyond the accepted list.
                 if scheme == "file" {
                     f.write_str("; file:// needs --allowed-local-media-path on the worker")?;
                 }
@@ -1912,6 +1913,28 @@ mod tests {
             "the selected worker does not fetch 'data' URLs (accepts: http,https)"
         );
         assert!(!data.contains("allowed-local-media-path"));
+    }
+
+    /// The empty scheme of a bare path or a port-less host written without a
+    /// scheme (what the scheme read gives them; a host with a port reads as a
+    /// scheme of its own) is refused like any scheme the worker's labels leave
+    /// out: the accepted list alone, no local-media remedy, since a scheme-less
+    /// string is not a file URL.
+    #[test]
+    fn the_scheme_refusal_gives_an_empty_scheme_the_accepted_list_alone() {
+        assert_eq!(url_scheme("images/a.png"), "");
+        assert_eq!(url_scheme("example.com/a.png"), "");
+        assert_eq!(url_scheme("localhost:8000/a.png"), "localhost");
+        let bare = MmRefsError::SchemeNotAccepted {
+            scheme: String::new(),
+            accepted: "http,https".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            bare,
+            "the selected worker does not fetch '' URLs (accepts: http,https)"
+        );
+        assert!(!bare.contains("allowed-local-media-path"));
     }
 
     #[test]
