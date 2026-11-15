@@ -263,10 +263,16 @@ impl McpConnectionPool {
         }
     }
 
-    /// Record where the connection's tool listing stands. A key the pool no
-    /// longer holds is left alone.
-    pub(crate) fn set_listing(&self, key: &PoolKey, listing: Listing) {
-        if let Some(cached) = self.connections.lock().peek_mut(key) {
+    /// Record where `client`'s tool listing stands. The record is the listing
+    /// connection's: a key the pool no longer holds, or holds for a connection
+    /// pooled since (the lister evicted during its listing), is left alone.
+    pub(crate) fn set_listing(&self, key: &PoolKey, client: &Arc<McpClient>, listing: Listing) {
+        if let Some(cached) = self
+            .connections
+            .lock()
+            .peek_mut(key)
+            .filter(|cached| Arc::ptr_eq(&cached.client, client))
+        {
             cached.listing = listing;
         }
     }

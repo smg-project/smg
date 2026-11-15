@@ -532,13 +532,15 @@ mod tests {
     /// What the local MCP server answers to `tools/list`: `tools` (each with
     /// an empty schema), or a JSON-RPC error when `tools` is `None`, when the
     /// request carries the `refused_bearer` token, or while `refusing` is
-    /// set; the answer comes after `list_delay`.
+    /// set; the answer comes after `list_delay` (while `slow` is set, when
+    /// it is given).
     #[derive(Clone, Default)]
     struct LocalServer {
         tools: Option<&'static [&'static str]>,
         refused_bearer: Option<&'static str>,
         refusing: Option<Arc<AtomicBool>>,
         list_delay: Duration,
+        slow: Option<Arc<AtomicBool>>,
     }
 
     /// A local MCP server over HTTP that initializes and answers `tools/list`
@@ -579,7 +581,12 @@ mod tests {
                                 .and_then(|value| value.to_str().ok())
                                 .is_some_and(|value| value == format!("Bearer {token}"))
                         });
-                    if !server.list_delay.is_zero() {
+                    let delayed = !server.list_delay.is_zero()
+                        && server
+                            .slow
+                            .as_ref()
+                            .is_none_or(|flag| flag.load(Ordering::SeqCst));
+                    if delayed {
                         tokio::time::sleep(server.list_delay).await;
                     }
                     match server.tools {
@@ -854,6 +861,75 @@ mod tests {
                 "the {which} request's item carries the refusal"
             );
         }
+    }
+
+    /// A listing's record is the listing connection's. With a pool of one,
+    /// the first connection is evicted during its slowed listing, a second
+    /// is pooled under the same key and its listing refused; the first's
+    /// late success does not stand for the second: the next caller under the
+    /// key lists again and carries the refusal instead of a hit's silence.
+    #[tokio::test]
+    async fn an_evicted_connections_late_listing_is_not_its_successors() {
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 1;
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        let format_registry = FormatRegistry::new();
+        let refusing = Arc::new(AtomicBool::new(false));
+        let slow = Arc::new(AtomicBool::new(true));
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            refusing: Some(Arc::clone(&refusing)),
+            list_delay: Duration::from_millis(600),
+            slow: Some(Arc::clone(&slow)),
+            ..Default::default()
+        })
+        .await;
+        let input = |label: &str, token: Option<&str>| McpServerInput {
+            label: label.to_string(),
+            url: Some(url.clone()),
+            authorization: token.map(str::to_string),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        let item_error = |bindings: Vec<McpServerBinding>| {
+            let label = bindings.first().expect("one binding").label.clone();
+            list_item_error(&orchestrator, bindings, &label)
+        };
+
+        let (first_input, evicting_input, second_input) = (
+            [input("first", None)],
+            [input("other", Some("other-token"))],
+            [input("second", None)],
+        );
+        let (first, second) = tokio::join!(
+            connect_mcp_servers(&orchestrator, &format_registry, &first_input),
+            async {
+                // The first connection is listing: another key's connect
+                // evicts it, then the same key's connect pools a second
+                // connection whose listing the server refuses at once.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                slow.store(false, Ordering::SeqCst);
+                refusing.store(true, Ordering::SeqCst);
+                connect_mcp_servers(&orchestrator, &format_registry, &evicting_input).await;
+                connect_mcp_servers(&orchestrator, &format_registry, &second_input).await
+            }
+        );
+        assert_eq!(item_error(first), None, "the first connection listed");
+        assert!(
+            item_error(second).is_some_and(|error| error.is_string()),
+            "the second connection's listing was refused"
+        );
+
+        // The server still refuses: the pooled connection's listing failed,
+        // so this caller lists again and reads the refusal. The evicted
+        // connection's late success recorded under the key would make this
+        // a hit that reads nothing.
+        let next_input = [input("next", None)];
+        let next = connect_mcp_servers(&orchestrator, &format_registry, &next_input).await;
+        assert!(
+            item_error(next).is_some_and(|error| error.is_string()),
+            "the evicted connection's listing is not the pooled connection's record"
+        );
     }
 
     /// A server URL of a scheme the connector does not take is refused with

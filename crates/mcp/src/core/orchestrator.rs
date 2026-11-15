@@ -842,7 +842,13 @@ impl McpOrchestrator {
                             let prompts = prompts_of(client.as_ref(), key).await;
                             let resources = resources_of(client.as_ref(), key).await;
                             tool_inventory.clear_server_tool_entries(key);
-                            if let Some(mut entry) = static_servers.get_mut(key) {
+                            // The error cleared is this connection's: a
+                            // recovery during the listings replaced the entry,
+                            // and its own load's outcome stands.
+                            if let Some(mut entry) = static_servers
+                                .get_mut(key)
+                                .filter(|entry| Arc::ptr_eq(&entry.client, &client))
+                            {
                                 entry.list_error = None;
                             }
                             for entry in tools {
@@ -1753,6 +1759,7 @@ impl McpOrchestrator {
         };
         self.connection_pool.set_listing(
             &pool_key,
+            &client,
             match &list_error {
                 Some(message) => Listing::Failed(message.clone()),
                 None => Listing::Listed,
