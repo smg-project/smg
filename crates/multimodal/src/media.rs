@@ -1019,7 +1019,7 @@ fn redirect_target(response: &reqwest::Response) -> Option<Result<Url, RefusedRe
     };
     if !fetched_scheme(target.scheme()) {
         return Some(Err(RefusedRedirect {
-            reason: format!("unsupported media scheme: {}", target.scheme()),
+            reason: MediaConnectorError::UnsupportedScheme(target.scheme().to_string()).to_string(),
             target: target.to_string(),
         }));
     }
