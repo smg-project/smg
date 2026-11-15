@@ -1405,6 +1405,64 @@ fn the_cut_check_keeps_its_span_lists_in_the_threads_scratch() {
     );
 }
 
+/// A window over a long blob under a digit split grows the cut check's
+/// lists to thousands of spans; the search gives such lists back once it is
+/// done (`CUT_SPANS_KEPT`), and prose regrows them to tens at the next.
+#[test]
+fn a_blob_grows_the_cut_checks_lists_past_the_cap_and_the_search_gives_them_back() {
+    let mut state = 0x5C5C_A11A_0000_0003u64;
+    let shape = Shape {
+        name: "digits-and-prose-for-the-cut-check",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"[0-9,]|\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let prose = "the pool cuts a long text at a space before a letter ".repeat(600);
+    let blob: String = (0..7_000).map(|i| format!("{},", i % 1_000)).collect();
+    let text = format!("{prose}{blob} {prose}");
+    assert!(prose.len() < PARALLEL_CHUNK_BYTES && prose.len() + blob.len() > PARALLEL_CHUNK_BYTES);
+    let room = |native: &NativeEncoder| -> Vec<usize> {
+        native
+            .cut_spans
+            .get()
+            .expect("this thread's scratch")
+            .borrow()
+            .iter()
+            .map(Vec::capacity)
+            .collect()
+    };
+    // The first candidate past the chunk follows the blob; its window reaches
+    // back through the blob, one span per digit and comma.
+    let cut = native.stable_cut(&text, PARALLEL_CHUNK_BYTES);
+    assert_eq!(cut, Some(prose.len() + blob.len()));
+    // The window's list and the one before the candidate grew past the cap
+    // and are given back; the one after it (prose) stays within the cap.
+    let given_back = room(&native);
+    assert!(
+        given_back[0] == 0 && given_back[1] == 0 && given_back[2] <= CUT_SPANS_KEPT,
+        "{given_back:?}"
+    );
+    // Prose alone: the lists hold tens of spans and stay.
+    assert!(native.stable_cut(&prose, 0).is_some());
+    let grown = room(&native);
+    assert!(
+        grown
+            .iter()
+            .all(|&slots| slots > 0 && slots <= CUT_SPANS_KEPT),
+        "{grown:?}"
+    );
+    assert!(native.stable_cut(&prose, 0).is_some());
+    assert_eq!(room(&native), grown);
+}
+
 #[test]
 fn an_end_anchored_chain_keeps_a_long_text_whole() {
     // `\s+$` reads the end of the text it runs over: a cut for the thread

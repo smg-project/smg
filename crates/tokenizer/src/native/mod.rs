@@ -312,6 +312,13 @@ const CUT_CHECK_REACH: usize = 2 << 10;
 /// a candidate is cheap, the window check on each one is not, so a text whose
 /// candidates keep failing the check costs at most this many checks per cut.
 const MAX_REJECTED_CUT_CANDIDATES: usize = 64;
+/// Spans a thread's cut-check lists may keep between searches (64 KiB a
+/// list): a window over prose holds tens, so prose never meets this; a
+/// window over a long blob under a digit or punctuation split (up to a
+/// chunk each side of the candidate, one span per piece) can grow a list
+/// to tens of thousands, and the search gives such a list back once it is
+/// done rather than keep it for the encoder's life (`stable_cut`).
+const CUT_SPANS_KEPT: usize = 4 << 10;
 
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
@@ -1154,9 +1161,10 @@ pub(crate) struct NativeEncoder {
     piece_cache: ThreadLocal<RefCell<PieceCache>>,
     /// The cut check's span lists of each thread that cuts a text for the
     /// pool: cleared per check and grown once per thread
-    /// ([`Self::piece_starts_at`]), apart from the piece cache so that a
-    /// thread that only cuts gets none and is not counted among the
-    /// threads that encode.
+    /// ([`Self::piece_starts_at`]), given back after a search that grew one
+    /// past [`CUT_SPANS_KEPT`] ([`Self::stable_cut`]), apart from the piece
+    /// cache so that a thread that only cuts gets none and is not counted
+    /// among the threads that encode.
     cut_spans: ThreadLocal<RefCell<CutSpans>>,
     /// Threads that hold a piece cache of this encoder.
     threads: AtomicUsize,
@@ -2545,9 +2553,22 @@ impl NativeEncoder {
         }
         // The check's span lists: this thread's scratch, grown at its first
         // check and kept (the search runs on the calling thread, before the
-        // pool, and borrows nothing else of the thread).
+        // pool, and borrows nothing else of the thread); a list a window
+        // over a long blob grew past the cap is given back after the search.
         let scratch = self.cut_spans.get_or_default();
         let mut spans = scratch.borrow_mut();
+        let found = self.search_cut(text, from, &mut spans);
+        for list in spans.iter_mut() {
+            if list.capacity() > CUT_SPANS_KEPT {
+                *list = Vec::new();
+            }
+        }
+        found
+    }
+
+    /// The search of [`Self::stable_cut`] over the stage path, with the
+    /// check's three span lists lent by the caller.
+    fn search_cut(&self, text: &str, from: usize, spans: &mut CutSpans) -> Option<usize> {
         let bytes = text.as_bytes();
         let mut rejected = 0;
         let mut p = from;
@@ -2580,7 +2601,7 @@ impl NativeEncoder {
                     p += CUT_SEARCH_SKIP;
                     continue;
                 };
-                if self.piece_starts_at(&text[start..end], p - start, &mut spans) {
+                if self.piece_starts_at(&text[start..end], p - start, spans) {
                     return Some(p);
                 }
                 rejected += 1;
