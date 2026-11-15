@@ -2384,10 +2384,11 @@ mod tests {
         thread::sleep(Duration::from_millis(15));
         let probed_at = now_ms();
         on_probe_passed(&w);
-        assert!(
-            w.contact_age() <= Duration::from_millis(now_ms() - probed_at),
-            "a passing probe is a contact"
-        );
+        // Age first, elapsed second: a stall between the two reads only
+        // widens the bound; the other way round it would shrink it.
+        let age = w.contact_age();
+        let elapsed = Duration::from_millis(now_ms() - probed_at);
+        assert!(age <= elapsed, "a passing probe is a contact");
         assert!(w.stall_reason().is_none(), "and ends an unreachable veto");
         assert!(
             rx.try_recv().is_err(),
