@@ -608,6 +608,7 @@ mod tests {
             ("openbmb/MiniCPM-OCR-Jev-GPTQ", Table::Qwen3Tagged),
             ("openbmb/MiniCPM-OCR-1.0-AWQ", Table::Qwen3Tagged),
             ("openbmb/MiniCPM-OCR-1.0-GPTQ", Table::Qwen3Tagged),
+            ("XHToken/Spark-X2.6-1.7B", Table::Glm),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
