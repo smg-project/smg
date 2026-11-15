@@ -82,10 +82,11 @@ pub(crate) enum MmRefsError {
     /// A part kind with no reference form (inline bytes or embeddings).
     UnsupportedPart(&'static str),
     /// A reference the request got wrong, refused at the door before any
-    /// worker is selected, in the media connector's own words (`cause`): an
-    /// empty url, a data URL whose header names no base64 payload or whose
-    /// payload is empty. The request's own fault, under the code the
-    /// router-side pipeline answers the same media (`invalid_multimodal_request`).
+    /// worker is selected, in the media connector's own words (`cause`): a
+    /// url that is empty or begins with whitespace or a control character, a
+    /// data URL whose header names no base64 payload or whose payload is
+    /// empty. The request's own fault, under the code the router-side
+    /// pipeline answers the same media (`invalid_multimodal_request`).
     InvalidReference { index: usize, cause: String },
     /// An inline `data:` payload above the router's byte cap.
     RefTooLarge {
@@ -806,12 +807,26 @@ fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
     Ok(hinted)
 }
 
+/// The characters of a refused url its refusal echoes, at most: the sentence
+/// names the url the client sent, never a whole inline payload.
+const URL_ECHO_CHARS: usize = 64;
+
+/// The first `URL_ECHO_CHARS` characters of a refused url, an ellipsis when cut.
+fn echoed_url(url: &str) -> String {
+    let mut echoed: String = url.chars().take(URL_ECHO_CHARS).collect();
+    if url.chars().nth(URL_ECHO_CHARS).is_some() {
+        echoed.push_str("...");
+    }
+    echoed
+}
+
 /// The references a forwarded plan carries, read once at the door before any
 /// worker is selected, by the rules the router-side pipeline's fetch applies
-/// to the same media: a url that is empty or begins with whitespace (the
-/// reference is forwarded as written and the byte caps read the scheme at
-/// offset zero), a data URL whose header names no base64 payload and an empty
-/// payload are refused here in the connector's own
+/// to the same media: a url that is empty or begins with whitespace or a
+/// control character (the reference is forwarded as written and the byte caps
+/// read the scheme at offset zero; the refusal echoes at most the first
+/// `URL_ECHO_CHARS` characters of it), a data URL whose header names no base64
+/// payload and an empty payload are refused here in the connector's own
 /// words, instead of being forwarded to a worker no engine of which serves
 /// them. The symbols and the length of a base64 payload stay the engine's
 /// verdict: nothing here reads the payload.
@@ -827,11 +842,13 @@ fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
             | MediaContentPart::AudioUrl { url, .. } => {
                 // The reference is forwarded as written and every byte cap reads
                 // the scheme at offset zero: nothing is trimmed here either, so a
-                // url that is empty or begins with whitespace is an invalid URL.
-                if url.is_empty() || url.starts_with(char::is_whitespace) {
+                // url that is empty or begins with a control character, a space
+                // or any whitespace (the leading set a URL parser strips) is an
+                // invalid URL, echoed by a bounded prefix.
+                if url.is_empty() || url.starts_with(|c: char| c <= ' ' || c.is_whitespace()) {
                     return Err(refused(
                         index,
-                        MediaConnectorError::InvalidUrl(url.to_string()),
+                        MediaConnectorError::InvalidUrl(echoed_url(url)),
                     ));
                 }
                 let is_data_url = url
@@ -1049,12 +1066,19 @@ mod tests {
         let components = components(MmProcessingMode::Worker);
         let registry = registry_with(vec![]);
         let worker_only = PlaceholderTokens::worker_only();
+        let long = format!(" data:image/png;base64,{}", "A".repeat(200));
+        let long_echo = format!("invalid media URL: {}...", &long[..64]);
         for (part, cause) in [
             (image_url(""), "invalid media URL: "),
             (image_url("   "), "invalid media URL:    "),
             (
                 image_url(" data:image/png;base64,AQ=="),
                 "invalid media URL:  data:image/png;base64,AQ==",
+            ),
+            (image_url(&long), long_echo.as_str()),
+            (
+                image_url("\u{1}data:image/png;base64,AQ=="),
+                "invalid media URL: \u{1}data:image/png;base64,AQ==",
             ),
             (
                 image_url("data:image/png,%89PNG%0D%0A"),
