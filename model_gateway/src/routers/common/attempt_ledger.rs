@@ -164,7 +164,7 @@ mod tests {
     use crate::{
         routers::common::retry::is_retryable_response,
         worker::{
-            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
             test_support::{no_health_check, worker_of},
             BasicWorkerBuilder,
         },

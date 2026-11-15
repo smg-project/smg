@@ -128,7 +128,9 @@ pub struct Trace {
     pub profile: u16,
     /// Candidates after the filters.
     pub survivors: u32,
-    /// The top candidates and their combined scores, best first.
+    /// The top candidates and their combined scores, best first: of the set
+    /// the picker compared, which is every candidate the filters left unless
+    /// the picker narrows them.
     pub top: [(WorkerId, f32); TRACE_TOP],
     pub top_len: u8,
     pub seed: u64,

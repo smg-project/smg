@@ -74,12 +74,12 @@ def test_rust_launcher_preserves_resolved_array_like_lora_refs():
     ]
 
 
-def test_cli_lora_resolution_precedes_the_rust_snapshot_and_preserves_scheduler_ids():
+def test_preloaded_snapshot_reads_resolved_values_without_rewriting_declarations():
     from smg_grpc_servicer.sglang.rust import server_facts
 
     class ServerArgs:
-        # SGLang retains these declarations; resolution stores its output
-        # separately and enables LoRA implicitly for --lora-paths.
+        # An args provider may expose resolved values separately from its
+        # declarations; the snapshot must use that view.
         lora_paths = ["adapter=/weights"]
         enable_lora = None
         resolved = None

@@ -35,14 +35,19 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::hash_ring::HashRing,
     worker::{
-        basic::{RuntimeType, WorkerType},
-        circuit_breaker::CircuitState,
-        event::{WorkerConnected, WorkerEvent},
-        pd_pair_index::{PdPairIndex, PdWire},
-        pd_pairing::PdPairingMode,
+        health::circuit_breaker::CircuitState,
+        identity::basic::{RuntimeType, WorkerType},
+        pd::{
+            pair_index::{PdPairIndex, PdWire},
+            pairing::PdPairingMode,
+        },
+        registry::event::{WorkerConnected, WorkerEvent},
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };
+
+pub mod event;
+pub mod service;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -3095,12 +3100,12 @@ impl WorkerRegistry {
     fn import_from(
         state: &smg_mesh::WorkerState,
         spec: Option<openai_protocol::worker::WorkerSpec>,
-    ) -> super::basic::BasicWorker {
+    ) -> super::identity::basic::BasicWorker {
         use openai_protocol::model_card::ModelCard;
 
         let worker = match spec {
-            Some(spec) => super::builder::BasicWorkerBuilder::from_spec(spec).build(),
-            None => super::builder::BasicWorkerBuilder::new(&state.url)
+            Some(spec) => super::identity::builder::BasicWorkerBuilder::from_spec(spec).build(),
+            None => super::identity::builder::BasicWorkerBuilder::new(&state.url)
                 .model(ModelCard::new(&state.model_id))
                 .build(),
         };
