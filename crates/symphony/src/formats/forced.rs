@@ -381,6 +381,50 @@ mod tests {
         assert!(!tables.is_empty(), "no table declares a structural token");
     }
 
+    #[test]
+    fn a_required_list_under_the_json_answer_option_reads_as_a_json_syntax() {
+        // A request may ask for a JSON answer and require a call: the required list is then
+        // read under the JSON-answer option, as a list with no marker is. A marker spelled
+        // inside a string of a call's arguments is the argument's text, with the option as
+        // without it. Where the model wrote text in the list's place, a marker the table
+        // ignores inside a string of that text is the string's under the option; without the
+        // option the table drops it. Every table, whole and cut anywhere.
+        let mut ignoring = Vec::new();
+        for table in Table::ALL {
+            let read = |json_answer: bool| {
+                move |pieces: &[&str]| {
+                    let format = table.format().with_forced_call(ForcedCall::List);
+                    let engine = Engine::new(format, Declared::default().forcing("lookup"));
+                    let mut engine = if json_answer {
+                        engine.reads_json_answer()
+                    } else {
+                        engine
+                    };
+                    drive(&mut engine, "", pieces)
+                }
+            };
+            for (marker, ignored) in markers(table) {
+                let case = format!("{} {marker:?}", table.name());
+                let arguments = format!("{{\"q\": \"a{marker}b\"}}");
+                let list = written_as(ForcedCall::List, &arguments);
+                let said = the_same_at_every_cut(read(true), &list);
+                assert_eq!(said, the_same_at_every_cut(read(false), &list), "{case}");
+                assert_eq!(said.calls, [("lookup".to_string(), arguments)], "{case}");
+                if ignored {
+                    let text = format!("say \"a{marker}b\" then");
+                    let said = the_same_at_every_cut(read(true), &text);
+                    assert_eq!(said.content, text, "{case}");
+                    assert!(said.calls.is_empty(), "{case}");
+                    let said = the_same_at_every_cut(read(false), &text);
+                    assert_eq!(said.content, "say \"ab\" then", "{case}");
+                    ignoring.push(table.name());
+                }
+            }
+        }
+        ignoring.dedup();
+        assert!(ignoring.len() >= 3, "{ignoring:?}");
+    }
+
     /// A table built by hand, as the builder lets anyone build one: content, and a thought
     /// between `<a>` and `</a>`.
     fn built() -> Format {

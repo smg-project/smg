@@ -569,18 +569,29 @@ impl Engine {
     /// Whether the table's calls are one JSON value each (the object is the call), so that a
     /// quoted spelling inside their arguments is a string's text under the JSON-answer option;
     /// the tagged, keyed, XML, pythonic, Gemma and shaped syntaxes carry their values otherwise.
+    /// Every syntax is classed by name: a new one does not compile until it is.
     fn json_syntax(&self) -> bool {
-        matches!(
-            self.format.call_syntax(),
-            None | Some(
+        match self.format.call_syntax() {
+            None
+            | Some(
                 CallSyntax::Json
-                    | CallSyntax::NamedJson(_)
-                    | CallSyntax::NamedArguments { .. }
-                    | CallSyntax::JsonList
-                    | CallSyntax::JsonAlone(_)
-                    | CallSyntax::ForcedArguments
-            )
-        )
+                | CallSyntax::NamedJson(_)
+                | CallSyntax::NamedArguments { .. }
+                | CallSyntax::JsonList
+                | CallSyntax::JsonAlone(_)
+                | CallSyntax::ForcedArguments
+                | CallSyntax::ForcedList,
+            ) => true,
+            Some(
+                CallSyntax::Tagged(..)
+                | CallSyntax::Keyed(_)
+                | CallSyntax::Pythonic(_)
+                | CallSyntax::Xml
+                | CallSyntax::Attributed(_)
+                | CallSyntax::Gemma(_)
+                | CallSyntax::Shaped(_),
+            ) => false,
+        }
     }
 
     fn emits(&self) -> Emits {
