@@ -207,9 +207,12 @@ pub trait Picker: Lifecycle + Debug {
 /// is one of them: when a scope panics at its open, the engine closes the
 /// scopes whose open returned, and neither that scope nor any after it.
 /// So a `close` always follows an `open` that returned, and an `open`
-/// that stops half-way undoes what it did itself. A built-in stage holds
-/// none; the profile's flag ([`Profile::scoped`]) is read once in the
-/// engine, so a profile without one pays nothing per decision.
+/// that stops half-way undoes what it did itself. A `close` that panics
+/// keeps no other scope open: the engine runs every close it owes, each
+/// under a catch, and the first panic of the decision is the one the host
+/// sees. A built-in stage holds none; the profile's flag
+/// ([`Profile::scoped`]) is read once in the engine, so a profile without
+/// one pays nothing per decision.
 pub trait DecisionScope: Send + Sync + Debug {
     fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>);
 
@@ -296,11 +299,29 @@ impl Drop for Opened<'_> {
     }
 }
 
+/// Closes every scope of the profile, each under a catch, so a close that
+/// panics keeps no scope after it open. The first panic of the decision is
+/// the one the host sees. Where one is already unwinding (a stage's, or the
+/// open of a pair's other side), a close's panic stops here: let out, it
+/// would end the process. Where none is, the first close's panic goes on
+/// once every scope is closed.
 #[cold]
 #[inline(never)]
 fn close_scopes(profile: &Profile) {
+    let mut first = None;
     for scope in profile.scopes() {
-        scope.close();
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.close()));
+        let Err(payload) = closed else { continue };
+        // A payload is resumed or forgotten, never dropped here: its own
+        // destructor could panic.
+        if first.is_none() && !std::thread::panicking() {
+            first = Some(payload);
+        } else {
+            std::mem::forget(payload);
+        }
+    }
+    if let Some(payload) = first {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -317,12 +338,19 @@ impl Drop for Opening<'_> {
     fn drop(&mut self) {
         for scope in self.profile.scopes().take(self.returned) {
             // A close here runs inside the unwinding of a later scope's
-            // open, where a second panic would end the process. So each
-            // runs under a catch of its own: a close that panics stops
-            // there, the rest are still closed, and the open's panic is the
-            // one that reaches the host.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.close()));
+            // open: a close that panics stops there, the rest are still
+            // closed, and the open's panic is the one that reaches the host.
+            contained(|| scope.close());
         }
+    }
+}
+
+/// Runs `f` on a path that is already unwinding, where a second panic let
+/// out would end the process: a panic of `f` stops here. Its payload is
+/// forgotten, not dropped, since a payload's own destructor could panic too.
+pub(crate) fn contained(f: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        std::mem::forget(payload);
     }
 }
 
