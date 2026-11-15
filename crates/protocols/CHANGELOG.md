@@ -51,6 +51,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the caller derived already, beside `template_thinking_for`. The readers without the suffix
   derive the profile from the model id as before; a serving path that derives it once per
   request no longer derives it again at each of them.
+- `ModelCard` derives `PartialEq`: a caller that holds a worker's cards tells a refresh that
+  repeats them from one that changes them (the gateway's model refresh publishes nothing for the
+  first).
 
 ### Changed
 

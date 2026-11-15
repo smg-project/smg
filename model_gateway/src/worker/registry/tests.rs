@@ -496,6 +496,267 @@ fn a_worker_keeps_the_policy_of_every_model_it_serves_and_of_its_primary_model()
     );
 }
 
+/// A gRPC worker of `model` whose card names `window` as its context
+/// window.
+fn worker_with_a_window(url: &str, model: &str, window: u32) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(vec![ModelCard::new(model).with_context_length(window)])
+            .build(),
+    )
+}
+
+/// The floor of a regular pool whose narrowest window is `window`.
+fn a_regular_floor_of(window: u32) -> WindowFloor {
+    WindowFloor {
+        budget: Some(window),
+        prefill: None,
+    }
+}
+
+/// A reader of a pool's floor for `model_id`: the narrowest window any
+/// worker names, as the budget's. The pipeline's own rule is its context
+/// check's to hold; these cases hold what the snapshot keeps of a reading.
+fn the_narrowest_window(model_id: &str) -> impl Fn(&[Arc<dyn Worker>]) -> WindowFloor + '_ {
+    move |workers| WindowFloor {
+        budget: workers
+            .iter()
+            .filter_map(|worker| worker.context_length(model_id))
+            .min(),
+        prefill: None,
+    }
+}
+
+/// Whether a worker of the list names `window` for qwen: an answer read
+/// from the cards, as a snapshot keeps them.
+fn a_worker_names(window: u32) -> impl Fn(&[Arc<dyn Worker>]) -> bool {
+    move |workers| {
+        workers
+            .iter()
+            .any(|worker| worker.context_length("qwen") == Some(window))
+    }
+}
+
+#[test]
+fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
+    let registry = WorkerRegistry::new();
+    let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
+    registry.register(Arc::clone(&worker)).unwrap();
+    let floor = |snapshot: &ModelWorkerSnapshot| {
+        snapshot.window_floor(
+            RoutingPool::GrpcPipelineRegular,
+            "qwen",
+            the_narrowest_window("qwen"),
+        )
+    };
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    let global = registry.current_global_routing_snapshot();
+    assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
+    assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
+    assert!(!model.harmony(a_worker_names(4_096)));
+
+    assert!(registry.refresh_models(
+        &worker,
+        vec![ModelCard::new("qwen").with_context_length(4_096)],
+    ));
+    // The snapshots drawn before the refresh keep what they answered; the
+    // ones a request draws now read the cards again.
+    assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
+    assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
+    assert!(!model.harmony(a_worker_names(4_096)));
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    assert_eq!(floor(&model), Some(a_regular_floor_of(4_096)));
+    assert_eq!(
+        floor(&registry.current_global_routing_snapshot()),
+        Some(a_regular_floor_of(4_096))
+    );
+    assert!(model.harmony(a_worker_names(4_096)));
+}
+
+#[test]
+fn a_refresh_publishes_the_snapshot_of_every_model_that_holds_the_worker() {
+    let registry = WorkerRegistry::new();
+    let cards = |window| {
+        vec![
+            ModelCard::new("qwen").with_context_length(window),
+            ModelCard::new("llama").with_context_length(window),
+        ]
+    };
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:8401")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(cards(8_192))
+            .build(),
+    );
+    registry.register(Arc::clone(&worker)).unwrap();
+    let floor = |model_id: &str| {
+        registry
+            .model_routing_snapshot(model_id)
+            .unwrap()
+            .window_floor(
+                RoutingPool::GrpcPipelineRegular,
+                model_id,
+                the_narrowest_window(model_id),
+            )
+    };
+    for model_id in ["qwen", "llama"] {
+        assert_eq!(floor(model_id), Some(a_regular_floor_of(8_192)));
+    }
+
+    assert!(registry.refresh_models(&worker, cards(4_096)));
+    // One worker under two models: each model's snapshot is published
+    // again, so the next answer of each is read from the new cards.
+    for model_id in ["qwen", "llama"] {
+        assert_eq!(
+            floor(model_id),
+            Some(a_regular_floor_of(4_096)),
+            "{model_id}"
+        );
+    }
+}
+
+#[test]
+fn a_pools_window_floor_is_kept_with_the_spelling_it_was_read_for() {
+    let registry = WorkerRegistry::new();
+    let card = |window| {
+        ModelCard::new("qwen")
+            .with_alias("qwen-latest")
+            .with_context_length(window)
+    };
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:8401")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(vec![card(8_192)])
+            .build(),
+    );
+    registry.register(Arc::clone(&worker)).unwrap();
+    let snapshot = registry.model_routing_snapshot("qwen").unwrap();
+    let pool = RoutingPool::GrpcPipelineRegular;
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // Another spelling of the model is not answered from the kept figure,
+    // and takes no place: the first spelling stays.
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen-latest", the_narrowest_window("qwen-latest")),
+        None
+    );
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // Kept, not read again: cards written past the registry leave this
+    // snapshot's figure as it was read.
+    worker.set_models(vec![card(4_096)]);
+    assert_eq!(worker.context_length("qwen"), Some(4_096));
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // A pool with no worker binds nothing under any spelling, and keeps none.
+    for spelling in ["qwen", "qwen-latest"] {
+        assert_eq!(
+            snapshot.window_floor(
+                RoutingPool::GrpcDecode,
+                spelling,
+                the_narrowest_window(spelling)
+            ),
+            Some(WindowFloor::default())
+        );
+    }
+}
+
+#[test]
+fn a_refresh_that_repeats_the_cards_publishes_nothing() {
+    let registry = WorkerRegistry::new();
+    let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
+    registry.register(Arc::clone(&worker)).unwrap();
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    let global = registry.current_global_routing_snapshot();
+
+    // The cards of its registration, then the cards of an earlier refresh.
+    for window in [8_192, 4_096, 4_096] {
+        let changed = worker.context_length("qwen") != Some(window);
+        let model = registry.model_routing_snapshot("qwen").unwrap();
+        let global = registry.current_global_routing_snapshot();
+        assert_eq!(
+            registry.refresh_models(
+                &worker,
+                vec![ModelCard::new("qwen").with_context_length(window)],
+            ),
+            changed
+        );
+        assert_eq!(
+            Arc::ptr_eq(&model, &registry.model_routing_snapshot("qwen").unwrap()),
+            !changed
+        );
+        assert_eq!(
+            Arc::ptr_eq(&global, &registry.current_global_routing_snapshot()),
+            !changed
+        );
+    }
+    assert!(!Arc::ptr_eq(
+        &model,
+        &registry.model_routing_snapshot("qwen").unwrap()
+    ));
+    assert!(!Arc::ptr_eq(
+        &global,
+        &registry.current_global_routing_snapshot()
+    ));
+}
+
+#[test]
+fn a_refresh_keeps_the_list_its_order_and_its_handles() {
+    let registry = WorkerRegistry::new();
+    let workers = [
+        "grpc://127.0.0.1:8401",
+        "grpc://127.0.0.1:8402",
+        "grpc://127.0.0.1:8403",
+    ]
+    .map(|url| worker_with_a_window(url, "qwen", 8_192));
+    for worker in &workers {
+        registry.register(Arc::clone(worker)).unwrap();
+    }
+    let list = registry.get_by_model("qwen");
+    let fleet = registry.get_routing_workers();
+
+    // The first and the middle worker: neither moves to the list's end. The
+    // second refresh renames the model: the worker stays where its
+    // registration indexed it and is found there by its handle.
+    for (refreshed, card) in [
+        (
+            &workers[1],
+            ModelCard::new("qwen").with_context_length(4_096),
+        ),
+        (
+            &workers[0],
+            ModelCard::new("llama").with_context_length(4_096),
+        ),
+    ] {
+        let before = registry.model_routing_snapshot("qwen").unwrap();
+        assert!(registry.refresh_models(refreshed, vec![card]));
+        let after = registry.model_routing_snapshot("qwen").unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(Arc::ptr_eq(&list, &registry.get_by_model("qwen")));
+        assert!(registry.get_by_model("llama").is_empty());
+        let fleet_now = registry.get_routing_workers();
+        assert_eq!(fleet.len(), fleet_now.len());
+        assert!(fleet
+            .iter()
+            .zip(fleet_now.iter())
+            .all(|(before, after)| Arc::ptr_eq(before, after)));
+    }
+    assert!(list
+        .iter()
+        .zip(&workers)
+        .all(|(listed, registered)| Arc::ptr_eq(listed, registered)));
+}
+
 /// The record a rebuild from a decoded spec is for.
 fn record(version: u64) -> ImportRecord {
     ImportRecord {

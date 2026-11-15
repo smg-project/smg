@@ -9,7 +9,9 @@
 //! (`regular_placement`: round robin and cache-aware over an event index, 128 and 1,024
 //! workers), and what one prefill-decode pair placement pays through the routers' pair
 //! selection (`pair_placement`: round robin and cache-aware over an event index, 64 and 512
-//! workers a side, untraced and inside a cache-trace capture). The two placement groups
+//! workers a side, untraced and inside a cache-trace capture). Each placement group also
+//! runs its placement as the gRPC selection stage does, under a request's context demand
+//! (the `cache_aware_context` and `context` cells). The two placement groups
 //! refuse to run under a process trace switch (`SMG_CACHE_TRACE`, `SMG_CACHE_TRACE_HEADER`),
 //! which captures every placement, the cells labelled untraced too.
 //!
@@ -33,7 +35,10 @@ use smg::{
         LoadBalancingPolicy, ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy,
         PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
     },
-    routers::common::bench_support::{process_trace_configured, PairPath, RegularPath},
+    routers::{
+        common::bench_support::{process_trace_configured, PairPath, RegularPath},
+        grpc::SelectionBench,
+    },
     worker::{
         kv::event_monitor::bench_support::IndexFeed,
         load::state::{one_rank_load, TestFeed},
@@ -423,6 +428,11 @@ const REGULAR_MODEL: &str = "regular-model";
 const PAIR_MODEL: &str = "pair-model";
 /// Blocks of a placement request's prompt.
 const PLACEMENT_PROMPT_BLOCKS: usize = 4;
+/// The context window every worker of a placement fleet names: it holds every request the
+/// stage's own cells place.
+const PLACEMENT_WINDOW: u32 = 32_768;
+/// The completion budget of the requests the stage's own cells place.
+const PLACEMENT_BUDGET: u32 = 256;
 
 /// A placement group measures what its labels say only in a process with no trace switch:
 /// a switch captures every placement, the cells labelled untraced too.
@@ -495,14 +505,17 @@ fn holders_monitor(
 /// A regular fleet of one model, `workers` workers over the gRPC wire, registered as the
 /// gateway registers them, under one default policy: round robin, or cache-aware (the pair
 /// fleet's configuration) over one event index in which prompt `p` is held by worker `p`.
-/// The prompts come with it.
-fn regular_fleet(workers: usize, cache_aware: bool) -> (RegularPath, Vec<Vec<u32>>) {
+/// The prompts come with it, and the gRPC selection stage over the same fleet.
+fn regular_fleet(
+    workers: usize,
+    cache_aware: bool,
+) -> (RegularPath, SelectionBench, Vec<Vec<u32>>) {
     let registry = Arc::new(WorkerRegistry::new());
     let pool: Vec<Arc<dyn Worker>> = (0..workers)
         .map(|i| {
             Arc::new(
                 BasicWorkerBuilder::new(format!("grpc://regular-{i:04}:9000"))
-                    .model(ModelCard::new(REGULAR_MODEL))
+                    .model(ModelCard::new(REGULAR_MODEL).with_context_length(PLACEMENT_WINDOW))
                     .worker_type(WorkerType::Regular)
                     .connection_mode(ConnectionMode::Grpc)
                     .health_config(HealthCheckConfig {
@@ -524,8 +537,17 @@ fn regular_fleet(workers: usize, cache_aware: bool) -> (RegularPath, Vec<Vec<u32
     } else {
         PolicyRegistry::new(PolicyConfig::RoundRobin)
     };
+    let policies = Arc::new(policies);
+    let stage = SelectionBench::regular(
+        Arc::clone(&registry),
+        Arc::clone(&policies),
+        REGULAR_MODEL,
+        BLOCK_SIZE * PLACEMENT_PROMPT_BLOCKS,
+        PLACEMENT_BUDGET,
+    );
     (
-        RegularPath::new(registry, Arc::new(policies), REGULAR_MODEL),
+        RegularPath::new(registry, policies, REGULAR_MODEL),
+        stage,
         prompts,
     )
 }
@@ -537,13 +559,15 @@ fn regular_fleet(workers: usize, cache_aware: bool) -> (RegularPath, Vec<Vec<u32
 /// `cache_aware_filtered` cells run the cache-aware placement under a candidate filter that
 /// refuses nobody and costs nothing itself. The `cache_aware_first_attempt` cells run it as
 /// the HTTP router does on a request's first attempt, under what a new request's attempt
-/// ledger hands.
+/// ledger hands. The `cache_aware_context` cells run it as the gRPC selection stage does on
+/// a request's first attempt, under the request's context demand, which every window of
+/// the fleet holds.
 fn bench_regular_placement(c: &mut Criterion) {
     refuse_a_process_trace("regular_placement");
     let mut group = c.benchmark_group("regular_placement");
     for workers in [128, 1_024] {
         for (policy, cache_aware) in [("round_robin", false), ("cache_aware", true)] {
-            let (path, prompts) = regular_fleet(workers, cache_aware);
+            let (path, stage, prompts) = regular_fleet(workers, cache_aware);
             group.throughput(Throughput::Elements(1));
             let mut next = 0usize;
             group.bench_with_input(BenchmarkId::new(policy, workers), &workers, |b, _| {
@@ -580,6 +604,18 @@ fn bench_regular_placement(c: &mut Criterion) {
                     });
                 },
             );
+            let mut next = 0usize;
+            group.bench_with_input(
+                BenchmarkId::new("cache_aware_context", workers),
+                &workers,
+                |b, _| {
+                    b.iter(|| {
+                        let tokens = &prompts[next % prompts.len()];
+                        next += 1;
+                        black_box(stage.place(Some(black_box(tokens))).unwrap())
+                    });
+                },
+            );
         }
     }
     group.finish();
@@ -588,8 +624,9 @@ fn bench_regular_placement(c: &mut Criterion) {
 /// A prefill-decode fleet of one model, `side` workers a role over the gRPC wire, every
 /// prefill paired with every decode, registered as the gateway registers them, with one
 /// policy object a role: round robin, or cache-aware over one event index in which prompt
-/// `p` is held by prefill `p` and by decode `p`. The prompts come with it.
-fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, Vec<Vec<u32>>) {
+/// `p` is held by prefill `p` and by decode `p`. The prompts come with it, and the gRPC
+/// selection stage over the same fleet.
+fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, SelectionBench, Vec<Vec<u32>>) {
     let registry = Arc::new(WorkerRegistry::new());
     let mut pools: Vec<Vec<Arc<dyn Worker>>> = Vec::new();
     for (host, role) in [
@@ -600,7 +637,7 @@ fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, Vec<Vec<u32>>) {
             .map(|i| {
                 Arc::new(
                     BasicWorkerBuilder::new(format!("grpc://{host}-{i:03}:9000"))
-                        .model(ModelCard::new(PAIR_MODEL))
+                        .model(ModelCard::new(PAIR_MODEL).with_context_length(PLACEMENT_WINDOW))
                         .worker_type(role)
                         .connection_mode(ConnectionMode::Grpc)
                         .runtime_type(RuntimeType::Vllm)
@@ -638,14 +675,27 @@ fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, Vec<Vec<u32>>) {
         policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
         policies.set_decode_policy(Arc::new(RoundRobinPolicy::new()));
     }
-    (PairPath::new(registry, policies, PAIR_MODEL), prompts)
+    let stage = SelectionBench::pair(
+        Arc::clone(&registry),
+        Arc::clone(&policies),
+        PAIR_MODEL,
+        BLOCK_SIZE * PLACEMENT_PROMPT_BLOCKS,
+        PLACEMENT_BUDGET,
+    );
+    (
+        PairPath::new(registry, policies, PAIR_MODEL),
+        stage,
+        prompts,
+    )
 }
 
 /// One pair placement through the routers' own pair selection, with no admission window: the
 /// open prefills and the picked prefill's open partners gathered for the request, one policy
 /// pick over each. Under round robin, and under cache-aware where each request's prompt has
 /// one holder a role (an index lookup and a hit on both sides), at 64 and 512 workers a side,
-/// untraced and inside a cache-trace capture.
+/// untraced and inside a cache-trace capture. The `context` cells run the placement as the
+/// gRPC selection stage does on a request's first attempt, untraced, under the request's
+/// context demand, which every window of the fleet holds.
 fn bench_pair_placement(c: &mut Criterion) {
     refuse_a_process_trace("pair_placement");
     let mut group = c.benchmark_group("pair_placement");
@@ -654,7 +704,7 @@ fn bench_pair_placement(c: &mut Criterion) {
         .unwrap();
     for side in [64, 512] {
         for (policy, cache_aware) in [("round_robin", false), ("cache_aware", true)] {
-            let (path, prompts) = pair_fleet(side, cache_aware);
+            let (path, stage, prompts) = pair_fleet(side, cache_aware);
             for (mode, traced) in [("untraced", false), ("traced", true)] {
                 group.throughput(Throughput::Elements(1));
                 let mut next = 0usize;
@@ -672,6 +722,19 @@ fn bench_pair_placement(c: &mut Criterion) {
                     },
                 );
             }
+            group.throughput(Throughput::Elements(1));
+            let mut next = 0usize;
+            group.bench_with_input(
+                BenchmarkId::new(format!("{policy}/context"), side),
+                &side,
+                |b, _| {
+                    b.iter(|| {
+                        let tokens = &prompts[next % prompts.len()];
+                        next += 1;
+                        black_box(stage.place_pair(Some(black_box(tokens))).unwrap())
+                    });
+                },
+            );
         }
     }
     group.finish();

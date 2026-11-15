@@ -25,7 +25,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
-use openai_protocol::worker::WorkerStatus;
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use rustc_hash::FxBuildHasher;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -187,6 +187,20 @@ fn serves_disaggregated_role(worker: &Arc<dyn Worker>) -> bool {
     }
 }
 
+/// The narrowest known context windows of a pool for one model id, as a
+/// membership snapshot keeps them ([`ModelWorkerSnapshot::window_floor`]):
+/// `budget` over the workers that hold a request's completion budget,
+/// `prefill` over the prefill workers, which are held to the input alone.
+/// `None` where no worker of the class is bound by a window.
+///
+/// The figure depends on the pool and on the model id as spelled, never on
+/// a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowFloor {
+    pub(crate) budget: Option<u32>,
+    pub(crate) prefill: Option<u32>,
+}
+
 /// Immutable membership snapshot. Route-specific projections are populated
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
@@ -204,6 +218,9 @@ pub(crate) struct ModelWorkerSnapshot {
     /// Whether a worker of this generation serves a Harmony model, kept from
     /// the first request's reading (see [`Self::harmony`]).
     harmony: OnceLock<bool>,
+    /// The pools' window floors, each kept with the model id it was read
+    /// for (see [`Self::window_floor`]).
+    window_floors: [OnceLock<(Box<str>, WindowFloor)>; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -213,6 +230,7 @@ impl ModelWorkerSnapshot {
             pools: std::array::from_fn(|_| OnceLock::new()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
+            window_floors: std::array::from_fn(|_| OnceLock::new()),
         }
     }
 
@@ -220,14 +238,43 @@ impl ModelWorkerSnapshot {
     /// model: `decide` reads the snapshot's workers on the first request
     /// after the membership change, every request after it reads the kept
     /// answer. A registration, a removal and a property rebuild each publish
-    /// a new snapshot, so the per-worker card scans run once, not per
-    /// request. A lazy model refresh (`Worker::set_models`) rewrites a
-    /// worker's cards in place without one and is read at the next
-    /// membership change; only external workers, which the gRPC pipeline
-    /// does not serve, are refreshed today. The rule itself stays with the
-    /// router's detector.
+    /// a new snapshot, and so does a model refresh that changes a worker's
+    /// cards in place ([`WorkerRegistry::refresh_models`]), so the
+    /// per-worker card scans run once, not per request. The rule itself
+    /// stays with the router's detector.
     pub(crate) fn harmony(&self, decide: impl FnOnce(&[Arc<dyn Worker>]) -> bool) -> bool {
         *self.harmony.get_or_init(|| decide(&self.all))
+    }
+
+    /// The window floor of `pool` for `model_id`: `read` reads the pool's
+    /// workers on the first request after the membership change, every
+    /// request after it reads the kept figure. Whatever changes a card
+    /// publishes a new snapshot (see [`Self::harmony`]). The rule that reads
+    /// a worker's window stays with the pipeline's context check, as
+    /// `harmony`'s stays with the router's detector.
+    ///
+    /// The figure is kept with the model id it was read for, as spelled: a
+    /// worker answers an id by the card that matches it and, with none, by
+    /// its primary card, so another spelling can read other windows. `None`
+    /// for another spelling than the kept one: the caller then asks the
+    /// workers themselves. The gRPC router resolves an alias to its
+    /// canonical id before it selects, so a model's snapshot is read under
+    /// one spelling.
+    pub(crate) fn window_floor(
+        &self,
+        pool: RoutingPool,
+        model_id: &str,
+        read: impl FnOnce(&[Arc<dyn Worker>]) -> WindowFloor,
+    ) -> Option<WindowFloor> {
+        let workers = self.pool(pool);
+        if workers.is_empty() {
+            // Nothing to keep, whatever the spelling: the snapshot shared by
+            // every unknown model keeps no client's model id.
+            return Some(WindowFloor::default());
+        }
+        let (spelling, floor) =
+            self.window_floors[pool.index()].get_or_init(|| (model_id.into(), read(workers)));
+        (**spelling == *model_id).then_some(*floor)
     }
 
     /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
@@ -1859,6 +1906,50 @@ impl WorkerRegistry {
         }
         self.model_retry_configs
             .insert(model_id.to_string(), config);
+    }
+
+    /// Write the model cards a refresh read for `worker`, on the same handle.
+    ///
+    /// The cards the worker holds already write nothing and publish nothing:
+    /// a refresh that repeats them leaves every answer a snapshot keeps as
+    /// it is. Other cards are stored in place, so rotations and tables keyed
+    /// by the handle stand, and each model snapshot that holds the worker is
+    /// published again over the same list, with the global one: an answer a
+    /// snapshot keeps from its workers' cards
+    /// ([`ModelWorkerSnapshot::harmony`]) is read again by the next request.
+    /// The model index stays as the registration wrote it, so the worker is
+    /// found by its handle, not by its cards.
+    ///
+    /// Returns whether the cards changed. Emits no events.
+    pub(crate) fn refresh_models(&self, worker: &Arc<dyn Worker>, models: Vec<ModelCard>) -> bool {
+        if worker.models() == models {
+            return false;
+        }
+        // Stored before the publish: a snapshot published from here on reads
+        // the new cards.
+        worker.set_models(models);
+        let holding: Vec<String> = self
+            .model_index
+            .iter()
+            .filter(|entry| entry.iter().any(|member| Arc::ptr_eq(member, worker)))
+            .map(|entry| entry.key().clone())
+            .collect();
+        // As in add_worker_to_model_index: a replaced snapshot drops after
+        // its shard guard, not under it.
+        let mut previous = Vec::with_capacity(holding.len());
+        for model_id in &holding {
+            if let Some(mut entry) = self.model_index.get_mut(model_id) {
+                let members = Arc::clone(&entry.all);
+                previous.push(std::mem::replace(
+                    &mut *entry,
+                    Arc::new(ModelWorkerSnapshot::new(members)),
+                ));
+            }
+        }
+        drop(previous);
+        let _order = self.global_membership_order.read();
+        self.bump_global_routing_epoch();
+        true
     }
 
     /// Reserve (or retrieve) a stable UUID for a worker URL.
