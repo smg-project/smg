@@ -593,6 +593,8 @@ mod tests {
                 "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
                 Table::Qwen3Tagged,
             ),
+            ("inclusionAI/Ling-3.1-flash-1019", Table::Ling),
+            ("inclusionAI/Ling-3.0-flash-Sante", Table::Ling),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
