@@ -337,11 +337,12 @@ impl GenerateMetaInfo<'_> {
     /// struct, its keys and brackets as literals and its values through the
     /// calls serde makes for them (the two strings escaped, the counters in
     /// decimal, the finish reason, the logprob lists and the latency as it
-    /// writes those values), the logprob pair and the latency present where
-    /// the derive writes them. Walked as a struct, the object cost an escape
-    /// scan and three writes per key on every event (seven keys a token, nine
-    /// with the logprob pair) and the flattened field's map dispatch: about a
-    /// quarter of a generate stream request's user instructions. Pinned by
+    /// writes those values), the logprob pair, its count and the latency
+    /// present where the derive writes them. Walked as a struct, the object
+    /// cost an escape scan and three writes per key on every event (seven keys
+    /// a token, nine with the logprob pair) and the flattened field's map
+    /// dispatch: about a quarter of a generate stream request's user
+    /// instructions. Pinned by
     /// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`.
     fn write_into(&self, buffer: &mut BytesMut) -> serde_json::Result<()> {
         // Matched field by field with no rest pattern, so a field added to the
@@ -373,10 +374,12 @@ impl GenerateMetaInfo<'_> {
             output_token_logprobs_length,
         }) = logprobs
         {
+            // The entries' `Serialize` lives in another crate as well
+            // (`GenerateTokenLogprob`), so the lists keep the fallible path.
             buffer.extend_from_slice(b",\"input_token_logprobs\":");
-            push_json(FrameSink(buffer), input_token_logprobs);
+            serde_json::to_writer(FrameSink(buffer), input_token_logprobs)?;
             buffer.extend_from_slice(b",\"output_token_logprobs\":");
-            push_json(FrameSink(buffer), output_token_logprobs);
+            serde_json::to_writer(FrameSink(buffer), output_token_logprobs)?;
             if let Some(length) = output_token_logprobs_length {
                 buffer.extend_from_slice(b",\"output_token_logprobs_length\":");
                 push_json(FrameSink(buffer), length);
