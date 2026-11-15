@@ -4816,7 +4816,7 @@ impl ToolInput {
                     function = function,
                     tool_call_id = %self.id,
                     error = %format!(
-                        "the arguments are valid JSON but not an object ({})",
+                        "the arguments do not open an object (they open like {})",
                         argument_kind(first)
                     ),
                     "Failed to parse tool call arguments, defaulting to empty object"
@@ -4837,16 +4837,17 @@ enum ToolArguments {
     Dropped,
 }
 
-/// The JSON kind a value opens with, for the log line of a call whose
-/// arguments are not an object (the buffered answer's words).
+/// What the first non-blank byte of a call's arguments opens like, for the
+/// log line of a call whose arguments do not open an object: the byte is
+/// all the stream has read, so the words claim no more than it shows (the
+/// buffered answer's log names the parsed kind, having parsed).
 fn argument_kind(first: char) -> &'static str {
     match first {
-        '[' => "array",
-        '"' => "string",
-        '-' | '0'..='9' => "number",
-        't' | 'f' => "boolean",
-        'n' => "null",
-        _ => "not JSON",
+        '[' => "an array",
+        '"' => "a string",
+        '-' | '0'..='9' => "a number",
+        't' | 'f' | 'n' => "a literal",
+        _ => "something that is not JSON",
     }
 }
 
