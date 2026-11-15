@@ -21,7 +21,7 @@ use std::sync::{
 };
 
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
+    builtins::{Best, Healthy, LeastRequests, PowerOfTwo},
     wasm::{
         Abi, Bound, BreakerSpec, Failure, LoadError, Plugin, PluginSpec, Reveal, Runtime,
         WasmFilter, WasmPicker, WasmScorer, World,
@@ -412,6 +412,79 @@ fn the_filters_answer_narrows_the_pool_once_per_decision_and_row_by_row() {
     };
     assert_eq!(pick.trace.survivors, 4);
     assert_eq!(plugin.stats().answered, 4, "filter asked once");
+}
+
+/// A plugin scorer under a picker that narrows is handed the set compared, as
+/// any scorer is: the guest scores its candidates once, the host reads the
+/// rows compared in the picker's order, and no line of the interface moves.
+/// Under the two-draw picker the better of the two drawn by the guest's score
+/// leads, the other follows, and the trace's top rows are the two.
+#[test]
+fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
+    let runtime = runtime();
+    for (name, component) in [
+        ("record", guest::record_guest()),
+        ("packed", guest::packed_guest()),
+    ] {
+        let plugin = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
+        let engine = single_engine(Profile {
+            name: "two-draw".into(),
+            filters: vec![],
+            scorers: vec![Weighted {
+                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+                weight: 1.0,
+            }],
+            picker: Box::new(PowerOfTwo),
+        });
+        // The in-flight counts descend, so of two rows the later scores
+        // higher: one less a hundredth a request in flight.
+        let candidates = pool(8);
+        let score = |id: u64| 1.0 - (108 - id) as f32 / 100.0;
+        let mut leads = std::collections::BTreeSet::new();
+        for seed in 1..=64 {
+            let decision = decide(&engine, &candidates, seed);
+            let ids = pick_ids(&decision);
+            assert_eq!(ids.len(), 2, "{name}, seed {seed}: the two drawn");
+            assert!(
+                ids[0] > ids[1],
+                "{name}, seed {seed}: the fewer in flight leads, {ids:?}"
+            );
+            let Some(pick) = decision.pick() else {
+                panic!("a pick, not {decision:?}")
+            };
+            assert_eq!(pick.trace.survivors, 8, "{name}: the filters' count");
+            let top = &pick.trace.top[..usize::from(pick.trace.top_len)];
+            assert_eq!(
+                top.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),
+                ids,
+                "{name}, seed {seed}: the trace's top rows are the two"
+            );
+            assert!(
+                top.iter().all(|(id, got)| (got - score(id.0)).abs() < 1e-6),
+                "{name}, seed {seed}: each row's own score, {top:?}"
+            );
+            leads.insert(ids[0]);
+        }
+        assert!(
+            leads.len() > 2,
+            "{name}: the draw moves the pair, {leads:?}"
+        );
+        let stats = plugin.stats();
+        assert_eq!(
+            stats.answered, 128,
+            "{name}: the constructor and one score a decision"
+        );
+        assert_eq!(
+            (
+                stats.declined,
+                stats.traps,
+                stats.fuel_exhausted,
+                stats.invalid
+            ),
+            (0, 0, 0, 0),
+            "{name}"
+        );
+    }
 }
 
 #[test]
