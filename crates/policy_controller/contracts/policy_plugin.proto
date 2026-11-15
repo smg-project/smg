@@ -229,7 +229,8 @@ message Candidate {
   // The request's session key is pinned to this worker.
   bool session_hit = 13;
   uint32 session_in_flight = 14;  // u16; of the request's key
-  // A decode may pair with a prefill of the same class; 0 outside any pairing.
+  // The row's pair class; 0 outside any pairing. The host says which
+  // classes pair.
   uint32 pair_class = 15;
   // Host-supplied admission bit: the prefill capacity window has a slot.
   bool has_capacity = 16;

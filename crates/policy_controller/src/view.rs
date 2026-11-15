@@ -373,9 +373,11 @@ pub struct Candidate {
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker.
     pub session_in_flight: u16,
-    /// The pairing class: a decode may pair with a prefill of the same class;
-    /// `0` for a worker outside any pairing. Until a store derives classes, a
-    /// host keys it by the open prefill a decode partners with.
+    /// The pairing class: `0` for a worker outside any pairing. Which decode
+    /// classes a prefill class pairs with is the pair table's to say
+    /// ([`PairTable`](crate::PairTable)); with no table a decode pairs with a
+    /// prefill of the same class. Until a store derives classes, a host keys
+    /// it by the open prefill a decode partners with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
     pub has_capacity: bool,
