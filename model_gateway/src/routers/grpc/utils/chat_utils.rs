@@ -1601,16 +1601,17 @@ pub(crate) fn completion_finish_reason(local_stop: bool, engine: &str) -> &'stat
     "stop"
 }
 
-/// Parse finish_reason string into GenerateFinishReason enum
+/// Parse a backend's finish_reason string into a `GenerateFinishReason`.
 ///
-/// Uses serde to deserialize the finish_reason, which handles all tagged variants automatically.
-/// The GenerateFinishReason enum is tagged with `#[serde(tag = "type", rename_all = "lowercase")]`,
-/// so it expects JSON objects like:
-/// - `{"type":"stop"}` -> Stop
-/// - `{"type":"length","length":100}` -> Length { length: 100 }
-/// - Any other JSON -> Other(...)
+/// A plain `"stop"` is `Stop`, its `matched` filled from `matched` (what the
+/// stop matched: the stop string or token id), and a plain `"length"` is
+/// `Length` at `completion_tokens`. Any other reason is read as the enum's
+/// JSON, which is `#[serde(untagged)]`, so its variants are tried in order:
+/// - `{"type":"length","length":100}` -> `Length { length: 100 }`
+/// - `{"type":"stop"}` -> `Stop`, with the `matched` its own JSON carries
+/// - any other JSON, or a reason that is not JSON -> `Other(...)`
 ///
-/// For backward compatibility, also handles simple string "stop" -> Stop
+/// `matched` is read for the plain `"stop"` only; every other reason ignores it.
 pub(crate) fn parse_finish_reason(
     reason_str: &str,
     completion_tokens: u32,
