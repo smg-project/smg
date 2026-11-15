@@ -11,7 +11,7 @@ use wfaas::{
 use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::{common::pd_admission, grpc::regular::symphony::telemetry},
-    worker::{bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
+    worker::{health::bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
     workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
 };
 
@@ -158,21 +158,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         let left_models = models_left(&app_context.worker_registry, workers);
 
         for worker in workers {
-            // The handle this URL had before the write: a registration that
-            // replaces it tells the policy registry, as a removal would, so
-            // the engine's rows of the retired handle do not outlive it (the
-            // policies' URL-keyed state carries over to the replacement).
-            let previous = app_context.worker_registry.get_by_url(worker.url());
             let worker_id = register_worker(
                 &app_context.worker_registry,
                 Arc::clone(worker),
                 &registration_mode,
             )?;
-            if let Some(previous) = previous.filter(|previous| !Arc::ptr_eq(previous, worker)) {
-                app_context
-                    .policy_registry
-                    .on_worker_replaced(previous.as_ref(), worker.as_ref());
-            }
             debug!(
                 "Registered worker {} (model: {}) with ID {:?}",
                 worker.redacted_url(),
@@ -243,7 +233,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         }
 
         // WorkerMonitor subscribes to registry events directly (see
-        // `worker::monitor::WorkerMonitor::start_event_loop`), so this
+        // `worker::load::monitor::WorkerMonitor::start_event_loop`), so this
         // step no longer has to push group-add notifications. The
         // monitor's event loop reconciles the impacted groups as soon as the
         // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.

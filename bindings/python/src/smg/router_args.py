@@ -540,9 +540,6 @@ class RouterArgs:
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
     policy: str = "cache_aware"
-    # Which implementation decides worker selection: legacy (the policies over
-    # worker handles) or engine (the policy engine over its bounded view)
-    policy_engine: str = "legacy"
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
     # operation included)
@@ -954,19 +951,6 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
-            f"--{prefix}policy-engine",
-            type=str,
-            choices=["legacy", "engine"],
-            default=RouterArgs.policy_engine,
-            help=(
-                "Which implementation decides worker selection: legacy, the policies over"
-                " worker handles, or engine, the policy engine over its bounded view. Under"
-                " engine the policy must be one the engine carries: random, round_robin,"
-                " passthrough, power_of_two (expected_wait, requests, least_requests),"
-                " least_load or manual"
-            ),
-        )
-        routing_group.add_argument(
             f"--{prefix}encode-policy",
             type=str,
             default=None,
@@ -1080,7 +1064,9 @@ class RouterArgs:
                 " transfer protocol. lenient refuses only a known difference in runtime,"
                 " transport or KV layout (unknown components and engine versions pair"
                 " with anything); strict also refuses unknown components and version"
-                " differences; off pairs on nothing"
+                " differences; off compares nothing of it. On the gRPC wire two known"
+                " runtimes never pair, in any mode: its requests are in the runtime's"
+                " own message type"
             ),
         )
         routing_group.add_argument(

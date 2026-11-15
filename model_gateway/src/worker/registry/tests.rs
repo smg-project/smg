@@ -7,9 +7,9 @@ use super::*;
 use crate::{
     observability::worker_metrics::{self, WorkerSeriesRecorder},
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         test_support::no_health_check,
-        BasicWorkerBuilder, WorkerLoadGuard,
+        BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
     },
 };
 
@@ -1260,7 +1260,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
+            .remove_inner(&id, Some(WorkerOrigin::Mesh))
             .is_none(),
         "removal must abort when the origin no longer matches"
     );
@@ -1748,9 +1748,9 @@ fn routing_pool_alias_reuses_canonical_snapshot() {
     assert!(Arc::ptr_eq(&canonical, &alias));
 }
 
-// Health-checker integration tests moved to worker/manager.rs along with
+// Health-checker integration tests moved to worker/health/manager.rs along with
 // the loop itself. The registry is now a pure collection — see
-// `worker::manager::WorkerManager` tests.
+// `worker::health::manager::WorkerManager` tests.
 
 #[test]
 fn test_transition_status_emits_event_and_changes_status() {
@@ -3291,7 +3291,7 @@ fn test_wildcard_hash_ring_follows_removals() {
 /// port: the port derived from a temporary ipc path is a hash into a band
 /// other listeners on the host may hold, and a collision there fails the
 /// handshake bind after the data-plane sockets are already bound.
-async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::BasicWorker> {
+async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
     let worker = Arc::new(
         BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)

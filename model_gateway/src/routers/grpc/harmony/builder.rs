@@ -1530,12 +1530,12 @@ mod tests {
         let audio_parts = [
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "https://example.com/audio.wav".to_string(),
+                    url: "https://example.com/audio.wav".to_string().into(),
                 },
             },
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             },

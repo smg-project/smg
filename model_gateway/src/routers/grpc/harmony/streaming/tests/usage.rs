@@ -122,6 +122,67 @@ fn chat_request(choices: u32, stream: bool) -> ChatCompletionRequest {
     serde_json::from_value(request).expect("chat request")
 }
 
+#[tokio::test]
+async fn harmony_chat_reports_the_dispatch_adapter_in_every_response_frame() {
+    let tokens = harmony_tokens(None, "Hello!");
+    let counters = Counters {
+        prompt: 10,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    for streaming in [false, true] {
+        let (stream, server) = scripted_stream(frames(&tokens, 1, counters), "0").await;
+        let execution = context::ExecutionResult::Single {
+            stream,
+            dispatch_start: std::time::Instant::now(),
+        };
+        let mut dispatch = dispatch();
+        dispatch.model.push_str(":adapter");
+        let mut request = chat_request(1, streaming);
+        request.lora_path = Some("adapter".to_string());
+        let request = Arc::new(request);
+        if streaming {
+            let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
+            let response = Arc::new(HarmonyStreamingProcessor::new())
+                .process_streaming_chat_response(
+                    execution,
+                    request,
+                    dispatch,
+                    Vec::new(),
+                    None,
+                    None,
+                    source,
+                )
+                .await;
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let events: Vec<Value> = std::str::from_utf8(&body)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            assert!(!events.is_empty());
+            for event in events {
+                assert_eq!(event["model"], "harmony-test:adapter", "{event}");
+            }
+        } else {
+            let (response, _) = HarmonyResponseProcessor::new()
+                .process_non_streaming_chat_response(execution, request, dispatch, &[])
+                .await
+                .unwrap_or_else(|response| panic!("{}", response.status()));
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["model"],
+                "harmony-test:adapter"
+            );
+        }
+        server.abort();
+    }
+}
+
 /// The events of a Harmony chat stream with `stream_options.include_usage`,
 /// `[DONE]` left out.
 async fn streamed_chat_events(

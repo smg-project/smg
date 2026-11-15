@@ -91,6 +91,7 @@ async fn resolve_within(source: &str, bound: Duration) -> anyhow::Result<PathBuf
     // served from the cache.
     for config_file in [
         "preprocessor_config.json",
+        "image_preprocessing.json",
         "video_preprocessor_config.json",
         "processor_config.json",
     ] {

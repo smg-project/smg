@@ -461,7 +461,9 @@ impl Stream for VllmGenerateStream {
 ///   make all n samples identical, and deriving distinct per-sample seeds from
 ///   the request seed is the established engine convention (each of the n
 ///   sequences gets its own sampler state for exactly this reason) while
-///   staying deterministic for repeat runs.
+///   staying deterministic for repeat runs. The wire carries each seed word
+///   in its unsigned form (see the translation), so a derived seed never
+///   reaches the engine as `-1`, which it reads as "no seed".
 /// - Usage: every sub reports the full `prompt_tokens` on its `Complete` (the
 ///   subs share one prompt), matching the gRPC engines' n>1 contract — the
 ///   pipeline de-duplicates (max per prompt), so nothing is counted n times.
@@ -894,7 +896,10 @@ pub(crate) fn translate_sampling(
         stop_token_ids,
         eos_token_id: (!sp.ignore_eos).then_some(eos.primary).flatten(),
         all_stop_token_ids,
-        seed: sp.seed.map(i64::from),
+        // The seed word in its unsigned form: the engine reads a seed of -1 as "no seed", and a
+        // word that is never negative never is one, whether it came from the request or was
+        // derived per sub by an offset; the form is one-to-one, so distinct words stay distinct.
+        seed: sp.seed.map(|seed| i64::from(seed as u32)),
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,

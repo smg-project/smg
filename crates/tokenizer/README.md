@@ -66,6 +66,50 @@ as of `tokenizer/src/*`.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
   the template matches the current official one. Any other template keeps MiniJinja.
 
+### Native Inkling2 requests (`encoders/inkling2.rs`)
+
+The tokenizer selects the native renderer only for `Inkling2ForConditionalGeneration` or model type
+`inkling2`. It uses the checkpoint's `tokenizer.json`, not a built-in
+OpenAI vocabulary or a Jinja template. Loading validates the structural token IDs.
+
+Use `apply_chat_template_with_encoding` and run its deferred `EncodeJob`. The
+returned text is diagnostic: a flat re-encode cannot distinguish literal caller
+text from structural tokens. The renderer encodes each text payload as ordinary text.
+It inserts typed message headers, content headers and turn endings as IDs.
+There is no BOS or assistant generation opener. The final assistant can continue
+only as string text without reasoning or tool calls.
+
+JSON response formats require separated reasoning and cannot continue nonempty assistant text.
+The gateway checks these renderer capabilities against the actual response format before rendering.
+An empty assistant prefix is permitted. This validation does not establish constrained-generation correctness.
+Other renderers retain their existing JSON continuation and reasoning behavior.
+
+Request rendering follows the model's reference request format, not the standalone renderer's
+tool-author convention: a tool call carries its name in JSON, without adding a
+tool-name author to the assistant header. Tool results retain an explicit name
+if supplied. A call ID is metadata, not prompt text. Tool schemas use sorted,
+compact Unicode JSON with round-trip float parsing. Effort defaults to 0.9, follows leading system messages,
+and accepts the native names or numbers in `[0, 0.99]`.
+
+An image part emits header ID 200005 followed by soft anchor ID 200054
+(`<|unused_200054|>`). The common multimodal
+hydration layer must expand only the soft anchor and retain the header. A literal
+anchor spelling in caller text is not an image. Image bytes, geometry, feature
+generation and cache identity belong to that layer. Audio, video, document
+rendering and non-function tools are not supported here.
+
+Native image processing requires the checkpoint's `image_preprocessing.json`.
+It retains original dimensions and rejects request-level `max_long_side_pixel`
+overrides before fetching media. Grid cells contain duplicated temporal RGB
+patches with fixed normalization. The tokenizer bundle includes that policy file.
+
+`cargo test -p llm-tokenizer --test inkling2_renderer` runs self-contained tests.
+The ignored oracle test additionally requires `INKLING2_MODEL_DIR` and
+`INKLING2_RENDER_FIXTURES` to name a local checkpoint and a file of reference
+renderings. It validates exact text and IDs without downloading model files.
+Direct typed thinking, tool-error and tool-call parts also require support in the
+gateway's request schema.
+
 ### TiktokenTokenizer (`tiktoken.rs`)
 - Wraps the `tiktoken-rs` `CoreBPE` builders (`cl100k_base`, `p50k_base`, `p50k_edit`, `r50k_base`).
 - `from_model_name` heuristically maps OpenAI model IDs (e.g. `gpt-4`, `text-davinci-003`) to those

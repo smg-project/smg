@@ -96,7 +96,16 @@ pub struct ControlPlaneAuthState {
     /// shows what the `user` role's reads do not. The gate refuses a user
     /// there like any other control-plane 403, denial line included.
     pub admin_only_reads: &'static [&'static str],
+
+    /// What a recorded mutation's task takes for its lifetime, when the
+    /// gateway hands one out: its in-flight count, so a shutdown drains the
+    /// task of a client that left as it drains a waiting one.
+    pub mutation_hold: Option<Arc<dyn Fn() -> MutationHold + Send + Sync>>,
 }
+
+/// A hold a recorded mutation's task owns until its outcome line is written:
+/// whatever the gateway's shutdown drain waits on, released by its drop.
+pub type MutationHold = Box<dyn std::any::Any + Send>;
 
 impl ControlPlaneAuthState {
     /// Create a new control plane auth state.
@@ -109,6 +118,7 @@ impl ControlPlaneAuthState {
             jwt_validator,
             audit_logger,
             admin_only_reads: &[],
+            mutation_hold: None,
         }
     }
 
@@ -117,6 +127,19 @@ impl ControlPlaneAuthState {
     #[must_use]
     pub fn with_admin_only_reads(mut self, paths: &'static [&'static str]) -> Self {
         self.admin_only_reads = paths;
+        self
+    }
+
+    /// The same state handing every recorded mutation's task a hold from
+    /// `take` for its lifetime; the gateway passes its in-flight count where
+    /// it attaches the layer, so the shutdown drain waits for a mutation
+    /// whose client left until its outcome line is written.
+    #[must_use]
+    pub fn with_mutation_hold(
+        mut self,
+        take: impl Fn() -> MutationHold + Send + Sync + 'static,
+    ) -> Self {
+        self.mutation_hold = Some(Arc::new(take));
         self
     }
 
@@ -307,11 +330,14 @@ impl Attempt {
     ///
     /// A recorded mutation and its outcome line run as one spawned task, so a
     /// client that leaves before the answer drops the wait and not the
-    /// record. A task that ends without an answer is recorded and answered
-    /// as a 500.
+    /// record. The record owns the hold `take_hold` gives (the gateway's
+    /// in-flight count) and releases it after the line, so a shutdown drains
+    /// the task as it drains a waiting client's request. A task that ends
+    /// without an answer is recorded and answered as a 500.
     async fn admit(
         &self,
         audit_logger: &AuditLogger,
+        take_hold: Option<&(dyn Fn() -> MutationHold + Send + Sync)>,
         principal: Principal,
         mut request: Request<Body>,
         next: Next,
@@ -334,18 +360,21 @@ impl Attempt {
         let Some((principal_id, role)) = outcome else {
             return next.run(request).await;
         };
-        let record = OutcomeRecord::new(OutcomeFacts {
-            principal_id,
-            kind,
-            role,
-            method: self.method.clone(),
-            path: self.path.clone(),
-            request_id: self.request_id.clone(),
-            audit_logger: audit_logger.clone(),
-        });
+        let record = OutcomeRecord::new(
+            OutcomeFacts {
+                principal_id,
+                kind,
+                role,
+                method: self.method.clone(),
+                path: self.path.clone(),
+                request_id: self.request_id.clone(),
+                audit_logger: audit_logger.clone(),
+            },
+            take_hold.map(|take| take()),
+        );
         #[expect(
             clippy::disallowed_methods,
-            reason = "the task is the admitted request's own work and ends with the handler's answer; a runtime shutdown drops it as it drops the request"
+            reason = "the task is the admitted request's own work and ends with the handler's answer; it holds the gateway's in-flight count, so a shutdown drains it before the runtime drops it"
         )]
         let mutation = tokio::spawn(
             async move {
@@ -397,20 +426,27 @@ impl OutcomeFacts {
 }
 
 /// The outcome line the task that runs a recorded mutation owes: written with
-/// the handler's answer, or at 500 with no resource when the record is
-/// dropped without one (the handler panicked, or the runtime shut down with
-/// the mutation in flight). The task owns it, so a client that leaves cannot
-/// skip it.
+/// the handler's answer, or at 500 with no resource when the handler
+/// panicked (the record is dropped on the unwind, whichever frame drops it).
+/// A record the runtime drops with the mutation in flight writes nothing: no
+/// client was answered a 500 and the handler's blocking work may still
+/// complete, so the admission line stands alone. The task owns it, so a
+/// client that leaves cannot skip it.
 struct OutcomeRecord {
     facts: OutcomeFacts,
     written: bool,
+    /// The gateway's hold on its in-flight count, kept for its drop: a field
+    /// drops after `Drop::drop` has run, so the hold goes after the line,
+    /// whichever way the record goes.
+    _hold: Option<MutationHold>,
 }
 
 impl OutcomeRecord {
-    fn new(facts: OutcomeFacts) -> Self {
+    fn new(facts: OutcomeFacts, hold: Option<MutationHold>) -> Self {
         Self {
             facts,
             written: false,
+            _hold: hold,
         }
     }
 
@@ -422,7 +458,7 @@ impl OutcomeRecord {
 
 impl Drop for OutcomeRecord {
     fn drop(&mut self) {
-        if !self.written {
+        if !self.written && std::thread::panicking() {
             self.facts.write(StatusCode::INTERNAL_SERVER_ERROR, None);
         }
     }
@@ -481,7 +517,15 @@ pub async fn control_plane_auth_middleware(
                     },
                     role: validated_token.role,
                 };
-                return attempt.admit(audit_logger, principal, request, next).await;
+                return attempt
+                    .admit(
+                        audit_logger,
+                        auth_state.mutation_hold.as_deref(),
+                        principal,
+                        request,
+                        next,
+                    )
+                    .await;
             }
             Err(e) => {
                 // 3 dot-separated parts => almost certainly a JWT; fail fast instead of trying API key.
@@ -505,7 +549,15 @@ pub async fn control_plane_auth_middleware(
             },
             role: api_key_entry.role,
         };
-        return attempt.admit(audit_logger, principal, request, next).await;
+        return attempt
+            .admit(
+                audit_logger,
+                auth_state.mutation_hold.as_deref(),
+                principal,
+                request,
+                next,
+            )
+            .await;
     }
 
     // Authentication failed
@@ -1046,6 +1098,135 @@ mod tests {
         assert_eq!(field(outcome, "request_id"), Some("req-7"), "{outcome:?}");
     }
 
+    /// The client of a mutation leaves after the first poll: the record keeps
+    /// the hold the state hands out until its outcome line is written and
+    /// releases it after the line, whether the handler answers or panics,
+    /// so a shutdown drain that waits on the hold waits for the line.
+    #[tokio::test]
+    async fn a_departed_clients_mutation_keeps_its_hold_until_the_outcome_line() {
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        /// A hold that counts itself while it lives and notes, when it goes,
+        /// how many audit lines the capture held by then.
+        struct Held {
+            count: Arc<AtomicUsize>,
+            lines: Arc<FieldCapture>,
+            lines_at_release: Arc<AtomicUsize>,
+        }
+        impl Drop for Held {
+            fn drop(&mut self) {
+                let lines = self.lines.events.lock().unwrap().len();
+                self.lines_at_release.store(lines, Ordering::Release);
+                self.count.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        async fn register(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
+        }
+        async fn give_up(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            panic!("the handler gave up after the client left")
+        }
+
+        for (handler, status) in [(post(register), "202"), (post(give_up), "500")] {
+            let held = Arc::new(AtomicUsize::new(0));
+            let lines_at_release = Arc::new(AtomicUsize::new(usize::MAX));
+            let capture = Arc::new(FieldCapture::default());
+            let gate = Arc::new(Notify::new());
+            let state = ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            )
+            .with_mutation_hold({
+                let (count, lines, lines_at_release) = (
+                    Arc::clone(&held),
+                    Arc::clone(&capture),
+                    Arc::clone(&lines_at_release),
+                );
+                move || {
+                    count.fetch_add(1, Ordering::AcqRel);
+                    Box::new(Held {
+                        count: Arc::clone(&count),
+                        lines: Arc::clone(&lines),
+                        lines_at_release: Arc::clone(&lines_at_release),
+                    })
+                }
+            });
+            let app = Router::new()
+                .route("/workers", handler)
+                .layer(from_fn_with_state(state, control_plane_auth_middleware))
+                .with_state(Arc::clone(&gate));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/workers")
+                .header(header::AUTHORIZATION, "Bearer admin-key")
+                .body(Body::empty())
+                .unwrap();
+
+            let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                call.as_mut().poll(&mut cx).is_pending(),
+                "the handler waits at its gate"
+            );
+            assert_eq!(held.load(Ordering::Acquire), 1, "the record took its hold");
+            // The client leaves; the task runs on to its gate with the hold.
+            drop(call);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                held.load(Ordering::Acquire),
+                1,
+                "the departed client's record keeps its hold"
+            );
+            gate.notify_one();
+            for _ in 0..1_000 {
+                if held.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                held.load(Ordering::Acquire),
+                0,
+                "the hold goes with the record"
+            );
+            let events = capture.events.lock().unwrap().clone();
+            assert_eq!(
+                events.len(),
+                2,
+                "the admission line, then the outcome line: {events:?}"
+            );
+            assert_eq!(field(&events[1], "status"), Some(status), "{events:?}");
+            assert_eq!(
+                lines_at_release.load(Ordering::Acquire),
+                2,
+                "the outcome line was written before the hold went ({status})"
+            );
+        }
+    }
+
     /// The client leaves, then the handler panics: the task's record still
     /// writes the outcome line, at 500 with no resource.
     #[tokio::test]
@@ -1070,6 +1251,81 @@ mod tests {
         assert_eq!(field(outcome, "status"), Some("500"), "{outcome:?}");
         assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
         assert_eq!(field(outcome, "resource"), None, "{outcome:?}");
+    }
+
+    /// The runtime drops the task of a mutation in flight (the process stops
+    /// with the handler at work, no panic): the record writes no outcome
+    /// line. No client was answered a 500, so the audit trail keeps the
+    /// admission line alone.
+    #[test]
+    fn a_task_the_runtime_drops_writes_no_outcome_line() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        async fn wait_at_the_gate(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            StatusCode::ACCEPTED.into_response()
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let capture = Arc::new(FieldCapture::default());
+        let gate = Arc::new(Notify::new());
+        runtime.block_on(async {
+            let state = ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            );
+            let app = Router::new()
+                .route("/workers", post(wait_at_the_gate))
+                .layer(from_fn_with_state(state, control_plane_auth_middleware))
+                .with_state(Arc::clone(&gate));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/workers")
+                .header(header::AUTHORIZATION, "Bearer admin-key")
+                .body(Body::empty())
+                .unwrap();
+            let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                call.as_mut().poll(&mut cx).is_pending(),
+                "the handler waits at its gate"
+            );
+            // The client leaves; the task runs on to its gate.
+            drop(call);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+        // The runtime goes with the task at its gate: the task's future is
+        // dropped on this thread, under the capture, with no panic.
+        tracing::subscriber::with_default(capture.clone(), || drop(runtime));
+
+        let events = capture.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "the admission line alone: {events:?}");
+        assert_eq!(
+            field(&events[0], "message"),
+            Some("control_plane_audit"),
+            "{events:?}"
+        );
     }
 
     /// A handler that ends without an answer: the request answers 500 and

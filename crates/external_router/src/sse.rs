@@ -491,8 +491,8 @@ fn split_sse_lines(s: &str) -> impl Iterator<Item = &str> {
         if remaining.is_empty() {
             return None;
         }
-        // Find the next \r or \n
-        let pos = remaining.find(['\r', '\n']);
+        // Find the next \r or \n (memchr2, as the frame decoder above)
+        let pos = memchr::memchr2(b'\r', b'\n', remaining.as_bytes());
         match pos {
             None => {
                 let line = remaining;

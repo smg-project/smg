@@ -19,6 +19,7 @@ pub mod deepseek_v32;
 pub mod deepseek_v4;
 pub mod deepseek_v41;
 pub mod glm53;
+pub mod inkling2;
 pub mod kimi_k25_tools;
 pub mod kimi_k3_xtml;
 pub(crate) mod marks;
@@ -94,8 +95,9 @@ pub(crate) struct RendererProfile {
     /// The thinking switch and its default. The Jinja processor knows
     /// nothing of a native renderer, so the renderer states it.
     pub(crate) thinking_toggle: ThinkingToggle,
-    /// The kwarg the switch reads.
-    pub(crate) thinking_key_name: ThinkingKeyName,
+    /// The kwarg the switch reads; `None` for a renderer without a thinking
+    /// switch.
+    pub(crate) thinking_key_name: Option<ThinkingKeyName>,
     /// `chat_template_kwargs.reasoning_effort` values that switch thinking
     /// on, so the gateway's parser is armed from the kwarg as the prompt is;
     /// empty when the renderer takes only the protocol's own words.
@@ -124,6 +126,8 @@ impl RendererProfile {
         native_assistant_continuation: false,
         raw_tool_call_arguments: false,
         leading_system_only: false,
+        json_requires_separate_reasoning: false,
+        json_requires_empty_assistant_prefix: false,
     };
 
     /// The behaviours of a renderer without a profile: the Jinja template,
@@ -169,7 +173,7 @@ impl TemplateAnswers<'_> {
     pub(crate) fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
         self.profile.map_or_else(
             || self.template.thinking_key_name(),
-            |profile| Some(profile.thinking_key_name),
+            |profile| profile.thinking_key_name,
         )
     }
 

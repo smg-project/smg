@@ -673,6 +673,20 @@ The mock fleet it is meant for is `mock-worker --engine realistic --admin-port`
 (the [Realistic engine](#realistic-engine) above; note the caveat that its timing
 polynomials were validated against hardware only with prefix caching off).
 
+`scripts/multiturn_trace.py` writes a synthetic trace in this format, shaped like
+multi-turn chat or agent sessions: Poisson session arrivals, tenant system
+prompts drawn by Zipf, and every turn of a session re-sending the conversation so
+far with the previous answer and a new message appended (`--help` lists the
+knobs). Its blocks are 64 tokens, not 512: replay it with `--words-per-block 64`
+(about one token a word), and to calibrate against a real tokenizer as above,
+count `blocks = trace_input_length / 64` and set `--words-per-block` to
+`64 * 64 / b`.
+
+```bash
+python3 scripts/multiturn_trace.py --out trace.jsonl --duration-s 480 --sessions-per-s 10
+replay --trace trace.jsonl --words-per-block 64 --max-output 200 --speedup 1 --limit 0 ...
+```
+
 ### Long runs
 
 For a run of hours, keep one gateway and one fleet up and start the replayer

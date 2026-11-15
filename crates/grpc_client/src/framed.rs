@@ -1,4 +1,4 @@
-//! A `GenerateRequest` of the TokenSpeed or the vLLM wire sent as HTTP/2
+//! A `GenerateRequest` of the TokenSpeed, vLLM or SGLang wire sent as HTTP/2
 //! data frames: the message's small fields in one scratch frame, every
 //! inline tensor payload of at least `FRAME_MIN_BYTES` as a frame of its
 //! own, shared with the request and never copied. prost's one-buffer
@@ -25,7 +25,13 @@
 //! entry: the key unless it is empty, the value unless it is the default,
 //! in the map's own order), `inline` 1 of `TensorData` (its payload oneof
 //! is the message's first field, so the payload leads the shape and dtype).
-//! Every message on either path is taken apart by an exhaustive pattern, so
+//! The SGLang path mirrors `mm_inputs` 3 and every element of
+//! `extra_mm_inputs` 21 of its `GenerateRequest`, `pixel_values` 4 and the
+//! value of every `model_specific_tensors` 9 entry of its `MultimodalInputs`,
+//! and `data` 1 of its `TensorData` (a plain bytes field and the message's
+//! first, so the payload leads there too); its raw media lists are owned
+//! byte vectors and stay in the scratch.
+//! Every message on any path is taken apart by an exhaustive pattern, so
 //! a field added to any of them stops this module from compiling until the
 //! layout names it; the tests compare the joined frames with
 //! `encode_to_vec` over a matrix of requests and decode them back. A
@@ -56,7 +62,9 @@ use tonic::{
 use tonic_prost::ProstCodec;
 
 use crate::{
-    codec::{reserves_for, EAGER_BUFFER_BYTES},
+    channel::Channel,
+    codec::{encode_prompt_carrier, reserves_for, EAGER_BUFFER_BYTES},
+    sglang_proto as sg,
     tokenspeed_scheduler::tokenspeed_proto as ts,
     vllm_proto as vllm,
 };
@@ -93,19 +101,26 @@ impl Frames {
     /// The one frame of a message none of whose payloads rides as a frame
     /// of its own: the prefix reserved, the message written once, the
     /// length taken from the buffer, as the crate's codec writes a plain
-    /// request: no walk over the message's length before the write, the
-    /// buffer reserved to that length first only when `reserve` says the
-    /// message carries media (the codec's own rule), else started at tonic's
-    /// eager size, so a plain request grows it no more than the codec's
-    /// buffer grows.
-    fn whole<M: Message>(message: &M, reserve: bool) -> Result<Vec<Bytes>, Status> {
-        let mut scratch = if reserve {
+    /// request. A text-only request that carries a prompt goes through the
+    /// codec's one-pass writer, as the codec writes it, with this frame as
+    /// the buffer: the writer reserves the frame's length for one walk of
+    /// the request's other fields. A message the writer's entry refuses is
+    /// prost's one write, with no walk over its length before it unless it
+    /// carries media: then the buffer is reserved to that length first (the
+    /// codec's own rule, [`reserves_for`]); else it starts at tonic's eager
+    /// size, so a plain request grows it no more than the codec's buffer
+    /// grows. The message is consumed: the writer takes its request id and
+    /// its prompt out of it.
+    fn whole<M: Message + 'static>(mut message: M) -> Result<Vec<Bytes>, Status> {
+        let mut scratch = if reserves_for(&message) {
             BytesMut::with_capacity(PREFIX_BYTES + message.encoded_len())
         } else {
             BytesMut::with_capacity(EAGER_BUFFER_BYTES)
         };
         scratch.put_bytes(0, PREFIX_BYTES);
-        message.encode_raw(&mut scratch);
+        if !encode_prompt_carrier(&mut message, &mut scratch) {
+            message.encode_raw(&mut scratch);
+        }
         let prefix = prefix_of(scratch.len() - PREFIX_BYTES)?;
         scratch[1..PREFIX_BYTES].copy_from_slice(&prefix.to_be_bytes());
         Ok(vec![scratch.freeze()])
@@ -146,6 +161,36 @@ fn prefix_of(len: usize) -> Result<u32, Status> {
     })
 }
 
+/// One entry of a `map<string, M>` field `tag` as prost writes it: the
+/// entry's key and length, then the key as field 1 unless it is empty and
+/// the value as field 2 unless it is the default, the value through
+/// `value_frames` so a large payload still takes its own frame.
+fn map_entry_frames<M: Message + Default + PartialEq>(
+    tag: u32,
+    key: String,
+    value: M,
+    out: &mut Frames,
+    value_frames: fn(u32, M, &mut Frames),
+) {
+    let key_len = if key.is_empty() {
+        0
+    } else {
+        string::encoded_len(1, &key)
+    };
+    let value_len = if value == M::default() {
+        0
+    } else {
+        message::encoded_len(2, &value)
+    };
+    out.length_delimited(tag, key_len + value_len);
+    if key_len != 0 {
+        string::encode(1, &key, &mut out.scratch);
+    }
+    if value_len != 0 {
+        value_frames(2, value, out);
+    }
+}
+
 /// The body frames of the gRPC message for a TokenSpeed `GenerateRequest`:
 /// the 5-byte length prefix and the message, every inline encoder input of at
 /// least `FRAME_MIN_BYTES` as a frame of its own. The joined frames are the
@@ -158,7 +203,7 @@ pub(crate) fn tokenspeed_frames(req: ts::GenerateRequest) -> Result<Vec<Bytes>, 
         .as_ref()
         .map_or(0, |mm| mm.items.iter().filter_map(framed_payload_len).sum());
     if framed_bytes == 0 {
-        return Frames::whole(&req, reserves_for(&req));
+        return Frames::whole(req);
     }
     let mut out = Frames::for_message(req.encoded_len(), framed_bytes)?;
     let mm_len = req.mm_inputs.as_ref().map_or(0, Message::encoded_len);
@@ -306,7 +351,7 @@ pub(crate) fn vllm_frames(req: vllm::GenerateRequest) -> Result<Vec<Bytes>, Stat
             .map(framed_inputs_len)
             .sum::<usize>();
     if framed_bytes == 0 {
-        return Frames::whole(&req, reserves_for(&req));
+        return Frames::whole(req);
     }
     let mut out = Frames::for_message(req.encoded_len(), framed_bytes)?;
     // Every field named, so a field added to the message is a compile error
@@ -390,27 +435,9 @@ fn inputs_frames(inputs: vllm::MultimodalInputs, out: &mut Frames) {
     if let Some(tensor) = pixel_values {
         tensor_frames(2, tensor, out);
     }
-    // Field 3: the map's entries as prost writes them, in the map's own
-    // order, the key unless it is empty and the value unless it is the
-    // default (the two rules of prost's map encoding).
+    // Field 3: the map's entries, in the map's own order.
     for (key, tensor) in model_specific_tensors {
-        let key_len = if key.is_empty() {
-            0
-        } else {
-            string::encoded_len(1, &key)
-        };
-        let tensor_len = if tensor == vllm::TensorData::default() {
-            0
-        } else {
-            message::encoded_len(2, &tensor)
-        };
-        out.length_delimited(3, key_len + tensor_len);
-        if key_len != 0 {
-            string::encode(1, &key, &mut out.scratch);
-        }
-        if tensor_len != 0 {
-            tensor_frames(2, tensor, out);
-        }
+        map_entry_frames(3, key, tensor, out, tensor_frames);
     }
     // Fields 4-11.
     vllm::MultimodalInputs {
@@ -472,13 +499,208 @@ fn framed_tensor_len(tensor: &vllm::TensorData) -> usize {
     }
 }
 
+/// The body frames of the gRPC message for an SGLang `GenerateRequest`: the
+/// 5-byte length prefix and the message, every inline tensor payload of at
+/// least `FRAME_MIN_BYTES` as a frame of its own, in the media inputs and in
+/// every extra media input alike. The joined frames are the message's
+/// generated encoding byte for byte. The request is consumed; a message
+/// longer than the four-byte prefix can carry is refused as tonic's encoder
+/// refuses it.
+pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Status> {
+    let framed_bytes = req.mm_inputs.as_deref().map_or(0, sglang_framed_inputs_len)
+        + req
+            .extra_mm_inputs
+            .iter()
+            .map(sglang_framed_inputs_len)
+            .sum::<usize>();
+    if framed_bytes == 0 {
+        return Frames::whole(req);
+    }
+    let mut out = Frames::for_message(req.encoded_len(), framed_bytes)?;
+    // Every field named, so a field added to the message is a compile error
+    // here until the layout places it before, between or after the two
+    // media paths.
+    let sg::GenerateRequest {
+        request_id,
+        tokenized,
+        mm_inputs,
+        sampling_params,
+        return_logprob,
+        logprob_start_len,
+        top_logprobs_num,
+        token_ids_logprob,
+        return_hidden_states,
+        disaggregated_params,
+        custom_logit_processor,
+        timestamp,
+        log_metrics,
+        input_embeds,
+        lora_id,
+        data_parallel_rank,
+        stream,
+        require_reasoning,
+        return_media_identity,
+        media_identity,
+        extra_mm_inputs,
+    } = req;
+    // Fields 1-2, moved.
+    sg::GenerateRequest {
+        request_id,
+        tokenized,
+        ..Default::default()
+    }
+    .encode_raw(&mut out.scratch);
+    // Field 3, out of its box.
+    if let Some(inputs) = mm_inputs {
+        out.length_delimited(3, inputs.encoded_len());
+        sglang_inputs_frames(*inputs, &mut out);
+    }
+    // Fields 4-20.
+    sg::GenerateRequest {
+        sampling_params,
+        return_logprob,
+        logprob_start_len,
+        top_logprobs_num,
+        token_ids_logprob,
+        return_hidden_states,
+        disaggregated_params,
+        custom_logit_processor,
+        timestamp,
+        log_metrics,
+        input_embeds,
+        lora_id,
+        data_parallel_rank,
+        stream,
+        require_reasoning,
+        return_media_identity,
+        media_identity,
+        ..Default::default()
+    }
+    .encode_raw(&mut out.scratch);
+    // Field 21, every element in order; the message's last field.
+    for inputs in extra_mm_inputs {
+        out.length_delimited(21, inputs.encoded_len());
+        sglang_inputs_frames(inputs, &mut out);
+    }
+    Ok(out.finish())
+}
+
+/// One media input of an SGLang request, its field key and length already
+/// written: the media references, the pixel values with a large inline
+/// payload as a frame of its own, the raw media lists and modalities, the
+/// model-specific tensors the same way, then the fields after them. A media
+/// input without a large inline payload is written whole, in order. The
+/// input is consumed either way.
+fn sglang_inputs_frames(inputs: sg::MultimodalInputs, out: &mut Frames) {
+    if sglang_framed_inputs_len(&inputs) == 0 {
+        inputs.encode_raw(&mut out.scratch);
+        return;
+    }
+    let sg::MultimodalInputs {
+        image_urls,
+        video_urls,
+        audio_urls,
+        pixel_values,
+        image_data,
+        video_data,
+        audio_data,
+        modalities,
+        model_specific_tensors,
+        im_token_id,
+        mm_placeholders,
+        feature_hash,
+    } = inputs;
+    // Fields 1-3.
+    sg::MultimodalInputs {
+        image_urls,
+        video_urls,
+        audio_urls,
+        ..Default::default()
+    }
+    .encode_raw(&mut out.scratch);
+    // Field 4.
+    if let Some(tensor) = pixel_values {
+        sglang_tensor_frames(4, tensor, out);
+    }
+    // Fields 5-8: the raw media lists are owned byte vectors, not shared
+    // buffers; they stay in the scratch.
+    sg::MultimodalInputs {
+        image_data,
+        video_data,
+        audio_data,
+        modalities,
+        ..Default::default()
+    }
+    .encode_raw(&mut out.scratch);
+    // Field 9: the map's entries, in the map's own order.
+    for (key, tensor) in model_specific_tensors {
+        map_entry_frames(9, key, tensor, out, sglang_tensor_frames);
+    }
+    // Fields 10-12.
+    sg::MultimodalInputs {
+        im_token_id,
+        mm_placeholders,
+        feature_hash,
+        ..Default::default()
+    }
+    .encode_raw(&mut out.scratch);
+}
+
+/// An SGLang tensor as field `tag` of the message being written: a payload
+/// of at least `FRAME_MIN_BYTES` as the next frame, led by its own key and
+/// length and followed by the tensor's shape and dtype (the payload is the
+/// tensor's first field, a plain bytes field); any other tensor whole, in
+/// order.
+fn sglang_tensor_frames(tag: u32, tensor: sg::TensorData, out: &mut Frames) {
+    out.length_delimited(tag, tensor.encoded_len());
+    if !frames_its_own(&tensor.data) {
+        tensor.encode_raw(&mut out.scratch);
+        return;
+    }
+    let sg::TensorData { data, shape, dtype } = tensor;
+    out.length_delimited(1, data.len());
+    out.payload(data);
+    // An empty bytes field is not written, so the copy holds the two fields
+    // after the payload alone.
+    sg::TensorData {
+        data: Bytes::new(),
+        shape,
+        dtype,
+    }
+    .encode_raw(&mut out.scratch);
+}
+
+/// The bytes of an SGLang media input's inline payloads that ride as frames
+/// of their own: the pixel values and every model-specific tensor.
+fn sglang_framed_inputs_len(inputs: &sg::MultimodalInputs) -> usize {
+    inputs
+        .pixel_values
+        .as_ref()
+        .map_or(0, sglang_framed_tensor_len)
+        + inputs
+            .model_specific_tensors
+            .values()
+            .map(sglang_framed_tensor_len)
+            .sum::<usize>()
+}
+
+/// The length of an SGLang tensor's payload when it rides as a frame of its
+/// own, else 0.
+fn sglang_framed_tensor_len(tensor: &sg::TensorData) -> usize {
+    if frames_its_own(&tensor.data) {
+        tensor.data.len()
+    } else {
+        0
+    }
+}
+
 /// The unary-streaming call with `frames` as the request body over the
 /// client's own channel: the request headers (the trace metadata among them)
 /// and the gRPC content type, the response read as `R` messages. Transport
 /// errors map through tonic's `Status::from_error`, as the generated client
 /// maps them.
 pub(crate) async fn call_with_frames<R>(
-    channel: &crate::channel::Channel,
+    channel: &Channel,
     path: &'static str,
     headers: http::HeaderMap,
     frames: Vec<Bytes>,
@@ -546,7 +768,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::common_proto::ShmHandle;
+    use crate::{codec::scratch_capacity, common_proto::ShmHandle};
 
     /// The 1080p float32 class and the 4k float32 class of the bed's corpus.
     const CLASS_1080P: usize = 1920 * 1080 * 3 * 4;
@@ -747,6 +969,65 @@ mod tests {
         assert_identical(&plain, &frames);
     }
 
+    /// A tokenized prompt: ids across the varint widths and the rendered text.
+    fn prompt() -> ts::TokenizedInput {
+        ts::TokenizedInput {
+            input_ids: (0..1_114u32)
+                .map(|i| i.wrapping_mul(2_654_435_761) % 150_000 + 10)
+                .collect(),
+            original_text: "a rendered conversation ".repeat(175),
+        }
+    }
+
+    /// A text-only request that carries a prompt is one frame of prost's
+    /// bytes, written by the codec's one-pass writer: on a fresh thread the
+    /// writer's scratch holds its packed ids afterwards.
+    #[test]
+    fn a_text_only_prompt_is_one_frame_through_the_one_pass_writer() {
+        std::thread::spawn(|| {
+            let req = ts::GenerateRequest {
+                request_id: "chatcmpl-0123456789abcdef".into(),
+                tokenized: Some(prompt()),
+                sampling_params: Some(ts::SamplingParams::default()),
+                stream: true,
+                ..Default::default()
+            };
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
+            assert_identical(&req, &frames);
+            let ids = scratch_capacity();
+            assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
+        })
+        .join()
+        .expect("the text-only pin holds");
+    }
+
+    /// A request with media never reaches the one-pass writer, whatever
+    /// carries the media: a payload that rides as a frame of its own, a small
+    /// payload inline in the one frame, a shared-memory handle. Each is
+    /// prost's bytes and the thread's scratch stays empty: the writer's entry
+    /// refused the request.
+    #[test]
+    fn a_request_with_media_never_reaches_the_one_pass_writer() {
+        std::thread::spawn(|| {
+            for items in [
+                vec![inline_item(1, CLASS_1080P)],
+                vec![inline_item(2, FRAME_MIN_BYTES - 1)],
+                vec![shm_item()],
+            ] {
+                let req = ts::GenerateRequest {
+                    tokenized: Some(prompt()),
+                    ..request(items)
+                };
+                assert_identical(&req, &frames_of(&req));
+            }
+            assert_eq!(scratch_capacity(), 0);
+        })
+        .join()
+        .expect("the media pin holds");
+    }
+
     fn trailers_only(status: &str, message: Option<&str>) -> http::Response<tonic::body::Body> {
         let mut response = http::Response::builder()
             .status(200)
@@ -797,6 +1078,7 @@ mod tests {
 
         use super::{assert_identical, joined, CLASS_1080P, CLASS_4K};
         use crate::{
+            codec::scratch_capacity,
             common_proto::{RemoteTensorHandle, ShmHandle},
             framed::{vllm_frames, FRAME_MIN_BYTES, PREFIX_BYTES},
             vllm_proto as vllm,
@@ -1065,6 +1347,437 @@ mod tests {
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].len(), PREFIX_BYTES + plain.encoded_len());
             assert_identical(&plain, &frames);
+        }
+
+        /// A tokenized prompt: ids across the varint widths and the rendered
+        /// text.
+        fn prompt() -> vllm::generate_request::Input {
+            vllm::generate_request::Input::Tokenized(vllm::TokenizedInput {
+                original_text: "a rendered conversation ".repeat(175),
+                input_ids: (0..1_114u32)
+                    .map(|i| i.wrapping_mul(2_654_435_761) % 150_000 + 10)
+                    .collect(),
+            })
+        }
+
+        /// A text-only request that carries a prompt is one frame of prost's
+        /// bytes, written by the codec's one-pass writer: on a fresh thread
+        /// the writer's scratch holds its packed ids afterwards.
+        #[test]
+        fn a_text_only_prompt_is_one_frame_through_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let req = vllm::GenerateRequest {
+                    request_id: "chatcmpl-0123456789abcdef".into(),
+                    input: Some(prompt()),
+                    sampling_params: Some(vllm::SamplingParams::default()),
+                    stream: true,
+                    ..Default::default()
+                };
+                let frames = frames_of(&req);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
+                assert_identical(&req, &frames);
+                let ids = scratch_capacity();
+                assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
+            })
+            .join()
+            .expect("the text-only pin holds");
+        }
+
+        /// A request with media never reaches the one-pass writer, whatever
+        /// carries the media: a payload that rides as a frame of its own, a
+        /// small payload inline in the one frame, an extra media input, a
+        /// media reference. Each is prost's bytes and the thread's scratch
+        /// stays empty: the writer's entry refused the request.
+        #[test]
+        fn a_request_with_media_never_reaches_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let extra = vllm::GenerateRequest {
+                    extra_mm_inputs: vec![inputs(Some(inline_tensor(3, CLASS_1080P)), [])],
+                    ..Default::default()
+                };
+                let reference = vllm::GenerateRequest {
+                    media_refs: Some(vllm::MediaRefs {
+                        items: vec![vllm::MediaRef {
+                            modality: 1,
+                            url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                        }],
+                    }),
+                    ..Default::default()
+                };
+                for media in [
+                    request(inputs(Some(inline_tensor(1, CLASS_1080P)), [])),
+                    request(inputs(Some(inline_tensor(2, FRAME_MIN_BYTES - 1)), [])),
+                    extra,
+                    reference,
+                ] {
+                    let req = vllm::GenerateRequest {
+                        input: Some(prompt()),
+                        ..media
+                    };
+                    assert_identical(&req, &frames_of(&req));
+                }
+                assert_eq!(scratch_capacity(), 0);
+            })
+            .join()
+            .expect("the media pin holds");
+        }
+
+        #[test]
+        fn the_largest_tensor_class_is_one_frame_of_its_own() {
+            let req = request(inputs(Some(inline_tensor(5, CLASS_4K)), []));
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 3);
+            assert_eq!(frames[1].len(), CLASS_4K);
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn the_joined_frames_start_with_the_prefix_of_the_whole_message() {
+            let req = request_with_every_field();
+            let (len, body) = joined(&frames_of(&req));
+            assert_eq!(len as usize, body.len());
+        }
+    }
+
+    /// The SGLang wire: the same matrix over its message, whose tensors sit
+    /// in `pixel_values`, in a map and in extra media inputs, whose payload
+    /// is a plain bytes field and the tensor's first, and whose raw media
+    /// lists stay in the scratch.
+    mod sglang_wire {
+        use std::collections::HashMap;
+
+        use bytes::Bytes;
+        use prost::Message;
+
+        use super::{assert_identical, joined, CLASS_1080P, CLASS_4K};
+        use crate::{
+            codec::scratch_capacity,
+            framed::{sglang_frames, FRAME_MIN_BYTES, PREFIX_BYTES},
+            sglang_proto as sg,
+        };
+
+        fn inline_tensor(fill: u8, len: usize) -> sg::TensorData {
+            sg::TensorData {
+                data: Bytes::from(vec![fill; len]),
+                shape: vec![1, (len / 4) as u32],
+                dtype: "float32".into(),
+            }
+        }
+
+        /// Media inputs with `pixel_values` and the named model-specific
+        /// tensors, nothing else.
+        fn inputs(
+            pixel_values: Option<sg::TensorData>,
+            tensors: impl IntoIterator<Item = (&'static str, sg::TensorData)>,
+        ) -> sg::MultimodalInputs {
+            sg::MultimodalInputs {
+                pixel_values,
+                model_specific_tensors: tensors
+                    .into_iter()
+                    .map(|(key, tensor)| (key.to_string(), tensor))
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        fn request(mm_inputs: sg::MultimodalInputs) -> sg::GenerateRequest {
+            sg::GenerateRequest {
+                request_id: "r".into(),
+                mm_inputs: Some(Box::new(mm_inputs)),
+                ..Default::default()
+            }
+        }
+
+        /// Every field of the media inputs set: the three reference lists, a
+        /// large and a small inline tensor, the three raw media lists, an
+        /// empty key and a default value in the map, the placeholders.
+        fn inputs_with_every_field(fill: u8) -> sg::MultimodalInputs {
+            sg::MultimodalInputs {
+                image_urls: vec!["image-1".into()],
+                video_urls: vec!["video-1".into()],
+                audio_urls: vec!["audio-1".into()],
+                pixel_values: Some(inline_tensor(fill, FRAME_MIN_BYTES + 3)),
+                image_data: vec![vec![fill; 3]],
+                video_data: vec![vec![fill; 2]],
+                audio_data: vec![vec![fill; 1]],
+                modalities: vec!["image".into()],
+                model_specific_tensors: HashMap::from([
+                    ("image_grid_thw".to_string(), inline_tensor(fill, 24)),
+                    (String::new(), inline_tensor(fill, FRAME_MIN_BYTES)),
+                    ("empty".to_string(), sg::TensorData::default()),
+                ]),
+                im_token_id: Some(151_655),
+                mm_placeholders: vec![sg::PlaceholderRange {
+                    offset: 3,
+                    length: 64,
+                }],
+                feature_hash: Some(7),
+            }
+        }
+
+        /// Every field of the request set, the seventeen fields between the
+        /// two media paths included: the proof that the frames keep prost's
+        /// order around both.
+        fn request_with_every_field() -> sg::GenerateRequest {
+            sg::GenerateRequest {
+                request_id: "every-field".into(),
+                tokenized: Some(sg::TokenizedInput {
+                    original_text: "hi".into(),
+                    input_ids: vec![1, 2],
+                }),
+                mm_inputs: Some(Box::new(inputs_with_every_field(1))),
+                sampling_params: Some(sg::SamplingParams::default()),
+                return_logprob: true,
+                logprob_start_len: 2,
+                top_logprobs_num: 5,
+                token_ids_logprob: vec![11, 12],
+                return_hidden_states: true,
+                disaggregated_params: Some(sg::DisaggregatedParams {
+                    bootstrap_host: "decode-0".into(),
+                    bootstrap_port: 8998,
+                    bootstrap_room: 42,
+                }),
+                custom_logit_processor: "processor".into(),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 2,
+                }),
+                log_metrics: true,
+                input_embeds: vec![0.5, 1.5],
+                lora_id: "lora".into(),
+                data_parallel_rank: Some(1),
+                stream: true,
+                require_reasoning: true,
+                return_media_identity: true,
+                media_identity: Some(Box::new(sg::MediaIdentity {
+                    version: 1,
+                    ..Default::default()
+                })),
+                extra_mm_inputs: vec![inputs_with_every_field(2), sg::MultimodalInputs::default()],
+            }
+        }
+
+        /// The frames of `req`, which stays with the caller for the comparison.
+        fn frames_of(req: &sg::GenerateRequest) -> Vec<Bytes> {
+            sglang_frames(req.clone()).expect("a request the prefix can carry")
+        }
+
+        #[test]
+        fn a_request_without_media_is_one_frame_of_the_plain_encoding() {
+            let req = sg::GenerateRequest {
+                request_id: "text".into(),
+                stream: true,
+                ..Default::default()
+            };
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 1);
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn payloads_below_the_frame_size_stay_inline_in_one_frame() {
+            let mut req = request(inputs(
+                Some(inline_tensor(1, 10)),
+                [("image_grid_thw", inline_tensor(2, FRAME_MIN_BYTES - 1))],
+            ));
+            req.extra_mm_inputs = vec![inputs(Some(inline_tensor(3, 16)), [])];
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn large_pixel_values_ride_as_their_own_frame_led_by_their_key() {
+            let req = request(inputs(Some(inline_tensor(1, CLASS_1080P)), []));
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 3, "prefix and head, the payload, the tail");
+            let pixel_values = req
+                .mm_inputs
+                .as_ref()
+                .unwrap()
+                .pixel_values
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                frames[1].as_ptr(),
+                pixel_values.data.as_ptr(),
+                "the payload frame is the payload's memory"
+            );
+            assert_eq!(frames[1].len(), CLASS_1080P);
+            assert_eq!(
+                frames[2][0], 0x12,
+                "the tensor's shape (field 2) follows its payload (field 1)"
+            );
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn map_entries_keep_the_maps_order_around_an_empty_key_and_a_default_value() {
+            let req = request(inputs(
+                None,
+                [
+                    ("", inline_tensor(1, FRAME_MIN_BYTES + 1)),
+                    ("empty", sg::TensorData::default()),
+                    ("image_grid_thw", inline_tensor(2, 24)),
+                    ("second_image", inline_tensor(3, FRAME_MIN_BYTES)),
+                ],
+            ));
+            let frames = frames_of(&req);
+            assert_eq!(
+                frames.len(),
+                5,
+                "prefix and head, a payload, the entries between, a payload, the tail"
+            );
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn extra_media_inputs_follow_the_fields_between_with_frames_of_their_own() {
+            let req = sg::GenerateRequest {
+                request_id: "extra".into(),
+                mm_inputs: Some(Box::default()),
+                sampling_params: Some(sg::SamplingParams::default()),
+                disaggregated_params: Some(sg::DisaggregatedParams::default()),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: 3,
+                    nanos: 4,
+                }),
+                lora_id: "lora".into(),
+                data_parallel_rank: Some(2),
+                media_identity: Some(Box::default()),
+                extra_mm_inputs: vec![
+                    inputs(
+                        Some(inline_tensor(1, 16)),
+                        [("image_grid_thw", inline_tensor(1, 24))],
+                    ),
+                    inputs(
+                        None,
+                        [("video_grid_thw", inline_tensor(2, FRAME_MIN_BYTES + 5))],
+                    ),
+                    inputs(Some(inline_tensor(3, CLASS_1080P)), []),
+                ],
+                ..Default::default()
+            };
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 5);
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn raw_media_lists_stay_in_the_scratch_beside_a_framed_tensor() {
+            let mut media = inputs(Some(inline_tensor(1, FRAME_MIN_BYTES)), []);
+            media.image_data = vec![vec![9; 100 * 1024]];
+            media.modalities = vec!["image".into()];
+            let req = request(media);
+            let frames = frames_of(&req);
+            assert_eq!(frames.len(), 3);
+            assert!(
+                frames[2].len() > 100 * 1024,
+                "the raw image bytes are in the tail, not a frame"
+            );
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn every_field_set_keeps_prosts_field_order_around_both_media_paths() {
+            let req = request_with_every_field();
+            let frames = frames_of(&req);
+            // Two large inline tensors in each of the two media inputs that
+            // hold them: prefix and head, then a payload and the bytes after
+            // it, four times.
+            assert_eq!(frames.len(), 9);
+            assert_identical(&req, &frames);
+        }
+
+        #[test]
+        fn a_plain_request_is_one_frame_of_exactly_its_length() {
+            let plain = sg::GenerateRequest {
+                mm_inputs: None,
+                extra_mm_inputs: Vec::new(),
+                ..request_with_every_field()
+            };
+            let frames = frames_of(&plain);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].len(), PREFIX_BYTES + plain.encoded_len());
+            assert_identical(&plain, &frames);
+        }
+
+        /// A tokenized prompt: ids across the varint widths and the rendered
+        /// text.
+        fn prompt() -> sg::TokenizedInput {
+            sg::TokenizedInput {
+                original_text: "a rendered conversation ".repeat(175),
+                input_ids: (0..1_114u32)
+                    .map(|i| i.wrapping_mul(2_654_435_761) % 150_000 + 10)
+                    .collect(),
+            }
+        }
+
+        /// A text-only request that carries a prompt is one frame of prost's
+        /// bytes, written by the codec's one-pass writer: on a fresh thread
+        /// the writer's scratch holds its packed ids afterwards.
+        #[test]
+        fn a_text_only_prompt_is_one_frame_through_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let req = sg::GenerateRequest {
+                    request_id: "chatcmpl-0123456789abcdef".into(),
+                    tokenized: Some(prompt()),
+                    sampling_params: Some(sg::SamplingParams::default()),
+                    stream: true,
+                    ..Default::default()
+                };
+                let frames = frames_of(&req);
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), PREFIX_BYTES + req.encoded_len());
+                assert_identical(&req, &frames);
+                let ids = scratch_capacity();
+                assert!(ids > 0, "the one-pass writer packed the ids: {ids}");
+            })
+            .join()
+            .expect("the text-only pin holds");
+        }
+
+        /// A request with media never reaches the one-pass writer, whatever
+        /// carries the media: a payload that rides as a frame of its own, a
+        /// small payload inline in the one frame, an extra media input of
+        /// either size, raw media bytes, a media reference. Each is prost's
+        /// bytes and the thread's scratch stays empty: the writer's entry
+        /// refused the request.
+        #[test]
+        fn a_request_with_media_never_reaches_the_one_pass_writer() {
+            std::thread::spawn(|| {
+                let extra_framed = sg::GenerateRequest {
+                    extra_mm_inputs: vec![inputs(Some(inline_tensor(3, CLASS_1080P)), [])],
+                    ..Default::default()
+                };
+                let extra_inline = sg::GenerateRequest {
+                    extra_mm_inputs: vec![inputs(Some(inline_tensor(4, 16)), [])],
+                    ..Default::default()
+                };
+                let mut raw = inputs(None, []);
+                raw.image_data = vec![vec![9; 1024]];
+                let mut reference = inputs(None, []);
+                reference.image_urls = vec!["data:image/png;base64,iVBORw0KGgo=".into()];
+                for media in [
+                    request(inputs(Some(inline_tensor(1, CLASS_1080P)), [])),
+                    request(inputs(Some(inline_tensor(2, FRAME_MIN_BYTES - 1)), [])),
+                    extra_framed,
+                    extra_inline,
+                    request(raw),
+                    request(reference),
+                ] {
+                    let req = sg::GenerateRequest {
+                        tokenized: Some(prompt()),
+                        ..media
+                    };
+                    assert_identical(&req, &frames_of(&req));
+                }
+                assert_eq!(scratch_capacity(), 0);
+            })
+            .join()
+            .expect("the media pin holds");
         }
 
         #[test]

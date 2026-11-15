@@ -10,14 +10,14 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 #[cfg(test)]
 use super::create_worker::labels_for_rank;
 use super::create_worker::{
-    model_card_for_labels, report_for_rank, validate_parser_overrides,
+    kv_transfer_value, model_card_for_labels, report_for_rank, validate_parser_overrides,
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
-        basic::merge_labels, overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker,
-        BasicWorkerBuilder, RuntimeType, Worker,
+        health::overload::OverloadThresholds, identity::basic::merge_labels,
+        registry::service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
 };
@@ -362,13 +362,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 }
             };
 
-            // The rebuilt handle stands at the old one's URL: tell the policy
-            // registry, as a removal would, so the engine's rows of the
-            // retired handle do not outlive it.
-            app_context
-                .policy_registry
-                .on_worker_replaced(worker.as_ref(), new_worker.as_ref());
-
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
             // the worker does not stay stuck in a non-routable pre-update
@@ -432,9 +425,10 @@ struct EngineKvMetadata {
 }
 
 impl EngineKvMetadata {
-    /// Takes the three keys out of the report; an empty value is none.
+    /// Takes the three keys out of the report, an empty value being none
+    /// (`kv_transfer_value`, the registration's reading of the same keys).
     fn take(report: &mut HashMap<String, String>) -> Self {
-        let mut take = |key: &str| report.remove(key).filter(|value| !value.is_empty());
+        let mut take = |key: &str| kv_transfer_value(report.remove(key));
         Self {
             connector: take("kv_connector"),
             role: take("kv_role"),

@@ -79,6 +79,19 @@ def test_embedding_response():
     assert resp.data[0].embedding == [0.1, 0.2, 0.3]
 
 
+def test_embedding_response_without_completion_tokens():
+    # The public API's embeddings usage has prompt_tokens and total_tokens only.
+    raw = {
+        "object": "list",
+        "data": [{"object": "embedding", "embedding": [0.1], "index": 0}],
+        "model": "bge-large",
+        "usage": {"prompt_tokens": 5, "total_tokens": 5},
+    }
+    resp = EmbeddingResponse.model_validate(raw)
+    assert resp.usage.prompt_tokens == 5
+    assert resp.usage.completion_tokens == 0
+
+
 def test_completion_response():
     raw = {
         "id": "cmpl-abc123",
@@ -124,7 +137,7 @@ def test_anthropic_message_response():
     }
     msg = Message.model_validate(raw)
     assert msg.id == "msg_abc123"
-    assert msg.content[0].type.value == "text"
+    assert msg.content[0].type == "text"
     assert msg.content[0].text == "Hello!"
     assert msg.usage.input_tokens == 10
 

@@ -243,9 +243,6 @@ pub(super) struct MergeTable {
     /// or the first empty entry, going on to the next bucket only when every
     /// entry holds another pair (see [`Self::merge_of`]).
     buckets: Box<[Bucket]>,
-    /// Bits a key's hash is shifted right by to give its first bucket; the
-    /// table holds `1 << (64 - shift)` buckets.
-    shift: u32,
     /// The pairs' filter: one 64-bit word per pair key and two bits of it,
     /// set by [`Self::insert`], [`PAIR_FILTER_BITS_PER_MERGE`] bits per
     /// merge at least (64-512 KiB for the vocabularies in use, a table the
@@ -524,10 +521,10 @@ impl MergeTable {
     /// window base once it knows the byte ids.
     fn with_capacity(merges: usize, ignore_merges: bool, hot: bool) -> Self {
         // Buckets for a load of one half at most, two at least: a probe
-        // always meets an empty entry, and the shift that picks a bucket
-        // from a key's high bits stays below the key's width.
-        let buckets = merges.div_ceil(BUCKET / 2).next_power_of_two().max(2);
-        let shift = u64::BITS - buckets.trailing_zeros();
+        // always meets an empty entry. Exactly as many as that needs: the
+        // first-bucket pick multiplies the hash by the count, so the count
+        // need not be a power of two.
+        let buckets = merges.div_ceil(BUCKET / 2).max(2);
         let hot = if hot {
             vec![Merge::NONE; (HOT_SIDE * HOT_SIDE) as usize].into_boxed_slice()
         } else {
@@ -543,7 +540,6 @@ impl MergeTable {
             hot,
             hot_base: NO_HOT_BASE,
             buckets: vec![Bucket::EMPTY; buckets].into_boxed_slice(),
-            shift,
             pair_filter: vec![0; filter_words].into_boxed_slice(),
             pair_filter_shift: u64::BITS - filter_words.trailing_zeros(),
             merges,
@@ -608,10 +604,29 @@ impl MergeTable {
         self.merges
     }
 
+    /// The bucket a pair key's walk starts at: the high word of the key's
+    /// hash times the bucket count, so the table holds exactly the buckets
+    /// its merges need and not the next power of two (a table of 269-322k
+    /// merges held 16 MiB where 8-10 are used). The count is the slice's
+    /// own length, kept in one place.
     #[inline(always)]
     fn first_bucket(&self, key: u64) -> usize {
-        // Fibonacci hashing: the pair's two ids spread over the high bits.
-        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+        // Fibonacci hashing spreads the pair's two ids over the high bits;
+        // the high word of the hash times the count maps them onto the
+        // buckets without a power-of-two count (one multiplication).
+        let hash = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((u128::from(hash) * self.buckets.len() as u128) >> 64) as usize
+    }
+
+    /// The bucket after `bucket` in the walk, the first after the last.
+    #[inline(always)]
+    fn next_bucket(&self, bucket: usize) -> usize {
+        let next = bucket + 1;
+        if next == self.buckets.len() {
+            0
+        } else {
+            next
+        }
     }
 
     /// The filter word of a pair key and its two bits: the hash's high bits
@@ -662,7 +677,6 @@ impl MergeTable {
         let key = Self::pair_key(a, b);
         let (word, bits) = self.pair_filter_slot(key);
         self.pair_filter[word] |= bits;
-        let mask = self.buckets.len() - 1;
         let mut bucket = self.first_bucket(key);
         loop {
             for entry in &mut self.buckets[bucket].0 {
@@ -671,7 +685,7 @@ impl MergeTable {
                     return;
                 }
             }
-            bucket = (bucket + 1) & mask;
+            bucket = self.next_bucket(bucket);
         }
     }
 
@@ -730,7 +744,6 @@ impl MergeTable {
             return Merge::NONE;
         }
         let buckets = &self.buckets;
-        let mask = buckets.len() - 1;
         let mut bucket = self.first_bucket(key);
         loop {
             // Most lookups end after one or two compares of the one line
@@ -743,7 +756,7 @@ impl MergeTable {
                     return Merge::NONE;
                 }
             }
-            bucket = (bucket + 1) & mask;
+            bucket = self.next_bucket(bucket);
         }
     }
 
@@ -796,7 +809,10 @@ impl MergeTable {
     /// pre-forms under the vocabulary: the caller merges from the bytes
     /// then. The caller sends a cold piece of a unit that holds a non-ASCII
     /// byte here first (a piece of an ASCII unit never comes); an ASCII
-    /// piece of a mixed unit leaves at the pays-off test.
+    /// piece of a mixed unit leaves at the pays-off test. A piece from the
+    /// stages over the byte-level image is not always whole text (a cut may
+    /// fall inside a character): a byte outside a whole character is its own
+    /// symbol here, as under the byte merge.
     #[inline(never)]
     pub(super) fn merge_preformed(&self, piece: &[u8], ids: &mut Vec<u32>) -> bool {
         debug_assert!(
@@ -822,8 +838,11 @@ impl MergeTable {
                     && i + len <= piece.len()
                     && piece[i + 1..i + len].iter().all(|&b| is_continuation(b)));
             if !whole {
-                // A byte that starts no character of the text (the piece is
-                // text, so none is met; a bare byte string merges as bytes).
+                // A byte outside a whole character: a piece from the stages
+                // over the byte-level image may begin on a continuation byte
+                // or end inside a character (see `pieces_in_alphabet`), and a
+                // bare byte string merges as bytes; such a byte is its own
+                // symbol, as the byte merge has it.
                 push_symbol(
                     &mut segment,
                     &mut n,

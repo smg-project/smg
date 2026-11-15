@@ -8,8 +8,8 @@ use symphony::{
     event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallId, CallSyntax, Emits, Format, Whitespace},
     grammar::{
-        Bound, Grammar, GrammarStart, Output, OutputAnswer, OutputChoice, OutputPosition,
-        OutputSpelling, Tag, Turn,
+        AddedTokens, Bound, Grammar, GrammarBackend, GrammarStart, Inexpressible, Lark, Output,
+        OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Spelling, Tag, Turn, Unspelled,
     },
     input::{EngineFinish, Input, TokenSpan},
     parser::{ParseError, Parser},
@@ -46,16 +46,22 @@ const RE_EXPORTS: [(&str, &[&str]); 9] = [
     (
         "grammar",
         &[
+            "AddedTokens",
             "Bound",
             "Grammar",
+            "GrammarBackend",
             "GrammarStart",
+            "Inexpressible",
+            "Lark",
             "Output",
             "OutputAnswer",
             "OutputChoice",
             "OutputPosition",
             "OutputSpelling",
+            "Spelling",
             "Tag",
             "Turn",
+            "Unspelled",
         ],
     ),
     ("ids", &["CallIds"]),
@@ -135,6 +141,8 @@ fn every_pinned_name_resolves_under_its_module() {
         OutputChoice,
     )>();
     named::<(OutputPosition, OutputSpelling, Tag, Turn)>();
+    named::<(AddedTokens, Inexpressible, Lark)>();
+    named::<(GrammarBackend, Spelling, Unspelled)>();
     named::<(EngineFinish, Input, TokenSpan, ParseError)>();
     named::<Inferred>();
     reads::<Inferred>();

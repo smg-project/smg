@@ -24,8 +24,8 @@ use llm_tokenizer::{
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
-        ContentPart, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice,
-        ToolChoiceValue,
+        ContentPart, FunctionCallResponse, ResponseFormat, StringOrArray, Tool, ToolCall,
+        ToolChoice, ToolChoiceValue,
     },
     generate::GenerateFinishReason,
     profile::ProviderProfile,
@@ -982,9 +982,11 @@ fn transform_content_field(
             // Replace media parts with placeholders. The default order builds
             // separate media/text buckets for the front placement; the
             // authored order appends each rendered part as it is encountered.
-            let mut media_parts: Vec<String> = Vec::new();
-            let mut text_parts: Vec<String> = Vec::new();
-            let mut authored_parts: Vec<String> = Vec::new();
+            // The lists borrow the parts from the message's own values and the
+            // template's placeholders; the join copies each part once.
+            let mut media_parts: Vec<&str> = Vec::new();
+            let mut text_parts: Vec<&str> = Vec::new();
+            let mut authored_parts: Vec<&str> = Vec::new();
             for part in content_array {
                 let Some(obj) = part.as_object() else {
                     continue;
@@ -995,8 +997,8 @@ fn transform_content_field(
                     Some(type_name @ ("text" | "refusal")) => {
                         if let Some(t) = obj.get(type_name).and_then(|t| t.as_str()) {
                             match media_order {
-                                MediaPartOrder::MediaFirst => text_parts.push(t.to_string()),
-                                MediaPartOrder::Authored => authored_parts.push(t.to_string()),
+                                MediaPartOrder::MediaFirst => text_parts.push(t),
+                                MediaPartOrder::Authored => authored_parts.push(t),
                             }
                         }
                     }
@@ -1014,10 +1016,10 @@ fn transform_content_field(
                         })?;
                         match media_order {
                             MediaPartOrder::MediaFirst => {
-                                media_parts.push(placeholder.to_string());
+                                media_parts.push(placeholder);
                             }
                             MediaPartOrder::Authored => {
-                                authored_parts.push(placeholder.to_string());
+                                authored_parts.push(placeholder);
                             }
                         }
                     }
@@ -1025,7 +1027,7 @@ fn transform_content_field(
                 }
             }
 
-            let ordered: Vec<String> = match media_order {
+            let ordered: Vec<&str> = match media_order {
                 MediaPartOrder::MediaFirst => media_parts.into_iter().chain(text_parts).collect(),
                 MediaPartOrder::Authored => authored_parts,
             };
@@ -1242,6 +1244,27 @@ pub(crate) fn process_chat_messages_with_placeholders(
             build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name(), |name| {
                 tokenizer.template_reads(name)
             });
+
+        // A renderer may constrain JSON responses: the actual response format
+        // and the continuation the render will take (an explicit template
+        // argument over the request field) decide the check.
+        if matches!(
+            request.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        ) {
+            let continuation = combined_template_kwargs
+                .get("continue_final_message")
+                .and_then(Value::as_bool)
+                .unwrap_or(request.continue_final_message);
+            let assistant_prefix = transformed_messages
+                .last()
+                .filter(|message| continuation && message["role"] == "assistant")
+                .and_then(|message| message["content"].as_str());
+            tokenizer
+                .renderer_capabilities()
+                .validate_json_response(request.separate_reasoning, assistant_prefix)
+                .map_err(|error| error.to_string())?;
+        }
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None

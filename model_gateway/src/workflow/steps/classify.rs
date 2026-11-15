@@ -17,7 +17,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
     routers::provider_support,
-    worker::{basic::RuntimeType, endpoint::Endpoint},
+    worker::identity::{basic::RuntimeType, endpoint::Endpoint},
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -199,6 +199,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::probe_models_owned_by;
+    use crate::server::http_client;
 
     #[tokio::test]
     async fn probe_models_owned_by_accepts_nvidia_as_local() {
@@ -225,14 +226,9 @@ mod tests {
                 .unwrap();
         });
 
-        let owned_by = probe_models_owned_by(
-            &format!("http://{addr}"),
-            5,
-            &crate::server::http_client(),
-            None,
-        )
-        .await
-        .unwrap();
+        let owned_by = probe_models_owned_by(&format!("http://{addr}"), 5, &http_client(), None)
+            .await
+            .unwrap();
         server.abort();
 
         assert_eq!(owned_by, "nvidia");

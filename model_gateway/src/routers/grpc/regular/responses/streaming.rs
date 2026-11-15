@@ -629,7 +629,9 @@ struct CallSite<'a> {
     session: &'a McpToolSession<'a>,
     format_registry: &'a FormatRegistry,
     original_request: &'a ResponsesRequest,
-    model: &'a str,
+    /// The loop's current request: its model labels the call's metrics, its
+    /// tools name the call's namespace.
+    request: &'a ResponsesRequest,
 }
 
 /// One MCP call's whole life on the stream: announced with its progress
@@ -677,8 +679,9 @@ async fn stream_mcp_call(
     );
 
     // Emit output_item.added
-    let event = emitter.emit_output_item_added(output_index, &item);
-    emitter.send_event(&event, tx).await?;
+    emitter
+        .send_output_item_added(output_index, &item, tx)
+        .await?;
 
     // Emit tool_call.in_progress
     let event = emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
@@ -753,7 +756,7 @@ async fn stream_mcp_call(
     // that follow, so a client who left during the call changes neither the
     // record nor the counts; `output_item.done` is still sent after the
     // completion event, in order.
-    emitter.store_output_item_data(output_index, item_done.clone());
+    emitter.keep_output_item(output_index, item_done);
     emitter.complete_output_item(output_index);
     let failure = (!success).then(|| {
         tool_output
@@ -761,7 +764,7 @@ async fn stream_mcp_call(
             .clone()
             .unwrap_or_else(|| output_str.clone())
     });
-    record_mcp_call(state, site.model, tool_output, output_str, output_item);
+    record_mcp_call(state, site.request, tool_output, output_str, output_item);
 
     if let Some(err_text) = failure {
         warn!("Tool execution returned error: {}", err_text);
@@ -783,8 +786,7 @@ async fn stream_mcp_call(
         emitter.send_event(&event, tx).await?;
     }
 
-    let event = emitter.emit_output_item_done(output_index, &item_done);
-    emitter.send_event(&event, tx).await?;
+    emitter.send_kept_output_item_done(output_index, tx).await?;
     Ok(())
 }
 
@@ -826,7 +828,7 @@ async fn execute_tool_loop_streaming_internal(
 ) -> Result<(), String> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
-    let mut state = ToolLoopState::new(&current_request);
+    let mut state = ToolLoopState::default();
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
@@ -989,7 +991,7 @@ async fn execute_tool_loop_streaming_internal(
                 session: &session,
                 format_registry: &ctx.mcp_format_registry,
                 original_request,
-                model: &current_request.model,
+                request: &current_request,
             };
             for tool_call in mcp_tool_calls {
                 if let Err(message) =
@@ -1016,7 +1018,7 @@ async fn execute_tool_loop_streaming_internal(
             }
 
             // Build next request with conversation history
-            current_request = build_next_request(&state, current_request);
+            current_request = build_next_request(&mut state, current_request);
 
             continue;
         }

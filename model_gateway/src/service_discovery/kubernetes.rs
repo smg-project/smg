@@ -27,7 +27,7 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, PodCondition};
 use kube::{
     api::Api,
     runtime::{
@@ -49,8 +49,8 @@ use super::{
 use crate::{
     app_context::AppContext,
     worker::{
-        endpoint::Endpoint,
-        pd_pairing::{connector_profile, KvTransferProfile},
+        identity::endpoint::Endpoint,
+        pd::pairing::{connector_profile, KvTransferProfile},
         MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
     },
 };
@@ -189,13 +189,16 @@ impl ServiceDiscoveryConfig {
         }
         self.role_selectors()
             .into_iter()
-            .find(|(selector, _)| PodInfo::matches_selector(pod, selector))
+            .find(|(selector, _)| matches_selector(pod, selector))
             .map_or(PodType::Regular, |(_, role)| role)
     }
 }
 
 /// A selector as the API server reads it: `key=value` pairs joined by commas.
-fn selector_string<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>) -> String {
+/// Shared with the mesh's router-peer watcher.
+pub(crate) fn selector_string<'a>(
+    pairs: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> String {
     pairs
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -204,14 +207,12 @@ fn selector_string<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>
 }
 
 /// Build a kube watcher Config that pushes the given label selector down to
-/// the API server, logging watcher startup at INFO. An empty selector falls
-/// back to `Config::default()` (no server-side label filtering) so the
-/// watcher still functions when no selector is set.
-fn build_watcher_config(label_selector: &str) -> Config {
-    info!(
-        "Starting K8s worker watcher | selector: '{}'",
-        label_selector
-    );
+/// the API server, logging the `kind` watcher's start at INFO. An empty
+/// selector falls back to `Config::default()` (no server-side label
+/// filtering) so the watcher still functions when no selector is set.
+/// Shared with the mesh's router-peer watcher.
+pub(crate) fn build_watcher_config(kind: &str, label_selector: &str) -> Config {
+    info!("Starting K8s {kind} watcher | selector: '{label_selector}'");
     if label_selector.is_empty() {
         Config::default()
     } else {
@@ -277,18 +278,30 @@ pub struct PodInfo {
     pub model_id_override: Option<String>,
 }
 
-impl PodInfo {
-    fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
-        if selector.is_empty() {
-            return false;
-        }
-
-        pod.metadata
-            .labels
-            .as_ref()
-            .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
+/// Whether every label of `selector` is on `pod`; an empty selector matches
+/// no Pod. Shared with the mesh's router-peer watcher.
+pub(crate) fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
+    if selector.is_empty() {
+        return false;
     }
 
+    pod.metadata
+        .labels
+        .as_ref()
+        .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
+}
+
+/// Whether a Pod's conditions carry `Ready = True`, Kubernetes' traffic-admission
+/// signal. Shared with the mesh's router-peer watcher.
+pub(crate) fn pod_is_ready(conditions: Option<&[PodCondition]>) -> bool {
+    conditions.is_some_and(|conditions| {
+        conditions
+            .iter()
+            .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+    })
+}
+
+impl PodInfo {
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
         if config.disaggregated_mode {
             let selectors = config.disaggregated_selectors();
@@ -298,13 +311,13 @@ impl PodInfo {
             }
             selectors
                 .iter()
-                .any(|selector| Self::matches_selector(pod, selector))
+                .any(|selector| matches_selector(pod, selector))
         } else {
             if config.selector.is_empty() {
                 warn!("Regular mode enabled but selector is empty");
                 return false;
             }
-            Self::matches_selector(pod, &config.selector)
+            matches_selector(pod, &config.selector)
         }
     }
 
@@ -319,11 +332,7 @@ impl PodInfo {
         };
         let status = pod.status.clone()?;
         let ip = pod_ip(&name, &status.pod_ip?)?;
-        let is_ready = status.conditions.as_ref().is_some_and(|conditions| {
-            conditions
-                .iter()
-                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
-        });
+        let is_ready = pod_is_ready(status.conditions.as_deref());
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
         let pod_type = config.map(|config| config.pod_type_of(pod));
@@ -368,7 +377,7 @@ impl PodInfo {
 /// The Pod's address, parsed rather than kept as a string so the worker URL
 /// renders an IPv6 address in bracketed form; `format!("{ip}:{port}")` on the
 /// string would produce the unusable `fd00::1:8080`.
-fn pod_ip(name: &str, raw: &str) -> Option<IpAddr> {
+pub(crate) fn pod_ip(name: &str, raw: &str) -> Option<IpAddr> {
     raw.parse()
         .inspect_err(|e| warn!("Pod {} has an unparsable Pod IP '{}': {e}", name, raw))
         .ok()
@@ -558,7 +567,7 @@ fn run_service_discovery(
         let (store, writer) = reflector::store::<Pod>();
         let notify = Notify::new();
 
-        let watcher_config = build_watcher_config(&config.list_label_selector());
+        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
         // managed_fields dominate pod object size and nothing here reads them;
         // pruning keeps the long-lived Store lean.
         let stream = watcher(pods, watcher_config)
@@ -706,7 +715,7 @@ mod tests {
     use super::*;
     use crate::{
         service_discovery::testing::make_labeled_pod,
-        worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey},
+        worker::{endpoint_key, identity::endpoint::Endpoint, registry::WorkerId, EndpointKey},
     };
 
     /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),
@@ -1247,7 +1256,7 @@ mod tests {
     }
 
     fn key(url: &str) -> EndpointKey {
-        crate::worker::endpoint_key(url).expect(url)
+        endpoint_key(url).expect(url)
     }
 
     /// A registered worker whose Pod the tests then stop publishing, so its
@@ -1687,13 +1696,13 @@ mod tests {
 
     #[test]
     fn test_build_watcher_config_with_selector_pushes_label_selector() {
-        let cfg = build_watcher_config("app=sglang");
+        let cfg = build_watcher_config("worker", "app=sglang");
         assert_eq!(cfg.label_selector.as_deref(), Some("app=sglang"));
     }
 
     #[test]
     fn test_build_watcher_config_empty_selector_falls_back_to_default() {
-        let cfg = build_watcher_config("");
+        let cfg = build_watcher_config("worker", "");
         assert!(cfg.label_selector.is_none());
     }
 
@@ -1706,14 +1715,14 @@ mod tests {
             disaggregated_mode: false,
             ..Default::default()
         };
-        let watcher_config = build_watcher_config(&config.list_label_selector());
+        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
 
     #[test]
     fn test_build_watcher_config_for_pd_mode_pushes_intersection() {
         let config = create_pd_config();
-        let watcher_config = build_watcher_config(&config.list_label_selector());
+        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
 
@@ -1721,7 +1730,7 @@ mod tests {
     fn test_build_watcher_config_for_epd_mode_pushes_intersection() {
         let config = create_epd_config();
 
-        let watcher_config = build_watcher_config(&config.list_label_selector());
+        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
 
@@ -1737,14 +1746,14 @@ mod tests {
             decode_selector: decode,
             ..Default::default()
         };
-        let watcher_config = build_watcher_config(&config.list_label_selector());
+        let watcher_config = build_watcher_config("worker", &config.list_label_selector());
         assert!(watcher_config.label_selector.is_none());
     }
 
     #[traced_test]
     #[test]
     fn test_build_watcher_config_logs_selector_at_info_level() {
-        let _ = build_watcher_config("app=sglang");
+        let _ = build_watcher_config("worker", "app=sglang");
         assert!(logs_contain("Starting K8s worker watcher"));
         assert!(logs_contain("app=sglang"));
     }

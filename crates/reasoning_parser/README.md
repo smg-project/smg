@@ -57,6 +57,19 @@ async fn main() {
 
 Unknown models fall back to a passthrough parser that returns all text as normal output.
 
+### Typed framing and structured JSON
+
+For a structured JSON response, call `parser.set_json_mode(true)` before parsing.
+The Inkling parser then preserves protocol spellings inside JSON string keys and values.
+It tracks quotes and escapes across stream chunks, including incomplete strings at EOF.
+It still removes actual framing outside JSON strings and separates reasoning blocks.
+Other parsers keep their existing behavior.
+
+The gateway selects this mode per request for `json_object` and `json_schema` responses.
+Fresh parsers isolate requests and choices.
+`reset` clears stream state but retains the selected mode.
+Call `set_json_mode(false)` before reusing a parser for a non-JSON request.
+
 ## Core Types
 
 ### ParserResult

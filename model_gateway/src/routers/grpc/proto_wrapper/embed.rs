@@ -12,6 +12,15 @@ pub enum ProtoEmbedRequest {
 }
 
 impl ProtoEmbedRequest {
+    /// The runtime whose message type this request is.
+    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
+        use crate::worker::RuntimeType;
+        match self {
+            Self::Sglang(_) => RuntimeType::Sglang,
+            Self::Vllm(_) => RuntimeType::Vllm,
+        }
+    }
+
     /// Serialized wire size, for the release metric.
     pub fn wire_len(&self) -> usize {
         use prost::Message;

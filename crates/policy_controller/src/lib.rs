@@ -11,8 +11,9 @@
 //! Section by section:
 //!
 //! - 4.1, the view ([`view`]): [`RequestFacts`], [`Candidate`] rows with their
-//!   [`LoadRow`], [`Constraints`] and [`PoolFacts`]. Built once per decision by
-//!   the host into a reused buffer; no handle, no callback into the host.
+//!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
+//!   and [`PoolFacts`]. Built once per decision by the host into a reused
+//!   buffer; no handle, no callback into the host.
 //! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
@@ -41,28 +42,55 @@
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`elector::Fence`] a shard thread reads before every decision it sends.
 //!
-//! What this step does not hold: the plugin hosts, the operator calls, the
-//! ingestion drivers and the gRPC API; they arrive in later
+//! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
+//!   feature): user policies as components of the committed `smg:policy`
+//!   package, one kept instance per deciding thread, every call under fuel,
+//!   bound to a profile as the framework's own stages.
+//! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
+//!   path (the `GetLoads` poll per engine under the store's poll
+//!   arbitration, the metrics scrape of an engine without a servicer) and
+//!   the load helpers the gateway shares with the controller (the row
+//!   conversion, the scrape parser). The KV subscription, the prober and
+//!   discovery arrive in the step's later PRs.
+//!
+//! - Behind the `controller` feature, the standalone controller
+//!   (`controller`): the listeners with their credentialed scopes, the
+//!   health service on each, the admin endpoints, readiness and the drain,
+//!   the load driver over the store, and the binary of the package's name
+//!   over them. The scopes' calls and the election arrive in the step's
+//!   later PRs.
+//!
+//! What this step does not hold: the gRPC plugin service, the operator calls,
+//! the other ingestion drivers and the gRPC API; they arrive in later
 //! steps and build on these types. The
 //! in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
+pub mod affinity;
 pub mod builtins;
+#[cfg(feature = "controller")]
+pub mod controller;
 pub mod decision;
 pub mod elector;
 pub mod framework;
+#[cfg(feature = "ingest")]
+pub mod ingest;
 pub mod lease;
 pub mod ring;
 pub mod sessions;
 pub mod spec;
 pub mod store;
 pub mod view;
+#[cfg(feature = "wasm")]
+pub mod wasm;
+pub mod wit;
 
 pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, Engine, Filter, PairPools, Picker, Plan, Profile, Scorer, Scratch, TieBand, Weighted,
+    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, Picker, Plan, Profile, Scorer,
+    Scratch, TieBand, Weighted,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
@@ -70,15 +98,27 @@ pub use lease::{
 };
 pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
-pub use spec::{Needs, PolicySpec, SessionsSpec, SpecError, API_VERSION, PRESETS};
+pub use spec::{
+    Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
+};
 pub use view::{
-    fingerprint, Candidate, Constraints, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
-    OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,
-    ZoneCapacity,
+    fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
+    LoadRow, MediaCounts, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource,
+    WireModes, WorkerId, ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
 /// decision replays from its trace.
+///
+/// The streams a decision opens are listed here, so that a new site derives
+/// one that none of them reads:
+///
+/// - the seed's own stream: the profile's picker, and a plugin's draws;
+/// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
+/// - the seed under the alternates' mask: the order of equal counts among
+///   the workers the count-first picker passed over;
+/// - the first value of the seed's stream: the seed a pair plan hands its
+///   decode side, whose stages derive their streams from it as above.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

@@ -153,8 +153,9 @@ const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// is tokenized every time.
 const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 
-/// Bytes of an input from which the single-stage scanners walk a letter or
-/// white-space run eight bytes at a time (`Roles::run_end_as`): the scanner
+/// Bytes of an input from which the scanners walk a letter or white-space
+/// run eight bytes at a time (`Roles::run_end_as`, and `run_end_as_in` for
+/// the chain scanner's runs, which also end at a stage class): the scanner
 /// loop is compiled with the word scans and without, and the choice is made
 /// once per encode call on the input's length; a shorter input walks every
 /// run byte by byte through the loop as it was before the scans, and no run
@@ -223,7 +224,11 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
-/// most. A thread reads its share at the start of every encode call and keeps
+/// most (a thread's long tier keeps its map's slots through an eviction's
+/// clear when they fit four times its share and gives them back when they
+/// do not; a share that fell below a quarter of what the tier holds, entries
+/// and empty slots together, makes it anew at the thread's next call). A
+/// thread reads its share at the start of every encode call and keeps
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
 /// miss), so after threads join it is within the smaller share from its next
@@ -271,15 +276,57 @@ const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
 /// loads on its own, sized by its host) reads on that pool instead.
 const SEED_THREADS: usize = 4;
 /// Text on each side of a candidate cut that every stage's pattern is run
-/// over to confirm a piece starts there (widened to the spaces around it).
-const CUT_CHECK_WINDOW: usize = 512;
+/// over to confirm a piece starts there (widened to the spaces around it:
+/// the window starts where the text's match loop begins a piece and ends
+/// just after such a space whatever the margin, see `window_start` and
+/// `window_end`). The check walks the window three times (`piece_starts_at`),
+/// serially in the cut search before the units encode, so the margin is
+/// its cost: at 512 bytes it took a fifth of a long text's pooled encode
+/// (2.3 MB, four threads: 8.4 -> 9.4 ms against the one-pass check before
+/// it); at 128 the same cuts, the same ids, 8.0 ms.
+const CUT_CHECK_WINDOW: usize = 128;
+/// How far the cut search moves past a candidate without a window: at
+/// least the margin (`CUT_CHECK_WINDOW`), so that the next candidate's walk
+/// back can stop at this one's space and a blob followed by prose keeps
+/// the prose's cuts, and no shorter than the margin was before it shrank:
+/// each skipped candidate costs the walks back and forward over the reach,
+/// and on a text whose candidates all lack a window (letters joined by
+/// single spaces under a pattern that reads the join inside a match) a
+/// skip of a quarter of this would read every byte of it four times over.
+const CUT_SEARCH_SKIP: usize = 512;
+/// How far before and after a candidate cut the window's start and end may
+/// be looked for when a stage can read a space after a non-whitespace
+/// character inside one match (a letter run joined by spaces, a class read
+/// before a space), so that spaces lie inside pieces; a candidate without a
+/// start or an end within this reach has no window and the cut search
+/// skips it (a stretch without one is one piece under such a stage, so no
+/// cut is lost). Without such a stage
+/// the start and the end are looked for within a chunk instead (see
+/// `cut_check_reach`): such a stretch is many pieces there, and a text
+/// whose spaces stand further apart than this reach keeps its cuts. Two
+/// kibibytes, on its own: the margin of the window (`CUT_CHECK_WINDOW`) is
+/// the check's cost, this reach is how far a space may be from a candidate
+/// under such a stage, and the one does not follow the other.
+const CUT_CHECK_REACH: usize = 2 << 10;
 /// Candidates one cut search may reject before it gives up: the byte scan for
 /// a candidate is cheap, the window check on each one is not, so a text whose
 /// candidates keep failing the check costs at most this many checks per cut.
 const MAX_REJECTED_CUT_CANDIDATES: usize = 64;
+/// Spans a thread's cut-check lists may keep between searches (64 KiB a
+/// list): a window over prose holds tens, so prose never meets this; a
+/// window over a long blob under a digit or punctuation split (up to a
+/// chunk each side of the candidate, one span per piece) can grow a list
+/// to tens of thousands, and the search gives such a list back once it is
+/// done rather than keep it for the encoder's life (`stable_cut`).
+const CUT_SPANS_KEPT: usize = 4 << 10;
 
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
+
+/// The cut check's three span lists (the window's pieces, those of the
+/// text before the candidate, those of the text from it on), one set per
+/// thread that cuts (`NativeEncoder::cut_spans`).
+type CutSpans = [Vec<(usize, usize)>; 3];
 
 /// The ids of one vocabulary entry while the seed is built, in a fixed slot
 /// (a byte-level piece of `n` bytes has at most `n` ids), so the pass over
@@ -364,6 +411,36 @@ impl PieceCache {
             unit_ascii: false,
             share,
         }
+    }
+
+    /// Bytes the long tier holds, used or not: its entries' pieces, ids and
+    /// slots (`long_bytes`) and the empty slots of its map, which a clear
+    /// in place keeps.
+    fn long_held_bytes(&self) -> usize {
+        self.long_bytes + (self.long.capacity() - self.long.len()) * LONG_PIECE_ENTRY_BYTES
+    }
+
+    /// Empties the long tier at an eviction for a share of `share` bytes: in
+    /// place when its map's slots fit four times the share (the next misses
+    /// fill them again without a growth), anew when they do not (a map grown
+    /// under a wider share gives its slots back).
+    fn clear_long_within(&mut self, share: usize) {
+        if self.long.capacity() * LONG_PIECE_ENTRY_BYTES > 4 * share {
+            self.remake_long();
+        } else {
+            self.long.clear();
+            self.long_bytes = 0;
+        }
+    }
+
+    /// Makes the long tier anew, its map's slots given back. The check at a
+    /// call's start takes this rather than a clear in place: what the tier
+    /// holds is never under its slots alone, so a map grown under a wider
+    /// share to just under the bound would be over it again with its first
+    /// entries back, and the check would empty the tier at every call.
+    fn remake_long(&mut self) {
+        self.long = PieceIds::default();
+        self.long_bytes = 0;
     }
 
     /// Entries of the tiers bounded by count, `packed` and `short`.
@@ -623,18 +700,44 @@ enum Pieces {
     /// `Removed`: the text between the matches alone; a match is dropped
     /// and the pieces on either side of it stay apart.
     Gaps,
+    /// `MergedWithNext`: each match with the text after it up to the next
+    /// match or the end, as one piece; the text before the first match
+    /// stands alone.
+    MatchesWithNextGap,
 }
 
 impl Pieces {
-    /// Whether the text between and around the matches goes on.
-    fn gaps(self) -> bool {
-        self != Self::Matches
+    /// How a walk cuts a text under this kind: the cursor loop over the
+    /// matches with its two switches, or the merged loop. Every walker asks
+    /// this first, so a kind the cursor loop does not know never falls
+    /// through its switches silently.
+    fn walk(self) -> Walk {
+        match self {
+            Self::MatchesAndGaps => Walk::Apart {
+                gaps: true,
+                matches: true,
+            },
+            Self::Matches => Walk::Apart {
+                gaps: false,
+                matches: true,
+            },
+            Self::Gaps => Walk::Apart {
+                gaps: true,
+                matches: false,
+            },
+            Self::MatchesWithNextGap => Walk::Merged,
+        }
     }
+}
 
-    /// Whether the matches go on.
-    fn matches(self) -> bool {
-        self != Self::Gaps
-    }
+/// The loop a walk runs under a [`Pieces`] kind (see [`Pieces::walk`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Walk {
+    /// Each match and each gap on its own: `gaps` says the text between and
+    /// around the matches goes on as pieces, `matches` says the matches do.
+    Apart { gaps: bool, matches: bool },
+    /// Each match with the text after it up to the next match or the end.
+    Merged,
 }
 
 /// An added token the path cuts out: its content and id, and whether the
@@ -998,11 +1101,25 @@ pub(crate) struct NativeEncoder {
     /// Whether a stage holds the end anchor `$`: such a text is never cut
     /// into units for the thread pool (see [`Self::stable_cut`]).
     end_anchored: bool,
+    /// The stages from this index on run over each piece's byte-level
+    /// image, the alphabet character of each of its bytes, rather than
+    /// over the raw text: a stage after the `ByteLevel` whose pattern can
+    /// read beyond printable ASCII cuts the image where the reference does,
+    /// which is not where it would cut the raw text (see
+    /// [`Self::pieces_in_alphabet`]). `None` when every stage runs over the
+    /// raw text. Such a text is never cut into units for the thread pool
+    /// either (see [`Self::stable_cut`]).
+    mapped_from: Option<usize>,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
     normalized_added: Option<AddedTokens>,
     stages: Vec<Stage>,
+    /// Whether a stage can read a space after a non-whitespace character
+    /// inside one match ([`Pattern::reads_space_inside`]): the thread
+    /// pool's cut check then chooses its window's start with care
+    /// ([`Self::window_start`]).
+    space_inside: bool,
     /// The one-pass matcher of the stages, when they are a chain it covers
     /// (the stages stay for the cut checks and as the matcher of record).
     chain: Option<chain::Scanner>,
@@ -1042,6 +1159,13 @@ pub(crate) struct NativeEncoder {
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
     piece_cache: ThreadLocal<RefCell<PieceCache>>,
+    /// The cut check's span lists of each thread that cuts a text for the
+    /// pool: cleared per check and grown once per thread
+    /// ([`Self::piece_starts_at`]), given back after a search that grew one
+    /// past [`CUT_SPANS_KEPT`] ([`Self::stable_cut`]), apart from the piece
+    /// cache so that a thread that only cuts gets none and is not counted
+    /// among the threads that encode.
+    cut_spans: ThreadLocal<RefCell<CutSpans>>,
     /// Threads that hold a piece cache of this encoder.
     threads: AtomicUsize,
 }
@@ -1101,7 +1225,7 @@ impl NativeEncoder {
         }
         let normalizer =
             Self::normalizer_from(&serialized("normalizer", tokenizer.get_normalizer())?)?;
-        let stages = Self::stages_from(&pre_tokenizer)?;
+        let (stages, mapped_from) = Self::stages_from(&pre_tokenizer)?;
         let frame = Self::frame_from(&serialized(
             "post-processor",
             tokenizer.get_post_processor(),
@@ -1130,13 +1254,22 @@ impl NativeEncoder {
                 None
             }
         };
-        let chain = chain::Scanner::recognize(&stages);
+        // The one-pass chain scanner reads the raw text: not for stages
+        // over the image.
+        let chain = match mapped_from {
+            None => chain::Scanner::recognize(&stages),
+            Some(_) => None,
+        };
         Ok(Self {
             end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
+            mapped_from,
             nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
+            space_inside: stages
+                .iter()
+                .any(|stage| stage.pattern.reads_space_inside()),
             stages,
             chain,
             frame,
@@ -1147,6 +1280,7 @@ impl NativeEncoder {
             merges,
             chars: None,
             piece_cache: ThreadLocal::new(),
+            cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
     }
@@ -1210,11 +1344,13 @@ impl NativeEncoder {
         );
         Ok(Self {
             end_anchored: false,
+            mapped_from: None,
             normalizer: Normalizer::None,
             nfc_quick: None,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
             stages: Vec::new(),
+            space_inside: false,
             chain: None,
             frame,
             alphabet: bytes_char(),
@@ -1224,6 +1360,7 @@ impl NativeEncoder {
             merges: None,
             chars: Some(Box::new(chars)),
             piece_cache: ThreadLocal::new(),
+            cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
     }
@@ -1830,6 +1967,10 @@ impl NativeEncoder {
             normalized_added: None,
             nfc_quick: None,
             end_anchored: false,
+            mapped_from: None,
+            space_inside: stages
+                .iter()
+                .any(|stage| stage.pattern.reads_space_inside()),
             stages,
             chain,
             frame: Frame::default(),
@@ -1840,6 +1981,7 @@ impl NativeEncoder {
             merges: Some(merges),
             chars: None,
             piece_cache: ThreadLocal::new(),
+            cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
     }
@@ -1859,9 +2001,10 @@ impl NativeEncoder {
     /// The stages of a pre-tokenizer that is zero or more `Split`s (or
     /// `Digits`, a split on numeric characters, or `Punctuation`s) around
     /// one `ByteLevel` without prefix space: those before it as they are,
-    /// those after it when they cut the text where they cut its byte-level
-    /// image.
-    fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
+    /// those after it over the raw text when they cut it where they cut its
+    /// byte-level image, else over the image itself (the index of the first
+    /// of them is the second half of the answer, see `mapped_from`).
+    fn stages_from(pre_tokenizer: &Value) -> Result<(Vec<Stage>, Option<usize>), Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
                 "no pre-tokenizer (the path needs a ByteLevel without a prefix space)",
@@ -1897,22 +2040,55 @@ impl NativeEncoder {
                 digits: false,
             });
         }
-        // A stage after the `ByteLevel` cuts the mapped text. It cuts the
-        // raw text at the same places when its pattern can only ever match
-        // or reject printable ASCII characters: the map leaves those in
-        // place and takes every other byte beyond ASCII. Such a stage moves
-        // before the map; any other declines.
+        // A stage after the `ByteLevel` cuts the mapped text. When every
+        // such stage's pattern can only ever match or reject printable
+        // ASCII characters, it cuts the raw text at the same places (the
+        // map leaves those in place and takes every other byte beyond
+        // ASCII), so the stages run over the raw text as the ones before
+        // the map do. Otherwise the stages after the map run over each
+        // piece's byte-level image, from the first of them on.
+        let after = stages.len();
         for split in &items[at + 1..] {
             let stage = Self::split_stage(split)?;
-            if !stage.pattern.within_printable_ascii() {
-                return Err(Declined::from(
-                    "a pre-tokenizer stage after the ByteLevel that reads beyond printable ASCII",
-                ));
-            }
             Self::check_anchors(&stage, &stages)?;
             stages.push(stage);
         }
-        Ok(stages)
+        let mapped_from = stages[after..]
+            .iter()
+            .any(|stage| !stage.pattern.within_printable_ascii())
+            .then_some(after);
+        // Over the image an ordinary text is one run of letters (a space
+        // maps to one), and the search passes over a failed run only when
+        // the program opens with it (see `Matches::next`): a stage whose
+        // program holds an unbounded run anywhere else would rescan that
+        // run from every start, so it is declined.
+        if let Some(from) = mapped_from {
+            if stages[from..]
+                .iter()
+                .any(|stage| stage.pattern.rescans_a_run())
+            {
+                return Err(Declined::from(
+                    "a pre-tokenizer stage over the byte-level image whose pattern rescans a run from every start",
+                ));
+            }
+        }
+        // A merged-with-next stage joins each match with the text after it
+        // (see `Pieces::walk`); the walk over the image takes matches and
+        // gaps apart, so such a stage among those over the image is declined
+        // (no covered vocabulary has one there). One after the `ByteLevel`
+        // still loads when every stage after the map stays within printable
+        // ASCII: those stages run over the raw text, where `pieces` glues it.
+        if let Some(from) = mapped_from {
+            if stages[from..]
+                .iter()
+                .any(|stage| stage.pieces == Pieces::MatchesWithNextGap)
+            {
+                return Err(Declined::from(
+                    "a merged-with-next pre-tokenizer stage over the byte-level image",
+                ));
+            }
+        }
+        Ok((stages, mapped_from))
     }
 
     /// A stage anchored to its text (`\A`, `\z` or `\G`) reads the bounds of
@@ -1921,10 +2097,13 @@ impl NativeEncoder {
     /// over the pieces of the one before). Three things keep it honest: the
     /// first stage runs over a unit of the thread pool as over the text, and
     /// would read the unit's bounds as the text's; the pool's cut check runs
-    /// every stage over a window of the text instead of over pieces
-    /// ([`Self::piece_starts_at`]), which stays right only when the stage's
-    /// matches are runs of decimal digits, which neither span nor start at a
-    /// cut candidate (a space); and the stage's own input pieces must meet
+    /// the stages over a window of the text ([`Self::piece_starts_at`]), each
+    /// over the pieces of the one before, from a start an earlier stage's
+    /// gap can span ([`Self::window_start`]) to an end that can sit inside a
+    /// whitespace run of the text ([`Self::window_end`]), which stays right
+    /// only when the stage's matches are runs of decimal digits, which begin
+    /// at neither of the window's bounds nor at a cut candidate (all spaces)
+    /// and span none of them; and the stage's own input pieces must meet
     /// the same bounds in a unit as in the text, which a gap of an earlier
     /// stage that holds digits and spans a cut would not (it ends at the
     /// unit's end, where the text goes on): after a `Digits` split every
@@ -1958,9 +2137,9 @@ impl NativeEncoder {
     }
 
     /// One `Split` as a stage: a regex or a literal the pattern engine takes,
-    /// `Isolated`, `Removed`, or `Removed` inverted. A `Digits` is the
-    /// `Isolated` split on numeric characters, each one a piece under
-    /// `individual_digits`, else each run: the reference splits on
+    /// `Isolated`, `Removed`, `Removed` inverted, or `MergedWithNext`. A
+    /// `Digits` is the `Isolated` split on numeric characters, each one a
+    /// piece under `individual_digits`, else each run: the reference splits on
     /// `char::is_numeric`, the toolchain's numeric set
     /// ([`unicode::STD_NUMERIC`]), which is not the engine's `\p{N}` (the
     /// regex engine's Unicode version). A `Punctuation` is the `Isolated`
@@ -2034,10 +2213,11 @@ impl NativeEncoder {
             (Some("Isolated"), Some(false)) => Pieces::MatchesAndGaps,
             (Some("Removed"), Some(false)) => Pieces::Gaps,
             (Some("Removed"), Some(true)) => Pieces::Matches,
+            (Some("MergedWithNext"), Some(false)) => Pieces::MatchesWithNextGap,
             (behavior, invert) => {
                 return Err(Declined::from(format!(
                     "Split behavior {behavior:?} with invert {invert:?} (only Isolated, Removed, \
-                     or Removed inverted)"
+                     Removed inverted, or MergedWithNext)"
                 )))
             }
         };
@@ -2333,13 +2513,25 @@ impl NativeEncoder {
     /// A byte offset at or past `from` where the stages' pieces can be cut
     /// without changing them: a space followed by a letter after a character
     /// that is not whitespace, where the patterns, run over the text around
-    /// it, cut cleanly ([`Self::piece_starts_at`]). No piece spans such a
-    /// point (letters, digits and punctuation stop at the space, a whitespace
-    /// run cannot start before it) and the patterns read nothing before a
-    /// match's start (the digit-grouping lookahead's word boundary reads the
-    /// character before it, one its match consumed: the parser declines the
-    /// lookahead where it could lead a match), so the pieces of the two
-    /// halves are the pieces of the whole. `None` when
+    /// it, cut cleanly ([`Self::piece_starts_at`]). Under a pattern that reads
+    /// no space inside a match ([`Pattern::reads_space_inside`]) no piece spans
+    /// such a point (letters, digits and punctuation stop at the space, a
+    /// whitespace run cannot start before it); under one that does (a letter run
+    /// joined by spaces, `\p{L}+ ?`) the check refuses a cut a piece spans. The
+    /// patterns read nothing before a match's start (the digit-grouping
+    /// lookahead's word boundary reads the character before it, one its match
+    /// consumed: the parser declines the lookahead where it could lead a
+    /// match), so the pieces of the two halves are the pieces of the whole.
+    /// A candidate without a window within the check's reach
+    /// ([`Self::window_start`], [`Self::window_end`]: a stretch without a
+    /// space longer than the reach on one side of it) is skipped, with the
+    /// bytes after it up to [`CUT_SEARCH_SKIP`] (the candidates there may
+    /// have a window, this one's space among their starts, but the step
+    /// bounds the walks' cost and moves the cut on by less than that), and
+    /// not counted: without a stage that reads a space inside a match its
+    /// own space begins a whitespace run, where the next candidate's walk
+    /// back can stop, so a blob followed by prose keeps its cuts past the
+    /// blob. `None` when
     /// the text has no such point past `from`, or when
     /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
     /// check: a stretch without candidates (a blob, a table of numbers) costs
@@ -2353,10 +2545,30 @@ impl NativeEncoder {
             return (from.max(1)..text.len()).find(|&p| chars.cuts_at(bytes, p));
         }
         // A stage that reads the end of the text (`$`) would read the
-        // window's end as one: no cut, the text stays one unit.
-        if self.stages.is_empty() || self.end_anchored {
+        // window's end as one, and the cut check's window is read in the
+        // raw text while a stage over the byte-level image cuts elsewhere:
+        // no cut, the text stays one unit.
+        if self.stages.is_empty() || self.end_anchored || self.mapped_from.is_some() {
             return None;
         }
+        // The check's span lists: this thread's scratch, grown at its first
+        // check and kept (the search runs on the calling thread, before the
+        // pool, and borrows nothing else of the thread); a list a window
+        // over a long blob grew past the cap is given back after the search.
+        let scratch = self.cut_spans.get_or_default();
+        let mut spans = scratch.borrow_mut();
+        let found = self.search_cut(text, from, &mut spans);
+        for list in spans.iter_mut() {
+            if list.capacity() > CUT_SPANS_KEPT {
+                *list = Vec::new();
+            }
+        }
+        found
+    }
+
+    /// The search of [`Self::stable_cut`] over the stage path, with the
+    /// check's three span lists lent by the caller.
+    fn search_cut(&self, text: &str, from: usize, spans: &mut CutSpans) -> Option<usize> {
         let bytes = text.as_bytes();
         let mut rejected = 0;
         let mut p = from;
@@ -2374,7 +2586,22 @@ impl NativeEncoder {
                     .next_back()
                     .is_some_and(|c| !c.is_whitespace())
             {
-                if self.piece_starts_at(text, p) {
+                let Some(start) = self.window_start(text, p) else {
+                    // No window within the check's reach before the candidate: a stretch
+                    // without a space there. The candidates within the skip of this one
+                    // may have a window (this one's space among their starts); skipping
+                    // them bounds the walks' cost and only moves the cut on. A skip, not
+                    // a rejection: the rejections count the candidates the check read.
+                    p += CUT_SEARCH_SKIP;
+                    continue;
+                };
+                let Some(end) = self.window_end(text, p) else {
+                    // The same after the candidate; the walk forward runs only once the
+                    // walk back has found a start.
+                    p += CUT_SEARCH_SKIP;
+                    continue;
+                };
+                if self.piece_starts_at(&text[start..end], p - start, spans) {
                     return Some(p);
                 }
                 rejected += 1;
@@ -2387,37 +2614,221 @@ impl NativeEncoder {
         None
     }
 
-    /// Whether the stages, run over a window of text around `p` that starts
-    /// and ends at whitespace, cut cleanly at `p`: at each stage in turn, no
-    /// match may span `p`; a match that starts at `p` settles it (the deeper
-    /// stages see that match from `p` on either way), a gap around `p` hands
-    /// the question to the next stage, and a gap at the last stage would be
-    /// split, so that is no cut.
-    fn piece_starts_at(&self, text: &str, p: usize) -> bool {
+    /// Whether the stages, run over the cut check's `window` of a candidate
+    /// at `at` inside it, cut cleanly there. The window starts where the
+    /// whole text's match loop begins a piece and ends just after such a
+    /// space ([`Self::window_start`], [`Self::window_end`]), so that its
+    /// pieces around the candidate are the text's. Over the window the
+    /// stages run as the walk runs them over a piece ([`Self::pieces`]), each
+    /// over the piece of the stage before it, never over the whole window
+    /// (two isolated stages, `aa` then a space with 999 of the space-or-a
+    /// class, over a run of ` a` with `aa` inside it: the second stage's match
+    /// begins where `aa` ends, while a run from the window's start would end
+    /// one match on the candidate and begin the next there). A piece that
+    /// holds `at` inside it would be split, so that is no cut. The text
+    /// before `at` on its own, as the unit before the cut reads it, must cut
+    /// into the same pieces as it does inside the window (a lookahead at
+    /// `at` reads the unit's end where the text reads on: ` a{1000}(?!\s)`
+    /// holds at the one and fails at the other); and the text from `at` on
+    /// its own, as the unit after the cut reads it, must cut into the same
+    /// pieces too (an earlier stage's match that a later stage splits at
+    /// `at`, or that a dropped stage drops, leaves no final piece over `at`,
+    /// while the next unit's first stage begins inside that match and may
+    /// match otherwise: `[ a]{999}` then ` a` over a run of ` a`); else that
+    /// is no cut. The three span lists are the caller's (`spans`, the
+    /// thread's scratch through `stable_cut`): cleared here and grown once
+    /// per thread, so a check over prose allocates nothing after the
+    /// thread's first (a search whose window grew a list past
+    /// [`CUT_SPANS_KEPT`] gives that list back, and the next check grows it
+    /// again).
+    fn piece_starts_at(&self, window: &str, at: usize, spans: &mut CutSpans) -> bool {
+        let [whole, left, right] = spans;
+        whole.clear();
+        self.piece_spans(window, whole);
+        if whole.iter().any(|&(from, to)| from < at && at < to) {
+            return false;
+        }
+        left.clear();
+        self.piece_spans(&window[..at], left);
+        if !left
+            .iter()
+            .eq(whole.iter().take_while(|&&(_, to)| to <= at))
+        {
+            return false;
+        }
+        right.clear();
+        self.piece_spans(&window[at..], right);
+        right
+            .iter()
+            .map(|&(from, to)| (from + at, to + at))
+            .eq(whole.iter().skip_while(|&&(_, to)| to <= at).copied())
+    }
+
+    /// The final pieces of `text` under the stages, as the walk cuts them
+    /// ([`Self::pieces`]), as spans of byte offsets into `text`.
+    fn piece_spans(&self, text: &str, out: &mut Vec<(usize, usize)>) {
+        let base = text.as_ptr() as usize;
+        self.pieces(0, text, &mut |piece| {
+            let from = piece.as_ptr() as usize - base;
+            out.push((from, from + piece.len()));
+        });
+    }
+
+    /// How far before and after a candidate the cut check's window may start
+    /// and end ([`Self::window_start`], [`Self::window_end`]): the reach
+    /// ([`CUT_CHECK_REACH`]) when a stage reads a space after a
+    /// non-whitespace character inside one match, where a stretch without a
+    /// piece-beginning space is one piece and the refusal loses no cut; a
+    /// chunk ([`PARALLEL_CHUNK_BYTES`]) otherwise, where such a stretch
+    /// (digits, letters, line breaks, a whitespace run) is many pieces and
+    /// its candidates are cuts the pool wants - a text whose spaces stand
+    /// thousands of bytes apart keeps them - while the chunk keeps the
+    /// window, and the spans the check collects over it (one per piece),
+    /// within two chunks whatever the text.
+    fn cut_check_reach(&self) -> usize {
+        if self.space_inside {
+            CUT_CHECK_REACH
+        } else {
+            PARALLEL_CHUNK_BYTES
+        }
+    }
+
+    /// Where the cut check's window for a candidate at `p` starts: the first
+    /// space at or before `p - CUT_CHECK_WINDOW`, or the text's start, where
+    /// the whole text's match loop begins a piece, so that the window's
+    /// pieces up to `p` are the text's. A space begins no piece when a
+    /// whitespace run took it from a whitespace character before it (the
+    /// text then lands on the character after the run, where a letter run
+    /// joined by spaces can begin, which a window begun on the space would
+    /// read by another alternative, a step behind the text for the whole
+    /// run), when it is the join of such a run
+    /// ([`Pattern::spans_space_between`]), or when some alternative of a
+    /// stage reads a space after a character like the one before it inside
+    /// one match ([`Pattern::reads_space_after`]: `\p{N}+ ?` takes `1 ` and
+    /// lands the text on the letter after it the same way); a space after
+    /// any other character begins a piece, since no alternative of the
+    /// subset reads a space inside its match but as the join, in a
+    /// whitespace run or after a character of such a class. When no stage
+    /// reads a space after a non-whitespace character inside one match
+    /// ([`Pattern::reads_space_inside`]: no such run, and the before-space
+    /// classes whitespace alone), a piece holds a space only at its start
+    /// or in a whitespace run, so the nearest space back that begins a
+    /// whitespace run is the start ([`Self::whitespace_run_begins_at`]: a
+    /// window begun inside the run would take a fixed-count whitespace
+    /// alternative, `\s{2}`, from another offset than the text and leave
+    /// another remainder at the run's end, one space before a letter run
+    /// that a space-led alternative with a lookahead at its end,
+    /// ` a{100}(?!\s)`, reads one way inside the text and another at a
+    /// unit's end), when it lies within a chunk of `p`
+    /// ([`Self::cut_check_reach`]); a stretch without one before a
+    /// candidate - a longer whitespace run, line breaks, digits, letters
+    /// without a space - leaves the candidate without a window (`None`; the
+    /// search skips it, [`Self::stable_cut`]), which keeps the window, and
+    /// the spans the check collects over it (one per piece: one per byte
+    /// under a whitespace or digit split), within a chunk. Otherwise
+    /// `None` when no such space lies within [`CUT_CHECK_REACH`] of `p`: a
+    /// long text without one stays one unit (under a letter run joined by
+    /// spaces such a stretch is one piece, so no cut is lost there).
+    fn window_start(&self, text: &str, p: usize) -> Option<usize> {
         let mut start = p.saturating_sub(CUT_CHECK_WINDOW);
-        while start > 0 && !(text.is_char_boundary(start) && text.as_bytes()[start] == b' ') {
+        let floor = p.saturating_sub(self.cut_check_reach());
+        while start > 0 {
+            let begins = if self.space_inside {
+                self.piece_begins_at_space(text, start)
+            } else {
+                Self::whitespace_run_begins_at(text, start)
+            };
+            if begins {
+                return Some(start);
+            }
+            if start <= floor {
+                return None;
+            }
             start -= 1;
         }
+        Some(0)
+    }
+
+    /// Where the cut check's window for a candidate at `p` ends: just after
+    /// the first space at or after `p + CUT_CHECK_WINDOW` where the whole
+    /// text's match loop begins a piece, by the rule of the start
+    /// ([`Self::window_start`]), or at the text's end, so that the window's
+    /// pieces around `p` are the text's. A window ended at a space inside a
+    /// piece cuts that piece short, and an alternative the end no longer
+    /// holds gives way to a shorter one that fits: ` [ a]{1999}| [ a]{999}| a`
+    /// over a run of ` a` ends its shorter alternative on a candidate the
+    /// text's longer one spans, which would approve a cut inside a piece. The
+    /// space itself lies inside the window, so that a lookahead at it reads
+    /// the space as the text does, not the window's end (` a{1000}(?!\s)`
+    /// holds at the one and fails at the other); nothing from before `p`
+    /// reads past that space (no piece spans it, and `p`'s own left
+    /// neighbour is no whitespace, so no whitespace run spans `p`). When no
+    /// stage reads a space inside a match the first space on is the end: no
+    /// piece spans `p` then, so an end inside a later piece (a whitespace
+    /// run) changes nothing up to `p`; `None` when no space lies within a
+    /// chunk of `p` ([`Self::cut_check_reach`]) and the text runs on (the
+    /// search skips the candidate, [`Self::stable_cut`]), which keeps the
+    /// window, and the spans the check collects over it, within a chunk.
+    /// Otherwise `None` when no such space lies within
+    /// [`CUT_CHECK_REACH`] of `p` and the text runs on: no cut there (under
+    /// a pattern that reads a space inside a match such a stretch is one
+    /// piece, so no cut is lost).
+    fn window_end(&self, text: &str, p: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
         let mut end = (p + CUT_CHECK_WINDOW).min(text.len());
-        while end < text.len() && !(text.is_char_boundary(end) && text.as_bytes()[end] == b' ') {
+        let ceiling = (p + self.cut_check_reach()).min(text.len());
+        while end < text.len() {
+            let ends = if self.space_inside {
+                self.piece_begins_at_space(text, end)
+            } else {
+                text.is_char_boundary(end) && bytes[end] == b' '
+            };
+            if ends {
+                return Some(end + 1);
+            }
+            if end >= ceiling {
+                return None;
+            }
             end += 1;
         }
-        let window = &text[start..end];
-        let at = p - start;
-        for stage in &self.stages {
-            for (piece_start, piece_end) in stage.pattern.find_iter(window) {
-                if piece_start == at {
-                    return true;
-                }
-                if piece_start < at && at < piece_end {
-                    return false;
-                }
-                if piece_start > at {
-                    break;
-                }
-            }
+        Some(text.len())
+    }
+
+    /// Whether the whole text's match loop begins a piece at `at` under a
+    /// pattern that reads a space inside a match: `at` holds a space that
+    /// no piece before it took, in a whitespace run from a whitespace
+    /// character before it, as the join of a letter run
+    /// ([`Pattern::spans_space_between`]) or read after a character like the
+    /// one before it inside one match ([`Pattern::reads_space_after`]). The
+    /// cut check's window starts and ends at such a space.
+    fn piece_begins_at_space(&self, text: &str, at: usize) -> bool {
+        if !(text.is_char_boundary(at) && text.as_bytes()[at] == b' ') {
+            return false;
         }
-        false
+        let after = text[at + 1..].chars().next();
+        !text[..at].chars().next_back().is_some_and(|before| {
+            before.is_whitespace()
+                || self.stages.iter().any(|stage| {
+                    stage.pattern.spans_space_between(before, after)
+                        || stage.pattern.reads_space_after(before)
+                })
+        })
+    }
+
+    /// Whether a whitespace run begins at `at` with a space: `at` holds a
+    /// space and no whitespace precedes it. Under a pattern that reads no
+    /// space inside a match the whole text's match loop attempts a match
+    /// there (nothing before the run takes the space), so the cut check's
+    /// window begins at such a space: a window begun inside the run would
+    /// take a fixed-count whitespace alternative (`\s{2}`) from another
+    /// offset than the text and leave another remainder at the run's end.
+    fn whitespace_run_begins_at(text: &str, at: usize) -> bool {
+        text.is_char_boundary(at)
+            && text.as_bytes()[at] == b' '
+            && !text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
     }
 
     /// Appends the ids of one unit: an added token's id, or a text's pieces
@@ -2468,9 +2879,21 @@ impl NativeEncoder {
         // its static callback; any other shape walks, a lone `Removed`
         // stage among them (its matches are no pieces: the scanner loop
         // stays the loop of a stage whose matches are).
-        match (&self.chain, self.stages.as_slice()) {
-            (Some(chain), _) => {
-                chain.pieces(text, &mut |start, end| {
+        match (&self.chain, self.stages.as_slice(), self.mapped_from) {
+            (_, _, Some(from)) => {
+                // The stages from `mapped_from` on run over each piece's
+                // byte-level image; a final piece is a byte range of the
+                // unit, not always a `str`.
+                let mut image = String::new();
+                let mut per_piece = |piece: &[u8]| {
+                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                        fallback = Some(declined);
+                    }
+                };
+                self.pieces_mapping(0, from, text, &mut image, &mut per_piece);
+            }
+            (Some(chain), _, None) => {
+                chain.pieces(text, words, &mut |start, end| {
                     if let Err(declined) =
                         self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
                     {
@@ -2478,16 +2901,20 @@ impl NativeEncoder {
                     }
                 });
             }
-            (None, [stage]) if stage.pieces.matches() => {
+            (None, [stage], None)
+                if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
+            {
                 if let Err(declined) =
                     self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
                 {
                     fallback = Some(declined);
                 }
             }
-            (None, _) => {
+            (None, _, None) => {
                 let mut per_piece = |piece: &str| {
-                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                    if let Err(declined) =
+                        self.tokenize_piece(model, piece.as_bytes(), mapped, ids, cache)
+                    {
                         fallback = Some(declined);
                     }
                 };
@@ -2508,18 +2935,151 @@ impl NativeEncoder {
             f(text);
             return;
         };
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                // Each match takes the text after it up to the next match or
+                // the end; the text before the first match stands alone, and
+                // a text without a match is one piece.
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(from) => self.pieces(depth + 1, &text[from..start], f),
+                        None if start > 0 => self.pieces(depth + 1, &text[..start], f),
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                self.pieces(depth + 1, &text[merged.unwrap_or(0)..], f);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
         let mut cursor = 0;
         for (start, end) in stage.pattern.find_iter(text) {
-            if stage.pieces.gaps() && cursor < start {
+            if gaps && cursor < start {
                 self.pieces(depth + 1, &text[cursor..start], f);
             }
-            if stage.pieces.matches() {
+            if matches {
                 self.pieces(depth + 1, &text[start..end], f);
             }
             cursor = end;
         }
-        if stage.pieces.gaps() && cursor < text.len() {
+        if gaps && cursor < text.len() {
             self.pieces(depth + 1, &text[cursor..], f);
+        }
+    }
+
+    /// [`Self::pieces`] for a chain with stages over the byte-level image
+    /// from the stage `from` on ([`Self::mapped_from`]): the stages before
+    /// it run over the raw text as there; at it each piece is mapped into
+    /// `image` once and the rest run over the image
+    /// ([`Self::pieces_in_alphabet`]). `f` takes each final piece's raw
+    /// bytes: a cut inside a multi-byte character is one the reference
+    /// makes too, so a piece is not always a `str`.
+    fn pieces_mapping<F: FnMut(&[u8])>(
+        &self,
+        depth: usize,
+        from: usize,
+        text: &str,
+        image: &mut String,
+        f: &mut F,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if depth >= from {
+            image.clear();
+            image.extend(text.bytes().map(|b| self.alphabet[usize::from(b)]));
+            self.pieces_in_alphabet(depth, image, text.as_bytes(), f);
+            return;
+        }
+        let stage = &self.stages[depth];
+        let (gaps, matches) = match stage.pieces.walk() {
+            Walk::Merged => {
+                // As in `pieces`: each match takes the text after it up to
+                // the next match or the end; the text before the first
+                // match stands alone, and a text without a match is one
+                // piece.
+                let mut merged = None;
+                for (start, _) in stage.pattern.find_iter(text) {
+                    match merged {
+                        Some(at) => {
+                            self.pieces_mapping(depth + 1, from, &text[at..start], image, f);
+                        }
+                        None if start > 0 => {
+                            self.pieces_mapping(depth + 1, from, &text[..start], image, f);
+                        }
+                        None => {}
+                    }
+                    merged = Some(start);
+                }
+                self.pieces_mapping(depth + 1, from, &text[merged.unwrap_or(0)..], image, f);
+                return;
+            }
+            Walk::Apart { gaps, matches } => (gaps, matches),
+        };
+        let mut cursor = 0;
+        for (start, end) in stage.pattern.find_iter(text) {
+            if gaps && cursor < start {
+                self.pieces_mapping(depth + 1, from, &text[cursor..start], image, f);
+            }
+            if matches {
+                self.pieces_mapping(depth + 1, from, &text[start..end], image, f);
+            }
+            cursor = end;
+        }
+        if gaps && cursor < text.len() {
+            self.pieces_mapping(depth + 1, from, &text[cursor..], image, f);
+        }
+    }
+
+    /// Applies the stages from `depth` on to `image`, the byte-level image
+    /// of `raw` (one alphabet character per byte, in order), calling `f`
+    /// with each final piece's raw bytes: a match's bounds in characters of
+    /// the image are its bounds in bytes of the raw text.
+    fn pieces_in_alphabet<F: FnMut(&[u8])>(
+        &self,
+        depth: usize,
+        image: &str,
+        raw: &[u8],
+        f: &mut F,
+    ) {
+        debug_assert_eq!(image.chars().count(), raw.len());
+        if raw.is_empty() {
+            return;
+        }
+        let Some(stage) = self.stages.get(depth) else {
+            f(raw);
+            return;
+        };
+        // `stages_from` declines a merged-with-next stage among those over
+        // the image, so the walk over the image takes the pieces apart.
+        let Walk::Apart { gaps, matches } = stage.pieces.walk() else {
+            debug_assert!(false, "a merged-with-next stage over the byte-level image");
+            f(raw);
+            return;
+        };
+        let mut cursor = 0;
+        let mut raw_cursor = 0;
+        for (start, end) in stage.pattern.find_iter(image) {
+            let raw_start = raw_cursor + image[cursor..start].chars().count();
+            let raw_end = raw_start + image[start..end].chars().count();
+            if gaps && cursor < start {
+                self.pieces_in_alphabet(
+                    depth + 1,
+                    &image[cursor..start],
+                    &raw[raw_cursor..raw_start],
+                    f,
+                );
+            }
+            if matches {
+                self.pieces_in_alphabet(depth + 1, &image[start..end], &raw[raw_start..raw_end], f);
+            }
+            cursor = end;
+            raw_cursor = raw_end;
+        }
+        if gaps && cursor < image.len() {
+            self.pieces_in_alphabet(depth + 1, &image[cursor..], &raw[raw_cursor..], f);
         }
     }
 
@@ -2546,14 +3106,14 @@ impl NativeEncoder {
     fn tokenize_piece(
         &self,
         model: Option<&ModelWrapper>,
-        piece: &str,
+        piece: &[u8],
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         // The hot path of a warm encode, and nothing else in this function:
         // the key of a short piece and the packed table's probe.
-        let vacancy = match ShortPieceKey::of(piece.as_bytes()) {
+        let vacancy = match ShortPieceKey::of(piece) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return Ok(()),
                 vacancy => vacancy,
@@ -2583,7 +3143,7 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let gaps = stage.pieces.gaps();
+        let gaps = matches!(stage.pieces.walk(), Walk::Apart { gaps: true, .. });
         let mut cursor = 0;
         let mut fallback = None;
         // The probe compiles into the scanner's loop. As a closure of its
@@ -2642,7 +3202,7 @@ impl NativeEncoder {
             },
             None => None,
         };
-        self.tokenize_piece_slow(model, &text[piece], vacancy, mapped, ids, cache)
+        self.tokenize_piece_slow(model, &text.as_bytes()[piece], vacancy, mapped, ids, cache)
     }
 
     /// [`Self::tokenize_piece_at`] for a gap between two matches of a
@@ -2669,13 +3229,12 @@ impl NativeEncoder {
     fn tokenize_piece_slow(
         &self,
         model: Option<&ModelWrapper>,
-        piece: &str,
+        bytes: &[u8],
         vacancy: Option<Vacancy>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let bytes = piece.as_bytes();
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
         if vacancy.is_none() && cacheable {
             if let Some(found) = cache.get(bytes) {
@@ -2772,8 +3331,7 @@ impl NativeEncoder {
             let share = self.long_piece_bytes_share();
             if entry <= share {
                 if cache.long_bytes + entry > share {
-                    cache.long.clear();
-                    cache.long_bytes = 0;
+                    cache.clear_long_within(share);
                 }
                 cache.long_bytes += entry;
                 cache.long.insert(piece.into(), ids[start..].into());
@@ -2924,13 +3482,15 @@ impl NativeEncoder {
     /// the capacity of its map (arrays grown for the earlier share keep
     /// their size through a clear at the bound; here the map is made anew for
     /// the share and the packed table is cut back to the share's slots inside
-    /// its reservation, see `ShortPieceTable::clear`), so every thread that
-    /// still encodes is within the share
+    /// its reservation, see `ShortPieceTable::clear`), and makes its long
+    /// tier anew when it holds more than four times the long share, entries
+    /// and empty slots together (see `PieceCache::remake_long`), so
+    /// every thread that still encodes is within the share
     /// from its next call on (the share is read here once and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
-    /// never encodes again holds what it had until it exits). One relaxed
-    /// load, one store and three compares per call.
+    /// never encodes again holds what it had until it exits). Two relaxed
+    /// loads, one store and four compares per call.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
@@ -2941,6 +3501,10 @@ impl NativeEncoder {
             || cache.map_capacity() > 2 * share
         {
             cache.clear_short(share);
+        }
+        let long_share = self.long_piece_bytes_share();
+        if cache.long_held_bytes() > 4 * long_share {
+            cache.remake_long();
         }
         cache
     }

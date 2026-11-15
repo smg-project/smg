@@ -44,7 +44,7 @@ rustfft = "6.4"
 symphonia = { version = "0.6", default-features = false, features = ["all"] }
 opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "imgproc", "videoio"], optional = true }
 reqwest = { workspace = true, features = ["stream"] }
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true
 tempfile = "3.27"
 thiserror.workspace = true

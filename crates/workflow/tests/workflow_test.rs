@@ -596,6 +596,71 @@ async fn test_dag_dependency_failure_blocks_dependents() {
     assert_eq!(b_executed.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn test_dag_failed_step_leaves_its_independent_sibling_running() {
+    // A root, then two steps that depend on the root alone: step B fails under
+    // FailWorkflow, step C runs. The failure neither cancels nor skips the
+    // sibling: C ran once, and the workflow ends Failed.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let c_executed = Arc::new(AtomicU32::new(0));
+
+    struct FailingStep;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for FailingStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("step_b"),
+                message: "Intentional failure".to_string(),
+            })
+        }
+
+        fn is_retryable(&self, _error: &WorkflowError) -> bool {
+            false
+        }
+    }
+
+    let workflow = WorkflowDefinition::new("sibling_workflow", "Sibling Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(FailingStep))
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["step_a"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                Arc::new(TrackingStep {
+                    counter: Arc::clone(&c_executed),
+                }),
+            )
+            .depends_on(&["step_a"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(c_executed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.step_states[&StepId::new("step_c")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("step_b")].status,
+        StepStatus::Failed
+    );
+}
+
 #[test]
 fn test_dag_validation_cycle_detection() {
     // Create a workflow with a cycle: A -> B -> C -> A
@@ -1494,6 +1559,76 @@ async fn a_cancelled_workflow_stops_before_the_next_attempt() {
         engine.active_workflow_count(),
         0,
         "the workflow's task ended"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no attempt after the cancellation"
+    );
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+}
+
+/// A workflow cancelled while a step waits out its backoff ends then, not
+/// when the backoff does: the wait reads the cancellation.
+#[tokio::test]
+async fn a_cancelled_workflow_ends_its_step_s_backoff_wait() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let first_attempt_running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let workflow = WorkflowDefinition::new("cancel_in_backoff_workflow", "Cancel In Backoff")
+        .add_step(
+            StepDefinition::new(
+                "held_step",
+                "Step held in its first attempt",
+                Arc::new(HeldFailingStep {
+                    attempts: Arc::clone(&attempts),
+                    first_attempt_running: Arc::clone(&first_attempt_running),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(30)),
+            })
+            .with_timeout(Duration::from_secs(5)),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), first_attempt_running.notified())
+        .await
+        .expect("the first attempt runs");
+    release.notify_one();
+
+    // The first attempt's failure puts the step into its 30 s backoff.
+    let mut retrying = false;
+    for _ in 0..250 {
+        let state = engine.get_status(instance_id).await.unwrap();
+        if state.step_states[&StepId::new("held_step")].status == StepStatus::Retrying {
+            retrying = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(retrying, "the step waits out its backoff");
+
+    let cancelled_at = std::time::Instant::now();
+    engine.cancel_workflow(instance_id).await.unwrap();
+
+    // The workflow's task ends inside the backoff, not after it.
+    for _ in 0..100 {
+        if engine.active_workflow_count() == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        engine.active_workflow_count(),
+        0,
+        "the workflow's task ended {:?} after the cancellation, inside the 30 s backoff",
+        cancelled_at.elapsed()
     );
     assert_eq!(
         attempts.load(Ordering::SeqCst),

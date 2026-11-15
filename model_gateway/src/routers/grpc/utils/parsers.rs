@@ -1441,8 +1441,8 @@ mod tests {
     }
 
     /// A tokenizer shaped like the DeepSeek-V4.1 renderer: `thinking` key,
-    /// native effort names, thinking on by default, and every renderer
-    /// capability declared.
+    /// native effort names, thinking on by default, and V4.1's rendering
+    /// capabilities declared.
     fn v41_like() -> llm_tokenizer::MockTokenizer {
         llm_tokenizer::MockTokenizer::new()
             .with_thinking_toggle(ThinkingToggle::DefaultOn)
@@ -1454,6 +1454,8 @@ mod tests {
                 native_assistant_continuation: true,
                 raw_tool_call_arguments: true,
                 leading_system_only: false,
+                json_requires_separate_reasoning: false,
+                json_requires_empty_assistant_prefix: false,
             })
     }
 

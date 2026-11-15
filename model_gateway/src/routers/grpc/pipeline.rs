@@ -69,12 +69,12 @@ use super::{
         },
         streaming, symphony,
     },
-    spec::ResponseSpec,
+    spec::{MessagesTools, ResponseSpec},
     utils,
     utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
-    config::{types::RetryConfig, ParserChoice},
+    config::{types::RetryConfig, GroupedDpSticky, ParserChoice},
     middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
@@ -86,11 +86,12 @@ use crate::{
         common::{
             json_response,
             placement::{self, Candidates, WireConstraint},
+            prefill_admission::PrefillAdmission,
             retry::{is_retryable_response, BackoffCalculator},
         },
         error,
     },
-    worker::{PrefillAdmission, RoutingPool, WorkerRegistry},
+    worker::{RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -132,6 +133,9 @@ pub(crate) struct PipelineDeps {
     /// its workers and of the streams they open, counted from the dispatch;
     /// `None` leaves them unbounded.
     request_timeout: Option<Duration>,
+    /// `--grouped-dp-sticky`: whether, and how, an attempt pins a sticky
+    /// request to one engine of a grouped data-parallel worker.
+    grouped_dp_sticky: GroupedDpSticky,
 }
 
 impl PipelineDeps {
@@ -163,6 +167,7 @@ impl PipelineDeps {
             rate_limit_manager,
             queue_timeout,
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 
@@ -186,6 +191,7 @@ impl PipelineDeps {
             rate_limit_manager,
             queue_timeout,
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 
@@ -195,6 +201,14 @@ impl PipelineDeps {
     #[must_use]
     pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
+    }
+
+    /// Pin each attempt's sticky request to one engine of a grouped
+    /// data-parallel worker as `sticky` says (`--grouped-dp-sticky`).
+    #[must_use]
+    pub(crate) fn with_grouped_dp_sticky(mut self, sticky: GroupedDpSticky) -> Self {
+        self.grouped_dp_sticky = sticky;
         self
     }
 
@@ -266,6 +280,7 @@ impl PipelineDeps {
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 }
@@ -299,6 +314,9 @@ pub(crate) struct RequestPipeline {
     tool_parser_factory: ToolParserFactory,
     /// The deadline of each attempt's dispatch and streams, when set.
     request_timeout: Option<Duration>,
+    /// How each attempt pins a sticky request to an engine of a grouped
+    /// data-parallel worker.
+    grouped_dp_sticky: GroupedDpSticky,
 }
 
 /// Outcome of one full pipeline run.
@@ -476,6 +494,7 @@ impl RequestPipeline {
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
             request_timeout: deps.request_timeout,
+            grouped_dp_sticky: deps.grouped_dp_sticky,
         })
     }
 
@@ -483,6 +502,13 @@ impl RequestPipeline {
     #[cfg(test)]
     pub(crate) fn request_timeout(&self) -> Option<Duration> {
         self.request_timeout
+    }
+
+    /// How each attempt pins a sticky request to an engine of a grouped
+    /// data-parallel worker.
+    #[cfg(test)]
+    pub(crate) fn grouped_dp_sticky(&self) -> GroupedDpSticky {
+        self.grouped_dp_sticky
     }
 
     /// Ingress phase: run the request-owning stages through request building.
@@ -628,7 +654,14 @@ impl RequestPipeline {
             dctx.created,
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
+        execute_plan(
+            dctx,
+            attempt_plan,
+            last_attempt,
+            self.request_timeout,
+            self.grouped_dp_sticky,
+        )
+        .await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
@@ -1276,6 +1309,7 @@ impl RequestPipeline {
     pub async fn execute_messages(
         &self,
         request: Arc<CreateMessageRequest>,
+        tools: MessagesTools,
         headers: Option<http::HeaderMap>,
         model_id: String,
         components: Arc<SharedComponents>,
@@ -1285,7 +1319,8 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
         let run = {
-            let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+            let mut ctx =
+                RequestContext::for_messages(request, tools, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)

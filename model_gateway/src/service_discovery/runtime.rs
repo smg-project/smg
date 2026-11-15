@@ -114,7 +114,10 @@ pub async fn start_service_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::test_support::regular_routing_mode;
+    use crate::config::{
+        test_support::regular_routing_mode, ConsulDiscoveryConfig, FileDiscoveryConfig,
+        SlurmDiscoveryConfig,
+    };
 
     fn kubernetes(config: &DiscoveryConfig, mode: &RoutingMode) -> ServiceDiscoveryConfig {
         let Ok(RuntimeDiscoveryConfig::Kubernetes(runtime)) =
@@ -188,7 +191,7 @@ mod tests {
 
     #[test]
     fn file_settings_reach_the_runtime() {
-        let config = DiscoveryConfig::File(crate::config::FileDiscoveryConfig {
+        let config = DiscoveryConfig::File(FileDiscoveryConfig {
             path: "/run/smg/workers.json".into(),
             check_interval_secs: 15,
         });
@@ -203,7 +206,7 @@ mod tests {
 
     #[test]
     fn slurm_settings_reach_the_runtime() {
-        let config = DiscoveryConfig::Slurm(crate::config::SlurmDiscoveryConfig {
+        let config = DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
             job_names: vec!["smg-worker".to_string()],
             encode_job_names: vec![],
             prefill_job_names: vec![],
@@ -225,7 +228,7 @@ mod tests {
 
     #[test]
     fn consul_settings_reach_the_runtime() {
-        let config = DiscoveryConfig::Consul(crate::config::ConsulDiscoveryConfig {
+        let config = DiscoveryConfig::Consul(ConsulDiscoveryConfig {
             service: "smg-worker".to_string(),
             address: Some("http://consul.internal:8500".to_string()),
             datacenter: Some("dc2".to_string()),

@@ -6,7 +6,8 @@
 //! renew wall timestamps, the holder's duration) at one place: a file on a
 //! local filesystem ([`FileLease`]), a record in this process
 //! ([`MemoryLease`], the one-replica controller), or a `Lease` object of
-//! `coordination.k8s.io/v1` (the next step's backend). A backend reads the
+//! `coordination.k8s.io/v1` (`KubernetesLease`, behind the `kubernetes`
+//! feature). A backend reads the
 //! record and writes it when the stored record is still the one the writer
 //! read: a compare-and-swap under the file's advisory lock, the object's
 //! resource version on the API server. Everything else is the elector's and
@@ -18,8 +19,10 @@
 //!   included: it times the record from the instant it first saw it in its
 //!   present shape, never from the wall timestamp the record carries, so no
 //!   second clock enters the decision. A take writes the next term (terms
-//!   only grow, one per change of holder); a resume of its own identity's
-//!   record keeps the record's term.
+//!   only grow, one per change of holder, and a candidate counts from the
+//!   highest term it saw, so a record that vanished under it is taken at the
+//!   term after the one it held); a resume of its own identity's record
+//!   keeps the record's term.
 //! - **Renew.** The holder rewrites the record every renew period with a
 //!   later wall timestamp under its own term; a record that moved under it (a
 //!   candidate took the expired lease) refuses the renewal and the holder has
@@ -59,6 +62,8 @@
 //! its own.
 
 mod file;
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
 
 use std::{
     fmt,
@@ -68,6 +73,8 @@ use std::{
 
 use arc_swap::ArcSwap;
 pub use file::FileLease;
+#[cfg(feature = "kubernetes")]
+pub use kubernetes::{KubernetesLease, TERM_ANNOTATION};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -297,6 +304,10 @@ pub struct Elector {
     /// still for its duration (this run resumes it), is released, or passes
     /// to another identity: the refusal lasts as long as the writing does.
     strangers: u32,
+    /// The highest term this run saw stored or wrote: a record that vanished
+    /// (a deleted object, a lost file) is taken at the term after it, so
+    /// terms only grow while any candidate that saw them is alive.
+    highest_term: u64,
 }
 
 impl fmt::Debug for Elector {
@@ -333,6 +344,7 @@ impl Elector {
             held: None,
             attempted: None,
             strangers: 0,
+            highest_term: 0,
         })
     }
 
@@ -404,7 +416,12 @@ impl Elector {
         let written = match self.backend.write(Some(&mine), &released) {
             Ok(written) => written,
             Err(err) => {
-                self.attempted = Some(released);
+                // A renewal attempt that may have landed stays the record to
+                // adopt on the retry; a release that landed is read by its
+                // released state and term, and needs no attempt kept.
+                if self.attempted.is_none() {
+                    self.attempted = Some(released);
+                }
                 return Err(err);
             }
         };
@@ -442,12 +459,15 @@ impl Elector {
     }
 
     fn observe(&mut self, current: Option<&LeaseRecord>, now: Instant) {
+        // An absent record keeps the attempted write: an initial take whose
+        // answer was lost may still land, and the record it leaves is this
+        // run's own.
         let Some(record) = current else {
             self.observed = None;
-            self.attempted = None;
             self.strangers = 0;
             return;
         };
+        self.highest_term = self.highest_term.max(record.term);
         if self.observed.as_ref().is_some_and(|o| o.record == *record) {
             return;
         }
@@ -544,9 +564,13 @@ impl Elector {
     }
 
     fn acquire(&mut self, current: Option<LeaseRecord>, now: Instant) -> Result<Tick, ElectError> {
+        // A new term is the one after the highest this run saw, whatever the
+        // record in front of it says: a record that vanished and came back
+        // lower (a deleted object recreated, a lost file) never lowers it.
+        let next_term = self.highest_term + 1;
         let (term, acquired_at_micros) = match &current {
-            None => (1, 0),
-            Some(record) if record.is_released() => (record.term + 1, 0),
+            None => (next_term, 0),
+            Some(record) if record.is_released() => (next_term, 0),
             // The write this run attempted landed after all: its own lease.
             Some(record) if self.attempted.as_ref() == Some(record) => {
                 (record.term, record.acquired_at_micros)
@@ -583,7 +607,7 @@ impl Elector {
                         term: record.term,
                     });
                 }
-                (record.term + 1, 0)
+                (next_term, 0)
             }
         };
         let wall = next_wall_micros(current.as_ref().map_or(0, |r| r.renewed_at_micros));
@@ -608,6 +632,7 @@ impl Elector {
         match written {
             Written::Done => {
                 self.attempted = None;
+                self.highest_term = self.highest_term.max(term);
                 self.fence.set(term, Some(now));
                 self.observed = Some(Observation {
                     record: record.clone(),
@@ -1536,13 +1561,15 @@ mod tests {
         );
     }
 
-    /// A backend whose reads fail while `read_fails` is above zero, and whose
+    /// A backend whose reads fail while `read_fails` is above zero, whose
     /// writes land and then report an error while `lost_answers` is above
-    /// zero: one API server through one blip.
+    /// zero, and whose writes fail before landing while `write_fails` is
+    /// above zero: one API server through its blips.
     struct Blips {
         lease: MemoryLease,
         read_fails: Arc<AtomicU32>,
         lost_answers: Arc<AtomicU32>,
+        write_fails: Arc<AtomicU32>,
     }
 
     impl LeaseBackend for Blips {
@@ -1562,6 +1589,13 @@ mod tests {
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
         ) -> Result<Written, ElectError> {
+            if self.write_fails.load(Ordering::Relaxed) > 0 {
+                self.write_fails.fetch_sub(1, Ordering::Relaxed);
+                return Err(ElectError::Io {
+                    place: self.place(),
+                    source: std::io::Error::other("the write was refused"),
+                });
+            }
             let written = self.lease.write(expected, record)?;
             if self.lost_answers.load(Ordering::Relaxed) > 0 {
                 self.lost_answers.fetch_sub(1, Ordering::Relaxed);
@@ -1587,6 +1621,7 @@ mod tests {
             lease: lease.clone(),
             read_fails: Arc::clone(&read_fails),
             lost_answers: Arc::clone(&lost_answers),
+            write_fails: Arc::new(AtomicU32::new(0)),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
         let t0 = Instant::now() + S;
@@ -1607,6 +1642,128 @@ mod tests {
         let stored = lease.clone().read().expect("read").expect("the record");
         assert!(stored.is_released());
         assert_eq!(stored.term, 1);
+    }
+
+    #[test]
+    fn a_release_write_that_fails_after_a_landed_renewal_keeps_that_renewal_for_the_retry() {
+        let lease = MemoryLease::new();
+        let lost_answers = Arc::new(AtomicU32::new(0));
+        let write_fails = Arc::new(AtomicU32::new(0));
+        let backend = Blips {
+            lease: lease.clone(),
+            read_fails: Arc::new(AtomicU32::new(0)),
+            lost_answers: Arc::clone(&lost_answers),
+            write_fails: Arc::clone(&write_fails),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        a.tick(t0).expect("acquire");
+        // A renewal lands and its answer is lost; then the release's own
+        // write fails before it lands. The landed renewal stays the record
+        // the retry adopts: the lease is free at once, not at its expiry.
+        lost_answers.store(1, Ordering::Relaxed);
+        a.tick(t0 + S).expect_err("the answer was lost");
+        write_fails.store(1, Ordering::Relaxed);
+        a.release().expect_err("the write was refused");
+        assert!(a.is_holder(), "kept for the retry");
+        assert!(a.release().expect("the retry"), "released after all");
+        assert!(!a.is_holder());
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert!(stored.is_released());
+        assert_eq!(stored.term, 1);
+        let mut b = candidate(&lease, "b@host:2");
+        assert_eq!(
+            b.tick(t0 + 2 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+    }
+
+    #[test]
+    fn a_record_that_vanished_is_taken_at_the_term_after_the_highest_seen() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lease");
+        let mut a = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
+            .expect("settings");
+        let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
+            .expect("settings");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        assert!(a.release().expect("release"));
+        assert_eq!(b.tick(t0 + S).expect("take"), Tick::Acquired { term: 2 });
+        assert!(matches!(
+            a.tick(t0 + S + S / 2).expect("follow"),
+            Tick::Following { term: 2, .. }
+        ));
+        // The record is deleted under the holder (an operator forcing a
+        // re-election): the holder loses, and the next take counts from the
+        // highest term either candidate saw, never from one.
+        std::fs::remove_file(&path).expect("the deletion");
+        assert_eq!(
+            b.tick(t0 + 2 * S).expect("look"),
+            Tick::Lost {
+                term: 2,
+                holder: String::new()
+            }
+        );
+        assert_eq!(
+            a.tick(t0 + 2 * S + S / 2).expect("take"),
+            Tick::Acquired { term: 3 }
+        );
+        assert!(matches!(
+            b.tick(t0 + 3 * S).expect("follow"),
+            Tick::Following { term: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn a_resume_under_a_lower_term_keeps_the_highest_term_this_run_saw() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lease");
+        let mut a = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
+            .expect("settings");
+        let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
+            .expect("settings");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        assert!(a.release().expect("release"));
+        assert_eq!(b.tick(t0 + S).expect("take"), Tick::Acquired { term: 2 });
+        assert!(matches!(
+            a.tick(t0 + S + S / 2).expect("follow"),
+            Tick::Following { term: 2, .. }
+        ));
+        // The record is deleted, and a second process under a's identity (a
+        // restart racing the first) takes the empty lease at term one and
+        // stalls. The first process resumes under that record's term once
+        // it has been still for its duration; the higher term it saw before
+        // stays its floor, so its next take after a deletion is above both.
+        std::fs::remove_file(&path).expect("the deletion");
+        let mut again = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
+            .expect("settings");
+        assert_eq!(
+            again.tick(t0 + 2 * S).expect("take"),
+            Tick::Acquired { term: 1 }
+        );
+        let first_sight = t0 + 2 * S + S / 2;
+        assert!(matches!(
+            a.tick(first_sight).expect("look"),
+            Tick::Following { term: 1, .. }
+        ));
+        assert_eq!(
+            a.tick(first_sight + 3 * S).expect("resume"),
+            Tick::Acquired { term: 1 }
+        );
+        std::fs::remove_file(&path).expect("the second deletion");
+        assert_eq!(
+            a.tick(first_sight + 4 * S).expect("look"),
+            Tick::Lost {
+                term: 1,
+                holder: String::new()
+            }
+        );
+        assert_eq!(
+            a.tick(first_sight + 4 * S + S / 2).expect("take"),
+            Tick::Acquired { term: 3 }
+        );
     }
 
     /// A backend whose write does not land while `delay` is set: it reports
@@ -1644,6 +1801,36 @@ mod tests {
         fn place(&self) -> String {
             "lands-late".to_string()
         }
+    }
+
+    #[test]
+    fn an_initial_take_that_landed_late_is_this_runs_own_on_the_next_tick() {
+        let lease = MemoryLease::new();
+        let delay = Arc::new(AtomicBool::new(true));
+        let backend = LandsLate {
+            lease: lease.clone(),
+            delay: Arc::clone(&delay),
+            pending: None,
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + S;
+        // The first take reports an error and lands after the next read:
+        // that read finds nothing, the retry's write is refused as moved,
+        // and the tick after reads this run's own record and takes it.
+        a.tick(t0).expect_err("the answer was lost");
+        assert_eq!(a.tick(t0 + S).expect("retry"), Tick::Raced);
+        assert_eq!(a.tick(t0 + 2 * S).expect("own"), Tick::Acquired { term: 1 });
+        assert!(a.is_holder());
+        assert_eq!(a.fence().leader_term(t0 + 2 * S), Some(1));
+        assert_eq!(
+            lease
+                .clone()
+                .read()
+                .expect("read")
+                .expect("the record")
+                .holder,
+            "a@host:1"
+        );
     }
 
     #[test]
@@ -1799,21 +1986,32 @@ mod tests {
         assert_eq!(record.duration(), Duration::from_secs(3));
     }
 
-    // The backend contract, over every in-tree backend.
+    // The backend contract, over every in-tree backend. The third element
+    // keeps the backend's place alive: the file's directory, the Kubernetes
+    // stand-in's runtime and server.
 
-    fn backends() -> Vec<(&'static str, Box<dyn LeaseBackend>, tempfile::TempDir)> {
+    type Backend = (&'static str, Box<dyn LeaseBackend>, Box<dyn std::any::Any>);
+
+    fn backends() -> Vec<Backend> {
         let dir = tempfile::tempdir().expect("a temp dir");
         let file = FileLease::new(dir.path().join("lease"));
-        let dir2 = tempfile::tempdir().expect("a temp dir");
-        vec![
-            ("memory", Box::new(MemoryLease::new()), dir2),
-            ("file", Box::new(file), dir),
-        ]
+        let backends: Vec<Backend> = vec![
+            ("memory", Box::new(MemoryLease::new()), Box::new(())),
+            ("file", Box::new(file), Box::new(dir)),
+        ];
+        #[cfg(feature = "kubernetes")]
+        let backends = {
+            let mut backends = backends;
+            let cell = kubernetes::tests::Cell::new();
+            backends.push(("kubernetes", Box::new(cell.backend()), Box::new(cell)));
+            backends
+        };
+        backends
     }
 
     #[test]
     fn a_backend_stores_a_record_equal_and_writes_only_over_the_expected_one() {
-        for (name, mut backend, _dir) in backends() {
+        for (name, mut backend, _place) in backends() {
             assert_eq!(
                 backend.read().expect("read"),
                 None,

@@ -4,16 +4,19 @@
 //! engine, whose decoder's message limit is raised above tonic's 4 MiB
 //! default as the engine servicers raise theirs. A failing engine reads
 //! back as the status it named: a trailers-only answer is the error, not a
-//! stream.
+//! stream. The SGLang wire's framed call is driven the same way against the
+//! mock on that wire.
 
 use std::collections::HashMap;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use smg_grpc_client::{vllm_proto as proto, VllmEngineClient};
+use smg_grpc_client::{
+    sglang_proto as sglang, vllm_proto as proto, SglangSchedulerClient, VllmEngineClient,
+};
 
 mod common;
-use common::spawn_mock_decoding_up_to;
+use common::{spawn_mock_decoding_up_to, spawn_sglang_mock_decoding_up_to};
 
 /// The 1080p float32 class: 25 MB, above tonic's default message limit.
 const CLASS_1080P: usize = 1920 * 1080 * 3 * 4;
@@ -78,6 +81,65 @@ async fn a_failing_engine_reads_back_as_its_status() {
     let client = VllmEngineClient::connect(&endpoint).await.unwrap();
     let error = client
         .generate_framed(framed_request())
+        .await
+        .err()
+        .expect("the trailers-only status");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+}
+
+/// The SGLang request of the same shape: a 1080p-class tensor in
+/// `pixel_values`, a small one in the map and a frame-sized one in an extra
+/// media input.
+fn framed_sglang_request() -> sglang::GenerateRequest {
+    let tensor = |fill: u8, len: usize| sglang::TensorData {
+        data: Bytes::from(vec![fill; len]),
+        shape: vec![1, (len / 4) as u32],
+        dtype: "float32".into(),
+    };
+    sglang::GenerateRequest {
+        request_id: "framed-sglang-1".to_string(),
+        mm_inputs: Some(Box::new(sglang::MultimodalInputs {
+            pixel_values: Some(tensor(1, CLASS_1080P)),
+            model_specific_tensors: HashMap::from([("image_grid_thw".to_string(), tensor(2, 24))]),
+            ..Default::default()
+        })),
+        extra_mm_inputs: vec![sglang::MultimodalInputs {
+            pixel_values: Some(tensor(3, 64 * 1024)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_framed_sglang_request_reaches_the_engine_as_the_request_it_was() {
+    let (endpoint, state) = spawn_sglang_mock_decoding_up_to(DECODE_LIMIT)
+        .await
+        .unwrap();
+    let client = SglangSchedulerClient::connect(&endpoint).await.unwrap();
+    let request = framed_sglang_request();
+    let mut stream = client
+        .generate_framed(request.clone())
+        .await
+        .expect("the framed call is accepted");
+    drop(state.lock_tx_sglang().take());
+    assert!(stream.next().await.is_none(), "no message, a clean end");
+    assert_eq!(
+        state.last_generated_sglang().as_ref(),
+        Some(&request),
+        "the engine decoded the request the client framed"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_sglang_engine_reads_back_as_its_status() {
+    let (endpoint, state) = spawn_sglang_mock_decoding_up_to(DECODE_LIMIT)
+        .await
+        .unwrap();
+    state.fail_generate_with(tonic::Code::Unavailable);
+    let client = SglangSchedulerClient::connect(&endpoint).await.unwrap();
+    let error = client
+        .generate_framed(framed_sglang_request())
         .await
         .err()
         .expect("the trailers-only status");

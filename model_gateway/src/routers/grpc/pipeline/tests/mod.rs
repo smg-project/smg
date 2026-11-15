@@ -1,6 +1,7 @@
 mod alias_pipeline;
 mod build_parity;
 mod chat_logit_bias;
+mod embeddings;
 mod generate_body;
 mod glm53;
 mod model_label;
@@ -70,7 +71,7 @@ use crate::{
     },
     tenant::TenantKey,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         test_support::select_worker,
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
     },
@@ -903,10 +904,12 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
         let components = components_with_multimodal(worker_registry, true).await;
         let request: Arc<CreateMessageRequest> =
             Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
+        let tools = MessagesTools::from(&*request);
         let response = tokio::time::timeout(
             Duration::from_secs(10),
             pipeline.execute_messages(
                 request,
+                tools,
                 None,
                 MODEL.to_string(),
                 components,
@@ -4088,4 +4091,196 @@ async fn deepseek_v41_media_refused_as_sent_answers_the_media_stages_code() {
         assert!(message.contains(words), "{name}: {body}");
         assert!(ids.is_empty(), "{name}: nothing reaches the worker");
     }
+}
+
+/// A generate request in another runtime's message type than the client's
+/// is refused by the dispatch with both runtimes named, where it used to
+/// panic the request's task: the status of a call the wire does not have, a
+/// 501 for the client. Every message type against every other runtime's
+/// client.
+#[tokio::test]
+async fn a_request_of_another_runtime_is_refused_by_the_dispatch_by_name() {
+    use smg_grpc_client::{mlx_proto, sglang_proto, trtllm_proto};
+
+    use crate::routers::grpc::{client::GrpcClient, proto_wrapper::ProtoGenerateRequest};
+
+    /// A default request of one message type.
+    type Make = fn() -> ProtoGenerateRequest;
+
+    // A transport listener is enough: the dispatch refuses before any RPC.
+    let scheduler = GatedScheduler::default();
+    let calls = Arc::clone(&scheduler.calls);
+    let port = spawn_stub(scheduler).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let requests: [(&str, Make); 5] = [
+        ("sglang", || {
+            ProtoGenerateRequest::Sglang(Box::<sglang_proto::GenerateRequest>::default())
+        }),
+        ("vllm", || {
+            ProtoGenerateRequest::Vllm(Box::<vllm_proto::GenerateRequest>::default())
+        }),
+        ("trtllm", || {
+            ProtoGenerateRequest::Trtllm(Box::<trtllm_proto::GenerateRequest>::default())
+        }),
+        ("mlx", || {
+            ProtoGenerateRequest::Mlx(Box::<mlx_proto::GenerateRequest>::default())
+        }),
+        ("tokenspeed", || {
+            ProtoGenerateRequest::TokenSpeed(Box::<ts::GenerateRequest>::default())
+        }),
+    ];
+    for (of, request) in requests {
+        for (to, _) in requests.iter().filter(|(to, _)| *to != of) {
+            let mut client = GrpcClient::connect(&url, to)
+                .await
+                .expect("the stub's listener connects");
+            let Err(status) = client.generate(request()).await else {
+                panic!("a {of} request was dispatched to a {to} worker");
+            };
+            assert_eq!(status.code(), tonic::Code::Unimplemented, "{of} to {to}");
+            assert_eq!(
+                status.message(),
+                format!("a {of} request cannot be sent to a {to} worker")
+            );
+            assert_eq!(
+                status.http_status(),
+                http::StatusCode::NOT_IMPLEMENTED,
+                "{of} to {to}"
+            );
+        }
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "nothing reaches the worker"
+    );
+}
+
+/// No worker receives a refused request, so the dispatch unlinks the
+/// shared-memory segment its multimodal input rides in, as the arms that
+/// fail to send unlink theirs: in each message type whose payloads ride
+/// shared memory.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_refused_request_leaves_no_shared_memory_segment_behind() {
+    use crate::routers::grpc::{
+        client::GrpcClient,
+        proto_wrapper::{write_tokenspeed_shm_with, ProtoGenerateRequest},
+    };
+
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let segment = || {
+        write_tokenspeed_shm_with(4, |bytes| {
+            bytes.copy_from_slice(&[1, 2, 3, 4]);
+            Ok(())
+        })
+        .expect("a segment is written")
+    };
+    let (in_vllm, in_tokenspeed) = (segment(), segment());
+    let names = [in_vllm.name.clone(), in_tokenspeed.name.clone()];
+    // Where the transport keeps its segments.
+    let on_file = |name: &String| Path::new("/dev/shm").join(name).exists();
+    assert!(
+        names.iter().all(on_file),
+        "the segments are on file before the dispatch"
+    );
+    // Each request with a client of another runtime.
+    let refused = [
+        (
+            "tokenspeed",
+            ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
+                mm_inputs: Some(vllm_proto::MultimodalInputs {
+                    pixel_values: Some(vllm_proto::TensorData {
+                        payload: Some(vllm_proto::tensor_data::Payload::Shm(in_vllm)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        ),
+        (
+            "sglang",
+            ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+                mm_inputs: Some(ts::MultimodalInputs {
+                    items: vec![ts::MultimodalItem {
+                        encoder_input: Some(ts::TensorData {
+                            payload: Some(ts::tensor_data::Payload::Shm(in_tokenspeed)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            })),
+        ),
+    ];
+    for (runtime, request) in refused {
+        let mut client = GrpcClient::connect(&url, runtime)
+            .await
+            .expect("the stub's listener connects");
+        assert!(client.generate(request).await.is_err(), "{runtime}");
+    }
+    assert!(
+        !names.iter().any(on_file),
+        "the refused requests' segments are unlinked"
+    );
+}
+
+/// The embedding dispatch answers a request in another runtime's message
+/// type as the generate dispatch does, where it used to panic the request's
+/// task: each message type against each client that has an embedding call
+/// of another type or none of its own.
+#[tokio::test]
+async fn an_embedding_request_of_another_runtime_is_refused_by_the_dispatch_by_name() {
+    use smg_grpc_client::sglang_proto;
+
+    use crate::routers::grpc::{client::GrpcClient, proto_wrapper::ProtoEmbedRequest};
+
+    /// A default request of one message type.
+    type Make = fn() -> ProtoEmbedRequest;
+
+    let scheduler = GatedScheduler::default();
+    let calls = Arc::clone(&scheduler.calls);
+    let port = spawn_stub(scheduler).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let requests: [(&str, Make); 2] = [
+        ("sglang", || {
+            ProtoEmbedRequest::Sglang(Box::<sglang_proto::EmbedRequest>::default())
+        }),
+        ("vllm", || {
+            ProtoEmbedRequest::Vllm(Box::<vllm_proto::EmbedRequest>::default())
+        }),
+    ];
+    for (of, request) in requests {
+        for to in ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"]
+            .into_iter()
+            .filter(|to| *to != of)
+        {
+            let client = GrpcClient::connect(&url, to)
+                .await
+                .expect("the stub's listener connects");
+            let Err(status) = client.embed(request()).await else {
+                panic!("a {of} embedding request was dispatched to a {to} worker");
+            };
+            let words = match to {
+                "mlx" => "MLX backend does not support embedding".to_string(),
+                "tokenspeed" => "TokenSpeed backend does not support embedding".to_string(),
+                _ => format!("a {of} embedding request cannot be sent to a {to} worker"),
+            };
+            assert_eq!(status.code(), tonic::Code::Unimplemented, "{of} to {to}");
+            assert_eq!(status.message(), words);
+            assert_eq!(
+                status.http_status(),
+                http::StatusCode::NOT_IMPLEMENTED,
+                "{of} to {to}"
+            );
+        }
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "nothing reaches the worker"
+    );
 }

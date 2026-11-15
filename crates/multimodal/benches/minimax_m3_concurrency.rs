@@ -79,7 +79,7 @@ async fn run(
                     AsyncMultiModalTracker::new(connector).with_minimax_image_resize(direct);
                 tracker
                     .push_part(MediaContentPart::ImageUrl {
-                        url: fixture.url.clone(),
+                        url: fixture.url.clone().into(),
                         detail: None,
                         uuid: None,
                         max_long_side_pixel: Some(fixture.cap),

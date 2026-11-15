@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     decision::{Target, Targets, MAX_TARGETS},
-    framework::{Filter, Picker, Scorer, TieBand},
+    framework::{Filter, Narrowed, Picker, Scorer, TieBand},
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
     view::{Candidate, Constraints, LoadRow, RequestFacts, WorkerId},
@@ -26,7 +26,9 @@ use crate::{
 
 /// Expected waits within this many seconds of the minimum are one tie: the
 /// least-load scorer's own band, mapped onto the normalized scale per
-/// decision.
+/// decision. A wait is a 32-bit float, so past about 16 s it holds no
+/// microsecond of its own: two waits that round together are a tie whatever
+/// the band, and two that round apart are not.
 const TIE_EPSILON_SECS: f32 = 1e-6;
 
 // ---------------------------------------------------------------- filters
@@ -225,40 +227,6 @@ impl Scorer for FewestSessions {
     fn needs(&self) -> Needs {
         Needs {
             active_sessions: true,
-            ..Needs::default()
-        }
-    }
-}
-
-/// Prefix overlap in blocks over the request's blocks.
-#[derive(Debug)]
-pub struct PrefixAffinity;
-
-impl Lifecycle for PrefixAffinity {}
-
-impl Scorer for PrefixAffinity {
-    fn name(&self) -> &'static str {
-        "prefix-affinity"
-    }
-
-    fn score(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        kept: &[u32],
-        out: &mut [f32],
-    ) -> TieBand {
-        let blocks = facts.block_hashes.len().max(1) as f32;
-        for (o, &i) in out.iter_mut().zip(kept) {
-            *o = (candidates[i as usize].overlap_blocks as f32 / blocks).clamp(0.0, 1.0);
-        }
-        TieBand::NORMALIZED
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            token_hashes: true,
-            events: true,
             ..Needs::default()
         }
     }
@@ -486,7 +454,9 @@ impl SinceReport {
 
     /// The held token-work and requests once the dispatches made at or
     /// before the report's sample are released. A sample that reaches none
-    /// of them reads the word alone.
+    /// of them reads the word alone. Inlined into each load scorer's row
+    /// loop: two loads and a compare a row, the release behind a call.
+    #[inline]
     fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
         if self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros {
             self.release_through(sampled_at_micros);
@@ -497,7 +467,12 @@ impl SinceReport {
 
     /// Releases every lane's dispatches made at or before the sample and
     /// recomputes the row's oldest, under every lane's lock in lane order,
-    /// so no dispatch lands between the lanes' reads and the store.
+    /// so no dispatch lands between the lanes' reads and the store. Out of
+    /// line: a decision reads a row far more often than a report releases
+    /// from it, and with this body inlined the read was too large to stay
+    /// in a second scorer's row loop.
+    #[cold]
+    #[inline(never)]
     fn release_through(&self, sampled_at_micros: u64) {
         let mut held_lanes = self.lock_lanes();
         for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
@@ -536,21 +511,126 @@ impl SinceReport {
 /// to 8 % at 64 and 512 rows.
 type RankKey = (WorkerId, u16);
 
+/// The since-report dispatch credit of a load scorer: per rank row, the
+/// dispatches no report reflects yet. A decision and a dispatch to a rank the
+/// tally knows load the map without a shared write (a read-write lock's
+/// reader count is one, and eight deciders queued on it); a rank's first
+/// dispatch and a membership change replace the map whole, which is rare.
+/// Within a row the dispatches take per-thread lanes: deciders that read the
+/// same minimum book the same rank, and one lock there queued them too.
+#[derive(Debug)]
+struct Credits {
+    tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
+}
+
+impl Default for Credits {
+    fn default() -> Self {
+        Self {
+            tally: ArcSwap::from_pointee(FxHashMap::default()),
+        }
+    }
+}
+
+impl Credits {
+    /// Dispatches no report reflects yet on `worker`, over every rank of it.
+    fn held(&self, worker: WorkerId) -> usize {
+        self.tally
+            .load()
+            .iter()
+            .filter(|((id, _), _)| *id == worker)
+            .map(|(_, since)| since.len())
+            .sum()
+    }
+
+    /// Dispatches no report reflects yet on one rank of `worker`.
+    fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
+        self.tally
+            .load()
+            .get(&(worker, dp_rank))
+            .map_or(0, |since| since.len())
+    }
+
+    /// The tally without the ranks `gone` names: the map replaced whole, as a
+    /// membership change is rare and a decision never waits on it.
+    fn forget(&self, gone: impl Fn(&RankKey) -> bool) {
+        self.tally.rcu(|tally| {
+            let mut next = FxHashMap::clone(tally);
+            next.retain(|rank, _| !gone(rank));
+            next
+        });
+    }
+
+    /// Credits the rank a dispatch landed on.
+    fn dispatched(&self, lease: &Lease, target: &Target, side: Side, since_decision_micros: u32) {
+        // The decode side of a pair target is the pair's decode rank; the
+        // target itself is the prefill. The credit dates from the dispatch,
+        // so a report sampled while a queue held the decision does not
+        // release it.
+        let rank: RankKey = match side {
+            Side::Decode => target.pair.map_or((target.id, target.dp_rank), |p| {
+                (p.decode_id, p.decode_dp_rank)
+            }),
+            Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
+        };
+        let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
+        // A rank the tally knows is credited on its own entry; the first
+        // dispatch to a rank enters it (another dispatch may have entered it
+        // meanwhile: the entry the map holds is the one credited).
+        if let Some(since) = self.tally.load().get(&rank) {
+            since.record(dispatched_micros, lease.tokens);
+            return;
+        }
+        self.tally.rcu(|tally| {
+            if tally.contains_key(&rank) {
+                return Arc::clone(tally);
+            }
+            let mut next = FxHashMap::clone(tally);
+            next.insert(rank, Arc::new(SinceReport::default()));
+            Arc::new(next)
+        });
+        if let Some(since) = self.tally.load().get(&rank) {
+            since.record(dispatched_micros, lease.tokens);
+        }
+    }
+
+    /// Drops the ranks a membership change takes away.
+    fn membership(&self, change: &Membership<'_>) {
+        match change {
+            // Every rank of the worker goes with it. A resized worker's ranks
+            // are a new set: what a vanished rank held would never release,
+            // and a kept rank's next report is one interval away. Rare, so a
+            // walk over the tally is cheaper than a second index per worker.
+            Membership::Removed(id)
+            | Membership::Replaced { old: id, .. }
+            | Membership::Resized(id) => {
+                self.forget(|(worker, _)| worker == id);
+            }
+            // A snapshot (every worker of every pool, after a resync) stands
+            // for removals that may never have arrived: only its ids keep a
+            // tally. Rare, so a sorted copy is cheaper than a scan per row.
+            Membership::Snapshot(ids) => {
+                let mut sorted: Vec<u64> = ids.iter().map(|w| w.0).collect();
+                sorted.sort_unstable();
+                self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
+            }
+            Membership::Added(_) | Membership::Relabelled(_) => {}
+        }
+    }
+}
+
+/// The mean prefill a load scorer prices a request of unknown size at when
+/// its profile names none.
+pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
+
 /// The expected wait: token-work over drain rate plus a convex KV-pressure
 /// barrier, the since-report dispatch credit water-filling arrivals between
-/// reports. The host's in-flight count floors the report. The credit tally is
-/// per rank row: a decision and a dispatch to a rank the tally knows load the
-/// map without a shared write (a read-write lock's reader count is one, and
-/// eight deciders queued on it); a rank's first dispatch and a membership
-/// change replace the map whole, which is rare. Within a row the dispatches
-/// take per-thread lanes: deciders that read the same minimum book the same
-/// rank, and one lock there queued them too.
+/// reports. The host's in-flight count floors the report.
 #[derive(Debug)]
 pub struct LeastLoad {
     pub kv_pressure_weight: f32,
     pub mean_prefill_tokens: u32,
     pub default_throughput: f32,
-    tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
+    credits: Credits,
 }
 
 impl LeastLoad {
@@ -563,33 +643,26 @@ impl LeastLoad {
             } else {
                 1.0
             },
-            tally: ArcSwap::from_pointee(FxHashMap::default()),
+            credits: Credits::default(),
         }
     }
 
     /// Dispatches no report reflects yet on `worker`, over every rank of it,
     /// for tests and dumps.
     pub fn held(&self, worker: WorkerId) -> usize {
-        self.tally
-            .load()
-            .iter()
-            .filter(|((id, _), _)| *id == worker)
-            .map(|(_, since)| since.len())
-            .sum()
+        self.credits.held(worker)
     }
 
     /// Dispatches no report reflects yet on one rank of `worker`.
     pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
-        self.tally
-            .load()
-            .get(&(worker, dp_rank))
-            .map_or(0, |since| since.len())
+        self.credits.held_at(worker, dp_rank)
     }
 
     /// One rank's held word as a decision reads it: token-work and requests.
     #[cfg(test)]
     fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
-        self.tally
+        self.credits
+            .tally
             .load()
             .get(&(worker, dp_rank))
             .map_or((0, 0), |since| {
@@ -602,7 +675,7 @@ impl LeastLoad {
     /// runs it.
     #[cfg(test)]
     fn retire_oldest_batch_of(&self, worker: WorkerId, dp_rank: u16) {
-        if let Some(since) = self.tally.load().get(&(worker, dp_rank)) {
+        if let Some(since) = self.credits.tally.load().get(&(worker, dp_rank)) {
             since.retire_oldest_batch();
         }
     }
@@ -610,21 +683,12 @@ impl LeastLoad {
     /// The rank row, for a test that holds its retire lock.
     #[cfg(test)]
     fn row(&self, worker: WorkerId, dp_rank: u16) -> Arc<SinceReport> {
-        self.tally
+        self.credits
+            .tally
             .load()
             .get(&(worker, dp_rank))
             .cloned()
             .expect("a rank row")
-    }
-
-    /// The tally without the ranks `gone` names: the map replaced whole, as a
-    /// membership change is rare and a decision never waits on it.
-    fn forget(&self, gone: impl Fn(&RankKey) -> bool) {
-        self.tally.rcu(|tally| {
-            let mut next = FxHashMap::clone(tally);
-            next.retain(|rank, _| !gone(rank));
-            next
-        });
     }
 
     /// A reporting candidate's dispatch credit as token-work: the since-report
@@ -656,7 +720,9 @@ impl LeastLoad {
         } else {
             nominal
         };
-        let k = r.active_kv().clamp(0.0, 0.999_999);
+        // The active share, at the legacy formula's clamp: a saturated row
+        // prices its barrier at 999 times the weight, not a million.
+        let k = r.active_kv().clamp(0.0, 0.999);
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
@@ -690,58 +756,12 @@ impl Lifecycle for LeastLoad {
         side: Side,
         since_decision_micros: u32,
     ) {
-        // The decode side of a pair target is the pair's decode rank; the
-        // target itself is the prefill. The credit dates from the dispatch,
-        // so a report sampled while a queue held the decision does not
-        // release it.
-        let rank: RankKey = match side {
-            Side::Decode => target.pair.map_or((target.id, target.dp_rank), |p| {
-                (p.decode_id, p.decode_dp_rank)
-            }),
-            Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
-        };
-        let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
-        // A rank the tally knows is credited on its own entry; the first
-        // dispatch to a rank enters it (another dispatch may have entered it
-        // meanwhile: the entry the map holds is the one credited).
-        if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
-            return;
-        }
-        self.tally.rcu(|tally| {
-            if tally.contains_key(&rank) {
-                return Arc::clone(tally);
-            }
-            let mut next = FxHashMap::clone(tally);
-            next.insert(rank, Arc::new(SinceReport::default()));
-            Arc::new(next)
-        });
-        if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
-        }
+        self.credits
+            .dispatched(lease, target, side, since_decision_micros);
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
-        match change {
-            // Every rank of the worker goes with it. A resized worker's ranks
-            // are a new set: what a vanished rank held would never release,
-            // and a kept rank's next report is one interval away. Rare, so a
-            // walk over the tally is cheaper than a second index per worker.
-            Membership::Removed(id)
-            | Membership::Replaced { old: id, .. }
-            | Membership::Resized(id) => {
-                self.forget(|(worker, _)| worker == id);
-            }
-            // A snapshot (every worker of every pool, after a resync) stands
-            // for removals that may never have arrived: only its ids keep a
-            // tally. Rare, so a sorted copy is cheaper than a scan per row.
-            Membership::Snapshot(ids) => {
-                let mut sorted: Vec<u64> = ids.iter().map(|w| w.0).collect();
-                sorted.sort_unstable();
-                self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
-            }
-            Membership::Added(_) | Membership::Relabelled(_) => {}
-        }
+        self.credits.membership(change);
     }
 }
 
@@ -774,7 +794,7 @@ impl Scorer for LeastLoad {
         // the peer baseline is known. No allocation.
         let mut reporting = 0usize;
         {
-            let tally = self.tally.load();
+            let tally = self.credits.tally.load();
             for (slot, &i) in out.iter_mut().zip(kept) {
                 let c = &candidates[i as usize];
                 *slot = match c.load {
@@ -835,6 +855,156 @@ impl Scorer for LeastLoad {
     }
 }
 
+/// The resident work, in context tokens, lower better: what a worker's
+/// report says its running requests hold, the prompts dispatched to it since
+/// that report (the credit the least-load scorer books too), and
+/// `request_tokens` for every request it holds: the reported ones, the
+/// credited ones, and the ones the host holds beyond both, those priced at
+/// the worker's mean context as well. Every survivor is scored. A worker
+/// whose report does not count resident tokens (the row's
+/// `resident_counted`), or that has no report, scores as the best reporting
+/// peer plus its in-flight requests, each at the mean prefill and
+/// `request_tokens`; with no survivor counting them, the in-flight count
+/// decides.
+#[derive(Debug)]
+pub struct ResidentWork {
+    pub request_tokens: u32,
+    pub mean_prefill_tokens: u32,
+    credits: Credits,
+}
+
+impl ResidentWork {
+    pub fn new(request_tokens: u32) -> Self {
+        Self {
+            request_tokens,
+            mean_prefill_tokens: DEFAULT_MEAN_PREFILL_TOKENS,
+            credits: Credits::default(),
+        }
+    }
+
+    /// Dispatches no report reflects yet on one rank of `worker`.
+    pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
+        self.credits.held_at(worker, dp_rank)
+    }
+
+    /// The resident work of a candidate whose report counts resident tokens,
+    /// with its since-report credit.
+    fn reported_cost(
+        &self,
+        c: &Candidate,
+        r: LoadRow,
+        credit_tokens: u64,
+        credit_requests: u64,
+    ) -> f32 {
+        let reported = u64::from(r.running) + u64::from(r.queued);
+        let unaccounted = u64::from(c.in_flight).saturating_sub(reported + credit_requests);
+        let resident = r.resident_tokens as f32;
+        let mean_context = if reported > 0 {
+            resident / reported as f32
+        } else {
+            self.mean_prefill_tokens as f32
+        };
+        let requests = reported + credit_requests + unaccounted;
+        resident
+            + credit_tokens as f32
+            + unaccounted as f32 * mean_context
+            + self.request_tokens as f32 * requests as f32
+    }
+}
+
+impl Lifecycle for ResidentWork {
+    fn on_dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        self.credits
+            .dispatched(lease, target, side, since_decision_micros);
+    }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        self.credits.membership(change);
+    }
+}
+
+impl Scorer for ResidentWork {
+    fn name(&self) -> &'static str {
+        "resident-work"
+    }
+
+    fn score(
+        &self,
+        _: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        // One load of the tally, as the least-load scorer reads it: a row
+        // that counts resident tokens is costed with its credit, any other
+        // is marked and costed after the reporting peers' baseline is known.
+        let mut reporting = 0usize;
+        {
+            let tally = self.credits.tally.load();
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                let c = &candidates[i as usize];
+                // A report releases the dispatches it reflects whatever the
+                // score reads of them: a rank whose report counts no
+                // resident tokens would hold its credit at the bound.
+                let reported = c.load.map(|r| {
+                    let credit = tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                        since.credit_through(c.load_sampled_at_micros)
+                    });
+                    (r, credit)
+                });
+                *slot = match reported {
+                    Some((r, (tokens, requests))) if r.resident_counted => {
+                        reporting += 1;
+                        self.reported_cost(c, r, tokens, requests)
+                    }
+                    _ => PENDING,
+                };
+            }
+        }
+        let fleet_reports = reporting > 0;
+        let peer_baseline = if fleet_reports && reporting < kept.len() {
+            out.iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            if *slot == PENDING {
+                let in_flight = candidates[i as usize].in_flight as f32;
+                *slot = if fleet_reports {
+                    peer_baseline + in_flight * in_flight_work
+                } else {
+                    in_flight
+                };
+            }
+        }
+        // The least-load scorer's band, on a score in tokens: equal work is
+        // a tie, drawn by the picker.
+        let span = normalize_costs(out);
+        if span > 0.0 {
+            TieBand((TIE_EPSILON_SECS / span).min(1.0))
+        } else {
+            TieBand::NORMALIZED
+        }
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------- pickers
 
 /// The best score first, ties drawn uniformly from the decision's seed, then
@@ -844,17 +1014,53 @@ pub struct Best;
 
 impl Lifecycle for Best {}
 
+/// Whether `score` lies below the band of `top`, the best score it is
+/// compared with. It is the one test of a tie: a score that is not below the
+/// band is drawn with the best.
+fn below_band(score: f32, top: f32, band: TieBand) -> bool {
+    score < top - band.0
+}
+
+/// One slot of a ranked pick, over the rows `open` admits: the best score
+/// among them is found first, then one of the rows within the band of it is
+/// drawn. The band lies around the best score, so the rows of a tie are the
+/// same whatever order they are listed in.
+fn draw_in_band(
+    scores: &[f32],
+    band: TieBand,
+    draw: &mut Draw,
+    open: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let mut top = f32::NEG_INFINITY;
+    for (i, &s) in scores.iter().enumerate() {
+        if open(i) && s > top {
+            top = s;
+        }
+    }
+    let mut best: Option<usize> = None;
+    let mut tied = 0usize;
+    for (i, &s) in scores.iter().enumerate() {
+        if !open(i) || below_band(s, top, band) {
+            continue;
+        }
+        tied += 1;
+        if best.is_none() || draw.below(tied) == 0 {
+            best = Some(i);
+        }
+    }
+    best
+}
+
 /// Push the kept positions in descending score order, ties by draw: per slot
 /// the rows within the band of the best remaining score are one tie, drawn
-/// from uniformly. One pass keeps the five best scores (equal scores in scan
-/// order); while the next best is below the band of the best remaining, that
-/// row stands alone in its band and is the slot's pick with no draw spent.
-/// From the first band that holds several rows on, a slot costs two passes:
-/// the best remaining score is found first, then the rows within the band of
-/// it are drawn from. The taken slots live in a fixed array: nothing is
-/// allocated.
+/// from uniformly with the values of `draw`. One pass keeps the five best
+/// scores (equal scores in scan order); while the next best is below the
+/// band of the best remaining, that row stands alone in its band and is the
+/// slot's pick with no draw spent. From the first band that holds several
+/// rows on, a slot costs the two passes of [`draw_in_band`]. The taken slots
+/// live in a fixed array: nothing is allocated.
 fn push_ranked(
-    facts: &RequestFacts<'_>,
+    mut draw: Draw,
     candidates: &[Candidate],
     kept: &[u32],
     scores: &[f32],
@@ -881,11 +1087,10 @@ fn push_ranked(
         }
         best_five[at] = (i, s);
     }
-    let mut draw = Draw::new(facts.seed);
     let mut taken = [usize::MAX; MAX_TARGETS];
     let mut filled = 0usize;
     while filled < slots
-        && (filled + 1 >= len || best_five[filled + 1].1 < best_five[filled].1 - band.0)
+        && (filled + 1 >= len || below_band(best_five[filled + 1].1, best_five[filled].1, band))
     {
         let (i, _) = best_five[filled];
         taken[filled] = i;
@@ -893,24 +1098,8 @@ fn push_ranked(
         filled += 1;
     }
     for slot in filled..slots {
-        let mut top = f32::NEG_INFINITY;
-        for (i, &s) in scores.iter().enumerate() {
-            if !taken[..slot].contains(&i) && s > top {
-                top = s;
-            }
-        }
-        let mut best: Option<usize> = None;
-        let mut tied = 0u32;
-        for (i, &s) in scores.iter().enumerate() {
-            if taken[..slot].contains(&i) || s < top - band.0 {
-                continue;
-            }
-            tied += 1;
-            if best.is_none() || draw.below(tied as usize) == 0 {
-                best = Some(i);
-            }
-        }
-        let Some(b) = best else {
+        let left = |i: usize| !taken[..slot].contains(&i);
+        let Some(b) = draw_in_band(scores, band, &mut draw, left) else {
             break;
         };
         taken[slot] = b;
@@ -918,7 +1107,8 @@ fn push_ranked(
     }
 }
 
-fn target_of(c: &Candidate) -> Target {
+/// The target that names `c`, on no pair.
+pub(crate) fn target_of(c: &Candidate) -> Target {
     Target {
         position: c.position,
         id: c.id,
@@ -941,7 +1131,7 @@ impl Picker for Best {
         band: TieBand,
         out: &mut Targets,
     ) {
-        push_ranked(facts, candidates, kept, scores, band, out);
+        push_ranked(Draw::new(facts.seed), candidates, kept, scores, band, out);
     }
 }
 
@@ -1017,9 +1207,104 @@ impl Picker for Random {
     }
 }
 
+/// Two distinct uniform positions below `n` (two at least), from the next two
+/// values of `draw`.
+fn two_below(draw: &mut Draw, n: usize) -> (usize, usize) {
+    let a = draw.below(n);
+    let mut b = draw.below(n - 1);
+    if b >= a {
+        b += 1;
+    }
+    (a, b)
+}
+
+/// The narrowing of the two-draw pickers: the two rows the first two values
+/// of the seed's stream draw move to the front of `kept`. The number compared
+/// comes back: two, or the whole of a set that holds no more, where nothing
+/// is passed over and nothing is drawn.
+fn draw_two(seed: u64, kept: &mut [u32]) -> usize {
+    let n = kept.len();
+    if n <= 2 {
+        return n;
+    }
+    let (a, b) = two_below(&mut Draw::new(seed), n);
+    kept.swap(0, a);
+    // The second draw's row moved with the swap if it led the list.
+    let b = if b == 0 { a } else { b };
+    kept.swap(1, b);
+    2
+}
+
+/// `a` before `b` by score, the higher first, for a pick between two rows.
+/// The lower of the two is equal to the higher unless it lies below its
+/// band: the band is the scorers' word on what they cannot tell apart, and a
+/// picker that compares scores reads it. It is the order of a pair alone.
+/// Walked over more rows against a running best it would chain ties by the
+/// order of the walk, so a pick over more rows draws within the band of the
+/// best ([`draw_in_band`]).
+fn score_order(scores: &[f32], band: TieBand, a: usize, b: usize) -> std::cmp::Ordering {
+    let order = scores[b].total_cmp(&scores[a]);
+    let (high, low) = if order.is_gt() {
+        (scores[b], scores[a])
+    } else {
+        (scores[a], scores[b])
+    };
+    if below_band(low, high, band) {
+        order
+    } else {
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// The pick of the two-draw pickers over `kept`: the two rows the first two
+/// values of the seed's stream draw, the one `order` puts first leading. Of
+/// two rows the draw takes both, so a pair the narrowing left and rows that
+/// were never narrowed (a plugin picker's fallback is handed every survivor)
+/// go through one rule and one stream, each value deciding once. A tie goes
+/// by the stream's third value, between the two rows as the host lists them:
+/// an even draw wherever the rows sit, the same for a narrowed pair and not.
+fn push_two(
+    seed: u64,
+    candidates: &[Candidate],
+    kept: &[u32],
+    order: impl Fn(usize, usize) -> std::cmp::Ordering,
+    out: &mut Targets,
+) {
+    let (first, second) = match kept.len() {
+        0 => return,
+        1 => return out.push(target_of(&candidates[kept[0] as usize])),
+        n => {
+            let mut draw = Draw::new(seed);
+            let (a, b) = two_below(&mut draw, n);
+            match order(a, b) {
+                std::cmp::Ordering::Less => (a, b),
+                std::cmp::Ordering::Greater => (b, a),
+                std::cmp::Ordering::Equal => {
+                    let (low, high) = if kept[a] < kept[b] { (a, b) } else { (b, a) };
+                    if draw.below(2) == 0 {
+                        (low, high)
+                    } else {
+                        (high, low)
+                    }
+                }
+            }
+        }
+    };
+    out.push(target_of(&candidates[kept[first] as usize]));
+    out.push(target_of(&candidates[kept[second] as usize]));
+}
+
 /// Two uniform draws, the better score taken; the other is the alternate.
-/// The profile's scorers decide which of the two is better, so a profile
-/// with this picker names at least one scorer.
+/// Scores within the profile's tie band are a tie, drawn. The profile's
+/// scorers decide which of the two is better, so a profile with this picker
+/// names at least one scorer. The two drawn are the set compared: the
+/// scorers are handed them alone, so a worker that was not drawn moves no
+/// input of a built-in's estimate.
+///
+/// Between two workers a score normalized over them is all or nothing, so
+/// several weighted scorers under this picker vote, each with its whole
+/// weight, where over the pool they would blend. A profile that wants the
+/// blend names one scorer here, or the `best` picker over the pool.
 #[derive(Debug)]
 pub struct PowerOfTwo;
 
@@ -1030,59 +1315,46 @@ impl Picker for PowerOfTwo {
         "power-of-two"
     }
 
+    fn narrow(&self, facts: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Narrowed {
+        Narrowed {
+            compared: draw_two(facts.seed, kept),
+            alternates: 0,
+        }
+    }
+
     fn pick(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         scores: &[f32],
-        _: TieBand,
+        band: TieBand,
         out: &mut Targets,
     ) {
-        if kept.is_empty() {
-            return;
-        }
-        let mut draw = Draw::new(facts.seed);
-        let a = draw.below(kept.len());
-        if kept.len() == 1 {
-            out.push(target_of(&candidates[kept[a] as usize]));
-            return;
-        }
-        let mut b = draw.below(kept.len() - 1);
-        if b >= a {
-            b += 1;
-        }
-        let (first, second) = if scores[a] >= scores[b] {
-            (a, b)
-        } else {
-            (b, a)
-        };
-        out.push(target_of(&candidates[kept[first] as usize]));
-        out.push(target_of(&candidates[kept[second] as usize]));
+        let by_score = |a: usize, b: usize| score_order(scores, band, a, b);
+        push_two(facts.seed, candidates, kept, by_score, out);
     }
 }
 
-/// `a` before `b` in the count-first order: fewer requests in flight on
-/// the host, then the higher score (compared exactly, as the policies'
-/// expected-wait tie-break is), equal on both.
-fn count_first_order(
-    candidates: &[Candidate],
-    kept: &[u32],
-    scores: &[f32],
-    a: usize,
-    b: usize,
-) -> std::cmp::Ordering {
-    let count_a = candidates[kept[a] as usize].in_flight;
-    let count_b = candidates[kept[b] as usize].in_flight;
-    count_a
-        .cmp(&count_b)
-        .then_with(|| scores[b].total_cmp(&scores[a]))
-}
+/// The mask of the stream count-first orders its alternates by: the order of
+/// equal counts among the workers passed over is drawn from the decision's
+/// seed under it. No other site derives that stream: the pick's ties read
+/// the seed's own stream, and a pair plan's decode side opens the stream of
+/// the seed's first value. [`Draw`] lists every stream a decision opens.
+const ALTERNATES_STREAM: u64 = 0xa54f_f53a_5f1d_36f1;
 
-/// The fewest requests in flight on the host first, the profile's score
-/// among equal counts, the decision's seed among exact ties; the next by
-/// the same order as alternates. No weight or band stands between the two
-/// stages: a strictly lower count wins whatever the scores.
+/// The fewest requests in flight on the host first, then the profile's score
+/// among equal counts as the `best` picker ranks it: the scores within the
+/// profile's tie band of the best are one tie, drawn from the decision's
+/// seed. No weight or band stands between the two stages: a strictly lower
+/// count wins whatever the scores. The fewest in flight are the set
+/// compared: the scorers are handed them alone, so a worker holding more
+/// moves no input of a built-in's estimate. The workers passed over follow
+/// as alternates by count, equal counts drawn from a stream of their own
+/// (the seed under a mask no other site uses), and no scorer orders them. A
+/// host that wants the estimate after a failed dispatch decides again with
+/// its tried list: the `not-tried` filter leaves the rest, compared among
+/// themselves.
 #[derive(Debug)]
 pub struct CountFirst;
 
@@ -1093,44 +1365,90 @@ impl Picker for CountFirst {
         "count-first"
     }
 
+    fn narrow(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut [u32],
+    ) -> Narrowed {
+        let count = |row: u32| candidates[row as usize].in_flight;
+        let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
+            return Narrowed::all(0);
+        };
+        let mut compared = 0usize;
+        for i in 0..kept.len() {
+            if count(kept[i]) == fewest {
+                kept.swap(compared, i);
+                compared += 1;
+            }
+        }
+        // The alternates the target list still has room for once the
+        // compared set is ordered: the next by count, equal counts drawn.
+        let alternates = MAX_TARGETS
+            .saturating_sub(compared)
+            .min(kept.len() - compared);
+        // The order of equal counts is drawn from a stream of its own, so it
+        // says nothing of the tie among the fewest (the seed's stream, which
+        // `pick` reads) nor of the draws a pair plan's decode side makes.
+        let mut draw = Draw::new(facts.seed ^ ALTERNATES_STREAM);
+        for slot in compared..compared + alternates {
+            let mut next = slot;
+            let mut tied = 1usize;
+            for i in slot + 1..kept.len() {
+                match count(kept[i]).cmp(&count(kept[next])) {
+                    std::cmp::Ordering::Less => {
+                        next = i;
+                        tied = 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        tied += 1;
+                        if draw.below(tied) == 0 {
+                            next = i;
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+            }
+            kept.swap(slot, next);
+        }
+        Narrowed {
+            compared,
+            alternates,
+        }
+    }
+
     fn pick(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         scores: &[f32],
-        _: TieBand,
+        band: TieBand,
         out: &mut Targets,
     ) {
+        let count = |row: u32| candidates[row as usize].in_flight;
+        // The ties are drawn from the seed's own stream, as the best picker
+        // draws them: the alternates' order has a stream of its own.
         let mut draw = Draw::new(facts.seed);
+        // The narrowing leaves one count, and among equal counts the pick is
+        // the best picker's.
+        if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
+            return push_ranked(draw, candidates, kept, scores, band, out);
+        }
+        // Rows that were never narrowed: the same rule a slot, among the
+        // fewest in flight of the rows left. Every row here came with a
+        // score, so equal counts past the fewest go by score too, where the
+        // narrowing draws them unscored.
         let mut taken = [usize::MAX; MAX_TARGETS];
         for slot in 0..MAX_TARGETS.min(kept.len()) {
-            let mut best: Option<usize> = None;
-            let mut tied = 0u32;
-            for i in 0..kept.len() {
-                if taken[..slot].contains(&i) {
-                    continue;
-                }
-                let Some(b) = best else {
-                    best = Some(i);
-                    tied = 1;
-                    continue;
-                };
-                match count_first_order(candidates, kept, scores, i, b) {
-                    std::cmp::Ordering::Less => {
-                        best = Some(i);
-                        tied = 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        tied += 1;
-                        if draw.below(tied as usize) == 0 {
-                            best = Some(i);
-                        }
-                    }
-                    std::cmp::Ordering::Greater => {}
-                }
-            }
-            let Some(b) = best else {
+            let left = |i: usize| !taken[..slot].contains(&i);
+            let rows = kept.iter().enumerate();
+            let fewest = rows
+                .filter(|&(i, _)| left(i))
+                .map(|(_, &row)| count(row))
+                .min();
+            let open = |i: usize| left(i) && Some(count(kept[i])) == fewest;
+            let Some(b) = draw_in_band(scores, band, &mut draw, open) else {
                 break;
             };
             taken[slot] = b;
@@ -1140,7 +1458,10 @@ impl Picker for CountFirst {
 }
 
 /// Two uniform draws, the one with fewer requests in flight taken and the
-/// profile's score deciding equal counts; the other is the alternate.
+/// profile's score deciding equal counts, scores within the tie band a tie
+/// and drawn; the other is the alternate. The two drawn are the set
+/// compared, as under [`PowerOfTwo`], and several weighted scorers vote
+/// between them as they do there.
 #[derive(Debug)]
 pub struct PowerOfTwoCountFirst;
 
@@ -1151,36 +1472,29 @@ impl Picker for PowerOfTwoCountFirst {
         "power-of-two-count-first"
     }
 
+    fn narrow(&self, facts: &RequestFacts<'_>, _: &[Candidate], kept: &mut [u32]) -> Narrowed {
+        Narrowed {
+            compared: draw_two(facts.seed, kept),
+            alternates: 0,
+        }
+    }
+
     fn pick(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         scores: &[f32],
-        _: TieBand,
+        band: TieBand,
         out: &mut Targets,
     ) {
-        if kept.is_empty() {
-            return;
-        }
-        let mut draw = Draw::new(facts.seed);
-        let a = draw.below(kept.len());
-        if kept.len() == 1 {
-            out.push(target_of(&candidates[kept[a] as usize]));
-            return;
-        }
-        let mut b = draw.below(kept.len() - 1);
-        if b >= a {
-            b += 1;
-        }
-        let (first, second) =
-            if count_first_order(candidates, kept, scores, b, a) == std::cmp::Ordering::Less {
-                (b, a)
-            } else {
-                (a, b)
-            };
-        out.push(target_of(&candidates[kept[first] as usize]));
-        out.push(target_of(&candidates[kept[second] as usize]));
+        let count = |i: usize| candidates[kept[i] as usize].in_flight;
+        let by_count = |a: usize, b: usize| {
+            count(a)
+                .cmp(&count(b))
+                .then_with(|| score_order(scores, band, a, b))
+        };
+        push_two(facts.seed, candidates, kept, by_count, out);
     }
 }
 
@@ -1367,7 +1681,10 @@ mod tests {
     pub(super) static RETIRE_WAITS: AtomicUsize = AtomicUsize::new(0);
 
     use super::*;
-    use crate::view::{Health, LoadRow};
+    use crate::{
+        decision::Pair,
+        view::{Health, LoadRow},
+    };
 
     fn candidate(position: u32, in_flight: u32) -> Candidate {
         Candidate {
@@ -1384,6 +1701,40 @@ mod tests {
 
     fn kept(n: u32) -> Vec<u32> {
         (0..n).collect()
+    }
+
+    /// The engine's order around a picker: the set it compares, that set's
+    /// scores from `scores_of`, the pick, then the survivors it passed over
+    /// as alternates. The positions of the targets come back, in order.
+    fn picked(
+        picker: &dyn Picker,
+        facts: &RequestFacts<'_>,
+        pool: &[Candidate],
+        scores_of: &dyn Fn(&[u32]) -> Vec<f32>,
+    ) -> Vec<u32> {
+        picked_within(picker, facts, pool, scores_of, TieBand::NORMALIZED)
+    }
+
+    /// [`picked`] under a tie band of the caller's.
+    fn picked_within(
+        picker: &dyn Picker,
+        facts: &RequestFacts<'_>,
+        pool: &[Candidate],
+        scores_of: &dyn Fn(&[u32]) -> Vec<f32>,
+        band: TieBand,
+    ) -> Vec<u32> {
+        let mut rows = kept(pool.len() as u32);
+        let Narrowed {
+            compared,
+            alternates,
+        } = picker.narrow(facts, pool, &mut rows);
+        let scores = scores_of(&rows[..compared]);
+        let mut out = Targets::new();
+        picker.pick(facts, pool, &rows[..compared], &scores, band, &mut out);
+        for &row in &rows[compared..compared + alternates] {
+            out.push(target_of(&pool[row as usize]));
+        }
+        out.iter().map(|t| t.position).collect()
     }
 
     fn first_pick(picker: &dyn Picker, facts: &RequestFacts<'_>, pool: &[Candidate]) -> u32 {
@@ -1774,6 +2125,36 @@ mod tests {
     }
 
     #[test]
+    fn the_kv_barrier_reads_the_active_share_at_the_legacy_clamp() {
+        let scorer = LeastLoad::new(0.15, 1024, 2000.0);
+        let row = |active: u16, total: u16, queued: u32| LoadRow {
+            active_kv_permille: active,
+            kv_usage_permille: total,
+            queued,
+            live_rate: 2000,
+            ..LoadRow::default()
+        };
+        let facts = RequestFacts::default();
+        // A saturated row prices its barrier at 999 times the weight (150 s
+        // at 0.15), so a queue of 400 requests at the mean prefill (205 s)
+        // loses to it; at a clamp of 0.999999 the barrier would be 150,000 s
+        // and the queue would win.
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(row(1000, 1000, 0));
+        pool[1].load = Some(row(0, 0, 400));
+        let mut scores = [0.0f32; 2];
+        scorer.score(&facts, &pool, &kept(2), &mut scores);
+        assert!(scores[0] > scores[1], "{scores:?}");
+        // The barrier reads the active share: a cache full of evictable
+        // blocks (total 1.0, active 0.1) is lighter than one half held by
+        // running requests.
+        pool[0].load = Some(row(100, 1000, 0));
+        pool[1].load = Some(row(500, 500, 0));
+        scorer.score(&facts, &pool, &kept(2), &mut scores);
+        assert!(scores[0] > scores[1], "{scores:?}");
+    }
+
+    #[test]
     fn least_load_ties_within_a_microsecond_of_wait_on_a_spread_pool() {
         // Two workers a quarter of a microsecond apart in expected wait, and a
         // third four seconds behind that stretches the normalized scale: the
@@ -1862,28 +2243,337 @@ mod tests {
         );
     }
 
+    /// A report that counts resident tokens.
+    fn resident(running: u32, resident_tokens: u32) -> LoadRow {
+        LoadRow {
+            running,
+            resident_tokens,
+            resident_counted: true,
+            ..LoadRow::default()
+        }
+    }
+
+    /// A report of an engine that does not count them.
+    fn uncounted(running: u32) -> LoadRow {
+        LoadRow {
+            running,
+            ..LoadRow::default()
+        }
+    }
+
+    fn resident_scores<const N: usize>(scorer: &ResidentWork, pool: &[Candidate; N]) -> [f32; N] {
+        let mut scores = [0.0f32; N];
+        scorer.score(&RequestFacts::default(), pool, &kept(N as u32), &mut scores);
+        scores
+    }
+
+    /// The request's price is part of the comparison: a worker holding fewer
+    /// tokens over more requests loses once a request is priced high enough.
+    #[test]
+    fn resident_work_is_the_resident_tokens_plus_the_request_price_of_every_request_held() {
+        let mut pool = [candidate(0, 2), candidate(1, 1)];
+        pool[0].load = Some(resident(2, 6_000));
+        pool[1].load = Some(resident(1, 9_000));
+        let cheap = ResidentWork::new(1_000);
+        assert_eq!(
+            cheap.reported_cost(&pool[0], resident(2, 6_000), 0, 0),
+            8_000.0
+        );
+        assert_eq!(
+            cheap.reported_cost(&pool[1], resident(1, 9_000), 0, 0),
+            10_000.0
+        );
+        assert_eq!(resident_scores(&cheap, &pool), [1.0, 0.0]);
+        let dear = ResidentWork::new(4_000);
+        assert_eq!(
+            resident_scores(&dear, &pool),
+            [0.0, 1.0],
+            "14,000 against 13,000"
+        );
+        // A queued request is held as a running one is.
+        let queued = LoadRow {
+            queued: 1,
+            ..resident(1, 6_000)
+        };
+        assert_eq!(cheap.reported_cost(&pool[0], queued, 0, 0), 8_000.0);
+    }
+
+    /// A dispatch the report does not reflect yet adds its prompt and one
+    /// request's price; a report sampled after it releases both.
+    #[test]
+    fn resident_work_credits_a_dispatch_until_a_report_reflects_it() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 2_000));
+        pool[0].load_sampled_at_micros = 1_000;
+        pool[1].load = Some(resident(1, 4_000));
+        pool[1].load_sampled_at_micros = 1_000;
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0]);
+
+        let lease = Lease {
+            issued_micros: 2_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        assert_eq!(rw.held_at(pool[0].id, 0), 1);
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            [0.0, 1.0],
+            "2,000 + 1,500 + 1,000 for each of two requests, against 5,000"
+        );
+
+        pool[0].load_sampled_at_micros = 3_000;
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0]);
+        assert_eq!(rw.held_at(pool[0].id, 0), 0);
+
+        // A removed worker leaves no credit behind.
+        rw.on_dispatched(&lease, &target_of(&pool[1]), Side::Single, 0);
+        rw.on_membership(&Membership::Removed(pool[1].id));
+        assert_eq!(rw.held_at(pool[1].id, 0), 0);
+    }
+
+    /// A report releases the dispatches it reflects whether or not the score
+    /// reads their credit. A rank whose report counts no resident tokens
+    /// scores from its peers, and holds a dispatch only until a report
+    /// sampled after it.
+    #[test]
+    fn a_report_that_counts_no_resident_tokens_still_releases_its_dispatches() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 1)];
+        pool[0].load = Some(uncounted(1));
+        pool[0].load_sampled_at_micros = 1_000;
+        pool[1].load = Some(resident(1, 4_000));
+        pool[1].load_sampled_at_micros = 1_000;
+        let lease = Lease {
+            issued_micros: 2_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        let before = resident_scores(&rw, &pool);
+        assert_eq!(
+            rw.held_at(pool[0].id, 0),
+            1,
+            "the report predates the dispatch"
+        );
+
+        pool[0].load_sampled_at_micros = 3_000;
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            before,
+            "the score reads no credit of that rank"
+        );
+        assert_eq!(rw.held_at(pool[0].id, 0), 0);
+    }
+
+    /// A credit is its rank's: a dispatch to rank 1 of a worker prices that
+    /// rank's row and leaves rank 0's alone.
+    #[test]
+    fn a_dispatch_is_credited_to_the_rank_it_went_to() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[1].id = pool[0].id;
+        pool[1].dp_rank = 1;
+        for c in &mut pool {
+            c.load = Some(resident(1, 2_000));
+            c.load_sampled_at_micros = 1_000;
+        }
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 1.0]);
+
+        let lease = Lease {
+            issued_micros: 2_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&lease, &target_of(&pool[1]), Side::Single, 0);
+        assert_eq!(
+            (rw.held_at(pool[0].id, 0), rw.held_at(pool[0].id, 1)),
+            (0, 1)
+        );
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            [1.0, 0.0],
+            "3,000 on rank 0 against 2,000 + 1,500 + 1,000 for each of two requests on rank 1"
+        );
+    }
+
+    /// The mean context is the resident tokens over the requests the report
+    /// holds, the queued with the running: 8,000 tokens over two running and
+    /// two queued price the one request in transit at 2,000.
+    #[test]
+    fn the_mean_context_counts_the_queued_requests_with_the_running() {
+        let rw = ResidentWork::new(1_000);
+        let busy = candidate(0, 5);
+        let row = LoadRow {
+            queued: 2,
+            ..resident(2, 8_000)
+        };
+        assert_eq!(
+            rw.reported_cost(&busy, row, 0, 0),
+            8_000.0 + 2_000.0 + 5.0 * 1_000.0
+        );
+    }
+
+    /// The band is the scorer's own, on its score in tokens, and not the
+    /// plain band of a normalized score: with one worker two million tokens
+    /// behind, two workers a token apart are still not a tie.
+    #[test]
+    fn a_token_apart_is_not_a_tie_under_a_wide_spread() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 1), candidate(2, 1)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(resident(1, 5_001));
+        pool[2].load = Some(resident(1, 2_005_000));
+        let mut scores = [0.0f32; 3];
+        let band = rw.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert!(scores[0] - scores[1] > band.0, "{scores:?} {band:?}");
+        for seed in 0..300u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            Best.pick(&facts, &pool, &kept(3), &scores, band, &mut out);
+            assert_eq!(out.first().map(|t| t.position), Some(0), "seed {seed}");
+        }
+    }
+
+    /// The requests the host holds beyond the report and the credit are in
+    /// transit: each is priced at the worker's mean context and at the
+    /// request price; a worker that reports nothing held prices them at the
+    /// mean prefill.
+    #[test]
+    fn resident_work_prices_the_requests_in_transit_at_the_workers_mean_context() {
+        let rw = ResidentWork::new(1_000);
+        let busy = candidate(0, 5);
+        // Two reported requests hold 8,000 tokens, a mean context of 4,000;
+        // three more are in transit.
+        assert_eq!(
+            rw.reported_cost(&busy, resident(2, 8_000), 0, 0),
+            8_000.0 + 3.0 * 4_000.0 + 5.0 * 1_000.0
+        );
+        // One of the three is a credited dispatch of 1,500 tokens.
+        assert_eq!(
+            rw.reported_cost(&busy, resident(2, 8_000), 1_500, 1),
+            8_000.0 + 1_500.0 + 2.0 * 4_000.0 + 5.0 * 1_000.0
+        );
+        let idle = candidate(1, 2);
+        assert_eq!(
+            rw.reported_cost(&idle, resident(0, 0), 0, 0),
+            2.0 * DEFAULT_MEAN_PREFILL_TOKENS as f32 + 2.0 * 1_000.0
+        );
+    }
+
+    /// A worker whose report does not count resident tokens, or that has no
+    /// report, starts from the best reporting peer and adds its in-flight
+    /// requests, each at the mean prefill and the request price.
+    #[test]
+    fn a_worker_without_resident_tokens_scores_from_the_best_reporting_peer() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 2), candidate(2, 0)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(uncounted(2));
+        // 6,000; 6,000 + 2 * 2,024; and the unreported idle worker at 6,000.
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0, 1.0]);
+    }
+
+    /// The peer it starts from is the best one, not the worst, and each of
+    /// its requests in flight costs the mean prefill and the request price:
+    /// between a peer at 6,000 and a peer at 14,096, two requests in flight
+    /// put it at 6,000 + 2 * 2,024, the exact middle.
+    #[test]
+    fn a_worker_without_resident_tokens_is_priced_between_two_reporting_peers() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 2), candidate(2, 1)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(uncounted(2));
+        pool[2].load = Some(resident(1, 13_096));
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn with_no_survivor_reporting_resident_tokens_the_in_flight_count_decides() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 3), candidate(1, 1), candidate(2, 2)];
+        pool[0].load = Some(uncounted(3));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0, 0.5]);
+    }
+
+    /// In a fleet whose engines do not count resident tokens, a report that
+    /// reads idle is no reporting peer: the in-flight count decides, and the
+    /// worker the host holds thirty requests on does not take the next one.
+    #[test]
+    fn an_idle_report_without_the_count_makes_no_reporting_peer() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 30), candidate(1, 1)];
+        pool[0].load = Some(uncounted(0));
+        pool[1].load = Some(uncounted(1));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0]);
+    }
+
+    /// A count of zero and no count are two reports. The idle worker of an
+    /// engine that counts resident tokens scores least, and so does one
+    /// whose running request has nothing resident yet; the idle worker of an
+    /// engine that does not count them ties with the best reporting peer.
+    #[test]
+    fn a_count_of_zero_is_not_a_report_without_the_count() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(resident(0, 0));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0]);
+        pool[1].load = Some(uncounted(0));
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 1.0]);
+        pool[1] = candidate(1, 1);
+        pool[1].load = Some(resident(1, 0));
+        assert_eq!(resident_scores(&rw, &pool), [0.0, 1.0]);
+    }
+
+    /// Equal work is one tie, and a token apart is not: the band is the
+    /// least-load scorer's, on a score in tokens.
+    #[test]
+    fn equal_resident_work_ties_and_a_token_apart_does_not() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 1), candidate(1, 1), candidate(2, 1)];
+        pool[0].load = Some(resident(1, 5_000));
+        pool[1].load = Some(resident(1, 5_000));
+        pool[2].load = Some(resident(1, 5_001));
+        let mut scores = [0.0f32; 3];
+        let band = rw.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert_eq!(scores, [1.0, 1.0, 0.0]);
+        assert!(band.0 < 1.0, "{band:?}");
+        let mut picks = [0usize; 3];
+        for seed in 0..300u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            Best.pick(&facts, &pool, &kept(3), &scores, band, &mut out);
+            picks[out.first().map(|t| t.position).unwrap_or(0) as usize] += 1;
+        }
+        assert!(picks[0] > 100 && picks[1] > 100, "{picks:?}");
+        assert_eq!(picks[2], 0, "{picks:?}");
+    }
+
     #[test]
     fn power_of_two_takes_the_better_scored_of_two_draws() {
         let pool = [candidate(0, 9), candidate(1, 9), candidate(2, 0)];
-        let mut scores = [0.0f32; 3];
-        LeastRequests.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        let least_requests = |rows: &[u32]| {
+            let mut scores = vec![0.0f32; rows.len()];
+            LeastRequests.score(&RequestFacts::default(), &pool, rows, &mut scores);
+            scores
+        };
         let mut hits = 0;
         for seed in 0..100u64 {
             let facts = RequestFacts {
                 seed,
                 ..RequestFacts::default()
             };
-            let mut out = Targets::new();
-            PowerOfTwo.pick(
-                &facts,
-                &pool,
-                &kept(3),
-                &scores,
-                TieBand::NORMALIZED,
-                &mut out,
-            );
-            assert_eq!(out.len(), 2);
-            if out.first().map(|t| t.position) == Some(2) {
+            let order = picked(&PowerOfTwo, &facts, &pool, &least_requests);
+            assert_eq!(order.len(), 2);
+            if order[0] == 2 {
                 hits += 1;
             }
         }
@@ -1898,33 +2588,19 @@ mod tests {
     #[test]
     fn count_first_takes_the_fewest_in_flight_before_any_score() {
         let pool = [candidate(0, 0), candidate(1, 1), candidate(2, 2000)];
-        let scores = [0.0f32, 1.0, 0.49];
+        let by_position = |rows: &[u32]| -> Vec<f32> {
+            rows.iter()
+                .map(|&row| [0.0f32, 1.0, 0.49][row as usize])
+                .collect()
+        };
         for seed in 0..20u64 {
             let facts = RequestFacts {
                 seed,
                 ..RequestFacts::default()
             };
-            let mut out = Targets::new();
-            CountFirst.pick(
-                &facts,
-                &pool,
-                &kept(3),
-                &scores,
-                TieBand::NORMALIZED,
-                &mut out,
-            );
-            let order: Vec<u32> = out.iter().map(|t| t.position).collect();
+            let order = picked(&CountFirst, &facts, &pool, &by_position);
             assert_eq!(order, [0, 1, 2], "seed {seed}");
-            let mut pair = Targets::new();
-            PowerOfTwoCountFirst.pick(
-                &facts,
-                &pool,
-                &kept(3),
-                &scores,
-                TieBand::NORMALIZED,
-                &mut pair,
-            );
-            let drawn: Vec<u32> = pair.iter().map(|t| t.position).collect();
+            let drawn = picked(&PowerOfTwoCountFirst, &facts, &pool, &by_position);
             assert_eq!(drawn.len(), 2, "seed {seed}");
             assert!(
                 pool[drawn[0] as usize].in_flight <= pool[drawn[1] as usize].in_flight,
@@ -1934,8 +2610,9 @@ mod tests {
         }
     }
 
-    /// Equal counts fall to the score, compared exactly; an exact tie on
-    /// both is drawn from the seed; the alternates keep the order.
+    /// Equal counts fall to the score; an exact tie on both is drawn from
+    /// the seed, as every tie within the band is; the alternates keep the
+    /// order.
     #[test]
     fn count_first_breaks_equal_counts_by_the_score_and_exact_ties_by_the_seed() {
         let pool = [
@@ -1944,28 +2621,362 @@ mod tests {
             candidate(2, 3),
             candidate(3, 7),
         ];
-        let scores = [0.2f32, 0.9, 0.9, 1.0];
+        let by_position = |rows: &[u32]| -> Vec<f32> {
+            rows.iter()
+                .map(|&row| [0.2f32, 0.9, 0.9, 1.0][row as usize])
+                .collect()
+        };
         let mut firsts = std::collections::BTreeSet::new();
         for seed in 0..40u64 {
             let facts = RequestFacts {
                 seed,
                 ..RequestFacts::default()
             };
-            let mut out = Targets::new();
-            CountFirst.pick(
-                &facts,
-                &pool,
-                &kept(4),
-                &scores,
-                TieBand::NORMALIZED,
-                &mut out,
-            );
-            let order: Vec<u32> = out.iter().map(|t| t.position).collect();
+            let order = picked(&CountFirst, &facts, &pool, &by_position);
             assert!(order[0] == 1 || order[0] == 2, "{order:?}");
             assert_eq!((order[2], order[3]), (0, 3), "{order:?}");
             firsts.insert(order[0]);
         }
         assert_eq!(firsts.len(), 2, "an exact tie is drawn from the seed");
+    }
+
+    /// The fewest in flight are the set count-first compares: a scorer never
+    /// sees a worker that holds more, whatever its score would be, and the
+    /// workers passed over still follow as alternates by count.
+    #[test]
+    fn count_first_scores_the_fewest_in_flight_alone() {
+        let pool = [
+            candidate(0, 9),
+            candidate(1, 3),
+            candidate(2, 5),
+            candidate(3, 3),
+            candidate(4, 4),
+        ];
+        let seen = std::cell::RefCell::new(Vec::new());
+        let record = |rows: &[u32]| -> Vec<f32> {
+            seen.borrow_mut().push(rows.to_vec());
+            rows.iter()
+                .map(|&row| [0.0f32, 0.1, 0.2, 0.3, 0.4][row as usize])
+                .collect()
+        };
+        let order = picked(&CountFirst, &RequestFacts::default(), &pool, &record);
+        assert_eq!(*seen.borrow(), [vec![1, 3]], "the two that hold three");
+        assert_eq!(
+            order,
+            [3, 1, 4, 2],
+            "the better score of the two, then the next by count, wherever they sit"
+        );
+    }
+
+    /// A drawn pair of equal scores is led by an even draw: the third value
+    /// of the seed's stream, between the two rows as the pool lists them.
+    /// Over many seeds every worker leads as often as another, wherever it
+    /// sits in the pool. (The stream's first value read again over the two
+    /// rows would favor a row by where it sits.)
+    #[test]
+    fn a_tie_of_two_draws_is_broken_evenly_wherever_the_rows_sit() {
+        let pool = [
+            candidate(0, 1),
+            candidate(1, 1),
+            candidate(2, 1),
+            candidate(3, 1),
+        ];
+        let level = |rows: &[u32]| vec![0.5f32; rows.len()];
+        for picker in [&PowerOfTwo as &dyn Picker, &PowerOfTwoCountFirst] {
+            let mut leads = [0u32; 4];
+            for seed in 0..4_000u64 {
+                let facts = RequestFacts {
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let order = picked(picker, &facts, &pool, &level);
+                let mut stream = Draw::new(seed);
+                let a = stream.below(4) as u32;
+                let mut b = stream.below(3) as u32;
+                if b >= a {
+                    b += 1;
+                }
+                let lead = if stream.below(2) == 0 {
+                    a.min(b)
+                } else {
+                    a.max(b)
+                };
+                assert_eq!(order, [lead, a + b - lead], "seed {seed}");
+                leads[order[0] as usize] += 1;
+            }
+            assert!(
+                leads.iter().all(|n| (850..=1150).contains(n)),
+                "{}: {leads:?}",
+                picker.name()
+            );
+        }
+    }
+
+    /// The band is the scorers' word on what they cannot tell apart, and
+    /// every picker that compares scores reads it: two workers of one count
+    /// whose scores lie within the band are a tie and drawn evenly, and two
+    /// further apart are not.
+    #[test]
+    fn scores_within_the_band_are_a_tie_for_every_picker_that_compares_them() {
+        let pair = [candidate(0, 2), candidate(1, 2)];
+        let near = |rows: &[u32]| -> Vec<f32> {
+            rows.iter()
+                .map(|&row| [0.50f32, 0.56][row as usize])
+                .collect()
+        };
+        for picker in [
+            &PowerOfTwo as &dyn Picker,
+            &PowerOfTwoCountFirst,
+            &CountFirst,
+        ] {
+            let mut leads = [0u32; 2];
+            for seed in 0..2_000u64 {
+                let facts = RequestFacts {
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let within = picked_within(picker, &facts, &pair, &near, TieBand(0.1));
+                leads[within[0] as usize] += 1;
+                let apart = picked_within(picker, &facts, &pair, &near, TieBand(0.05));
+                assert_eq!(
+                    apart,
+                    [1, 0],
+                    "{}, seed {seed}: the higher score",
+                    picker.name()
+                );
+            }
+            assert!(
+                leads.iter().all(|n| (850..=1150).contains(n)),
+                "{}: {leads:?}",
+                picker.name()
+            );
+        }
+    }
+
+    /// The engine has one band rule: the rows within the band of the best
+    /// score are drawn from, whatever order the pool lists them in. Three
+    /// near neighbours whose ends lie more than the band apart are listed in
+    /// each of their six orders: under the best picker and under count-first
+    /// the lowest is no part of the draw, and the other two share it. (A tie
+    /// walked against a running best would chain: the lowest would be drawn
+    /// wherever a neighbour of it is listed before the best.)
+    #[test]
+    fn a_tie_is_drawn_within_the_band_of_the_best_whatever_the_order_of_the_rows() {
+        let chain = [candidate(0, 2), candidate(1, 2), candidate(2, 2)];
+        let steps = [0.50f32, 0.58, 0.66];
+        for order in [
+            [0usize, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let listed = |rows: &[u32]| -> Vec<f32> {
+                rows.iter().map(|&row| steps[order[row as usize]]).collect()
+            };
+            for picker in [&Best as &dyn Picker, &CountFirst] {
+                // How often each step of the chain leads, the lowest first.
+                let mut leads = [0u32; 3];
+                for seed in 0..2_000u64 {
+                    let facts = RequestFacts {
+                        seed,
+                        ..RequestFacts::default()
+                    };
+                    let ranked = picked_within(picker, &facts, &chain, &listed, TieBand(0.1));
+                    leads[order[ranked[0] as usize]] += 1;
+                }
+                assert_eq!(leads[0], 0, "{}, {order:?}: {leads:?}", picker.name());
+                assert!(
+                    leads[1..].iter().all(|n| (850..=1150).contains(n)),
+                    "{}, {order:?}: {leads:?}",
+                    picker.name()
+                );
+            }
+        }
+    }
+
+    /// Count-first orders no more of the workers it passed over than the
+    /// target list has room for behind the fewest in flight: the narrowing
+    /// costs the list's room times the pool, never the pool's square. The
+    /// ones it orders go by count, and equal counts are drawn.
+    #[test]
+    fn count_first_orders_no_more_alternates_than_the_target_list_has_room_for() {
+        let narrowed = |pool: &[Candidate]| {
+            let rows = &mut kept(pool.len() as u32);
+            let narrowed = CountFirst.narrow(&RequestFacts::default(), pool, rows);
+            (narrowed.compared, narrowed.alternates)
+        };
+        // Two hold one request and eight hold more: two of the eight follow.
+        let spread: Vec<Candidate> = (0..10).map(|i| candidate(i, i.max(1))).collect();
+        assert_eq!(narrowed(&spread), (2, MAX_TARGETS - 2));
+        // The fewest fill the list alone: no worker behind them is ordered.
+        let level: Vec<Candidate> = (0..10).map(|i| candidate(i, 3)).collect();
+        assert_eq!(narrowed(&level), (10, 0));
+        // Fewer behind the fewest than the list has room for: all of them.
+        let short = [candidate(0, 5), candidate(1, 2), candidate(2, 7)];
+        assert_eq!(narrowed(&short), (1, 2));
+        // Four workers hold the next count and two of them follow, drawn:
+        // over the seeds each of the four stands first among the alternates,
+        // so a share does not follow where a host lists a worker.
+        let counts = [1u32, 1, 2, 2, 2, 2, 5, 6, 7, 8];
+        let tied: Vec<Candidate> = (0..10).map(|i| candidate(i, counts[i as usize])).collect();
+        let mut firsts = std::collections::BTreeSet::new();
+        for seed in 0..64u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut rows = kept(10);
+            let narrowed = CountFirst.narrow(&facts, &tied, &mut rows);
+            assert_eq!(narrowed.alternates, 2, "seed {seed}");
+            assert!(
+                rows[2] != rows[3] && rows[2..4].iter().all(|row| (2..6).contains(row)),
+                "seed {seed}: {rows:?}"
+            );
+            firsts.insert(rows[2]);
+        }
+        assert_eq!(
+            firsts,
+            std::collections::BTreeSet::from([2, 3, 4, 5]),
+            "equal counts are drawn, never taken as listed"
+        );
+    }
+
+    /// Count-first handed rows that were never narrowed applies its rule a
+    /// slot: the fewest in flight of the rows left, and among those the tie
+    /// within the band of the best score. A plugin picker's fallback is
+    /// handed every survivor with their scores: it picks as the engine's
+    /// order does over the same scores, whatever the busier rows score. The
+    /// two orders are one past the fewest too because this pool holds each
+    /// higher count once: among equal counts there the pick goes by the
+    /// scores it was handed, where the narrowing draws them unscored.
+    #[test]
+    fn count_first_over_rows_that_were_not_narrowed_picks_as_the_engines_order_does() {
+        let pool = [
+            candidate(0, 4),
+            candidate(1, 2),
+            candidate(2, 5),
+            candidate(3, 2),
+            candidate(4, 3),
+            candidate(5, 2),
+        ];
+        // Of the three that hold two requests, two tie within the band and
+        // one lies below it; the busier rows hold the best scores.
+        let scores = [0.9f32, 0.52, 1.0, 0.30, 0.95, 0.56];
+        let by_position =
+            |rows: &[u32]| -> Vec<f32> { rows.iter().map(|&row| scores[row as usize]).collect() };
+        let band = TieBand(0.1);
+        let mut leads = std::collections::BTreeSet::new();
+        for seed in 0..200u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            CountFirst.pick(&facts, &pool, &kept(6), &scores, band, &mut out);
+            let whole: Vec<u32> = out.iter().map(|t| t.position).collect();
+            assert_eq!(
+                whole,
+                picked_within(&CountFirst, &facts, &pool, &by_position, band),
+                "seed {seed}"
+            );
+            assert_eq!(
+                (whole[2], whole[3]),
+                (3, 4),
+                "seed {seed}: the last of the fewest, then the next count"
+            );
+            leads.insert(whole[0]);
+        }
+        assert_eq!(
+            leads,
+            std::collections::BTreeSet::from([1, 5]),
+            "the two within the band are drawn"
+        );
+    }
+
+    /// A two-draw pick handed rows that were never narrowed draws its own
+    /// two, the two its narrowing would have put in front. A plugin picker's
+    /// fallback is handed every survivor with their scores: it picks as the
+    /// engine's order does over the same scores.
+    #[test]
+    fn a_two_draw_pick_over_rows_that_were_not_narrowed_draws_its_own_two() {
+        let pool = [
+            candidate(0, 4),
+            candidate(1, 2),
+            candidate(2, 4),
+            candidate(3, 2),
+            candidate(4, 3),
+        ];
+        // The scores tie two by two, so the tie's draw is in the case.
+        let scores = [0.3f32, 0.3, 0.7, 0.7, 0.5];
+        let by_position =
+            |rows: &[u32]| -> Vec<f32> { rows.iter().map(|&row| scores[row as usize]).collect() };
+        let mut leads = std::collections::BTreeSet::new();
+        for picker in [&PowerOfTwo as &dyn Picker, &PowerOfTwoCountFirst] {
+            for seed in 0..200u64 {
+                let facts = RequestFacts {
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let mut out = Targets::new();
+                picker.pick(
+                    &facts,
+                    &pool,
+                    &kept(5),
+                    &scores,
+                    TieBand::NORMALIZED,
+                    &mut out,
+                );
+                let whole: Vec<u32> = out.iter().map(|t| t.position).collect();
+                assert_eq!(
+                    whole,
+                    picked(picker, &facts, &pool, &by_position),
+                    "{}, seed {seed}",
+                    picker.name()
+                );
+                leads.insert(whole[0]);
+            }
+        }
+        assert_eq!(leads.len(), 5, "the draw reaches every row: {leads:?}");
+    }
+
+    /// Count-first draws from two streams of the decision's seed that share
+    /// no value: the tie among the fewest from the seed's own stream, as the
+    /// best picker draws it, and the order of equal counts among the workers
+    /// passed over from the seed under the alternates' mask. Two tied
+    /// leaders over two tied followers so fall four ways, each about as
+    /// often. (One stream begun twice would tie the two draws: two ways of
+    /// the four.)
+    #[test]
+    fn count_first_draws_its_tie_and_its_alternates_from_streams_that_share_no_value() {
+        let pool = [
+            candidate(0, 1),
+            candidate(1, 1),
+            candidate(2, 4),
+            candidate(3, 4),
+        ];
+        let level = |rows: &[u32]| vec![0.5f32; rows.len()];
+        let mut ways = [0u32; 4];
+        for seed in 0..4_000u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let order = picked(&CountFirst, &facts, &pool, &level);
+            assert_eq!(order.len(), 4);
+            assert!(order[0] < 2 && order[1] < 2, "the fewest lead: {order:?}");
+            // A later row of a tie takes the lead when its draw is zero.
+            let follower = if Draw::new(seed ^ ALTERNATES_STREAM).below(2) == 0 {
+                3
+            } else {
+                2
+            };
+            let leader = if Draw::new(seed).below(2) == 0 { 1 } else { 0 };
+            assert_eq!((order[0], order[2]), (leader, follower), "seed {seed}");
+            ways[(order[0] * 2 + order[2] - 2) as usize] += 1;
+        }
+        assert!(ways.iter().all(|n| (850..=1150).contains(n)), "{ways:?}");
     }
 
     #[test]
@@ -1996,7 +3007,7 @@ mod tests {
             position: 0,
             id: WorkerId(1),
             dp_rank: 0,
-            pair: Some(crate::decision::Pair {
+            pair: Some(Pair {
                 decode_position: 0,
                 decode_id: WorkerId(2),
                 decode_dp_rank: 0,
@@ -2071,7 +3082,7 @@ mod tests {
             position: 0,
             id: WorkerId(1),
             dp_rank: 0,
-            pair: Some(crate::decision::Pair {
+            pair: Some(Pair {
                 decode_position: 1,
                 decode_id: WorkerId(7),
                 decode_dp_rank: 1,
@@ -2584,14 +3595,10 @@ mod tests {
             ..RequestFacts::default()
         };
         let mut pool = [candidate(0, 0), candidate(1, 0)];
-        pool[0].overlap_blocks = 2;
         pool[1].session_hit = true;
         let mut scores = [0.0f32; 2];
-        PrefixAffinity.score(&facts, &pool, &kept(2), &mut scores);
-        assert_eq!(scores, [0.5, 0.0]);
         SessionAffinity.score(&facts, &pool, &kept(2), &mut scores);
         assert_eq!(scores, [0.0, 1.0]);
-        assert!(PrefixAffinity.needs().token_hashes && PrefixAffinity.needs().events);
         assert!(SessionAffinity.needs().headers);
         assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().loads);
     }

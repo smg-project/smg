@@ -14,7 +14,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use symphony::{
     grammar::{GrammarStart, Options},
-    Format, Grammar, OutputAnswer, OutputChoice, Turn,
+    Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
 };
 use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
@@ -47,16 +47,47 @@ fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Cow<'_, Val
     }
 }
 
-/// `grammar` as the engine's structural tag, written straight from the tree
-/// ([`Grammar::payload_text`], the bytes of `payload().to_string()` without the JSON tree in
-/// between) in the `vocabulary` the worker's grammar compiler takes: spelled without the newer
-/// nodes first for a worker that advertises the older one ([`Grammar::in_older_vocabulary`]), as
-/// the table built it otherwise ([`TagVocabulary`]).
-fn structural_tag(grammar: Grammar, vocabulary: TagVocabulary) -> ToolConstraint {
-    ToolConstraint::StructuralTag(match vocabulary {
-        TagVocabulary::Current => grammar.payload_text(),
-        TagVocabulary::Older => grammar.in_older_vocabulary().payload_text(),
-    })
+/// `grammar` spelled for the worker's grammar backend ([`Grammar::spelled`]): xgrammar's
+/// structural tag, written straight from the tree, in the `vocabulary` the worker's grammar
+/// compiler takes (spelled without the newer nodes for a worker that advertises the older one,
+/// [`TagVocabulary`]); a JSON schema alone rides as the schema constraint the wires carry. Every
+/// worker spells for xgrammar today. A backend with no spelling of the grammar is [`Unspelled`],
+/// and what that counts as follows what the request asked and whose table reads the output: a tag
+/// the table does not have under `auto` ([`auto_tag`]) and for a registry table's forced call or
+/// answer ([`unspelled_tag`]: the older registry decides, as before), a refusal by the backend's
+/// name for the response template's forced call or answer ([`unspelled_tag`]: that table alone
+/// writes them) and for the [`whole_turn`].
+fn structural_tag(
+    grammar: Grammar,
+    vocabulary: TagVocabulary,
+) -> Result<ToolConstraint, Unspelled> {
+    grammar
+        .spelled(GrammarBackend::Xgrammar, vocabulary)
+        .map(|spelling| match spelling {
+            Spelling::StructuralTag(text) => ToolConstraint::StructuralTag(text),
+            Spelling::JsonSchema(text) => ToolConstraint::JsonSchema(text),
+        })
+}
+
+/// What a tag the worker's grammar backend has no spelling of counts as, for `model`'s `asked`:
+/// no tag, which a registry table leaves to the older registry as it leaves a tag it does not
+/// have ([`tagged`]), and which the response template's table (`compiled`) refuses by the
+/// backend's name, since its output has no other syntax the older path could constrain.
+fn unspelled_tag(
+    unspelled: Unspelled,
+    compiled: bool,
+    model: &str,
+    asked: &str,
+) -> Result<Option<ToolConstraint>, SymphonyError> {
+    if compiled {
+        Err(SymphonyError::Constraint(format!(
+            "model '{model}' reads its output with its response template, whose structural tag \
+             for {asked} the {} grammar backend has no spelling of",
+            unspelled.backend
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The constraint `grammar` gives, written straight from the tree as the request carries it, in
@@ -65,7 +96,8 @@ fn structural_tag(grammar: Grammar, vocabulary: TagVocabulary) -> ToolConstraint
 /// table with no tag leaves the older registry to decide, as before; the template's table refuses
 /// instead, since its output has no other syntax the older path could constrain and the table
 /// still read, and so does a prompt that `continues` the assistant's message, since the tag
-/// writes a turn from its start.
+/// writes a turn from its start. A tag the worker's grammar backend has no spelling of counts
+/// as no tag ([`unspelled_tag`]).
 pub(super) fn tagged(
     grammar: Option<Grammar>,
     vocabulary: TagVocabulary,
@@ -79,7 +111,10 @@ pub(super) fn tagged(
             "model '{model}' constrains {asked} from the start of a new assistant message, as its \
              response template writes one, so it cannot continue the assistant's message"
         ))),
-        Some(grammar) => Ok(Some(structural_tag(grammar, vocabulary))),
+        Some(grammar) => match structural_tag(grammar, vocabulary) {
+            Ok(constraint) => Ok(Some(constraint)),
+            Err(unspelled) => unspelled_tag(unspelled, compiled, model, asked),
+        },
         None if compiled => Err(SymphonyError::Constraint(format!(
             "model '{model}' reads its output with its response template, whose table has no \
              structural tag for {asked}"
@@ -181,7 +216,7 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
 /// them names in its `constrained_decoding_start` label (parsed once at its construction,
-/// [`WorkerMetadata::decoding`](crate::worker::metadata::WorkerMetadata::decoding): this walk runs on every
+/// [`WorkerMetadata::decoding`](crate::worker::identity::metadata::WorkerMetadata::decoding): this walk runs on every
 /// request and looks nothing up), a prefill or encode worker left out
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
 /// role added later is left out until it is named); `Either` when one that starts at the first
@@ -250,10 +285,25 @@ pub(crate) enum Asks<'a> {
         request: &'a CreateMessageRequest,
         /// The prompt continues the assistant's message.
         continues: bool,
+        /// The request declared a `tools` field (an empty list being a declaration), as its
+        /// response spec recorded it: the route takes the tools out of a request it still owns,
+        /// so the request's own field reads `None` past the route.
+        has_tools: bool,
     },
 }
 
 impl<'a> Asks<'a> {
+    /// A Messages request's ask over a request that still carries its tools, as the tests build
+    /// theirs: the declaration is the request's own field.
+    #[cfg(test)]
+    pub(crate) fn for_messages(request: &'a CreateMessageRequest, continues: bool) -> Self {
+        Self::Messages {
+            request,
+            continues,
+            has_tools: request.tools.is_some(),
+        }
+    }
+
     pub(crate) fn model(self) -> &'a str {
         match self {
             Self::Chat(request) => &request.model,
@@ -432,7 +482,7 @@ impl<'a> Asks<'a> {
     pub(super) fn no_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
             Self::Chat(request) => !scans_for_tool_calls_for(request, provider),
-            Self::Messages { request, .. } => request.tools.is_none(),
+            Self::Messages { has_tools, .. } => !has_tools,
         }
     }
 
@@ -450,10 +500,9 @@ impl<'a> Asks<'a> {
                     Some(ToolChoice::Value(ToolChoiceValue::None))
                 ) && scans_for_tool_calls_for(request, provider)
             }
-            Self::Messages { request, .. } => {
-                matches!(request.tool_choice, Some(MessagesToolChoice::None))
-                    && request.tools.is_some()
-            }
+            Self::Messages {
+                request, has_tools, ..
+            } => matches!(request.tool_choice, Some(MessagesToolChoice::None)) && has_tools,
         }
     }
 
@@ -578,6 +627,7 @@ pub(crate) fn constraint_for(
             Some(constraint) => Prepared::Constraint {
                 constraint,
                 first_token: start == GrammarStart::FirstToken,
+                table: true,
             },
             None => Prepared::None,
         });
@@ -600,9 +650,9 @@ pub(crate) fn constraint_for(
 /// callable `tools` with no call required, at most one when parallel calls are off, and
 /// `reasoning_open` when the prompt leaves the model inside its thought. The request asked for
 /// nothing, so nothing is refused: `Ok(None)` when no table reads the response ([`reads`]), the
-/// request takes no tag for its calls ([`Asks::auto_calls`]), or the table has none for them. A
-/// thought and an answer alone are not constrained today. `thought_closed` as for
-/// [`constraint_for`].
+/// request takes no tag for its calls ([`Asks::auto_calls`]), the table has none for them, or
+/// the worker's grammar backend has no spelling of it ([`auto_tag`]). A thought and an answer
+/// alone are not constrained today. `thought_closed` as for [`constraint_for`].
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model"
@@ -636,7 +686,8 @@ pub(crate) fn auto_constraint(
 
 /// The tag of the calls `format` lets a model make under `auto`: no call required, one at most
 /// when `one_call`, in the `vocabulary` the worker's grammar compiler takes; `None` when the
-/// table has no tag for them.
+/// table has no tag for them or the worker's grammar backend has no spelling of it
+/// ([`Unspelled`]): the request asked for no constraint, so none is refused.
 pub(super) fn auto_tag(
     format: &Format,
     tools: &[Tool],
@@ -657,7 +708,7 @@ pub(super) fn auto_tag(
                 start,
             },
         )
-        .map(|grammar| structural_tag(grammar, vocabulary))
+        .and_then(|grammar| structural_tag(grammar, vocabulary).ok())
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known
@@ -681,6 +732,11 @@ pub(crate) enum Prepared {
         /// The older registry's is shaped for the worker at request building, which says then
         /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
         first_token: bool,
+        /// The table built it (its tag for the forced call, `calls_tag`), so the table reads
+        /// the response whatever the constraint's kind; `false` for the older registry's, whose
+        /// output the legacy parsers read, and for the request's own schema where no table
+        /// reads ([`WorkerConstraint::table`]).
+        table: bool,
     },
     /// A JSON answer's tag, which derives for the selected worker's own start as the `auto` tag
     /// does ([`AnswerTag`]): the schema alone behind a reasoning parser's gate or where the engine
@@ -711,12 +767,14 @@ impl Prepared {
 }
 
 impl From<Option<ToolConstraint>> for Prepared {
-    /// The older registry's constraint, as it built it: request building shapes it for the
-    /// worker and says whether it led the tag.
+    /// The older registry's constraint, as it built it (or the request's own schema where no
+    /// table reads): request building shapes it for the worker and says whether it led the
+    /// tag; no table built it.
     fn from(constraint: Option<ToolConstraint>) -> Self {
         constraint.map_or(Self::None, |constraint| Self::Constraint {
             constraint,
             first_token: false,
+            table: false,
         })
     }
 }
@@ -795,7 +853,9 @@ impl fmt::Debug for AnswerTag {
     }
 }
 
-/// The text of a table's structural tag; the schema kind is not built by a table ([`tagged`]).
+/// The text of a table's structural tag; the schema kind, a JSON answer spelled as the schema
+/// alone ([`structural_tag`]), is `None` here, since the attempt stamp writes the answer's own
+/// schema in a tag's place ([`TagForStart::schema`]).
 fn tag_text(constraint: Option<ToolConstraint>) -> Option<String> {
     match constraint? {
         ToolConstraint::StructuralTag(tag) => Some(tag),
@@ -826,6 +886,13 @@ pub(crate) struct WorkerConstraint {
     /// or none, starts where the engine does. Never the older registry's constraint: request
     /// building shapes that one for the worker and says whether it led the tag.
     pub first_token: bool,
+    /// The table built the constraint (the whole turn's grammar, the `auto` tag, a JSON
+    /// answer's tag, a forced call's), so the table reads the response whatever the
+    /// constraint's kind, which a backend's spelling may change; `false` for the older
+    /// registry's forced call, which the legacy parsers read, and where nothing constrains.
+    /// Symphony's assignment reads the older registry's by its kind alone
+    /// (`regular::symphony::assign_for`).
+    pub table: bool,
 }
 
 /// The table's `auto` tag for a request, derived for where a worker's engine starts the grammar on
@@ -864,6 +931,8 @@ pub(crate) enum AutoRequest {
         tools: Arc<[Tool]>,
         /// The prompt continues the assistant's message.
         continues: bool,
+        /// The request declared tools, as its response spec recorded ([`Asks::Messages`]).
+        has_tools: bool,
     },
 }
 
@@ -881,10 +950,12 @@ impl AutoTag {
                 request,
                 tools,
                 continues,
+                has_tools,
             } => (
                 Asks::Messages {
                     request,
                     continues: *continues,
+                    has_tools: *has_tools,
                 },
                 Cow::Borrowed(&tools[..]),
             ),
@@ -925,7 +996,8 @@ impl TagForStart for AutoTag {
             .map_err(String::from)
     }
 
-    /// The `auto` tag stands in for nothing: a worker the table gives none goes unconstrained.
+    /// The `auto` tag stands in for nothing: a worker the table gives none, or whose grammar
+    /// backend spells none, goes unconstrained.
     fn schema(&self) -> Option<&Value> {
         None
     }
@@ -980,6 +1052,7 @@ pub(crate) fn worker_constraint(
                 by_policy: true,
                 table_tag: None,
                 first_token: true,
+                table: true,
             });
         }
     }
@@ -990,30 +1063,33 @@ pub(crate) fn worker_constraint(
     // shaped and spoken for at request building (`utils::tool_constraints_for_worker`).
     let derived_for_first_token =
         |tag: &Option<ToolConstraint>| tag.is_some() && start == GrammarStart::FirstToken;
-    let (constraint, by_policy, table_tag, first_token) = match prepared? {
+    let (constraint, by_policy, table_tag, first_token, table) = match prepared? {
         Prepared::None if always => {
             let auto = auto();
             let tag = auto.for_start(start, vocabulary)?;
             let by_policy = tag.is_some();
             let first_token = derived_for_first_token(&tag);
             let table_tag = by_policy.then(|| -> Arc<dyn TagForStart> { Arc::new(auto) });
-            (tag, by_policy, table_tag, first_token)
+            (tag, by_policy, table_tag, first_token, by_policy)
         }
         Prepared::Answer(answer) => {
             let tag = answer.for_start(start, vocabulary)?;
             let first_token = derived_for_first_token(&tag);
+            let table = tag.is_some();
             (
                 tag,
                 false,
                 Some(answer as Arc<dyn TagForStart>),
                 first_token,
+                table,
             )
         }
         Prepared::Constraint {
             constraint,
             first_token,
-        } => (Some(constraint), false, None, first_token),
-        Prepared::None => (None, false, None, false),
+            table,
+        } => (Some(constraint), false, None, first_token, table),
+        Prepared::None => (None, false, None, false, false),
     };
     Ok(WorkerConstraint {
         constraint,
@@ -1021,6 +1097,7 @@ pub(crate) fn worker_constraint(
         by_policy,
         table_tag,
         first_token,
+        table,
     })
 }
 
@@ -1089,16 +1166,21 @@ fn output_choice(choice: Option<&ToolChoice>) -> OutputChoice {
 }
 
 /// `format`'s grammar for `turn` as the engine's structural tag, in the `vocabulary` the
-/// worker's grammar compiler takes.
+/// worker's grammar compiler takes; refused by the backend's name when that backend has no
+/// spelling of it ([`Unspelled`]): the engine takes the whole turn, so there is no going without.
 pub(super) fn whole_turn(
     format: &Format,
     turn: &Turn<'_>,
     vocabulary: TagVocabulary,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
-    Ok(format
+    format
         .turn_grammar(turn)
         .map_err(SymphonyError::Constraint)?
-        .map(|grammar| structural_tag(grammar, vocabulary)))
+        .map(|grammar| {
+            structural_tag(grammar, vocabulary)
+                .map_err(|unspelled| SymphonyError::Constraint(unspelled.to_string()))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -1107,6 +1189,31 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
+
+    /// A tag the worker's grammar backend has no spelling of counts as a tag the table does not
+    /// have: a registry table's request goes out as before, whatever it asked (the older registry
+    /// decides a forced call or an answer, `auto` asks for no constraint); the response template's
+    /// table refuses by the backend's name, as it refuses a tag it lacks. Every worker spells for
+    /// xgrammar today, so the rule is pinned on the helper that takes the spelling's refusal.
+    #[test]
+    fn an_unspelled_tag_counts_as_a_tag_the_table_does_not_have() {
+        for backend in [GrammarBackend::Llguidance, GrammarBackend::Outlines] {
+            let unspelled = Unspelled { backend };
+            assert!(
+                matches!(
+                    unspelled_tag(unspelled, false, "m", "a forced call"),
+                    Ok(None)
+                ),
+                "a registry table leaves the request as it was"
+            );
+            let refused = unspelled_tag(unspelled, true, "m", "a forced call")
+                .expect_err("the response template's table refuses");
+            let words = refused.to_string();
+            assert!(words.contains(backend.name()), "{words}");
+            assert!(words.contains("model 'm'"), "{words}");
+            assert!(words.contains("a forced call"), "{words}");
+        }
+    }
 
     /// A Messages request's untabled schema is its format's, except under a choice that forces a
     /// call to a declared tool: the turn has no text answer to format, whether or not the call has a
@@ -1132,12 +1239,9 @@ mod tests {
         ]))
         .expect("a tool");
         let asks = |request: &CreateMessageRequest| {
-            Asks::Messages {
-                request,
-                continues: false,
-            }
-            .untabled_answer_schema(&tools)
-            .map(Cow::into_owned)
+            Asks::for_messages(request, false)
+                .untabled_answer_schema(&tools)
+                .map(Cow::into_owned)
         };
         assert_eq!(asks(&request(None)), Some(schema.clone()));
         assert_eq!(
@@ -1158,12 +1262,9 @@ mod tests {
         );
         let forced = request(Some(json!({"type": "any"})));
         assert_eq!(
-            Asks::Messages {
-                request: &forced,
-                continues: false
-            }
-            .untabled_answer_schema(&[])
-            .map(Cow::into_owned),
+            Asks::for_messages(&forced, false)
+                .untabled_answer_schema(&[])
+                .map(Cow::into_owned),
             Some(schema.clone()),
             "no callable tool: the choice forces nothing"
         );
@@ -1203,10 +1304,7 @@ mod tests {
             answer
         };
         let for_chat = answer_of(Asks::Chat(&chat));
-        let for_messages = answer_of(Asks::Messages {
-            request: &messages,
-            continues: false,
-        });
+        let for_messages = answer_of(Asks::for_messages(&messages, false));
         assert_eq!(for_messages.schema(), Some(&schema));
         for start in [
             symphony::GrammarStart::FirstToken,
@@ -1288,6 +1386,7 @@ mod tests {
             let Ok(Prepared::Constraint {
                 constraint: ToolConstraint::StructuralTag(tag),
                 first_token,
+                ..
             }) = super::constraint(
                 ParserChoice::Symphony,
                 &deepseek,
@@ -1343,6 +1442,7 @@ mod tests {
             let Ok(Prepared::Constraint {
                 constraint: ToolConstraint::StructuralTag(tag),
                 first_token,
+                ..
             }) = super::constraint(
                 ParserChoice::Symphony,
                 &kimi,
@@ -1419,6 +1519,7 @@ mod tests {
             let Ok(Prepared::Constraint {
                 constraint: ToolConstraint::StructuralTag(tag),
                 first_token,
+                ..
             }) = super::constraint(
                 ParserChoice::Symphony,
                 &deepseek,
@@ -2008,10 +2109,7 @@ mod tests {
             auto_constraint(
                 ParserChoice::Symphony,
                 &ModelNames::default(),
-                Asks::Messages {
-                    request: &messages_auto,
-                    continues: false
-                },
+                Asks::for_messages(&messages_auto, false),
                 &tools,
                 false,
                 false,
@@ -2025,10 +2123,7 @@ mod tests {
         assert!(auto_constraint(
             ParserChoice::Symphony,
             &ModelNames::default(),
-            Asks::Messages {
-                request: &messages_auto,
-                continues: true
-            },
+            Asks::for_messages(&messages_auto, true),
             &tools,
             false,
             false,
@@ -2045,10 +2140,7 @@ mod tests {
         assert!(auto_constraint(
             ParserChoice::Symphony,
             &ModelNames::default(),
-            Asks::Messages {
-                request: &messages_any,
-                continues: false
-            },
+            Asks::for_messages(&messages_any, false),
             &tools,
             false,
             false,
@@ -2189,10 +2281,10 @@ mod tests {
         let no_calls = super::super::assign(
             symphony,
             &plain,
-            Asks::Messages {
-                request: &message_request(json!({"tool_choice": {"type": "none"}})),
-                continues: false,
-            },
+            Asks::for_messages(
+                &message_request(json!({"tool_choice": {"type": "none"}})),
+                false,
+            ),
             None,
             PROMPT,
             &templates(),
@@ -2205,13 +2297,10 @@ mod tests {
         let forbidden = super::super::assign(
             symphony,
             &plain,
-            Asks::Messages {
-                request: &message_request(json!({
+            Asks::for_messages(&message_request(json!({
                     "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
                     "tool_choice": {"type": "none"}
-                })),
-                continues: false,
-            },
+                })), false),
             None,
             PROMPT,
             &templates(),
@@ -2224,14 +2313,32 @@ mod tests {
             "the table keeps its calls under none over declared tools"
         );
         assert!(forbidden.forbids_calls);
+        // Past the route the request's own `tools` reads `None` (the route took them out while it
+        // owned the request): the declaration the spec recorded is what the table reads.
+        let taken = super::super::assign(
+            symphony,
+            &plain,
+            Asks::Messages {
+                request: &message_request(json!({"tool_choice": {"type": "none"}})),
+                continues: false,
+                has_tools: true,
+            },
+            None,
+            PROMPT,
+            &templates(),
+        )
+        .expect("read")
+        .expect("assigned");
+        assert!(
+            taken.format.call_syntax().is_some(),
+            "the declaration is read from the ask, not from the request's emptied field"
+        );
+        assert!(taken.forbids_calls);
         let constrain = |extra: Value| {
             super::constraint(
                 symphony,
                 &plain,
-                Asks::Messages {
-                    request: &message_request(extra),
-                    continues: false,
-                },
+                Asks::for_messages(&message_request(extra), false),
                 &tools(),
                 false,
                 false,
@@ -2259,10 +2366,7 @@ mod tests {
         let assigned = super::super::assign(
             symphony,
             &plain,
-            Asks::Messages {
-                request: &message_request(json!({})),
-                continues: false,
-            },
+            Asks::for_messages(&message_request(json!({})), false),
             None,
             PROMPT,
             &templates(),
@@ -2281,10 +2385,10 @@ mod tests {
         let why = super::constraint(
             symphony,
             &hf,
-            Asks::Messages {
-                request: &message_request(json!({"tool_choice": {"type": "any"}})),
-                continues: false,
-            },
+            Asks::for_messages(
+                &message_request(json!({"tool_choice": {"type": "any"}})),
+                false,
+            ),
             &tools(),
             false,
             false,
@@ -2334,9 +2438,10 @@ mod tests {
             let auto = decided(Always, start, None);
             assert!(auto.constraint.is_some(), "{start:?}: the auto tag");
             assert_eq!(auto.first_token, start == FirstToken, "{start:?}");
+            assert!(auto.table, "{start:?}: the table built the auto tag");
             let none = decided(Requested, start, None);
             assert!(
-                none.constraint.is_none() && !none.first_token,
+                none.constraint.is_none() && !none.first_token && !none.table,
                 "{start:?}: nothing shaped"
             );
         }
@@ -2345,7 +2450,7 @@ mod tests {
             FirstToken,
             Some(ToolConstraint::StructuralTag("turn".to_string())),
         );
-        assert!(turn.whole_turn && turn.first_token);
+        assert!(turn.whole_turn && turn.first_token && turn.table);
         // A prepared constraint speaks for itself, whatever the worker's start: the table's
         // forced-call tag built for a pool that starts at the first token says so; the older
         // registry's says nothing here, since request building shapes it and speaks for it.
@@ -2360,12 +2465,16 @@ mod tests {
                     Ok(Prepared::Constraint {
                         constraint: ToolConstraint::StructuralTag("prepared".to_string()),
                         first_token: built_for_first_token,
+                        table: true,
                     }),
                     || Ok(None),
                     auto_tag,
                 )
                 .expect("decided");
-                assert!(prepared.constraint.is_some(), "{start:?}: kept as it is");
+                assert!(
+                    prepared.constraint.is_some() && prepared.table,
+                    "{start:?}: kept as it is, the table's"
+                );
                 assert_eq!(
                     prepared.first_token, built_for_first_token,
                     "{start:?}: as the table built it, not as the worker starts"
@@ -2450,6 +2559,7 @@ mod tests {
                     Ok(Prepared::Constraint {
                         constraint: tag("prepared"),
                         first_token: false,
+                        table: true,
                     }),
                     Ok(Some(tag("turn")))
                 ),
@@ -2504,6 +2614,7 @@ mod tests {
                 Ok(Prepared::Constraint {
                     constraint: tag("prepared"),
                     first_token: false,
+                    table: true,
                 }),
                 Ok(None)
             ),
@@ -2532,6 +2643,7 @@ mod tests {
                     Ok(Prepared::Constraint {
                         constraint: tag("prepared"),
                         first_token: false,
+                        table: true,
                     }),
                     Ok(Some(tag("turn")))
                 ),
@@ -2630,6 +2742,10 @@ mod tests {
                 decided.constraint
             );
             assert!(!decided.by_policy && !decided.whole_turn, "{start:?}");
+            assert!(
+                !decided.table,
+                "{start:?}: no tag, so nothing the table built"
+            );
             let stamp = decided
                 .table_tag
                 .expect("the derivation goes with the plan");
@@ -2651,6 +2767,7 @@ mod tests {
         assert_eq!(tag["format"]["elements"][1]["type"], "json_schema", "{tag}");
         assert_eq!(tag["format"]["elements"][1]["json_schema"], schema, "{tag}");
         assert!(!first.by_policy && !first.whole_turn);
+        assert!(first.table, "the tag is the table's");
         // The worker a retry takes, of the other kind, and back.
         let stamp = first.table_tag.expect("the derivation goes with the plan");
         assert_eq!(
@@ -2678,6 +2795,7 @@ mod tests {
         let Ok(Prepared::Constraint {
             constraint: ToolConstraint::StructuralTag(call),
             first_token,
+            ..
         }) = super::constraint(
             ParserChoice::Symphony,
             &deepseek,
@@ -2732,6 +2850,7 @@ mod tests {
                     request: Arc::new(messages.clone()),
                     tools: tools().into(),
                     continues: false,
+                    has_tools: messages.tools.is_some(),
                 },
                 reasoning_open: true,
                 thought_closed: false,
@@ -2755,10 +2874,7 @@ mod tests {
                     AutoRequest::Messages { .. } => auto_constraint(
                         ParserChoice::Symphony,
                         &names,
-                        Asks::Messages {
-                            request: &messages,
-                            continues: false,
-                        },
+                        Asks::for_messages(&messages, false),
                         &tools(),
                         true,
                         false,
@@ -2980,10 +3096,7 @@ mod tests {
             assert_eq!(
                 tag(turn_of(
                     &turn_table(),
-                    Asks::Messages {
-                        request: &messages,
-                        continues: false
-                    },
+                    Asks::for_messages(&messages, false),
                     &messages.chat_tools(),
                     prompt,
                     TagVocabulary::Current,
@@ -3181,5 +3294,35 @@ mod tests {
             }
         }
         assert!(spelled > 0, "no tag carried a newer node");
+    }
+
+    /// The older registry's constraint, which preparation takes where the table gives a forced
+    /// call no tag, is not the table's ([`Prepared::from`]): the decision says so, whatever the
+    /// constraint's kind, and Symphony's assignment then reads it by its kind alone.
+    #[test]
+    fn the_older_registrys_constraint_is_not_the_tables() {
+        use ConstrainedDecoding::Requested;
+        use WorkerGrammarStart::Unknown;
+        for constraint in [
+            ToolConstraint::JsonSchema("{}".to_string()),
+            ToolConstraint::StructuralTag("{}".to_string()),
+        ] {
+            let decided = worker_constraint(
+                WorkerDecoding {
+                    policy: Requested,
+                    start: Unknown,
+                    vocabulary: TagVocabulary::Current,
+                },
+                Ok(Prepared::from(Some(constraint.clone()))),
+                || panic!("requested: the whole turn is not asked"),
+                || panic!("requested: the auto tag is not asked"),
+            )
+            .expect("decided");
+            assert_eq!(
+                decided.constraint.map(|decided| decided.to_tuple()),
+                Some(constraint.to_tuple())
+            );
+            assert!(!decided.table && !decided.first_token && !decided.by_policy);
+        }
     }
 }

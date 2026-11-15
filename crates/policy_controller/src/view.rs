@@ -1,10 +1,11 @@
 //! The bounded view: the per-decision, handle-free picture of one request and
 //! its candidates (design 4.1). Built once per decision by the host into a
 //! reused buffer; every row is `Copy`, and nothing here reaches back into the
-//! host. The names are the wire's: a candidate on the wire is this row without
-//! its position and sample instant, a request this request without its host
-//! clock, and positions into the spec's declared lists (zones, engine kinds,
-//! connectors, labels, headers) are the same positions here.
+//! host. The names are the wire's: a candidate on the wire is this row with
+//! its affinity facts and without its position and sample instant, a request
+//! this request without its host clock and its affinity column, and positions
+//! into the spec's declared lists (zones, engine kinds, connectors, labels,
+//! headers) are the same positions here.
 
 /// The stable identity of a candidate: a hash of the registration key and the
 /// incarnation, never a URL. A same-URL replacement is a new id.
@@ -165,8 +166,13 @@ pub struct LoadRow {
     pub active_kv_permille: u16,
     /// Tokens per second the worker drains; `0` when unknown.
     pub live_rate: u32,
-    /// Context tokens resident for the running requests.
+    /// Context tokens resident for the running requests; `0` too when the
+    /// engine does not count them.
     pub resident_tokens: u32,
+    /// Whether the report counts resident tokens: an engine that does not
+    /// count them sends none, which is not a count of zero. The host's own
+    /// reading of the report, in no plugin's view.
+    pub resident_counted: bool,
     /// Age of the report's sample at the decision, in milliseconds.
     pub report_age_ms: u32,
     /// Where the row came from.
@@ -257,13 +263,57 @@ pub fn fingerprint(key: &[u8]) -> u64 {
     }
 }
 
-/// One candidate row: a worker, or one DP rank of a data-parallel worker.
-/// About 120 bytes in memory; the wire form drops the position and the
-/// sample instant and encodes to about 76 bytes with its load row.
+/// What the affinity stages read of one candidate: a column beside the rows,
+/// by the candidate's index ([`RequestFacts::affinity`]). A host fills it for
+/// a profile whose stages declare it
+/// ([`Needs::affinity`](crate::Needs::affinity)) and for no other, so a
+/// decision that reads none of it copies none of it. `Default` is nothing
+/// held by a worker just admitted, which is what every candidate reads as
+/// when the column is empty. On a wire the five are fields of the
+/// candidate's own record, at the numbers they were given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AffinityFacts {
+    /// Prefix blocks of the request this worker holds, by the event index.
+    pub overlap_blocks: u32,
+    /// The same by the sent-prefix predictor.
+    pub predicted_blocks: u32,
+    /// Milliseconds since the worker was admitted to the pool, saturating at
+    /// `u32::MAX` as `report_age_ms` does; never wrapping.
+    pub admitted_age_ms: u32,
+    /// Blocks the index learned about the worker since admission.
+    pub indexed_growth: u32,
+    /// Blocks the index holds for the worker: what a warm-up stage reads
+    /// thinness from, against the fleet's level.
+    pub indexed_blocks: u32,
+}
+
+/// One candidate row: a worker, or one DP rank of a data-parallel worker:
+/// what every decision reads. Its fields take 104 bytes, and the row is
+/// aligned to a 64-byte cache line: 128 bytes in memory, every row on a
+/// line's start.
+///
+/// The alignment is measured. The filters walk the rows once a filter, and
+/// where the pull-request bench gate runs, such a pass over 512 rows read 5
+/// to 11 percent slower at a stride of 96, 104 or 112 bytes than at 128,
+/// wherever the flags sat in the row. A build host read the narrower
+/// strides faster, so a change of the row's size or alignment carries the
+/// decision bench (`benches/decision.rs`) on both.
+///
+/// The wire form drops the position and the sample instant, carries the
+/// candidate's [`AffinityFacts`] in the same record and encodes to about 76
+/// bytes with its load row.
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(align(64))]
 pub struct Candidate {
     /// The row's position in the host's candidate slice; targets name it.
-    /// In-process only: the wire names rows by their order.
+    /// In-process only: the wire names rows by their order. It is also the
+    /// row's index in the slice the decision is made over (its own side's
+    /// pool on a pair): the plugin's filter adapter asks for its row by it
+    /// and the pair plan looks a chosen prefill up by it. A filter's `keep`
+    /// takes one row and no index, so a filter that read the affinity
+    /// column there would have to read it at the position; no filter of
+    /// this crate does. A debug build asserts that the two agree where a
+    /// decision takes its inputs; a release build does not check.
     pub position: u32,
     pub id: WorkerId,
     pub role: Role,
@@ -287,10 +337,6 @@ pub struct Candidate {
     /// now and leave a load scorer's credit. In-process only; the wire carries
     /// the row's age.
     pub load_sampled_at_micros: u64,
-    /// Prefix blocks of the request this worker holds, by the event index.
-    pub overlap_blocks: u32,
-    /// The same by the sent-prefix predictor.
-    pub predicted_blocks: u32,
     /// The session key of the request is pinned to this worker.
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker.
@@ -304,11 +350,6 @@ pub struct Candidate {
     /// Host-supplied admission bit: the decode's running window has a room
     /// nobody waiting at its gate is in line for.
     pub has_room: bool,
-    /// Milliseconds since the worker was admitted to the pool, saturating at
-    /// `u32::MAX` as `report_age_ms` does; never wrapping.
-    pub admitted_age_ms: u32,
-    /// Blocks the index learned about the worker since admission.
-    pub indexed_growth: u32,
     /// The zone, as a position into the spec's declared list; `0` when
     /// unzoned.
     pub zone: u16,
@@ -334,9 +375,8 @@ pub struct Candidate {
     /// index owns first: by the birthday bound, n(n - 1) / 2 over 2^32, about
     /// one chance in 8,600 over a pool of a thousand and one in 870,000 over
     /// a hundred; the 64-bit form waits for the candidate's byte budget.
-    /// Zero when the host carries none. Last in the record (the wire numbers
-    /// its fields in the record's order; this one came after the contract's
-    /// first cut).
+    /// Zero when the host carries none. After the contract's first cut (the
+    /// wire numbers its fields in the record's order).
     pub key: u32,
 }
 
@@ -393,9 +433,49 @@ pub struct RequestFacts<'a> {
     /// The per-decision seed, recorded in the trace: the only randomness a
     /// stage gets.
     pub seed: u64,
+    /// The size in tokens of one of the request's blocks as the host
+    /// counted them: an index's learned block size on an event-fed request,
+    /// the configured one on a tree-fed request; `0` reads the view's. Last
+    /// on the wire (the numbering follows the record's order).
+    pub block_size: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
+    /// The candidates' affinity facts, by index in the candidate slice the
+    /// decision is made over: the one column the affinity stages read, in
+    /// the candidates' own order. It is EMPTY or holds exactly one entry a
+    /// candidate; the engine refuses any other before a stage runs. An
+    /// empty column is the host's word that it holds nothing: it reads as
+    /// nothing held for every candidate, under a profile that declared
+    /// [`Needs::affinity`](crate::Needs::affinity) as under one that did
+    /// not, and the engine neither refuses it nor counts it. A host that
+    /// owes the column and hands none is routed by its other stages alone,
+    /// with no signal. A pair decision takes each side's column from
+    /// its pool ([`PairPools`](crate::PairPools)) and none from here: a
+    /// non-empty column on the request of a pair decision is refused, as a
+    /// column of another length is. The host keeps it readable, as it keeps
+    /// the candidates, until the decision is committed. In-process only: a
+    /// wire carries each candidate's facts in its record.
+    pub affinity: &'a [AffinityFacts],
+}
+
+impl RequestFacts<'_> {
+    /// The affinity facts of the candidate at `index` of the slice the
+    /// decision is made over. An empty column reads as nothing held for
+    /// every candidate. Any other column holds the candidate's own entry,
+    /// and the read is that entry: an index past its end is a host's
+    /// mistake and fails as an index past the candidates does, never as a
+    /// default in the entry's place. Each read tests the column's emptiness
+    /// and its bound: a pass over a pool takes the column once
+    /// ([`RequestFacts::affinity`]) and walks it beside the rows, as this
+    /// crate's stages and its packed plugin fill do.
+    pub fn affinity_at(&self, index: u32) -> AffinityFacts {
+        if self.affinity.is_empty() {
+            AffinityFacts::default()
+        } else {
+            self.affinity[index as usize]
+        }
+    }
 }
 
 /// What only the deciding host knows now: its standing vetoes, the wires it
@@ -462,14 +542,110 @@ mod tests {
     }
 
     #[test]
-    fn a_candidate_row_stays_within_two_cache_lines() {
-        // The row is copied once per candidate per decision; a change that
-        // grows it past two cache lines is a design change, not a field.
-        assert!(
-            size_of::<Candidate>() <= 128,
-            "a candidate row is {} bytes",
-            size_of::<Candidate>()
+    fn a_candidate_row_is_two_lines_and_its_affinity_facts_20_bytes() {
+        // The filters walk the rows once a filter, so the rows' stride is a
+        // cost every policy pays: the pin is exact, 128 bytes at a 64-byte
+        // alignment, and a change of any number here carries the crate's
+        // decision bench (`benches/decision.rs`) where the pull-request gate
+        // runs as well as on a build host: the two read a narrower stride in
+        // opposite directions.
+        assert_eq!(size_of::<Candidate>(), 128);
+        assert_eq!(align_of::<Candidate>(), 64);
+        assert_eq!(size_of::<AffinityFacts>(), 20);
+    }
+
+    #[test]
+    fn a_candidate_rows_fields_end_within_104_bytes() {
+        // The row is written once per candidate per decision, so what its
+        // fields take is a cost every policy pays. The alignment leaves
+        // spare bytes, so the row's size no longer says it, and a field
+        // added to the row would move no size. This case names every field
+        // (a new one does not compile until it is named here) and pins
+        // where the last one ends. A fact one stage family reads belongs in
+        // a column beside the rows, as the affinity facts are. The plugin
+        // view's packed row is 104 bytes too, WITH the five facts in it:
+        // nothing ties that number to this one, and each is pinned in its
+        // own file.
+        fn end<T>(at: usize, _field: &T) -> usize {
+            at + size_of::<T>()
+        }
+        macro_rules! ends {
+            ($($field:ident),* $(,)?) => {{
+                let Candidate { $($field),* } = Candidate::default();
+                [$(end(std::mem::offset_of!(Candidate, $field), &$field)),*]
+            }};
+        }
+        let ends = ends!(
+            position,
+            id,
+            role,
+            dp_rank,
+            dp_size,
+            health,
+            wire_modes,
+            engine_kind,
+            connector,
+            in_flight,
+            load,
+            load_sampled_at_micros,
+            session_hit,
+            session_in_flight,
+            pair_class,
+            has_capacity,
+            has_room,
+            zone,
+            labels,
+            ec_compatible,
+            vision,
+            host_local,
+            active_sessions,
+            key,
         );
+        assert_eq!(ends.into_iter().max(), Some(103));
+    }
+
+    #[test]
+    fn an_empty_affinity_column_reads_as_nothing_held_for_every_candidate() {
+        let empty = RequestFacts::default();
+        for index in [0, 1, 511] {
+            assert_eq!(empty.affinity_at(index), AffinityFacts::default());
+        }
+    }
+
+    #[test]
+    fn a_filled_affinity_column_reads_the_entry_at_the_candidates_index() {
+        let column = [3, 5, 8].map(|overlap_blocks| AffinityFacts {
+            overlap_blocks,
+            ..AffinityFacts::default()
+        });
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let read = [0, 1, 2].map(|index| facts.affinity_at(index).overlap_blocks);
+        assert_eq!(read, [3, 5, 8]);
+    }
+
+    /// A column that holds an entry is never read as a default past its
+    /// end: zero is a real answer (a cold worker), so a forgiving read would
+    /// turn a column filled for another pool into a routing change.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn a_read_past_a_filled_affinity_column_is_not_a_default() {
+        let column = [AffinityFacts::default()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let _ = facts.affinity_at(1);
+    }
+
+    #[test]
+    fn the_load_row_holds_its_resident_count_flag_in_its_padding() {
+        // 34 bytes of fields in a row aligned to four: the flag adds no
+        // byte, and an optional row needs no tag beside it.
+        assert_eq!(size_of::<LoadRow>(), 36);
+        assert_eq!(size_of::<Option<LoadRow>>(), 36);
     }
 
     #[test]

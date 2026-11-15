@@ -26,7 +26,8 @@ pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
     config::{
-        AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        AccessLogField, GroupedDpSticky, PowerOfTwoLoadMetric, TurboJpegPolicy,
+        DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
     secrets::SecretFiles,
@@ -596,7 +597,9 @@ struct RoutingArgs {
     /// transfer protocol. `lenient` refuses only a known difference in
     /// runtime, transport or KV layout (unknown components and engine
     /// versions pair with anything); `strict` also refuses unknown
-    /// components and version differences; `off` pairs on nothing.
+    /// components and version differences; `off` compares nothing of it.
+    /// On the gRPC wire two known runtimes never pair, in any mode: its
+    /// requests are in the runtime's own message type.
     #[arg(
         long,
         value_parser = ["off", "lenient", "strict"],
@@ -605,25 +608,27 @@ struct RoutingArgs {
     )]
     pd_pairing_mode: String,
 
-    /// Which implementation decides worker selection: `legacy`, the
-    /// policies over worker handles, or `engine`, the policy engine over its
-    /// bounded view. Under `engine` the policy must be one the engine
-    /// carries: random, round_robin, passthrough, power_of_two (expected_wait,
-    /// requests, least_requests) or least_load
-    #[arg(
-        long,
-        value_parser = ["legacy", "engine"],
-        default_value = "legacy",
-        help_heading = "Routing Policy"
-    )]
-    policy_engine: String,
-
     /// Ordered header names checked for the routing key; the first header
     /// present with a valid value wins. Header keys get the same
     /// per-turn/per-retry suffix stripping as rid-derived keys when the
     /// override is enabled
     #[arg(long, num_args = 0.., default_value = "x-smg-routing-key", value_parser = parse_routing_key_header, help_heading = "Routing Policy")]
     routing_key_headers: Vec<String>,
+
+    /// Whether, and how, a request that carries a routing key is pinned to
+    /// one engine of a grouped data-parallel worker (a ZMQ worker whose
+    /// socket set several engines dial, as many as --zmq-engine-count says
+    /// or its engines declare), so a conversation keeps one engine's prefix
+    /// cache. The key is the sticky-session key: the first valid
+    /// --routing-key-headers header, or the body rid under
+    /// --routing-key-override
+    #[arg(
+        long,
+        value_enum,
+        default_value = "off",
+        help_heading = "Routing Policy"
+    )]
+    grouped_dp_sticky: GroupedDpSticky,
 
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -2001,8 +2006,7 @@ mod tests {
         config::{
             CacheIndexKind, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
             FileDiscoveryConfig, ManualAssignmentMode, ParserChoice, PolicyConfig,
-            PolicyEngineMode, SlurmDiscoveryConfig, UnhealthyRemovalScope,
-            DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+            SlurmDiscoveryConfig, UnhealthyRemovalScope, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
         },
         server::posture::SecretSource,
         service_discovery::RuntimeDiscoveryConfig,
@@ -3263,6 +3267,34 @@ mod tests {
     }
 
     #[test]
+    fn grouped_dp_sticky_flag_flows_into_router_config() {
+        // Off by default: no request is pinned to an engine of a grouped worker.
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        for (flag, sticky) in [
+            ("off", GroupedDpSticky::Off),
+            ("hash", GroupedDpSticky::Hash),
+        ] {
+            let config = cli_args_from(&["--grouped-dp-sticky", flag])
+                .to_router_config(vec![], vec![])
+                .unwrap();
+            assert_eq!(
+                config.grouped_dp_sticky, sticky,
+                "--grouped-dp-sticky {flag}"
+            );
+        }
+
+        for bad in ["", "on", "1", "least_load", "HASH"] {
+            let argv = ["smg", "--grouped-dp-sticky", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--grouped-dp-sticky {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn manual_policy_assignment_default_stays_random() {
         // One invocation, both contexts: the manual policy keeps its random
         // default while the override sticky map defaults to delegate.
@@ -4090,29 +4122,6 @@ mod tests {
         assert!(router_config.worker_overload_protection);
         let server_config = cli.to_server_config(router_config).unwrap();
         assert!(server_config.router_config.worker_overload_shed);
-    }
-
-    /// `--policy-engine` defaults to the legacy path and its `engine` value
-    /// survives into `ServerConfig.router_config`.
-    #[test]
-    fn policy_engine_defaults_to_legacy_and_the_switch_flows_into_both_configs() {
-        let cli = cli_args_from(&[]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.policy_engine, PolicyEngineMode::Legacy);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.router_config.policy_engine,
-            PolicyEngineMode::Legacy
-        );
-
-        let cli = cli_args_from(&["--policy-engine", "engine", "--policy", "round_robin"]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.policy_engine, PolicyEngineMode::Engine);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.router_config.policy_engine,
-            PolicyEngineMode::Engine
-        );
     }
 
     /// Both thresholds are `>=` comparisons, so the excluded ends of their

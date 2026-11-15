@@ -1,7 +1,7 @@
 //! Source geometry, pixel identity and lazy decode regressions.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use crate::{ImageDetail, ImageSource};
+use crate::{test_support::http_client_builder, ImageDetail, ImageSource};
 /// Exercise mutually exclusive branches, exact-cap equality and unaligned caps.
 #[test]
 fn branches_on_source_geometry_then_aligns_like_the_model() {
@@ -157,11 +157,8 @@ async fn encoded_pixels_match_direct_resize_after_transparency() {
     use crate::{
         ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, TransparencyPolicy,
     };
-    let connector = MediaConnector::new(
-        crate::test_support::http_client_builder(),
-        MediaConnectorConfig::default(),
-    )
-    .unwrap();
+    let connector =
+        MediaConnector::new(http_client_builder(), MediaConnectorConfig::default()).unwrap();
     for format in [ImageFormat::Png, ImageFormat::WebP, ImageFormat::Jpeg] {
         let pixels = DynamicImage::ImageRgba8(RgbaImage::from_fn(400, 50, |x, y| {
             Rgba([x as u8, y as u8, 70, (x + y) as u8])
@@ -219,11 +216,7 @@ async fn tracker_deduplicates_without_confusing_effective_sizes() {
         TrackedMedia,
     };
     let connector = Arc::new(
-        MediaConnector::new(
-            crate::test_support::http_client_builder(),
-            MediaConnectorConfig::default(),
-        )
-        .unwrap(),
+        MediaConnector::new(http_client_builder(), MediaConnectorConfig::default()).unwrap(),
     );
     let source = encoded(2000, 100);
     let url = format!(
@@ -234,7 +227,7 @@ async fn tracker_deduplicates_without_confusing_effective_sizes() {
     for cap in [1000, 1000, 1009, 2016] {
         tracker
             .push_part(MediaContentPart::ImageUrl {
-                url: url.clone(),
+                url: url.clone().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: Some(cap),

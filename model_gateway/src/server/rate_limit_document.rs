@@ -22,12 +22,14 @@ use tracing::{error, info};
 
 use super::AppState;
 use crate::{
-    admin::document::Applied,
+    admin::{
+        document::Applied,
+        json::{refusal, AdminJson},
+    },
     rate_limit::{
         DocumentOutcome, DocumentRefusal, PolicyChanges, PolicyReplacement, PolicySummary,
         RateLimitManager, RateLimitYaml,
     },
-    worker::admin_json::{refusal, AdminJson},
 };
 
 /// The resource in audit lines: the document's path under the control-plane
@@ -276,7 +278,8 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext, config::RouterConfig, health::ProbeState,
-        policies::PolicyRegistry, routers::gateway::Gateway, worker::WorkerRegistry,
+        policies::PolicyRegistry, routers::gateway::Gateway, server::http_client,
+        worker::WorkerRegistry,
     };
 
     const START: &str = "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\ntenants:\n  - tenant_key: auth:team-red\n    tokens_per_minute: 500\n    requests_per_minute: 30\n";
@@ -296,7 +299,7 @@ mod tests {
             .expect("a tenant rate limiter");
         let context = Arc::new(
             AppContext::builder()
-                .client(crate::server::http_client())
+                .client(http_client())
                 .rate_limit_manager(Some(manager))
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)

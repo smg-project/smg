@@ -79,7 +79,7 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     content_format: None,
     // Thinking is gated on the `thinking` kwarg, default off.
     thinking_toggle: ThinkingToggle::DefaultOff,
-    thinking_key_name: ThinkingKeyName::Thinking,
+    thinking_key_name: Some(ThinkingKeyName::Thinking),
     // Switches off on the protocol's `none` / `minimal`: no words of its own.
     native_effort_values: &[],
     native_effort_off_values: &[],

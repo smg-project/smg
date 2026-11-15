@@ -177,6 +177,18 @@ impl ProtoGenerateRequest {
         matches!(self, Self::TokenSpeed(_))
     }
 
+    /// The runtime whose message type this request is.
+    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
+        use crate::worker::RuntimeType;
+        match self {
+            Self::Sglang(_) => RuntimeType::Sglang,
+            Self::Vllm(_) => RuntimeType::Vllm,
+            Self::Trtllm(_) => RuntimeType::Trtllm,
+            Self::Mlx(_) => RuntimeType::Mlx,
+            Self::TokenSpeed(_) => RuntimeType::TokenSpeed,
+        }
+    }
+
     /// Sanitize sampling params for the prefill-only side (vLLM PD mode).
     /// max_tokens=1 computes KV without generating; min_tokens is cleared so the
     /// engine accepts it; n=1 so the prefill returns a single kv_transfer_params dict.
@@ -955,6 +967,44 @@ impl ProtoGenerateRequest {
                 tracing::warn!("set_kv_bootstrap_info called on non-TokenSpeed request, ignoring");
             }
         }
+    }
+
+    /// Move the PD KV bootstrap room into the residue class of `rank` modulo
+    /// `ranks`, its other bits kept as minted: a TokenSpeed prefill of
+    /// `ranks` engines runs a disaggregated request on the rank its room's
+    /// residue names, and its decode side reads the KV from there. The room
+    /// stays in `[0, i64::MAX)`. False, and nothing changed, for a request
+    /// without a room (not TokenSpeed, or not disaggregated) or a rank
+    /// outside `0..ranks`.
+    pub fn set_kv_bootstrap_room_residue(&mut self, rank: usize, ranks: usize) -> bool {
+        let Self::TokenSpeed(req) = self else {
+            return false;
+        };
+        let Some(info) = req.kv_bootstrap_info.as_mut() else {
+            return false;
+        };
+        let (Ok(rank), Ok(ranks)) = (i64::try_from(rank), i64::try_from(ranks)) else {
+            return false;
+        };
+        if rank >= ranks || ranks == i64::MAX {
+            return false;
+        }
+        // Below `i64::MAX - ranks`, so adding back up to `ranks - 1` cannot
+        // overflow.
+        let minted = info.bootstrap_room;
+        let base = minted.rem_euclid(i64::MAX - ranks);
+        info.bootstrap_room = base - base % ranks + rank;
+        // The minted room was logged when it was injected; name the room that
+        // is dispatched, which engines report in their KV-transfer errors.
+        tracing::debug!(
+            request_id = %req.request_id,
+            minted_room = minted,
+            room = info.bootstrap_room,
+            rank,
+            ranks,
+            "PD bootstrap room moved into the sticky key's prefill rank"
+        );
+        true
     }
 }
 

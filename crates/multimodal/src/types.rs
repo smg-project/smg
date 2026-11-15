@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
@@ -15,6 +16,7 @@ use crate::{
     buffer_pool,
     error::MediaConnectorError,
     media::{apply_transparency, decode_image_bytes},
+    minimax_resize::resize_image,
     vision::{execution, transforms::resize_bicubic_pil},
 };
 
@@ -57,12 +59,26 @@ pub enum MediaContentPart {
         text: String,
     },
     ImageUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
         /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_long_side_pixel: Option<u32>,
+    },
+    /// An image carried as base64 text with its media type (a base64 source
+    /// of the Messages API): the decoder reads the text in place, as it reads
+    /// a data URL's payload; nothing re-encodes it into one.
+    ImageBase64 {
+        media_type: String,
+        data: Arc<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_long_side_pixel: Option<u32>,
     },
@@ -81,7 +97,16 @@ pub enum MediaContentPart {
         uuid: Option<String>,
     },
     AudioUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
+    /// Audio carried as base64 text with its media type (a chat `input_audio`
+    /// part): read in place, as a data URL's payload.
+    AudioBase64 {
+        media_type: String,
+        data: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
@@ -93,7 +118,8 @@ pub enum MediaContentPart {
         uuid: Option<String>,
     },
     VideoUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
         /// MiniMax-M3 extension: frames per second to sample at.
@@ -403,14 +429,17 @@ impl VideoClip {
         self.sampling.as_ref()
     }
 
-    pub fn materialized_frames(&self) -> Result<Vec<DynamicImage>, String> {
+    /// The clip's frames: lent when the decode produced them, materialised
+    /// from the RGB video otherwise.
+    pub fn materialized_frames(&self) -> Result<Cow<'_, [DynamicImage]>, String> {
         if !self.frames.is_empty() {
-            return Ok(self.frames.clone());
+            return Ok(Cow::Borrowed(&self.frames));
         }
         self.rgb_video
             .as_ref()
             .ok_or_else(|| "video clip has no decoded frames".to_string())?
             .to_dynamic_images()
+            .map(Cow::Owned)
     }
 
     pub fn raw_bytes(&self) -> &[u8] {
@@ -534,7 +563,7 @@ impl ImageFrame {
             Ok(if self.minimax_sglang_resize {
                 resize_bicubic_pil(&image, self.size.width, self.size.height)
             } else if self.minimax_resize {
-                crate::minimax_resize::resize_image(image, self.size.width, self.size.height)
+                resize_image(image, self.size.width, self.size.height)
             } else {
                 image
             })

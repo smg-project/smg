@@ -41,8 +41,10 @@ pub(crate) struct Prepared {
     /// cannot constrain the request. Request building decides on the selected
     /// worker (`regular::symphony::worker_constraint`).
     pub constraint: PreparedConstraint,
-    /// The constraint is a JSON schema: the older path's forced call, under
-    /// which no table reads.
+    /// The constraint is the older registry's JSON schema (its forced call,
+    /// or the request's own answer schema where no table reads), told by its
+    /// origin: a schema a table built keeps the table's reading and its
+    /// markers, whatever its kind.
     pub json_schema: bool,
     /// The decoder keeps the special tokens the reader of the response needs:
     /// a table's markers, or a legacy reasoning parser's.
@@ -182,7 +184,8 @@ pub(crate) fn prepare(
     };
     let json_schema = matches!(
         &constraint,
-        Ok(symphony::Prepared::Constraint { constraint, .. }) if constraint.is_json_schema()
+        Ok(symphony::Prepared::Constraint { constraint, table: false, .. })
+            if constraint.is_json_schema()
     );
     let keeps_special_tokens = match reading.as_ref().ok().and_then(|read| {
         symphony::keeps_special_tokens_for(read, model, &ctx.components.templates, tokenizer)
@@ -314,8 +317,9 @@ pub(crate) struct Decided {
 /// retry re-selects only workers that decide alike
 /// (`utils::WorkerDecoding::decides_alike`); what the request asked for suits
 /// any worker. Then Symphony's assignment, taken while the rendered prompt is
-/// still here (`regular::symphony::assign`): it reads the constraint's kind
-/// alone, before any shaping for the worker, and the state records the parser
+/// still here (`regular::symphony::assign`): it reads the older registry's
+/// constraint by its kind, before any shaping for the worker, and the table's
+/// by its origin (`WorkerConstraint::table`), and the state records the parser
 /// that reads the response, Symphony when a table takes the request and
 /// legacy otherwise, for the response's header. `declared` is the tools the
 /// template sees (a chat request's effective tool list, a Messages request's
@@ -371,10 +375,12 @@ pub(crate) fn decide(
     if decided.by_policy {
         ctx.state.constraint_decided_on = Some(decoding);
     }
-    // The table's constraint, as Symphony's assignment reads it below: a
-    // `json_schema` pair there is the older path's forced call, which the
-    // legacy parsers read.
+    // The constraint as the request carries it; Symphony's assignment below
+    // reads the older registry's alone (a `json_schema` pair there is the
+    // older path's forced call, which the legacy parsers read), never the
+    // table's, whatever kind the backend's spelling gave it.
     let tabled = decided.constraint.map(|constraint| constraint.to_tuple());
+    let registry = if decided.table { None } else { tabled.as_ref() };
     let provider = ctx
         .state
         .provider
@@ -389,7 +395,7 @@ pub(crate) fn decide(
         None => symphony::reading(parser, &names, model, &ctx.components.templates)
             .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
     };
-    let assignment = symphony::assign_for(read, asks, tabled.as_ref(), processed_text, provider);
+    let assignment = symphony::assign_for(read, asks, registry, processed_text, provider);
     ctx.state.parser = Some(match assignment {
         Some(_) => ParserChoice::Symphony,
         None => ParserChoice::Legacy,
@@ -475,13 +481,14 @@ mod tests {
             }))
             .expect("a Messages request"),
         );
-        let mut ctx =
-            RequestContext::for_messages(Arc::clone(&request), None, MODEL.into(), components());
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
+            Arc::clone(&request),
+            None,
+            MODEL.into(),
+            components(),
+        );
         ctx.state.parser = Some(ParserChoice::Symphony);
-        let asks = Asks::Messages {
-            request: &request,
-            continues: false,
-        };
+        let asks = Asks::for_messages(&request, false);
         let names = ctx.components.parser_resolver.names_for(None, MODEL);
         let read = symphony::reading(
             ParserChoice::Symphony,
@@ -520,6 +527,48 @@ mod tests {
         assert!(matches!(ctx.state.parser, Some(ParserChoice::Symphony)));
     }
 
+    /// A constraint the table built keeps the table as the reader whatever its kind: a JSON-schema
+    /// pair from the table (a backend's spelling of the table's grammar, where a backend takes a
+    /// schema) is not the older path's forced call, which the same pair from the older registry
+    /// is, so the first assigns the table and the second leaves the response to the legacy
+    /// parsers; the engine gets the pair either way.
+    #[test]
+    fn a_constraint_the_table_built_keeps_the_table_as_the_reader_whatever_its_kind() {
+        let chat: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(
+                json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .expect("chat request"),
+        );
+        for (table, assigned) in [(true, true), (false, false)] {
+            let mut ctx =
+                RequestContext::for_chat(Arc::clone(&chat), None, MODEL.into(), components());
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let prepared = Ok(symphony::Prepared::Constraint {
+                constraint: ToolConstraint::JsonSchema("{}".to_string()),
+                first_token: false,
+                table,
+            });
+            let decided = decide(&mut ctx, Asks::Chat(&chat), &[], PROMPT, prepared, |_| {
+                panic!("the policy is requested: no auto tag")
+            })
+            .map_err(|response| response.status())
+            .expect("nothing refused");
+            assert_eq!(
+                decided.tool_constraints,
+                Some(("json_schema".to_string(), "{}".to_string())),
+                "table {table}"
+            );
+            assert_eq!(decided.assignment.is_some(), assigned, "table {table}");
+            let parser = if assigned {
+                ParserChoice::Symphony
+            } else {
+                ParserChoice::Legacy
+            };
+            assert_eq!(ctx.state.parser, Some(parser), "table {table}");
+        }
+    }
+
     /// The decision follows preparation on whether the choice forces a call, over different tool
     /// lists: preparation reads the tools the template renders, narrowed by `tool_choice`
     /// (`message_utils::template_tools`), the decision the request's declared chat tools. A choice
@@ -550,13 +599,14 @@ mod tests {
             (1, 0),
             "the custom tool alone is declared, and the choice narrows it away"
         );
-        let mut ctx =
-            RequestContext::for_messages(Arc::clone(&request), None, MODEL.into(), components());
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
+            Arc::clone(&request),
+            None,
+            MODEL.into(),
+            components(),
+        );
         ctx.state.parser = Some(ParserChoice::Symphony);
-        let asks = Asks::Messages {
-            request: &request,
-            continues: false,
-        };
+        let asks = Asks::for_messages(&request, false);
         let names = ctx.components.parser_resolver.names_for(None, MODEL);
         let read = symphony::reading(
             ParserChoice::Symphony,
@@ -676,15 +726,13 @@ mod tests {
             }))
             .expect("messages request"),
         );
-        let mut ctx =
-            RequestContext::for_messages(Arc::clone(&messages), None, MODEL.into(), components());
-        let for_messages = decided(
-            &mut ctx,
-            Asks::Messages {
-                request: &messages,
-                continues: false,
-            },
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
+            Arc::clone(&messages),
+            None,
+            MODEL.into(),
+            components(),
         );
+        let for_messages = decided(&mut ctx, Asks::for_messages(&messages, false));
 
         assert_eq!(for_chat, for_messages);
         assert_eq!(for_chat.parser, Some(ParserChoice::Symphony));

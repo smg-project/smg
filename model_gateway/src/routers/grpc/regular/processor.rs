@@ -144,6 +144,7 @@ impl ResponseProcessor {
             ReasoningSource {
                 wanted: original_request.separate_reasoning && reasoning_parser_available,
                 in_prefill: original_request.reasoning_in_prefill,
+                json_mode: original_request.json_mode,
                 parser_name: reasoning_parser_name,
                 model,
             },
@@ -159,6 +160,7 @@ impl ResponseProcessor {
                     parser_available: tool_parser_available,
                     history_tool_calls_count,
                     first_call_only: original_request.first_tool_call_only,
+                    json_mode: original_request.json_mode,
                 },
             )
             .await;
@@ -318,7 +320,8 @@ impl ResponseProcessor {
         let mut output = adapt::messages::output(&events);
         // A `tool_use` block carries `{}` only where the parser said the arguments are none;
         // arguments that are JSON no `input` value holds would leave as `{}` with no word, so the
-        // message is refused, naming the call (the stream carries such arguments as written).
+        // message is refused, naming the call (the stream carries such arguments as written
+        // where they open an object, and withholds them where they do not).
         if let Some(refused) = output.refused.first() {
             return Err(SymphonyError::InputRefused(format!(
                 "the tool_use input of call {} ({}) cannot carry the arguments the model wrote: {}",
@@ -495,6 +498,7 @@ impl ResponseProcessor {
             (reasoning_parser_available || chat_request.symphony.is_some())
                 .then_some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
+            chat_request.image_tokens,
         );
 
         // Build final ChatCompletionResponse
@@ -546,6 +550,7 @@ impl ResponseProcessor {
         ) else {
             return split;
         };
+        parser.set_json_mode(source.json_mode);
         if source.in_prefill {
             parser.mark_reasoning_started();
         }
@@ -605,6 +610,7 @@ impl ResponseProcessor {
                         source.parser_name,
                         tools,
                         source.history_tool_calls_count,
+                        source.json_mode,
                     )
                     .await;
             }
@@ -624,6 +630,7 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
+        json_mode: bool,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
         let pooled_parser =
@@ -633,7 +640,9 @@ impl ResponseProcessor {
         // tool schemas so schema-aware parsers coerce argument types by their
         // declared type instead of guessing from the raw text.
         let result = {
-            let parser = pooled_parser.lock().await;
+            let mut parser = pooled_parser.lock().await;
+            // The parser is pooled across requests, so every use sets the mode.
+            parser.set_json_mode(json_mode);
             parser
                 .parse_complete_with_tools(processed_text, tools)
                 .await
@@ -995,6 +1004,7 @@ impl ResponseProcessor {
             ReasoningSource {
                 wanted: reasoning_parser_available,
                 in_prefill: messages_request.reasoning_in_prefill,
+                json_mode: false,
                 parser_name: reasoning_parser_name,
                 model,
             },
@@ -1013,6 +1023,7 @@ impl ResponseProcessor {
                     parser_available: tool_parser_available,
                     history_tool_calls_count: messages_request.history_tool_calls_count,
                     first_call_only: messages_request.first_tool_call_only,
+                    json_mode: false,
                 },
             )
             .await;
@@ -1313,10 +1324,13 @@ struct ReasoningSplit {
 /// What the reasoning split reads from the request: whether the request
 /// wants the split at all (its separate-reasoning switch, with a parser
 /// available), whether the rendered prompt ends inside the thinking block,
-/// the parser the request resolved to, and the model.
+/// whether the response is structured JSON (a typed parser then keeps its
+/// framing spellings inside JSON strings), the parser the request resolved
+/// to, and the model.
 struct ReasoningSource<'a> {
     wanted: bool,
     in_prefill: bool,
+    json_mode: bool,
     parser_name: Option<&'a str>,
     model: &'a str,
 }
@@ -1324,7 +1338,8 @@ struct ReasoningSource<'a> {
 /// What a tool-call parse reads from the request: the tools it offered (none
 /// when it offered none), its tool choice in the chat form, the model, the
 /// parser the request resolved to and whether it is available, how many
-/// calls the history already holds, and whether the first call alone is kept.
+/// calls the history already holds, whether the first call alone is kept,
+/// and whether the response format is JSON.
 struct ToolCallSource<'a> {
     tools: Option<&'a [Tool]>,
     tool_choice: Option<&'a ToolChoice>,
@@ -1333,6 +1348,9 @@ struct ToolCallSource<'a> {
     parser_available: bool,
     history_tool_calls_count: usize,
     first_call_only: bool,
+    /// A structured JSON response: a typed parser keeps its framing
+    /// spellings inside JSON strings.
+    json_mode: bool,
 }
 
 /// The 500 a whole response whose reading panicked is answered with: under
@@ -1640,7 +1658,9 @@ fn tool_use_input(arguments: Option<&str>, tool_call_id: &str) -> serde_json::Va
 /// double-encoded or bare string, an array, a number, null), named once in the
 /// log under `function`. The request side refuses anything but an object, so an
 /// answer of either collected reader never carries a value a client could not
-/// send back as history. (The stream carries a call's arguments as written.)
+/// send back as history. The stream keeps its block an object too: a call
+/// whose arguments open with anything but an object streams none of them
+/// (`streaming::ToolInput`), and its block keeps the `{}` it started with.
 fn object_input(
     value: serde_json::Value,
     function: &'static str,
@@ -1939,6 +1959,7 @@ mod responses_finish_reason_tests {
             ReasoningSource {
                 wanted: true,
                 in_prefill: false,
+                json_mode: false,
                 parser_name: None,
                 model: "no-such-model",
             },

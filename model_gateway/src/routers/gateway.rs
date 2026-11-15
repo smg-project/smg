@@ -8,6 +8,8 @@
 //! size of the pools they would select from, so traffic can migrate between
 //! HTTP and gRPC and between regular and disaggregated fleets gradually.
 
+mod lora;
+
 use std::{
     collections::HashMap,
     future::Future,
@@ -774,42 +776,80 @@ impl RouterTrait for Gateway {
                 "/generate requests must include a model when IGW routing is enabled",
             );
         }
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_generate(headers, tenant_meta, body, model_id)
-                .await
-        })
-        .await
+        let router = self.select_router_for_adapter(
+            model_id,
+            body.lora_path.as_deref().or(body.lora_id.as_deref()),
+        );
+        match router {
+            Some(router) => {
+                router
+                    .route_generate(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        }
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        mut body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_chat(headers, tenant_meta, body, model_id)
-                .await
-        })
-        .await
+        let lora_model = match lora::normalize_model(
+            &self.worker_registry,
+            &mut body.model,
+            &mut body.lora_path,
+        ) {
+            Ok(model) => model,
+            Err(response) => return response,
+        };
+        let model_id = lora_model.as_deref().unwrap_or(model_id);
+        let router = if lora_model.is_some() {
+            self.select_lora_router(model_id)
+        } else {
+            self.select_router_for_adapter(model_id, body.lora_path.as_deref())
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_chat(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        }
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CompletionRequest,
+        mut body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_completion(headers, tenant_meta, body, model_id)
-                .await
-        })
-        .await
+        let lora_model = match lora::normalize_model(
+            &self.worker_registry,
+            &mut body.model,
+            &mut body.lora_path,
+        ) {
+            Ok(model) => model,
+            Err(response) => return response,
+        };
+        let model_id = lora_model.as_deref().unwrap_or(model_id);
+        let router = if lora_model.is_some() {
+            self.select_lora_router(model_id)
+        } else {
+            self.select_router_for_adapter(model_id, body.lora_path.as_deref())
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_completion(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        }
     }
 
     async fn route_messages(

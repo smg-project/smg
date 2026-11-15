@@ -21,7 +21,7 @@ use super::*;
 use crate::{
     config::{
         test_support::{epd_routing_mode, pd_routing_mode, regular_routing_mode},
-        ParserChoice, RoutingMode,
+        GroupedDpSticky, ParserChoice, RoutingMode,
     },
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
@@ -126,6 +126,40 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     for pipeline in pipelines_of(&router) {
         assert_eq!(pipeline.request_timeout(), Some(Duration::from_secs(30)));
+    }
+}
+
+/// `--grouped-dp-sticky` reaches every pipeline a regular or PD router
+/// builds, so a sticky request is pinned alike on every endpoint (a PD one
+/// through its bootstrap room): off by default, and the configured placement
+/// when the configuration names one.
+#[tokio::test]
+async fn the_grouped_dp_pinning_reaches_every_pipeline() {
+    let mcp_orchestrator = mcp_orchestrator().await;
+    for mode in [Mode::Regular, Mode::PrefillDecode] {
+        let config = grpc_config(routing_mode(mode)).build_unchecked();
+        let ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        for pipeline in pipelines_of(&router) {
+            assert_eq!(
+                pipeline.grouped_dp_sticky(),
+                GroupedDpSticky::Off,
+                "{mode:?}"
+            );
+        }
+
+        let config = grpc_config(routing_mode(mode))
+            .grouped_dp_sticky(GroupedDpSticky::Hash)
+            .build_unchecked();
+        let ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        for pipeline in pipelines_of(&router) {
+            assert_eq!(
+                pipeline.grouped_dp_sticky(),
+                GroupedDpSticky::Hash,
+                "{mode:?}"
+            );
+        }
     }
 }
 
@@ -482,6 +516,17 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
         assert!(Instant::now() < deadline, "the tokenizer did not register");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // The entry the step's load registered is the worker's: the release
+    // step takes it with the model's last worker.
+    let id = ctx
+        .tokenizer_registry
+        .get_by_name("m")
+        .expect("registered")
+        .id;
+    assert!(
+        ctx.worker_loaded_tokenizers.contains(&id),
+        "the entry a worker's registration loaded is the worker's"
+    );
 
     let response = router
         .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
@@ -971,6 +1016,34 @@ async fn epd_router_501s_responses_and_cancel() {
 #[tokio::test]
 async fn responses_request_is_canonical_before_the_responses_layer_sees_it() {
     let ctx = grpc_ctx(pd_routing_mode()).await;
+    register_aliased_pd_workers(&ctx.worker_registry);
+
+    let mut request = responses_request("model-alias");
+    let model_id =
+        canonicalize_responses_request(&ctx.worker_registry, &mut request, "model-alias");
+    assert_eq!(
+        request.model, "canonical-model",
+        "the Responses layer must see the canonical model ID"
+    );
+    assert_eq!(
+        model_id, "canonical-model",
+        "worker selection must use the canonical model ID"
+    );
+
+    // The canonical ID is left alone, and costs no copy.
+    let mut already_canonical = responses_request("canonical-model");
+    let model_id = canonicalize_responses_request(
+        &ctx.worker_registry,
+        &mut already_canonical,
+        "canonical-model",
+    );
+    assert_eq!(already_canonical.model, "canonical-model");
+    assert!(matches!(model_id, Cow::Borrowed(_)));
+}
+
+/// A prefill and a decode worker serving `canonical-model` under the alias
+/// `model-alias`.
+fn register_aliased_pd_workers(registry: &WorkerRegistry) {
     for (url, worker_type) in [
         ("grpc://prefill:30000", WorkerType::Prefill),
         ("grpc://decode:30000", WorkerType::Decode),
@@ -984,29 +1057,84 @@ async fn responses_request_is_canonical_before_the_responses_layer_sees_it() {
                 ..Default::default()
             })
             .build();
-        ctx.worker_registry
+        registry
             .register(Arc::new(worker))
             .expect("register worker");
     }
+}
 
-    let request = responses_request("model-alias");
-    let (body, model_id) =
-        canonicalize_responses_request(&ctx.worker_registry, &request, "model-alias");
+/// The helper rewrites the model id on the request it is given: the request's
+/// instructions buffer keeps its address across the call, under an alias and
+/// under the canonical id alike. This pins the helper alone; the caller's copy
+/// of the previous tree (an `into_owned` of a borrowed body) is gone with the
+/// body `Cow` itself, which the signature no longer returns.
+#[tokio::test]
+async fn canonicalisation_rewrites_the_owned_request_in_place() {
+    let ctx = grpc_ctx(pd_routing_mode()).await;
+    register_aliased_pd_workers(&ctx.worker_registry);
+    for model in ["model-alias", "canonical-model"] {
+        let mut request = responses_request(model);
+        request.instructions = Some("the buffer whose address the pin follows".to_string());
+        let before = request
+            .instructions
+            .as_deref()
+            .expect("instructions")
+            .as_ptr();
+        canonicalize_responses_request(&ctx.worker_registry, &mut request, model);
+        let after = request
+            .instructions
+            .as_deref()
+            .expect("instructions")
+            .as_ptr();
+        assert!(
+            std::ptr::eq(before, after),
+            "the request sent as {model} was copied to rewrite its model id"
+        );
+    }
+}
+
+/// No engine behind this router applies the reasoning config's `mode`,
+/// `context` or `generate_summary`, so the router clears them before the
+/// Responses layer reads the request. That layer echoes the config into
+/// every Response object: the non-streamed body and the stored object
+/// through the response builder, the streamed terminal event as the
+/// request's config is. Each then says `effort` and `summary`, what ran,
+/// and a `pro` request does not read back as run in `pro` mode.
+#[test]
+fn the_responses_layer_sees_no_reasoning_mode_context_or_generate_summary() {
+    let mut request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "m",
+        "input": "think it through",
+        "reasoning": {
+            "effort": "high",
+            "summary": "concise",
+            "mode": "pro",
+            "context": "all_turns",
+            "generate_summary": "detailed"
+        }
+    }))
+    .expect("responses request");
+    clear_unapplied_reasoning_keys(&mut request);
+
+    let applied = json!({"effort": "high", "summary": "concise"});
+    let built = openai_protocol::responses::ResponsesResponse::builder("resp_1", "m")
+        .copy_from_request(&request)
+        .build();
     assert_eq!(
-        body.model, "canonical-model",
-        "the Responses layer must see the canonical model ID"
+        serde_json::to_value(&built).expect("serialize the response")["reasoning"],
+        applied,
+        "the non-streamed and stored objects"
     );
     assert_eq!(
-        model_id, "canonical-model",
-        "worker selection must use the canonical model ID"
+        serde_json::to_value(&request.reasoning).expect("serialize the config"),
+        applied,
+        "the streamed terminal event"
     );
 
-    // The canonical ID is left alone, and costs no copy.
-    let already_canonical = responses_request("canonical-model");
-    let (body, model_id) =
-        canonicalize_responses_request(&ctx.worker_registry, &already_canonical, "canonical-model");
-    assert!(matches!(body, Cow::Borrowed(_)));
-    assert!(matches!(model_id, Cow::Borrowed(_)));
+    // A request without a reasoning config is left without one.
+    let mut bare = responses_request("m");
+    clear_unapplied_reasoning_keys(&mut bare);
+    assert!(bare.reasoning.is_none());
 }
 
 /// A per-model retry override must survive an alias. The override is keyed

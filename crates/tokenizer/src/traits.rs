@@ -5,8 +5,11 @@ use std::{
 
 use anyhow::Result;
 
-use crate::chat_template::{
-    ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+use crate::{
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+    },
+    decode_activity::note_prefix_mismatch,
 };
 
 /// Type alias for token IDs
@@ -82,6 +85,31 @@ pub struct RendererCapabilities {
     /// message is forwarded in place, for the templates that render a
     /// system turn anywhere.
     pub leading_system_only: bool,
+    /// JSON constraints require reasoning outside the response body.
+    pub json_requires_separate_reasoning: bool,
+    /// JSON constraints start at an empty assistant body, not a partial value.
+    pub json_requires_empty_assistant_prefix: bool,
+}
+
+impl RendererCapabilities {
+    /// Validate reasoning separation and the optional continued assistant text
+    /// for a JSON response. Return an error for an unsupported combination.
+    pub fn validate_json_response(
+        self,
+        separate_reasoning: bool,
+        assistant_prefix: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.json_requires_separate_reasoning || separate_reasoning,
+            "JSON response formats require separate_reasoning=true"
+        );
+        anyhow::ensure!(
+            !self.json_requires_empty_assistant_prefix
+                || assistant_prefix.is_none_or(str::is_empty),
+            "JSON response formats cannot continue a nonempty assistant message"
+        );
+        Ok(())
+    }
 }
 
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
@@ -227,7 +255,7 @@ pub(crate) fn past_emitted(decoded: &str, prefix: &str) -> DecodeStep {
                 .zip(prefix.chars())
                 .find(|((_, a), b)| a != b)
                 .map_or_else(|| decoded.len().min(prefix.len()), |((index, _), _)| index);
-            crate::decode_activity::note_prefix_mismatch(false);
+            note_prefix_mismatch(false);
             (decoded[common..].to_string(), true)
         }
     };

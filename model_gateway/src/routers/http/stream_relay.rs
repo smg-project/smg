@@ -30,8 +30,9 @@ use crate::{
     routers::common::{
         sse::SSE_CHANNEL_BUFFER,
         sse_rechunk::{NoopObserver, SseRechunker},
+        stream::GuardedStream,
     },
-    worker::{GuardedStream, WorkerLoadGuard},
+    worker::WorkerLoadGuard,
 };
 
 /// What a chunk became through the relay's hook, and whether it ends the
@@ -329,6 +330,7 @@ mod tests {
             grpc::wire::Wire,
             http::stream_failure::RelaySource,
         },
+        server::http_client_builder,
         worker::{test_support::RefusedAddress, BasicWorkerBuilder, Worker, WorkerLoadGuard},
     };
 
@@ -568,7 +570,7 @@ mod tests {
     /// host.
     async fn upstream_error() -> reqwest::Error {
         let refused = RefusedAddress::reserve();
-        crate::server::http_client_builder()
+        http_client_builder()
             .no_proxy()
             .build()
             .unwrap()

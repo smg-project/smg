@@ -163,7 +163,7 @@ fn bench_source_resize(c: &mut Criterion) {
                                 .with_minimax_image_resize(source_policy);
                             tracker
                                 .push_part(MediaContentPart::ImageUrl {
-                                    url,
+                                    url: url.into(),
                                     detail: None,
                                     uuid: None,
                                     max_long_side_pixel: Some(cap),

@@ -2,6 +2,8 @@
 
 mod api_endpoints_test;
 mod content_encoding_test;
+mod conversation_bounds_test;
+mod conversation_create_items_test;
 mod messages_api_test;
 mod messages_streaming_test;
 mod messages_test;
@@ -12,4 +14,5 @@ mod query_path_refusals_test;
 mod request_formats_test;
 #[cfg(feature = "provider-openai")]
 mod responses_api_test;
+mod stored_responses_query_test;
 mod streaming_tests;

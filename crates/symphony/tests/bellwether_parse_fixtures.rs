@@ -282,6 +282,56 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // an older template without a thought; the recorded outputs follow the former.
     ("qwen-agentworld-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
+    // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
+    // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
+    // off.
+    ("mage-vl-cowork", GenerationPrompt::OpensTheThought),
+    // Flora-Rewarder and Flora-Captioner are Qwen3.5-27B fine-tunes with templates of their own.
+    // The Rewarder writes Qwen 3.5's tagged calls and opens the thought only when the request asks
+    // for it (closed otherwise, by default too); the Captioner's template declares no tools and
+    // never opens or renders a thought: content alone, read with the plain table.
+    ("flora-rewarder", GenerationPrompt::OpensTheThoughtWhenAsked),
+    ("flora-captioner", GenerationPrompt::Plain),
+    // MiniMax-H3-Image-PE is a Qwen3.8-27B fine-tune (the hub's base-model tag) that ships the
+    // base's chat template byte for byte: ChatML, Qwen 3.5's tagged calls, and the thought opened
+    // in the prompt (closed there when the request turns thinking off).
+    ("minimax-h3-image-pe", GenerationPrompt::OpensTheThought),
+    // MiniCPM-V 4.7 (the 35B-A3B on a Qwen 3.5 mixture-of-experts text stack, the 1B on the dense
+    // one, each with its own tokenizer) ships one chat template for both: ChatML, Qwen 3.5's tagged
+    // calls, and the thought opened in the prompt only when the request asks for it (closed there
+    // otherwise, by default too, as Qwen3.5-2B's).
+    (
+        "minicpm-v-4.7-1b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "minicpm-v-4.7-35b-a3b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    // MiniCPM-OCR-1.0 (its own OCR stack) and MiniCPM-OCR-Jev (a Qwen 3.5 stack) each ship a chat
+    // template and a tokenizer of their own with the MiniCPM-V-4.7 prompt shapes: ChatML, Qwen 3.5's
+    // tagged calls, and the thought opened in the prompt only when the request asks for it.
+    (
+        "minicpm-ocr-1.0",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "minicpm-ocr-jev",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    // The LightOnOCR-3 line: the 4B and the 0.8B (a Qwen 3.5 stack) write the MiniCPM-OCR prompt
+    // shapes under templates of their own (the 0.8B's is MiniCPM-OCR-Jev's byte for byte): ChatML,
+    // Qwen 3.5's tagged calls, the thought opened in the prompt only when the request asks for it;
+    // the 1B (a Mistral 3 stack under ChatML markers) renders no tool section and no thought.
+    (
+        "lightonocr-3-4b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "lightonocr-3-0.8b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    ("lightonocr-3-1b", GenerationPrompt::Plain),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
@@ -360,11 +410,26 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("webworld-32b", GenerationPrompt::ModelWritesTheThought),
     ("webworld-14b", GenerationPrompt::ModelWritesTheThought),
     ("k-exaone-236b-a23b", GenerationPrompt::OpensTheThought),
+    // Youtu-Parsing-Omni writes Qwen3's thinking switch under turn headers of its own
+    // (`<|begin_of_text|>assistant\n`, the group's opener) and declares no tools; bellwether
+    // recorded one content case of it (the rest refused), and a thought the model writes is
+    // reasoning, as the switch says.
+    (
+        "youtu-parsing-omni",
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
+    // Step-5-Preview writes ChatML after a DeepSeek-style beginning-of-sentence marker, the tools
+    // with Qwen 3.5's tagged call format, and `<think>` whatever the request says.
+    ("step-5-preview", GenerationPrompt::AlwaysOpensTheThought),
     ("nanbeige4.2-3b", GenerationPrompt::OpensTheThought),
+    ("nanbeige4.3-33b", GenerationPrompt::OpensTheThought),
+    // Arete-27B (a Qwen 3.5 stack) writes Qwen 3.5's prompt shapes with a reasoning-effort sentence
+    // in the system turn.
+    ("arete-27b", GenerationPrompt::OpensTheThought),
     // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     ("mimo-v2.5", GenerationPrompt::ModelWritesTheThought),
     // The V2.6 line writes the same tags with no newline between them; the generation prompt
@@ -398,7 +463,16 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "hy-memory-30b-a3b",
         GenerationPrompt::OpensTheThoughtByEffort,
     ),
+    // LongCat writes GLM 4.5 and 4.6's keyed spelling under `longcat_`-prefixed tags, each call
+    // bare after the content; its template writes the thinking switch into the user turn
+    // (`/think_on` under `enable_thinking`, `/think_off` otherwise, the default) and opens the
+    // thought in the prompt only when it is on (`<longcat_think>` alone), closing an empty one
+    // otherwise (the tail's newlines are not read, its markers are); bellwether's reference
+    // refused the thought-bearing probes, so the common set holds eleven of the sixteen cases
+    // and the turns set eight of the twelve.
+    ("longcat-2.5", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("ling-3.0-flash", GenerationPrompt::OpensTheThought),
+    ("ling-3.1-flash", GenerationPrompt::OpensTheThought),
     // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
     // whatever the request says (the template has no thinking switch).
     ("glm-5.3-flash", GenerationPrompt::AlwaysOpensTheThought),
@@ -413,12 +487,27 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // assistant turn without a thinking field, so bellwether records five of its sixteen common
     // cases, the reasoning ones and the thinking-on call.
     ("k2-horizon-36b", GenerationPrompt::AlwaysOpensTheThought),
+    // The Jais 3 line (two groups: the dense checkpoints under the 32B, the MoVA one on its own
+    // tokenizer) writes K2-Horizon's shape on a template of its own: the thought opened by the
+    // prompt whatever `enable_thinking` says (`reasoning_effort` picks the tag, `<ifm|think>` by
+    // default, as K2-Horizon's), the calls in the block; its render set lacks every case
+    // with an assistant turn in the history but the one carrying reasoning content, and each
+    // parse set holds the thinking-on call, the reasoning cases and three turn shapes.
+    ("jais-3-32b-fp8", GenerationPrompt::AlwaysOpensTheThought),
+    (
+        "jais-3-mova-36b-a4b-fp8",
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     ("iquest-q1", GenerationPrompt::OpensTheThought),
     // Content and nothing else: templates without a thought or a call syntax, whose parse sets
     // hold content alone.
     ("tinyllama-1.1b-chat-v1.0", GenerationPrompt::Plain),
     ("phi-4-mini-instruct", GenerationPrompt::Plain),
     ("phi-4-multimodal-instruct", GenerationPrompt::Plain),
+    // MiDashengLM-spatial writes a Qwen2.5-Omni-shaped template that renders neither the tools nor
+    // a thought, so the model is never told a call syntax: content alone (bellwether's reference
+    // refused every call and reasoning probe, leaving three common cases and two turn shapes).
+    ("midashenglm-spatial", GenerationPrompt::Plain),
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
@@ -454,6 +543,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // MiniCPM5: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
     // prompt.
     ("minicpm5-2b", GenerationPrompt::ModelWritesTheThought),
+    // colgrep-agent-2B (a MiniCPM5-2B fine-tune) writes the MiniCPM5-2B base template: the same
+    // prompt shapes, the model writing its own `<think>`.
+    ("colgrep-agent-2b", GenerationPrompt::ModelWritesTheThought),
     // dots3: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
     // prompt.
     ("dots3-note-prev", GenerationPrompt::ModelWritesTheThought),
@@ -463,6 +555,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
     // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    // OTel-2.0-LLM-31B-IT (a Gemma 4 stack) writes Gemma 4's template with a comment block added at
+    // the generation prompt and nothing else: the prompt is the turn's opener alone; the model
+    // writes `<|channel>thought` or not.
+    ("otel-2.0-llm-31b-it", GenerationPrompt::ModelDecides),
     // Nemotron 3.5 Bolt-E4B writes a Nemotron-modified Gemma 4 template: the prompt is the turn's opener
     // alone, and a request that turns thinking on puts `<|think|>` in a system turn instead.
     (
@@ -535,9 +631,11 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "nvidia-nemotron-labs-3-puzzle-75b-a9b-bf16",
         GenerationPrompt::OpensTheThought,
     ),
-    // The Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates write the Lightning prompt
-    // (`<think>\n` opened, `<think></think>` when the request turns thinking off) with their own
-    // additions elsewhere in the turn (a media macro, an effort or budget suffix on the user turn).
+    // The Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates and the Sports-Basketball
+    // template (Nemotron 3 Nano Omni) write the Lightning prompt (`<think>\n` opened,
+    // `<think></think>` when the request turns thinking off) with their own additions elsewhere in
+    // the turn (a media macro, an effort or budget suffix on the user turn, an assistant turn's
+    // content parts written as a Python list repr).
     (
         "nvidia-nemotron-3.5-super-vl-120b-a12b-bf16",
         GenerationPrompt::OpensTheThought,
@@ -551,6 +649,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         GenerationPrompt::OpensTheThought,
     ),
     ("nld-uni", GenerationPrompt::OpensTheThought),
+    (
+        "nvidia-nemotronlabs-ai-for-media-sports-basketball",
+        GenerationPrompt::OpensTheThought,
+    ),
     // The LFM3 line (LFM3-1.7B, LFM3-VL-2B, d1-2B) writes Qwen 3.5's tagged calls under ChatML and opens
     // the thought in the prompt (`<think>`, no newline), closed at once (`<think></think>`) when the
     // request turns thinking off; LFM3-Omni-2B's template opens it only when the request asks.
@@ -564,8 +666,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("glm-4.6v", GenerationPrompt::ModelWritesTheThought),
     ("glm-4.6v-flash", GenerationPrompt::ModelWritesTheThought),
     // GLM's compact keyed spelling; the prompt opens the thought, or closes it when the request
-    // turns thinking off; GLM-5.3 opens it whatever the request says.
+    // turns thinking off; GLM-5.3 opens it whatever the request says. Atria-Dawn writes the
+    // preview's template.
     ("atria-dawn-preview", GenerationPrompt::OpensTheThought),
+    ("atria-dawn", GenerationPrompt::OpensTheThought),
     ("glm-4.7", GenerationPrompt::OpensTheThought),
     ("glm-4.7-flash", GenerationPrompt::OpensTheThought),
     ("glm-5", GenerationPrompt::OpensTheThought),
@@ -723,6 +827,7 @@ impl Recorded for Table {
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
+            Self::LongCat => ("<longcat_think>", "</longcat_think>"),
             Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
@@ -763,9 +868,9 @@ impl Recorded for Table {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::Qwen3TaggedDirect => KNOWN_TAGGED_DIFFERENCES,
             // Seed-OSS, Hy4, Olmo 3, Llama 4, xLAM, the json table, Kimi K3, Muse Spark, K2-Horizon,
-            // Inkling, Gemma 4 and the plain table read neither of the probes' Qwen markers:
-            // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content,
-            // as the reference says.
+            // Inkling, Gemma 4, LongCat and the plain table read neither of the probes' Qwen
+            // markers: `</think>` stays reasoning text and the fenced `<tool_call>` block stays
+            // content, as the reference says.
             Self::SeedOss
             | Self::Hy4
             | Self::Olmo3
@@ -780,6 +885,7 @@ impl Recorded for Table {
             | Self::FunctionGemma
             | Self::Mistral
             | Self::MistralV13
+            | Self::LongCat
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, Hy V3 (whose `<tool_call>` opens a
@@ -834,6 +940,7 @@ impl Recorded for Table {
                 | Self::Ling
                 | Self::IQuest
                 | Self::Glm
+                | Self::LongCat
         ) {
             allowed.push(Allowance::DeclaredTypeConflict);
         }
@@ -1041,14 +1148,16 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "llama-3.3-nemotron-70b-reward-principle",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
+    ("youtu-parsing-omni", "<|begin_of_text|>assistant\n"),
 ];
 
 /// What a recorded model's own chat template writes after the thought's close before a call,
 /// where it is not its table's, measured against the rendered prompts (bellwether's
 /// `render/common.jsonl`, `tools-call-arguments-object`): the NVIDIA Nemotron 3 groups and Step
 /// 3.5 Flash write `</think>\n<tool_call>` where the Qwen 3.5 template behind their table writes
-/// two newlines; the Nemotron 3.5 Super-VL and Bolt-74B, Dory and NLD-Uni templates write the same one
-/// newline, and the LFM3 and d1 templates write the call right after the close.
+/// two newlines; the Nemotron 3.5 Super-VL and Bolt-74B, Dory, NLD-Uni and Sports-Basketball
+/// templates write the same one newline, and the LFM3 and d1 templates write the call right after
+/// the close.
 /// The registry's groups carry it as the group's `after`; the test after the next reads the
 /// rendered prompts themselves where the tree holds them (the recorded thinking-on call where the
 /// rendered call turn carries no thought, as d1-2B's does not).
@@ -1067,11 +1176,13 @@ const MEASURED_AFTER: &[(&str, &str)] = &[
     ("nvidia-nemotron-3.5-bolt-74b-a9b-bf16", "\n"),
     ("nvidia-nemotron-labs-dory1.0-4b-bf16", "\n"),
     ("nld-uni", "\n"),
+    ("nvidia-nemotronlabs-ai-for-media-sports-basketball", "\n"),
     ("step-3.5-flash", "\n"),
     ("lfm3-1.7b", ""),
     ("lfm3-vl-2b", ""),
     ("lfm3-omni-2b", ""),
     ("d1-2b", ""),
+    ("step-5-preview", ""),
 ];
 
 #[test]
@@ -1193,12 +1304,20 @@ fn every_recorded_models_text_after_the_thoughts_close_is_the_registrys() {
             );
             continue;
         }
-        let Some((source, rendered, at)) = texts
-            .iter()
-            .find_map(|(source, text)| text.find(close).map(|at| (*source, text, at)))
-        else {
+        // A close counts only when a call follows it: a template whose history call turn writes
+        // no thought (d1-Omni-2B's `<|im_start|>assistant\n<tool_call>`) leaves the generation
+        // prompt's own closed thought as the text's only close, with nothing after it, and that
+        // says nothing about the call; the next source is read instead. The first close decides:
+        // every later close's rest is a suffix of the first one's, so a tag after a later close
+        // is a tag after the first.
+        let Some((source, rendered, at)) = texts.iter().find_map(|(source, text)| {
+            text.find(close)
+                .filter(|at| text[at + close.len()..].contains('<'))
+                .map(|at| (*source, text, at))
+        }) else {
             unread(format!(
-                "no {close:?} in the rendered call turn or the recorded thinking-on call"
+                "no {close:?} followed by a call in the rendered call turn or the recorded \
+                 thinking-on call"
             ));
             continue;
         };
@@ -1569,6 +1688,30 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     // sixteen, and no fence probe.
     ("d1-2b", "parse/content-with-marker-in-code-fence"),
     ("lfm2.5-24b-a2b", "parse/content-with-marker-in-code-fence"),
+    // Youtu-Parsing-Omni: the set is the one content case bellwether could record (the template
+    // renders no thought in history), so the qwen3 table's two listed probes are not among its
+    // fixtures.
+    ("youtu-parsing-omni", "parse/reasoning-with-marker-text"),
+    (
+        "youtu-parsing-omni",
+        "parse/content-with-marker-in-code-fence",
+    ),
+    // bellwether's round trip refuses a parse case whose rendered turn stringifies the content
+    // parts (bellwether #318): this template writes an assistant turn's content as a Python list
+    // repr, so its common set holds six call probes and neither the reasoning nor the fence probe.
+    (
+        "nvidia-nemotronlabs-ai-for-media-sports-basketball",
+        "parse/reasoning-with-marker-text",
+    ),
+    (
+        "nvidia-nemotronlabs-ai-for-media-sports-basketball",
+        "parse/content-with-marker-in-code-fence",
+    ),
+    // bellwether's hand-written set for Step-5-Preview holds the content cases alone (the two content
+    // probes and the turn with the switch off): its reference rejected the fourteen other common
+    // probes, the reasoning and fence probes among them.
+    ("step-5-preview", "parse/reasoning-with-marker-text"),
+    ("step-5-preview", "parse/content-with-marker-in-code-fence"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker

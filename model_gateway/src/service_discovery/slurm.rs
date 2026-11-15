@@ -71,7 +71,7 @@ use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, RoutingMode, SlurmDiscoveryConfig},
     observability::metrics::metrics_labels,
-    worker::{endpoint::Endpoint, EndpointKey},
+    worker::{identity::endpoint::Endpoint, EndpointKey},
 };
 
 /// The oldest Slurm release this provider reads, as (major, minor).
