@@ -306,35 +306,6 @@ def test_the_image_follows_the_routers(router):
 
 
 @needs_helm
-def test_a_router_tag_written_as_a_number_is_refused_with_the_controller_on_alone(
-    tmp_path, chart_with_no_block
-):
-    """The controller's default tag is the router's with a suffix, so with
-    the controller on the router's tag is text: the schema refuses a tag
-    written as a number under its name, where the template gave a type
-    error. With the controller off such a file renders what it rendered
-    before this value was read: the number as the templates print it. A tag
-    of digits alone, quoted, names the image under either switch."""
-    number = tmp_path / "number.yaml"
-    for written, printed in (("1.16", "1.16"), ("20261115", "2.0261115e+07")):
-        number.write_text(f"global:\n  image:\n    tag: {written}\n")
-        assert "global.image.tag: Invalid type" in render_error(*ON, files=(number,))
-        off = render(files=(number,))
-        assert router_image(off) == f"docker.io/lightseekorg/smg:%!s(float64={printed})"
-        labels = [d["metadata"].get("labels", {}) for d in off]
-        assert {found.get("app.kubernetes.io/version") for found in labels} - {None} == {printed}
-        number.write_text(f'global:\n  image:\n    tag: "{written}"\n')
-        for switch in ((), ON):
-            quoted = render(*switch, files=(number,))
-            assert router_image(quoted) == f"docker.io/lightseekorg/smg:{written}"
-    # Over values that hold no block, a block given as null reaches the
-    # schema: the controller is off there as well.
-    number.write_text("policyController: null\nglobal:\n  image:\n    tag: 1.16\n")
-    off = render(files=(number,), chart=chart_with_no_block)
-    assert router_image(off) == "docker.io/lightseekorg/smg:%!s(float64=1.16)"
-
-
-@needs_helm
 def test_a_release_names_the_image_it_publishes():
     """The chart's own values at a release: the router's image on Docker Hub
     and the controller's beside it, under the suffixed tag."""

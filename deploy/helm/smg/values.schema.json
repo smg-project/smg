@@ -1,33 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "if": {
-    "required": ["policyController"],
-    "properties": {
-      "policyController": {
-        "type": "object",
-        "required": ["enabled"],
-        "properties": { "enabled": { "const": true } }
-      }
-    }
-  },
-  "then": {
-    "properties": {
-      "global": {
-        "properties": {
-          "image": {
-            "properties": {
-              "tag": {
-                "type": ["string", "null"],
-                "description": "With the controller on, its default tag is the router's with a suffix, so the router's tag is text: a tag of digits alone is quoted."
-              }
+  "properties": {
+    "global": {
+      "properties": {
+        "image": {
+          "properties": {
+            "tag": {
+              "type": ["string", "null"],
+              "description": "The router's image tag, and a worker's that names none of its own. A tag is text: a tag of digits alone is quoted. A number is not rendered as written: 1.10 is read as 1.1."
             }
           }
         }
       }
-    }
-  },
-  "properties": {
+    },
     "router": {
       "type": "object",
       "properties": {
@@ -491,6 +477,20 @@
         "shutdownGracePeriodSeconds": { "type": ["integer", "null"], "minimum": 1 },
         "shutdownSettleSeconds": { "type": ["integer", "null"], "minimum": 0 },
         "terminationGraceMarginSeconds": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "workers": {
+      "items": {
+        "properties": {
+          "image": {
+            "properties": {
+              "tag": {
+                "type": ["string", "null"],
+                "description": "The worker's image tag; none takes the router's. A tag is text: a tag of digits alone is quoted."
+              }
+            }
+          }
+        }
       }
     }
   }
