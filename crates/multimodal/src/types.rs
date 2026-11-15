@@ -1003,21 +1003,27 @@ mod tests {
                 }
                 // Each bound names itself in the panic, so a red run says
                 // which one fired.
-                // The quiet window is judged at the sample's own instant: a
-                // parent held off the core between the read and the check
+                // The quiet window runs from just after the read that last
+                // saw progress to just before the current read, so the span
+                // it judges is never longer than the span between the two:
+                // a parent held off the core, inside a read or after it,
                 // must not turn an unobserved stretch into a deadlock.
                 let observed = Instant::now();
                 let blocked = match process_cpu_time(child.id()) {
                     Some(cpu) => {
                         if cpu > progressed.1 {
-                            progressed = (observed, cpu);
+                            // Stamped after the read: the child may have
+                            // accrued its last tick just before it.
+                            progressed = (Instant::now(), cpu);
                         }
-                        if observed.duration_since(progressed.0) >= QUIET {
+                        if observed.saturating_duration_since(progressed.0) >= QUIET {
                             Some(format!(
                                 "no CPU accrued for {QUIET:?} (child CPU time {cpu:?})"
                             ))
                         } else if observed.duration_since(started) >= CEILING {
-                            Some(format!("the {CEILING:?} wall ceiling passed with the child still on CPU ({cpu:?})"))
+                            Some(format!(
+                                "wall ceiling {CEILING:?} passed, child still on CPU ({cpu:?})"
+                            ))
                         } else {
                             None
                         }
