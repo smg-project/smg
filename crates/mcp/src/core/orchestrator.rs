@@ -76,7 +76,8 @@ use crate::{
 
 /// A server's tools as inventory entries under `category`: the listing and
 /// the entries; the failure's message, after one warning, when the server
-/// cannot be listed (the inventory keeps it as the server's listing error).
+/// cannot be listed (the caller keeps it as the server's listing error: a
+/// static server's entry, a pooled connection and the request's binding).
 async fn tools_of<S: rmcp::service::Service<RoleClient>>(
     client: &RunningService<RoleClient, S>,
     server_key: &str,
@@ -356,6 +357,16 @@ struct ServerEntry {
     /// Why the server's tool listing failed; `None` once a listing succeeded
     /// (the first load, a refresh).
     list_error: Option<String>,
+}
+
+/// A dynamic server as its connect leaves it: the key (its URL) that names
+/// the connection, and why its tools could not be listed (`None` when they
+/// were). The caller keeps the outcome with its binding; the pool keeps it
+/// with the connection for a later hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedServer {
+    pub server_key: String,
+    pub list_error: Option<String>,
 }
 
 /// Internal result type for approval-checked execution.
@@ -1637,12 +1648,16 @@ impl McpOrchestrator {
     /// Connect to a dynamic server and add it to the connection pool.
     ///
     /// This is used for per-request MCP servers specified in tool configurations.
-    /// Returns the server key (URL) that can be used to reference the connection.
+    /// Returns the server key (URL) that references the connection and the
+    /// outcome of its tool listing.
     ///
     /// The connection is keyed by (url, auth_hash, tenant_id) to ensure:
     /// - Different auth tokens get different connections
     /// - Different tenants are isolated
-    pub async fn connect_dynamic_server(&self, config: McpServerConfig) -> McpResult<String> {
+    pub async fn connect_dynamic_server(
+        &self,
+        config: McpServerConfig,
+    ) -> McpResult<ConnectedServer> {
         self.connect_dynamic_server_with_tenant(config, None).await
     }
 
@@ -1654,7 +1669,7 @@ impl McpOrchestrator {
         &self,
         config: McpServerConfig,
         tenant_id: Option<String>,
-    ) -> McpResult<String> {
+    ) -> McpResult<ConnectedServer> {
         use rmcp::{
             transport::{
                 streamable_http_client::StreamableHttpClientTransportConfig,
@@ -1664,51 +1679,66 @@ impl McpOrchestrator {
         };
 
         let pool_key = PoolKey::from_config(&config, tenant_id);
-
-        // Check if already connected with same auth/tenant
-        if self.connection_pool.contains(&pool_key) {
-            return Ok(pool_key.url.clone());
-        }
-
-        // Extract server_key from pool_key to avoid double URL extraction
         let server_key = pool_key.url.clone();
+
+        // A connection with the same auth and tenant is a pool hit, unless the
+        // listing made on it failed: that connection lists again, so a
+        // transient refusal does not stand until the connection is evicted.
+        let pooled = self.connection_pool.get(&pool_key);
+        if pooled.is_some() && self.connection_pool.list_error(&pool_key).is_none() {
+            return Ok(ConnectedServer {
+                server_key,
+                list_error: None,
+            });
+        }
+        let opened = pooled.is_none();
 
         // Connect via the pool
         let inventory_clone = Arc::clone(&self.tool_inventory);
         let global_proxy = self.config.proxy.clone();
 
-        let client = self
-            .connection_pool
-            .get_or_create(pool_key.clone(), config.clone(), |cfg, _proxy| async move {
-                match &cfg.transport {
-                    McpTransport::Streamable {
-                        url,
-                        token,
-                        headers: custom_headers,
-                    } => {
-                        let proxy_config =
-                            super::proxy::resolve_proxy_config(&cfg, global_proxy.as_ref());
-                        let http_client =
-                            build_http_client(proxy_config, token.as_deref(), custom_headers)?;
-                        let cfg_http = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+        let client = match pooled {
+            Some(client) => client,
+            None => {
+                self.connection_pool
+                    .get_or_create(pool_key.clone(), config.clone(), |cfg, _proxy| async move {
+                        match &cfg.transport {
+                            McpTransport::Streamable {
+                                url,
+                                token,
+                                headers: custom_headers,
+                            } => {
+                                let proxy_config =
+                                    super::proxy::resolve_proxy_config(&cfg, global_proxy.as_ref());
+                                let http_client = build_http_client(
+                                    proxy_config,
+                                    token.as_deref(),
+                                    custom_headers,
+                                )?;
+                                let cfg_http =
+                                    StreamableHttpClientTransportConfig::with_uri(url.as_str());
 
-                        let transport =
-                            StreamableHttpClientTransport::with_client(http_client, cfg_http);
+                                let transport = StreamableHttpClientTransport::with_client(
+                                    http_client,
+                                    cfg_http,
+                                );
 
-                        Box::pin(().serve(transport))
-                            .await
-                            .map_err(|e| McpError::ConnectionFailed(format!("streamable: {e}")))
-                    }
-                    McpTransport::Sse { .. } => Err(sse_unsupported(&cfg.name)),
-                    McpTransport::Stdio { .. } => Err(McpError::Transport(
-                        "Stdio not supported for dynamic connections".to_string(),
-                    )),
-                }
-            })
-            .await?;
+                                Box::pin(().serve(transport)).await.map_err(|e| {
+                                    McpError::ConnectionFailed(format!("streamable: {e}"))
+                                })
+                            }
+                            McpTransport::Sse { .. } => Err(sse_unsupported(&cfg.name)),
+                            McpTransport::Stdio { .. } => Err(McpError::Transport(
+                                "Stdio not supported for dynamic connections".to_string(),
+                            )),
+                        }
+                    })
+                    .await?
+            }
+        };
 
         // The tools go to the inventory by URL; the listing's outcome stays
-        // with this connection (its pool key), not with the URL.
+        // with this connection (its pool key) and goes to the caller's binding.
         let list_error = match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
             Ok(entries) => {
                 for entry in entries {
@@ -1718,10 +1748,16 @@ impl McpOrchestrator {
             }
             Err(message) => Some(message),
         };
-        self.connection_pool.set_list_error(&pool_key, list_error);
+        self.connection_pool
+            .set_list_error(&pool_key, list_error.clone());
 
-        self.metrics.record_connection_opened();
-        Ok(server_key)
+        if opened {
+            self.metrics.record_connection_opened();
+        }
+        Ok(ConnectedServer {
+            server_key,
+            list_error,
+        })
     }
 
     // ========================================================================
@@ -1787,15 +1823,13 @@ impl McpOrchestrator {
         Arc::clone(&self.tool_inventory)
     }
 
-    /// Why a server's tools could not be listed, when its last listing failed:
-    /// a static server's own entry, else the pooled connections to the URL
-    /// (`None` as soon as one of them listed; the record leaves with the
-    /// connection on eviction).
+    /// Why a static server's tools could not be listed, when its last listing
+    /// failed; a dynamic server answers that at its connect
+    /// (`ConnectedServer::list_error`) and the request's binding keeps it.
     pub fn list_error_for_server(&self, server_key: &str) -> Option<String> {
-        if let Some(entry) = self.static_servers.get(server_key) {
-            return entry.list_error.clone();
-        }
-        self.connection_pool.list_error_by_url(server_key)
+        self.static_servers
+            .get(server_key)
+            .and_then(|entry| entry.list_error.clone())
     }
 
     /// Get the approval manager.

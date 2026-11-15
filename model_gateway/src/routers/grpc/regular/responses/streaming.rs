@@ -876,13 +876,13 @@ async fn execute_tool_loop_streaming_internal(
         if !mcp_list_tools_emitted {
             for binding in session.mcp_servers() {
                 let tools_for_server = session.list_tools_for_server(&binding.server_key);
-                let list_error = session.list_error_for_server(&binding.server_key);
+                let list_error = binding.list_error.as_deref();
 
                 if let Err(message) = emitter
                     .emit_mcp_list_tools_sequence(
                         &binding.label,
                         &tools_for_server,
-                        list_error.as_deref(),
+                        list_error,
                         &tx,
                     )
                     .await

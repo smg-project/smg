@@ -130,12 +130,13 @@ pub async fn connect_mcp_servers(
             )
             .await
             {
-                Ok(_) => {
+                Ok(connected) => {
                     if !mcp_servers.iter().any(|b| b.server_key == server_key) {
                         mcp_servers.push(McpServerBinding {
                             label: input.label.clone(),
                             server_key,
                             allowed_tools: input.allowed_tools.clone(),
+                            list_error: connected.list_error,
                         });
                     }
                 }
@@ -150,6 +151,7 @@ pub async fn connect_mcp_servers(
                 label: input.label.clone(),
                 server_key: input.label.clone(),
                 allowed_tools: input.allowed_tools.clone(),
+                list_error: mcp_orchestrator.list_error_for_server(&input.label),
             });
         }
     }
@@ -302,10 +304,12 @@ pub async fn ensure_mcp_servers(
                 "Adding static server for built-in tool routing"
             );
             if !mcp_servers.iter().any(|b| b.server_key == server_name) {
+                let list_error = orchestrator.list_error_for_server(&server_name);
                 mcp_servers.push(McpServerBinding {
                     label: server_name.clone(),
                     server_key: server_name,
                     allowed_tools: None,
+                    list_error,
                 });
             }
         } else {
@@ -520,8 +524,12 @@ mod tests {
 
     /// A local MCP server over HTTP that initializes and answers `tools/list`
     /// with `tools` (each with an empty schema), or with a JSON-RPC error when
-    /// `tools` is `None`; the URL it serves on.
-    async fn serve_local_mcp_server(tools: Option<&'static [&'static str]>) -> String {
+    /// `tools` is `None` or the request carries the `refused_bearer` token;
+    /// the URL it serves on.
+    async fn serve_local_mcp_server(
+        tools: Option<&'static [&'static str]>,
+        refused_bearer: Option<&'static str>,
+    ) -> String {
         use axum::{
             extract::State,
             http::{HeaderMap, StatusCode},
@@ -530,8 +538,11 @@ mod tests {
         };
 
         async fn mcp(
-            State(tools): State<Option<&'static [&'static str]>>,
-            _headers: HeaderMap,
+            State((tools, refused_bearer)): State<(
+                Option<&'static [&'static str]>,
+                Option<&'static str>,
+            )>,
+            headers: HeaderMap,
             Json(message): Json<Value>,
         ) -> axum::response::Response {
             use axum::response::IntoResponse;
@@ -546,22 +557,30 @@ mod tests {
                     }
                 }))
                 .into_response(),
-                Some("tools/list") => match tools {
-                    Some(names) => Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": {"tools": names.iter().map(|name| json!({
-                            "name": name,
-                            "description": format!("the {name} tool"),
-                            "inputSchema": {"type": "object", "properties": {}}
-                        })).collect::<Vec<_>>()}
-                    }))
-                    .into_response(),
-                    None => Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "error": {"code": -32603, "message": "tools/list refused by the server"}
-                    }))
-                    .into_response(),
-                },
+                Some("tools/list") => {
+                    let refused = refused_bearer.is_some_and(|token| {
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .is_some_and(|value| value == format!("Bearer {token}"))
+                    });
+                    match tools {
+                        Some(names) if !refused => Json(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {"tools": names.iter().map(|name| json!({
+                                "name": name,
+                                "description": format!("the {name} tool"),
+                                "inputSchema": {"type": "object", "properties": {}}
+                            })).collect::<Vec<_>>()}
+                        }))
+                        .into_response(),
+                        _ => Json(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": -32603, "message": "tools/list refused by the server"}
+                        }))
+                        .into_response(),
+                    }
+                }
                 Some(method) if method.starts_with("notifications/") => {
                     StatusCode::ACCEPTED.into_response()
                 }
@@ -584,7 +603,9 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/mcp", post(mcp)).with_state(tools),
+                Router::new()
+                    .route("/mcp", post(mcp))
+                    .with_state((tools, refused_bearer)),
             )
             .await
             .expect("the local MCP server serves");
@@ -600,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_tools_list_is_the_list_items_error() {
         let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-        let url = serve_local_mcp_server(None).await;
+        let url = serve_local_mcp_server(None, None).await;
         let inputs = [McpServerInput {
             label: "conf".to_string(),
             url: Some(url),
@@ -632,19 +653,18 @@ mod tests {
         assert_eq!(json["tools"], json!([]));
     }
 
-    /// A listing failure leaves with its connection: with a pool of one, the
-    /// second server's connect evicts the first, and the first's failure is
-    /// no longer the list item's error for its URL (nothing is keyed by the
-    /// URL alone). The read goes through the item builder, as a request's
-    /// does.
+    /// A binding keeps the outcome of its own connect: with a pool of one, the
+    /// second server's connect evicts the first's connection, and the first's
+    /// item still carries its listing's error while the second's carries
+    /// none. The read goes through the item builder, as a request's does.
     #[tokio::test]
-    async fn a_listing_failure_leaves_with_its_connection() {
+    async fn a_bindings_listing_failure_survives_its_connections_eviction() {
         let mut config = McpConfig::default();
         config.pool.max_connections = 1;
         let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
         let format_registry = FormatRegistry::new();
-        let refusing = serve_local_mcp_server(None).await;
-        let listing = serve_local_mcp_server(Some(&["echo"])).await;
+        let refusing = serve_local_mcp_server(None, None).await;
+        let listing = serve_local_mcp_server(Some(&["echo"]), None).await;
         let input = |label: &str, url: &str| McpServerInput {
             label: label.to_string(),
             url: Some(url.to_string()),
@@ -678,10 +698,56 @@ mod tests {
         assert_eq!(second.len(), 1);
         let bindings = [first, second].concat();
         assert_eq!(item_error(bindings.clone(), "b"), None);
+        assert!(
+            item_error(bindings, "a").is_some_and(|error| error.is_string()),
+            "the first binding keeps the failure its own connect saw"
+        );
+    }
+
+    /// One URL under two bearer tokens is two connections (the pool key takes
+    /// the auth): the server refuses `tools/list` for one token and lists for
+    /// the other, and the request that listed reads no error on its item
+    /// while the refused one reads its own; neither reads the other's.
+    #[tokio::test]
+    async fn a_listing_refused_for_one_caller_is_not_anothers_error() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let url = serve_local_mcp_server(Some(&["echo"]), Some("refused-token")).await;
+        let input = |label: &str, token: &str| McpServerInput {
+            label: label.to_string(),
+            url: Some(url.clone()),
+            authorization: Some(token.to_string()),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        let item_error = |bindings: Vec<McpServerBinding>| {
+            let binding = bindings.first().expect("one binding").clone();
+            let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+            openai_bridge::mcp_list_tools_json(&session, &binding.label, &binding.server_key)
+                .get("error")
+                .cloned()
+        };
+
+        let refused = connect_mcp_servers(
+            &orchestrator,
+            &format_registry,
+            &[input("a", "refused-token")],
+        )
+        .await;
+        let listed =
+            connect_mcp_servers(&orchestrator, &format_registry, &[input("b", "good-token")]).await;
+        assert_eq!((refused.len(), listed.len()), (1, 1));
         assert_eq!(
-            item_error(bindings, "a"),
+            refused[0].server_key, listed[0].server_key,
+            "one URL, two connections"
+        );
+        assert!(
+            item_error(refused.clone()).is_some_and(|error| error.is_string()),
+            "the refused caller's item carries the refusal"
+        );
+        assert_eq!(
+            item_error(listed),
             None,
-            "the evicted connection took its failure with it"
+            "a refusal another caller met is not this caller's error"
         );
     }
 

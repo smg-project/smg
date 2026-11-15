@@ -175,7 +175,7 @@ pub fn mcp_list_tools_item(
         id: generate_id("mcpl"),
         server_label: server_label.to_string(),
         tools: build_mcp_tool_infos(&tools),
-        error: session.list_error_for_server(server_key),
+        error: session.list_error_for_binding(server_label, server_key),
     }
 }
 
@@ -203,7 +203,7 @@ pub fn mcp_list_tools_json(
         "tools".to_string(),
         Value::Array(tools.iter().map(mcp_tool_info_json).collect()),
     );
-    if let Some(error) = session.list_error_for_server(server_key) {
+    if let Some(error) = session.list_error_for_binding(server_label, server_key) {
         item.insert("error".to_string(), Value::String(error));
     }
     Value::Object(item)

@@ -42,6 +42,10 @@ pub struct McpServerBinding {
     /// When `Some`, only the listed tool names are exposed for this server.
     /// When `None`, all tools from the server are exposed.
     pub allowed_tools: Option<Vec<String>>,
+    /// Why the server's tools could not be listed when this binding was made;
+    /// `None` when they were listed. A request's item reports its own
+    /// connect's outcome, whatever the pool did since.
+    pub list_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -407,10 +411,14 @@ impl<'a> McpToolSession<'a> {
             .collect()
     }
 
-    /// The failure of a server's last tool listing, for its `mcp_list_tools`
+    /// The failure of the tool listing made when `server_label` (bound to
+    /// `server_key`) was connected for this request, for its `mcp_list_tools`
     /// item's `error`; `None` when the listing succeeded.
-    pub fn list_error_for_server(&self, server_key: &str) -> Option<String> {
-        self.orchestrator.list_error_for_server(server_key)
+    pub fn list_error_for_binding(&self, server_label: &str, server_key: &str) -> Option<String> {
+        self.all_mcp_servers
+            .iter()
+            .find(|binding| binding.label == server_label && binding.server_key == server_key)
+            .and_then(|binding| binding.list_error.clone())
     }
 
     /// Resolve an exposed tool name (post-alias) to its `QualifiedToolName`.
@@ -667,11 +675,13 @@ mod tests {
                 label: "label1".to_string(),
                 server_key: "key1".to_string(),
                 allowed_tools: None,
+                list_error: None,
             },
             McpServerBinding {
                 label: "label2".to_string(),
                 server_key: "key2".to_string(),
                 allowed_tools: None,
+                list_error: None,
             },
         ];
 
@@ -706,6 +716,7 @@ mod tests {
             label: "my_label".to_string(),
             server_key: "my_key".to_string(),
             allowed_tools: None,
+            list_error: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
 
@@ -751,6 +762,7 @@ mod tests {
             label: "label1".to_string(),
             server_key: "server1".to_string(),
             allowed_tools: None,
+            list_error: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
 
@@ -770,6 +782,7 @@ mod tests {
                 label: "label1".to_string(),
                 server_key: "server1".to_string(),
                 allowed_tools: None,
+                list_error: None,
             }],
             "test-request",
         );
@@ -808,6 +821,7 @@ mod tests {
             label: "my_server".to_string(),
             server_key: "server1".to_string(),
             allowed_tools: None,
+            list_error: None,
         }];
         let session = McpToolSession::new(&orchestrator, mcp_servers, "test-request");
 
@@ -829,11 +843,13 @@ mod tests {
                     label: "alpha".to_string(),
                     server_key: "server1".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
                 McpServerBinding {
                     label: "beta".to_string(),
                     server_key: "server2".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
             ],
             "test-request",
@@ -872,16 +888,19 @@ mod tests {
                     label: "a".to_string(),
                     server_key: "s1".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
                 McpServerBinding {
                     label: "b".to_string(),
                     server_key: "s2".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
                 McpServerBinding {
                     label: "c".to_string(),
                     server_key: "s3".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
             ],
             "test-request",
@@ -923,11 +942,13 @@ mod tests {
                 label: "brave".to_string(),
                 server_key: "brave-builtin".to_string(),
                 allowed_tools: None,
+                list_error: None,
             },
             McpServerBinding {
                 label: "regular".to_string(),
                 server_key: "regular-server".to_string(),
                 allowed_tools: None,
+                list_error: None,
             },
         ];
 
@@ -970,6 +991,7 @@ mod tests {
                 label: "internal-label".to_string(),
                 server_key: "internal-server".to_string(),
                 allowed_tools: None,
+                list_error: None,
             }],
             "test-request",
         );
@@ -1000,6 +1022,7 @@ mod tests {
                 label: "image".to_string(),
                 server_key: "image-server".to_string(),
                 allowed_tools: None,
+                list_error: None,
             }],
             "test-request",
         );
@@ -1021,6 +1044,7 @@ mod tests {
                 label: "mock".to_string(),
                 server_key: "server1".to_string(),
                 allowed_tools: Some(vec!["brave_web_search".to_string()]),
+                list_error: None,
             }],
             "test-request",
         );
@@ -1055,6 +1079,7 @@ mod tests {
                 label: "brave".to_string(),
                 server_key: "server1".to_string(),
                 allowed_tools: None,
+                list_error: None,
             }],
             "test-request",
         );
@@ -1086,6 +1111,7 @@ mod tests {
                 label: "brave".to_string(),
                 server_key: "server1".to_string(),
                 allowed_tools: Some(vec!["web_search".to_string()]),
+                list_error: None,
             }],
             "test-request",
         );
@@ -1116,6 +1142,7 @@ mod tests {
                 label: "internal-label".to_string(),
                 server_key: "internal-server".to_string(),
                 allowed_tools: None,
+                list_error: None,
             }],
             "test-request",
         );
@@ -1150,6 +1177,7 @@ mod tests {
                 label: "internal-label".to_string(),
                 server_key: "internal-server".to_string(),
                 allowed_tools: None,
+                list_error: None,
             }],
             "test-request",
         );
@@ -1181,11 +1209,13 @@ mod tests {
                     label: "shared-label".to_string(),
                     server_key: "public-server".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
                 McpServerBinding {
                     label: "shared-label".to_string(),
                     server_key: "internal-server".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
             ],
             "test-request",
@@ -1216,11 +1246,13 @@ mod tests {
                     label: "brave".to_string(),
                     server_key: "server1".to_string(),
                     allowed_tools: Some(vec!["brave_web_search".to_string()]),
+                    list_error: None,
                 },
                 McpServerBinding {
                     label: "deepwiki".to_string(),
                     server_key: "server2".to_string(),
                     allowed_tools: None,
+                    list_error: None,
                 },
             ],
             "test-request",

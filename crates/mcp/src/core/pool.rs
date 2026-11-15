@@ -263,26 +263,13 @@ impl McpConnectionPool {
         }
     }
 
-    /// The listing failure reported for `url`: `None` as soon as one of the
-    /// connections to it listed its tools (the inventory holds them), else the
-    /// most recently used connection's failure; `None` with no connection.
-    pub fn list_error_by_url(&self, url: &str) -> Option<String> {
-        let connections = self.connections.lock();
-        let mut failure = None;
-        for (key, cached) in connections.iter() {
-            if key.url != url {
-                continue;
-            }
-            match &cached.list_error {
-                None => return None,
-                Some(message) => {
-                    if failure.is_none() {
-                        failure = Some(message.clone());
-                    }
-                }
-            }
-        }
-        failure
+    /// The failure recorded for the connection under `key`; `None` when its
+    /// listing succeeded or the pool does not hold it. No promotion.
+    pub fn list_error(&self, key: &PoolKey) -> Option<String> {
+        self.connections
+            .lock()
+            .peek(key)
+            .and_then(|cached| cached.list_error.clone())
     }
 
     pub fn list_keys(&self) -> Vec<PoolKey> {

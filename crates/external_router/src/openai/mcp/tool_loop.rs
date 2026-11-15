@@ -1800,11 +1800,13 @@ mod tests {
                 label: "deepwiki_ask".to_string(),
                 server_key: "server-ask".to_string(),
                 allowed_tools: Some(vec!["ask_question".to_string()]),
+                list_error: None,
             },
             McpServerBinding {
                 label: "deepwiki_read".to_string(),
                 server_key: "server-read".to_string(),
                 allowed_tools: Some(vec!["read_wiki_structure".to_string()]),
+                list_error: None,
             },
         ];
 
@@ -1823,6 +1825,7 @@ mod tests {
             label: "deepwiki_ask".to_string(),
             server_key: "server-ask".to_string(),
             allowed_tools: Some(vec!["ask_question".to_string()]),
+            list_error: None,
         }];
 
         let bindings_to_emit = mcp_list_tools_bindings_to_emit(&existing_labels, &bindings);
@@ -2281,6 +2284,7 @@ mod tests {
             label: "wiki".to_string(),
             server_key: "wiki-server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }];
         (orchestrator, bindings)
     }
@@ -2769,6 +2773,7 @@ mod tests {
             label: label.to_string(),
             server_key: server_key.to_string(),
             allowed_tools: None,
+            list_error: None,
         };
         let session = McpToolSession::new(
             &orchestrator,
