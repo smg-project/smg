@@ -89,8 +89,8 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        endpoint::Endpoint, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
-        WorkerRegistry, UNKNOWN_MODEL_ID,
+        identity::endpoint::Endpoint, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
+        WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -3090,8 +3090,8 @@ mod tests {
         server::http_client_builder,
         tenant::TenantKey,
         worker::{
-            circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
-            CircuitBreakerConfig, WorkerType,
+            health::circuit_breaker::CircuitState, test_support::RefusedAddress,
+            BasicWorkerBuilder, CircuitBreakerConfig, WorkerType,
         },
     };
 
@@ -6864,7 +6864,7 @@ mod tests {
         builder: BasicWorkerBuilder,
         successes: u32,
     ) -> Arc<dyn Worker> {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
 
         let worker: Arc<dyn Worker> = Arc::new(
             builder
@@ -6905,7 +6905,7 @@ mod tests {
     /// standing failure.
     #[tokio::test]
     async fn a_decode_heads_success_is_recorded_before_the_relay_can_sample_a_cut() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
 
         let router = create_test_pd_router();
         let decode = half_open_decode_worker();
@@ -6982,7 +6982,7 @@ mod tests {
     /// breaker.
     #[test]
     fn the_attempt_skips_a_decode_head_the_relay_recorded() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
 
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://prefill:8000")
@@ -7019,7 +7019,7 @@ mod tests {
     #[tokio::test]
     async fn a_streamed_decode_heads_success_is_recorded_once_on_the_parallel_and_sequential_paths()
     {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -7128,7 +7128,7 @@ mod tests {
     /// the cut, every time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cut_right_behind_the_decode_head_is_sampled_after_the_heads_success() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
 
         const ROUNDS: usize = 40;
         let decode_url = spawn_abrupt_cut_stub("/v1/chat/completions", CHAT_SSE_CHUNKS[0]).await;

@@ -12,8 +12,8 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
     worker::{
-        endpoint::Endpoint, sampling_defaults::SamplingDefaults, ConnectionMode,
-        DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
+        identity::{endpoint::Endpoint, sampling_defaults::SamplingDefaults},
+        ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},

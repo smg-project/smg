@@ -230,3 +230,10 @@ schema in an XML style, a schema that accepts nothing, an embedded EBNF grammar 
 vocabulary lacks have no Lark spelling and refuse the grammar by name (`Inexpressible`). The one
 loosening is named in the text's notes (`Lark::notes`): a schema's excluded words are not held out
 of its strings, which the backend's JSON cannot do.
+
+The outlines backend builds a regular expression from one JSON schema and nothing wider, so its one
+spelling is a JSON schema alone (`Spelling::JsonSchema`, `Grammar::json_schema_alone`): an answer
+the engine starts at the schema, in the plain JSON style and with no excluded words, written as the
+schema's text; its whitespace bound is not written, as an older xgrammar ignores it. A tag, a schema
+the template's text leads or follows, a schema in an XML style or one with excluded words has no
+outlines spelling and is refused by the backend's name (`Unspelled`).

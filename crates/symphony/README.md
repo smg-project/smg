@@ -240,6 +240,7 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
+| 2026-11-08 | [minimax-h3-image-pe](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-h3-image-pe) | MiniMaxAI/MiniMax-H3-Image-PE |  | `qwen3`, tagged calls | 28 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-11-06 | [arete-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/arete-27b) | NousResearch/Arete-27B |  | `qwen3`, tagged calls | 28 | replaying the set | none |
 | 2026-11-06 | [cola2](https://github.com/smg-project/bellwether/tree/main/fixtures/cola2) | ByteDance-Seed/Cola2 |  | `qwen3` | — | awaiting fixtures | none |
 | 2026-11-04 | [longcat-2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/longcat-2.5) | meituan-longcat/LongCat-2.5 |  | `longcat` | 19 | replaying the set | none |
@@ -261,6 +262,8 @@ Newest first; the status column reads ready, replaying the set, awaiting fixture
 | 2026-10-12 | [nvidia-nemotron-3.5-super-vl-120b-a12b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-super-vl-120b-a12b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 | NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 | `qwen3`, tagged calls | 27 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-10-09 | [nvidia-nemotron-3.5-bolt-74b-a9b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-bolt-74b-a9b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16 |  | `qwen3`, tagged calls | 27 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-10-09 | [youtu-parsing-omni](https://github.com/smg-project/bellwether/tree/main/fixtures/youtu-parsing-omni) | tencent/Youtu-Parsing-Omni |  | `qwen3` | 1 | replaying the set | none |
+| 2026-10-07 | [minicpm-v-4.7-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm-v-4.7-35b-a3b) | openbmb/MiniCPM-V-4.7-35B-A3B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
+| 2026-10-06 | [minicpm-v-4.7-1b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm-v-4.7-1b) | openbmb/MiniCPM-V-4.7-1B |  | `qwen3`, tagged calls | 19 | replaying the set | none |
 | 2026-10-05 | [d1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/d1-3b) | LiquidAI/d1-3B |  | `lfm2.5` | 589,657 | replaying the set | none |
 | 2026-10-05 | [nld-uni](https://github.com/smg-project/bellwether/tree/main/fixtures/nld-uni) | nvidia/NLD-Uni |  | `qwen3`, tagged calls | 27 | replaying the set | none |
 | 2026-10-05 | [nvidia-nemotron-3.5-bolt-e4b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-bolt-e4b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 |  | `gemma4` | 28 | replaying the set | `qwen_xml`, `nano_v3` |
