@@ -49,7 +49,7 @@ use smg_policy_controller::{
     client::{self, blocking, Client},
     controller::{State, PROTOCOL_VERSION},
     proto::{completed::Class, principal, released, Completed, Released, Side},
-    store::WorkerStatus,
+    store::{LaneCounts, WorkerStatus},
     view::{Role, SignalSource},
 };
 use tokio::sync::oneshot;
@@ -220,6 +220,53 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 "only the busy engine runs requests: {row:?}"
             );
         }
+
+        // The KV events follow the fleet: the busy engine's held requests
+        // stored blocks, its stream's batches reached its rank's cursor, and
+        // its row's index holds every block the engine holds.
+        let stored = within(
+            "the busy engine's blocks reach its row's index",
+            PROBE_INTERVAL + ROOM,
+            || {
+                harness.heard(busy).first().is_some_and(|rank| {
+                    rank.indexed > 0 && rank.cursor.is_some_and(|cursor| cursor.applied >= 1)
+                })
+            },
+        )
+        .await
+        .expect("the KV events follow");
+        let heard = harness.heard(busy);
+        let rank = heard.first().expect("the busy engine's one rank");
+        assert!(
+            rank.last >= 1
+                && rank.cursor.is_some_and(|cursor| {
+                    cursor.applied >= rank.last && !cursor.replay_pending && !cursor.degraded
+                }),
+            "the cursor stands at what the stream delivered: {rank:?}"
+        );
+        assert!(
+            rank.applied >= 1 && rank.indexed == rank.held,
+            "the index holds each block the engine's events left it holding: {rank:?}"
+        );
+        assert_eq!(
+            rank.counts,
+            Some(LaneCounts::default()),
+            "no store came without its parent and no block was refused: {rank:?}"
+        );
+        for engine in engines.iter().filter(|engine| **engine != busy) {
+            for rank in harness.heard(*engine) {
+                assert!(
+                    rank.applied == 0 && rank.indexed == 0 && rank.held == 0,
+                    "an engine that stored no block published none: engine {engine} {rank:?}"
+                );
+            }
+        }
+        assert_eq!(harness.gaps(), 0, "no stream named a gap");
+        assert_eq!(
+            harness.snapshot_chunks(),
+            0,
+            "an engine's own stream carries no snapshot chunk"
+        );
 
         // The death. The kill waits for a view that reads its engine
         // healthy, so the death alone moves its rows. Its promise is held
@@ -532,6 +579,9 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         writeln!(out, "FLEET_DIAL_TIMEOUT_MS {}", DIAL_TIMEOUT.as_millis()).expect("stdout");
         writeln!(out, "FLEET_READY_MS {}", ready.as_millis()).expect("stdout");
         writeln!(out, "FLEET_LOADS_FOLLOW_MS {}", followed.as_millis()).expect("stdout");
+        writeln!(out, "FLEET_KV_FOLLOW_MS {}", stored.as_millis()).expect("stdout");
+        writeln!(out, "FLEET_KV_BATCHES {}", rank.applied).expect("stdout");
+        writeln!(out, "FLEET_KV_BLOCKS {}", rank.indexed).expect("stdout");
         writeln!(out, "FLEET_DEATH_WRITTEN_MS {}", written.as_millis()).expect("stdout");
         writeln!(out, "FLEET_DEATH_SEEN_MS {}", seen.as_millis()).expect("stdout");
         writeln!(out, "FLEET_HANG_SEEN_MS {}", hung_seen.as_millis()).expect("stdout");
