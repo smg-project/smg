@@ -1196,9 +1196,7 @@ mod tests {
         use http::StatusCode;
         use openai_protocol::worker::WorkerSpec;
 
-        use crate::{
-            worker::pd_pairing::PdPairing, workflow::steps::local::test_support::serve_json_routes,
-        };
+        use crate::{worker::PdPairing, workflow::steps::local::test_support::serve_json_routes};
 
         for (value, expected) in [
             (None, None),
