@@ -1791,7 +1791,8 @@ mod tests {
     /// and the field under the route's own code, as every other field's
     /// refusal on this door does: a message with or without its `type` or
     /// its `id`, a part inside a typed item, a field inside a part's own
-    /// array; the accepted shapes are unchanged.
+    /// array, a typed item's own field or the element of one of its arrays,
+    /// the kind of a typed item; the accepted shapes are unchanged.
     #[tokio::test]
     async fn a_responses_input_part_refusal_names_the_part_and_its_field() {
         let image = |part: &str| {
@@ -1866,14 +1867,71 @@ mod tests {
                 "input[0].output[0].text",
                 "input[0].output[0]: missing field `text`",
             ),
-            // A typed item's own missing field keeps the derived reader's
-            // words: its fallback to the untagged shapes drops the tagged
-            // reading's reason (the limit of the reader).
+            // A typed item's own field: a missing one by serde's words at the
+            // item, an invalid one at the field, a kind the door has no
+            // variant for at `type`, a field inside one of the item's arrays
+            // at the element.
             (
                 r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].call_id",
+                "input[0]: missing field `call_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}],"max_output_tokens":2}"#.to_string(),
                 "invalid_type",
-                "input[0]",
-                "input[0]: data did not match any variant of untagged enum ResponseInputOutputItem",
+                "input[0].arguments",
+                "input[0].arguments: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].role",
+                "input[0].role: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"web_search_results","id":"ws_1"}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].type",
+                "input[0].type: unknown variant `web_search_results`, expected one of `message`, `reasoning`, `function_call`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].tools[0].input_schema",
+                "input[0].tools[0]: missing field `input_schema`",
+            ),
+            // A field missing inside an array element whose name is an
+            // optional field of the item too (the safety check's `id`, the
+            // output's own `id`) is named at the element.
+            (
+                r#"{"model":"m","input":[{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":[{}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].acknowledged_safety_checks[0].id",
+                "input[0].acknowledged_safety_checks[0]: missing field `id`",
+            ),
+            // An item reference is refused for its `id` alone, never for its
+            // kind, which the door takes.
+            (
+                r#"{"model":"m","input":[{"type":"item_reference"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].id",
+                "input[0]: missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference","id":7}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].id",
+                "input[0].id: invalid type: integer `7`, expected a string",
+            ),
+            // A `message` with an `id` and a string `content` is the untagged
+            // shape (the `id` dropped); a refused field beside them is named,
+            // not the `content` the shape takes.
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","content":"hi","role":7}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].role",
+                "input[0].role: invalid type: integer `7`, expected a string",
             ),
             (
                 r#"{"model":"m","input":[{"content":"hi"}],"max_output_tokens":2}"#.to_string(),
@@ -1906,6 +1964,9 @@ mod tests {
             r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
             r#"{"model":"m","input":[{"id":"msg_1"}],"max_output_tokens":2}"#.to_string(),
             r#"{"model":"m","input":[{"id":"msg_1","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1","type":"item_reference"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"found"}],"max_output_tokens":2}"#.to_string(),
         ] {
             let (status, json) = rejected::<ResponsesRequest>(&body).await;
             assert_eq!(status, StatusCode::OK, "{body}: {json}");

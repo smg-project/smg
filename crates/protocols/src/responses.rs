@@ -5190,7 +5190,9 @@ mod tests {
 
     /// A long part is read in its own size: a missing field inside the last
     /// of many annotations is located at its element, and a part with many
-    /// array-valued keys is refused at the part, both within one generous
+    /// array-valued keys is refused at the part; a long item too: a missing
+    /// field inside the last of many safety checks beside a long own `id` of
+    /// the same name is located at its element. All within one generous
     /// wall-clock bound (the quadratic shapes took tens of seconds here).
     #[test]
     fn a_long_part_is_located_in_linear_time() {
@@ -5219,6 +5221,23 @@ mod tests {
         assert_eq!(
             content_part_refusal("content", 0, &part, &error),
             "content[0]: missing field `text`"
+        );
+        let mut checks: Vec<Value> = (0..20_000)
+            .map(|index| serde_json::json!({"id": format!("sc_{index}")}))
+            .collect();
+        checks.push(serde_json::json!({}));
+        let item = serde_json::json!({
+            "type": "computer_call",
+            "id": "x".repeat(1 << 20),
+            "call_id": "call_1",
+            "status": "completed",
+            "pending_safety_checks": checks,
+        });
+        let error = ResponseInputOutputItem::deserialize(&item)
+            .expect_err("the last safety check lacks its id");
+        assert_eq!(
+            typed_item_refusal(&item, error),
+            "pending_safety_checks[20000]: missing field `id`"
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
@@ -5249,6 +5268,56 @@ mod tests {
                     .starts_with(&format!("duplicate field `{key}`")),
                 "{error}"
             );
+        }
+    }
+
+    /// A typed item refused at its own field says which: serde's words for a
+    /// missing one (the extractor appends the field), the field before the
+    /// reason for an invalid one, `type` for a kind with no variant, the
+    /// element of one of the item's arrays for a field missing inside it.
+    #[test]
+    fn a_typed_item_refused_at_its_own_field_names_it() {
+        for (body, words) in [
+            (
+                r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}]}"#,
+                "missing field `call_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}]}"#,
+                "arguments: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}]}"#,
+                "role: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"web_search_results","id":"ws_1"}]}"#,
+                "type: unknown variant `web_search_results`, expected one of `message`, `reasoning`, `function_call`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search"}]}]}"#,
+                "tools[0]: missing field `input_schema`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":[{}]}]}"#,
+                "acknowledged_safety_checks[0]: missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference"}]}"#,
+                "missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference","id":7}]}"#,
+                "id: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","content":"hi","role":7}]}"#,
+                "role: invalid type: integer `7`, expected a string",
+            ),
+        ] {
+            let error = serde_json::from_str::<ResponsesRequest>(body)
+                .expect_err("the typed item is refused");
+            assert!(error.to_string().starts_with(words), "{body}: {error}");
         }
     }
 
