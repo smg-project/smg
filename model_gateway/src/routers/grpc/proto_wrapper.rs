@@ -2014,23 +2014,23 @@ impl ProtoStream {
             Self::Sglang(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(|r| ProtoGenerateResponse::Sglang(Box::new(r)))),
+                .map(|result| result.map(ProtoGenerateResponse::Sglang)),
             Self::Vllm(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
+                .map(|result| result.map(ProtoGenerateResponse::Vllm)),
             Self::Trtllm(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(|r| ProtoGenerateResponse::Trtllm(Box::new(r)))),
+                .map(|result| result.map(ProtoGenerateResponse::Trtllm)),
             Self::Mlx(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(|r| ProtoGenerateResponse::Mlx(Box::new(r)))),
+                .map(|result| result.map(ProtoGenerateResponse::Mlx)),
             Self::TokenSpeed(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(|r| ProtoGenerateResponse::TokenSpeed(Box::new(r)))),
+                .map(|result| result.map(ProtoGenerateResponse::TokenSpeed)),
             // Every ZMQ engine (including TokenSpeed) emits vllm-shaped
             // responses: the adapter translates wire output into
             // `vllm::GenerateResponse`, so variant checks like
