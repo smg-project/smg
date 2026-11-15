@@ -36,10 +36,19 @@
 //!
 //! A decision's build is a copy and one pass ([`World::build`]): the rows,
 //! less another gateway's host-local ones, then what is the decision's own
-//! (the position, the report's age), then the facts that arrive by a
-//! worker's id (the asking gateway's vetoes, the pinned worker), each found
-//! in the slice the decision is made over: the sorted slice is its own
-//! index.
+//! (the position, the report's age), then the pool's standing vetoes, each
+//! published with its row's place (the asking gateway's are masked by
+//! position in a pool every gateway copies whole, by id in a pool that
+//! holds host-local rows), then
+//! the pinned worker, found by its id in the slice the decision is made
+//! over: the sorted slice is its own index.
+//!
+//! **A veto is published in the form the build reads.** The writer keeps
+//! each gateway's list and derives each pool's standing vetoes by row at
+//! the three writes that change them: a veto's write, a membership write
+//! and a window's publication that drops a veto past its end. A veto
+//! leaves with its worker's row in the membership write's own step, so no
+//! publication shows the row without it.
 
 use std::{
     sync::Arc,
@@ -149,7 +158,9 @@ struct PoolShape {
 const ROLES: usize = 4;
 
 /// A role's slot among a model's pools. A role added to the enum stops the
-/// build here until it has a slot of its own and [`ROLES`] counts it.
+/// build at this match until it has an arm. The compiler checks the arm
+/// alone: [`ROLES`] is raised by hand with the new slot, and a slot past it
+/// panics at the first membership write that derives that role's pool.
 const fn role_slot(role: Role) -> usize {
     match role {
         Role::Single => 0,
@@ -171,9 +182,24 @@ struct Derived {
     pools: Box<[PoolShape]>,
 }
 
-/// The gateways' standing vetoes as a decision reads them: per gateway its
-/// vetoed workers by id, each until an instant. Replaced whole at a veto's
-/// write, which is rare, and published with the world.
+/// One standing veto as a pool carries it: the row it masks, by index and
+/// by id, the gateway that holds it and its end. The index finds the row in
+/// a pool every gateway copies whole, the id in a pool that holds host-local
+/// rows, whichever gateway asks.
+#[derive(Clone, Copy, Debug)]
+struct PoolVeto {
+    row: u32,
+    id: WorkerId,
+    gateway: GatewayId,
+    until: Instant,
+}
+
+/// The gateways' vetoes as the writer keeps them: per gateway its vetoed
+/// workers by id, each until an instant. Replaced whole at each of the
+/// three writes that change them, all rare: a veto's write, a membership
+/// write that takes a departed worker's vetoes with its row, and a window's
+/// publication that drops a veto past its end. A world carries what is
+/// derived from them: each pool's list by row ([`PoolVeto`]).
 #[derive(Debug, Default)]
 struct Vetoes {
     by_gateway: FxHashMap<GatewayId, Arc<[(WorkerId, Instant)]>>,
@@ -206,27 +232,40 @@ impl Vetoes {
         Some(Self { by_gateway })
     }
 
-    /// The vetoes without any on `id`, when some gateway holds one: a
-    /// worker's vetoes leave with its row.
-    fn without(&self, id: WorkerId) -> Option<Self> {
-        let named = |list: &Arc<[(WorkerId, Instant)]>| {
-            list.binary_search_by_key(&id, |&(worker, _)| worker)
-                .is_ok()
-        };
-        if !self.by_gateway.values().any(named) {
+    /// The vetoes still standing at `at`, when some veto ended at or before
+    /// it: what the clock has ended leaves by the store's own clock.
+    fn standing_at(&self, at: Instant) -> Option<Self> {
+        let stands = |&(_, until): &(WorkerId, Instant)| until > at;
+        if self.by_gateway.values().all(|list| list.iter().all(stands)) {
             return None;
         }
         let mut by_gateway = FxHashMap::default();
         for (gateway, list) in &self.by_gateway {
-            if !named(list) {
+            let kept: Vec<(WorkerId, Instant)> = list.iter().copied().filter(stands).collect();
+            if !kept.is_empty() {
+                by_gateway.insert(*gateway, kept.into());
+            }
+        }
+        Some(Self { by_gateway })
+    }
+
+    /// The vetoes on the workers in `members`, a list sorted by id, when
+    /// some veto names a worker outside it: a worker's vetoes leave with
+    /// its row.
+    fn of_members(&self, members: &[WorkerId]) -> Option<Self> {
+        let member = |id: WorkerId| members.binary_search(&id).is_ok();
+        let whole = |list: &Arc<[(WorkerId, Instant)]>| list.iter().all(|&(id, _)| member(id));
+        if self.by_gateway.values().all(whole) {
+            return None;
+        }
+        let mut by_gateway = FxHashMap::default();
+        for (gateway, list) in &self.by_gateway {
+            if whole(list) {
                 by_gateway.insert(*gateway, Arc::clone(list));
                 continue;
             }
-            let kept: Vec<(WorkerId, Instant)> = list
-                .iter()
-                .copied()
-                .filter(|&(worker, _)| worker != id)
-                .collect();
+            let kept: Vec<(WorkerId, Instant)> =
+                list.iter().copied().filter(|&(id, _)| member(id)).collect();
             if !kept.is_empty() {
                 by_gateway.insert(*gateway, kept.into());
             }
@@ -235,10 +274,12 @@ impl Vetoes {
     }
 }
 
-/// Everything a decision reads, as one publication left it. Taken once per
-/// decision ([`MemoryStore::world`](crate::store::MemoryStore::world)); both
-/// sides of a pair decision are built from the same one. A world never
-/// changes once published.
+/// Everything a decision reads, as one publication left it. A decision
+/// borrows it for its build
+/// ([`MemoryStore::build_view`](crate::store::MemoryStore::build_view)), and
+/// both sides of a pair decision are built from the same one
+/// ([`MemoryStore::build_pair`](crate::store::MemoryStore::build_pair)). A
+/// world never changes once published.
 pub struct World {
     epoch: u64,
     origin: Instant,
@@ -246,7 +287,9 @@ pub struct World {
     /// Each pool's rows as this publication left them, sorted by worker id,
     /// at the pool's index.
     rows: Box<[Arc<[Candidate]>]>,
-    vetoes: Arc<Vetoes>,
+    /// The standing vetoes by pool, each list by row: empty while no veto
+    /// stands in the store.
+    vetoes: Arc<[Box<[PoolVeto]>]>,
 }
 
 impl std::fmt::Debug for World {
@@ -279,8 +322,12 @@ impl World {
     }
 
     fn pool(&self, model: &str, role: Role) -> Option<(&[Candidate], &PoolShape)> {
-        let index = self.derived.by_model.get(model)?[role_slot(role)]? as usize;
+        let index = self.index(model, role)?;
         Some((self.rows.get(index)?, self.derived.pools.get(index)?))
+    }
+
+    fn index(&self, model: &str, role: Role) -> Option<usize> {
+        Some(self.derived.by_model.get(model)?[role_slot(role)]? as usize)
     }
 
     /// Build one decision's view of the pool serving `model` in `role` into
@@ -291,11 +338,18 @@ impl World {
     /// holds no socket to those, so its pool is the pool without them.
     /// Each row is as this publication left it, with what is the
     /// decision's own written over it: its position in the slice, its
-    /// report's age at `ask.now`, the stalled bit where the asking
-    /// gateway's veto stands at that instant, whichever kind of veto it
-    /// is, and the session bit on the pinned worker. Under `ask.affinity`
-    /// the column holds one entry per candidate with the worker's age
-    /// since admission.
+    /// report's age at `ask.now`, the stalled bit where a veto of the
+    /// asking gateway is in this publication and stands at that instant,
+    /// whichever kind of veto it is, and the session bit on the pinned
+    /// worker. A veto past its end masks nothing and costs the build one
+    /// compare until a window's publication drops it; a store that
+    /// publishes no window keeps it. A window's publication drops every
+    /// veto ended by its own instant, so a decision dated before that
+    /// instant finds a veto that still stood at its date already gone: a
+    /// decision reads one publication, and its date restores nothing the
+    /// publication dropped. The health sink's own answer keeps its compare.
+    /// Under `ask.affinity` the column holds one entry per candidate with
+    /// the worker's age since admission.
     ///
     /// What no fact of the store feeds yet reads as the row's default: the
     /// in-flight and session counts, the two admission bits, the overload
@@ -313,7 +367,8 @@ impl World {
     ) -> Option<Built> {
         out.candidates.clear();
         out.affinity.clear();
-        let (rows, shape) = self.pool(model, role)?;
+        let index = self.index(model, role)?;
+        let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
         let now_micros = micros(self.origin, ask.now);
         for (from, to) in Segments::of(&shape.locals, ask.gateway, rows.len()) {
             out.candidates.extend_from_slice(&rows[from..to]);
@@ -325,12 +380,22 @@ impl World {
                 load.report_age_ms = age_ms(now_micros, sampled_at);
             }
         }
-        if let Some(vetoed) = self.vetoes.by_gateway.get(&ask.gateway) {
-            for &(id, until) in vetoed.iter() {
-                if until > ask.now {
-                    if let Some(row) = row_of_id(&mut out.candidates, id) {
-                        row.health.stalled = true;
-                    }
+        if let Some(vetoes) = self.vetoes.get(index) {
+            // A pool every gateway dials whole is copied whole: a veto's
+            // row is its position. Another gateway's host-local rows are
+            // left out, so there the row is found by its id.
+            let whole = shape.locals.is_empty();
+            for veto in vetoes {
+                if veto.gateway != ask.gateway || veto.until <= ask.now {
+                    continue;
+                }
+                let row = if whole {
+                    out.candidates.get_mut(veto.row as usize)
+                } else {
+                    row_of_id(&mut out.candidates, veto.id)
+                };
+                if let Some(row) = row {
+                    row.health.stalled = true;
                 }
             }
         }
@@ -471,6 +536,10 @@ pub(super) struct Writer {
     /// models has a row in each model's pool.
     places: Vec<Place>,
     vetoes: Arc<Vetoes>,
+    /// The vetoes as the world carries them: derived from the gateways'
+    /// lists and the members' places at a veto's write, at a membership
+    /// write and at a window's publication that drops a veto past its end.
+    pool_vetoes: Arc<[Box<[PoolVeto]>]>,
     /// The last publication the window counts from: a window's end, or a
     /// load write that published by itself.
     last_window: Option<Instant>,
@@ -491,6 +560,7 @@ impl Writer {
             working: Vec::new(),
             places: Vec::new(),
             vetoes: Arc::default(),
+            pool_vetoes: Arc::default(),
             last_window: None,
             waiting: false,
         }
@@ -504,7 +574,7 @@ impl Writer {
             origin: self.origin,
             derived: Arc::clone(&self.derived),
             rows: self.published.clone().into_boxed_slice(),
-            vetoes: Arc::clone(&self.vetoes),
+            vetoes: Arc::clone(&self.pool_vetoes),
         })
     }
 
@@ -527,7 +597,14 @@ impl Writer {
         }
         let origin = self.origin;
         let mut groups: FxHashMap<Box<str>, [Vec<Entry>; ROLES]> = FxHashMap::default();
+        // The members' ids are read by the vetoes alone: a membership write
+        // with no veto standing neither collects nor sorts them.
+        let standing = !self.vetoes.by_gateway.is_empty();
+        let mut ids = Vec::new();
         for member in members {
+            if standing {
+                ids.push(member.id);
+            }
             let facts = &member.facts;
             let sample = sample_of(member.id, facts.dp_rank);
             let entry = Entry {
@@ -595,7 +672,44 @@ impl Writer {
             by_model,
             pools: pools.into_boxed_slice(),
         });
+        // A worker's vetoes leave with its row, in this write's own hold:
+        // no publication shows the row without them.
+        if standing {
+            ids.sort_unstable();
+            if let Some(vetoes) = self.vetoes.of_members(&ids) {
+                self.vetoes = Arc::new(vetoes);
+            }
+        }
+        self.derive_vetoes();
         self.publish()
+    }
+
+    /// The standing vetoes by pool and row, from the gateways' lists and
+    /// the members' places: no list at all while no veto stands.
+    fn derive_vetoes(&mut self) {
+        if self.vetoes.by_gateway.is_empty() {
+            self.pool_vetoes = Arc::default();
+            return;
+        }
+        let mut pools: Vec<Vec<PoolVeto>> = vec![Vec::new(); self.working.len()];
+        for (&gateway, list) in &self.vetoes.by_gateway {
+            for &(id, until) in list.iter() {
+                for place in places_of(&self.places, id) {
+                    if let Some(pool) = pools.get_mut(place.pool as usize) {
+                        pool.push(PoolVeto {
+                            row: place.row,
+                            id,
+                            gateway,
+                            until,
+                        });
+                    }
+                }
+            }
+        }
+        for pool in &mut pools {
+            pool.sort_unstable_by_key(|veto| (veto.row, veto.gateway));
+        }
+        self.pool_vetoes = pools.into_iter().map(Vec::into_boxed_slice).collect();
     }
 
     /// Fold one rank's load record, or its absence, into the member's rows;
@@ -699,15 +813,8 @@ impl Writer {
     ) -> Option<Arc<World>> {
         let vetoes = self.vetoes.with(gateway, id, until)?;
         self.vetoes = Arc::new(vetoes);
+        self.derive_vetoes();
         Some(self.publish())
-    }
-
-    /// A worker's row is gone: its vetoes leave with it. Nothing is
-    /// published here; the membership write that removed the row publishes.
-    pub(super) fn forget_vetoes(&mut self, id: WorkerId) {
-        if let Some(vetoes) = self.vetoes.without(id) {
-            self.vetoes = Arc::new(vetoes);
-        }
     }
 
     /// When the waiting folds are due: the end of the window the last
@@ -752,6 +859,13 @@ impl Writer {
 
     fn publish_window(&mut self, at: Instant) -> Arc<World> {
         self.last_window = Some(at);
+        // A veto that ended at or before this window's instant leaves the
+        // table here and waits for no gateway's clear: a decision walks
+        // only what stands.
+        if let Some(vetoes) = self.vetoes.standing_at(at) {
+            self.vetoes = Arc::new(vetoes);
+            self.derive_vetoes();
+        }
         self.publish()
     }
 }

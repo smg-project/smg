@@ -3,9 +3,10 @@
 //! `Lease` object on an API server stand-in the parent serves over HTTP
 //! (the three calls the backend makes, the resource version's precondition,
 //! the server's answers). The holder takes the lease, renews it twice and
-//! stalls; two candidates on one tick grid race the take once their sight
-//! of the record is a duration old, and the precondition lets exactly one
-//! of them write the next term: the other reads what it wrote and follows.
+//! stalls until a candidate took it; two candidates on one tick grid race
+//! the take once their sight of the record is a duration old, and the
+//! precondition lets exactly one of them write the next term: the other
+//! reads what it wrote and follows.
 //! The parent reads the three logs and the stand-in's record of holder
 //! changes and checks what the fence and the term promise: the holder's
 //! fence closed before the taker's first fenced instant, one holder per
@@ -22,7 +23,7 @@ use std::{
     env, fs,
     io::Write,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{mpsc, Arc},
     thread,
@@ -51,6 +52,13 @@ const NAMESPACE: &str = "policy";
 const NAME: &str = "controller";
 const HOLDER: &str = "a@cell:1";
 const CANDIDATES: [&str; 2] = ["b@cell:2", "c@cell:3"];
+/// The tick a candidate logs when it takes the lease from the holder.
+const TAKE: &str = "Acquired { term: 2 }";
+/// How long a wait of the cell lasts before the cell is broken. Every wait
+/// ends at its event (the first take, the holder's stall at the second, a
+/// candidate's loop at its own take or at the winner's term), so a process
+/// that starts late moves the events and never meets this bound.
+const BROKEN: Duration = Duration::from_secs(10);
 
 /// The design's order between the settings at a third of its size, with the
 /// whole second the `Lease` stores.
@@ -224,6 +232,31 @@ fn sleep_to_grid() {
     thread::sleep(Duration::from_micros(next - now));
 }
 
+/// A candidate's log, beside the holder's in the parent's directory.
+fn candidate_log(logs: &Path, identity: &str) -> PathBuf {
+    logs.join(format!("{identity}.log"))
+}
+
+/// The holder's stall: no tick until a candidate's log holds its take. The
+/// stall ends at the take, never at a fixed time, so candidates that start
+/// late move its end with them: a holder that woke before the take would
+/// renew its own unmoved record and the cell would have no loss to read.
+/// Bounded for a broken cell.
+fn stall_until_taken() {
+    let own = env::var(LOG).expect("the child's log path");
+    let logs = Path::new(&own).parent().expect("the logs' directory");
+    let stalled = Instant::now();
+    while !CANDIDATES.iter().any(|identity| {
+        fs::read_to_string(candidate_log(logs, identity)).is_ok_and(|log| log.contains(TAKE))
+    }) {
+        assert!(
+            stalled.elapsed() < BROKEN,
+            "no candidate took the lease within {BROKEN:?} of the holder's last renewal"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn holder(url: &str) {
     let mut holder = candidate(url, HOLDER);
     step(&mut holder, HOLDER);
@@ -231,18 +264,18 @@ fn holder(url: &str) {
         thread::sleep(settings().renew_period);
         step(&mut holder, HOLDER);
     }
-    // The stall: longer than the duration the candidates wait after their
-    // first sight of the last renewal, with a grid step and a margin.
-    thread::sleep(2 * settings().duration);
+    stall_until_taken();
     step(&mut holder, HOLDER);
     let released = holder.elector.release().expect("the release");
     log(&format!("{HOLDER} release {released}"));
 }
 
+/// A candidate ticks on the grid until it took the lease or follows the one
+/// that did: its loop ends at that event, however late it started.
 fn taker(url: &str, identity: &str) {
     let mut taker = candidate(url, identity);
     let start = Instant::now();
-    while start.elapsed() < 4 * settings().duration {
+    while start.elapsed() < BROKEN {
         sleep_to_grid();
         match step(&mut taker, identity) {
             Tick::Acquired { .. } => {
@@ -316,13 +349,10 @@ fn three_processes_over_one_lease_object_hand_over_once_per_term() {
     // of a held record.
     let created = Instant::now();
     while shared.lock().object.is_none() {
-        assert!(
-            created.elapsed() < Duration::from_secs(10),
-            "no take within 10 s"
-        );
+        assert!(created.elapsed() < BROKEN, "no take within {BROKEN:?}");
         thread::sleep(Duration::from_millis(5));
     }
-    let candidate_logs = CANDIDATES.map(|identity| logs.path().join(format!("{identity}.log")));
+    let candidate_logs = CANDIDATES.map(|identity| candidate_log(logs.path(), identity));
     let candidates = [0, 1].map(|i| spawn(&url, CANDIDATES[i], &candidate_logs[i]));
     finished(
         &holder.wait_with_output().expect("the holder's exit"),
@@ -355,7 +385,7 @@ fn three_processes_over_one_lease_object_hand_over_once_per_term() {
     let mut follows = Vec::new();
     for (identity, log) in CANDIDATES.iter().zip(&candidate_logs) {
         for (before, _, tick) in ticks(log, identity) {
-            if tick.starts_with("Acquired { term: 2 }") {
+            if tick.starts_with(TAKE) {
                 takes.push((*identity, before));
             } else if tick.starts_with("Following") && tick.contains("term: 2") {
                 follows.push((*identity, before));

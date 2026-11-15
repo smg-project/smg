@@ -125,16 +125,17 @@ impl MemoryStore {
         }
     }
 
-    /// The world as the last publication left it: what one decision reads.
-    /// Taken once per decision and through no lock; a pair decision builds
-    /// both its sides from the one it took. Its identity moves with every
-    /// publication: [`World::epoch`] says whether the membership moved.
+    /// The world as the last publication left it, taken through no lock.
+    /// Its identity moves with every publication: [`World::epoch`] says
+    /// whether the membership moved.
     ///
-    /// This door hands an owned pointer: taking it and dropping it each
-    /// write the count every holder of that world shares, so deciding
-    /// threads write one cache line twice a decision.
-    /// [`build_view`](Self::build_view) borrows the world and writes no
-    /// shared count.
+    /// This door hands an owned pointer, for a reader that keeps a world
+    /// across calls. Taking it and dropping it each write the count every
+    /// holder of that world shares, so deciding threads that took it would
+    /// write one cache line twice a decision. A decision builds through
+    /// [`build_view`](Self::build_view) and a pair decision through
+    /// [`build_pair`](Self::build_pair): both borrow the world and write
+    /// no shared count.
     pub fn world(&self) -> Arc<World> {
         self.world.load_full()
     }
@@ -149,6 +150,35 @@ impl MemoryStore {
         out: &mut ViewBuffers,
     ) -> Option<Built> {
         self.world.load().build(model, role, ask, out)
+    }
+
+    /// Build both sides of one pair decision from the world of this instant
+    /// under one borrow: the model's prefill pool into `prefill` and its
+    /// decode pool into `decode`, both of one publication. `None`, with
+    /// both buffers cleared, when either pool has no member: one side
+    /// alone is no pair.
+    ///
+    /// This is a pair decision's door. It borrows the world, so the two
+    /// builds read one publication and no deciding thread writes the
+    /// world's shared count.
+    pub fn build_pair(
+        &self,
+        model: &str,
+        ask: &Ask,
+        prefill: &mut ViewBuffers,
+        decode: &mut ViewBuffers,
+    ) -> Option<(Built, Built)> {
+        let world = self.world.load();
+        let pair = world
+            .build(model, Role::Prefill, ask, prefill)
+            .zip(world.build(model, Role::Decode, ask, decode));
+        if pair.is_none() {
+            for side in [prefill, decode] {
+                side.candidates.clear();
+                side.affinity.clear();
+            }
+        }
+        pair
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -213,21 +243,20 @@ impl MemoryStore {
     }
 
     /// A worker's row is gone (removed, or replaced by a new incarnation):
-    /// the tables that live exactly as long as the row leave with it, here
-    /// and nowhere else. The health tables and the load rows today; the KV
-    /// tables join with their first writer. Called under the workers lock:
+    /// the store's tables that live exactly as long as the row leave with
+    /// it, here and nowhere else. The health tables and the load rows today;
+    /// the KV tables join with their first writer. The vetoes a world
+    /// carries are not among them: they leave with the row in the
+    /// publication of the membership write that calls this. Called under
+    /// the workers lock:
     /// the health writers take it first and a load write goes into its
     /// worker's entry or nowhere, so a write racing the removal finds the
     /// row gone or lands before the tables are cleared.
     fn forget_worker(&self, id: WorkerId) {
-        // The health lock is held across the load lock: the published
-        // vetoes lose the worker in the order the health table did. Nothing
-        // is published here: the membership write that calls this does.
         let mut health = self.health.lock();
         health.forget(id);
         let mut loads = self.loads.lock();
         loads.ranks.remove(&id);
-        loads.writer.forget_vetoes(id);
     }
 
     /// How many resyncs were recorded for `reason`.

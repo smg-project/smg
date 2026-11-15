@@ -9,9 +9,11 @@ on:
       - 'scripts/bench_gate.py'
       - 'crates/policy_controller/Cargo.toml'
       - 'crates/policy_controller/benches/store_view.rs'
+      - 'crates/policy_controller/benches/common/mod.rs'
       - 'crates/policy_controller/benches/common/placed.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/tests.rs'
       - '!crates/policy_controller/src/**/*_test.rs'
   pull_request:
     branches: [ main, release/** ]
@@ -21,9 +23,11 @@ on:
       - 'scripts/bench_gate.py'
       - 'crates/policy_controller/Cargo.toml'
       - 'crates/policy_controller/benches/store_view.rs'
+      - 'crates/policy_controller/benches/common/mod.rs'
       - 'crates/policy_controller/benches/common/placed.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/tests.rs'
       - '!crates/policy_controller/src/**/*_test.rs'
   workflow_dispatch:
   schedule:
