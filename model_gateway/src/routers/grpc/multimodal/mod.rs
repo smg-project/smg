@@ -128,12 +128,22 @@ pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
 /// words for the URL whose fetch ran out of its budget, the clip the decoder
 /// refused, the cap a payload met), without the gateway's stage frames between
 /// them: "failed to finalize the tracker" names a structure the client never
-/// sees. A failure with no verdict in its chain names its root cause. The
-/// whole chain, frames included, is the ERROR log line's at the call site.
+/// sees. The stage frames sit above the tracker's own typed error, so a
+/// failure with no connector verdict reads that error's own text when the
+/// chain carries one, and the whole chain otherwise: the frames that say what
+/// failed (the config read, the replacement index, the panic) stay in the
+/// client's sentence. The whole chain, stage frames included, is the ERROR
+/// log line's at the call site.
 pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
-    let cause = match media_verdict(error) {
-        Some(media) => media.to_string(),
-        None => error.root_cause().to_string(),
+    let cause = if let Some(media) = media_verdict(error) {
+        media.to_string()
+    } else if let Some(tracker) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MultiModalError>())
+    {
+        tracker.to_string()
+    } else {
+        format!("{error:#}")
     };
     format!("Multimodal processing failed: {cause}")
 }
@@ -584,8 +594,9 @@ mod tests {
     /// The message is the route's sentence and the pipeline's verdict on the
     /// request: the gateway's stage frames around the verdict are the log's
     /// (the chain keeps them), and the verdict's own source is not repeated
-    /// after it. A failure with no verdict in its chain names its root cause
-    /// the same way.
+    /// after it. The tracker's own typed error under the frames reads its text
+    /// alone; a failure with neither keeps its whole chain, whose frames say
+    /// what failed.
     #[test]
     fn a_processing_failures_message_leaves_the_stage_frames_to_the_log() {
         let undecodable =
@@ -608,11 +619,28 @@ mod tests {
             "the chain keeps the frames for the log: {error:#}"
         );
 
-        let no_verdict = anyhow::anyhow!("Multimodal not supported for model: m")
-            .context("Failed to push content part");
+        let validation = anyhow::Error::new(MultiModalError::Validation(
+            "placeholder 3 has no part".to_string(),
+        ))
+        .context("Failed to finalize multimodal tracker");
         assert_eq!(
-            processing_failed_message(&no_verdict),
-            "Multimodal processing failed: Multimodal not supported for model: m"
+            processing_failed_message(&validation),
+            "Multimodal processing failed: tracker validation error: placeholder 3 has no part"
+        );
+
+        let config_read = anyhow::anyhow!("No such file or directory (os error 2)")
+            .context("Failed to read config.json at /models/m/config.json");
+        assert_eq!(
+            processing_failed_message(&config_read),
+            "Multimodal processing failed: Failed to read config.json at /models/m/config.json: \
+             No such file or directory (os error 2)"
+        );
+        let ranges = anyhow::anyhow!("feature range 0 has zero length")
+            .context("Invalid explicit feature ranges in image replacement 2");
+        assert_eq!(
+            processing_failed_message(&ranges),
+            "Multimodal processing failed: Invalid explicit feature ranges in image replacement 2: \
+             feature range 0 has zero length"
         );
     }
 
