@@ -8,7 +8,22 @@
 //! - `policy_store/load_write/<n>`: one load record's write inside the
 //!   publication window: on file and folded into the writer's rows;
 //! - `policy_store/publish/<n>`: one window's publication of the pool: one
-//!   copy, one pointer swap.
+//!   copy, one pointer swap;
+//! - `policy_store/floor/<n>`: the decision benches' gated build, rows
+//!   written from facts in hand, in this binary: a build from the store
+//!   stays within twice this cell, and one job reads both;
+//! - `policy_store/view_build_veto1/<n>` and `view_build_veto8/<n>`: the
+//!   build with one and with eight standing vetoes of the asking gateway.
+//!
+//! `policy_store_vetoes/*` are the veto cells outside the gate: `k3/<n>`
+//! with three vetoes of the asking gateway, `foreign8/<n>` with eight other
+//! gateways' vetoes on one member and `foreign64/<n>` with eight gateways'
+//! on each of eight members, none of them the asking one's: what a build
+//! pays to pass over a veto that is not its own.
+//!
+//! The pair door's cells are a bench target of their own (`store_pair`):
+//! this binary is built on the base branch with the pull request's bench
+//! sources, so a row here calls nothing the base's store lacks.
 //!
 //! `policy_store_cadence/*` reads the build beside a writer on another
 //! core, for a run pinned to two cores (both threads spin, so each keeps
@@ -30,6 +45,11 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[expect(
+    dead_code,
+    reason = "the shared fleet's engine builder belongs to the decision benches"
+)]
+mod common;
 #[path = "common/placed.rs"]
 mod placed;
 
@@ -40,6 +60,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -47,8 +68,8 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use placed::page_start_buffer;
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
+        WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     LoadRow, Role, SignalSource, WorkerId,
 };
@@ -156,6 +177,96 @@ fn build(store: &MemoryStore, ask: &Ask, out: &mut ViewBuffers) -> usize {
     black_box(&out.candidates);
     black_box(&out.affinity);
     built.map_or(0, |built| built.pool_size as usize)
+}
+
+/// The gated build's floor in this binary: the rows written from facts in
+/// hand (`policy_engine/view_build`'s own build over the same synthetic
+/// fleet) into the fixture's buffer, so one run on one machine reads the
+/// floor and the build from the store.
+fn floor(c: &mut Criterion, fixtures: &mut [Fixture]) {
+    let mut group = c.benchmark_group("policy_store/floor");
+    for fixture in fixtures.iter_mut() {
+        let n = fixture.n;
+        let fleet = common::fleet(n);
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                common::build_view(black_box(&fleet), &mut fixture.out.candidates);
+                black_box(&fixture.out.candidates);
+                fixture.out.candidates.len()
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The build under standing vetoes, each ending after the decision, on
+/// members spread over the pool; every cell is held to its count of masked
+/// rows and the vetoes are cleared after the last. Of the asking gateway:
+/// `policy_store/view_build_veto1/<n>` and `policy_store/view_build_veto8/<n>`
+/// with one and eight, and `policy_store_vetoes/k3/<n>` with three. Of other
+/// gateways alone, which mask nothing for the asking one:
+/// `policy_store_vetoes/foreign8/<n>` (eight gateways on one member) and
+/// `policy_store_vetoes/foreign64/<n>` (eight gateways on eight members).
+fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
+    for fixture in fixtures.iter_mut() {
+        let n = fixture.n;
+        let ask = fixture.ask(false);
+        let until = ask.now + Duration::from_secs(60);
+        let member = |nth: usize| fixture.ids[nth * n / 8];
+        let mut cell = |c: &mut Criterion, group: &str, id: &str, masked: usize| {
+            assert_eq!(build(&fixture.store, &ask, &mut fixture.out), n);
+            let stalled = fixture
+                .out
+                .candidates
+                .iter()
+                .filter(|row| row.health.stalled)
+                .count();
+            assert_eq!(stalled, masked, "{group}/{id}/{n}");
+            let mut group = c.benchmark_group(group);
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(BenchmarkId::new(id, n), &n, |b, _| {
+                b.iter(|| build(&fixture.store, &ask, &mut fixture.out));
+            });
+            group.finish();
+        };
+        let mut standing = 0;
+        for (count, group, id) in [
+            (1_usize, "policy_store", "view_build_veto1"),
+            (3, "policy_store_vetoes", "k3"),
+            (8, "policy_store", "view_build_veto8"),
+        ] {
+            while standing < count {
+                fixture
+                    .store
+                    .gateway_veto(ask.gateway, member(standing), Some(until));
+                standing += 1;
+            }
+            cell(c, group, id, count);
+        }
+        for nth in 0..standing {
+            fixture.store.gateway_veto(ask.gateway, member(nth), None);
+        }
+        // Other gateways' vetoes: on one member, then on eight.
+        let others = (2..10).map(GatewayId);
+        for (members, id) in [(1_usize, "foreign8"), (8, "foreign64")] {
+            for gateway in others.clone() {
+                for nth in 0..members {
+                    fixture
+                        .store
+                        .gateway_veto(gateway, member(nth), Some(until));
+                }
+            }
+            cell(c, "policy_store_vetoes", id, 0);
+        }
+        for gateway in others {
+            for nth in 0..8 {
+                fixture.store.gateway_veto(gateway, member(nth), None);
+            }
+        }
+        assert_eq!(build(&fixture.store, &ask, &mut fixture.out), n);
+        assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
+    }
 }
 
 fn view_build(c: &mut Criterion, fixtures: &mut [Fixture]) {
@@ -277,8 +388,8 @@ fn spawn_writer(
     store: Arc<MemoryStore>,
     ids: Vec<WorkerId>,
     opened: Instant,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         let n = ids.len();
         let period = Duration::from_secs(1) / (10 * n as u32);
         let mut turn = 0u64;
@@ -416,10 +527,12 @@ fn cadence(c: &mut Criterion, fixtures: &mut [Fixture]) {
 
 fn store_view(c: &mut Criterion) {
     let mut fixtures: Vec<Fixture> = SIZES.iter().map(|&n| Fixture::new(n)).collect();
+    floor(c, &mut fixtures);
     view_build(c, &mut fixtures);
     load_write(c, &mut fixtures);
     publish(c, &mut fixtures);
     cadence(c, &mut fixtures);
+    vetoed(c, &mut fixtures);
 }
 
 criterion_group!(benches, store_view);

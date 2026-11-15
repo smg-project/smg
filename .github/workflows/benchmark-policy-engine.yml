@@ -19,6 +19,7 @@ on:
       - 'crates/policy_controller/benches/power_of_two.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/tests.rs'
       - '!crates/policy_controller/src/**/*_test.rs'
       - 'scripts/bench_gate.py'
   pull_request:
@@ -37,6 +38,7 @@ on:
       - 'crates/policy_controller/benches/power_of_two.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/tests.rs'
       - '!crates/policy_controller/src/**/*_test.rs'
       - 'scripts/bench_gate.py'
   workflow_dispatch:

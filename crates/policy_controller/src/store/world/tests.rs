@@ -2,15 +2,18 @@
 //! [`MemoryStore`]: every instant is handed in, none is slept.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
-use super::{Ask, Built, ViewBuffers, World, PUBLISH_WINDOW};
+use super::{Ask, Built, ViewBuffers, World, Writer, PUBLISH_WINDOW};
 use crate::{
     store::{
         GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, WorkerFacts,
-        WorkerPatch, WorkerStatus, WorkersStore,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, AffinityFacts, Candidate, LoadRow, Phase, Role, WireModes, WorkerId},
     PolicySpec,
@@ -287,7 +290,8 @@ fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_i
     assert!(Arc::ptr_eq(&before.derived, &after.derived));
     // and the pool no write was folded into keeps its rows by pointer.
     let rows = |world: &World, model: &str| {
-        let index = world.derived.by_model[model][Role::Single as usize].expect("the pool");
+        let index =
+            world.derived.by_model[model][super::role_slot(Role::Single)].expect("the pool");
         Arc::clone(&world.rows[index as usize])
     };
     assert!(Arc::ptr_eq(&rows(&before, "two"), &rows(&after, "two")));
@@ -1015,4 +1019,380 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
         store.probe_outcome(id, false, revision());
     }
     assert!(!healthy());
+}
+
+#[test]
+fn one_models_members_stand_in_the_pool_of_their_own_role() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    // One model served in every role, a different count each: a role read
+    // from another's slot is seen by its size and by its rows.
+    let roles = [
+        (Role::Single, 1_u32),
+        (Role::Prefill, 2),
+        (Role::Decode, 3),
+        (Role::Encode, 4),
+    ];
+    for (role, count) in roles {
+        for index in 0..count {
+            store.upsert(facts(
+                &format!("http://{role:?}-{index}:8000"),
+                role,
+                &[MODEL],
+            ));
+        }
+    }
+    for (role, count) in roles {
+        let mut out = ViewBuffers::default();
+        let built = store
+            .build_view(MODEL, role, &ask(t0), &mut out)
+            .expect("the pool");
+        assert_eq!(built.pool_size, count, "{role:?}");
+        assert!(
+            out.candidates.iter().all(|row| row.role == role),
+            "{role:?}"
+        );
+    }
+}
+
+#[test]
+fn a_veto_masks_its_workers_row_in_every_pool_it_serves() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(1);
+    let both = store
+        .upsert(facts("http://a:8000", Role::Single, &["one", "two"]))
+        .id();
+    store.upsert(facts("http://b:8000", Role::Single, &["one"]));
+    let two = store
+        .upsert(facts("http://c:8000", Role::Single, &["two"]))
+        .id();
+    let masked = |model: &str| {
+        let mut out = ViewBuffers::default();
+        store
+            .build_view(model, Role::Single, &ask(t0), &mut out)
+            .expect("the pool");
+        out.candidates
+            .iter()
+            .filter(|row| row.health.stalled)
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    };
+    store.gateway_veto(ASKER, both, Some(until));
+    assert_eq!(masked("one"), [both]);
+    assert_eq!(masked("two"), [both]);
+    // A veto on a worker of one pool masks nothing in the other.
+    store.gateway_veto(ASKER, two, Some(until));
+    assert_eq!(masked("one"), [both]);
+    let mut pair = [both, two];
+    pair.sort_unstable();
+    assert_eq!(masked("two"), pair);
+    store.gateway_veto(ASKER, both, None);
+    assert_eq!(masked("one"), []);
+    assert_eq!(masked("two"), [two]);
+}
+
+#[test]
+fn a_veto_beside_host_local_rows_masks_its_own_row_in_each_gateways_slice() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(1);
+    let other = GatewayId(2);
+    let register = |key: &str, reachable_from: Reachability| {
+        store
+            .upsert(WorkerFacts {
+                reachable_from,
+                ..facts(key, Role::Single, &[MODEL])
+            })
+            .id()
+    };
+    register("http://a:8000", Reachability::Any);
+    let theirs = register("http://b:8000", Reachability::Gateway(other));
+    let behind = register("http://c:8000", Reachability::Any);
+    register("http://d:8000", Reachability::Gateway(ASKER));
+    let last = register("http://e:8000", Reachability::Any);
+    // The asking gateway's slice leaves the other gateway's row out: a veto
+    // on a row behind it masks that row, never the one at its index.
+    store.gateway_veto(ASKER, behind, Some(until));
+    assert_eq!(stalled(&store, ASKER, t0), [behind]);
+    // A veto on a row the gateway's slice does not hold masks nothing.
+    store.gateway_veto(ASKER, theirs, Some(until));
+    assert_eq!(stalled(&store, ASKER, t0), [behind]);
+    // The other gateway's slice leaves out the asking gateway's row.
+    store.gateway_veto(other, last, Some(until));
+    assert_eq!(stalled(&store, other, t0), [last]);
+    assert_eq!(stalled(&store, ASKER, t0), [behind]);
+}
+
+#[test]
+fn the_pair_door_builds_both_sides_of_one_publication() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let prefill = store
+        .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
+        .id();
+    let decode = store
+        .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
+        .id();
+    let (mut first, mut second) = (ViewBuffers::default(), ViewBuffers::default());
+    let (left, right) = store
+        .build_pair(MODEL, &ask(t0), &mut first, &mut second)
+        .expect("both pools");
+    assert_eq!((left.pool_size, right.pool_size), (1, 1));
+    assert_eq!(left.membership_epoch, right.membership_epoch);
+    assert_eq!(
+        (first.candidates[0].id, second.candidates[0].id),
+        (prefill, decode)
+    );
+    // A model served on one side alone has no pair, and neither buffer
+    // keeps a view: not the side that has members, not the last pair's;
+    // neither its rows nor, under an ask that declares it, its column.
+    let with_column = Ask {
+        affinity: true,
+        ..ask(t0)
+    };
+    let empty = |first: &ViewBuffers, second: &ViewBuffers| {
+        first.candidates.is_empty()
+            && first.affinity.is_empty()
+            && second.candidates.is_empty()
+            && second.affinity.is_empty()
+    };
+    store.upsert(facts("http://s:8000", Role::Prefill, &["prefill-alone"]));
+    assert_eq!(
+        store.build_pair("prefill-alone", &with_column, &mut first, &mut second),
+        None
+    );
+    assert!(empty(&first, &second));
+    store
+        .build_pair(MODEL, &with_column, &mut first, &mut second)
+        .expect("both pools");
+    assert_eq!((first.affinity.len(), second.affinity.len()), (1, 1));
+    store.upsert(facts("http://t:8000", Role::Decode, &["decode-alone"]));
+    assert_eq!(
+        store.build_pair("decode-alone", &with_column, &mut first, &mut second),
+        None
+    );
+    assert!(empty(&first, &second));
+}
+
+#[test]
+fn the_pair_door_racing_the_publications_builds_both_sides_from_one_load() {
+    /// How many publications the door is read across before the case ends.
+    const SEEN: u32 = 256;
+    let store = Arc::new(MemoryStore::new());
+    let t0 = Instant::now();
+    let prefill = store
+        .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
+        .id();
+    let decode = store
+        .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
+        .id();
+    // Both sides hold turn 0 before the door is asked.
+    store.record(prefill, 0, load(0, 0), t0, LoadSource::Stream);
+    store.record(decode, 0, load(0, 0), t0, LoadSource::Stream);
+    store.publish(t0 + PUBLISH_WINDOW);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            // One publication shows a turn's two records, turn after turn
+            // until the door was read across enough of them.
+            let mut turn = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                turn += 1;
+                let opened = t0 + PUBLISH_WINDOW * turn;
+                let inside = opened + Duration::from_millis(1);
+                store.record(prefill, 0, load(turn, 0), inside, LoadSource::Stream);
+                store.record(decode, 0, load(turn, 0), inside, LoadSource::Stream);
+                store.publish(opened + PUBLISH_WINDOW);
+            }
+            turn
+        })
+    };
+    let (mut first, mut second) = (ViewBuffers::default(), ViewBuffers::default());
+    let mut sides = || {
+        store
+            .build_pair(MODEL, &ask(t0), &mut first, &mut second)
+            .expect("both pools");
+        let running = |side: &ViewBuffers| side.candidates[0].load.map(|load| load.running);
+        (running(&first), running(&second))
+    };
+    // The case ends at an event, the door read across `SEEN` publications,
+    // and holds the door's rule at every read: one load of the world feeds
+    // both sides, so a publication between the two builds shows in neither.
+    let (mut seen, mut last) = (0, None);
+    while seen < SEEN {
+        assert!(
+            !writer.is_finished(),
+            "the writer ended before the door was read across {SEEN} publications"
+        );
+        let (prefills, decodes) = sides();
+        assert_eq!(
+            prefills, decodes,
+            "the door's two sides are of one load of the world"
+        );
+        if prefills != last {
+            (seen, last) = (seen + 1, prefills);
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let turns = writer.join().expect("the writer ends");
+    assert_eq!(sides(), (Some(turns), Some(turns)));
+}
+
+#[test]
+fn two_ranks_that_push_at_two_instants_are_each_aged_from_their_own() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let rank = |rank: u16| {
+        store
+            .upsert(WorkerFacts {
+                engine: "grpc://e:9000".to_string(),
+                dp_rank: rank,
+                dp_size: 2,
+                ..facts(&format!("grpc://e:9000@{rank}"), Role::Single, &[MODEL])
+            })
+            .id()
+    };
+    let (first, second) = (rank(0), rank(1));
+    let ages = |now: Instant| {
+        let (rows, _, _) = view(&store, &ask(now));
+        let age = |id: WorkerId| {
+            rows.iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.load)
+                .map(|load| load.report_age_ms)
+        };
+        (age(first), age(second))
+    };
+    store.record(first, 0, load(1, 0), t0, LoadSource::Stream);
+    // A decision between the two pushes: the second rank has no record yet.
+    assert_eq!(ages(t0 + Duration::from_millis(2)), (Some(2), None));
+    let later = t0 + PUBLISH_WINDOW;
+    store.record(second, 1, load(2, 0), later, LoadSource::Stream);
+    store.publish(later);
+    // Each row's age counts from its own record's instant, never from the
+    // later one.
+    let window_ms = u32::try_from(PUBLISH_WINDOW.as_millis()).expect("a window in milliseconds");
+    assert_eq!(
+        ages(later + Duration::from_millis(5)),
+        (Some(window_ms + 5), Some(5))
+    );
+}
+
+#[test]
+fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
+    let origin = Instant::now();
+    let t0 = origin + Duration::from_secs(1);
+    let row = |id: u64, key: &str| WorkerRow {
+        id: WorkerId(id),
+        facts: facts(key, Role::Single, &[MODEL]),
+        status: WorkerStatus::Ready,
+        revision: 1,
+        admitted_at: origin,
+    };
+    let members = [row(1, "http://a:8000"), row(2, "http://b:8000")];
+    let masked = |world: &World| {
+        let mut out = ViewBuffers::default();
+        world
+            .build(MODEL, Role::Single, &ask(t0), &mut out)
+            .expect("the pool");
+        out.candidates
+            .iter()
+            .filter(|row| row.health.stalled)
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    };
+    let leaving = WorkerId(1);
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, members.iter(), |_, _| None);
+    let vetoed = writer
+        .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)))
+        .expect("a new veto");
+    assert_eq!(masked(&vetoed), [leaving]);
+    // Another worker's load write publishes while the removal is under
+    // way: the leaving worker's row still stands in that world, masked.
+    let between = writer.publish_window(t0);
+    assert_eq!(masked(&between), [leaving]);
+    // The membership write takes the row and its vetoes out together,
+    let after = writer.rebuild(2, members[1..].iter(), |_, _| None);
+    assert_eq!(after.members(MODEL, Role::Single), Some(1));
+    assert_eq!(masked(&after), []);
+    // and the same id registered again starts without them.
+    let again = writer.rebuild(3, members.iter(), |_, _| None);
+    assert_eq!(again.members(MODEL, Role::Single), Some(2));
+    assert_eq!(masked(&again), []);
+}
+
+#[test]
+fn a_departing_workers_vetoes_leave_alone_and_every_other_veto_stands() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let other = GatewayId(2);
+    let leaving = member(&store, "http://a:8000");
+    let staying = member(&store, "http://b:8000");
+    // The asking gateway's list names both workers, the other gateway's
+    // the one that stays.
+    store.gateway_veto(ASKER, leaving, Some(until));
+    store.gateway_veto(ASKER, staying, Some(until));
+    store.gateway_veto(other, staying, Some(until));
+    let mut both = [leaving, staying];
+    both.sort_unstable();
+    assert_eq!(stalled(&store, ASKER, t0), both);
+    assert_eq!(stalled(&store, other, t0), [staying]);
+    let revision = WorkersStore::get(&store, leaving)
+        .expect("the row")
+        .revision;
+    store.remove(leaving, revision).expect("removed");
+    // The membership write drops the vetoes on the worker that left and no
+    // other: the rest of that gateway's list stands, and so does the list
+    // that named members alone.
+    assert_eq!(stalled(&store, ASKER, t0), [staying]);
+    assert_eq!(stalled(&store, other, t0), [staying]);
+}
+
+#[test]
+fn a_membership_write_keeps_the_standing_veto_of_each_of_many_members() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let mut vetoed: Vec<WorkerId> = (0..64)
+        .map(|n| member(&store, &format!("http://w{n}:8000")))
+        .collect();
+    for &id in &vetoed {
+        store.gateway_veto(ASKER, id, Some(until));
+    }
+    vetoed.sort_unstable();
+    assert_eq!(stalled(&store, ASKER, t0), vetoed);
+    // One more registration derives every pool anew. Each vetoed worker is
+    // still a member, in whatever order the store's map hands that write
+    // its members: no veto leaves.
+    member(&store, "http://joined:8000");
+    assert_eq!(stalled(&store, ASKER, t0), vetoed);
+}
+
+#[test]
+fn a_veto_past_its_end_leaves_at_the_next_windows_publication() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let ended = member(&store, "http://a:8000");
+    let standing = member(&store, "http://b:8000");
+    let until = t0 + Duration::from_millis(10);
+    store.gateway_veto(ASKER, ended, Some(until));
+    store.gateway_veto(ASKER, standing, Some(until + Duration::from_secs(1)));
+    let mut both = [ended, standing];
+    both.sort_unstable();
+    assert_eq!(stalled(&store, ASKER, t0), both);
+    // Dated past the first veto's end over the publication that still
+    // lists it: lapsed by the build's own compare.
+    assert_eq!(stalled(&store, ASKER, until), [standing]);
+    // A window's publication at or past that end takes the entry out by
+    // the store's own clock. A decision dated before that instant reads
+    // the publication, which no longer holds it; the veto that stands
+    // stays.
+    store.record(ended, 0, load(1, 0), until, LoadSource::Stream);
+    assert_eq!(stalled(&store, ASKER, t0), [standing]);
+    // The sink's own answer keeps its compare.
+    assert!(store.vetoed(ASKER, ended, t0));
 }

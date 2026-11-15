@@ -209,6 +209,10 @@ name = "store_view"
 harness = false
 
 [[bench]]
+name = "store_pair"
+harness = false
+
+[[bench]]
 name = "store"
 harness = false
 
