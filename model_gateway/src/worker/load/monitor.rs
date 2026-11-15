@@ -175,6 +175,19 @@ impl WorkerLoadManager {
     }
 }
 
+/// The token counts the DP-rank cache takes from `report`: one per rank
+/// whose row carries token capacity. A row without it is no token count of
+/// its rank, whatever the rows beside it carry: the report on file and a
+/// poll's report under the stream's rows hold rows of more than one origin.
+fn dp_rank_token_loads(report: &WorkerLoadResponse) -> HashMap<isize, isize> {
+    report
+        .loads
+        .iter()
+        .filter(|rank| rank.max_total_num_tokens > 0)
+        .map(|rank| (rank.dp_rank as isize, rank.num_used_tokens as isize))
+        .collect()
+}
+
 /// Per-group polling loop state.
 struct GroupState {
     handle: JoinHandle<()>,
@@ -586,12 +599,13 @@ impl WorkerMonitor {
         // The record feeds its own rank's `smg_engine_*` series through the
         // handles kept for it; a poll's report feeds every rank's.
         Metrics::record_engine_rank_load(url, worker.model_id(), &report.loads[at]);
-        // The DP-rank token cache takes a report with absolute token counts,
-        // as it takes a poll; a core-only record leaves its last-known-good
-        // entry alone.
+        // The DP-rank token cache takes the rows that carry token capacity,
+        // as it takes a poll's: a row a poll wrote to the file without it is
+        // no token count of its rank. A core-only record leaves its
+        // last-known-good entry alone.
         if report.has_absolute_token_data() && report.ranks_are_dp_ranks() {
             self.worker_load_manager
-                .update_worker_dp_loads(url, report.dp_rank_loads());
+                .update_worker_dp_loads(url, dp_rank_token_loads(report));
         }
         // The window's publish takes the report once, under the incarnation
         // that pushed last.
@@ -658,50 +672,107 @@ impl WorkerMonitor {
     /// carries it and the rank's figures are at most a tick interval old,
     /// the poll decision's own bound. A rank whose record arrived
     /// since the poll began keeps it: the stream's is the newer. The
-    /// receipts (`pushed_at`) are not touched: a poll is not the stream
-    /// working, and the worker stays polled until the rank's records
-    /// resume. Only a rank on file is replaced: a rank the stream never
-    /// named has no receipt for the poll decision to age, so a poll's
-    /// figure for it would sit in the report unrefreshed once the pushing
-    /// ranks are fresh again; it stays out of the pushed report, and the
-    /// poll's report stands for it while the worker is polled. A worker
-    /// with no pushed record on file has no report to merge into; the
-    /// poll's report stands on its own, as always.
+    /// receipt (`pushed_at`) of a rank that stays is not touched: a poll
+    /// is not the stream working, and the worker stays polled until the
+    /// rank's records resume. Only a rank on file is replaced: a rank the
+    /// stream never named has no receipt for the poll decision to age, so
+    /// a poll's figure for it would sit in the report unrefreshed once the
+    /// pushing ranks are fresh again; it stays out of the pushed report,
+    /// and the poll's report stands for it while the worker is polled. A
+    /// worker with no pushed record on file has no report to merge into;
+    /// the poll's report stands on its own, as always. A rank on file that
+    /// pushed nothing since the poll began and that the answer omits leaves
+    /// the file, its row and its receipt, as after an empty answer: the
+    /// file and the poll's publish say one thing of a rank, and the
+    /// worker's next pushed record does not publish the old row again. The
+    /// answer that may retract a rank from the file is one whose entries
+    /// the rank cache takes as the worker's ranks, and no other: its entries
+    /// are ranks and it carries token capacity, which stands in for the
+    /// engine's own list of its ranks. An answer the cache does not take
+    /// leaves the cache nothing of the worker and takes nothing from the
+    /// file: the old row stays. A retraction reads one more word of the
+    /// answer, where the two tests part: an answer that counts more ranks
+    /// than it lists is short by its own count, so it says nothing of a
+    /// rank it leaves out and retracts none, though the cache takes its
+    /// rows as the counts to pick by.
+    /// A rank worker's file holds its own rank and its answer is scoped to
+    /// that rank, so an answer with rows never omits it. Returns the rows
+    /// on file of the ranks that pushed since the poll began (the stream's,
+    /// the newer), named by the poll's answer or not, and, when there are
+    /// any, the report on file's sample instant, for a publish that carries
+    /// them over the poll's under their own sample boundary.
     pub(crate) fn apply_polled_load(
         &self,
         url: &str,
         load: &WorkerLoadResponse,
         polled_at: Instant,
-    ) {
+    ) -> (Vec<SchedulerLoadSnapshot>, Option<Instant>) {
         // A rollup from a gateway registered as a worker is keyed by
         // downstream worker, not by rank: its entries all say rank 0 and
         // would collapse into one slot (the DP cache applies the same
         // guard).
         if !load.ranks_are_dp_ranks() {
-            return;
+            return (Vec::new(), None);
         }
         // Both tables held together so a record landing between the two
         // reads is not undone; pushes and retractions use the same lock order.
         let mut reports = self.pushed_reports.lock();
         let Some(report) = reports.get_mut(url) else {
-            return;
+            return (Vec::new(), None);
         };
-        let pushed_at = self.pushed_at.lock();
-        let receipts = pushed_at.get(url);
-        for entry in &load.loads {
+        let mut pushed_at = self.pushed_at.lock();
+        let mut receipts = pushed_at.get_mut(url);
+        // The rank cache's test: the entries are ranks (the guard above)
+        // and the answer carries token capacity. The capacity stands in for
+        // the engine's own list of its ranks, so a rank such an answer omits
+        // is retracted. An answer with none retracts nothing: the row
+        // synthesized from backend-wide gauges, which names one rank and
+        // says nothing of the others, and the answer of an engine that
+        // reports no capacity, or none yet. A retraction reads the answer's
+        // own count too, and here it parts from the cache's test: an answer
+        // that counts more ranks than it lists says ranks exist that it
+        // does not list, so it retracts none. A count of zero says nothing
+        // against the list.
+        let lists_ranks = load.has_absolute_token_data()
+            && load.loads.len() >= usize::try_from(load.dp_rank_count).unwrap_or(0);
+        let on_file = report.loads.len();
+        let mut newer = Vec::new();
+        // Every rank on file: one that pushed since the poll began keeps its
+        // row and hands it to the publish, whether the poll's answer names
+        // the rank or not; any other takes the answer's entry for it, and
+        // one a listing omits leaves the file, row and receipt, as after an
+        // empty answer: what a poll retracts it retracts from the file, so
+        // no later record of another rank publishes the old row again.
+        report.loads.retain_mut(|row| {
             let pushed_since = receipts
-                .and_then(|ranks| ranks.get(&entry.dp_rank))
+                .as_deref()
+                .and_then(|ranks| ranks.get(&row.dp_rank))
                 .is_some_and(|&at| at >= polled_at);
             if pushed_since {
-                continue;
+                newer.push(row.clone());
+                return true;
             }
-            if let Ok(at) = report
-                .loads
-                .binary_search_by_key(&entry.dp_rank, |load| load.dp_rank)
-            {
-                report.loads[at].clone_from(entry);
+            if let Some(entry) = load.loads.iter().find(|entry| entry.dp_rank == row.dp_rank) {
+                row.clone_from(entry);
+                return true;
             }
+            if !lists_ranks {
+                return true;
+            }
+            if let Some(ranks) = receipts.as_deref_mut() {
+                ranks.remove(&row.dp_rank);
+            }
+            false
+        });
+        if report.loads.len() < on_file {
+            report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
         }
+        let sampled_at = if newer.is_empty() {
+            None
+        } else {
+            report.sampled_at
+        };
+        (newer, sampled_at)
     }
 
     /// Retract pre-poll pushed ranks after an authoritative empty response.
@@ -1684,8 +1755,60 @@ async fn poll_group_once(
     let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
     let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
     let mut dp_evict: Vec<String> = Vec::new();
-    for (worker, response) in results {
+    for (worker, mut response) in results {
         let url = worker.url().to_string();
+        // Whether the rank cache takes the answer as the worker's ranks is
+        // the answer's own fact, the one the merge reads too: asked before
+        // the stream's rows are laid over it, whose token capacity is not
+        // the answer's. The merge reads one fact more, the answer's count
+        // against its rows: a short answer feeds the cache and retracts no
+        // rank from the file.
+        let cache_takes_answer = response
+            .as_ref()
+            .is_some_and(|load| load.has_absolute_token_data() && load.ranks_are_dp_ranks());
+        // A worker polled because a rank's records went quiet (`fallback`)
+        // takes the poll's figures for the ranks that pushed nothing since
+        // the tick began. A rank that pushed since keeps the stream's row,
+        // in the report on file and in the report this poll publishes,
+        // whether the poll's answer names the rank or not: every step
+        // below reads the report so reconciled.
+        if let Some(load) = response.as_mut().filter(|load| !load.loads.is_empty()) {
+            let read_at = Instant::now();
+            let (newer, stream_sampled_at) = monitor.apply_polled_load(&url, load, now);
+            // One sample instant per report, the earlier of the two: the
+            // carried rows keep their stream's, so the scorer releases
+            // no dispatch they never saw; the poll's own rows cost their
+            // in-flight dispatches once more until the next report, the
+            // safe side.
+            load.sampled_at = Some(stream_sampled_at.map_or(read_at, |at| at.min(read_at)));
+            let polled_rows = load.loads.len();
+            for row in newer {
+                if let Some(entry) = load
+                    .loads
+                    .iter_mut()
+                    .find(|entry| entry.dp_rank == row.dp_rank)
+                {
+                    *entry = row;
+                } else {
+                    // A rank the answer does not name: the row goes in
+                    // before the first entry of a greater rank, its
+                    // rank's place where the answer is listed by rank.
+                    let at = load
+                        .loads
+                        .iter()
+                        .position(|entry| entry.dp_rank > row.dp_rank)
+                        .unwrap_or(load.loads.len());
+                    load.loads.insert(at, row);
+                }
+            }
+            // The rank count is never below the rows the report carries; a
+            // larger count of the poll's own stands, so a partial report
+            // stays partial for the readers that ask.
+            if load.loads.len() > polled_rows {
+                let carried = i32::try_from(load.loads.len()).unwrap_or(i32::MAX);
+                load.dp_rank_count = load.dp_rank_count.max(carried);
+            }
+        }
         // The overload predicate runs exactly here, once per report, never
         // on a request path, against the worker's effective thresholds
         // (resolved at registration). A failed fetch means no fresh
@@ -1695,10 +1818,11 @@ async fn poll_group_once(
             response.as_ref().filter(|load| !load.loads.is_empty()),
             "poll",
         );
-        if let Some(mut load) = response {
+        if let Some(load) = response {
             // A successful native poll can retract a rank. A failed poll
-            // leaves the last-known DP cache alone; an explicit omission must
-            // not keep that rank selectable or be published as an idle load.
+            // leaves the last-known DP cache alone; an explicit omission of a
+            // rank that pushed nothing since the tick began must not keep
+            // that rank selectable or be published as an idle load.
             if load.loads.is_empty() {
                 monitor.retract_pushed_load(&url, worker.dp_rank(), now);
                 if let Some(rank) = worker.dp_rank() {
@@ -1708,11 +1832,6 @@ async fn poll_group_once(
                 }
                 continue;
             }
-            load.sampled_at = Some(Instant::now());
-            // A worker polled because a rank's records went quiet
-            // (`fallback`) takes the poll's figures for the ranks that
-            // pushed nothing since the tick began.
-            monitor.apply_polled_load(&url, &load, now);
             // The wedged rule reads the queue depth off every report.
             let waiting: i64 = load
                 .loads
@@ -1728,8 +1847,8 @@ async fn poll_group_once(
             // A fleet rollup from a gateway worker is keyed by downstream
             // worker, not by rank, so its repeated `dp_rank: 0` entries
             // would overwrite each other down to a single bogus rank.
-            if load.has_absolute_token_data() && load.ranks_are_dp_ranks() {
-                group_dp_loads.insert(url.clone(), load.dp_rank_loads());
+            if cache_takes_answer {
+                group_dp_loads.insert(url.clone(), dp_rank_token_loads(&load));
             } else {
                 dp_evict.push(url.clone());
             }
@@ -3039,6 +3158,566 @@ mod native_loads_tests {
         assert_eq!(
             cached.get(worker.url()).and_then(|ranks| ranks.get(&0)),
             Some(&2048)
+        );
+    }
+
+    /// What a fallback poll leaves of a worker whose rank 0 pushed a record
+    /// after the tick began: the published rows (rank, running requests),
+    /// the published rank count and sample instant, the instant of the push,
+    /// the overload verdict, the worker's two entries in the rank cache
+    /// (`None` when the cache holds nothing of the worker), and the rows the
+    /// worker's next pushed record publishes from the report on file.
+    struct AfterFallbackPoll {
+        rows: Vec<(i32, i32)>,
+        rank_count: i32,
+        sampled_at: Option<Instant>,
+        pushed_at: Instant,
+        overloaded: bool,
+        cached: Option<(Option<isize>, Option<isize>)>,
+        next_rows: Vec<(i32, i32)>,
+    }
+
+    /// Two ranks with a pushed record on file, rank 1's aged by the tick so
+    /// the worker is polled. Rank 0 pushes a record after the tick's
+    /// instant, before the poll's response is read: ten running and eight
+    /// waiting, over the worker's threshold. Then the tick's fallback poll
+    /// reads `answer`, and rank 1 pushes its next record.
+    async fn fallback_poll_after_rank_0_pushed(answer: &'static str) -> AfterFallbackPoll {
+        let stub = spawn_engine(StatusCode::OK, answer).await;
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                waiting_requests: Some(4),
+                token_usage: None,
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let interval = Duration::from_secs(10);
+        // The tick lies a second back, so the record pushed just after it
+        // was sampled before the poll's response is read.
+        let tick = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the clock is older than a second");
+        let t0 = tick
+            .checked_sub(interval)
+            .expect("the clock is older than the interval");
+        let record = |running: u32, waiting: u32, used: i32, sample: u64| EngineLoad {
+            running_requests: running,
+            waiting_requests: waiting,
+            num_used_tokens: Some(used),
+            max_total_num_tokens: Some(1000),
+            sample,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200, 1), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
+
+        let pushed_at = tick + Duration::from_millis(1);
+        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 3), pushed_at);
+        monitor.flush_pushed();
+        let published = |monitor: &WorkerMonitor| {
+            let snapshot = monitor.load_state.snapshot();
+            let report = snapshot.get(stub.url.as_str()).expect("published");
+            let rows: Vec<(i32, i32)> = report
+                .loads
+                .iter()
+                .map(|rank| (rank.dp_rank, rank.num_running_reqs))
+                .collect();
+            (rows, report.dp_rank_count, report.sampled_at)
+        };
+        assert_eq!(
+            published(&monitor).0,
+            vec![(0, 10), (1, 8)],
+            "the stream's publish"
+        );
+        assert!(worker.is_overloaded(), "the pushed record's verdict");
+
+        poll_group_once(&monitor, &key, interval, tick).await;
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1, "one fallback poll");
+        let (rows, rank_count, sampled_at) = published(&monitor);
+        let overloaded = worker.is_overloaded();
+        let cached = {
+            let cached = monitor.worker_load_manager.dp_cached_loads.read();
+            cached
+                .get(stub.url.as_str())
+                .map(|ranks| (ranks.get(&0).copied(), ranks.get(&1).copied()))
+        };
+        // The worker's next record publishes the report on file.
+        let next = pushed_at + Duration::from_millis(1);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 4), next);
+        monitor.flush_pushed();
+        AfterFallbackPoll {
+            rows,
+            rank_count,
+            sampled_at,
+            pushed_at,
+            overloaded,
+            cached,
+            next_rows: published(&monitor).0,
+        }
+    }
+
+    /// A rank that pushed a record after the tick began keeps the stream's
+    /// row in what the tick's fallback poll publishes, as the report on file
+    /// keeps it: the poll's figure for that rank is the older one. The
+    /// overload verdict and the DP-rank token cache read the same rows, and
+    /// the report carries the earlier of the two sample instants.
+    #[tokio::test]
+    async fn a_row_pushed_during_a_fallback_poll_is_in_what_the_poll_publishes() {
+        // The poll's answer: rank 0 idle, as it was before its record.
+        const TWO_RANKS: &str = r#"{"loads":[
+            {"dp_rank":0,"num_running_reqs":0,"num_waiting_reqs":0,
+             "num_used_tokens":100,"max_total_num_tokens":1000},
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":500,"max_total_num_tokens":1000}]}"#;
+        let after = fallback_poll_after_rank_0_pushed(TWO_RANKS).await;
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8)],
+            "rank 0 pushed since the tick began: the stream's row is the newer one"
+        );
+        assert_eq!(
+            after.sampled_at,
+            Some(after.pushed_at - PUSHED_ONE_WAY_MARGIN),
+            "the earlier sample instant, the stream's"
+        );
+        assert!(
+            after.overloaded,
+            "the verdict reads the stream's row for rank 0"
+        );
+        assert_eq!(
+            after.cached,
+            Some((Some(900), Some(500))),
+            "the rank cache reads the stream's row for rank 0"
+        );
+    }
+
+    /// The same push where the poll's answer does not name the rank at all.
+    /// The stream's row is still that rank's row in everything the poll
+    /// writes: it is published at its rank's place under a rank count that
+    /// covers it, and the verdict and the rank cache read it. Without it the
+    /// worker lost its overload verdict on an answer older than its newest
+    /// record. The row stays on file too: the worker's next pushed record
+    /// publishes it again.
+    #[tokio::test]
+    async fn a_row_pushed_during_a_fallback_poll_is_published_though_the_answer_omits_its_rank() {
+        const RANK_1_ALONE: &str = r#"{"loads":[
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":500,"max_total_num_tokens":1000}]}"#;
+        let after = fallback_poll_after_rank_0_pushed(RANK_1_ALONE).await;
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8)],
+            "the stream's row, at its rank's place"
+        );
+        assert_eq!(after.rank_count, 2, "the count covers the rows carried");
+        assert_eq!(
+            after.sampled_at,
+            Some(after.pushed_at - PUSHED_ONE_WAY_MARGIN),
+            "the earlier sample instant, the stream's"
+        );
+        assert!(
+            after.overloaded,
+            "the verdict reads the stream's row for the omitted rank"
+        );
+        assert_eq!(
+            after.cached,
+            Some((Some(900), Some(500))),
+            "the rank cache holds the omitted rank's row"
+        );
+        assert_eq!(
+            after.next_rows,
+            vec![(0, 10), (1, 8)],
+            "the omitted rank pushed since the tick: its row stays on file"
+        );
+    }
+
+    /// A poll's answer may count more ranks than it lists: a partial report.
+    /// Carrying the stream's row of a rank the answer omits does not lower
+    /// that count to the rows the report now holds, so the report stays
+    /// partial for the readers that ask.
+    #[tokio::test]
+    async fn a_fallback_polls_larger_rank_count_stands_over_the_rows_it_carries() {
+        const RANK_1_OF_FOUR: &str = r#"{"dp_rank_count":4,"loads":[
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":500,"max_total_num_tokens":1000}]}"#;
+        let after = fallback_poll_after_rank_0_pushed(RANK_1_OF_FOUR).await;
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8)],
+            "the stream's row, at its rank's place"
+        );
+        assert_eq!(after.rank_count, 4, "the poll's own larger count stands");
+    }
+
+    /// The rank cache's test is asked of the poll's answer, not of the
+    /// report the stream's rows are laid over. An answer with no token
+    /// capacity leaves the cache nothing of the worker, as it did before,
+    /// though the row it carries holds capacity; the poll still publishes
+    /// the carried row.
+    #[tokio::test]
+    async fn a_fallback_poll_without_token_capacity_feeds_no_rank_cache_over_a_carried_row() {
+        const RANK_1_NO_CAPACITY: &str = r#"{"loads":[
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":0,"max_total_num_tokens":0}]}"#;
+        let after = fallback_poll_after_rank_0_pushed(RANK_1_NO_CAPACITY).await;
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8)],
+            "the stream's row, at its rank's place"
+        );
+        assert_eq!(
+            after.cached, None,
+            "the answer carries no capacity: the cache holds nothing of the worker"
+        );
+    }
+
+    /// What the worker's next pushed record publishes after a fallback poll
+    /// whose answer does not name a rank that pushed nothing since the tick
+    /// began: the published rows (rank, running requests), the published
+    /// rank count, the overload verdict, and the poll decision after that
+    /// record. Before them, the sample instant of the poll's own report and
+    /// an instant taken just before the poll. Last, the worker's entries in
+    /// the rank cache (rank, token count; `None` when the cache holds
+    /// nothing of the worker) right after the poll and after that record.
+    struct AfterNextRecord {
+        poll_sampled_at: Option<Instant>,
+        before_poll: Instant,
+        rows: Vec<(i32, i32)>,
+        rank_count: i32,
+        overloaded: bool,
+        mode: PollMode,
+        cached_after_poll: Option<Vec<(isize, isize)>>,
+        cached: Option<Vec<(isize, isize)>>,
+    }
+
+    /// Ranks 0 and 1 with a pushed record on file, both aged by the tick:
+    /// rank 0 with ten running and eight waiting, over the worker's
+    /// threshold. Each rank of `also_quiet` is on file the same way, three
+    /// running. The tick's fallback poll reads `answer`, which has no entry
+    /// for this worker's rank 0; then rank 1 alone pushes its next record
+    /// and the window publishes.
+    async fn next_record_after_a_poll_omits_quiet_rank_0(
+        answer: &'static str,
+        also_quiet: &[i32],
+    ) -> AfterNextRecord {
+        let stub = spawn_engine(StatusCode::OK, answer).await;
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                waiting_requests: Some(4),
+                token_usage: None,
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let interval = Duration::from_secs(10);
+        let tick = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("the clock is older than three seconds");
+        let t0 = tick
+            .checked_sub(interval)
+            .expect("the clock is older than the interval");
+        let record = |running: u32, waiting: u32, used: i32, sample: u64| EngineLoad {
+            running_requests: running,
+            waiting_requests: waiting,
+            num_used_tokens: Some(used),
+            max_total_num_tokens: Some(1000),
+            sample,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 1), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
+        for &rank in also_quiet {
+            monitor.apply_pushed_load(&worker, rank, &record(3, 0, 300, 3), t0);
+        }
+        monitor.flush_pushed();
+        assert!(
+            worker.is_overloaded(),
+            "rank 0's record is over the threshold"
+        );
+        let cached = |monitor: &WorkerMonitor| {
+            let loads = monitor.worker_load_manager.dp_cached_loads.read();
+            loads.get(stub.url.as_str()).map(|ranks| {
+                let mut ranks: Vec<(isize, isize)> = ranks
+                    .iter()
+                    .map(|(&rank, &tokens)| (rank, tokens))
+                    .collect();
+                ranks.sort_unstable();
+                ranks
+            })
+        };
+        assert!(cached(&monitor).is_some(), "the records fed the rank cache");
+
+        let before_poll = Instant::now();
+        poll_group_once(&monitor, &key, interval, tick).await;
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1, "one fallback poll");
+        let cached_after_poll = cached(&monitor);
+        let poll_sampled_at = monitor
+            .load_state
+            .snapshot()
+            .get(stub.url.as_str())
+            .and_then(|report| report.sampled_at);
+
+        let next = tick + Duration::from_secs(2);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 4), next);
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get(stub.url.as_str()).expect("published");
+        AfterNextRecord {
+            poll_sampled_at,
+            before_poll,
+            rows: report
+                .loads
+                .iter()
+                .map(|rank| (rank.dp_rank, rank.num_running_reqs))
+                .collect(),
+            rank_count: report.dp_rank_count,
+            overloaded: worker.is_overloaded(),
+            mode: monitor.poll_mode(&stub.url, next, interval),
+            cached_after_poll,
+            cached: cached(&monitor),
+        }
+    }
+
+    /// A rank on file that pushed nothing since the tick began and that the
+    /// fallback poll's answer omits leaves the file with its receipt, as
+    /// after an empty answer. The worker's next pushed record does not
+    /// publish the old row again: the report, its count and the overload
+    /// verdict read the ranks the engine still names, and the stream serves
+    /// the worker again. No rank pushed since the tick began, so the poll's
+    /// own report goes out under the poll's instant, not the file's.
+    #[tokio::test]
+    async fn a_quiet_rank_a_fallback_poll_omits_is_not_published_again_by_the_next_record() {
+        const RANK_1_ALONE: &str = r#"{"loads":[
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":500,"max_total_num_tokens":1000}]}"#;
+        let after = next_record_after_a_poll_omits_quiet_rank_0(RANK_1_ALONE, &[]).await;
+        assert!(
+            after.poll_sampled_at >= Some(after.before_poll),
+            "no rank pushed since the tick began: the poll's report carries the poll's own instant"
+        );
+        assert_eq!(
+            after.rows,
+            vec![(1, 8)],
+            "the omitted rank's old row is off the file"
+        );
+        assert_eq!(after.rank_count, 1, "the file counts the rows it holds");
+        assert!(
+            !after.overloaded,
+            "no verdict from a row nobody stands behind"
+        );
+        assert_eq!(
+            after.mode,
+            PollMode::Suppressed,
+            "the receipt went with the row: the stream serves the worker again"
+        );
+    }
+
+    /// A row with no token capacity is the one synthesized from backend-wide
+    /// gauges: it names one rank and lists none. A rank it does not name
+    /// keeps its row and its receipt on file.
+    #[tokio::test]
+    async fn a_fallback_polls_row_without_token_capacity_retracts_no_rank_it_does_not_name() {
+        const RANK_1_NO_CAPACITY: &str = r#"{"loads":[
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":0,"max_total_num_tokens":0}]}"#;
+        let after = next_record_after_a_poll_omits_quiet_rank_0(RANK_1_NO_CAPACITY, &[]).await;
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8)],
+            "the rank the row does not name stays on file"
+        );
+        assert_eq!(after.rank_count, 2, "both rows are counted");
+        assert_eq!(
+            after.mode,
+            PollMode::Fallback,
+            "rank 0's receipt stays, so the worker stays polled"
+        );
+    }
+
+    /// An answer that counts more ranks than it lists is short by its own
+    /// word: it says nothing of the ranks it leaves out, though its row
+    /// carries token capacity. A quiet rank it does not name keeps its row
+    /// and its receipt on file, and the worker's next record publishes both
+    /// rows. The rank cache takes the short answer's row all the same: here
+    /// the merge's test and the cache's part.
+    #[tokio::test]
+    async fn a_fallback_polls_answer_short_of_its_rank_count_retracts_no_rank_it_does_not_name() {
+        const RANK_1_OF_FOUR: &str = r#"{"dp_rank_count":4,"loads":[
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":500,"max_total_num_tokens":1000}]}"#;
+        let after = next_record_after_a_poll_omits_quiet_rank_0(RANK_1_OF_FOUR, &[]).await;
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8)],
+            "the rank a short answer does not name stays on file"
+        );
+        assert_eq!(after.rank_count, 2, "both rows are counted");
+        assert_eq!(
+            after.mode,
+            PollMode::Fallback,
+            "rank 0's receipt stays, so the worker stays polled"
+        );
+        assert_eq!(
+            after.cached_after_poll,
+            Some(vec![(1, 500)]),
+            "the rank cache takes the short answer's row"
+        );
+    }
+
+    /// A retraction takes the retracted rank's receipt alone. Three ranks
+    /// on file, each aged by the tick: the answer omits rank 0 and names
+    /// ranks 1 and 2, counting the two it lists as an engine's answer does,
+    /// then rank 1 alone pushes its next record. Rank 2 pushed nothing, and
+    /// its receipt, kept, holds the worker in the fallback poll. Had the
+    /// retraction cleared the worker's receipts, the stream would seem to
+    /// serve every rank left, and rank 2's row would stay as the poll left
+    /// it.
+    #[tokio::test]
+    async fn a_fallback_poll_that_retracts_a_rank_keeps_the_receipt_of_a_rank_that_stays() {
+        const RANKS_1_AND_2: &str = r#"{"dp_rank_count":2,"loads":[
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,
+             "num_used_tokens":500,"max_total_num_tokens":1000},
+            {"dp_rank":2,"num_running_reqs":3,"num_waiting_reqs":0,
+             "num_used_tokens":300,"max_total_num_tokens":1000}]}"#;
+        let after = next_record_after_a_poll_omits_quiet_rank_0(RANKS_1_AND_2, &[2]).await;
+        assert_eq!(
+            after.rows,
+            vec![(1, 8), (2, 3)],
+            "rank 0 alone is off the file"
+        );
+        assert_eq!(after.rank_count, 2, "the file counts the rows it holds");
+        assert_eq!(
+            after.mode,
+            PollMode::Fallback,
+            "rank 2 is still quiet: its receipt stays and the worker stays polled"
+        );
+    }
+
+    /// An answer whose entries are annotated with their workers is a
+    /// gateway's rollup: it carries token capacity, and its entries are not
+    /// this worker's ranks. The rank cache takes none of them: the worker's
+    /// entry, fed by its records, leaves the cache with the poll. The
+    /// answer changes and retracts no rank on file.
+    #[tokio::test]
+    async fn a_fallback_polls_rollup_by_worker_changes_no_rank_on_file() {
+        const ROLLUP: &str = r#"{"loads":[
+            {"worker":"http://w1:8000","dp_rank":0,"num_running_reqs":1,"num_waiting_reqs":0,
+             "num_used_tokens":100,"max_total_num_tokens":1000}]}"#;
+        let after = next_record_after_a_poll_omits_quiet_rank_0(ROLLUP, &[]).await;
+        assert_eq!(
+            after.cached_after_poll, None,
+            "a rollup's entries are no ranks of the worker: its entry leaves the rank cache"
+        );
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8)],
+            "both ranks keep their rows"
+        );
+        assert_eq!(after.rank_count, 2, "both rows are counted");
+        assert_eq!(
+            after.mode,
+            PollMode::Fallback,
+            "rank 0's receipt stays, so the worker stays polled"
+        );
+    }
+
+    /// A poll's row without token capacity is no token count of the rank it
+    /// names. On file for a quiet rank, beside rows that carry capacity, it
+    /// stays out of the rank cache when another rank's next record feeds the
+    /// cache from the file. Read as zero tokens, the quiet rank was the least
+    /// loaded one and was handed out.
+    #[tokio::test]
+    async fn a_fallback_polls_row_without_token_capacity_is_no_token_count_in_the_rank_cache() {
+        const RANK_2_NO_CAPACITY: &str = r#"{"loads":[
+            {"dp_rank":2,"num_running_reqs":4,"num_waiting_reqs":0,
+             "num_used_tokens":0,"max_total_num_tokens":0}]}"#;
+        let after = next_record_after_a_poll_omits_quiet_rank_0(RANK_2_NO_CAPACITY, &[2]).await;
+        assert_eq!(
+            after.cached_after_poll, None,
+            "an answer without token capacity feeds the rank cache nothing"
+        );
+        assert_eq!(
+            after.rows,
+            vec![(0, 10), (1, 8), (2, 4)],
+            "the answer retracts no rank, and its row is rank 2's on file"
+        );
+        assert_eq!(
+            after.cached,
+            Some(vec![(0, 900), (1, 500)]),
+            "rank 1's record feeds the rows that carry capacity: rank 2's is no token count"
+        );
+    }
+
+    /// The poll's own feed reads its report row by row too: beside a row
+    /// that carries token capacity, an answer's row without it is no token
+    /// count, after the poll and after the worker's next record. The row
+    /// with capacity is an idle rank's: its zero is a count, and it is fed.
+    #[tokio::test]
+    async fn a_fallback_polls_answer_feeds_the_rank_cache_its_rows_with_token_capacity_alone() {
+        const CAPACITY_ON_RANK_1: &str = r#"{"loads":[
+            {"dp_rank":1,"num_running_reqs":0,"num_waiting_reqs":0,
+             "num_used_tokens":0,"max_total_num_tokens":1000},
+            {"dp_rank":2,"num_running_reqs":4,"num_waiting_reqs":0,
+             "num_used_tokens":0,"max_total_num_tokens":0}]}"#;
+        let after = next_record_after_a_poll_omits_quiet_rank_0(CAPACITY_ON_RANK_1, &[2]).await;
+        assert_eq!(
+            after.cached_after_poll,
+            Some(vec![(1, 0)]),
+            "the poll feeds the idle rank that carries capacity, and it alone"
+        );
+        assert_eq!(
+            after.cached,
+            Some(vec![(1, 500)]),
+            "so does rank 1's next record, from the file"
+        );
+    }
+
+    /// A pushed record on a file that carries token capacity on no row
+    /// feeds the rank cache nothing: the worker's last entry stays.
+    #[tokio::test]
+    async fn a_record_on_a_file_without_token_capacity_leaves_the_rank_caches_last_entry() {
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let worker = vllm_worker("http://engine:8000");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let last_entry = HashMap::from([(0, 900), (1, 500)]);
+        monitor
+            .worker_load_manager
+            .update_dp_loads(&HashMap::from([(
+                worker.url().to_string(),
+                last_entry.clone(),
+            )]));
+
+        // A core-only record: no token count and no capacity.
+        let core_only = EngineLoad {
+            running_requests: 3,
+            sample: 1,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &core_only, Instant::now());
+        assert_eq!(
+            monitor
+                .worker_load_manager
+                .dp_cached_loads
+                .read()
+                .get(worker.url())
+                .cloned(),
+            Some(last_entry),
+            "a file with no capacity on any row writes nothing over the last entry"
         );
     }
 }
