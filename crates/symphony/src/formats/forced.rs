@@ -638,32 +638,45 @@ mod tests {
                 vec![", \"name\": \"lookup\""],
             ),
         ] {
-            let said = the_same_at_every_cut(forced_qwen3(ForcedCall::List, TURN), &output);
+            let read = forced_qwen3(ForcedCall::List, TURN);
+            // Every read of the output holds what follows: whole, one character at a time and
+            // at every two-way cut.
+            let said = the_same_at_every_cut(
+                |pieces| {
+                    let events = read(pieces);
+                    // What a chat client reads as content: the content and the malformed text.
+                    assert_eq!(crate::tagged::shown(&events), "", "{output}: {pieces:?}");
+                    assert_eq!(
+                        crate::tagged::refused(&events),
+                        refused,
+                        "{output}: {pieces:?}"
+                    );
+                    // Each refused run is counted once: the event of no bytes stands right
+                    // before it.
+                    let counted = events
+                        .windows(2)
+                        .filter(|pair| {
+                            matches!(
+                                pair,
+                                [
+                                    Event::Malformed {
+                                        text,
+                                        why: MalformedReason::UnterminatedRegion,
+                                    },
+                                    Event::Dropped {
+                                        why: DropReason::MalformedCall,
+                                        ..
+                                    },
+                                ] if text.text.is_empty()
+                            )
+                        })
+                        .count();
+                    assert_eq!(counted, refused.len(), "{output}: {pieces:?}: {events:?}");
+                    events
+                },
+                &output,
+            );
             assert_eq!(said.calls, expected, "{output}");
-            let events = forced_qwen3(ForcedCall::List, TURN)(&[&output]);
-            // What a chat client reads as content: the content and the malformed text.
-            assert_eq!(crate::tagged::shown(&events), "", "{output}");
-            assert_eq!(crate::tagged::refused(&events), refused, "{output}");
-            // Each refused run is counted once: the event of no bytes stands right before it.
-            let counted = events
-                .windows(2)
-                .filter(|pair| {
-                    matches!(
-                        pair,
-                        [
-                            Event::Malformed {
-                                text,
-                                why: MalformedReason::UnterminatedRegion,
-                            },
-                            Event::Dropped {
-                                why: DropReason::MalformedCall,
-                                ..
-                            },
-                        ] if text.text.is_empty()
-                    )
-                })
-                .count();
-            assert_eq!(counted, refused.len(), "{output}: {events:?}");
         }
         // The bracket alone, with no object after it, is what the list with no marker says of
         // it: the model's text, as before.
