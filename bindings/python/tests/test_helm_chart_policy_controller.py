@@ -14,6 +14,7 @@ the job that runs these cases on the image's binary does not install.
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -53,6 +55,11 @@ NAME = "smg-policy-controller"
 # The block turned on. The switch is all it takes: every other value holds a
 # default, and the image's is the router's.
 ON = ("policyController.enabled=true",)
+# The block with the election turned on.
+ELECTED = (*ON, "policyController.election.enabled=true")
+# The variable the elected controller's address is read from: the kubelet
+# writes the pod's address in place of $(POD_IP).
+POD_IP = {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}
 # The settle window the controller takes when the chart passes none.
 DEFAULT_SETTLE_SECONDS = 5
 # The started controller is read on a loopback port: a proxy named in the
@@ -67,10 +74,15 @@ needs_helm = pytest.mark.skipif(
 )
 
 
-def helm_template(settings: tuple[str, ...], files: tuple[Path, ...] = (), chart: Path = CHART):
+def helm_template(
+    settings: tuple[str, ...],
+    files: tuple[Path, ...] = (),
+    chart: Path = CHART,
+    namespace: str = "default",
+):
     command = ["helm", "template", "smg", str(chart), "--kube-version", KUBE_VERSION]
     # Pinned so the render never follows the kube context.
-    command += ["--namespace", "default"]
+    command += ["--namespace", namespace]
     for file in files:
         command += ["-f", str(file)]
     for setting in settings:
@@ -78,9 +90,11 @@ def helm_template(settings: tuple[str, ...], files: tuple[Path, ...] = (), chart
     return subprocess.run(command, capture_output=True, text=True)
 
 
-def render(*settings: str, files: tuple[Path, ...] = (), chart: Path = CHART) -> list[dict]:
+def render(
+    *settings: str, files: tuple[Path, ...] = (), chart: Path = CHART, namespace: str = "default"
+) -> list[dict]:
     """The documents the chart renders with ``--set`` pairs."""
-    completed = helm_template(settings, files, chart)
+    completed = helm_template(settings, files, chart, namespace)
     assert completed.returncode == 0, completed.stderr
     return [document for document in yaml.safe_load_all(completed.stdout) if document]
 
@@ -128,6 +142,8 @@ def selects(selector: dict[str, str], labels: dict[str, str]) -> bool:
 def test_the_controller_is_off_by_default():
     assert of_the_controller(render()) == []
     assert of_the_controller(render("policyController.enabled=false")) == []
+    # An election asked for with the controller off renders nothing of it.
+    assert of_the_controller(render("policyController.election.enabled=true")) == []
 
 
 @pytest.fixture
@@ -237,6 +253,19 @@ def test_only_its_own_example_turns_the_controller_on():
     assert on == ["with-policy-controller.yaml"]
 
 
+@needs_helm
+def test_an_example_on_a_release_with_no_controller_image_needs_the_tag_named():
+    """The controller turned on over each example: it renders on the default
+    tag, or the example pins the router at a release with no controller
+    image and the chart says so until the controller's tag is named."""
+    for example in sorted(EXAMPLES.glob("*.yaml")):
+        completed = helm_template(ON, files=(example,))
+        if completed.returncode != 0:
+            assert "policyController.image.tag is needed" in completed.stderr, example.name
+            named = render(*ON, "policyController.image.tag=mine", files=(example,))
+            assert container(named)["image"].endswith(":mine"), example.name
+
+
 def router_image(documents: list[dict]) -> str:
     (deployment,) = [d for d in documents if d["kind"] == "Deployment" and component(d) == "router"]
     (found,) = deployment["spec"]["template"]["spec"]["containers"]
@@ -277,6 +306,35 @@ def test_the_image_follows_the_routers(router):
 
 
 @needs_helm
+def test_a_router_tag_written_as_a_number_is_refused_with_the_controller_on_alone(
+    tmp_path, chart_with_no_block
+):
+    """The controller's default tag is the router's with a suffix, so with
+    the controller on the router's tag is text: the schema refuses a tag
+    written as a number under its name, where the template gave a type
+    error. With the controller off such a file renders what it rendered
+    before this value was read: the number as the templates print it. A tag
+    of digits alone, quoted, names the image under either switch."""
+    number = tmp_path / "number.yaml"
+    for written, printed in (("1.16", "1.16"), ("20261115", "2.0261115e+07")):
+        number.write_text(f"global:\n  image:\n    tag: {written}\n")
+        assert "global.image.tag: Invalid type" in render_error(*ON, files=(number,))
+        off = render(files=(number,))
+        assert router_image(off) == f"docker.io/lightseekorg/smg:%!s(float64={printed})"
+        labels = [d["metadata"].get("labels", {}) for d in off]
+        assert {found.get("app.kubernetes.io/version") for found in labels} - {None} == {printed}
+        number.write_text(f'global:\n  image:\n    tag: "{written}"\n')
+        for switch in ((), ON):
+            quoted = render(*switch, files=(number,))
+            assert router_image(quoted) == f"docker.io/lightseekorg/smg:{written}"
+    # Over values that hold no block, a block given as null reaches the
+    # schema: the controller is off there as well.
+    number.write_text("policyController: null\nglobal:\n  image:\n    tag: 1.16\n")
+    off = render(files=(number,), chart=chart_with_no_block)
+    assert router_image(off) == "docker.io/lightseekorg/smg:%!s(float64=1.16)"
+
+
+@needs_helm
 def test_a_release_names_the_image_it_publishes():
     """The chart's own values at a release: the router's image on Docker Hub
     and the controller's beside it, under the suffixed tag."""
@@ -309,13 +367,14 @@ def published(workflow: str, environment: dict[str, str], tmp_path: Path) -> dic
     (step,) = [s for s in document["jobs"]["build-and-push"]["steps"] if s.get("id") == "tags"]
     output = tmp_path / "output"
     output.write_text("")
-    subprocess.run(
+    ran = subprocess.run(
         ["bash", "-e", "-c", step["run"]],
         env={"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(output), "GITHUB_SHA": "0" * 40}
         | environment,
-        check=True,
         capture_output=True,
+        text=True,
     )
+    assert ran.returncode == 0, f"the tags step of {workflow} failed:\n{ran.stderr}"
     lists: dict[str, list[str]] = {}
     lines = output.read_text().splitlines()
     while lines:
@@ -395,12 +454,23 @@ def test_a_release_older_than_the_first_with_a_controller_image_is_refused():
 
 
 @needs_helm
-def test_the_block_renders_a_deployment_and_a_service_and_nothing_else():
-    """No ConfigMap, Role, RoleBinding or ServiceAccount: each arrives with
-    the controller flag that reads it."""
+def test_the_block_renders_two_objects_and_the_election_four_more():
+    """No ConfigMap: it arrives with the controller flag that reads it. The
+    election's four objects stand behind the election's switch."""
     documents = of_the_controller(render(*ON))
     assert sorted(document["kind"] for document in documents) == ["Deployment", "Service"]
     assert {document["metadata"]["name"] for document in documents} == {NAME}
+
+    elected = of_the_controller(render(*ELECTED))
+    assert sorted(document["kind"] for document in elected) == [
+        "Deployment",
+        "Lease",
+        "Role",
+        "RoleBinding",
+        "Service",
+        "ServiceAccount",
+    ]
+    assert {document["metadata"]["name"] for document in elected} == {NAME}
 
     switched = of_the_controller(
         render(
@@ -690,6 +760,215 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
 
 
 @needs_helm
+def test_the_election_names_its_lease_and_the_pods_own_address():
+    """On, the controller is passed the Lease's name and its pod's address;
+    the variable the address is read from is the chart's, ahead of the
+    operator's. No flag names a namespace: the controller's is its pod's."""
+    assert controller_args("policyController.election.enabled=true")[-4:] == [
+        "--lease-name",
+        NAME,
+        "--advertise-address",
+        "$(POD_IP)",
+    ]
+    found = container(
+        render(
+            *ELECTED,
+            "policyController.election.leaseName=routing",
+            "policyController.extraEnv[0].name=EXAMPLE",
+            "policyController.extraEnv[0].value=set",
+            "policyController.extraArgs={--lease-duration-ms,2000}",
+        )
+    )
+    assert found["args"][-6:] == [
+        "--lease-name",
+        "routing",
+        "--advertise-address",
+        "$(POD_IP)",
+        "--lease-duration-ms",
+        "2000",
+    ]
+    assert found["env"] == [POD_IP, {"name": "EXAMPLE", "value": "set"}]
+    assert "--lease-namespace" not in found["args"]
+
+
+def rest(documents: list[dict]) -> list[dict]:
+    """What the chart renders beside the controller's own objects."""
+    own = of_the_controller(documents)
+    return [document for document in documents if document not in own]
+
+
+@needs_helm
+def test_the_election_grants_the_controller_its_one_lease_and_nothing_else():
+    """The Role holds a read and a replace of the one Lease the chart
+    renders: no create, no list, no watch, no other name. It is bound to the
+    controller's own account, whose token is mounted in the controller's
+    pods alone; every other object of the release is the same with the
+    election on and off."""
+    off, on = render(*ON), render(*ELECTED)
+    assert rest(on) == rest(off)
+    assert one(on, "Role")["rules"] == [
+        {
+            "apiGroups": ["coordination.k8s.io"],
+            "resources": ["leases"],
+            "resourceNames": [NAME],
+            "verbs": ["get", "update"],
+        }
+    ]
+    binding = one(on, "RoleBinding")
+    assert binding["roleRef"] == {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": NAME,
+    }
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": NAME, "namespace": "default"}]
+    assert one(on, "ServiceAccount")["metadata"]["name"] == NAME
+    pod = one(on, "Deployment")["spec"]["template"]["spec"]
+    assert pod["serviceAccountName"] == pod["serviceAccount"] == NAME
+    assert pod["automountServiceAccountToken"] is True
+    for document in rest(on):
+        other = document.get("spec", {}).get("template", {}).get("spec", {})
+        assert other.get("serviceAccountName") != NAME, document["metadata"]["name"]
+    # Off, the pod names no account and mounts no token.
+    lone = one(off, "Deployment")["spec"]["template"]["spec"]
+    assert "serviceAccountName" not in lone and "serviceAccount" not in lone
+    assert lone["automountServiceAccountToken"] is False
+    # A name of the operator's own is the Lease's, the grant's and the flag's.
+    named = render(*ELECTED, "policyController.election.leaseName=routing")
+    assert one(named, "Lease", "routing")["metadata"]["name"] == "routing"
+    assert one(named, "Role")["rules"][0]["resourceNames"] == ["routing"]
+    assert "routing" in container(named)["args"]
+    # A name no Lease can carry is refused at render: the cluster reads a
+    # name label by label.
+    for name in ("Routing", "routing_a", "-routing", "r" * 254, "a..b", "a.-b", "a-.b"):
+        assert "policyController.election.leaseName" in render_error(
+            *ELECTED, f"policyController.election.leaseName={name}"
+        )
+    for name in ("a.b", "routing-2.smg"):
+        named = render(*ELECTED, f"policyController.election.leaseName={name}")
+        assert one(named, "Lease", name)["metadata"]["name"] == name
+
+
+@needs_helm
+def test_turning_the_election_off_takes_the_account_off_the_live_pod_template():
+    """The server fills `serviceAccount`, the deprecated alias of `serviceAccountName`, on the live object and reads the
+    name back from the alias when the name is gone. An upgrade or a rollback deletes only what the old manifest named
+    and the new one does not. The elected manifest names both, so with the election off neither stands."""
+    elected = one(render(*ELECTED), "Deployment")["spec"]["template"]["spec"]
+    lone = one(render(*ON), "Deployment")["spec"]["template"]["spec"]
+    live = {**elected, "serviceAccount": elected["serviceAccountName"]}
+    for field in elected.keys() - lone.keys():
+        del live[field]
+    live.update(lone)
+    assert "serviceAccountName" not in live
+    assert "serviceAccount" not in live
+
+
+@needs_helm
+def test_a_name_yaml_reads_as_a_number_a_boolean_or_null_stays_text(tmp_path):
+    """A Lease may be named 123, true or null, and so may a namespace: text
+    the cluster admits, which YAML reads as a number, a boolean or null
+    where it is rendered bare. The Lease's name is the text given, the same
+    as the grant's and the flag's, and the binding's subject is in the
+    release's namespace by its text."""
+    values = tmp_path / "values.yaml"
+    for name in ("123", "007", "0x1f", "1.5", "true", "on", "no", "null"):
+        values.write_text(yaml.safe_dump({"policyController": {"election": {"leaseName": name}}}))
+        named = render(*ELECTED, files=(values,))
+        assert one(named, "Lease", name)["metadata"]["name"] == name
+        assert one(named, "Role")["rules"][0]["resourceNames"] == [name]
+        args = container(named)["args"]
+        assert args[args.index("--lease-name") + 1] == name
+    for namespace in ("123", "on", "true", "routing"):
+        (subject,) = one(render(*ELECTED, namespace=namespace), "RoleBinding")["subjects"]
+        assert subject["namespace"] == namespace
+
+
+@needs_helm
+def test_the_rendered_lease_holds_no_record():
+    """The Lease is rendered with its name and its labels and nothing else:
+    the holder, the times and the term are the controllers', so an upgrade
+    has nothing to say of them."""
+    lease = one(render(*ELECTED), "Lease")
+    assert set(lease) == {"apiVersion", "kind", "metadata"}
+    assert lease["apiVersion"] == "coordination.k8s.io/v1"
+    assert set(lease["metadata"]) == {"name", "labels"}
+
+
+@needs_helm
+def test_the_rollout_follows_the_election():
+    """On, one pod more at a time and none unavailable: a new pod stands by
+    before an old one stops. One elected replica is a leader with no
+    standby: allowed."""
+    elected = one(render(*ELECTED, "policyController.replicas=2"), "Deployment")["spec"]
+    assert elected["strategy"] == {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxSurge": 1, "maxUnavailable": 0},
+    }
+    assert one(render(*ELECTED), "Deployment")["spec"]["replicas"] == 1
+
+
+@needs_helm
+def test_with_the_election_off_nothing_of_it_is_rendered():
+    """A release that does not turn the election on renders what it rendered
+    before the election, in each spelling of off and at any replica count:
+    no object of the election, and on the controller's Deployment no
+    strategy, no account, no variable and neither flag."""
+    for off in (
+        (),
+        ("policyController.election.enabled=false",),
+        ("policyController.election=null",),
+    ):
+        for replicas in (1, 2):
+            documents = render(*ON, f"policyController.replicas={replicas}", *off)
+            kinds = sorted(document["kind"] for document in of_the_controller(documents))
+            assert kinds == ["Deployment", "Service"], off
+            deployment = one(documents, "Deployment")["spec"]
+            assert deployment["replicas"] == replicas, off
+            assert "strategy" not in deployment, off
+            pod = deployment["template"]["spec"]
+            assert "serviceAccountName" not in pod, off
+            assert "serviceAccount" not in pod, off
+            assert pod["automountServiceAccountToken"] is False, off
+            lone = container(documents)
+            assert "env" not in lone, off
+            assert not {"--lease-name", "--advertise-address"} & set(lone["args"]), off
+
+
+@pytest.fixture
+def chart_with_no_election(tmp_path) -> Path:
+    """A copy of the chart whose controller block holds no election: what an
+    upgrade that reuses the values of a release from before the election
+    hands the templates."""
+    values = yaml.safe_load(VALUES.read_text())
+    del values["policyController"]["election"]
+    chart = tmp_path / "smg"
+    shutil.copytree(CHART, chart)
+    (chart / "values.yaml").write_text(yaml.safe_dump(values))
+    return chart
+
+
+@needs_helm
+def test_the_election_over_reused_values_renders_a_fresh_install(chart_with_no_election):
+    """Over values that hold no election the controller renders what a fresh
+    install renders, byte for byte: off with nothing set, at one replica and
+    at two, and on, with the Lease under the controller's own name or a
+    given one."""
+    cells = (
+        ON,
+        (*ON, "policyController.replicas=2"),
+        ELECTED,
+        (*ELECTED, "policyController.replicas=2"),
+        (*ELECTED, "policyController.election.leaseName=routing"),
+    )
+    for settings in cells:
+        fresh = helm_template(settings)
+        assert fresh.returncode == 0, fresh.stderr
+        reused = helm_template(settings, chart=chart_with_no_election)
+        assert reused.returncode == 0, reused.stderr
+        assert reused.stdout == fresh.stdout, settings
+
+
+@needs_helm
 def test_the_chart_refuses_what_the_controller_refuses_at_start():
     shared = render_error(*ON, "policyController.ports.control=30100")
     assert "policyController.ports.control 30100 equals policyController.ports.gateway" in shared
@@ -750,6 +1029,13 @@ def test_the_schema_refuses_a_value_the_block_does_not_have():
     assert "policyController.logging.level" in render_error(
         *ON, "policyController.logging.level=loud"
     )
+    # The election's block holds its two values, and its switch is no text.
+    assert "Additional property lease is not allowed" in render_error(
+        *ON, "policyController.election.lease=routing"
+    )
+    assert "policyController.election.enabled" in render_error(
+        *ON, "policyController.election.enabled=yes"
+    )
     assert "policyController.replicas" in render_error(*ON, "policyController.replicas=0")
     for threads in (-1, 4097):
         assert "policyController.runtimeWorkerThreads" in render_error(
@@ -802,6 +1088,10 @@ SAME_AS_THE_DEFAULT = {
     "extraArgs",
     "extraEnv",
     "shutdownSettleSeconds",
+    # The election off, and the Lease under the controller's own name.
+    "election",
+    "election.enabled",
+    "election.leaseName",
 }
 # These are legal too: each is a switch, and its null turns it off.
 SWITCHED_OFF_BY_A_NULL = {
@@ -939,6 +1229,13 @@ ARGUMENT_SETS = {
     "extra-arguments": (
         "policyController.extraArgs={--ingestion-listen,0.0.0.0:30104,--load-monitor-interval,2}",
     ),
+    "an-election": ("policyController.election.enabled=true", "policyController.replicas=2"),
+    "an-election-over-a-named-lease": (
+        "policyController.election.enabled=true",
+        "policyController.election.leaseName=routing",
+        "policyController.extraArgs={--lease-duration-ms,2000,--lease-renew-period-ms,500,"
+        "--lease-renew-deadline-ms,1250}",
+    ),
 }
 
 
@@ -1009,18 +1306,18 @@ def test_a_path_filter_is_read_as_the_platform_reads_it():
 def test_the_image_job_starts_on_what_these_cases_read():
     """The job that runs these cases on the image's binary starts when
     something they read changes: this file, what configures its run and
-    every file of the chart a render reads. The chart's README and its alert
-    rule tests are read by no case, so they start nothing. The two publishing
-    workflows are read by one render case and by no binary case: the unit
-    job, which starts on every pull request, runs that one. The binary the
-    cases run is built by the image's file from the crate's manifest, build
-    script, source and contracts under the pinned toolchain, and from the
-    engine wire's messages the protocol imports: the job starts on each of
-    those too."""
+    every file of the chart a render reads. The chart's alert rule tests are
+    read by no case, so they start nothing. The chart's README and the two
+    publishing workflows are each read by one render case and by no binary
+    case: the unit job, which starts on every pull request, runs those. The
+    binary the cases run is built by the image's file from the crate's
+    manifest, build script, source and contracts under the pinned toolchain,
+    and from the engine wire's messages the protocol imports: the job starts
+    on each of those too."""
     document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
     # PyYAML reads the bare key `on` as the boolean true.
     entries = document[True]["pull_request"]["paths"]
-    unread = (CHART / "README.md", CHART / "tests")
+    starts_nothing = (CHART / "README.md", CHART / "tests")
     tests = Path(__file__).resolve().parent
     crate = REPO / "crates" / "policy_controller"
     read = [
@@ -1041,7 +1338,8 @@ def test_the_image_job_starts_on_what_these_cases_read():
     ] + [
         path
         for path in sorted(CHART.rglob("*"))
-        if path.is_file() and not any(path == skip or skip in path.parents for skip in unread)
+        if path.is_file()
+        and not any(path == skip or skip in path.parents for skip in starts_nothing)
     ]
     moved = [str(path.relative_to(REPO)) for path in read if not path.is_file()]
     assert moved == [], f"{moved} is no file of the tree: the image job's filter follows it"
@@ -1162,3 +1460,395 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+# The elected controller on the chart's own Lease and grant. No cluster: the
+# three calls a controller makes are answered here, in this process.
+
+LEASES = "/apis/coordination.k8s.io/v1/namespaces/default/leases"
+# What a started controller is never left to find in this environment: a
+# cluster's configuration and a proxy for its client.
+AMBIENT = (
+    "KUBECONFIG",
+    "KUBERNETES_SERVICE_HOST",
+    "KUBERNETES_SERVICE_PORT",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+class LeaseStandIn:
+    """One namespace's Leases behind the three calls a controller makes (a
+    read, a replace under the version it read, a create), answered as an API
+    server answers an account that holds ``rules`` and nothing else: a call
+    no rule allows is refused as forbidden. Every call is kept as its verb,
+    the Lease's name and whether a rule allowed it."""
+
+    def __init__(self, rules: list[dict]):
+        self.rules = rules
+        self.objects: dict[str, dict] = {}
+        self.calls: list[tuple[str, str, bool]] = []
+        self._version = 0
+        self._lock = threading.Lock()
+        stand_in = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args) -> None:
+                """Nothing of the stand-in's joins the test's output."""
+
+            def do_GET(self) -> None:
+                stand_in.answer(self, "get")
+
+            def do_PUT(self) -> None:
+                stand_in.answer(self, "update")
+
+            def do_POST(self) -> None:
+                stand_in.answer(self, "create")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def apply(self, document: dict) -> None:
+        """What applying the release does: the object as the chart renders
+        it, under a version of the server's."""
+        with self._lock:
+            self._store(json.loads(json.dumps(document)))
+
+    def delete(self, name: str) -> None:
+        """What a delete by hand does: the object is gone."""
+        with self._lock:
+            del self.objects[name]
+
+    def _store(self, document: dict) -> dict:
+        self._version += 1
+        document["metadata"]["namespace"] = "default"
+        document["metadata"]["resourceVersion"] = str(self._version)
+        self.objects[document["metadata"]["name"]] = document
+        return document
+
+    def allows(self, verb: str, name: str) -> bool:
+        """The rules as an API server reads them. A rule held to names never
+        allows a create: no name stands in a create's address."""
+        for rule in self.rules:
+            if "coordination.k8s.io" not in rule["apiGroups"] or "leases" not in rule["resources"]:
+                continue
+            if verb not in rule["verbs"]:
+                continue
+            names = rule.get("resourceNames")
+            if names is None or (verb != "create" and name in names):
+                return True
+        return False
+
+    def answer(self, request: http.server.BaseHTTPRequestHandler, verb: str) -> None:
+        length = int(request.headers.get("Content-Length") or 0)
+        sent = json.loads(request.rfile.read(length)) if length else {}
+        path = request.path.partition("?")[0]
+        name = path[len(LEASES) + 1 :] if path.startswith(f"{LEASES}/") else ""
+        name = name or sent.get("metadata", {}).get("name", "")
+        with self._lock:
+            status, body = self._decide(verb, path, name, sent)
+        payload = json.dumps(body).encode()
+        request.send_response(status)
+        request.send_header("Content-Type", "application/json")
+        request.send_header("Content-Length", str(len(payload)))
+        request.end_headers()
+        request.wfile.write(payload)
+
+    def _decide(self, verb: str, path: str, name: str, sent: dict) -> tuple[int, dict]:
+        def failure(code: int, reason: str, message: str) -> tuple[int, dict]:
+            status = {
+                "kind": "Status",
+                "apiVersion": "v1",
+                "metadata": {},
+                "status": "Failure",
+                "message": message,
+                "reason": reason,
+                "code": code,
+            }
+            return code, status
+
+        if path != LEASES and not path.startswith(f"{LEASES}/"):
+            return failure(404, "NotFound", f"the stand-in serves no {path}")
+        allowed = self.allows(verb, name)
+        self.calls.append((verb, name, allowed))
+        if not allowed:
+            return failure(
+                403,
+                "Forbidden",
+                f'leases.coordination.k8s.io "{name}" is forbidden: the account cannot {verb} '
+                'resource "leases" in API group "coordination.k8s.io" in the namespace "default"',
+            )
+        stored = self.objects.get(name)
+        if verb == "create":
+            if stored is not None:
+                return failure(409, "AlreadyExists", f'leases.coordination.k8s.io "{name}" exists')
+            return 201, self._store(sent)
+        if stored is None:
+            return failure(404, "NotFound", f'leases.coordination.k8s.io "{name}" not found')
+        if verb == "get":
+            return 200, stored
+        if sent.get("metadata", {}).get("resourceVersion") != stored["metadata"]["resourceVersion"]:
+            return failure(409, "Conflict", f'the object "{name}" has been modified')
+        return 200, self._store(sent)
+
+
+def client_configuration(directory: Path, server: str) -> Path:
+    """What a pod's account gives a controller, as a file: the API server
+    and the pod's own namespace."""
+    path = directory / "kubeconfig"
+    configuration = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "current-context": "stand-in",
+        "clusters": [{"name": "stand-in", "cluster": {"server": server}}],
+        "contexts": [
+            {
+                "name": "stand-in",
+                "context": {"cluster": "stand-in", "user": "stand-in", "namespace": "default"},
+            }
+        ],
+        "users": [{"name": "stand-in", "user": {}}],
+    }
+    path.write_text(yaml.safe_dump(configuration))
+    return path
+
+
+class ElectedPod:
+    """The controller as one pod of the elected Deployment: exactly the
+    arguments the Deployment passes, on ports free here and a short grace
+    period, with the pod's address written where the kubelet writes it, the
+    pod's name in HOSTNAME, and the client configuration of its account."""
+
+    def __init__(self, binary: str, configuration: Path, name: str):
+        gateway, control, replication, admin = free_ports(4)
+        found = container(
+            render(
+                *ELECTED,
+                "policyController.replicas=2",
+                f"policyController.ports.gateway={gateway}",
+                f"policyController.ports.control={control}",
+                f"policyController.ports.replication={replication}",
+                f"policyController.ports.admin={admin}",
+                "policyController.shutdownGracePeriodSeconds=4",
+                "policyController.shutdownSettleSeconds=1",
+            )
+        )
+        # The kubelet expands a variable the container itself names.
+        assert "POD_IP" in [variable["name"] for variable in found["env"]]
+        arguments = [argument.replace("$(POD_IP)", "127.0.0.1") for argument in found["args"]]
+        assert arguments != found["args"], "the arguments name no pod address"
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in LOG_VARIABLES and key not in AMBIENT
+        }
+        environment["HOSTNAME"] = name
+        environment["KUBECONFIG"] = str(configuration)
+        self.identity = f"{name}@127.0.0.1:{gateway}"
+        self.probe = f"http://127.0.0.1:{admin}/readiness"
+        self.process = subprocess.Popen(
+            [binary, *arguments],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    def readiness(self) -> tuple[int, dict]:
+        """The probe's status and body; 0 while nothing listens, and when a
+        held host does not answer inside the probe's two seconds."""
+        if self.process.poll() is not None:
+            output = self.process.stdout.read() if self.process.stdout else ""
+            raise AssertionError(f"the controller exited: {output}")
+        try:
+            with DIRECT.open(self.probe, timeout=2) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as refused:
+            return refused.code, json.load(refused)
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            return 0, {}
+
+    def reads(self, role: str, seconds: float = 20) -> None:
+        """Waits until the probe answers ready under ``role``."""
+        deadline = time.monotonic() + seconds
+        answer = self.readiness()
+        while answer != (200, {"status": "ready", "role": role}):
+            assert time.monotonic() < deadline, f"not ready as {role} in {seconds} s: {answer}"
+            time.sleep(0.1)
+            answer = self.readiness()
+
+    def stop(self) -> str:
+        """SIGTERM, the exit status checked, and the log."""
+        self.process.send_signal(signal.SIGTERM)
+        output, _ = self.process.communicate(timeout=15)
+        assert self.process.returncode == 0, output
+        return output
+
+    def end(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.wait()
+
+
+POD_NAMES = ("smg-policy-controller-6d5f7c9b8-x2x4z", "smg-policy-controller-6d5f7c9b8-k8m2p")
+
+
+def one_leads_and_one_follows(pods: list[ElectedPod]) -> None:
+    """Waits until one pod reads ready as the leader and the other as a
+    follower."""
+    deadline = time.monotonic() + 20
+    roles: list[str] = []
+    while sorted(roles) != ["follower", "leader"]:
+        assert time.monotonic() < deadline, f"no leader and follower in 20 s: {roles}"
+        time.sleep(0.2)
+        roles = [pod.readiness()[1].get("role", "") for pod in pods]
+
+
+@needs_helm
+def test_two_elected_pods_lead_follow_and_hand_over_on_the_charts_lease_and_grant(binary, tmp_path):
+    """Two controllers started as the elected Deployment's pods, over the
+    Lease as the chart renders it, behind the Role as the chart renders it:
+    the first reads ready as the leader and is the Lease's holder under its
+    pod's address, the second reads ready as a follower, and the first's
+    stop hands the Lease over. THE GRANT: every call the two made is one the
+    Role allows, and the Role holds no verb they did not call."""
+    documents = render(*ELECTED, "policyController.replicas=2")
+    (rule,) = one(documents, "Role")["rules"]
+    lease = one(documents, "Lease")
+    stand_in = LeaseStandIn([rule])
+    pods: list[ElectedPod] = []
+    try:
+        stand_in.apply(lease)
+        configuration = client_configuration(tmp_path, stand_in.url)
+        pods.append(ElectedPod(binary, configuration, POD_NAMES[0]))
+        pods[0].reads("leader")
+        pods.append(ElectedPod(binary, configuration, POD_NAMES[1]))
+        pods[1].reads("follower")
+        assert pods[0].readiness() == (200, {"status": "ready", "role": "leader"})
+        stored = stand_in.objects[NAME]
+        assert stored["spec"]["holderIdentity"] == pods[0].identity
+        # The controllers' writes keep what the chart rendered on the object.
+        assert stored["metadata"]["labels"] == lease["metadata"]["labels"]
+
+        output = pods[0].stop()
+        assert "the lease is released" in output
+        pods[1].reads("leader")
+        assert stand_in.objects[NAME]["spec"]["holderIdentity"] == pods[1].identity
+        pods[1].stop()
+
+        refused = [call for call in stand_in.calls if not call[2]]
+        assert refused == [], f"calls the Role does not allow: {refused}"
+        assert {name for _, name, _ in stand_in.calls} == set(rule["resourceNames"])
+        assert {verb for verb, _, _ in stand_in.calls} == set(rule["verbs"])
+    finally:
+        for pod in pods:
+            pod.end()
+        stand_in.close()
+
+
+@needs_helm
+def test_a_missing_lease_leaves_no_leader_until_the_release_is_applied_again(binary, tmp_path):
+    """The controller is granted no create, so with the Lease gone neither
+    pod leads: each stays not ready and says the refusal. The create is the
+    one call of theirs the Role refuses, by design. The Lease applied again,
+    as the release renders it, one leads and the other follows with no
+    restart."""
+    documents = render(*ELECTED, "policyController.replicas=2")
+    (rule,) = one(documents, "Role")["rules"]
+    stand_in = LeaseStandIn([rule])
+    pods: list[ElectedPod] = []
+    try:
+        configuration = client_configuration(tmp_path, stand_in.url)
+        for name in POD_NAMES:
+            pods.append(ElectedPod(binary, configuration, name))
+        # Through four renew periods of the controller's own timings. A
+        # probe a held host did not answer in time is no sample.
+        starting = (503, {"status": "not ready", "reason": "starting"})
+        answered = [0, 0]
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            for place, pod in enumerate(pods):
+                answer = pod.readiness()
+                if answer != (0, {}):
+                    assert answer == starting
+                    answered[place] += 1
+            time.sleep(0.2)
+        assert min(answered) >= 5, f"the probes answered {answered} times in the window"
+        assert stand_in.objects == {}
+        assert {call for call in stand_in.calls if not call[2]} == {("create", NAME, False)}
+
+        stand_in.apply(one(documents, "Lease"))
+        one_leads_and_one_follows(pods)
+        for pod in pods:
+            output = pod.stop()
+            assert "an election step failed" in output
+            assert f'"{NAME}" is forbidden' in output
+    finally:
+        for pod in pods:
+            pod.end()
+        stand_in.close()
+
+
+@needs_helm
+def test_a_lease_deleted_under_running_pods_leaves_them_ready_and_nobody_leading(binary, tmp_path):
+    """The Lease deleted under a leader and a follower: the leader's next
+    renewal finds no object, so it fences itself inside the renew deadline,
+    and the one take tried after it, a create, is refused: nobody leads.
+    Neither pod turns unready: a controller that read its Lease once reads
+    ready as a follower. The Lease applied again, as the release renders it,
+    one leads and the other follows with no restart."""
+    documents = render(*ELECTED, "policyController.replicas=2")
+    (rule,) = one(documents, "Role")["rules"]
+    lease = one(documents, "Lease")
+    stand_in = LeaseStandIn([rule])
+    pods: list[ElectedPod] = []
+    try:
+        stand_in.apply(lease)
+        configuration = client_configuration(tmp_path, stand_in.url)
+        pods.append(ElectedPod(binary, configuration, POD_NAMES[0]))
+        pods[0].reads("leader")
+        pods.append(ElectedPod(binary, configuration, POD_NAMES[1]))
+        pods[1].reads("follower")
+
+        stand_in.delete(NAME)
+        pods[0].reads("follower")
+        # Through the lost record's duration and three renew periods of the
+        # controller's own timings: a replica may wait a lost record out
+        # before the take that is refused. A probe a held host did not
+        # answer in time is no sample.
+        follower = (200, {"status": "ready", "role": "follower"})
+        answered = [0, 0]
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            for place, pod in enumerate(pods):
+                answer = pod.readiness()
+                if answer != (0, {}):
+                    assert answer == follower
+                    answered[place] += 1
+            time.sleep(0.2)
+        assert min(answered) >= 5, f"the probes answered {answered} times in the window"
+        assert stand_in.objects == {}
+        assert {call for call in stand_in.calls if not call[2]} == {("create", NAME, False)}
+
+        stand_in.apply(lease)
+        one_leads_and_one_follows(pods)
+        for pod in pods:
+            pod.stop()
+    finally:
+        for pod in pods:
+            pod.end()
+        stand_in.close()
