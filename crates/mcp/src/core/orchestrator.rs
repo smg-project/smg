@@ -304,15 +304,30 @@ fn install_crypto_provider() {
     }
 }
 
-/// A client builder with the process-level TLS crypto provider installed:
-/// every HTTP client of this crate comes from here.
+/// A client builder with the process-level TLS crypto provider installed and
+/// the crate's request headers: every HTTP client of this crate comes from
+/// here.
 #[expect(
     clippy::disallowed_methods,
     reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
 )]
 pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
     install_crypto_provider();
-    reqwest::Client::builder()
+    reqwest::Client::builder().default_headers(default_request_headers())
+}
+
+/// The headers every client of this crate sends with every request: the
+/// client names `identity` as the one content coding it accepts. It is built
+/// without decoders, so a coded body would fail to parse as a protocol
+/// message; a server that honours the header never sends one (RFC 9110,
+/// section 12.5.3).
+fn default_request_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    headers
 }
 
 /// Build HTTP client with default headers.
@@ -2857,5 +2872,74 @@ mod tests {
         assert!(orchestrator
             .find_builtin_server(BuiltinToolType::FileSearch)
             .is_none());
+    }
+
+    /// Every client of the crate names `identity` as the content coding it
+    /// accepts, so a server that compresses every request naming no coding
+    /// answers this one in the clear and the body parses. Without the header
+    /// the server sends a gzip body, which the client, built without decoders,
+    /// cannot read.
+    #[tokio::test]
+    async fn every_client_names_identity_so_a_server_compressing_unasked_answers_in_the_clear() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::mpsc,
+            thread,
+        };
+        // `{"ok":true}` under gzip: what the server sends a request that names no coding.
+        const GZIPPED_BODY: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xad, 0x05, 0x00, 0x90, 0x5f, 0xd4, 0xa7, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let names_identity = head
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("accept-encoding: identity"));
+            let _ = tx.send(head);
+            let response_head: &[u8] = if names_identity {
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n"
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 31\r\nConnection: close\r\n\r\n"
+            };
+            let body: &[u8] = if names_identity {
+                b"{\"ok\":true}"
+            } else {
+                GZIPPED_BODY
+            };
+            let _ = socket
+                .write_all(response_head)
+                .and_then(|()| socket.write_all(body));
+        });
+
+        let client = http_client_builder().build().unwrap();
+        let response = client.get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body, serde_json::json!({ "ok": true }));
+        let head = rx.recv().unwrap();
+        assert!(
+            head.lines()
+                .any(|line| line.eq_ignore_ascii_case("accept-encoding: identity")),
+            "the request head names no identity coding:\n{head}"
+        );
     }
 }
