@@ -3552,7 +3552,7 @@ fn test_wildcard_hash_ring_follows_removals() {
 /// port: the port derived from a temporary ipc path is a hash into a band
 /// other listeners on the host may hold, and a collision there fails the
 /// handshake bind after the data-plane sockets are already bound.
-async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
+fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
     let worker = Arc::new(
         BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)
@@ -3561,7 +3561,7 @@ async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
             .build(),
     );
     assert!(
-        !worker.zmq_health_check().await.unwrap(),
+        !worker.zmq_health_check(),
         "worker is not ready until the handshake lands"
     );
     assert!(
@@ -3578,7 +3578,7 @@ async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
 async fn remove_aborts_the_zmq_handshake_driver() {
     let dir = tempfile::tempdir().unwrap();
     let registry = WorkerRegistry::new();
-    let worker = connecting_zmq_worker(dir.path()).await;
+    let worker = connecting_zmq_worker(dir.path());
 
     let id = registry
         .register(worker.clone() as Arc<dyn Worker>)
@@ -3597,7 +3597,7 @@ async fn remove_aborts_the_zmq_handshake_driver() {
 async fn replace_aborts_the_replaced_workers_zmq_handshake_driver() {
     let dir = tempfile::tempdir().unwrap();
     let registry = WorkerRegistry::new();
-    let worker = connecting_zmq_worker(dir.path()).await;
+    let worker = connecting_zmq_worker(dir.path());
     let url = worker.url().to_string();
 
     let id = registry
