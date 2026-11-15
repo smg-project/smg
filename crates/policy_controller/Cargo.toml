@@ -55,6 +55,9 @@ axum = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 metrics = { version = "0.24.6", optional = true }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
+# The protocol's generated messages, service and client (`proto`): the code
+# the build script writes from the contract files names both.
+prost = { workspace = true, optional = true }
 # The process TLS crypto provider, installed once before the first listener
 # or HTTP client; the gateway, the servicer and the mock worker install the
 # same one.
@@ -62,6 +65,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
 tonic = { workspace = true, features = ["tls-ring"], optional = true }
 tonic-health = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
@@ -76,6 +80,11 @@ tracing-subscriber = { workspace = true, optional = true }
 # one such tools serve.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "time", "use-libc-auxv"], optional = true }
+
+# The build script compiles the protocol under the `controller` feature
+# alone: the engine's own build runs nothing and needs no `protoc`.
+[build-dependencies]
+tonic-prost-build = { version = "0.14.6", optional = true }
 
 [features]
 # The ingestion drivers over the store: the load path (the `GetLoads` poll
@@ -92,18 +101,22 @@ ingest = [
     "dep:tracing",
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
-# scopes, the gRPC health service, the admin endpoints and the binary of the
-# package's name. Off by default: the engine alone has no server dependency.
+# scopes, the protocol's generated service and client, the election, the gRPC
+# health service, the admin endpoints and the binary of the package's name.
+# Off by default: the engine alone has no server dependency.
 controller = [
     "ingest",
     "dep:axum",
     "dep:clap",
     "dep:metrics",
     "dep:metrics-exporter-prometheus",
+    "dep:prost",
     "dep:rustls",
     "dep:tokio",
     "dep:tonic",
     "dep:tonic-health",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
     "dep:tracing",
     "dep:tracing-subscriber",
 ]
@@ -173,6 +186,10 @@ required-features = ["kubernetes"]
 
 [[test]]
 name = "ingest"
+required-features = ["controller"]
+
+[[test]]
+name = "replicas"
 required-features = ["controller"]
 
 [[bench]]

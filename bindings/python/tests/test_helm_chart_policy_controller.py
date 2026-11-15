@@ -1013,9 +1013,10 @@ def test_the_image_job_starts_on_what_these_cases_read():
     rule tests are read by no case, so they start nothing. The two publishing
     workflows are read by one render case and by no binary case: the unit
     job, which starts on every pull request, runs that one. The binary the
-    cases run is built by the image's file from the crate's manifest, source
-    and plugin contract under the pinned toolchain: the job starts on each
-    of those too."""
+    cases run is built by the image's file from the crate's manifest, build
+    script, source and contracts under the pinned toolchain, and from the
+    engine wire's messages the protocol imports: the job starts on each of
+    those too."""
     document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
     # PyYAML reads the bare key `on` as the boolean true.
     entries = document[True]["pull_request"]["paths"]
@@ -1031,8 +1032,12 @@ def test_the_image_job_starts_on_what_these_cases_read():
         REPO / "docker" / "policy-controller.Dockerfile",
         REPO / "rust-toolchain.toml",
         crate / "Cargo.toml",
+        crate / "build.rs",
         crate / "src" / "main.rs",
         crate / "contracts" / "smg-policy.wit",
+        # The engine wire's messages the controller's protocol imports: the
+        # build script reads them beside the contract.
+        REPO / "crates" / "grpc_client" / "proto" / "common.proto",
     ] + [
         path
         for path in sorted(CHART.rglob("*"))
@@ -1137,7 +1142,8 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
                     body = json.load(response)
             except (urllib.error.URLError, ConnectionError):
                 time.sleep(0.1)
-        assert body == {"status": "ready"}
+        # One replica with no lease flag leads itself.
+        assert body == {"status": "ready", "role": "leader"}
         for other in others:
             with DIRECT.open(other, timeout=2) as response:
                 assert response.status == 200, other
