@@ -546,7 +546,7 @@ mod tests {
     async fn serve_local_mcp_server(server: LocalServer) -> String {
         use axum::{
             extract::State,
-            http::{HeaderMap, StatusCode},
+            http::{header::AUTHORIZATION, HeaderMap, StatusCode},
             routing::post,
             Json, Router,
         };
@@ -575,7 +575,7 @@ mod tests {
                         .is_some_and(|flag| flag.load(Ordering::SeqCst))
                         || server.refused_bearer.is_some_and(|token| {
                             headers
-                                .get(axum::http::header::AUTHORIZATION)
+                                .get(AUTHORIZATION)
                                 .and_then(|value| value.to_str().ok())
                                 .is_some_and(|value| value == format!("Bearer {token}"))
                         });
