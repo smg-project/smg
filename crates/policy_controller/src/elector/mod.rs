@@ -22,7 +22,9 @@
 //!   only grow, one per change of holder, and a candidate counts from the
 //!   highest term it saw, so a record that vanished under it is taken at the
 //!   term after the one it held); a resume of its own identity's record
-//!   keeps the record's term.
+//!   keeps the record's term where that term is the highest this run saw,
+//!   and is a take above the highest under a lower one: a run leads under no
+//!   term below the highest it saw.
 //! - **Renew.** The holder rewrites the record every renew period with a
 //!   later wall timestamp under its own term; a record that moved under it (a
 //!   candidate took the expired lease) refuses the renewal and the holder has
@@ -52,7 +54,9 @@
 //! `controller-id@host:port`, dialable without a Service and unique per
 //! instance. A restart under the same identity resumes its own record under
 //! its term once the record stood still for its duration, the wait of every
-//! candidate (the earlier run's fence, stalled or gone, is closed by then); a
+//! candidate (the earlier run's fence, stalled or gone, is closed by then);
+//! a record under this identity that came back under a term this run saw
+//! passed (a store put back) is taken after the same wait, above the highest; a
 //! second instance under a duplicated identity sees the record move under
 //! its name and refuses to take it for as long as it moves, so two fences
 //! never open under one term.
@@ -301,7 +305,8 @@ pub struct Elector {
     /// New shapes of the record under this identity that this run did not
     /// write: the first is the earlier run's last write, a second is another
     /// candidate under a duplicated identity. Cleared when the record stands
-    /// still for its duration (this run resumes it), is released, or passes
+    /// still for its duration (this run resumes it, or takes above it where
+    /// its term is under the highest this run saw), is released, or passes
     /// to another identity: the refusal lasts as long as the writing does.
     strangers: u32,
     /// The highest term this run saw stored or wrote: a record that vanished
@@ -579,10 +584,15 @@ impl Elector {
             // earlier run's last write, or another candidate's under a
             // duplicated identity. Either writer's fence may be open to its
             // renew deadline, so this run waits for the record's duration of
-            // stillness, as every candidate does, and resumes under the
-            // record's term; a record that moves again under this name has
-            // another writer and is refused for as long as it keeps moving,
-            // since a take would open a second fence under one term.
+            // stillness, as every candidate does. Then it resumes under the
+            // record's term and acquire stamp where that term is the highest
+            // this run saw (a restart's resume); under a lower one (the store
+            // went back to an older record under this name) the write is a
+            // take in every field, so no write of this run opens the fence
+            // under a term below the highest it saw. A record that moves
+            // again under this name has another writer and is refused for as
+            // long as it keeps moving, since a take would open a second fence
+            // under one term.
             Some(record) if record.holder == self.identity => {
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
                 if now.saturating_duration_since(since) < record.duration() {
@@ -597,7 +607,11 @@ impl Elector {
                     });
                 }
                 self.strangers = 0;
-                (record.term, record.acquired_at_micros)
+                if record.term < self.highest_term {
+                    (next_term, 0)
+                } else {
+                    (record.term, record.acquired_at_micros)
+                }
             }
             Some(record) => {
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
@@ -1716,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_under_a_lower_term_keeps_the_highest_term_this_run_saw() {
+    fn a_record_under_this_identity_that_came_back_lower_is_taken_above_the_highest_term() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("lease");
         let mut a = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
@@ -1733,9 +1747,10 @@ mod tests {
         ));
         // The record is deleted, and a second process under a's identity (a
         // restart racing the first) takes the empty lease at term one and
-        // stalls. The first process resumes under that record's term once
-        // it has been still for its duration; the higher term it saw before
-        // stays its floor, so its next take after a deletion is above both.
+        // stalls. The first process saw term two: once that record has been
+        // still for its duration it takes above the highest term it saw, a
+        // take in every field, and never resumes under the lower term. Its
+        // next take after a deletion is above that again.
         std::fs::remove_file(&path).expect("the deletion");
         let mut again = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
             .expect("settings");
@@ -1748,21 +1763,25 @@ mod tests {
             a.tick(first_sight).expect("look"),
             Tick::Following { term: 1, .. }
         ));
+        let twins = a.observed().expect("the twin's record").clone();
         assert_eq!(
-            a.tick(first_sight + 3 * S).expect("resume"),
-            Tick::Acquired { term: 1 }
+            a.tick(first_sight + 3 * S).expect("take"),
+            Tick::Acquired { term: 3 }
         );
+        let taken = a.observed().expect("the take's record").clone();
+        assert_eq!(taken.acquired_at_micros, taken.renewed_at_micros);
+        assert!(taken.acquired_at_micros > twins.acquired_at_micros);
         std::fs::remove_file(&path).expect("the second deletion");
         assert_eq!(
             a.tick(first_sight + 4 * S).expect("look"),
             Tick::Lost {
-                term: 1,
+                term: 3,
                 holder: String::new()
             }
         );
         assert_eq!(
             a.tick(first_sight + 4 * S + S / 2).expect("take"),
-            Tick::Acquired { term: 3 }
+            Tick::Acquired { term: 4 }
         );
     }
 

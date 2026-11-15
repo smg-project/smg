@@ -1,8 +1,8 @@
 //! The standalone policy controller (design 2: the `remote` mode of the
 //! policy engine). The command line is the operator's surface: the
-//! controller's identity, its listeners, their TLS, the shutdown bounds and
-//! the logging; the routing policy itself is the spec's and arrives over the
-//! control scope.
+//! controller's identity, its listeners, their TLS, the election, the
+//! shutdown bounds and the logging; the routing policy itself is the spec's
+//! and arrives over the control scope.
 
 use std::{
     ffi::OsStr, future::pending, io::IsTerminal, net::SocketAddr, path::PathBuf, process::ExitCode,
@@ -10,8 +10,11 @@ use std::{
 };
 
 use clap::Parser;
-use smg_policy_controller::controller::{
-    Config, ConfigError, Controller, Listener, Scope, Tls, VERSION,
+use smg_policy_controller::{
+    controller::{
+        Config, ConfigError, Controller, Election, LeasePlace, Listener, Scope, Tls, VERSION,
+    },
+    elector::ElectionSettings,
 };
 use tokio::{
     runtime::{Builder, Runtime},
@@ -95,6 +98,51 @@ struct Cli {
     #[arg(long, help_heading = "TLS")]
     replication_client_ca: Option<PathBuf>,
 
+    // ==================== Election ====================
+    /// The lease as a file on this host: the replicas of one host elect
+    /// their leader over it; its directory must exist. With no lease flag
+    /// the controller runs alone and leads itself
+    #[arg(long, help_heading = "Election")]
+    lease_file: Option<PathBuf>,
+
+    /// The lease as a Kubernetes Lease object of this name: the replicas of
+    /// one namespace elect their leader over it
+    #[cfg(feature = "kubernetes")]
+    #[arg(long, conflicts_with = "lease_file", help_heading = "Election")]
+    lease_name: Option<String>,
+
+    /// The namespace of --lease-name; unset, the pod's own
+    #[cfg(feature = "kubernetes")]
+    #[arg(
+        long,
+        requires = "lease_name",
+        conflicts_with = "lease_file",
+        help_heading = "Election"
+    )]
+    lease_namespace: Option<String>,
+
+    /// This replica's dialable address, in the lease's holder identity and
+    /// in the Leader call's answer: a host, which takes the gateway
+    /// listener's port, or host:port; under Kubernetes the pod's address.
+    /// A lease flag needs it when the gateway listener binds every address
+    #[arg(long, help_heading = "Election")]
+    advertise_address: Option<String>,
+
+    /// Milliseconds a lease stands unrenewed before a follower takes it
+    #[arg(long, default_value_t = millis(ElectionSettings::default().duration), help_heading = "Election")]
+    lease_duration_ms: u64,
+
+    /// Milliseconds between two renewals of the leader, and between two
+    /// looks of a follower
+    #[arg(long, default_value_t = millis(ElectionSettings::default().renew_period), help_heading = "Election")]
+    lease_renew_period_ms: u64,
+
+    /// Milliseconds a leader serves on after its last renewal; past them
+    /// it fences itself. Below --lease-duration-ms, above
+    /// --lease-renew-period-ms
+    #[arg(long, default_value_t = millis(ElectionSettings::default().renew_deadline), help_heading = "Election")]
+    lease_renew_deadline_ms: u64,
+
     // ==================== Load Monitoring ====================
     /// Seconds between two load polls of an engine whose stream is not
     /// serving it, and the freshness bound a pushed record must meet to
@@ -132,7 +180,28 @@ struct Cli {
     log_json: bool,
 }
 
+/// A duration in whole milliseconds, as the election's flags take it.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl Cli {
+    /// Where the lease flags put the lease: a named object, a file, or
+    /// this process when neither is given.
+    fn lease(&self) -> LeasePlace {
+        #[cfg(feature = "kubernetes")]
+        if let Some(name) = &self.lease_name {
+            return LeasePlace::Kubernetes {
+                namespace: self.lease_namespace.clone(),
+                name: name.clone(),
+            };
+        }
+        match &self.lease_file {
+            Some(path) => LeasePlace::File(path.clone()),
+            None => LeasePlace::Process,
+        }
+    }
+
     /// The listeners the flags describe: one server identity for every gRPC
     /// listener, one client authority per scope, one credential rule per
     /// listener.
@@ -234,6 +303,15 @@ impl Cli {
             shutdown_settle: Duration::from_secs(self.shutdown_settle_secs),
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
             load_poll_interval: Duration::from_secs(self.load_monitor_interval),
+            election: Election {
+                lease: self.lease(),
+                settings: ElectionSettings {
+                    duration: Duration::from_millis(self.lease_duration_ms),
+                    renew_period: Duration::from_millis(self.lease_renew_period_ms),
+                    renew_deadline: Duration::from_millis(self.lease_renew_deadline_ms),
+                },
+                advertise: self.advertise_address.clone(),
+            },
         })
     }
 }
@@ -393,7 +471,10 @@ mod tests {
     };
 
     use clap::Parser;
-    use smg_policy_controller::controller::{Config, ConfigError, Scope};
+    use smg_policy_controller::{
+        controller::{Config, ConfigError, Election, LeasePlace, Scope},
+        elector::ElectionSettings,
+    };
 
     use super::{color_for, set, truthy, Cli};
 
@@ -613,6 +694,150 @@ mod tests {
         assert_eq!(two.load_poll_interval, Duration::from_secs(2));
         let zero = config(&["--load-monitor-interval", "0"]).expect("parsed");
         assert_eq!(zero.validate(), Err(ConfigError::ZeroLoadPollInterval));
+    }
+
+    #[test]
+    fn with_no_lease_flag_one_replica_leads_itself_on_the_designs_settings() {
+        let alone = config(&[]).expect("parsed");
+        assert_eq!(alone.election, Election::default());
+        assert_eq!(alone.election.lease, LeasePlace::Process);
+        assert_eq!(alone.election.settings, ElectionSettings::default());
+        assert_eq!(
+            alone.validate(),
+            Ok(()),
+            "a wildcard listener is no refusal"
+        );
+    }
+
+    #[test]
+    fn a_lease_file_elects_under_an_address_a_client_can_dial() {
+        // The default gateway listener binds every address: a shared lease
+        // behind it is refused until an address is advertised.
+        let file = config(&["--lease-file", "/run/smg/lease"]).expect("parsed");
+        assert_eq!(
+            file.election.lease,
+            LeasePlace::File(PathBuf::from("/run/smg/lease"))
+        );
+        assert_eq!(file.validate(), Err(ConfigError::AdvertiseAddressRequired));
+
+        let advertised = config(&[
+            "--lease-file",
+            "/run/smg/lease",
+            "--advertise-address",
+            "10.0.0.7",
+        ])
+        .expect("parsed");
+        assert_eq!(advertised.election.advertise.as_deref(), Some("10.0.0.7"));
+        assert_eq!(advertised.validate(), Ok(()));
+
+        // A gateway listener that binds one address is the address.
+        let bound = config(&[
+            "--lease-file",
+            "/run/smg/lease",
+            "--gateway-listen",
+            "127.0.0.1:30100",
+        ])
+        .expect("parsed");
+        assert_eq!(bound.validate(), Ok(()));
+
+        let malformed = config(&["--advertise-address", "controller@host"]).expect("parsed");
+        assert_eq!(
+            malformed.validate(),
+            Err(ConfigError::MalformedAdvertiseAddress(
+                "controller@host".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_lease_timings_reach_the_configuration_and_keep_their_order() {
+        let slow = config(&[
+            "--lease-duration-ms",
+            "15000",
+            "--lease-renew-period-ms",
+            "2000",
+            "--lease-renew-deadline-ms",
+            "10000",
+        ])
+        .expect("parsed");
+        assert_eq!(
+            slow.election.settings,
+            ElectionSettings {
+                duration: Duration::from_secs(15),
+                renew_period: Duration::from_secs(2),
+                renew_deadline: Duration::from_secs(10),
+            }
+        );
+        assert_eq!(slow.validate(), Ok(()));
+
+        let inverted = config(&["--lease-renew-deadline-ms", "3000"]).expect("parsed");
+        assert_eq!(
+            inverted.validate(),
+            Err(ConfigError::ElectionSettings(
+                "the duration is not longer than the renew deadline"
+            ))
+        );
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn a_lease_object_is_named_and_takes_the_pods_namespace_unless_one_is_given() {
+        let args = [
+            "--advertise-address",
+            "10.0.0.7",
+            "--lease-name",
+            "smg-policy",
+        ];
+        let object = config(&args).expect("parsed");
+        assert_eq!(
+            object.election.lease,
+            LeasePlace::Kubernetes {
+                namespace: None,
+                name: "smg-policy".to_owned(),
+            }
+        );
+        assert_eq!(object.validate(), Ok(()));
+
+        let mut named = args.to_vec();
+        named.extend(["--lease-namespace", "policy"]);
+        assert_eq!(
+            config(&named).expect("parsed").election.lease,
+            LeasePlace::Kubernetes {
+                namespace: Some("policy".to_owned()),
+                name: "smg-policy".to_owned(),
+            }
+        );
+
+        // The object stores whole seconds.
+        let mut fraction = args.to_vec();
+        fraction.extend(["--lease-duration-ms", "2500"]);
+        assert_eq!(
+            config(&fraction).expect("parsed").validate(),
+            Err(ConfigError::LeaseDurationNotWholeSeconds(
+                Duration::from_millis(2500)
+            ))
+        );
+
+        // One lease, one place; a namespace names an object's.
+        for refused in [
+            &[
+                "--lease-name",
+                "smg-policy",
+                "--lease-file",
+                "/run/smg/lease",
+            ][..],
+            &["--lease-namespace", "policy"],
+            &[
+                "--lease-namespace",
+                "policy",
+                "--lease-file",
+                "/run/smg/lease",
+            ],
+        ] {
+            let mut argv = vec!["smg-policy-controller", "--controller-id", "c"];
+            argv.extend_from_slice(refused);
+            assert!(Cli::try_parse_from(argv).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

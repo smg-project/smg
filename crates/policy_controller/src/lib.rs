@@ -82,6 +82,8 @@ pub mod ingest;
 pub mod lease;
 #[cfg(feature = "wasm")]
 pub mod plugins;
+#[cfg(feature = "controller")]
+pub mod proto;
 pub mod ring;
 pub mod sessions;
 pub mod spec;
