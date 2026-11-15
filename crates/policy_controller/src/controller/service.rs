@@ -7,7 +7,8 @@
 //! the call's scopes (the contract: the scope does not cover the RPC),
 //! `UNIMPLEMENTED` where it does and no step serves the call yet. The step
 //! that serves a call replaces that call's one line here, behind
-//! [`Service::admit`], and adds what it reads to [`Shared`].
+//! [`Service::admit`], and adds what it reads to [`Shared`], which
+//! [`Shared::new`] alone builds.
 
 use std::{sync::Arc, time::Instant};
 
@@ -20,8 +21,9 @@ use super::{
     PROTOCOL_VERSION,
 };
 use crate::{
-    elector::Fence,
+    elector::{Elector, Fence},
     proto::{self, policy_controller_server::PolicyController},
+    store::MemoryStore,
 };
 
 /// What every listener's instance of the service reads. A step that serves
@@ -38,6 +40,33 @@ pub(crate) struct Shared {
     pub(crate) fence: Arc<Fence>,
     /// The election's last sight of the lease.
     pub(crate) standing: watch::Receiver<Standing>,
+    /// The controller's store: what the calls feed and read, and the run
+    /// loop's drivers with them.
+    pub(crate) store: Arc<MemoryStore>,
+}
+
+impl Shared {
+    /// The one place a `Shared` is built: a step that serves a call adds
+    /// its state as a field and fills it here, from these arguments where
+    /// it can, so the other builders do not change. The identity and the
+    /// fence are `elector`'s, so no instance answers under an identity
+    /// another fence guards.
+    pub(crate) fn new(
+        controller_id: String,
+        address: String,
+        elector: &Elector,
+        standing: watch::Receiver<Standing>,
+        store: Arc<MemoryStore>,
+    ) -> Self {
+        Self {
+            controller_id,
+            address,
+            identity: elector.identity().to_owned(),
+            fence: elector.fence(),
+            standing,
+            store,
+        }
+    }
 }
 
 /// A call of the service a scope owns. `Leader` is not one: every scope
@@ -400,13 +429,13 @@ mod tests {
         )
         .expect("the default settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let shared = Arc::new(Shared {
-            controller_id: ID.to_owned(),
-            address: ADDRESS.to_owned(),
-            identity: IDENTITY.to_owned(),
-            fence: elector.fence(),
-            standing: stood,
-        });
+        let shared = Arc::new(Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            Arc::new(MemoryStore::new()),
+        ));
         (elector, standing, Service::new(scopes.to_vec(), shared))
     }
 
@@ -455,16 +484,16 @@ mod tests {
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let shared = Arc::new(Shared {
-            controller_id: ID.to_owned(),
-            address: ADDRESS.to_owned(),
-            identity: IDENTITY.to_owned(),
-            fence: elector.fence(),
-            standing: stood,
-        });
+        let store = Arc::new(MemoryStore::new());
+        let shared = Arc::new(Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            Arc::clone(&store),
+        ));
         let service = Service::new(vec![Scope::Gateway], shared);
-        let mut running =
-            election::start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        let mut running = election::start(elector, store, standing).expect("a thread");
         let mut last = 0;
 
         let first = answers_until(&service, &mut last, "the first take", |info| info.is_leader);
@@ -755,13 +784,13 @@ mod tests {
         let (standing, stood) = watch::channel(Standing::default());
         let service = Service::new(
             vec![Scope::Gateway],
-            Arc::new(Shared {
-                controller_id: ID.to_owned(),
-                address: ADDRESS.to_owned(),
-                identity: IDENTITY.to_owned(),
-                fence: elector.fence(),
-                standing: stood,
-            }),
+            Arc::new(Shared::new(
+                ID.to_owned(),
+                ADDRESS.to_owned(),
+                &elector,
+                stood,
+                Arc::new(MemoryStore::new()),
+            )),
         );
 
         // The other replica holds the lease under term 1; this one's look

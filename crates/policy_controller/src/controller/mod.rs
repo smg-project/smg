@@ -77,7 +77,6 @@ pub const SERVICE_NAME: &str = "smg.policy.v1.PolicyController";
 /// A controller with its listeners bound and nothing served yet.
 pub struct Controller {
     config: Config,
-    store: Arc<MemoryStore>,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -87,7 +86,8 @@ pub struct Controller {
     elector: Elector,
     /// The election's sight of the lease, written by its thread.
     standing: watch::Sender<Standing>,
-    /// What every listener's instance of the service reads.
+    /// What every listener's instance of the service reads; the store is
+    /// its field, the run loop's drivers read the same one.
     shared: Arc<Shared>,
     listeners: Vec<Bound>,
     admin: TcpListener,
@@ -299,20 +299,18 @@ impl Controller {
             renew_deadline = ?settings.renew_deadline,
             "election"
         );
-        let fence = elector.fence();
         let (standing, stood) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(Arc::clone(&fence), stood.clone());
-        let shared = Arc::new(Shared {
-            controller_id: config.controller_id.clone(),
-            address: address.unwrap_or_default(),
-            identity,
-            fence,
-            standing: stood,
-        });
+        let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
+        let shared = Arc::new(Shared::new(
+            config.controller_id.clone(),
+            address.unwrap_or_default(),
+            &elector,
+            stood,
+            Arc::new(MemoryStore::new()),
+        ));
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
             config,
-            store: Arc::new(MemoryStore::new()),
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
@@ -345,7 +343,7 @@ impl Controller {
 
     /// The store the ingestion drivers and the scopes' calls feed and read.
     pub fn store(&self) -> Arc<MemoryStore> {
-        Arc::clone(&self.store)
+        Arc::clone(&self.shared.store)
     }
 
     /// A read handle on the controller's state, valid across [`Self::serve`].
@@ -392,7 +390,6 @@ impl Controller {
     ) -> Result<(), Error> {
         let Self {
             config,
-            store,
             phase,
             readiness,
             metrics,
@@ -404,6 +401,7 @@ impl Controller {
             admin,
             ..
         } = self;
+        let store = Arc::clone(&shared.store);
         let (stop, _held) = watch::channel(false);
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
