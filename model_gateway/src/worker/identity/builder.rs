@@ -466,20 +466,21 @@ impl BasicWorkerBuilder {
 }
 
 /// The host a worker's partners reach it at for the bootstrap handshake:
-/// the host of the address the worker is dialled at, as a client reads it,
-/// falling back to "localhost" for an address no client reads.
+/// the host of the address requests dial, as a client reads it, falling
+/// back to "localhost" for an address no client reads.
 ///
-/// A rank-expanded worker is dialled at its base, which the registration
-/// keeps beside the address it writes as `{base}@{rank}`. Any other worker
-/// is dialled at its address as written: an `@` and digits at its end are a
-/// userinfo and a host there, and no rank to strip. Stripped as one, they
-/// leave what stands before them as the host, and that may be a token:
-/// `http://token@8080` is the host `8080` behind a userinfo.
+/// The address requests dial is [`WorkerMetadata::base_url`]'s, and the
+/// rule is read there: the base a spec holds, which the registration keeps
+/// beside the address it writes as `{base}@{rank}`, and the address as
+/// written for a spec that holds none. In an address as written an `@` and
+/// digits at the end are a userinfo and a host, and no rank to strip.
+/// Stripped as one, they leave what stands before them as the host, and
+/// that may be a token: `http://token@8080` is a userinfo and the host
+/// `0.0.31.144`, the number `8080` as a client reads an HTTP host.
 fn bootstrap_host(spec: &WorkerSpec) -> String {
-    let dialled = match (&spec.dp_base_url, spec.dp_rank) {
-        (Some(base), Some(_)) => base.as_str(),
-        _ => spec.url.as_str(),
-    };
+    // The address requests dial (`WorkerMetadata::base_url`): a spec's base
+    // where it holds one, its address as written where it holds none.
+    let dialled = spec.dp_base_url.as_deref().unwrap_or(spec.url.as_str());
     let host_of = |address: &str| {
         url::Url::parse(address)
             .ok()
@@ -888,6 +889,35 @@ mod tests {
             bootstrap_host_of("http://s3cret-token@99999999999"),
             "localhost"
         );
+    }
+
+    /// The bootstrap host is the host of the address requests dial
+    /// (`base_url`), whatever a spec holds of a base and a rank. The
+    /// registration writes both. A spec a peer hands over may hold a base
+    /// and no rank, or a base that is not its address less the rank, and
+    /// requests dial that base.
+    #[test]
+    fn the_bootstrap_host_is_the_host_of_the_address_requests_dial() {
+        let base = "http://prefill1:8080";
+        let ranked = "http://prefill1:8080@3";
+        for (url, holds_base, holds_rank, host) in [
+            (base, false, false, "prefill1"),
+            (ranked, true, true, "prefill1"),
+            (ranked, true, false, "prefill1"),
+            (ranked, false, true, "0.0.0.3"),
+            ("http://other:9000@3", true, true, "prefill1"),
+        ] {
+            let mut spec = WorkerSpec::new(url);
+            spec.dp_base_url = holds_base.then(|| base.to_string());
+            spec.dp_rank = holds_rank.then_some(3);
+            let worker = BasicWorkerBuilder::from_spec(spec).build();
+
+            let dialled = url::Url::parse(worker.base_url()).unwrap();
+            let bootstrap_host = worker.metadata().spec.bootstrap_host.as_str();
+            let cell = format!("{url}, a base {holds_base}, a rank {holds_rank}");
+            assert_eq!(Some(bootstrap_host), dialled.host_str(), "{cell}");
+            assert_eq!(bootstrap_host, host, "{cell}");
+        }
     }
 
     #[test]
