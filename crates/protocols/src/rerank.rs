@@ -43,7 +43,9 @@ pub struct RerankRequest {
     pub model: String,
 
     /// Maximum number of documents to return (optional). `top_n`, SGLang's
-    /// spelling, is read as well, as `/v1/rerank` reads `top_k`.
+    /// spelling, is read as well, as `/v1/rerank` reads `top_k`; a body
+    /// carrying both spellings is refused as a duplicate field, on either
+    /// route.
     #[serde(alias = "top_n", skip_serializing_if = "Option::is_none")]
     #[validate(range(min = 1))]
     pub top_k: Option<usize>,
@@ -449,8 +451,8 @@ mod tests {
     /// SGLang's rerank takes an `instruct` and spells the limit `top_n`: the
     /// native route reads `top_n` as its `top_k`, and both routes keep the
     /// instruction, `/v1/rerank`'s through its conversion. A `top_n` of 0 on
-    /// the native route is refused, as SGLang refuses it; a request without
-    /// an instruction writes none.
+    /// the native route is refused under `top_k`, as SGLang refuses it; a
+    /// request without an instruction writes none.
     #[test]
     fn a_rerank_request_keeps_instruct_and_reads_top_n() {
         let native: RerankRequest = serde_json::from_value(json!({
@@ -488,7 +490,11 @@ mod tests {
             "top_n": 0
         }))
         .expect("a native request");
-        assert!(zero.validate().is_err(), "a top_n of 0 is refused");
+        let refusal = zero.validate().expect_err("a top_n of 0 is refused");
+        assert!(
+            refusal.field_errors().contains_key("top_k"),
+            "the refusal names top_k, the field top_n is read as: {refusal:?}"
+        );
 
         let plain: RerankRequest =
             serde_json::from_value(json!({"model": "m", "query": "q", "documents": ["d"]}))
@@ -497,6 +503,28 @@ mod tests {
             .expect("serialize")
             .get("instruct")
             .is_none());
+    }
+
+    /// Both spellings of the limit fill one field, so a body carrying both is
+    /// refused as a duplicate field, on the native route as on `/v1/rerank`.
+    #[test]
+    fn a_body_carrying_both_spellings_of_the_limit_is_refused() {
+        let both = json!({
+            "model": "m",
+            "query": "q",
+            "documents": ["d1", "d2"],
+            "top_k": 2,
+            "top_n": 1
+        });
+        let native = serde_json::from_value::<RerankRequest>(both.clone())
+            .expect_err("the native route refuses both spellings");
+        assert!(
+            native.to_string().contains("duplicate field `top_k`"),
+            "{native}"
+        );
+        let v1 = serde_json::from_value::<V1RerankReqInput>(both)
+            .expect_err("/v1/rerank refuses both spellings");
+        assert!(v1.to_string().contains("duplicate field `top_n`"), "{v1}");
     }
 
     /// A request without a `user` writes no `user` key, as one without a

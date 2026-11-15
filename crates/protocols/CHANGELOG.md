@@ -273,7 +273,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the Qwen3 rerankers scored under their template's default instruction, and a `/rerank` client's
   `top_n` was ignored, answering every document. `RerankRequest` and `V1RerankReqInput` gain
   `instruct`, carried by the conversion and skipped when absent; a `top_n` of 0 on `/rerank` is
-  refused by `top_k`'s bound, as SGLang refuses it. Breaking: both request types gain `instruct`.
+  refused by `top_k`'s bound, the refusal naming `top_k`, as SGLang refuses it. Both spellings fill
+  one field, so a `/rerank` body carrying both `top_k` and `top_n`, which kept `top_k` and ignored
+  `top_n`, is refused as a duplicate field, as a `/v1/rerank` body carrying both is. Breaking: both
+  request types gain `instruct`.
 - A `ResponsesResponse` whose `metadata` is `null`, or whose `incomplete_details.reason` is
   `max_messages` or `steered`, as the public API writes them, parses; it refused all three.
   `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
