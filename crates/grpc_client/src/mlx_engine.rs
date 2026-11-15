@@ -104,8 +104,9 @@ impl MlxEngineClient {
         json_schema: Option<&String>,
         regex: Option<&String>,
         ebnf: Option<&String>,
+        structural_tag: Option<&String>,
     ) -> Result<(), String> {
-        if json_schema.is_some() || regex.is_some() || ebnf.is_some() {
+        if json_schema.is_some() || regex.is_some() || ebnf.is_some() || structural_tag.is_some() {
             return Err("MLX backend does not support structured output constraints".to_string());
         }
         Ok(())
@@ -157,10 +158,12 @@ impl MlxEngineClient {
     ) -> Result<proto::GenerateRequest, String> {
         Self::reject_n(body.n)?;
         Self::reject_stop_strings(body.stop.as_ref().is_some_and(|s| !s.is_empty()))?;
+        // A completion request names no structural tag.
         Self::reject_if_any_constraint(
             body.json_schema.as_ref(),
             body.regex.as_ref(),
             body.ebnf.as_ref(),
+            None,
         )?;
 
         let sampling_params = Self::build_sampling_params_from_completion(body);
@@ -218,6 +221,7 @@ impl MlxEngineClient {
                 sp.json_schema.as_ref(),
                 sp.regex.as_ref(),
                 sp.ebnf.as_ref(),
+                sp.structural_tag.as_ref(),
             )?;
         }
 
@@ -445,6 +449,53 @@ mod tests {
         assert_eq!(chat(Some(i64::MAX)), Some(0));
         assert_eq!(chat(Some(1 << 31)), Some(0));
         assert_eq!(chat(None), None);
+    }
+
+    /// A client over a channel that dials on its first call: the request
+    /// builders never call it.
+    fn unconnected_client() -> MlxEngineClient {
+        let channel = Channel::unconnected("http://127.0.0.1:1", std::time::Duration::from_secs(1))
+            .expect("an unconnected channel");
+        MlxEngineClient {
+            client: proto::mlx_engine_client::MlxEngineClient::new(channel.clone()),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+            channel,
+        }
+    }
+
+    /// MLX runs no constrained decoding, so a plain generate request whose
+    /// sampling params carry a structural tag is refused, as one carrying a
+    /// regex is, rather than decoded with no constraint and answered `200`.
+    #[tokio::test]
+    async fn a_plain_request_with_a_structural_tag_is_refused() {
+        let client = unconnected_client();
+        let request = |sampling_params: serde_json::Value| -> GenerateRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "input_ids": [1, 2],
+                "sampling_params": sampling_params
+            }))
+            .expect("a generate request")
+        };
+        let build = |sampling_params: serde_json::Value| {
+            client.build_plain_generate_request(
+                "req-1".to_string(),
+                &request(sampling_params),
+                None,
+                vec![1, 2],
+            )
+        };
+        for constrained in [
+            serde_json::json!({"structural_tag": "{\"type\":\"structural_tag\"}"}),
+            serde_json::json!({"regex": "a+"}),
+        ] {
+            assert_eq!(
+                build(constrained.clone()).expect_err("a constraint MLX cannot run"),
+                "MLX backend does not support structured output constraints",
+                "{constrained}"
+            );
+        }
+        assert!(build(serde_json::json!({"temperature": 0.5})).is_ok());
     }
 
     #[tokio::test]
