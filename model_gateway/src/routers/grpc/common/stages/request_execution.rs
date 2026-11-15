@@ -57,8 +57,8 @@ use crate::{
         },
     },
     worker::{
-        basic::WorkerTypeExt,
-        liveness::{self, SideReprieve},
+        health::liveness::{self, SideReprieve},
+        identity::basic::WorkerTypeExt,
         ConnectionModeExt, Worker,
     },
 };
@@ -2498,7 +2498,7 @@ pub(crate) mod tests {
     /// the next one opens a breaker set to two.
     #[tokio::test]
     async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
         let decode: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30002")
                 .worker_type(WorkerType::Decode)
@@ -3930,7 +3930,7 @@ pub(crate) mod tests {
     #[test]
     fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
     {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
         let pair = || {
             let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
                 Arc::new(

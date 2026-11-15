@@ -320,7 +320,8 @@ impl ResponseProcessor {
         let mut output = adapt::messages::output(&events);
         // A `tool_use` block carries `{}` only where the parser said the arguments are none;
         // arguments that are JSON no `input` value holds would leave as `{}` with no word, so the
-        // message is refused, naming the call (the stream carries such arguments as written).
+        // message is refused, naming the call (the stream carries such arguments as written
+        // where they open an object, and withholds them where they do not).
         if let Some(refused) = output.refused.first() {
             return Err(SymphonyError::InputRefused(format!(
                 "the tool_use input of call {} ({}) cannot carry the arguments the model wrote: {}",
@@ -1661,7 +1662,9 @@ fn tool_use_input(arguments: Option<&str>, tool_call_id: &str) -> serde_json::Va
 /// double-encoded or bare string, an array, a number, null), named once in the
 /// log under `function`. The request side refuses anything but an object, so an
 /// answer of either collected reader never carries a value a client could not
-/// send back as history. (The stream carries a call's arguments as written.)
+/// send back as history. The stream keeps its block an object too: a call
+/// whose arguments open with anything but an object streams none of them
+/// (`streaming::ToolInput`), and its block keeps the `{}` it started with.
 fn object_input(
     value: serde_json::Value,
     function: &'static str,

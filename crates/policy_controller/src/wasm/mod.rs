@@ -27,13 +27,79 @@
 //! dropped at the end. Every call runs under fuel: the plugin's frame budget
 //! clamped to the decision's remaining budget (one remainder per thread per
 //! decision, shared by every plugin and side it opens), times the host's calibration
-//! of fuel to microseconds, with an epoch deadline of what the decision has
-//! left (at most the frame) as the wall bound. The budget is wall time: a
-//! call is charged the larger of its fuel at the calibration and its elapsed
-//! time, so a bulk memory loop (one unit of fuel whatever its length) draws
-//! the remainder down too, inside one linear memory under a cap. A frame budget gone on
-//! arrival is never forwarded: the stages fall back and the breaker counts a
-//! budget hit, the instance standing.
+//! of fuel to microseconds, and under a bound on the clock of what the
+//! decision has left (at most the frame). Fuel prices every operator, a bulk
+//! memory operation by its size once it has run; the clock catches what the
+//! calibration underprices and the CPU a host call spends. A plugin's bound
+//! is measured on the clock the plugin can spend. A guest of these worlds
+//! cannot wait by itself (it has no WASI; of its four imports the counter
+//! and the draw return at once, and the clock and a log line return when
+//! the host's code does: the clock is a number stored for a decision and
+//! the host's own clock outside one, a log line runs the host's log
+//! subscriber, and a wait there is one the host serves), so the time its
+//! call is off the CPU is the host's, and the bound counts the time its
+//! thread had the CPU since a reading of the thread's clock: a call ends
+//! at the tick that finds it has had its bound, and runs on otherwise,
+//! however late the wall clock says it is. A call takes no reading as it
+//! starts (the hot path reads no clock): the first tick that finds it in
+//! flight takes one, and the bound counts from there. That tick knows
+//! nothing of the time before it, so it can end a call and never says one
+//! was held. What a late call was (the wall clock put it at or past its
+//! bound in whole ticks, the earliest a deadline there could have ended it)
+//! is judged once, at its end, on a reading of its start. With none,
+//! the call is what it was before the bound counted the CPU: charged the
+//! time it took, and counted by name (`unread`: the host held it, or it
+//! overran what its fuel did not price). It arms its thread: while its
+//! decision's sample is in the plugin's latency ring there (128 decisions)
+//! every call reads the clock at its start, and at its end unless it is not
+//! late and its fuel covers the time it took (no reading moves that time).
+//! It meets no tick before the one its deadline on the wall clock falls on
+//! (a reading ends no call the wall clock would let run), and its time is
+//! its fuel or the CPU its thread had, late or not. Late and short of its
+//! bound on the CPU, a call that answered or declined is the host's
+//! (`stalls`: a starved or throttled thread, never a failure of the call):
+//! the hold itself drops no instance and moves no breaker, and the call's
+//! own time is its fuel or that CPU, never the hold. A hold excuses
+//! lateness, never a fault: a held call that failed by itself is that
+//! failure alone, and an answer the stage then refuses is counted under its
+//! own name beside its stall. At its bound a call is the plugin's. So a ring
+//! never holds two unread calls, and the latency rule, which wants two slow
+//! samples, never opens on unread calls alone; `unread` counts the first
+//! hold of each window and `stalls` the holds read inside one, and on a busy
+//! thread, where a window is short, the two are read together. This is the
+//! rule of this plugin form alone: a plugin that can wait (a remote one; a
+//! world that gained an import that blocks) is bounded on the wall clock, and
+//! so are every call on a host with no thread clock and an `init`: a cold
+//! slot's is charged the time it took with no reading, so a held one is a
+//! slow sample, and with an unread call in the same ring that is two. The
+//! thread's clock is the kernel's account of the thread: where a virtual
+//! machine's host takes the processor and the kernel counts no stolen time,
+//! that time reads as the thread's own, and a call so held is the plugin's,
+//! as before. The decision's own deadline stays on the wall clock: a call
+//! draws the decision's remainder by the larger of its fuel at the
+//! calibration and its elapsed time, so a call the calibration underprices
+//! and a held call draw it down too, and a later stage that falls back on a
+//! remainder a held call spent is nobody's failure. Nor is a later call
+//! that runs out under one: time nothing read draws the decision's
+//! remainder, never the plugin's own spend. With no reading a call's time is
+//! an interval, from its fuel to its charge. The latency rule wants more
+//! than one slow sample and takes the high end. A run-out is one event and a
+//! verdict, so it convicts on the low end: it is the plugin's when the fuel
+//! of its unread calls and the grant reach the budget, the decision's budget
+//! spent otherwise (`budget_spent`, the breaker untouched). Where the time
+//! those calls took would have made it the plugin's, nothing says whether a
+//! hold or their own time past their fuel is the difference: the run-out is
+//! counted with the unread calls and arms the thread. There a reading gives
+//! every call one time, so a hold short of late leaves the sample too, and
+//! the next run-out has one answer. That answer is the plugin's only when
+//! every earlier call read whole: a reading is exact, and a thread's clock
+//! can run short of its call (a kernel that bills a thread no interrupt
+//! time), so behind a call of a millisecond a run-out stays the budget's.
+//! A guest slow for that long in what its fuel does not price is held by
+//! the latency rule: its decisions sample at their whole budget, and the
+//! ring's first read opens the breaker. A frame budget gone on arrival is
+//! never forwarded: the stages fall back and the breaker counts a budget
+//! hit, the instance standing.
 //!
 //! What a failure does: a `decline` falls back to the stage's configured
 //! fallback and keeps the instance; a trap, an exhausted budget or an answer
@@ -53,19 +119,22 @@
 //! clamps and ends (its charge reached what was left) is the decision's
 //! budget spent and the close rebuilds the slot; one that ends by itself
 //! short of the clamp is the plugin's own failure, as under the full frame.
-//! A resource's destructor runs under a small fuel frame and a wall bound
-//! of its own, so a spent budget drops no healthy instance and a cheap slow
-//! destructor cannot stretch a decision.
+//! A resource's destructor runs under a small fuel frame and a bound on the
+//! clock of its own, so a spent budget drops no healthy instance and a
+//! destructor long on the clock cannot stretch a decision.
 //!
 //! The breaker opens for a cool-down on a run of failures within its window,
 //! or when the moving p50 of the plugin's decisions passes half the budget
 //! or the p99 (the second-slowest of the ring) passes it: one sample per
-//! decision, the plugin's own charge in it (its constructor and stage
-//! calls, whatever ended them, and a lazy `init` the decision paid) over
-//! the decision's budget, taken at its last close, the ring the thread's
-//! across rebuilds. An opening writes one warning with the plugin, the rule
-//! and the cool-down; a report made while the breaker is open, by a call
-//! admitted before it opened, is dropped, so one incident is one opening.
+//! decision, the plugin's own time in it (its constructor and stage calls,
+//! whatever ended them, each its charge, or for a late call a reading
+//! covers its fuel or the CPU its thread had and never the time the host
+//! held it; and a lazy `init` the decision paid) over the
+//! decision's budget, taken at its last close, the ring the thread's across
+//! rebuilds. An opening writes one warning with the plugin, the rule and the
+//! cool-down; a report stamped while the breaker was open, by a call
+//! admitted before it opened, is dropped whenever it arrives, so one
+//! incident is one opening.
 //! Open, the stages take their fallbacks without a call. Without a fallback
 //! stage, `failure: open` steps aside (keep all, flat scores, rank by score)
 //! and `failure: closed` sheds (an emptied pool or a declined pick naming
