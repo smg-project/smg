@@ -1934,12 +1934,12 @@ impl ResponseStreamEventEmitter {
             Vec::new()
         });
 
-        // In-progress item (empty tools)
+        // The added item (no tools yet): the typed item's shape, which has no
+        // status; the item's progress is on its events.
         let item_in_progress = json!({
             "id": item_id,
             "type": "mcp_list_tools",
             "server_label": server_label,
-            "status": "in_progress",
             "tools": []
         });
 
@@ -1964,7 +1964,6 @@ impl ResponseStreamEventEmitter {
             "id": item_id,
             "type": "mcp_list_tools",
             "server_label": server_label,
-            "status": if error.is_some() { "failed" } else { "completed" },
             "tools": tool_items
         });
         if let Some(error) = error {
@@ -2168,7 +2167,6 @@ mod tests {
         let item = &failed[3]["item"];
         assert_eq!(item["type"], "mcp_list_tools");
         assert_eq!(item["server_label"], "conf");
-        assert_eq!(item["status"], "failed");
         assert_eq!(item["error"], "Mcp error: -32603: tools/list refused");
         assert_eq!(item["tools"], json!([]));
 
@@ -2186,7 +2184,44 @@ mod tests {
             ]
         );
         assert_eq!(listed[3]["item"].get("error"), None);
-        assert_eq!(listed[3]["item"]["status"], "completed");
+    }
+
+    /// The streamed list item has the typed item's shape: the added and the
+    /// done item carry `id`, `type`, `server_label`, `tools` (and `error`
+    /// when the listing failed) and no `status`, as the non-streaming form
+    /// does; both parse as the typed item.
+    #[tokio::test]
+    async fn the_streamed_list_item_has_the_typed_items_shape() {
+        fn keys(item: &serde_json::Value) -> Vec<&str> {
+            let mut keys: Vec<&str> = item
+                .as_object()
+                .expect("an item object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+        for error in [None, Some("Mcp error: -32603: tools/list refused")] {
+            let events = list_tools_sequence_events(error).await;
+            let (added, done) = (&events[0]["item"], &events[3]["item"]);
+            assert_eq!(keys(added), ["id", "server_label", "tools", "type"]);
+            let mut done_keys = vec!["id", "server_label", "tools", "type"];
+            if error.is_some() {
+                done_keys.insert(0, "error");
+            }
+            assert_eq!(keys(done), done_keys);
+            for item in [added, done] {
+                let typed: ResponseOutputItem =
+                    serde_json::from_value(item.clone()).expect("the typed item");
+                assert!(matches!(typed, ResponseOutputItem::McpListTools { .. }));
+                assert_eq!(
+                    &serde_json::to_value(&typed).expect("the typed item serialises"),
+                    item,
+                    "the streamed item is the typed item's own serialisation"
+                );
+            }
+        }
     }
 
     /// The typed text-delta event writes the frame the `json!` event wrote,
