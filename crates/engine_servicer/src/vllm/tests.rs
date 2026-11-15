@@ -4603,6 +4603,10 @@ async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
     );
 
     server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
     assert_handshake_released(&handshake).await;
 }
 
