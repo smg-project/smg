@@ -4,6 +4,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Changed
+
+- A Messages request's `tool_use` block whose `input` is not an object is still refused under
+  `tool_use_input_not_an_object` with the public API's sentence, and the sentence now names the
+  block: `messages.1.content.0.tool_use.input: Input should be a valid dictionary (the tool_use
+  block toolu_... for calc carries an array)`, so a caller who replays a streamed answer sees which
+  block and what it carries.
+
 ### Added
 
 - `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any

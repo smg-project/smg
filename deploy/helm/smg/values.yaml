@@ -412,11 +412,15 @@ router:
 policyController:
   enabled: false
 
-  # -- The controller's image. No image is published yet: build one from
-  #    docker/policy-controller.Dockerfile. repository and tag have no
-  #    default, and a release that turns the controller on without them is
-  #    refused at render. registry "" takes global.image.registry; the pull
-  #    policy and the pull secrets are the global ones.
+  # -- The controller's image. Each part left empty is the router's: registry
+  #    "" takes global.image.registry, repository "" takes
+  #    global.image.repository, and tag "" takes the router's tag with
+  #    -policy-controller appended, the tag a release publishes the
+  #    controller under (a release publishes one controller image, so the
+  #    router's -slurm suffix is cut first). A repository of your own needs
+  #    its tag, and so does a router image named by a digest or by a release
+  #    older than the first with a controller image. The pull policy and
+  #    the pull secrets are the global ones.
   image:
     registry: ""
     repository: ""

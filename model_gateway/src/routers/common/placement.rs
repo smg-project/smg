@@ -1058,10 +1058,10 @@ fn relaxed_pair(
 /// last changed, so this path compares no descriptors. Every pool is judged
 /// live for availability, and a prefill counts only while one of its
 /// partners is available, so the policy's pick can always be paired; `wire`
-/// pins both pools to the retained plan's runtime and transport on a retry;
-/// `homogeneous_runtime` narrows both pools to the runtime of the first
-/// prefill worker open under its own runtime, which the gRPC wire needs
-/// because its rendezvous is runtime-specific. A miss names the role and carries the verdict judged
+/// pins both pools to the retained plan's runtime and transport on a retry.
+/// Where the index's wire is runtime-specific (`PdWire::runtime_specific`),
+/// both pools are narrowed to the runtime of the first prefill worker open
+/// under its own runtime. A miss names the role and carries the verdict judged
 /// from that role's candidates the request may use. A prefill pool whose
 /// policy balances load against cache affinity itself is never steered by
 /// the overload veto, and is placed by that policy even when every worker
@@ -1069,17 +1069,12 @@ fn relaxed_pair(
 /// request may use is over them is steered by load as before: a prefill
 /// pool by the least-loaded default ([`relaxed_pair`]), a decode pool to
 /// the least-loaded partner of the prefill its own policy picked.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "pair placement threads every routing input plus the admission view"
-)]
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
-    homogeneous_runtime: bool,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
@@ -1165,8 +1160,11 @@ pub(crate) fn select_pair(
     // wire's rendezvous is runtime-specific, both pools must also share a
     // runtime: that of the first prefill worker open under its own runtime,
     // so a prefill whose partners are all down never shuts out a healthy
-    // pair on another runtime. The index keeps runtimes apart already
-    // unless pairing is off or a runtime is unknown.
+    // pair on another runtime. The index keeps known runtimes apart on such
+    // a wire in every pairing mode (`PdWire::mismatch`); what this
+    // narrowing still decides is the order among runtimes that each hold a
+    // pair, and that a pair on one known runtime goes before a pair with a
+    // worker whose runtime is unknown.
     let partner_open = |d: &Arc<dyn Worker>, runtime: Option<RuntimeType>| {
         eligible(d, lift_decode) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
     };
@@ -1192,7 +1190,9 @@ pub(crate) fn select_pair(
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
     }
-    let pair_runtime = homogeneous_runtime
+    let pair_runtime = pairs
+        .wire
+        .runtime_specific()
         .then(|| {
             pairs.prefill.iter().enumerate().find_map(|(i, p)| {
                 let runtime = p.metadata().spec.runtime_type;
@@ -1492,7 +1492,6 @@ mod tests {
             MODEL,
             &pairs_of(registry, policies),
             None,
-            true,
             None,
             PlacementInputs::default(),
         )
@@ -1522,7 +1521,6 @@ mod tests {
                 MODEL,
                 &pairs,
                 None,
-                true,
                 None,
                 PlacementInputs::default(),
             )
@@ -1739,7 +1737,6 @@ mod tests {
                 MODEL,
                 &pairs,
                 None,
-                true,
                 None,
                 PlacementInputs::default(),
             )
@@ -1895,7 +1892,6 @@ mod tests {
                 MODEL,
                 &pairs,
                 None,
-                true,
                 None,
                 PlacementInputs {
                     headers: Some(&headers),
@@ -1944,7 +1940,6 @@ mod tests {
                     MODEL,
                     &pairs,
                     None,
-                    true,
                     None,
                     PlacementInputs {
                         tokens: Some(&tokens),
@@ -2156,6 +2151,183 @@ mod tests {
         assert!(pair_from(&registry, &off).is_ok());
     }
 
+    /// A fleet with no pair on one runtime is refused by name under pairing
+    /// off, in the words the lenient mode refuses it with, and the
+    /// least-loaded default has no pair to steer to either once the prefill
+    /// is over the thresholds.
+    #[test]
+    fn pairing_off_refuses_a_fleet_with_no_shared_runtime_by_name() {
+        let registry = registry_of(&[
+            (
+                "grpc://p:1",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+            (
+                "grpc://d:1",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        let off =
+            PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(PdPairingMode::Off);
+        let lenient = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let refused = |policies: &PolicyRegistry, path: &str| {
+            let failure = pair_from(&registry, policies)
+                .err()
+                .unwrap_or_else(|| panic!("{path}: no pair shares a runtime"));
+            assert_eq!(failure.role, WorkerRole::Decode, "{path}");
+            match failure.verdict {
+                PlacementFailure::NoCompatiblePair {
+                    prefill,
+                    decode,
+                    mismatches,
+                } => {
+                    assert_eq!(prefill, ["vllm/?/?"], "{path}");
+                    assert_eq!(decode, ["sglang/?/?"], "{path}");
+                    assert_eq!(mismatches, ["runtime"], "{path}");
+                }
+                _ => panic!("{path}: expected NoCompatiblePair"),
+            }
+        };
+        refused(&lenient, "lenient");
+        refused(&off, "off, the open path");
+
+        let prefill = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&prefill, true);
+        refused(&off, "off, the prefill over the thresholds");
+    }
+
+    /// The HTTP wire forwards one body to both sides, so no pair on it has
+    /// to share a runtime: with pairing off its pairs are not narrowed to
+    /// the first prefill's runtime, and a prefill of another runtime keeps
+    /// its turn. The selection reads the narrowing from the index's wire.
+    #[test]
+    fn the_http_wire_does_not_narrow_its_pairs_to_one_runtime() {
+        let registry = registry_of(&[
+            (
+                "http://p:vllm",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Vllm,
+            ),
+            (
+                "http://p:sglang",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Sglang,
+            ),
+            (
+                "http://d:vllm",
+                WorkerType::Decode,
+                ConnectionMode::Http,
+                RuntimeType::Vllm,
+            ),
+        ]);
+        let policies = cohort_policies().with_pd_pairing_mode(PdPairingMode::Off);
+        let pairs = registry
+            .get_routing_snapshot(MODEL)
+            .pd_pairs(PdWire::Http, policies.pd_pairing_mode());
+        let mut prefills: Vec<String> = (0..4)
+            .map(|_| {
+                select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    None,
+                    PlacementInputs::default(),
+                )
+                .map(|pair| pair.prefill.url().to_string())
+                .unwrap_or_default()
+            })
+            .collect();
+        prefills.sort();
+        prefills.dedup();
+        assert_eq!(
+            prefills,
+            ["http://p:sglang", "http://p:vllm"],
+            "both prefills take a turn"
+        );
+    }
+
+    /// With pairing off a prefill of a runtime-specific wire is still listed
+    /// only the decodes of its runtime, and every placement reads that list:
+    /// the open path, and the least-loaded default once the prefill is over
+    /// the thresholds, though the decode on the other runtime is the idle
+    /// one. With its one partner not ready the request has no pair on
+    /// either path; the other runtime's decode is never handed out. Every
+    /// ordered pair of the wire's runtimes is a row.
+    #[test]
+    fn pairing_off_never_pairs_two_known_runtimes_on_either_path() {
+        let runtimes = [
+            RuntimeType::Vllm,
+            RuntimeType::Sglang,
+            RuntimeType::TokenSpeed,
+            RuntimeType::Trtllm,
+            RuntimeType::Mlx,
+        ];
+        for own in runtimes {
+            for other in runtimes.into_iter().filter(|other| *other != own) {
+                let registry = registry_of(&[
+                    (
+                        "grpc://p:own",
+                        WorkerType::Prefill,
+                        ConnectionMode::Grpc,
+                        own,
+                    ),
+                    (
+                        "grpc://d:own",
+                        WorkerType::Decode,
+                        ConnectionMode::Grpc,
+                        own,
+                    ),
+                    (
+                        "grpc://d:other",
+                        WorkerType::Decode,
+                        ConnectionMode::Grpc,
+                        other,
+                    ),
+                ]);
+                let off = PolicyRegistry::new(PolicyConfig::RoundRobin)
+                    .with_pd_pairing_mode(PdPairingMode::Off);
+                let decode_of = |path: &str| {
+                    let pair = pair_from(&registry, &off)
+                        .unwrap_or_else(|_| panic!("{path} pairs ({own:?}, {other:?})"));
+                    assert_eq!(pair.runtime, own, "{path} ({own:?}, {other:?})");
+                    pair.decode.url().to_string()
+                };
+                for _ in 0..4 {
+                    assert_eq!(decode_of("the open path"), "grpc://d:own");
+                }
+
+                let prefill = registry.get_by_url("grpc://p:own").expect("registered");
+                registry.set_worker_overloaded(&prefill, true);
+                let partner = registry.get_by_url("grpc://d:own").expect("registered");
+                for _ in 0..10 {
+                    partner.increment_load();
+                }
+                for _ in 0..4 {
+                    assert_eq!(decode_of("the default"), "grpc://d:own");
+                }
+
+                partner.set_status(WorkerStatus::NotReady);
+                assert!(
+                    pair_from(&registry, &off).is_err(),
+                    "the default has no pair ({own:?}, {other:?})"
+                );
+                registry.set_worker_overloaded(&prefill, false);
+                assert!(
+                    pair_from(&registry, &off).is_err(),
+                    "the open path has no pair ({own:?}, {other:?})"
+                );
+            }
+        }
+    }
+
     /// A pair over a pool whose only decode is not ready is the decode
     /// role's unavailability.
     #[test]
@@ -2364,6 +2536,7 @@ mod tests {
         let pairs = PdPairIndex::build(
             by_type(WorkerType::Prefill).into(),
             by_type(WorkerType::Decode).into(),
+            PdWire::Http,
             policies.pd_pairing_mode(),
         );
 
@@ -2374,7 +2547,6 @@ mod tests {
             MODEL,
             &pairs,
             None,
-            false,
             None,
             PlacementInputs::default(),
         )
@@ -2392,7 +2564,6 @@ mod tests {
                 requires_media_refs: false,
                 pipeline: PipelinePin::Any,
             }),
-            false,
             None,
             PlacementInputs::default(),
         )
@@ -2457,7 +2628,6 @@ mod tests {
                 MODEL,
                 &pairs_of(&registry, &policies),
                 None,
-                true,
                 None,
                 inputs,
             )
@@ -2510,7 +2680,6 @@ mod tests {
                 MODEL,
                 &pairs_of(&registry, &policies),
                 None,
-                true,
                 None,
                 inputs,
             )
@@ -2564,7 +2733,6 @@ mod tests {
             MODEL,
             &pairs_of(&registry, &policies),
             other_wire,
-            true,
             None,
             PlacementInputs {
                 candidate_filter: Some(&only_p1),
@@ -3313,7 +3481,6 @@ mod tests {
             MODEL,
             &pairs_of(registry, policies),
             None,
-            true,
             None,
             PlacementInputs {
                 tokens: Some(tokens),

@@ -240,6 +240,7 @@ impl ModelWorkerSnapshot {
                 Arc::new(PdPairIndex::build(
                     Arc::clone(self.pool(prefill)),
                     Arc::clone(self.pool(decode)),
+                    wire,
                     mode,
                 ))
             })
