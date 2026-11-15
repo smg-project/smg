@@ -32,8 +32,10 @@ use smg::{
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        manager::{WorkerManager, WorkerManagerConfig},
+        health::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            manager::{WorkerManager, WorkerManagerConfig},
+        },
         test_support::RefusedAddress,
         BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
     },

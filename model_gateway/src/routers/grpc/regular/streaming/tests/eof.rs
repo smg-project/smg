@@ -27,7 +27,7 @@ use crate::{
         grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
     },
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
     },
 };

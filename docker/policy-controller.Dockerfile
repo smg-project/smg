@@ -7,12 +7,18 @@
 # From the repository root:
 #   docker build --file docker/policy-controller.Dockerfile --tag smg-policy-controller .
 #   docker run --rm --publish 30103:30103 smg-policy-controller
+#
+# An image for another architecture than the builder's (`--platform`) is
+# cross-compiled: the build stage runs on the builder's own architecture, and
+# the last stage's few commands alone run on the image's. Every build needs a
+# builder that sets the platform arguments (BUILDPLATFORM, TARGETARCH and
+# BUILDARCH).
 
 FROM scratch AS local_src
 COPY . /src
 
 ######################### BUILD IMAGE #########################
-FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS build-image
+FROM --platform=$BUILDPLATFORM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS build-image
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -38,6 +44,32 @@ COPY --from=local_src /src/rust-toolchain.toml /opt/smg/rust-toolchain.toml
 RUN rustup toolchain install \
     && rustc --version && cargo --version && protoc --version
 
+# What a cross build needs, for an image of another architecture than the
+# builder's: that architecture's C and C++ compilers and its C library (for
+# the dependencies that compile C or C++, and for the link), its Rust standard
+# library, and the linker's name for cargo. The one package named, the C++
+# compiler's, brings the C compiler and the C library with it. /cross-target
+# holds the Rust target's name for the build below. The builder sets both
+# arguments; they are named here and not above, so the steps above are the
+# same for every architecture.
+ARG TARGETARCH
+ARG BUILDARCH
+RUN if [ "${TARGETARCH}" != "${BUILDARCH}" ]; then \
+        case "${TARGETARCH}" in \
+            arm64) cpu=aarch64 ;; \
+            amd64) cpu=x86_64 ;; \
+            *) echo "no cross build is named here for ${TARGETARCH}" >&2; exit 1 ;; \
+        esac \
+        && apt update -y \
+        && apt install -y --no-install-recommends "g++-$(echo "${cpu}" | tr _ -)-linux-gnu" \
+        && rm -rf /var/lib/apt/lists/* \
+        && apt clean \
+        && rustup target add "${cpu}-unknown-linux-gnu" \
+        && printf '[target.%s]\nlinker = "%s"\n' "${cpu}-unknown-linux-gnu" "${cpu}-linux-gnu-gcc" \
+            >> /root/.cargo/config.toml \
+        && echo "${cpu}-unknown-linux-gnu" > /cross-target; \
+    fi
+
 COPY --from=local_src /src /opt/smg
 
 # The workspace package whose binary the image runs: the stock controller, or
@@ -45,13 +77,16 @@ COPY --from=local_src /src /opt/smg
 # crate (a package that depends on smg-policy-controller; its binary carries
 # the package's name and answers `--version`). The features are named with
 # the crate, so the one line builds either: the listeners, the WebAssembly
-# plugin host the crate turns on by default, and the Kubernetes Lease elector
-# for a controller of your own that runs it. The stock binary compiles the
-# elector in and does not elect yet.
+# plugin host the crate turns on by default, and the Kubernetes Lease
+# elector. The stock binary compiles both in and runs neither yet: they are
+# there for a controller of your own that does.
 ARG PACKAGE=smg-policy-controller
-RUN cargo build --release --locked --package "${PACKAGE}" \
+# A cross build names its Rust target, and cargo then writes the binary under
+# that name.
+RUN target="$(cat /cross-target 2>/dev/null || true)" \
+    && cargo build --release --locked ${target:+--target "${target}"} --package "${PACKAGE}" \
         --features smg-policy-controller/controller,smg-policy-controller/kubernetes \
-    && install -D "target/release/${PACKAGE}" /out/smg-policy-controller
+    && install -D "target/${target:+${target}/}release/${PACKAGE}" /out/smg-policy-controller
 
 ######################### CONTROLLER IMAGE #########################
 FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS policy-controller-image

@@ -296,7 +296,7 @@ impl<T> TonicResultExt for Result<T, tonic::Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::resilience::{
+    use crate::worker::health::resilience::{
         DEFAULT_CAPACITY_STATUS_CODES, DEFAULT_RETRYABLE_STATUS_CODES,
     };
 
