@@ -1,44 +1,20 @@
 //! The scratch rule, pinned on the `epd` plan: after the first decision on a
 //! thread (which sizes the thread's scratch and lets the ring learn the pool),
 //! an encode item's decision allocates nothing, over 8, 64 and 512 encoders
-//! and under each encode preset.
-#![expect(
-    unsafe_code,
-    reason = "a counting allocator is the one proof of an allocation count; it forwards to the system allocator"
-)]
+//! and under each encode preset. The count is the test thread's own
+//! (`common::counting_alloc`), so what runs beside it in the process, the
+//! harness included, is not charged to the decisions.
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+mod common;
 
+use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     Candidate, Constraints, Health, Identity, Phase, PolicySpec, PoolFacts, RequestFacts, Role,
     Scratch, WorkerId,
 };
 
-struct Counting;
-
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
-    }
-}
-
 #[global_allocator]
-static COUNTING: Counting = Counting;
+static GLOBAL: Counting = Counting;
 
 fn encoders(n: u32) -> Vec<Candidate> {
     (0..n)
@@ -87,13 +63,13 @@ fn an_encode_items_decision_allocates_nothing_after_the_first() {
                 .decide(&facts_of(1), &pool_facts, &pool, &cx, &mut scratch)
                 .pick()
                 .expect("a pick");
-            let before = ALLOCATIONS.load(Ordering::Relaxed);
+            let before = calls();
             let mut picked = 0usize;
             for key in 2..=200u64 {
                 let decision = engine.decide(&facts_of(key), &pool_facts, &pool, &cx, &mut scratch);
                 picked += decision.pick().map_or(0, |p| p.targets.len());
             }
-            let after = ALLOCATIONS.load(Ordering::Relaxed);
+            let after = calls();
             assert!(picked > 0);
             assert_eq!(
                 after - before,
