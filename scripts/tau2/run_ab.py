@@ -22,7 +22,7 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
-from math import comb
+from math import comb, isfinite
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -52,22 +52,71 @@ def passk(num_success: int, num_trials: int, k: int) -> float:
     return comb(num_success, k) / comb(num_trials, k)
 
 
-def load_results(raw: dict) -> list[dict]:
-    """Flatten τ²-bench results.json to task/trial identity and reward records.
+class InfrastructureResults(ValueError):
+    """Pinned tau2 placeholders are unscored obligations, never synthetic zeroes."""
 
-    Validated schema (tau2-bench 1.0.0, recon d8e915f): the top-level Results
-    object has a `simulations` list; each SimulationRun carries `task_id` and
-    `reward_info.reward` (0.0/1.0). (`simulation_index[].reward` mirrors it.)
+    def __init__(self, unscored: list[dict], scored: list[dict]):
+        super().__init__(f"{len(unscored)} infrastructure-error simulations remain unscored")
+        self.unscored = unscored
+        self.scored = scored
+
+
+def load_results(raw: dict) -> list[dict]:
+    """Read pinned tau2 5bfa7e37 results without inventing rewards or dropping trials.
+
+    Its SimulationRun permits reward_info=None for infrastructure-error
+    placeholders. Upstream excludes these from metrics; our full comparison
+    remains incomplete instead of shrinking its task/trial denominator.
     """
+    if not isinstance(raw, dict) or not isinstance(raw.get("simulations"), list):
+        raise ValueError("results must contain a simulations list")
     out: list[dict] = []
+    unscored: list[dict] = []
     for s in raw["simulations"]:
-        out.append(
-            {
-                "task_id": str(s["task_id"]),
-                "trial": s.get("trial"),
-                "reward": float(s["reward_info"]["reward"]),
-            }
-        )
+        if not isinstance(s, dict) or "reward_info" not in s:
+            raise ValueError("simulation is missing its reward schema")
+        if type(s.get("task_id")) not in (str, int) or not str(s["task_id"]):
+            raise ValueError("simulation is missing its task identity")
+        identity = {"task_id": str(s["task_id"]), "trial": s.get("trial")}
+        if "seed" in s:
+            identity["seed"] = s["seed"]
+        info = s["reward_info"]
+        if s.get("termination_reason") == "infrastructure_error":
+            if (
+                info is not None
+                or not identity["task_id"]
+                or type(identity["trial"]) is not int
+                or identity["trial"] < 0
+                or type(s.get("seed")) is not int
+            ):
+                raise ValueError("contradictory or unidentified infrastructure placeholder")
+            error_info = s.get("info")
+            error_type = error_info.get("error_type") if isinstance(error_info, dict) else None
+            # Never copy provider messages/tracebacks (which may contain secrets).
+            if (
+                not isinstance(error_type, str)
+                or not error_type.isidentifier()
+                or len(error_type) > 80
+            ):
+                error_type = "UnspecifiedError"
+            unscored.append(
+                {
+                    **identity,
+                    "termination_reason": "infrastructure_error",
+                    "error_type": error_type,
+                }
+            )
+            continue
+        if not isinstance(info, dict) or type(info.get("reward")) not in (int, float):
+            raise ValueError("missing or malformed reward outside infrastructure placeholder")
+        reward = float(info["reward"])
+        if not isfinite(reward):
+            raise ValueError("reward must be finite")
+        out.append({**identity, "reward": reward})
+    # Scan every row first: an unknown/contradictory row must not be masked by
+    # an earlier supported placeholder. No averages are computed for this domain.
+    if unscored:
+        raise InfrastructureResults(unscored, out)
     return out
 
 
@@ -367,14 +416,21 @@ def run_tau2(
         if results_json.is_symlink() or results_json.parent.is_symlink():
             raise ValueError("results must belong to the fresh invocation directory")
         body = results_json.read_bytes()
-        scores = domain_scores(load_results(json.loads(body)), k=num_trials)
         invocation["results_sha256"] = hashlib.sha256(body).hexdigest()
+        scores = domain_scores(load_results(json.loads(body)), k=num_trials)
         if issue := coverage_problem(scores, expected_task_ids, num_trials):
             fail("incomplete_results", "results")
             invocation["coverage_problem"] = issue
             return
         arm.scores[domain] = scores
         invocation["status"] = "completed"
+    except InfrastructureResults as error:
+        invocation.update(
+            n_infrastructure_errors=len(error.unscored),
+            unscored_cases=error.unscored,
+            scored_case_diagnostics=error.scored,
+        )
+        fail("infrastructure_error_results", "results", error)
     except FileNotFoundError as error:
         fail("missing_results", "results", error)
     except (OSError, KeyError, ValueError, TypeError) as error:
@@ -671,8 +727,19 @@ def write_report_and_gate(
     # An incomplete arm outranks a regression: there is no trustworthy delta to gate on.
     for name, reason in payload["incomplete"].items():
         print(f"\nINCOMPLETE: arm {name} — {reason}", file=sys.stderr)
-    # Quality diagnostics cannot waive failed mandatory paid-budget acceptance.
-    if budget_failed or (payload["incomplete"] and not args.allow_incomplete):
+    # Neither diagnostics nor a quality-tolerance flag can turn unscored
+    # infrastructure obligations into a complete comparison (or waive paid gates).
+    unscored_infrastructure = any(
+        invocation.get("failure_kind") == "infrastructure_error_results"
+        for arm in (baseline, candidate)
+        for invocation in arm.invocations.values()
+        if isinstance(invocation, dict)
+    )
+    if (
+        budget_failed
+        or unscored_infrastructure
+        or (payload["incomplete"] and not args.allow_incomplete)
+    ):
         exit_code = EXIT_INCOMPLETE
     return exit_code
 
@@ -730,7 +797,10 @@ def main() -> int:
     p.add_argument(
         "--allow-incomplete",
         action="store_true",
-        help="report a timed-out or unscored arm without failing (exit 2 otherwise)",
+        help=(
+            "allow partial quality reports; paid-budget failures and "
+            "unscored infrastructure still exit 2"
+        ),
     )
     p.add_argument("--out", type=Path)
     p.add_argument("--json-out", type=Path)

@@ -270,10 +270,23 @@ checkout used by `uv sync` editable installations, and verifies the same pinned
 request-path hashes in either installation mode. Distribution versions and SDK
 source fingerprints remain mandatory; an editable install does not waive them.
 
-A timeout or HTTP error from the exact uncharged loopback agent remains a
-simulation/quality failure, without halting the shared paid ledger. Unknown
-clients, redirects outside the fixed request contract, and paid request failures
-still halt it and make budget acceptance fail independently of quality tolerance.
+A timeout or HTTP error from the exact uncharged loopback agent does not by
+itself halt the shared paid ledger. With the pinned zero-retry runner, an ordinary
+exception can instead produce an `infrastructure_error` simulation with
+`reward_info: null`. Upstream excludes these placeholders from its metrics; they
+are **unscored**, not synthetic zero-reward trials. This driver reports their
+original task/trial/seed identities and safe error types, preserves the raw result
+hash and any scored-case diagnostics, and marks the invocation
+`infrastructure_error_results`. The full comparison remains incomplete (exit 2),
+even with `--allow-incomplete`: no obligation is discarded and no smaller
+pass^k denominator or complete-domain mean is substituted. Genuine reported zero
+rewards remain valid. Unknown nulls, contradictory infrastructure rows with a
+reward, and malformed schemas remain invalid results rather than being scored.
+
+Unknown clients, redirects outside the fixed request contract, and paid request
+failures still halt the ledger. Nonzero process exits and mandatory paid-ledger
+halt/pending/unknown checks remain independent gates; a result placeholder never
+waives them. No retry, model, task selection, trial, seed or arm contract changes.
 
 ### Optional AMD native arms (source capability, off by default)
 

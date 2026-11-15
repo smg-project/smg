@@ -278,16 +278,12 @@ jobs:
           bash scripts/ci_apt_update.sh sudo
           bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends make
 
-      # Every test under scripts/tests runs: the Python files as one pytest run, the
-      # shell tests one by one. The tools the step above can install come from there; a
-      # test that needs one it cannot skips itself and says so under -rs. A new test
-      # file runs from its first commit instead of waiting for a name here;
-      # scripts/tests/test_ci_tooling_tests.py pins this step. `python -m pytest`, not
-      # the console script: it puts the repository root on sys.path, which the tests
-      # that import `scripts.<module>` need to collect.
+      # Run every script test in this blocking job. General tests and shell tests
+      # retain Python 3.13; the complete tau2 cohort runs below in its fixed 3.12
+      # SDK environment. The routing contract checks their union, including new files.
       - name: Run CI tooling unit tests
         run: |
-          python -m pytest -q -rs scripts/tests
+          python -m pytest -q -rs scripts/tests --ignore-glob='scripts/tests/test_tau2*.py'
           for test in scripts/tests/test_*.sh; do bash "$test"; done
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
@@ -301,6 +297,31 @@ jobs:
         run: |
           pip install ./e2e_test
           pytest -q --noconftest e2e_test/infra e2e_test/fixtures
+
+      # Keep this in the same blocking job: the separate budget workflow need
+      # not be a required status check. No Python 3.13 tests follow this switch.
+      - name: Set up fixed tau2 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check out fixed tau2 source for tooling tests
+        uses: actions/checkout@v7
+        with:
+          repository: sierra-research/tau2-bench
+          ref: 5bfa7e37b36656b37dc6d022156be6563c1007f3
+          path: .tau2-upstream
+          persist-credentials: false
+          sparse-checkout: src/tau2/utils/llm_utils.py
+          sparse-checkout-cone-mode: false
+
+      - name: Install fixed SDKs for fake-HTTP-only tests
+        run: |
+          python -m venv "$RUNNER_TEMP/tau2-budget-venv"
+          "$RUNNER_TEMP/tau2-budget-venv/bin/python" -m pip install pytest ruff==0.15.0 litellm==1.81.11 openai==2.20.0 httpx==0.28.1 websockets==15.0.1 pydub==0.25.1 'tau2 @ https://github.com/sierra-research/tau2-bench/archive/5bfa7e37b36656b37dc6d022156be6563c1007f3.tar.gz'
+
+      - name: Run fixed tau2 tooling unit tests
+        run: '"$RUNNER_TEMP/tau2-budget-venv/bin/python" -m pytest -q -rs --confcutdir=scripts/tests scripts/tests/test_tau2*.py'
 
   # --- Rust lint and tests (CPU) ---
 
