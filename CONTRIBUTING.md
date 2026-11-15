@@ -174,6 +174,7 @@ runners only has to set the variables it needs (**Settings → Secrets and varia
 | `SMG_RUN_AMD_SGLANG_EMBEDDINGS` | `false` | Original SGLang embeddings suite and sentence-transformers dependency on AMD, floor 18; same gates, cohort checks and numeric preflight |
 | `SMG_RUN_AMD_SGLANG_GATEWAY` | `false` | Original SGLang router suite on AMD, floor 23; same gates and cohort checks, retaining the chat-one-engine path gate and SGLang's default enabled selection |
 | `SMG_RUN_AMD_SGLANG_ZMQ` | `false` | Original single-engine SGLang headless ZMQ full-chat suite on AMD, floor 209 and engine count 1; same LEGS/existing GPU1/ON_PRS gates. Retains original 60-minute job / 48-minute tests, engine-gated servicer tests and fixed cohort/numeric checks. No gRPC servicer or startup-profile substitution; actual scheduler/plugin API compatibility and first normal GPU qualification remain unproven |
+| `SMG_RUN_AMD_VLLM_REALTIME` | `false` (when unset) | Original local realtime WebSocket tests in `e2e_test/realtime`, serving `Qwen/Qwen3-ASR-1.7B` on one AMD GPU. Requires `SMG_RUN_AMD_LEGS=true`; PRs additionally require `SMG_RUN_AMD_ON_PRS=true`. Retains the AMD GPU1 fallback and build/change gates. Uses 30-minute job / 20-minute test limits; shared-host admission and actual GPU qualification remain required |
 | `SMG_RUN_AMD_VLLM_PYTHON_SERVICER` | `false` | Original vLLM gRPC Python-servicer full chat plus flush-cache admin case on AMD; requires `SMG_RUN_AMD_LEGS=true`, the existing nonempty AMD GPU1 route and `SMG_RUN_AMD_ON_PRS=true` for PRs. Both original path gates apply; 60-minute job and 45-minute tests await first normal CI qualification |
 | `SMG_RUN_AMD_VLLM_MM_WORKER` | `false` | Original vLLM worker-side multimodal file on AMD, with the default servicer and current parser/sampling; requires the same LEGS/GPU1/PR gates. Original 28-minute job and 20-minute tests; first normal CI must establish actual case results, not just the selection floor |
 | `SMG_RUN_AMD_VLLM_ZMQ` | `false` | Original single-GPU vLLM ZMQ full-chat qualification; requires `SMG_RUN_AMD_LEGS=true`, a nonempty existing `SMG_RUNNER_AMD_GPU_1`, and `SMG_RUN_AMD_ON_PRS=true` for PRs. One engine, current parser/sampling, 86-minute job and 80-minute tests; shared-host full lifecycle admission still applies |
@@ -211,7 +212,7 @@ first-normal-run qualification, not prior identical-pass activation gates.
 Selection floors are guards, not pass counts. Every row retains the shared-host
 390-minute lifecycle, current Router/ownership/lease admission and owned cleanup.
 A local source candidate or passing CPU controls does not establish GPU quality.
-The pure-CPU `finish` gate runs on `ubuntu-24.04` with a five-minute timeout,
+The pure-CPU `finish` gate runs on hosted `ubuntu-latest` with a five-minute timeout,
 retaining `always()` and all failure/cancelled/unknown result checks.
 
 The DP2 and TP4 opt-ins require the shared switch, their dedicated switch and a
