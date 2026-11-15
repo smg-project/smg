@@ -316,6 +316,11 @@ const MAX_REJECTED_CUT_CANDIDATES: usize = 64;
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
 
+/// The cut check's three span lists (the window's pieces, those of the
+/// text before the candidate, those of the text from it on), one set per
+/// thread that cuts (`NativeEncoder::cut_spans`).
+type CutSpans = [Vec<(usize, usize)>; 3];
+
 /// The ids of one vocabulary entry while the seed is built, in a fixed slot
 /// (a byte-level piece of `n` bytes has at most `n` ids), so the pass over
 /// the vocabulary allocates one list rather than one per entry.
@@ -1147,6 +1152,12 @@ pub(crate) struct NativeEncoder {
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
     piece_cache: ThreadLocal<RefCell<PieceCache>>,
+    /// The cut check's span lists of each thread that cuts a text for the
+    /// pool: cleared per check and grown once per thread
+    /// ([`Self::piece_starts_at`]), apart from the piece cache so that a
+    /// thread that only cuts gets none and is not counted among the
+    /// threads that encode.
+    cut_spans: ThreadLocal<RefCell<CutSpans>>,
     /// Threads that hold a piece cache of this encoder.
     threads: AtomicUsize,
 }
@@ -1261,6 +1272,7 @@ impl NativeEncoder {
             merges,
             chars: None,
             piece_cache: ThreadLocal::new(),
+            cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
     }
@@ -1340,6 +1352,7 @@ impl NativeEncoder {
             merges: None,
             chars: Some(Box::new(chars)),
             piece_cache: ThreadLocal::new(),
+            cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
     }
@@ -1960,6 +1973,7 @@ impl NativeEncoder {
             merges: Some(merges),
             chars: None,
             piece_cache: ThreadLocal::new(),
+            cut_spans: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
     }
@@ -2529,6 +2543,11 @@ impl NativeEncoder {
         if self.stages.is_empty() || self.end_anchored || self.mapped_from.is_some() {
             return None;
         }
+        // The check's span lists: this thread's scratch, grown at its first
+        // check and kept (the search runs on the calling thread, before the
+        // pool, and borrows nothing else of the thread).
+        let scratch = self.cut_spans.get_or_default();
+        let mut spans = scratch.borrow_mut();
         let bytes = text.as_bytes();
         let mut rejected = 0;
         let mut p = from;
@@ -2561,7 +2580,7 @@ impl NativeEncoder {
                     p += CUT_SEARCH_SKIP;
                     continue;
                 };
-                if self.piece_starts_at(&text[start..end], p - start) {
+                if self.piece_starts_at(&text[start..end], p - start, &mut spans) {
                     return Some(p);
                 }
                 rejected += 1;
@@ -2595,23 +2614,26 @@ impl NativeEncoder {
     /// `at`, or that a dropped stage drops, leaves no final piece over `at`,
     /// while the next unit's first stage begins inside that match and may
     /// match otherwise: `[ a]{999}` then ` a` over a run of ` a`); else that
-    /// is no cut.
-    fn piece_starts_at(&self, window: &str, at: usize) -> bool {
-        let mut whole = Vec::new();
-        self.piece_spans(window, &mut whole);
+    /// is no cut. The three span lists are the caller's (`spans`, the
+    /// thread's scratch through `stable_cut`): cleared here, grown once per
+    /// thread, so a check allocates nothing after a thread's first.
+    fn piece_starts_at(&self, window: &str, at: usize, spans: &mut CutSpans) -> bool {
+        let [whole, left, right] = spans;
+        whole.clear();
+        self.piece_spans(window, whole);
         if whole.iter().any(|&(from, to)| from < at && at < to) {
             return false;
         }
-        let mut left = Vec::new();
-        self.piece_spans(&window[..at], &mut left);
+        left.clear();
+        self.piece_spans(&window[..at], left);
         if !left
             .iter()
             .eq(whole.iter().take_while(|&&(_, to)| to <= at))
         {
             return false;
         }
-        let mut right = Vec::new();
-        self.piece_spans(&window[at..], &mut right);
+        right.clear();
+        self.piece_spans(&window[at..], right);
         right
             .iter()
             .map(|&(from, to)| (from + at, to + at))

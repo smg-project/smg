@@ -1360,6 +1360,51 @@ fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
     }
 }
 
+/// The cut check's three span lists are the calling thread's scratch,
+/// apart from its piece cache: they grow at the thread's first search and
+/// keep their room through the next, the cut the same, and the search
+/// gives the thread no piece cache (a thread is counted when it encodes).
+#[test]
+fn the_cut_check_keeps_its_span_lists_in_the_threads_scratch() {
+    let mut state = 0x5C5C_A11A_0000_0002u64;
+    let shape = Shape {
+        name: "prose-for-the-cut-check",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let prose = "the pool cuts a long text at a space before a letter ".repeat(2_000);
+    assert!(native.cut_spans.get().is_none());
+    let cut = native.stable_cut(&prose, PARALLEL_CHUNK_BYTES);
+    assert!(cut.is_some());
+    let room = |native: &NativeEncoder| -> Vec<usize> {
+        native
+            .cut_spans
+            .get()
+            .expect("this thread's scratch")
+            .borrow()
+            .iter()
+            .map(Vec::capacity)
+            .collect()
+    };
+    let grown = room(&native);
+    assert!(grown.iter().all(|&slots| slots > 0), "{grown:?}");
+    assert_eq!(native.stable_cut(&prose, PARALLEL_CHUNK_BYTES), cut);
+    assert_eq!(room(&native), grown);
+    assert!(
+        native.piece_cache.get().is_none(),
+        "the search gave the thread a cache"
+    );
+}
+
 #[test]
 fn an_end_anchored_chain_keeps_a_long_text_whole() {
     // `\s+$` reads the end of the text it runs over: a cut for the thread
