@@ -369,6 +369,8 @@ jobs:
 
       # Pre-download models with flock to prevent races between pods on same node
       - name: Download models
+        env:
+          CI_SGLANG_GPTOSS_REVISION: ${{ inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && '6cee5e81ee83917806bbde320786a8fb61efebee' || '' }}
         run: bash scripts/ci_download_model.sh --gpu-tier ${{ inputs.gpu_tier }}
 
       - name: Download extra models
@@ -378,6 +380,7 @@ jobs:
         # word-splits into multiple space-separated model ids.
         env:
           EXTRA_MODELS: ${{ inputs.extra_models }}
+          CI_SGLANG_GPTOSS_REVISION: ${{ inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && '6cee5e81ee83917806bbde320786a8fb61efebee' || '' }}
         run: bash scripts/ci_download_model.sh $EXTRA_MODELS
 
       - name: Check original GPTOSS packed MXFP4 numeric path
@@ -630,6 +633,11 @@ jobs:
             IMPL="${{ inputs.servicer_impl }}"
             if [ -n "$IMPL" ]; then
               SUFFIX="${SUFFIX}-${IMPL}-servicer"
+            fi
+            # Explicit parser rows share the ordinary row's suite and wire.
+            # Keep default-row names intact while separating legacy/symphony logs.
+            if [ -n "${E2E_PARSER:-}" ]; then
+              SUFFIX="${SUFFIX}-parser-${E2E_PARSER}"
             fi
             ARTIFACT="e2e-worker-logs-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${LABEL}${SUFFIX}"
             bash scripts/ci_dump_worker_logs.sh e2e-logs "$ARTIFACT"

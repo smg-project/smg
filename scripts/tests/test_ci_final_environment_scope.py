@@ -298,12 +298,16 @@ def test_evidence_artifacts_feed_only_their_uploads(tmp_path):
 
     # Exercise the actual diagnostic shell: the valid opt-in uses its generated
     # identity; wrong engine/vendor and false opt-in keep nonempty legacy logs.
-    for index, (enabled, engine, vendor) in enumerate(
+    for index, (enabled, engine, vendor, parser, backend) in enumerate(
         [
-            (True, "sglang", "amd"),
-            (True, "vllm", "amd"),
-            (True, "sglang", "nvidia"),
-            (False, "sglang", "amd"),
+            (True, "sglang", "amd", "", ""),
+            (True, "vllm", "amd", "", ""),
+            (True, "sglang", "nvidia", "", ""),
+            (False, "sglang", "amd", "", ""),
+            # Actual ordinary AMD vLLM default/legacy/symphony callers.
+            (False, "vllm", "amd", "", "nixl"),
+            (False, "vllm", "amd", "legacy", "nixl"),
+            (False, "vllm", "amd", "symphony", "nixl"),
         ]
     ):
         work = tmp_path / str(index)
@@ -330,7 +334,8 @@ def test_evidence_artifacts_feed_only_their_uploads(tmp_path):
                 "gpu_tier": "1",
                 "test_dirs": "e2e_test/chat_completions",
                 "kv_backend": "",
-                "vllm_kv_backend": "",
+                "vllm_kv_backend": backend,
+                "parser": parser,
                 "vllm_moriio_mode": "",
                 "connection_mode": "",
                 "zmq_engine_count": "",
@@ -356,6 +361,7 @@ def test_evidence_artifacts_feed_only_their_uploads(tmp_path):
                 "PATH": str(binary),
                 "WORKER_LOG_ARTIFACT": identity,
                 "FINAL_ENVIRONMENT_CHECK": "1" if scoped else "0",
+                "E2E_PARSER": parser,
                 "GITHUB_OUTPUT": str(output),
                 "DUMP_LOG": str(dump_log),
                 "PYTHONDONTWRITEBYTECODE": "1",
@@ -370,6 +376,8 @@ def test_evidence_artifacts_feed_only_their_uploads(tmp_path):
             legacy += "-" + str(inputs["vllm_kv_backend"])
         if vendor == "amd":
             legacy += "-amd"
+        if parser:
+            legacy += "-parser-" + parser
         expected = identity if scoped else legacy
         assert expected
         assert json.loads(dump_log.read_text()) == [
