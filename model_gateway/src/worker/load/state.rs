@@ -44,6 +44,8 @@ use tokio::sync::{watch, Notify};
 
 #[cfg(any(test, feature = "test-util"))]
 use crate::policies::LoadBalancingPolicy;
+#[cfg(any(test, feature = "test-util"))]
+use crate::worker::BasicWorker;
 use crate::worker::{registry::WorkerRegistry, Worker};
 
 /// Subscription handle to the published load snapshots. `borrow().clone()`
@@ -114,7 +116,7 @@ impl LoadSnapshot {
         let entries = loads
             .into_iter()
             .map(|(url, load)| {
-                let dangling: Weak<crate::worker::BasicWorker> = Weak::new();
+                let dangling: Weak<BasicWorker> = Weak::new();
                 let entry = LoadEntry {
                     sampled_at: load.sampled_at.unwrap_or(published_at),
                     load: Arc::new(load),

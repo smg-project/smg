@@ -42,6 +42,9 @@ pub(crate) use file::export_manifest;
 pub use file::FileProviderConfig;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;
+pub(crate) use kubernetes::{
+    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string,
+};
 pub use kubernetes::{
     ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
 };

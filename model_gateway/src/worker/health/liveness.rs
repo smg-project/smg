@@ -2376,10 +2376,21 @@ mod tests {
         let (w, mut rx) = signalling_worker();
         set(&w, Some(StallReason::Unreachable), "test");
         w.set_status(WorkerStatus::NotReady);
+        let runtime = w.liveness_runtime().expect("a BasicWorker runtime");
+        let previous_contact = runtime.contact_stamp_ms_for_test();
         thread::sleep(Duration::from_millis(15));
-        let before = w.contact_age();
+        let before_probe = now_ms();
         on_probe_passed(&w);
-        assert!(w.contact_age() < before, "a passing probe is a contact");
+        let after_probe = now_ms();
+        let contact = runtime.contact_stamp_ms_for_test();
+        assert!(
+            contact > previous_contact,
+            "a passing probe records a new contact: {previous_contact} -> {contact}"
+        );
+        assert!(
+            (before_probe..=after_probe).contains(&contact),
+            "the contact is recorded during this probe: {contact} in {before_probe}..={after_probe}"
+        );
         assert!(w.stall_reason().is_none(), "and ends an unreachable veto");
         assert!(
             rx.try_recv().is_err(),
