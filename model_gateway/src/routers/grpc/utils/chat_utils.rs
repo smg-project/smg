@@ -821,12 +821,15 @@ fn validate_chat_parts(
         // The roles whose content the public contract keeps to text: a media
         // part there is refused here, before any fetch, in this door's own
         // sentence, not after the pipeline processed it and the rendered
-        // prompt carried no anchor for it (the template's own sentence).
+        // prompt's anchors did not match it (none for a system, developer or
+        // root part; one too many for an assistant part on a template that
+        // renders assistant media). The binding carries the role's article
+        // for the sentence.
         let text_only_role = match message {
-            ChatMessage::System { .. } => Some("system"),
-            ChatMessage::Developer { .. } => Some("developer"),
-            ChatMessage::Assistant { .. } => Some("assistant"),
-            ChatMessage::Root { .. } => Some("root"),
+            ChatMessage::System { .. } => Some("a system"),
+            ChatMessage::Developer { .. } => Some("a developer"),
+            ChatMessage::Assistant { .. } => Some("an assistant"),
+            ChatMessage::Root { .. } => Some("a root"),
             ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
                 None
             }
@@ -865,7 +868,7 @@ fn validate_chat_parts(
                     _ => {
                         if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
                             return Err(format!(
-                                "Unsupported chat content part type {kind:?} in a {role} message \
+                                "Unsupported chat content part type {kind:?} in {role} message \
                                  for gRPC backends: media parts are taken in user and tool messages"
                             ));
                         }

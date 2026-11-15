@@ -98,8 +98,9 @@ fn a_refusal_part_outside_an_assistant_turn_is_refused() {
 
 /// A media part is taken in a user message (and in a tool result): in a
 /// system, developer, assistant or root message it is refused at the door in
-/// this door's own sentence, before any fetch, not after the pipeline ran it
-/// and the rendered prompt carried no anchor for it.
+/// this door's own sentence (with the role's article), before any fetch, not
+/// after the pipeline ran it and the rendered prompt's anchors did not match
+/// it (none for the first three, one too many for an assistant part).
 #[test]
 fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
     let parts = [
@@ -108,7 +109,12 @@ fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
         json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}),
         json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
     ];
-    for role in ["system", "developer", "assistant", "root"] {
+    for (role, phrase) in [
+        ("system", "a system"),
+        ("developer", "a developer"),
+        ("assistant", "an assistant"),
+        ("root", "a root"),
+    ] {
         for part in &parts {
             let kind = part["type"].as_str().unwrap();
             let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -120,7 +126,7 @@ fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
             assert_eq!(
                 error,
                 format!(
-                    "Unsupported chat content part type {kind:?} in a {role} message for gRPC \
+                    "Unsupported chat content part type {kind:?} in {phrase} message for gRPC \
                      backends: media parts are taken in user and tool messages"
                 )
             );
