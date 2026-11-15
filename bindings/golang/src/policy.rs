@@ -162,24 +162,10 @@ impl Worker for GrpcWorker {
         Ok(())
     }
 
-    // FFI workers don't run the state machine — these counters are unused.
+    // FFI workers don't run the health state machine: this worker keeps the
+    // trait's default `runtime_state` (`None`) and so has no probe counts.
     // The Go SDK manages worker health via direct set_status() calls
     // through the `sgl_multi_client_set_worker_health` FFI entry point.
-    fn consecutive_failures_increment(&self) -> usize {
-        0
-    }
-    fn consecutive_failures_reset(&self) {}
-    fn consecutive_successes_increment(&self) -> usize {
-        0
-    }
-    fn consecutive_successes_reset(&self) {}
-    fn total_pending_probes(&self) -> usize {
-        0
-    }
-    fn total_pending_probes_increment(&self) -> usize {
-        0
-    }
-    fn total_pending_probes_reset(&self) {}
 
     fn load(&self) -> usize {
         self.load.load(Ordering::Relaxed)

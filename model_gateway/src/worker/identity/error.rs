@@ -1,6 +1,5 @@
-//! Error types for the SGLang router core
-//!
-//! This module defines error types used throughout the router for worker operations.
+//! The worker errors: what a worker operation reports when it fails, the
+//! worker's address masked where the message names it.
 
 use super::endpoint::Endpoint;
 

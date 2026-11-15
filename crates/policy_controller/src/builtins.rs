@@ -1207,6 +1207,41 @@ impl Picker for Random {
     }
 }
 
+/// The picker of a profile that leaves the placement to its binding's
+/// sessions rule. The engine reads [`Picker::by_assignment`] once per profile
+/// and places every request of such a profile by the rule's assignment, a
+/// keyed request with no routable pin and a keyless one alike: a random
+/// worker, the fewest requests in flight or the fewest session keys. With
+/// no stages of its own to delegate to, `delegate` and a binding without a
+/// rule read the fewest requests in flight. The picker itself ranks
+/// nothing: asked to pick (a side of a pair, where no sessions rule runs),
+/// it declines.
+#[derive(Debug, Default)]
+pub struct Manual;
+
+impl Lifecycle for Manual {}
+
+impl Picker for Manual {
+    fn name(&self) -> &'static str {
+        "manual"
+    }
+
+    fn pick(
+        &self,
+        _: &RequestFacts<'_>,
+        _: &[Candidate],
+        _: &[u32],
+        _: &[f32],
+        _: TieBand,
+        _: &mut Targets,
+    ) {
+    }
+
+    fn by_assignment(&self) -> bool {
+        true
+    }
+}
+
 /// Two distinct uniform positions below `n` (two at least), from the next two
 /// values of `draw`.
 fn two_below(draw: &mut Draw, n: usize) -> (usize, usize) {

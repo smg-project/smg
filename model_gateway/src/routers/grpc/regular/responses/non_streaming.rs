@@ -117,7 +117,7 @@ async fn execute_without_mcp(
             error = %e,
             "Failed to convert ResponsesRequest to ChatCompletionRequest"
         );
-        error::bad_request(e.code(), format!("Failed to convert request: {e}"))
+        error::bad_request(e.code(), e.to_string())
     })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
@@ -205,7 +205,7 @@ pub(super) async fn execute_tool_loop(
                         error = %e,
                         "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
                     );
-                    error::bad_request(e.code(), format!("Failed to convert request: {e}"))
+                    error::bad_request(e.code(), e.to_string())
                 })?;
 
         // Prepare tool_choice for this iteration

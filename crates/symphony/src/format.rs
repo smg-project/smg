@@ -274,6 +274,18 @@ pub enum Whitespace {
     Bounded(u32),
 }
 
+/// How the JSON of a forced call is written under the gateway's JSON-schema constraint
+/// ([`Format::with_forced_call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForcedCall {
+    /// The arguments object alone, of the function the request names
+    /// ([`CallSyntax::ForcedArguments`]).
+    Arguments,
+    /// A list of `{"name": …, "parameters": …}` objects, as a required call writes them
+    /// ([`CallSyntax::JsonAlone`]).
+    List,
+}
+
 /// Where a call's id comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CallId {
@@ -750,6 +762,12 @@ impl Format {
         self.start
     }
 
+    /// The state the unopened row names, if the table has one: where a turn starts when the
+    /// prompt opens no turn for the model ([`Self::unopened_turn_starts_in`]).
+    pub(crate) fn unopened_start(&self) -> Option<usize> {
+        self.unopened.as_ref().map(|unopened| unopened.state)
+    }
+
     /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
     /// row in [`crate::format`]): the prompt holds no turn opener, or `turn_end`, the text that
     /// ends a turn the model wrote in the prompt (`<｜end▁of▁sentence｜>`), follows the last one.
@@ -975,6 +993,100 @@ impl Format {
         self
     }
 
+    /// The table for a request whose call the gateway's JSON-schema constraint forces, where the
+    /// engine holds the output to the schema only once the model's thought is over: the output
+    /// is the thought, as the table reads it, and then the JSON alone, with no call marker, no
+    /// name outside the JSON and no answer. The thought's states stay, with every row into, out
+    /// of and between them; every other state is one arguments state, the first, which reads
+    /// the JSON as `written` says: the arguments of the function the request names
+    /// ([`Declared::forcing`](crate::Declared::forcing)), or the list a required call writes.
+    /// So the output starts in the call unless the prompt's replay, an anchor or the unopened
+    /// row leaves it inside the thought, and the thought's close, wherever the table's own row
+    /// led, opens the call.
+    ///
+    /// A row out of the arguments state is taken only before the JSON's first byte, where a
+    /// marker is the template's framing: the thought's opener enters the thought, and any other
+    /// marker with a row from a state that is now this one (an answer's opener) is dropped as
+    /// wrapping. From the first byte on every marker is the call's text, which a JSON string
+    /// may hold: the assemblers of the two syntaxes close at no terminal once their value began.
+    /// A marker the table ignores is the call's text inside the value too, and wrapping the
+    /// engine drops before the value and after it, as everywhere. The rows the parser alone
+    /// reads (the leading and the recovery rows) are rows like the others here; where two
+    /// states that are now one read a marker differently, the row the table lists first
+    /// stands. An anchor that named a state other than a thought's names the arguments state.
+    /// An unopened row that named one goes, since the row cannot name a state that holds a
+    /// call ([`Self::validate`]), and so does a start row, the turn's first byte being the
+    /// call's. The layout goes, and the call's id is the engine's. The table keeps its name:
+    /// the model's table reads the output.
+    ///
+    /// A table without a thought becomes the arguments state alone, its markers dropped before
+    /// the JSON: what [`forced`](crate::formats::forced()) and [`json`](crate::formats::json())
+    /// read, for an output that is the JSON from its first byte. The variant
+    /// [`Self::without_reasoning`] makes of this one reads the thought as content and keeps its
+    /// markers dropped, which here are the rows into and out of the call.
+    #[must_use]
+    pub fn with_forced_call(mut self, written: ForcedCall) -> Self {
+        let mut states = vec![State {
+            name: "forced".to_string(),
+            emits: Emits::Arguments,
+            framing: false,
+            trimmed: false,
+            kept: false,
+            closes_at_stop: false,
+            remade: false,
+        }];
+        // Where each state of the table stands in the variant: a thought's state after the
+        // arguments state, in the table's order, every other state at the arguments state.
+        let moved: Vec<usize> = self
+            .states
+            .iter()
+            .map(|state| {
+                if state.emits == Emits::Reasoning {
+                    states.push(state.clone());
+                    states.len() - 1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        // The rows in the table's order, so the first one listed for a state and a marker is the
+        // one a lookup finds ([`Self::next`]).
+        let rows: Vec<Transition> = self
+            .transitions
+            .iter()
+            .chain(&self.leading_transitions)
+            .chain(&self.recovery_transitions)
+            .map(|row| Transition {
+                from: moved[row.from],
+                on: row.on,
+                to: moved[row.to],
+            })
+            .collect();
+        for anchor in &mut self.anchors {
+            anchor.state = moved[anchor.state];
+        }
+        self.unopened = self
+            .unopened
+            .take()
+            .map(|row| Unopened {
+                state: moved[row.state],
+                end: row.end,
+            })
+            .filter(|row| row.state != 0);
+        self.start = None;
+        self.states = states;
+        self.transitions = rows;
+        self.leading_transitions = Vec::new();
+        self.recovery_transitions = Vec::new();
+        self.calls = Some(match written {
+            ForcedCall::Arguments => CallSyntax::ForcedArguments,
+            ForcedCall::List => CallSyntax::JsonAlone(None),
+        });
+        self.call_id = CallId::Minted;
+        self.layout = None;
+        self
+    }
+
     /// The states of the turn's frame where the table starts in a message header: an arguments
     /// state a row returns to (Inkling's, where the call's name follows the message's opener, so
     /// the state reads the call, and the thought and the answer open from it too), and the
@@ -1179,7 +1291,10 @@ impl Format {
     /// the turn starts in, the turn's first piece deciding its start where the table has a start
     /// row ([`Self::opening`]), a terminal the table ignores, or one with no row from where the
     /// walk stands, moving nothing; and the stay the output continues. A call the prompt left
-    /// open is not entered: the walk rests where the turn started. A prompt that opens no turn
+    /// open is not entered: the walk rests where the turn started. The first state is no such
+    /// call where the turn started elsewhere and a row led the walk back to it (a thought the
+    /// prompt opened and closed, in a table whose first state holds the call, as a forced
+    /// call's variant has it): the output starts there. A prompt that opens no turn
     /// for the model, where the table has an unopened row ([`Self::unopened_turn`]), is not
     /// replayed: the output starts in the row's state, with nothing begun. The engine starts the
     /// output where this leaves it, and [`Self::reasoning_open`] reads the same walk.
@@ -1234,7 +1349,12 @@ impl Format {
             }
         }
         if self.emits(state) == Emits::Arguments {
-            (state, begun) = (rest, false);
+            // A call the prompt left open is not entered. The first state reached from another one
+            // the turn started in is where the output starts, not a call left open.
+            if state != 0 || rest == 0 {
+                state = rest;
+            }
+            begun = false;
         }
         Replay {
             state,

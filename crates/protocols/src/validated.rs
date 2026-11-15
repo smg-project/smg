@@ -162,12 +162,13 @@ fn opens_a_reason(text: &str) -> bool {
 /// letter outside ASCII) is a path all the same: the reason is then found by
 /// serde's own words, at the first split whose remainder opens with one
 /// (serde quotes the value it refused after its words, never before). This
-/// order reads two cases wrong: a key with a colon and a space in it, whose
-/// part before the colon reads as a path, is cut at the colon whatever
-/// follows; and a key that is no plain path, in front of a custom error,
-/// keeps no path.
+/// order cuts a key with a colon and a space in it at the colon and folds
+/// its parts into a path (`a: b` reads as `a.b`); serde's words then name
+/// the key whole and the param reads it back from them. One case it reads
+/// wrong: a key that is no plain path, in front of a custom error, keeps no
+/// path.
 #[cfg(feature = "axum")]
-fn deserialize_detail(message: &str) -> (Option<&str>, &str) {
+fn deserialize_detail(message: &str) -> (Option<Cow<'_, str>>, &str) {
     let detail = message
         .split_once(DESERIALIZE_PREFIX)
         .map_or(message, |(_, detail)| detail);
@@ -177,16 +178,35 @@ fn deserialize_detail(message: &str) -> (Option<&str>, &str) {
     let mut splits = detail
         .match_indices(": ")
         .map(|(at, _)| (&detail[..at], &detail[at + 2..]));
-    let is_path_char =
-        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-');
+    let is_path = |head: &str| {
+        !head.is_empty()
+            && head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-'))
+    };
     match splits.next() {
-        Some((head, reason)) if !head.is_empty() && head.chars().all(is_path_char) => {
-            (Some(head), reason)
+        Some((head, mut reason)) if is_path(head) => {
+            // A reader that read a buffered value itself (an item's message,
+            // a message's part) puts the path it tracked in front of the
+            // reason, under serde's: the two fold into one path.
+            let mut path = Cow::Borrowed(head);
+            while !opens_a_reason(reason) {
+                match reason.split_once(": ") {
+                    Some((inner, rest)) if is_path(inner) => {
+                        path = Cow::Owned(format!("{path}.{inner}"));
+                        reason = rest;
+                    }
+                    _ => break,
+                }
+            }
+            (Some(path), reason)
         }
         Some(first) => std::iter::once(first)
             .chain(splits)
             .find(|(_, reason)| opens_a_reason(reason))
-            .map_or((None, detail), |(head, reason)| (Some(head), reason)),
+            .map_or((None, detail), |(head, reason)| {
+                (Some(Cow::Borrowed(head)), reason)
+            }),
         None => (None, detail),
     }
 }
@@ -214,10 +234,15 @@ fn param_from_deserialize_message(message: &str) -> Option<String> {
         .find_map(|marker| reason.strip_prefix(marker))
         .and_then(|rest| rest.split_once('`'))
         .map(|(field, _)| field);
-    match (path, field) {
+    match (path.as_deref(), field) {
         // A refused unknown key is already the last segment of serde's path.
         (Some(path), Some(field)) if path == field || path.ends_with(&format!(".{field}")) => {
             Some(path.to_string())
+        }
+        // A key with a colon and a space in it folded into the path; serde's
+        // words name it whole.
+        (Some(path), Some(field)) if field.contains(": ") && path == field.replace(": ", ".") => {
+            Some(field.to_string())
         }
         (Some(path), Some(field)) => Some(format!("{path}.{field}")),
         (Some(path), None) => Some(path.to_string()),
@@ -639,7 +664,11 @@ fn json_rejection(err: JsonRejection) -> Response {
     }
     let (code, error_message) = match err {
         JsonRejection::JsonDataError(e) => {
-            let message = format!("Invalid JSON data: {e}");
+            let mut message = format!("Invalid JSON data: {e}");
+            // A path a reader tracked under serde's reads as one path.
+            if let (Some(Cow::Owned(path)), reason) = deserialize_detail(&message) {
+                message = format!("Invalid JSON data: {DESERIALIZE_PREFIX}{path}: {reason}");
+            }
             (deserialize_code(&message), message)
         }
         JsonRejection::JsonSyntaxError(e) => ("invalid_json", format!("JSON syntax error: {e}")),
@@ -829,6 +858,7 @@ mod tests {
     use crate::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::{invalid, invalid_at},
+        responses::ResponsesRequest,
     };
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
@@ -1757,6 +1787,131 @@ mod tests {
         }
     }
 
+    /// A refusal inside a Responses `input` item names the item, the part
+    /// and the field under the route's own code, as every other field's
+    /// refusal on this door does: a message with or without its `type` or
+    /// its `id`, a part inside a typed item, a field inside a part's own
+    /// array; the accepted shapes are unchanged.
+    #[tokio::test]
+    async fn a_responses_input_part_refusal_names_the_part_and_its_field() {
+        let image = |part: &str| {
+            format!(
+                r#"{{"model":"m","input":[{{"role":"user","content":[{{"type":"input_text","text":"describe"}},{{"type":"input_image","image_url":"data:image/png;base64,AQ==",{part}}}]}}],"max_output_tokens":2}}"#
+            )
+        };
+        for (body, code, param, message) in [
+            (
+                image(r#""detail":"LOW""#),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                image(r#""detail":"bogus""#),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `bogus`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":{"url":"data:image/png;base64,AQ=="}}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[1].image_url",
+                "input[0].content[1].image_url: invalid type: map, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_video","video_url":"http://127.0.0.1/clip.mp4"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].type",
+                "input[0].content[1].type: unknown variant `input_video`, expected one of `output_text`, `input_text`, `input_image`, `input_file`, `refusal`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].content[0].text",
+                "input[0].content[0]: missing field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,AQ==","detail":"LOW"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,AQ==","detail":"LOW"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":7,"text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].type",
+                "input[0].content[0].type: invalid type: integer `7`, expected variant identifier",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"output_text","text":"hi","annotations":[{"type":"file_citation","index":0}]}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].content[0].annotations[0].file_id",
+                "input[0].content[0].annotations[0]: missing field `file_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"output_text","text":"hi","annotations":[{"type":"url_citation","url":5}]}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].annotations[0]",
+                "input[0].content[0].annotations[0]: invalid type: integer `5`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].output[0].text",
+                "input[0].output[0]: missing field `text`",
+            ),
+            // A typed item's own missing field keeps the derived reader's
+            // words: its fallback to the untagged shapes drops the tagged
+            // reading's reason (the limit of the reader).
+            (
+                r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0]",
+                "input[0]: data did not match any variant of untagged enum ResponseInputOutputItem",
+            ),
+            (
+                r#"{"model":"m","input":[{"content":"hi"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].role",
+                "input[0]: missing field `role`",
+            ),
+            (
+                r#"{"model":"m","input":7,"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input",
+                "input: invalid type: integer `7`, expected a string or an array of input items",
+            ),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(&body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+        for body in [
+            image(r#""detail":"low""#),
+            r#"{"model":"m","input":"hi","max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(&body).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {json}");
+        }
+    }
+
     #[test]
     fn deserialize_code_follows_the_reason_in_the_message() {
         for (message, code) in [
@@ -1854,12 +2009,11 @@ mod tests {
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
                 "json_parse_error",
             ),
-            // A key this order reads wrong: a colon and a space in it, after a
-            // part that reads as a path, is cut at the colon whatever follows;
-            // here what follows the cut is no reason of serde's.
+            // A key with a colon and a space in it is cut at the colon and its
+            // parts fold into the path; serde's words after them keep their code.
             (
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
-                "json_parse_error",
+                "unknown_parameter",
             ),
         ] {
             assert_eq!(deserialize_code(message), code, "{message}");
@@ -1941,11 +2095,12 @@ mod tests {
                 "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
                 Some("function_call"),
             ),
-            // A key read wrong: a colon and a space in it, after a part that
-            // reads as a path, is cut at the colon.
+            // A key with a colon and a space in it is cut at the colon and folds
+            // into the path; serde's words name it whole, and the param reads it
+            // back from them.
             (
                 "Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
-                Some("a"),
+                Some("a: b"),
             ),
             ("JSON syntax error: expected value at line 1 column 1", None),
             ("Missing Content-Type: application/json header", None),

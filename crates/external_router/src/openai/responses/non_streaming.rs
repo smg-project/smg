@@ -15,7 +15,7 @@ use super::utils::{patch_response_with_request_metadata, restore_original_tools}
 use crate::{
     error,
     header_utils::{extract_forwardable_request_headers, ApiProvider},
-    mcp_utils::{ensure_request_mcp_client, request_uses_mcp_routing},
+    mcp_utils::{ensure_request_mcp_routing, request_uses_mcp_routing},
     openai::{
         context::{PayloadState, RequestContext, ResponsesPayloadState},
         mcp::{execute_tool_loop, prepare_mcp_tools_as_functions, ToolLoopExecutionContext},
@@ -75,9 +75,12 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
                     "MCP format registry required for requests carrying MCP/builtin tools",
                 );
             };
-            ensure_request_mcp_client(mcp_orchestrator, registry, tools)
-                .await
-                .map(|servers| (servers, mcp_orchestrator.clone(), registry.clone()))
+            match ensure_request_mcp_routing(mcp_orchestrator, registry, tools).await {
+                Ok(servers) => {
+                    servers.map(|servers| (servers, mcp_orchestrator.clone(), registry.clone()))
+                }
+                Err(refusal) => return refusal,
+            }
         }
         _ => None,
     };
@@ -222,12 +225,17 @@ mod tests {
     use axum::http::StatusCode;
     use openai_protocol::responses::ResponsesRequest;
     use serde_json::json;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
+    use smg_mcp::{McpConfig, McpOrchestrator};
 
-    use super::handle_non_streaming_response;
+    use super::{super::streaming::handle_streaming_response, handle_non_streaming_response};
     use crate::{
         openai::{
             context::{
-                ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection,
+                ComponentRefs, PayloadState, RequestContext, ResponsesComponents, SharedComponents,
+                WorkerSelection,
             },
             provider::OpenAIProvider,
         },
@@ -257,6 +265,62 @@ mod tests {
             url: format!("{worker_url}/v1/responses"),
         });
         ctx
+    }
+
+    /// A request context past worker selection, the worker at `worker_url`,
+    /// over a router with MCP wiring and no configured server; the request
+    /// names one `mcp` tool with no `server_url` under a label no server is
+    /// held under.
+    async fn mcp_context_for(worker_url: &str) -> RequestContext {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "mcp", "server_label": "conf"}]
+        }))
+        .expect("a request");
+        let components = ResponsesComponents {
+            shared: Arc::new(SharedComponents {
+                client: http_client(),
+            }),
+            mcp_orchestrator: Arc::new(
+                McpOrchestrator::new(McpConfig::default())
+                    .await
+                    .expect("an orchestrator without servers"),
+            ),
+            mcp_format_registry: Default::default(),
+            response_storage: Arc::new(MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(MemoryConversationStorage::new()),
+            conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
+        };
+        let mut ctx = RequestContext::for_responses(
+            Arc::new(request),
+            None,
+            Some("m".to_string()),
+            ComponentRefs::Responses(Arc::new(components)),
+        );
+        ctx.state.worker = Some(WorkerSelection {
+            worker: StubWorker::at(worker_url),
+            provider: Arc::new(OpenAIProvider),
+        });
+        ctx.state.payload = Some(PayloadState {
+            json: json!({}),
+            url: format!("{worker_url}/v1/responses"),
+        });
+        ctx
+    }
+
+    /// An `mcp` tool that binds no server is refused on the missing
+    /// connection before the forward, on both routes: the worker nobody
+    /// listens at is never reached (a forward there fails with 502).
+    #[tokio::test]
+    async fn an_mcp_tool_that_binds_nothing_is_refused_on_both_routes_before_the_forward() {
+        let response =
+            handle_non_streaming_response(mcp_context_for(CREDENTIALED_WORKER_URL).await).await;
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+
+        let response =
+            handle_streaming_response(mcp_context_for(CREDENTIALED_WORKER_URL).await).await;
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
     }
 
     /// The forward's failure line names the worker masked: a worker

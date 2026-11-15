@@ -1049,6 +1049,10 @@ mod tests {
         assert!(access_after_miss > access_after_hit);
     }
 
+    /// Exercise the real PeriodicTask with an interval shorter than max_idle.
+    /// Wait boundedly for both the map and entry count to report removal, then
+    /// check the age of the entry's actual stored last_access. A fixed sleep
+    /// of interval + max_idle can race the eviction tick on a loaded host.
     #[test]
     fn test_manual_ttl_eviction_logic() {
         let config = ManualConfig {

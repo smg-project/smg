@@ -792,24 +792,48 @@ impl ResponseStreamEventEmitter {
     // MCP Event Emission Methods
     // ========================================================================
 
-    pub fn emit_mcp_list_tools_in_progress(&mut self, output_index: usize) -> serde_json::Value {
+    /// The list item's events carry the item's id after the output index,
+    /// as the call events do: a client joins them to the item's
+    /// `output_item.added` by `item_id`.
+    pub fn emit_mcp_list_tools_in_progress(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+    ) -> serde_json::Value {
         json!({
             "type": McpEvent::LIST_TOOLS_IN_PROGRESS,
             "sequence_number": self.next_sequence(),
-            "output_index": output_index
+            "output_index": output_index,
+            "item_id": item_id
         })
     }
 
     pub fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
+        item_id: &str,
         tool_items: &[serde_json::Value],
     ) -> serde_json::Value {
         json!({
             "type": McpEvent::LIST_TOOLS_COMPLETED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
+            "item_id": item_id,
             "tools": tool_items
+        })
+    }
+
+    /// The failure itself is on the done item (`error`), not on the event.
+    pub fn emit_mcp_list_tools_failed(
+        &mut self,
+        output_index: usize,
+        item_id: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": McpEvent::LIST_TOOLS_FAILED,
+            "sequence_number": self.next_sequence(),
+            "output_index": output_index,
+            "item_id": item_id
         })
     }
 
@@ -1890,10 +1914,16 @@ impl ResponseStreamEventEmitter {
     ///
     /// `server_label` is taken as an explicit parameter so callers can iterate
     /// over multiple MCP servers without mutating the emitter's own label.
+    /// The list-tools item's events: `output_item.added`, `in_progress`, then
+    /// `completed` with the tools or, when the server's listing failed
+    /// (`error`), `failed`, and `output_item.done` with the item as the
+    /// completed response carries it (the error on it); every event carries
+    /// the item's id.
     pub async fn emit_mcp_list_tools_sequence(
         &mut self,
         server_label: &str,
         tools: &[mcp::ToolEntry],
+        error: Option<&str>,
         tx: &SseSender,
     ) -> Result<(), String> {
         let (output_index, item_id) = self.allocate_output_index(OutputItemKind::McpListTools);
@@ -1904,12 +1934,12 @@ impl ResponseStreamEventEmitter {
             Vec::new()
         });
 
-        // In-progress item (empty tools)
+        // The added item (no tools yet): the typed item's shape, which has no
+        // status; the item's progress is on its events.
         let item_in_progress = json!({
             "id": item_id,
             "type": "mcp_list_tools",
             "server_label": server_label,
-            "status": "in_progress",
             "tools": []
         });
 
@@ -1918,21 +1948,27 @@ impl ResponseStreamEventEmitter {
             .await?;
 
         // Emit mcp_list_tools.in_progress
-        let event = self.emit_mcp_list_tools_in_progress(output_index);
+        let event = self.emit_mcp_list_tools_in_progress(output_index, &item_id);
         self.send_event(&event, tx).await?;
 
-        // Emit mcp_list_tools.completed
-        let event = self.emit_mcp_list_tools_completed(output_index, &tool_items);
+        // Emit mcp_list_tools.completed, or .failed when the listing failed
+        let event = if error.is_some() {
+            self.emit_mcp_list_tools_failed(output_index, &item_id)
+        } else {
+            self.emit_mcp_list_tools_completed(output_index, &item_id, &tool_items)
+        };
         self.send_event(&event, tx).await?;
 
-        // Completed item (with tools populated)
-        let item_done = json!({
+        // The done item: the tools, and the listing's failure as its error
+        let mut item_done = json!({
             "id": item_id,
             "type": "mcp_list_tools",
             "server_label": server_label,
-            "status": "completed",
             "tools": tool_items
         });
+        if let Some(error) = error {
+            item_done["error"] = json!(error);
+        }
 
         // Emit output_item.done (the emitter keeps the item)
         self.send_output_item_done(output_index, item_done, tx)
@@ -2064,6 +2100,129 @@ mod tests {
     use crate::routers::grpc::common::responses::utils::{
         assert_responses_api_usage, responses_api_test_usage,
     };
+
+    /// The events of one list-tools sequence for a server with no tools whose
+    /// listing failed with `error` (or succeeded, `None`), read back from the
+    /// stream in order.
+    async fn list_tools_sequence_events(error: Option<&str>) -> Vec<serde_json::Value> {
+        let (tx, mut rx) = sse_channel();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        emitter
+            .emit_mcp_list_tools_sequence("conf", &[], error, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let frame = String::from_utf8(bytes.to_vec()).unwrap();
+            let data = frame.split("data: ").nth(1).unwrap().trim();
+            events.push(serde_json::from_str::<serde_json::Value>(data).unwrap());
+        }
+        events
+    }
+
+    /// The list item's `in_progress` and `completed` (or `failed`) events
+    /// carry the item's id and output index, as the call events do: a
+    /// client joins them to the item's `output_item.added` by `item_id`.
+    #[tokio::test]
+    async fn the_list_tools_events_carry_the_items_id() {
+        for error in [None, Some("Mcp error: -32603: tools/list refused")] {
+            let events = list_tools_sequence_events(error).await;
+            assert_eq!(events.len(), 4);
+            let item_id = events[0]["item"]["id"]
+                .as_str()
+                .expect("the added item's id");
+            assert!(!item_id.is_empty());
+            for event in &events[1..3] {
+                assert_eq!(event["item_id"], item_id, "{}", event["type"]);
+                assert_eq!(event["output_index"], 0, "{}", event["type"]);
+            }
+            assert_eq!(events[3]["item"]["id"], item_id);
+        }
+    }
+
+    /// A server whose listing failed streams its list item as `added`,
+    /// `mcp_list_tools.in_progress`, `mcp_list_tools.failed`, then
+    /// `output_item.done` whose item carries the error and no tools; a
+    /// listed server streams `completed` and an item without an error.
+    #[tokio::test]
+    async fn a_failed_listing_streams_the_failed_event_and_the_items_error() {
+        let failed =
+            list_tools_sequence_events(Some("Mcp error: -32603: tools/list refused")).await;
+        assert_eq!(
+            failed
+                .iter()
+                .map(|e| e["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "response.output_item.added",
+                "response.mcp_list_tools.in_progress",
+                "response.mcp_list_tools.failed",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(failed[2].get("error"), None, "the failure is on the item");
+        assert_eq!(failed[2]["output_index"], 0);
+        let item = &failed[3]["item"];
+        assert_eq!(item["type"], "mcp_list_tools");
+        assert_eq!(item["server_label"], "conf");
+        assert_eq!(item["error"], "Mcp error: -32603: tools/list refused");
+        assert_eq!(item["tools"], json!([]));
+
+        let listed = list_tools_sequence_events(None).await;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|e| e["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "response.output_item.added",
+                "response.mcp_list_tools.in_progress",
+                "response.mcp_list_tools.completed",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(listed[3]["item"].get("error"), None);
+    }
+
+    /// The streamed list item has the typed item's shape: the added and the
+    /// done item carry `id`, `type`, `server_label`, `tools` (and `error`
+    /// when the listing failed) and no `status`, as the non-streaming form
+    /// does; both parse as the typed item.
+    #[tokio::test]
+    async fn the_streamed_list_item_has_the_typed_items_shape() {
+        fn keys(item: &serde_json::Value) -> Vec<&str> {
+            let mut keys: Vec<&str> = item
+                .as_object()
+                .expect("an item object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+        for error in [None, Some("Mcp error: -32603: tools/list refused")] {
+            let events = list_tools_sequence_events(error).await;
+            let (added, done) = (&events[0]["item"], &events[3]["item"]);
+            assert_eq!(keys(added), ["id", "server_label", "tools", "type"]);
+            let mut done_keys = vec!["id", "server_label", "tools", "type"];
+            if error.is_some() {
+                done_keys.insert(0, "error");
+            }
+            assert_eq!(keys(done), done_keys);
+            for item in [added, done] {
+                let typed: ResponseOutputItem =
+                    serde_json::from_value(item.clone()).expect("the typed item");
+                assert!(matches!(typed, ResponseOutputItem::McpListTools { .. }));
+                assert_eq!(
+                    &serde_json::to_value(&typed).expect("the typed item serialises"),
+                    item,
+                    "the streamed item is the typed item's own serialisation"
+                );
+            }
+        }
+    }
 
     /// The typed text-delta event writes the frame the `json!` event wrote,
     /// byte for byte (the same keys in the same order, the same escaping, the

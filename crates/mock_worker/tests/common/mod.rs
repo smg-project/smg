@@ -79,7 +79,7 @@ pub async fn generate(
     let mut stream = client.generate(req).await.context("generate")?;
     let mut frames = Vec::new();
     while let Some(frame) = stream.next().await {
-        frames.push(frame.context("a response frame")?);
+        frames.push(*frame.context("a response frame")?);
     }
     stream.mark_completed();
     Ok(frames)

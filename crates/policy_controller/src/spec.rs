@@ -30,7 +30,7 @@ use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
         Best, CountFirst, FewestSessions, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests,
-        NotOverloaded, NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random,
+        Manual, NotOverloaded, NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random,
         ResidentWork, RoundRobin, SessionAffinity, DEFAULT_MEAN_PREFILL_TOKENS,
     },
     framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, Weighted},
@@ -82,8 +82,9 @@ pub const SCORERS: [&str; 10] = [
 ];
 
 /// The pickers of v1; `count-first` and `power-of-two-count-first` compare
-/// the requests in flight before the score; `best-with-temperature` takes
-/// its temperature and is written in the parameter form.
+/// the requests in flight before the score; `manual` leaves the placement
+/// to the binding's sessions rule, by its assignment; `best-with-temperature`
+/// takes its temperature and is written in the parameter form.
 pub const PICKERS: [&str; 9] = [
     "best",
     "round-robin",
@@ -1040,7 +1041,10 @@ impl Default for OverloadSpec {
     }
 }
 
-/// How a session key seen for the first time picks its worker.
+/// How a session key seen for the first time picks its worker. Under the
+/// `manual` picker the same assignment places a request with no key, which
+/// is not pinned, and a `manual` profile bound with no sessions rule places
+/// every request by `min_load`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Assignment {
@@ -1089,7 +1093,8 @@ pub struct SessionsSpec {
     #[serde(default = "default_sweep_s")]
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
-    /// How a first-seen key picks its worker (default `delegate`).
+    /// How a first-seen key picks its worker (default `delegate`); under
+    /// the `manual` picker, a request with no key as well.
     #[serde(default)]
     pub assignment: Assignment,
     /// How many requests of one key a worker carries before the next steps
@@ -1298,6 +1303,8 @@ pub enum SpecError {
     UnknownPicker { profile: String, name: String },
     #[error("profile {profile:?}: picker {picker:?} needs a scorer to compare by")]
     PickerNeedsScorer { profile: String, picker: String },
+    #[error("profile {profile:?}: picker {picker:?} leaves the placement to the binding's sessions rule and runs no scorer; remove `score`")]
+    PickerRunsNoScorer { profile: String, picker: String },
     #[error("binding {index}: unknown profile {name:?}")]
     UnknownProfile { index: usize, name: String },
     #[error("binding {index} names no profile")]
@@ -1766,7 +1773,7 @@ fn picker_of(
             "count-first" => built_picker(CountFirst),
             "power-of-two-count-first" => built_picker(PowerOfTwoCountFirst),
             "passthrough" => built_picker(Passthrough),
-            "manual" => Resolved::NotInBuild("the manual picker"),
+            "manual" => built_picker(Manual),
             "best-with-temperature" => {
                 return Err(at.bad(
                     "pick",
@@ -1871,6 +1878,15 @@ fn check_profile(
             picker: p.pick.name().to_string(),
         });
     }
+    // A picker that leaves the placement to the binding's rule: the engine
+    // never runs such a profile's scorers, so a document that names one
+    // names a stage that never runs.
+    if !p.score.is_empty() && picker.as_ref().is_some_and(|picker| picker.by_assignment()) {
+        return Err(SpecError::PickerRunsNoScorer {
+            profile: name.to_string(),
+            picker: p.pick.name().to_string(),
+        });
+    }
     Ok(match picker {
         Some(picker) if complete => Some(Profile {
             name: name.to_string(),
@@ -1889,6 +1905,9 @@ struct BindingContext<'a> {
     denied: &'a [&'a str],
     /// Profile name to its position in the document's map.
     profiles: &'a BTreeMap<&'a str, u16>,
+    /// The profiles whose built picker leaves the placement to a sessions
+    /// rule ([`Picker::by_assignment`]), by name.
+    by_assignment: &'a [&'a str],
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -2183,6 +2202,20 @@ fn check_binding(
     check_matcher(&b.matcher, cx, &at, deferred)?;
     check_binding_rules(b, cx, &at, deferred)?;
     let mut built = resolve_plan(b, cx)?;
+    // A picker that leaves the placement to a sessions rule, and a rule runs
+    // under the single plan alone: on a side of a pair or of `epd` nothing
+    // would place its requests. The built picker answers, as it answers the
+    // engine.
+    if b.plan.unwrap_or_default() != PlanName::Single {
+        for (side, name) in &b.profiles {
+            if cx.by_assignment.contains(&name.as_str()) {
+                deferred.note(
+                    at.sub("profiles").field(side),
+                    "a picker that places by the sessions rule outside the single plan",
+                );
+            }
+        }
+    }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan)?;
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
@@ -2341,11 +2374,13 @@ impl PolicySpec {
             // Sticky sessions over a random assignment: a key stays with the
             // first worker it was placed on, no in-flight cap, the first
             // worker back in the lead when it recovers; the idle TTL of four
-            // hours swept each minute, as the keyed policy of today.
+            // hours swept each minute, as the keyed policy of today. The
+            // picker leaves the placement to the rule, so another assignment
+            // is the rule's one field and no other profile.
             "manual" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec![],
-                pick: "random".into(),
+                pick: "manual".into(),
             },
             // Affinity first, the expected wait within the group: the slice
             // and the diversion over everything when due, the holder tiers
@@ -2378,7 +2413,7 @@ impl PolicySpec {
             headers: vec![],
             ttl_s: 14_400,
             sweep_s: 60,
-            assignment: Assignment::Delegate,
+            assignment: Assignment::Random,
             inflight_cap: u16::MAX,
             issue_session_id: false,
             recovery: Recovery::Original,
@@ -2495,8 +2530,14 @@ impl PolicySpec {
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
         let mut profiles = Vec::with_capacity(self.profiles.len());
+        // Noted by name: the built vector lines up with the document's
+        // positions only once nothing is deferred.
+        let mut by_assignment = Vec::new();
         for (name, profile) in &self.profiles {
             if let Some(built) = check_profile(name, profile, &self.view, &mut deferred)? {
+                if built.picker.by_assignment() {
+                    by_assignment.push(name.as_str());
+                }
                 profiles.push(built);
             }
         }
@@ -2518,6 +2559,7 @@ impl PolicySpec {
                 view: &self.view,
                 denied: denied_headers,
                 profiles: &positions,
+                by_assignment: &by_assignment,
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 bindings.push(built);
@@ -3491,12 +3533,116 @@ mod tests {
         }
     }
 
+    /// One profile for every assignment: the `manual` preset's picker
+    /// leaves the placement to the binding's rule, the rule names the
+    /// classic default, and each other assignment is that one field and
+    /// validates. The recorded rows hold where each one places. The built
+    /// engine answers each rule with the assignment the document names:
+    /// under this picker it places a `delegate` by the fewest in flight,
+    /// and a reader of the binding still reads `delegate`.
+    #[test]
+    fn the_manual_preset_is_one_profile_for_every_assignment() {
+        let mut spec = PolicySpec::preset("manual").expect("the preset");
+        let pick = spec.profiles.get("manual").map(|p| p.pick.name());
+        assert_eq!(pick, Some("manual"));
+        let default = spec
+            .bindings
+            .first()
+            .and_then(|b| b.sessions.as_ref())
+            .map(|rule| rule.assignment);
+        assert_eq!(default, Some(Assignment::Random), "the classic default");
+        for assignment in [
+            Assignment::Random,
+            Assignment::MinLoad,
+            Assignment::MinGroup,
+            Assignment::Delegate,
+        ] {
+            let rule = spec
+                .bindings
+                .first_mut()
+                .and_then(|b| b.sessions.as_mut())
+                .expect("the preset's sessions rule");
+            rule.assignment = assignment;
+            let engine = spec.validate().expect("every assignment validates");
+            assert_eq!(
+                engine.needs().active_sessions,
+                assignment == Assignment::MinGroup,
+                "{assignment:?}"
+            );
+            let read_back = engine
+                .binding("m", Phase::Single)
+                .and_then(|binding| binding.sessions)
+                .map(|rule| rule.assignment);
+            assert_eq!(read_back, Some(assignment), "read back as declared");
+        }
+    }
+
+    /// The `manual` preset's whole rule, as the gateway's keyed policy runs
+    /// today: the routing-key header as the session key and the view's one
+    /// header, no header list of the rule's own, four hours of idle time
+    /// swept each minute, a random assignment, no in-flight cap, no session
+    /// id issued, the first worker back in the lead.
+    #[test]
+    fn the_manual_preset_states_its_whole_rule() {
+        let spec = PolicySpec::preset("manual").expect("the preset");
+        let rule = spec
+            .bindings
+            .first()
+            .and_then(|b| b.sessions.as_ref())
+            .expect("the preset's sessions rule");
+        assert_eq!(
+            *rule,
+            SessionsSpec {
+                sticky_header: "x-smg-routing-key".into(),
+                headers: vec![],
+                ttl_s: 14_400,
+                sweep_s: 60,
+                assignment: Assignment::Random,
+                inflight_cap: u16::MAX,
+                issue_session_id: false,
+                recovery: Recovery::Original,
+            }
+        );
+        assert_eq!(spec.view.headers, ["x-smg-routing-key"]);
+    }
+
+    /// The manual picker places by a sessions rule, and a rule runs under
+    /// the single plan alone: on a side of a pair or of `epd` the profile is
+    /// refused, with the side that names it. The built picker answers, so
+    /// any picker that leaves the placement to the rule is refused the same
+    /// way.
+    #[test]
+    fn the_manual_picker_outside_the_single_plan_is_not_in_this_build() {
+        let spec = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
+        );
+        assert_eq!(
+            not_in_build(&spec),
+            (
+                "bindings[0].profiles.decode".to_string(),
+                "a picker that places by the sessions rule outside the single plan"
+            )
+        );
+        let epd = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"epd","profiles":{"encode":"sticky","prefill":"q","decode":"q"}}]}"#,
+        );
+        assert_eq!(
+            not_in_build(&epd),
+            (
+                "bindings[0].profiles.encode".to_string(),
+                "a picker that places by the sessions rule outside the single plan"
+            )
+        );
+        // Under the single plan the same profile validates, here with no
+        // rule; the preset is the profile with one.
+        let single = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
+        );
+        assert!(single.validate().is_ok());
+    }
+
     #[test]
     fn the_pickers_of_v1_resolve_or_are_refused_by_name() {
-        assert_eq!(
-            not_in_build(&spec_with_pick(r#""manual""#)),
-            ("profiles.p.pick".to_string(), "the manual picker")
-        );
         assert_eq!(
             bad_field(&spec_with_pick(r#""best-with-temperature""#)),
             "profiles.p.pick"
@@ -3534,6 +3680,16 @@ mod tests {
                 "{name}"
             );
         }
+        // The manual picker leaves the placement to the binding's rule: no
+        // scorer of its profile would ever run, so one is refused by name.
+        match spec_with_pick(r#""manual""#).validate() {
+            Err(SpecError::PickerRunsNoScorer { profile, picker }) => {
+                assert_eq!((profile.as_str(), picker.as_str()), ("p", "manual"));
+            }
+            other => panic!("a scorer beside the manual picker validated as {other:?}"),
+        }
+        let alone = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"manual"}}}"#);
+        assert!(alone.validate().is_ok());
     }
 
     #[test]

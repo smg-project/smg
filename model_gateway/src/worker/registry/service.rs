@@ -31,7 +31,7 @@ use crate::{
         registry::WorkerId,
         Worker, WorkerRegistry, WorkerType,
     },
-    workflow::{Job, JobQueue, WorkerRegistrationMode},
+    workflow::{steps::local::find_workers_by_url, Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -872,14 +872,48 @@ impl WorkerService {
             }
         }
 
+        // The removal is pinned to the worker this DELETE named, by the id
+        // of the request itself, and to the rest of its group by theirs, at
+        // no revision, as the removal step's guard reads it: a worker
+        // rebuilt under its id before the removal runs (a PATCH or a PUT
+        // answered earlier and still in flight, a label refresh) is the one
+        // this DELETE named and goes; a worker registered under a fresh id
+        // since is not and stays. A revision pin held the removal behind
+        // the job that moves the revision and then skipped the worker,
+        // every time.
+        let mut entries = find_workers_by_url(&self.worker_registry, &url)
+            .into_iter()
+            .filter_map(|worker| {
+                let id = self.worker_registry.get_id_by_url(worker.url())?;
+                Some((id.as_str().to_string(), None))
+            })
+            .collect::<HashMap<String, Option<u64>>>();
+        // The named worker's own id, not one read back through the URL: a
+        // registration landing at the URL between the two reads is not this
+        // request's to remove.
+        entries.insert(worker_id.as_str().to_string(), None);
         let job = Job::RemoveWorker {
             url: url.clone(),
-            expected_revisions: None,
+            expected_revisions: Some(entries),
         };
+        // One removal per URL at a time: a registration's own end queues one
+        // for the workers it registered and did not finish, and a repeated
+        // DELETE would queue another; the second would find the worker
+        // draining and remove it without the drain wait the first sits out.
+        // The removal in flight holds the URL; this DELETE's removal is kept
+        // and runs on its heels (`run_kept`), after it and never beside it.
+        // A repeated DELETE's removal finds nothing left then; one behind a
+        // guarded cleanup that skipped a worker replaced since the cleanup's
+        // snapshot removes that worker, where a DELETE answered by the
+        // cleanup alone removed nothing. The queue keeps one job of each
+        // kind per URL; a label refresh is kept the same way
+        // (`submit_label_refresh`) and runs after a kept removal: the worker
+        // it would refresh may be the one leaving, or the one a guarded
+        // removal leaves standing.
         job_queue
-            .submit(job)
+            .submit_or_defer(job)
             .await
-            .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+            .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
 
         Ok(DeleteWorkerResult { worker_id, url })
     }
@@ -1058,6 +1092,39 @@ mod tests {
             .expect_err("mixed-case scheme must be rejected at the boundary");
 
         assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+    }
+
+    /// A worker URL that ends in `@` and digits is refused with a 400 and
+    /// its reason: every line would name a rank of the host before the
+    /// digits while the probe dialled the digits as the host. The answer
+    /// shows the scheme of the address and no other part: the last two are
+    /// a token alone, and a user with a password of digits, which the
+    /// gateway's own rendering reads as a host and writes whole.
+    #[tokio::test]
+    async fn create_worker_refuses_an_address_read_two_ways() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+        for url in [
+            "http://127.0.0.1:35099@2130706433",
+            "http://user:s3cret@127.0.0.1:52605@2130706433",
+            "grpc://127.0.0.1:61845@2130706433",
+            "http://s3cret-token@8080",
+            "http://s3cret-user:8080@2130706433",
+        ] {
+            let err = service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err(url);
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{url}");
+            let WorkerServiceError::BadRequest { message } = err else {
+                panic!("expected a bad request, got {err}");
+            };
+            assert!(
+                message.contains("cannot end in '@' and digits"),
+                "{url}: {message}"
+            );
+            assert!(!message.contains("s3cret"), "{url}: {message}");
+        }
     }
 
     #[tokio::test]
@@ -1329,6 +1396,52 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// A DELETE behind a removal in flight for its URL keeps its removal for
+    /// that removal's end (`run_kept`), where before it was answered by the
+    /// removal in flight alone: a guarded cleanup (the entries a
+    /// registration's end saw) skips a worker replaced since its snapshot,
+    /// and a DELETE answered by it removed nothing.
+    #[tokio::test]
+    async fn a_delete_behind_a_removal_in_flight_keeps_its_removal() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "http://10.0.0.7:8000";
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        // A queue that accepts jobs and never runs one: no slot to run one in.
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(Arc::clone(&queue)).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("served"))
+            .build();
+        let id = registry
+            .register(Arc::new(worker))
+            .expect("the worker registers");
+        // The cleanup removal of a registration's end, pinned to the entry it
+        // saw, holds the URL.
+        let cleanup = Job::RemoveWorker {
+            url: url.to_string(),
+            expected_revisions: Some(HashMap::from([(id.as_str().to_string(), Some(1))])),
+        };
+        assert!(queue.claim_if_idle(&cleanup), "the cleanup holds the URL");
+        let deleted = service
+            .delete_worker(id.as_str())
+            .await
+            .expect("the DELETE is admitted");
+        assert_eq!(deleted.worker_id, id);
+        assert!(
+            queue.kept_for(url),
+            "the DELETE's removal is kept for the removal in flight to run on its heels"
+        );
     }
 
     /// The status, the body and the Retry-After header of an error's answer.

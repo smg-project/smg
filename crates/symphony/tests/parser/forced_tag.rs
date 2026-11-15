@@ -36,6 +36,11 @@ const KNOWN_GAPS: &[(Table, Gap, &str)] = &[
         Gap::OpenThoughtAtFirstToken,
         "the thought is a message of its own, and the tag finds no close of it to write before the call",
     ),
+    (
+        Table::Inkling2,
+        Gap::OpenThoughtAtFirstToken,
+        "Inkling's rows: the thought is a message of its own, and the tag finds no close of it to write before the call",
+    ),
 ];
 
 fn tool(name: &str, parameters: serde_json::Value) -> Tool {

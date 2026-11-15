@@ -69,7 +69,7 @@
 //!   progress, or with a record that shows the engine producing again while
 //!   this gateway has no silent pile of its own. The requests counted are the
 //!   tracked ones, streaming generations to the worker over gRPC, whose
-//!   responses the gateway sees one by one ([`Worker::tracked_load`]): an
+//!   responses the gateway sees one by one ([`WorkerRuntime::tracked_load`]): an
 //!   HTTP worker, a PD side or a non-streaming generation gives no signal
 //!   between dispatch and completion, so it never forms a pile and is never
 //!   judged by one; a non-streaming generation's one answer is progress all
@@ -78,11 +78,11 @@
 //!   the first dispatch of a run of
 //!   tracked requests, never at registration, and the bound is the
 //!   configured threshold or, if longer, the time the engine may still need
-//!   to prefill what is in flight ([`Worker::prefill_backlog`]): a batch that
+//!   to prefill what is in flight ([`WorkerRuntime::prefill_backlog`]): a batch that
 //!   is all in prefill streams nothing and is not wedged. The bound is the
 //!   cap outright ([`COLD_SHAPE_GRACE`]) while the worker is on a prompt
 //!   longer than any it has answered, once it has answered one
-//!   ([`Worker::prefill_cold_shape`]): an engine meeting a shape it has not
+//!   ([`WorkerRuntime::prefill_cold_shape`]): an engine meeting a shape it has not
 //!   run may build a kernel for it first, a minute of silence on the engines
 //!   we know, with nothing on any wire to tell it from a freeze (the
 //!   servicer's record flows through both, its health answers through
@@ -174,7 +174,7 @@ const WEDGE_PILE: usize = 4;
 const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
 
 /// The wedge bound while a worker is on a prompt longer than any it has
-/// answered ([`Worker::prefill_cold_shape`]): the cap, outright. An engine
+/// answered ([`WorkerRuntime::prefill_cold_shape`]): the cap, outright. An engine
 /// meeting a shape it has not run may build a kernel for it first, a minute
 /// of silence with nothing on the wire to tell it from a freeze, so the
 /// gateway gives the shape the most the prefill stretch could, and a real
@@ -185,20 +185,25 @@ const COLD_SHAPE_GRACE: Duration = WEDGE_BOUND_CAP;
 /// the engine may still need before the first token of its in-flight prompts
 /// is due, or the cold-shape grace while one of them is longer than any the
 /// worker has answered, whichever is longest.
-fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
-    wedge_bound_given(worker, wedge, cold_shape_grace(worker, 0))
+fn wedge_bound(state: Option<&WorkerRuntime>, wedge: Duration) -> Duration {
+    wedge_bound_given(state, wedge, cold_shape_grace(state, 0))
 }
 
 /// [`wedge_bound`] at the given cold-shape `grace`.
-fn wedge_bound_given(worker: &Arc<dyn Worker>, wedge: Duration, grace: Duration) -> Duration {
-    bound_over(wedge, worker.prefill_backlog().max(grace))
+fn wedge_bound_given(state: Option<&WorkerRuntime>, wedge: Duration, grace: Duration) -> Duration {
+    bound_over(
+        wedge,
+        state
+            .map_or(Duration::ZERO, WorkerRuntime::prefill_backlog)
+            .max(grace),
+    )
 }
 
 /// The cold-shape grace for `worker` with `extra` more prompt tokens about
 /// to be dispatched: [`COLD_SHAPE_GRACE`] while the worker is on a prompt
 /// longer than any it has answered, zero otherwise.
-fn cold_shape_grace(worker: &Arc<dyn Worker>, extra: u64) -> Duration {
-    if worker.prefill_cold_shape(extra) {
+fn cold_shape_grace(state: Option<&WorkerRuntime>, extra: u64) -> Duration {
+    if state.is_some_and(|state| state.prefill_cold_shape(extra)) {
         COLD_SHAPE_GRACE
     } else {
         Duration::ZERO
@@ -214,7 +219,7 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
 /// How long a disaggregated prefill side of `prompt_tokens` dispatched to
 /// `worker` now may produce nothing before its request gives up on it: the
 /// wedge rule's bound, with the side's own prompt behind what the worker is
-/// already prefilling ([`Worker::prefill_eta`]) at twice the time the
+/// already prefilling ([`WorkerRuntime::prefill_eta`]) at twice the time the
 /// worker's rate gives, as the engine-reported rule allows for the prefill
 /// in hand ([`silence_allowance`]): the rate is an estimate, the answer can
 /// come an engine step after the prefill (a TokenSpeed prefill worker
@@ -255,7 +260,7 @@ fn prefill_side_bound_with(
 /// request with the silence verdict at the 3 s threshold, and both in about
 /// a second once warm). The grace is what is left of it against the time
 /// the worker's prompts have gone unanswered
-/// ([`Worker::prefill_unanswered_total`]), as a side on a cold shape gets
+/// ([`WorkerRuntime::prefill_unanswered_total`]), as a side on a cold shape gets
 /// what is left of the grace since its dispatch
 /// ([`prefill_side_reprieve`]): the sides of a cold burst share one deadline
 /// about the grace after the run began, and a worker given up on without an
@@ -276,11 +281,14 @@ fn prefill_side_bound_behind_encode_with(
     prompt_tokens: u64,
     wedge: Duration,
 ) -> Option<Duration> {
+    let state = worker.runtime_state();
+    let state = state.as_deref();
     let grace = match worker.prefill_answered_ago() {
-        None => COLD_SHAPE_GRACE.saturating_sub(worker.prefill_unanswered_total()),
-        Some(_) => cold_shape_grace(worker, prompt_tokens),
+        None => COLD_SHAPE_GRACE
+            .saturating_sub(state.map_or(Duration::ZERO, WorkerRuntime::prefill_unanswered_total)),
+        Some(_) => cold_shape_grace(state, prompt_tokens),
     };
-    side_bound_given(worker, prompt_tokens, wedge, 2, grace)
+    side_bound_given(state, prompt_tokens, wedge, 2, grace)
 }
 
 /// A side's bound at the given wedge threshold: the threshold, `times` the
@@ -293,25 +301,29 @@ fn side_bound_with(
     wedge: Duration,
     times: u32,
 ) -> Option<Duration> {
+    let state = worker.runtime_state();
+    let state = state.as_deref();
     side_bound_given(
-        worker,
+        state,
         prompt_tokens,
         wedge,
         times,
-        cold_shape_grace(worker, prompt_tokens),
+        cold_shape_grace(state, prompt_tokens),
     )
 }
 
 /// [`side_bound_with`] at the given cold-shape `grace`.
 fn side_bound_given(
-    worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
     prompt_tokens: u64,
     wedge: Duration,
     times: u32,
     grace: Duration,
 ) -> Option<Duration> {
     (!wedge.is_zero()).then(|| {
-        let eta = worker.prefill_eta(prompt_tokens).saturating_mul(times);
+        let eta = state
+            .map_or(Duration::ZERO, |state| state.prefill_eta(prompt_tokens))
+            .saturating_mul(times);
         bound_over(wedge, eta.max(grace))
     })
 }
@@ -415,7 +427,7 @@ impl SideReprieve {
 /// has shown no silence before the run began, and the side dispatched first
 /// to its empty book has a short bound while the engine may well serve the
 /// burst booked behind it first. Past the rule above, its side waits until
-/// the run has gone unanswered ([`Worker::prefill_unanswered_run`]) for the
+/// the run has gone unanswered ([`WorkerRuntime::prefill_unanswered_run`]) for the
 /// time the worker's backlog takes at its prefill rate, capped
 /// ([`backlog_bound`]). That backlog is read once, the first time the rule
 /// above gives up on the side, and kept in `backlog`, so prompts that go on
@@ -429,17 +441,19 @@ pub(crate) fn prefill_side_reprieve(
     dispatched_ago: Duration,
     backlog: &OnceLock<Duration>,
 ) -> SideReprieve {
+    let state = worker.runtime_state();
+    let state = state.as_deref();
     side_reprieve(
-        cold_shape_grace(worker, 0),
+        cold_shape_grace(state, 0),
         answered_or_handed_off(
             worker.prefill_answered_ago(),
             worker.prefill_handed_off_ago(),
             bound,
             dispatched_ago,
         ),
-        worker.prefill_unanswered_run(),
+        state.and_then(WorkerRuntime::prefill_unanswered_run),
         bound,
-        || *backlog.get_or_init(|| backlog_bound(worker)),
+        || *backlog.get_or_init(|| backlog_bound(state)),
         dispatched_ago,
     )
 }
@@ -479,8 +493,10 @@ fn answered_or_handed_off(
 /// a side's bound counts its prompt's: it only ever lengthens a side's
 /// window past that bound, and a run that never answers is how a frozen
 /// worker looks, whose sides twice the backlog would hold twice as long.
-fn backlog_bound(worker: &Arc<dyn Worker>) -> Duration {
-    worker.prefill_backlog().min(WEDGE_BOUND_CAP)
+fn backlog_bound(state: Option<&WorkerRuntime>) -> Duration {
+    state
+        .map_or(Duration::ZERO, WorkerRuntime::prefill_backlog)
+        .min(WEDGE_BOUND_CAP)
 }
 
 /// [`prefill_side_reprieve`] for a side of `bound` on a worker under a
@@ -742,11 +758,15 @@ pub(crate) fn is_connection_code(code: tonic::Code) -> bool {
 /// worker promoted on one of those takes requests its engine is not ready
 /// for.
 pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
-    worker.note_contact();
+    let state = worker.runtime_state();
+    let state = state.as_deref();
+    if let Some(state) = state {
+        state.note_contact();
+    }
     if worker.stall_reason() != Some(StallReason::Unreachable) {
         return;
     }
-    set(worker, None, "contact");
+    set(worker, state, None, "contact");
     if matches!(
         worker.status(),
         WorkerStatus::NotReady | WorkerStatus::Failed
@@ -762,9 +782,13 @@ pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
 /// probe that short-circuited it would make one passing probe out of a
 /// flapping engine's run a return to service.
 pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
-    worker.note_contact();
+    let state = worker.runtime_state();
+    let state = state.as_deref();
+    if let Some(state) = state {
+        state.note_contact();
+    }
     if worker.stall_reason() == Some(StallReason::Unreachable) {
-        set(worker, None, "probe");
+        set(worker, state, None, "probe");
     }
 }
 
@@ -786,12 +810,19 @@ pub(crate) fn on_contact_failed(worker: &Arc<dyn Worker>, what: &'static str) {
 
 /// [`on_contact_failed`] at the given stall threshold.
 fn on_contact_failed_with(worker: &Arc<dyn Worker>, what: &'static str, stall: Duration) {
-    worker.note_transport_failure();
+    let state = worker.runtime_state();
+    let state = state.as_deref();
+    if let Some(state) = state {
+        state.note_transport_failure();
+    }
     if worker.stall_reason() == Some(StallReason::Unreachable) {
         return;
     }
-    if stalled(worker.contact_age(), stall) {
-        set(worker, Some(StallReason::Unreachable), what);
+    if stalled(
+        state.map_or(Duration::ZERO, WorkerRuntime::contact_age),
+        stall,
+    ) {
+        set(worker, state, Some(StallReason::Unreachable), what);
     }
 }
 
@@ -805,13 +836,20 @@ pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
 
 /// [`sweep`] at the given thresholds.
 fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale: Duration) {
-    let load = worker.tracked_load();
-    let previous_load = worker.swap_load_sample(load);
-    let contact_age = worker.contact_age();
-    let silent_after_failure = worker.transport_failure_pending() && stalled(contact_age, stall);
+    let state = worker.runtime_state();
+    let state = state.as_deref();
+    let load = state.map_or(0, WorkerRuntime::tracked_load);
+    let previous_load = state.map_or(0, |state| state.swap_load_sample(load));
+    let contact_age = state.map_or(Duration::ZERO, WorkerRuntime::contact_age);
+    let silent_after_failure =
+        state.is_some_and(WorkerRuntime::transport_failure_pending) && stalled(contact_age, stall);
     // The stream that pushed this worker's load records has gone quiet, and
     // so has everything else: unreachability the transport has not reported.
-    let records_stopped = records_stopped(worker.pushes_load_records(), contact_age, stale);
+    let records_stopped = records_stopped(
+        state.is_some_and(WorkerRuntime::pushes_load_records),
+        contact_age,
+        stale,
+    );
     match worker.stall_reason() {
         Some(StallReason::Unreachable) => return,
         Some(StallReason::Wedged) => {
@@ -825,19 +863,21 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
             if silent_after_failure {
                 set(
                     worker,
+                    state,
                     Some(StallReason::Unreachable),
                     "silent since a transport failure",
                 );
             } else if records_stopped {
                 set(
                     worker,
+                    state,
                     Some(StallReason::Unreachable),
                     "load records stopped",
                 );
-            } else if load == 0 && !worker.engine_stalled() {
+            } else if load == 0 && !state.is_some_and(WorkerRuntime::engine_stalled) {
                 // (Unless the engine's own record still says it is stuck:
                 // then the evidence is the engine's, not this pile's.)
-                set(worker, None, "drained");
+                set(worker, state, None, "drained");
             }
             return;
         }
@@ -846,6 +886,7 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
     if silent_after_failure {
         set(
             worker,
+            state,
             Some(StallReason::Unreachable),
             "silent since a transport failure",
         );
@@ -854,6 +895,7 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
     if records_stopped {
         set(
             worker,
+            state,
             Some(StallReason::Unreachable),
             "load records stopped",
         );
@@ -866,12 +908,13 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
         && wedged_by_pile(
             load,
             previous_load,
-            worker.token_progress_age(),
-            wedge_bound(worker, wedge),
+            state.map_or(Duration::ZERO, WorkerRuntime::token_progress_age),
+            wedge_bound(state, wedge),
         )
     {
         set(
             worker,
+            state,
             Some(StallReason::Wedged),
             "in-flight requests pile up without progress",
         );
@@ -882,21 +925,25 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
 /// (a stamp the caller read once for this note and the others of the same
 /// message): progress clears any veto.
 pub(crate) fn on_token_progress_at(worker: &Arc<dyn Worker>, now_ms: u64) {
-    worker.note_token_progress_at(now_ms);
+    let state = worker.runtime_state();
+    let state = state.as_deref();
+    if let Some(state) = state {
+        state.note_token_progress_at(now_ms);
+    }
     if worker.stall_reason().is_some() {
-        set(worker, None, "progress");
+        set(worker, state, None, "progress");
     }
 }
 
 /// [`on_token_progress_at`] for a stream that captured its worker's runtime
-/// at its start (see [`Worker::liveness_runtime`]): the note and the veto
+/// at its start (see [`Worker::runtime_state`]): the note and the veto
 /// read go to the runtime directly, without the worker's runtime load and
 /// its dispatch for every token; a veto is cleared through the worker as
 /// before.
 pub(crate) fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, now_ms: u64) {
     runtime.note_token_progress_at(now_ms);
     if runtime.stall_reason().is_some() {
-        set(worker, None, "progress");
+        set(worker, Some(runtime), None, "progress");
     }
 }
 
@@ -941,7 +988,9 @@ fn on_load_report_with(
     engine_prefill_pending: Option<u64>,
     wedge: Duration,
 ) {
-    let previous = worker.swap_waiting_reqs(waiting);
+    let state = worker.runtime_state();
+    let state = state.as_deref();
+    let previous = state.map_or(0, |state| state.swap_waiting_reqs(waiting));
     // The grace of a cold shape arms no veto and lifts none: a worker vetoed
     // before the longer prompt reached it is judged as before until it
     // produces, so the grace never reads as the engine producing again.
@@ -949,9 +998,9 @@ fn on_load_report_with(
     let grace = if standing {
         Duration::ZERO
     } else {
-        cold_shape_grace(worker, 0)
+        cold_shape_grace(state, 0)
     };
-    let bound = wedge_bound_given(worker, wedge, grace);
+    let bound = wedge_bound_given(state, wedge, grace);
     // Nor does the prefill allowance lift one, on either wire: a long prompt
     // that reaches a vetoed worker (a veto steers, it never refuses)
     // stretches the servicer's pending figure, and must not read as the
@@ -961,7 +1010,7 @@ fn on_load_report_with(
     let allowance = if standing {
         Some(wedge)
     } else {
-        silence_allowance(worker, wedge, engine_prefill_pending, engine_reports_steps)
+        silence_allowance(state, wedge, engine_prefill_pending, engine_reports_steps)
     };
     let engine_stalled = engine_stalled(
         engine_silence,
@@ -970,20 +1019,25 @@ fn on_load_report_with(
         allowance,
         grace,
     );
-    worker.note_engine_stall(engine_stalled);
+    if let Some(state) = state {
+        state.note_engine_stall(engine_stalled);
+    }
     match worker.stall_reason() {
         Some(StallReason::Wedged) => {
             // A clock that restarted with this gateway's first dispatch is
             // not progress while the engine still reports silence: a token
             // clears that veto through `on_token_progress`.
-            if !engine_stalled && worker.token_progress_age() < wedge {
-                set(worker, None, "progress");
+            if !engine_stalled
+                && state.map_or(Duration::ZERO, WorkerRuntime::token_progress_age) < wedge
+            {
+                set(worker, state, None, "progress");
             } else if !engine_stalled
-                && (worker.tracked_load() == 0 || worker.token_progress_age() < bound)
+                && (state.map_or(0, WorkerRuntime::tracked_load) == 0
+                    || state.map_or(Duration::ZERO, WorkerRuntime::token_progress_age) < bound)
             {
                 // The engine produces again and this gateway holds no silent
                 // pile of its own on it: whatever armed the veto is over.
-                set(worker, None, "engine output resumed");
+                set(worker, state, None, "engine output resumed");
             }
         }
         Some(StallReason::Unreachable) => {}
@@ -991,20 +1045,22 @@ fn on_load_report_with(
             if engine_stalled {
                 set(
                     worker,
+                    state,
                     Some(StallReason::Wedged),
                     "the engine reports no output for its in-flight requests",
                 );
             } else if !wedge.is_zero()
                 && wedged_by_queue(
-                    worker.tracked_load(),
+                    state.map_or(0, WorkerRuntime::tracked_load),
                     waiting,
                     previous,
-                    worker.token_progress_age(),
+                    state.map_or(Duration::ZERO, WorkerRuntime::token_progress_age),
                     bound,
                 )
             {
                 set(
                     worker,
+                    state,
                     Some(StallReason::Wedged),
                     "no progress with a waiting queue",
                 );
@@ -1064,13 +1120,13 @@ fn engine_stalled(
 /// the same); a standing veto is judged without the allowance (see
 /// [`on_load_report`]).
 fn silence_allowance(
-    worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
     wedge: Duration,
     engine_prefill_pending: Option<u64>,
     reports_steps: bool,
 ) -> Option<Duration> {
     let pending = engine_prefill_pending?;
-    let rate = match worker.prefill_rate_tps() {
+    let rate = match state.map_or(0, WorkerRuntime::prefill_rate_tps) {
         0 if reports_steps => COLD_PREFILL_TOKENS_PER_SEC,
         0 => return None,
         rate => rate,
@@ -1116,7 +1172,12 @@ fn wedged_by_pile(
         && (in_flight > previous_in_flight || in_flight >= WEDGE_PILE)
 }
 
-fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static str) {
+fn set(
+    worker: &Arc<dyn Worker>,
+    state: Option<&WorkerRuntime>,
+    reason: Option<StallReason>,
+    cause: &'static str,
+) {
     let previous = worker.stall_reason();
     if !worker.set_stall(reason) {
         return;
@@ -1127,7 +1188,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
                 worker_url = %worker.redacted_url(),
                 reason = reason.as_str(),
                 cause,
-                contact_age_ms = u64::try_from(worker.contact_age().as_millis()).unwrap_or(u64::MAX),
+                contact_age_ms = u64::try_from(state.map_or(Duration::ZERO, WorkerRuntime::contact_age).as_millis()).unwrap_or(u64::MAX),
                 "Worker vetoed by liveness"
             );
             // A veto that changes reason (wedged, then unreachable once its
@@ -1138,13 +1199,17 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
             // The channel the engine's silence came on is gone with the
             // transport; the next record speaks for the engine again.
             if reason == StallReason::Unreachable {
-                worker.note_engine_stall(false);
+                if let Some(state) = state {
+                    state.note_engine_stall(false);
+                }
             }
             Metrics::set_worker_stalled(worker.url(), reason.as_str(), true);
         }
         None => {
             info!(worker_url = %worker.redacted_url(), cause, "Worker re-admitted by liveness");
-            worker.note_admitted();
+            if let Some(state) = state {
+                state.note_admitted();
+            }
             if let Some(previous) = previous {
                 // The outage's connection failures opened the circuit breaker
                 // as well, and it would hold the worker out of routing for
@@ -1189,7 +1254,11 @@ mod tests {
         w.note_prefill_ended_at(95, true, None, t0 + 120_000);
         w.note_prefill_started_at(95, true, t0 + 120_000);
         w.note_prefill_ended_at(95, true, Some(0), t0 + 121_000);
-        assert_eq!(w.prefill_rate_tps(), 95, "the answer's own rate");
+        assert_eq!(
+            w.runtime_state().unwrap().prefill_rate_tps(),
+            95,
+            "the answer's own rate"
+        );
         assert_eq!(
             prefill_side_bound_with(&w, 95, DEFAULT_WEDGE),
             Some(DEFAULT_WEDGE),
@@ -1357,9 +1426,9 @@ mod tests {
         thread::sleep(Duration::from_millis(15));
         for _ in 0..3 {
             w.increment_load();
-            w.note_tracked_started();
+            w.runtime_state().unwrap().note_tracked_started();
         }
-        let age = w.token_progress_age();
+        let age = w.runtime_state().unwrap().token_progress_age();
         assert!(
             age < Duration::from_millis(10),
             "clock started at the dispatch"
@@ -1387,8 +1456,10 @@ mod tests {
         for _ in 0..128 {
             w.increment_load();
         }
-        w.note_prefill_started(128 * 1_152, true);
-        let bound = wedge_bound(&w, DEFAULT_WEDGE);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(128 * 1_152, true);
+        let bound = wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE);
         assert_eq!(
             bound,
             Duration::from_millis(14_745),
@@ -1404,12 +1475,20 @@ mod tests {
         // The first tokens arrive: the backlog is gone and the bound is the
         // configured threshold again.
         w.note_prefill_ended(128 * 1_152, true, Some(0));
-        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
-        // The bound is capped against leaking books.
-        w.note_prefill_started(100_000_000, true);
-        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), WEDGE_BOUND_CAP);
         assert_eq!(
-            wedge_bound(&w, Duration::from_secs(600)),
+            wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
+            DEFAULT_WEDGE
+        );
+        // The bound is capped against leaking books.
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(100_000_000, true);
+        assert_eq!(
+            wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
+            WEDGE_BOUND_CAP
+        );
+        assert_eq!(
+            wedge_bound(w.runtime_state().as_deref(), Duration::from_secs(600)),
             Duration::from_secs(600),
             "a longer configured threshold stands"
         );
@@ -1423,8 +1502,10 @@ mod tests {
         for _ in 0..8 {
             w.increment_load();
         }
-        w.note_prefill_started(8 * 150, true);
-        let bound = wedge_bound(&w, DEFAULT_WEDGE);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(8 * 150, true);
+        let bound = wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE);
         assert_eq!(
             bound, DEFAULT_WEDGE,
             "0.12 s of prefill is inside the threshold"
@@ -1453,7 +1534,9 @@ mod tests {
             Some(Duration::from_millis(6_552)),
             "a 32k prompt on a cold worker"
         );
-        w.note_prefill_started(8 * 32_768, true);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(8 * 32_768, true);
         assert_eq!(
             prefill_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
             Some(Duration::from_millis(58_982)),
@@ -1494,7 +1577,9 @@ mod tests {
             Some(Duration::from_millis(3_276)),
             "a 32k prompt on a cold worker, where its prefill side has 6.552 s"
         );
-        w.note_prefill_started(8 * 32_768, true);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(8 * 32_768, true);
         assert_eq!(
             decode_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
             Some(Duration::from_millis(29_491)),
@@ -1537,7 +1622,7 @@ mod tests {
             let at = dispatched + waited;
             let waited = Duration::from_millis(waited);
             side_reprieve(
-                cold_shape_grace(&w, 0),
+                cold_shape_grace(w.runtime_state().as_deref(), 0),
                 answered_or_handed_off(
                     runtime.prefill_answered_ago_at(at),
                     runtime.prefill_handed_off_ago_at(at),
@@ -1546,7 +1631,7 @@ mod tests {
                 ),
                 runtime.prefill_unanswered_run_at(at),
                 bound,
-                || backlog_bound(&w),
+                || backlog_bound(w.runtime_state().as_deref()),
                 waited,
             )
         };
@@ -1596,7 +1681,7 @@ mod tests {
             },
             "a fresh worker has answered nothing"
         );
-        w.note_prefill_started(256, true);
+        w.runtime_state().unwrap().note_prefill_started(256, true);
         w.note_prefill_ended(256, true, Some(0));
         let standing = prefill_side_reprieve(&w, bound, Duration::ZERO, &OnceLock::new());
         assert!(
@@ -1751,7 +1836,9 @@ mod tests {
         // short side's bound. Its backlog is read once, at the cap here.
         let w = worker();
         for _ in 0..40 {
-            w.note_prefill_started(100_000, true);
+            w.runtime_state()
+                .unwrap()
+                .note_prefill_started(100_000, true);
         }
         let read = OnceLock::new();
         assert_eq!(
@@ -1764,7 +1851,9 @@ mod tests {
         // move it.
         let w = worker();
         for _ in 0..2 {
-            w.note_prefill_started(10_000, true);
+            w.runtime_state()
+                .unwrap()
+                .note_prefill_started(10_000, true);
         }
         let read = OnceLock::new();
         assert!(prefill_side_reprieve(&w, Duration::from_secs(1), bound, &read).past_bound());
@@ -1774,7 +1863,9 @@ mod tests {
             "20k at the cold prior"
         );
         for _ in 0..40 {
-            w.note_prefill_started(10_000, true);
+            w.runtime_state()
+                .unwrap()
+                .note_prefill_started(10_000, true);
         }
         assert!(prefill_side_reprieve(&w, Duration::from_secs(1), bound, &read).past_bound());
         assert_eq!(
@@ -1898,12 +1989,12 @@ mod tests {
         // The worker: a short side dispatched, then the longest prompt yet
         // behind it.
         let w = worker();
-        w.note_prefill_started(1_024, true);
+        w.runtime_state().unwrap().note_prefill_started(1_024, true);
         w.note_prefill_ended(1_024, true, Some(0));
-        w.note_prefill_started(512, true);
-        assert!(!w.prefill_cold_shape(0));
-        w.note_prefill_started(8_192, true);
-        assert!(w.prefill_cold_shape(0));
+        w.runtime_state().unwrap().note_prefill_started(512, true);
+        assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
+        w.runtime_state().unwrap().note_prefill_started(8_192, true);
+        assert!(w.runtime_state().unwrap().prefill_cold_shape(0));
         let late = COLD_SHAPE_GRACE - Duration::from_secs(1);
         assert_eq!(
             prefill_side_reprieve(&w, bound, late, &OnceLock::new()),
@@ -1912,7 +2003,7 @@ mod tests {
         );
         // The shape shown: the side is judged by the worker's answers again.
         w.note_prefill_ended(8_192, true, Some(0));
-        assert!(!w.prefill_cold_shape(0));
+        assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
         let standing = prefill_side_reprieve(&w, bound, late, &OnceLock::new());
         assert!(
             matches!(standing, SideReprieve::WithinBound(left) if left > Duration::from_secs(2)),
@@ -1947,7 +2038,7 @@ mod tests {
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
         assert!(w.stall_reason().is_none(), "never pushed");
         // The stream delivers a record: from here on silence counts.
-        w.note_load_record();
+        w.runtime_state().unwrap().note_load_record();
         on_contact(&w);
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
         assert!(w.stall_reason().is_none(), "just heard from");
@@ -1974,10 +2065,15 @@ mod tests {
     fn a_wedged_worker_whose_records_stop_becomes_unreachable() {
         let stale = Duration::from_millis(20);
         let w = worker();
-        w.note_load_record();
+        w.runtime_state().unwrap().note_load_record();
         w.increment_load();
-        w.note_tracked_started();
-        set(&w, Some(StallReason::Wedged), "test");
+        w.runtime_state().unwrap().note_tracked_started();
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Wedged),
+            "test",
+        );
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
         assert_eq!(
             w.stall_reason(),
@@ -1995,7 +2091,12 @@ mod tests {
     fn a_veto_removes_the_worker_from_routing_and_contact_restores_it() {
         let w = worker();
         assert!(w.stall_reason().is_none());
-        set(&w, Some(StallReason::Unreachable), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
         assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
         assert!(w.routing_state().stalled);
         assert!(!w.routing_state().eligible());
@@ -2019,7 +2120,12 @@ mod tests {
             !w.circuit_breaker_can_execute(),
             "the outage's failures opened the breaker"
         );
-        set(&w, Some(StallReason::Unreachable), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
         on_contact(&w);
         assert!(w.stall_reason().is_none());
         assert!(
@@ -2032,7 +2138,7 @@ mod tests {
     fn tracked_pile(w: &Arc<dyn Worker>, n: usize) {
         for _ in 0..n {
             w.increment_load();
-            w.note_tracked_started();
+            w.runtime_state().unwrap().note_tracked_started();
         }
     }
 
@@ -2055,7 +2161,7 @@ mod tests {
             w.stall_reason().is_none(),
             "a waiting queue without tracked requests is not a wedge either"
         );
-        assert_eq!(w.tracked_load(), 0);
+        assert_eq!(w.runtime_state().unwrap().tracked_load(), 0);
     }
 
     #[test]
@@ -2075,7 +2181,25 @@ mod tests {
             w.note_tracked_ended();
             w.decrement_load();
         }
-        assert_eq!(w.tracked_load(), 0);
+        assert_eq!(w.runtime_state().unwrap().tracked_load(), 0);
+    }
+
+    #[test]
+    fn a_silent_pile_is_a_wedge_while_the_worker_still_answers_its_probes() {
+        // The pile rule reads how long ago the worker last produced a
+        // response, never how long ago it was last heard from: an engine
+        // that passes its health probes and produces nothing for four
+        // streams is wedged all the same.
+        let w = worker();
+        tracked_pile(&w, 4);
+        thread::sleep(Duration::from_millis(30));
+        on_probe_passed(&w);
+        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(20), DEFAULT_STALE);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "a probe that passed is contact, not progress: the pile's silence stands"
+        );
     }
 
     #[test]
@@ -2118,11 +2242,11 @@ mod tests {
         let w = worker();
         w.increment_load();
         thread::sleep(Duration::from_millis(15));
-        assert!(w.token_progress_age() >= Duration::from_millis(15));
+        assert!(w.runtime_state().unwrap().token_progress_age() >= Duration::from_millis(15));
         w.increment_load();
-        w.note_tracked_started();
+        w.runtime_state().unwrap().note_tracked_started();
         assert!(
-            w.token_progress_age() < Duration::from_millis(10),
+            w.runtime_state().unwrap().token_progress_age() < Duration::from_millis(10),
             "the clock restarted with the tracked run"
         );
     }
@@ -2149,14 +2273,19 @@ mod tests {
         // at 48 s, and before this the worker never returned.
         let w = worker();
         tracked_pile(&w, 4);
-        set(&w, Some(StallReason::Wedged), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Wedged),
+            "test",
+        );
         on_contact_failed_with(&w, "kv stream", Duration::from_secs(600));
         assert_eq!(
             w.stall_reason(),
             Some(StallReason::Wedged),
             "heard from within the threshold: remembered, the wedge stands"
         );
-        assert!(w.transport_failure_pending());
+        assert!(w.runtime_state().unwrap().transport_failure_pending());
         thread::sleep(Duration::from_millis(5));
         on_contact_failed_with(&w, "kv stream", Duration::from_millis(1));
         assert_eq!(
@@ -2176,7 +2305,12 @@ mod tests {
     fn the_sweep_turns_a_wedged_worker_unreachable_once_silent_after_a_failure() {
         let w = worker();
         tracked_pile(&w, 4);
-        set(&w, Some(StallReason::Wedged), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Wedged),
+            "test",
+        );
         on_contact_failed_with(&w, "load poll", Duration::from_secs(600));
         sweep_with(&w, Duration::from_secs(600), DEFAULT_WEDGE, DEFAULT_STALE);
         assert_eq!(
@@ -2197,14 +2331,19 @@ mod tests {
         // ended in error, or the clients gave up.
         let w = worker();
         tracked_pile(&w, 4);
-        set(&w, Some(StallReason::Wedged), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Wedged),
+            "test",
+        );
         sweep(&w);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "still piled");
         for _ in 0..4 {
             w.note_tracked_ended();
             w.decrement_load();
         }
-        assert!(!w.transport_failure_pending());
+        assert!(!w.runtime_state().unwrap().transport_failure_pending());
         sweep(&w);
         assert!(
             w.stall_reason().is_none(),
@@ -2221,7 +2360,12 @@ mod tests {
     #[test]
     fn a_wedged_veto_survives_polls_and_ends_with_progress() {
         let w = worker();
-        set(&w, Some(StallReason::Wedged), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Wedged),
+            "test",
+        );
         on_contact(&w);
         assert_eq!(
             w.stall_reason(),
@@ -2323,7 +2467,12 @@ mod tests {
         let w = worker();
         thread::sleep(Duration::from_millis(20));
         let before = w.admitted_age();
-        set(&w, Some(StallReason::Unreachable), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
         on_contact(&w);
         assert!(
             w.admitted_age() < before,
@@ -2348,7 +2497,12 @@ mod tests {
         assert!(rx.try_recv().is_err(), "a Ready worker needs no promotion");
         // Demoted by its probes while its transport was gone: the first
         // contact is its return, promoted now.
-        set(&w, Some(StallReason::Unreachable), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
         w.set_status(WorkerStatus::NotReady);
         on_contact(&w);
         assert!(w.stall_reason().is_none());
@@ -2374,9 +2528,14 @@ mod tests {
     #[test]
     fn a_passing_probe_is_contact_but_never_a_promotion() {
         let (w, mut rx) = signalling_worker();
-        set(&w, Some(StallReason::Unreachable), "test");
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
         w.set_status(WorkerStatus::NotReady);
-        let runtime = w.liveness_runtime().expect("a BasicWorker runtime");
+        let runtime = w.runtime_state().expect("a BasicWorker runtime");
         let previous_contact = runtime.contact_stamp_ms_for_test();
         thread::sleep(Duration::from_millis(15));
         let before_probe = now_ms();
@@ -2401,11 +2560,11 @@ mod tests {
     #[test]
     fn a_failure_right_after_contact_is_a_blip() {
         let w = worker();
-        w.note_contact();
+        w.runtime_state().unwrap().note_contact();
         on_contact_failed(&w, "test");
         assert!(w.stall_reason().is_none());
         assert!(
-            w.transport_failure_pending(),
+            w.runtime_state().unwrap().transport_failure_pending(),
             "but it is remembered for the sweep"
         );
         sweep(&w);
@@ -2413,8 +2572,11 @@ mod tests {
             w.stall_reason().is_none(),
             "the sweep waits for the threshold"
         );
-        w.note_contact();
-        assert!(!w.transport_failure_pending(), "a contact forgets it");
+        w.runtime_state().unwrap().note_contact();
+        assert!(
+            !w.runtime_state().unwrap().transport_failure_pending(),
+            "a contact forgets it"
+        );
     }
 
     #[test]
@@ -2433,7 +2595,7 @@ mod tests {
         );
         on_load_report_with(&w, 0, Some(Duration::from_millis(1)), true, None, wedge);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
-        assert!(w.engine_stalled());
+        assert!(w.runtime_state().unwrap().engine_stalled());
         // This gateway's progress clock restarted with a dispatch after the
         // veto: not progress while the engine still reports its silence.
         on_load_report_with(&w, 0, Some(Duration::from_millis(2)), true, None, wedge);
@@ -2451,9 +2613,18 @@ mod tests {
     fn a_cold_worker_on_a_step_reporting_wire_is_judged_from_the_cold_prior() {
         let w = worker();
         tracked_pile(&w, 1);
-        assert_eq!(w.prefill_rate_tps(), 0, "no rate shown yet");
         assert_eq!(
-            silence_allowance(&w, DEFAULT_WEDGE, Some(2_048), true),
+            w.runtime_state().unwrap().prefill_rate_tps(),
+            0,
+            "no rate shown yet"
+        );
+        assert_eq!(
+            silence_allowance(
+                w.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                Some(2_048),
+                true
+            ),
             Some(DEFAULT_WEDGE),
             "0.4 s of prefill at the prior is inside the threshold"
         );
@@ -2470,7 +2641,12 @@ mod tests {
         tracked_pile(&long, 1);
         // 150k tokens at the prior's 10k tokens/s: 15 s of prefill, 30 s allowed.
         assert_eq!(
-            silence_allowance(&long, DEFAULT_WEDGE, Some(150_000), true),
+            silence_allowance(
+                long.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                Some(150_000),
+                true
+            ),
             Some(Duration::from_secs(30))
         );
         on_load_report_with(
@@ -2520,8 +2696,10 @@ mod tests {
         // this gateway has booked on the worker.
         let w = worker();
         tracked_pile(&w, 1);
-        w.note_prefill_started(128 * 1_152, true);
-        assert!(wedge_bound(&w, DEFAULT_WEDGE) > Duration::from_secs(10));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(128 * 1_152, true);
+        assert!(wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE) > Duration::from_secs(10));
         on_load_report_with(
             &w,
             0,
@@ -2583,20 +2761,24 @@ mod tests {
     fn a_step_reporting_engines_silence_is_judged_against_the_servicers_pending_prefill() {
         let w = worker();
         // The length answered before: no cold-shape grace on the next.
-        w.note_prefill_started(156_752, false);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(156_752, false);
         w.note_prefill_ended(156_752, false, Some(0));
         assert_eq!(
-            w.prefill_rate_tps(),
+            w.runtime_state().unwrap().prefill_rate_tps(),
             0,
             "a non-streaming generation times no prefill"
         );
-        w.note_prefill_started(156_752, false);
-        assert!(!w.prefill_cold_shape(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(156_752, false);
+        assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
         let pending = Some(156_752);
         // 156,752 tokens at the prior's 10k tokens/s: 15.7 s of prefill,
         // 31.4 s allowed.
         assert_eq!(
-            silence_allowance(&w, DEFAULT_WEDGE, pending, true),
+            silence_allowance(w.runtime_state().as_deref(), DEFAULT_WEDGE, pending, true),
             Some(Duration::from_millis(31_350))
         );
         for secs in [3, 10, 31] {
@@ -2640,15 +2822,28 @@ mod tests {
         }
         let measured: Arc<dyn Worker> = Arc::new(measured);
         assert_eq!(
-            silence_allowance(&measured, DEFAULT_WEDGE, pending, true),
+            silence_allowance(
+                measured.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                pending,
+                true
+            ),
             Some(Duration::from_millis(15_675))
         );
         // A frozen engine with a short prompt pending: the threshold, as
         // before.
         let frozen = worker();
-        frozen.note_prefill_started(200, false);
+        frozen
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(200, false);
         assert_eq!(
-            silence_allowance(&frozen, DEFAULT_WEDGE, Some(200), true),
+            silence_allowance(
+                frozen.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                Some(200),
+                true
+            ),
             Some(DEFAULT_WEDGE)
         );
         on_load_report_with(
@@ -2683,7 +2878,12 @@ mod tests {
         assert_eq!(decoding.stall_reason(), Some(StallReason::Wedged));
         // The cap holds on this wire too.
         assert_eq!(
-            silence_allowance(&w, DEFAULT_WEDGE, Some(100_000_000), true),
+            silence_allowance(
+                w.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                Some(100_000_000),
+                true
+            ),
             Some(WEDGE_BOUND_CAP)
         );
     }
@@ -2723,12 +2923,20 @@ mod tests {
         // Sixteen prompts of the length it has answered: a shape it has
         // shown, no cold-shape grace.
         for _ in 0..16 {
-            with_backlog.note_prefill_started(1_152, true);
+            with_backlog
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(1_152, true);
         }
         let pending = Some(16 * 1_152);
         // 18,432 tokens at 1,536 tokens/s: 12 s of prefill, 24 s allowed.
         assert_eq!(
-            silence_allowance(&idle, DEFAULT_WEDGE, pending, false),
+            silence_allowance(
+                idle.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                pending,
+                false
+            ),
             Some(Duration::from_secs(24))
         );
         for w in [&with_backlog, &idle] {
@@ -2798,7 +3006,12 @@ mod tests {
         // record that does not say which wire it is counts as token batches.
         let cold = worker();
         assert_eq!(
-            silence_allowance(&cold, DEFAULT_WEDGE, pending, false),
+            silence_allowance(
+                cold.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                pending,
+                false
+            ),
             None
         );
         on_load_report_with(
@@ -2828,10 +3041,18 @@ mod tests {
         }
         let unstreamed: Arc<dyn Worker> = Arc::new(unstreamed);
         assert_eq!(
-            silence_allowance(&unstreamed, DEFAULT_WEDGE, pending, false),
+            silence_allowance(
+                unstreamed.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                pending,
+                false
+            ),
             None
         );
-        assert_eq!(silence_allowance(&idle, DEFAULT_WEDGE, None, false), None);
+        assert_eq!(
+            silence_allowance(idle.runtime_state().as_deref(), DEFAULT_WEDGE, None, false),
+            None
+        );
         assert!(!engine_stalled(
             Some(Duration::from_secs(60)),
             false,
@@ -2841,7 +3062,12 @@ mod tests {
         ));
         // The allowance never exceeds the wedge bound's cap.
         assert_eq!(
-            silence_allowance(&idle, DEFAULT_WEDGE, Some(100_000_000), false),
+            silence_allowance(
+                idle.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                Some(100_000_000),
+                false
+            ),
             Some(WEDGE_BOUND_CAP)
         );
     }
@@ -2854,19 +3080,22 @@ mod tests {
     #[test]
     fn a_prompt_longer_than_any_answered_is_given_the_cap_once() {
         let w = worker();
-        w.note_prefill_started(1_024, true);
+        w.runtime_state().unwrap().note_prefill_started(1_024, true);
         w.note_prefill_ended(1_024, true, Some(0));
         assert_eq!(
-            wedge_bound(&w, DEFAULT_WEDGE),
+            wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
             DEFAULT_WEDGE,
             "nothing pending"
         );
         // An 8k prompt, the longest yet, on a step-reporting wire silent
         // from its dispatch on.
         tracked_pile(&w, 1);
-        w.note_prefill_started(8_192, true);
-        assert!(w.prefill_cold_shape(0));
-        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), COLD_SHAPE_GRACE);
+        w.runtime_state().unwrap().note_prefill_started(8_192, true);
+        assert!(w.runtime_state().unwrap().prefill_cold_shape(0));
+        assert_eq!(
+            wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
+            COLD_SHAPE_GRACE
+        );
         assert_eq!(
             prefill_side_bound_with(&w, 8_192, DEFAULT_WEDGE),
             Some(COLD_SHAPE_GRACE),
@@ -2890,7 +3119,7 @@ mod tests {
         }
         // The sweep's own rules read the same bound: a pile behind the
         // prompt, or a queue, is not a wedge under the cap.
-        let bound = wedge_bound(&w, DEFAULT_WEDGE);
+        let bound = wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE);
         assert!(!wedged_by_pile(9, 1, Duration::from_secs(119), bound));
         assert!(!wedged_by_queue(9, 4, 0, Duration::from_secs(119), bound));
         assert!(wedged_by_pile(9, 1, COLD_SHAPE_GRACE, bound), "at the cap");
@@ -2902,9 +3131,12 @@ mod tests {
         on_token_progress(&w);
         w.note_prefill_ended(8_192, true, Some(0));
         assert!(w.stall_reason().is_none());
-        w.note_prefill_started(8_192, true);
-        assert!(!w.prefill_cold_shape(0));
-        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
+        w.runtime_state().unwrap().note_prefill_started(8_192, true);
+        assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
+        assert_eq!(
+            wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
+            DEFAULT_WEDGE
+        );
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "once");
         // A token-batch wire: the grace stands above the allowance too,
@@ -2933,11 +3165,15 @@ mod tests {
         ));
         // A longer configured threshold stands above the grace.
         let long = worker();
-        long.note_prefill_started(1_024, true);
+        long.runtime_state()
+            .unwrap()
+            .note_prefill_started(1_024, true);
         long.note_prefill_ended(1_024, true, Some(0));
-        long.note_prefill_started(8_192, true);
+        long.runtime_state()
+            .unwrap()
+            .note_prefill_started(8_192, true);
         assert_eq!(
-            wedge_bound(&long, Duration::from_secs(600)),
+            wedge_bound(long.runtime_state().as_deref(), Duration::from_secs(600)),
             Duration::from_secs(600)
         );
     }
@@ -2951,9 +3187,12 @@ mod tests {
     fn a_worker_that_has_answered_nothing_gets_no_grace() {
         let w = worker();
         tracked_pile(&w, 1);
-        w.note_prefill_started(8_192, true);
-        assert!(!w.prefill_cold_shape(0));
-        assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
+        w.runtime_state().unwrap().note_prefill_started(8_192, true);
+        assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
+        assert_eq!(
+            wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
+            DEFAULT_WEDGE
+        );
         assert_eq!(
             prefill_side_bound_with(&w, 8_192, DEFAULT_WEDGE),
             Some(Duration::from_millis(3_276)),
@@ -3014,7 +3253,7 @@ mod tests {
             Some(DEFAULT_WEDGE),
             "given up on without an answer for the whole grace: the threshold until the worker answers"
         );
-        w.note_prefill_started(95, true);
+        w.runtime_state().unwrap().note_prefill_started(95, true);
         w.note_prefill_ended(95, true, Some(0));
         assert_eq!(
             prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
@@ -3033,7 +3272,9 @@ mod tests {
                 "a worker that has answered is judged as a plain side is ({prompt_tokens} tokens)"
             );
         }
-        w.note_prefill_started(8 * 32_768, true);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(8 * 32_768, true);
         assert_eq!(
             prefill_side_bound_behind_encode_with(&w, 32_768, DEFAULT_WEDGE),
             prefill_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
@@ -3048,15 +3289,15 @@ mod tests {
     #[test]
     fn the_grace_lifts_no_standing_veto() {
         let w = worker();
-        w.note_prefill_started(1_024, true);
+        w.runtime_state().unwrap().note_prefill_started(1_024, true);
         w.note_prefill_ended(1_024, true, Some(0));
         tracked_pile(&w, 1);
-        w.note_prefill_started(1_024, true);
+        w.runtime_state().unwrap().note_prefill_started(1_024, true);
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
         tracked_pile(&w, 1);
-        w.note_prefill_started(8_192, true);
-        assert!(w.prefill_cold_shape(0));
+        w.runtime_state().unwrap().note_prefill_started(8_192, true);
+        assert!(w.runtime_state().unwrap().prefill_cold_shape(0));
         on_load_report_with(
             &w,
             0,
@@ -3070,7 +3311,7 @@ mod tests {
             Some(StallReason::Wedged),
             "the grace is no engine output"
         );
-        assert!(w.engine_stalled());
+        assert!(w.runtime_state().unwrap().engine_stalled());
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
         on_token_progress(&w);
@@ -3085,7 +3326,9 @@ mod tests {
     #[test]
     fn the_allowance_lifts_no_standing_veto() {
         let w = worker();
-        w.note_prefill_started(1_024, false);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(1_024, false);
         w.note_prefill_ended(1_024, false, Some(0));
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, Some(0), DEFAULT_WEDGE);
         assert_eq!(
@@ -3096,7 +3339,7 @@ mod tests {
         // Another gateway's long prompt: nothing of this gateway's in flight.
         let pending = Some(156_752);
         assert_eq!(
-            silence_allowance(&w, DEFAULT_WEDGE, pending, true),
+            silence_allowance(w.runtime_state().as_deref(), DEFAULT_WEDGE, pending, true),
             Some(Duration::from_millis(31_350)),
             "the allowance a fresh record would get"
         );
@@ -3113,11 +3356,13 @@ mod tests {
             Some(StallReason::Wedged),
             "more work queued behind a frozen engine is no output"
         );
-        assert!(w.engine_stalled());
+        assert!(w.runtime_state().unwrap().engine_stalled());
         // This gateway's own long prompt, streamed: a fresh dispatch restarts
         // its progress clock, and the veto still stands.
         tracked_pile(&w, 1);
-        w.note_prefill_started(156_752, true);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started(156_752, true);
         on_load_report_with(
             &w,
             0,
@@ -3153,7 +3398,12 @@ mod tests {
         );
         assert_eq!(batch.stall_reason(), Some(StallReason::Wedged));
         assert_eq!(
-            silence_allowance(&batch, DEFAULT_WEDGE, pending, false),
+            silence_allowance(
+                batch.runtime_state().as_deref(),
+                DEFAULT_WEDGE,
+                pending,
+                false
+            ),
             Some(Duration::from_millis(15_675)),
             "the allowance a fresh record would get at the measured rate"
         );
@@ -3185,7 +3435,12 @@ mod tests {
         tracked_pile(&cold, 1);
         on_load_report_with(&cold, 0, Some(DEFAULT_WEDGE), false, Some(0), DEFAULT_WEDGE);
         assert_eq!(cold.stall_reason(), None, "no rate, no verdict: not armed");
-        set(&cold, Some(StallReason::Wedged), "test");
+        set(
+            &cold,
+            cold.runtime_state().as_deref(),
+            Some(StallReason::Wedged),
+            "test",
+        );
         on_load_report_with(
             &cold,
             0,
@@ -3225,7 +3480,7 @@ mod tests {
         );
         on_load_report_with(&w, 0, Some(Duration::ZERO), true, None, wedge);
         assert!(w.stall_reason().is_none(), "the engine produces again");
-        assert!(!w.engine_stalled());
+        assert!(!w.runtime_state().unwrap().engine_stalled());
         // A pile of this gateway's own that is still silent keeps the veto
         // when the engine reports output (its progress is what clears it).
         let busy = worker();
@@ -3244,8 +3499,13 @@ mod tests {
         // The flag goes with the record channel: an unreachable veto forgets
         // it, and the next record speaks for the engine again.
         on_load_report_with(&w, 0, Some(Duration::from_secs(4)), true, None, wedge);
-        assert!(w.engine_stalled());
-        set(&w, Some(StallReason::Unreachable), "test");
-        assert!(!w.engine_stalled());
+        assert!(w.runtime_state().unwrap().engine_stalled());
+        set(
+            &w,
+            w.runtime_state().as_deref(),
+            Some(StallReason::Unreachable),
+            "test",
+        );
+        assert!(!w.runtime_state().unwrap().engine_stalled());
     }
 }
