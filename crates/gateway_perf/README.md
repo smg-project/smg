@@ -186,7 +186,11 @@ or hub id>`.
   absolute.
 - **RSS**: after the window, from `/proc`: the whole set (`VmRSS`), its anonymous part and
   its file part; `VmHWM` is the peak of the whole set (the kernel reports no peak of a
-  part), so it carries the file part too. The whole set is those two parts and shared memory
+  part), so it carries the file part too. The read waits one second after the driver's own
+  metrics scrape. The scrape is the gateway's first allocating work after an idle second,
+  and the purge pass it starts in the allocator steps the anonymous part down for up to
+  half a second: a read taken right after the scrape stood 56 to 1,784 kB above the level
+  the set settled at. The whole set is those two parts and shared memory
   (`RssShmem`, zero for the gateway on the bed). The anonymous part (`RssAnon`) is what the
   gateway allocated. It moves with the allocator's decay and the request mix in flight at
   the moment of reading, a few percent, and it is the part the gate judges. The file part
