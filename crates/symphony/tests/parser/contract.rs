@@ -476,6 +476,12 @@ fn inkling_without_calls() -> Box<dyn Parser> {
     ))
 }
 
+/// Inkling as a JSON answer reads it (`Engine::reads_json_answer`): a marker's spelling inside a
+/// string of the answer is the answer's text, a frame outside the strings a call.
+fn inkling_json_answer() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Inkling.format(), Declared::default()).reads_json_answer())
+}
+
 /// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
 fn word() -> Class {
     Class::new([('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')], false)
@@ -1041,6 +1047,12 @@ const FORMATS: &[Subject] = &[
         name: "inkling, no tools",
         new: inkling_without_calls,
         outputs: INKLING_NO_TOOLS_OUTPUTS,
+        table: None,
+    },
+    Subject {
+        name: "inkling, json answer",
+        new: inkling_json_answer,
+        outputs: INKLING_JSON_ANSWER_OUTPUTS,
         table: None,
     },
     Subject {
@@ -2277,6 +2289,22 @@ const INKLING_NO_TOOLS_OUTPUTS: &[&str] = &[
     "<|content_thinking|>The user asks: \"Give the facts about Tokyo.\" The system instruction says: \"Answer with a JSON object with the keys city, country and population.\"\n\nSo I need to provide facts about Tokyo, but specifically format the answer as a JSON object with keys: city, country, population.\n\nI should include the relevant values:\n- city: Tokyo\n- country: Japan\n- population: Approximately 13.9 million (for Tokyo proper) or 37 million (for Greater Tokyo Area). Usually \"Tokyo\" as a city refers to the prefecture/capital, but the city proper is about 14 million. I should provide a clear figure. Let's use ~13.96 million (as of recent estimates) or just \"13.9 million\". To be safe and accurate, I can specify the metropolitan area, but the key is just population. Let's provide \"13.9 million\" for the city proper, or mention both? The instruction is strict: JSON object with those keys. So just those three.\n\nLet's construct:\n{\n  \"city\": \"Tokyo\",\n  \"country\": \"Japan\",\n  \"population\": \"13.9 million\"\n}\n\nThis satisfies. I will not add extra text outside JSON? The instruction says \"Answer with a JSON object...\". Usually that means the response should be just the JSON. I will provide just the JSON.<|end_message|><|message_model|><|content_text|><|content_text|>{\"city\": \"Tokyo\", \"country\": \"Japan\", \"population\": \"13.9 million\"}<|end_message|>",
     "<|content_thinking|>The user asks about Paris.<|end_message|><|message_model|><|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
     "<|content_thinking|>Short.<|end_message|><|message_model|><|content_text|>The answer is cut he",
+];
+
+/// JSON answers under the engine's JSON-answer option, the family's parsers' own cases: a marker's
+/// spelling in a value and in a key, every spelling as a key and in a value with escapes after a
+/// thought that holds an unmatched quote, a list and a bare string of spellings, a whole call frame
+/// quoted in a value beside a real call, and strings the stream's end leaves open.
+const INKLING_JSON_ANSWER_OUTPUTS: &[&str] = &[
+    "<|content_text|>{\"literal\":\"<|content_thinking|>quoted<|end_message|>\"}<|end_message|>",
+    "<|content_thinking|>unmatched quote: \"<|end_message|><|message_model|><|content_text|>{\"<|message_model|>\":\"\u{3b1}\\\"<|content_text|>\\\\\u{7d42}\",\"<|end_message|>\":\"<|content_thinking|><|content_model_end_sampling|>\"}<|end_message|><|content_model_end_sampling|>",
+    "<|content_text|>[\"<|message_model|>\",\"<|end_message|>\"]<|end_message|>",
+    "<|content_text|>\"<|content_thinking|>\"<|end_message|>",
+    "<|content_text|>{\"note\":\"get_weather<|content_invoke_tool_json|>{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":{}}<|end_message|>\"}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
+    "<|content_text|>{\"value\":\"<|content_thinking|>unfinished<|end_mes",
+    "<|content_text|>{\"value\":\"escaped quote: \\\"<|end_message|>",
+    "<|content_text|>{\"note\":\"<|end_message|>\"}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>\
+     {\"name\":\"get_weather\",\"args\":{\"city\":\"\\\"<|end_message|>\"}}<|end_message|>",
 ];
 
 /// Every subject with each of its outputs.
