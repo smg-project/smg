@@ -191,9 +191,11 @@ pub(crate) fn assign(
 
 /// Symphony's assignment to a request, if a table reads the response (`read`, the table decision:
 /// preparation reads it once per request, [`reading`](super::names::reading), and request building
-/// passes it, `ProcessingState::reading`) and the constraint is not a JSON schema: the older
-/// path's forced call, whose output has no markers for a table to read, which the older registry
-/// writes where the table has no tag. The table goes without its calls where the legacy path would
+/// passes it, `ProcessingState::reading`) and `constraint`, the older registry's where the table
+/// built none (`WorkerConstraint::table`; the table's own is never passed, whatever kind its
+/// backend's spelling gave it), is not a JSON schema: the older path's forced call, whose output
+/// has no markers for a table to read, which the older registry writes where the table has no
+/// tag. The table goes without its calls where the legacy path would
 /// run no tool parser, without its thought where it would run no reasoning parser
 /// ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call the conversation
 /// established without a tool inventory comes back as a call under either parser. `None` where
