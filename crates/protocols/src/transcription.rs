@@ -42,8 +42,9 @@ pub struct TranscriptionRequest {
     /// The form's other text parts, in order and under the names they came
     /// with: the public API's `include[]`, `chunking_strategy` (or the SDK's
     /// `chunking_strategy[type]` and its other bracketed keys),
-    /// `known_speaker_names[]` and the fields the gateway does not model,
-    /// forwarded to the worker as sent.
+    /// `known_speaker_names[]`, `known_speaker_references[]` and the fields the
+    /// gateway does not model. The HTTP router forwards them to the worker as
+    /// sent; the gRPC pipeline does not read them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub other: Vec<(String, String)>,
 }

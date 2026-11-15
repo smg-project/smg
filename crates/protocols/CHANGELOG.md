@@ -261,7 +261,8 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   form from the typed fields alone, so a transcription answered without the logprobs, speaker
   names or chunking the client asked for. `TranscriptionRequest.other` keeps them in order under
   the names they came with, and the router appends them to the worker's form; a file part under
-  another name is still drained. Breaking: `TranscriptionRequest` gains `other`.
+  another name is still drained. The gRPC pipeline builds its request from the typed fields and
+  does not read them. Breaking: `TranscriptionRequest` gains `other`.
 - The preview web search tool takes the public API's dated type, `web_search_preview_2025_03_11`,
   written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
   refused a request declaring either, as an unknown tool type or field. Breaking:
