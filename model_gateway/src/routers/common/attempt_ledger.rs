@@ -115,9 +115,11 @@ impl AttemptLedger {
 
     /// Runs `select` with the candidate filter the request's next attempt
     /// needs. Until a worker answered the request definitively there is
-    /// none: a first attempt, and a retry after transient failures alone,
-    /// place over the pool as drawn, and nothing is asked of each candidate.
-    /// After that the filter is [`Self::admits`].
+    /// none, and nothing is asked of each candidate here: a first attempt
+    /// places over the pool as drawn, and a retry after transient failures
+    /// alone does too, but for the engines it tried, which the selection
+    /// steps past by itself while another candidate is left. After that the
+    /// filter is [`Self::admits`].
     ///
     /// The check and the selection are two critical sections. That stands on
     /// a request's attempts running one after another: no answer is recorded
@@ -316,6 +318,51 @@ mod tests {
             "the worker that answered takes no later attempt"
         );
         assert!(admits_w2, "the other worker still can");
+
+        // A second engine's answer keeps the filter in hand, and it now
+        // refuses both.
+        let mut failed_again = answered(StatusCode::INTERNAL_SERVER_ERROR);
+        ledger.settle(&mut failed_again, [&w2], pool.iter());
+        let (admits_w1, admits_w2) = ledger.with_candidate_filter(|filter| {
+            let admits = filter.expect("a second definitive answer keeps the filter");
+            (admits(w1.as_ref()), admits(w2.as_ref()))
+        });
+        assert!(
+            !admits_w1 && !admits_w2,
+            "neither worker that answered takes a later attempt"
+        );
+    }
+
+    #[test]
+    fn a_ranks_answer_stands_for_its_engine() {
+        // One engine's ranks share a base address, and the ledger keeps an
+        // answer by it: a definitive answer from one rank takes its sibling
+        // out of the request's later attempts too, and no other engine.
+        let rank = |rank: usize| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new("http://engine:8080")
+                    .dp_config(rank, 2)
+                    .health_config(no_health_check())
+                    .build(),
+            )
+        };
+        let (first, sibling) = (rank(0), rank(1));
+        let other = worker("http://other:8080", 5);
+        let pool = [Arc::clone(&first), Arc::clone(&sibling), Arc::clone(&other)];
+        let ledger = AttemptLedger::default();
+
+        let mut failed = answered(StatusCode::INTERNAL_SERVER_ERROR);
+        ledger.settle(&mut failed, [&first], pool.iter());
+        assert!(!ledger.admits(first.as_ref()));
+        assert!(
+            !ledger.admits(sibling.as_ref()),
+            "the sibling rank is the same engine"
+        );
+        assert!(ledger.admits(other.as_ref()));
+        assert!(
+            is_retryable_response(&failed),
+            "another engine can still take the request"
+        );
     }
 
     #[test]

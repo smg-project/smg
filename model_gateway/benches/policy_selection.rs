@@ -12,13 +12,15 @@
 //! workers a side, untraced and inside a cache-trace capture). Each placement group also
 //! runs its placement as the gRPC selection stage does, under a request's context demand
 //! (the `cache_aware_context` and `context` cells). The two placement groups
-//! refuse to run under a process trace switch (`SMG_CACHE_TRACE`, `SMG_CACHE_TRACE_HEADER`),
-//! which captures every placement, the cells labelled untraced too.
+//! are skipped under a process trace switch (`SMG_CACHE_TRACE`, `SMG_CACHE_TRACE_HEADER`),
+//! which captures every placement, the cells labelled untraced too: each says so once on
+//! stderr and the other groups run.
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
     clippy::unwrap_used,
-    reason = "benchmark code: panicking on setup failure is expected"
+    clippy::print_stderr,
+    reason = "benchmark code: panicking on setup failure is expected, a skipped group says so on stderr"
 )]
 
 use std::{collections::HashMap, hint::black_box, sync::Arc};
@@ -32,8 +34,9 @@ use smg::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
         hash_ring::HashRing,
         CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
-        LoadBalancingPolicy, ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy,
-        PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SelectWorkerInfo,
+        LoadBalancingPolicy, ManualPolicy, NamedList, PassthroughPolicy, PolicyRegistry,
+        PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+        SelectWorkerInfo,
     },
     routers::{
         common::bench_support::{process_trace_configured, PairPath, RegularPath},
@@ -318,6 +321,9 @@ fn bench_ring_policies(c: &mut Criterion) {
 /// One pick of each simple policy over the fed pool with every worker eligible: power_of_two
 /// (its pair drawn, the pair scored), random, round_robin (its rotation keyed by the eligible
 /// set) and passthrough (the first eligible worker). The request carries 1,024 token ids.
+/// `round_robin_named` is round_robin's pick over a list the caller names whole, as the
+/// single-worker placement hands a routing snapshot's pool: the list is rotated by row, so the
+/// cell reads the same at 128 and at 1,024 workers.
 fn bench_simple_policy_pick(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_policies/pick");
     let tokens: Vec<u32> = (0..1_024).collect();
@@ -339,6 +345,27 @@ fn bench_simple_policy_pick(c: &mut Criterion) {
                 b.iter(|| black_box(policy.select_worker(black_box(&pool), black_box(&info))));
             });
         }
+    }
+    for workers in [128, 1_024] {
+        let policy = RoundRobinPolicy::new();
+        let (_feed, pool, _reports) = fed_pool(&policy, workers);
+        let list: Arc<[Arc<dyn Worker>]> = pool.into();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            named: Some(NamedList {
+                list: &list,
+                positions: None,
+            }),
+            ..Default::default()
+        };
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(
+            BenchmarkId::new("round_robin_named", workers),
+            &workers,
+            |b, _| {
+                b.iter(|| black_box(policy.select_worker(black_box(&list), black_box(&info))));
+            },
+        );
     }
     group.finish();
 }
@@ -434,14 +461,19 @@ const PLACEMENT_WINDOW: u32 = 32_768;
 /// The completion budget of the requests the stage's own cells place.
 const PLACEMENT_BUDGET: u32 = 256;
 
-/// A placement group measures what its labels say only in a process with no trace switch:
-/// a switch captures every placement, the cells labelled untraced too.
-fn refuse_a_process_trace(group: &str) {
-    assert!(
-        !process_trace_configured(),
-        "{group}: unset SMG_CACHE_TRACE and SMG_CACHE_TRACE_HEADER; a process trace switch \
-         captures every placement, the untraced cells too"
-    );
+/// Whether `group` is skipped. A placement group measures what its labels say only in a
+/// process with no trace switch: a switch captures every placement, the cells labelled
+/// untraced too. Under one the group says so once and the rest of the binary runs, so a
+/// run filtered to another group is not stopped by a group it never asked for.
+fn skipped_under_a_process_trace(group: &str) -> bool {
+    let traced = process_trace_configured();
+    if traced {
+        eprintln!(
+            "{group}: skipped; unset SMG_CACHE_TRACE and SMG_CACHE_TRACE_HEADER: a process \
+             trace switch captures every placement, the untraced cells too"
+        );
+    }
+    traced
 }
 
 /// The stored event of one prompt, as an engine publishes a chain.
@@ -559,11 +591,14 @@ fn regular_fleet(
 /// `cache_aware_filtered` cells run the cache-aware placement under a candidate filter that
 /// refuses nobody and costs nothing itself. The `cache_aware_first_attempt` cells run it as
 /// the HTTP router does on a request's first attempt, under what a new request's attempt
-/// ledger hands. The `cache_aware_context` cells run it as the gRPC selection stage does on
-/// a request's first attempt, under the request's context demand, which every window of
-/// the fleet holds.
+/// ledger hands: the filter and the entry are that router's, the pool is this group's, the
+/// gRPC pipeline's regular one. The `cache_aware_context` cells run it as the gRPC selection
+/// stage does on a request's first attempt, under the request's context demand, which every
+/// window of the fleet holds.
 fn bench_regular_placement(c: &mut Criterion) {
-    refuse_a_process_trace("regular_placement");
+    if skipped_under_a_process_trace("regular_placement") {
+        return;
+    }
     let mut group = c.benchmark_group("regular_placement");
     for workers in [128, 1_024] {
         for (policy, cache_aware) in [("round_robin", false), ("cache_aware", true)] {
@@ -697,7 +732,9 @@ fn pair_fleet(side: usize, cache_aware: bool) -> (PairPath, SelectionBench, Vec<
 /// gRPC selection stage does on a request's first attempt, untraced, under the request's
 /// context demand, which every window of the fleet holds.
 fn bench_pair_placement(c: &mut Criterion) {
-    refuse_a_process_trace("pair_placement");
+    if skipped_under_a_process_trace("pair_placement") {
+        return;
+    }
     let mut group = c.benchmark_group("pair_placement");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
