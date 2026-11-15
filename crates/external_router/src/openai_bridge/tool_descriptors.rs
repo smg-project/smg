@@ -170,7 +170,7 @@ pub fn mcp_list_tools_item(
     server_label: &str,
     server_key: &str,
 ) -> ResponseOutputItem {
-    let tools = session.list_tools_for_server(server_key);
+    let tools = session.list_tools_for_label(server_label, server_key);
     ResponseOutputItem::McpListTools {
         id: generate_id("mcpl"),
         server_label: server_label.to_string(),
@@ -188,7 +188,7 @@ pub fn mcp_list_tools_json(
     server_label: &str,
     server_key: &str,
 ) -> Value {
-    let tools = session.list_tools_for_server(server_key);
+    let tools = session.list_tools_for_label(server_label, server_key);
     let mut item = serde_json::Map::with_capacity(4);
     item.insert(
         "type".to_string(),

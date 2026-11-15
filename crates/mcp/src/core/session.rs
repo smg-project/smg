@@ -89,6 +89,10 @@ pub struct McpToolSession<'a> {
     internal_non_builtin_server_labels: HashSet<String>,
 }
 
+/// A binding with its allowlist as a set (`None` for an open binding), built
+/// once per session construction for the tools' attribution to a label.
+type LabelledAllowlist<'b> = (&'b McpServerBinding, Option<HashSet<&'b str>>);
+
 impl<'a> McpToolSession<'a> {
     /// Create a new session by performing the setup every path currently repeats:
     /// 1. Create request context with default tenant and policy-only approval
@@ -115,20 +119,23 @@ impl<'a> McpToolSession<'a> {
         let server_keys: Vec<String> = mcp_servers.iter().map(|b| b.server_key.clone()).collect();
         let mut mcp_tools = Self::collect_visible_mcp_tools(orchestrator, &server_keys);
 
-        // Build per-server allowlists from bindings that specify allowed_tools.
-        let allowed_tools_by_server_key: HashMap<&str, HashSet<&str>> = mcp_servers
-            .iter()
-            .filter_map(|b| {
-                b.allowed_tools.as_ref().map(|tools| {
-                    let set: HashSet<&str> = tools
-                        .iter()
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    (b.server_key.as_str(), set)
-                })
-            })
-            .collect();
+        // The model's view of a server is the union of its bindings' allowlists
+        // (a server bound under several labels lists each label's own set,
+        // `list_tools_for_binding`); a binding without one leaves the server open.
+        let mut open_server_keys: HashSet<&str> = HashSet::new();
+        let mut allowed_tools_by_server_key: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for b in &mcp_servers {
+            match b.allowed_tools.as_deref() {
+                None => {
+                    open_server_keys.insert(b.server_key.as_str());
+                }
+                Some(tools) => allowed_tools_by_server_key
+                    .entry(b.server_key.as_str())
+                    .or_default()
+                    .extend(Self::allowlist(tools)),
+            }
+        }
+        allowed_tools_by_server_key.retain(|key, _| !open_server_keys.contains(key));
 
         if !allowed_tools_by_server_key.is_empty() {
             mcp_tools.retain(|entry| {
@@ -399,9 +406,8 @@ impl<'a> McpToolSession<'a> {
         self.internal_server_keys.contains(server_key)
     }
 
-    /// List tools for a single server key.
-    ///
-    /// Useful for emitting per-server `mcp_list_tools` items.
+    /// List tools for a single server key: every label's, as the model sees
+    /// them (`list_tools_for_binding` for one label's own).
     pub fn list_tools_for_server(&self, server_key: &str) -> Vec<ToolEntry> {
         // Use the session's pre-filtered tool snapshot for consistency.
         self.mcp_tools
@@ -419,6 +425,34 @@ impl<'a> McpToolSession<'a> {
             .iter()
             .find(|binding| binding.label == server_label && binding.server_key == server_key)
             .and_then(|binding| binding.list_error.clone())
+    }
+
+    /// The tools a binding lists: its server's visible tools narrowed to the
+    /// binding's own allowlist (a server bound under several labels lists
+    /// each label's own set; the model sees their union).
+    pub fn list_tools_for_binding(&self, binding: &McpServerBinding) -> Vec<ToolEntry> {
+        let allowed = binding.allowed_tools.as_deref().map(Self::allowlist);
+        self.list_tools_for_server(&binding.server_key)
+            .into_iter()
+            .filter(|entry| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|allowed| Self::matches_allowed_tool_name(entry, allowed))
+            })
+            .collect()
+    }
+
+    /// The tools listed under `server_label` for `server_key`: the binding's
+    /// own set when that label is bound, the server's tools otherwise.
+    pub fn list_tools_for_label(&self, server_label: &str, server_key: &str) -> Vec<ToolEntry> {
+        match self
+            .all_mcp_servers
+            .iter()
+            .find(|b| b.label == server_label && b.server_key == server_key)
+        {
+            Some(binding) => self.list_tools_for_binding(binding),
+            None => self.list_tools_for_server(server_key),
+        }
     }
 
     /// Resolve an exposed tool name (post-alias) to its `QualifiedToolName`.
@@ -475,11 +509,6 @@ impl<'a> McpToolSession<'a> {
         HashMap<String, ExposedToolBinding>,
         HashMap<QualifiedToolName, String>,
     ) {
-        let server_labels: HashMap<&str, &str> = mcp_servers
-            .iter()
-            .map(|b| (b.server_key.as_str(), b.label.as_str()))
-            .collect();
-
         let mut name_counts: HashMap<&str, usize> = HashMap::new();
         for entry in tools {
             *name_counts.entry(entry.tool_name()).or_insert(0) += 1;
@@ -491,13 +520,16 @@ impl<'a> McpToolSession<'a> {
             HashMap::with_capacity(tools.len());
         let mut exposed_name_by_qualified: HashMap<QualifiedToolName, String> =
             HashMap::with_capacity(tools.len());
+        // Each binding's allowlist built once; the attribution reads it per tool.
+        let bindings: Vec<LabelledAllowlist<'_>> = mcp_servers
+            .iter()
+            .map(|b| (b, b.allowed_tools.as_deref().map(Self::allowlist)))
+            .collect();
 
         for entry in tools {
             let server_key = entry.server_key().to_string();
             let associated_server_key = Self::associated_server_key(entry);
-            let server_label = server_labels
-                .get(associated_server_key)
-                .copied()
+            let server_label = Self::label_for_entry(entry, &bindings)
                 .unwrap_or(associated_server_key)
                 .to_string();
             let resolved_tool_name = entry.tool_name().to_string();
@@ -598,6 +630,39 @@ impl<'a> McpToolSession<'a> {
             .as_ref()
             .map(|alias| alias.target.server_key())
             .unwrap_or_else(|| entry.server_key())
+    }
+
+    /// The label a tool is attributed to: the first binding of its server
+    /// whose allowlist admits it (a server bound under several labels lists
+    /// each label's own tools); failing that, the server's first binding.
+    /// `bindings` pairs each binding with its allowlist, built once.
+    fn label_for_entry<'b>(
+        entry: &ToolEntry,
+        bindings: &'b [LabelledAllowlist<'b>],
+    ) -> Option<&'b str> {
+        let key = Self::associated_server_key(entry);
+        let mut of_server = bindings
+            .iter()
+            .filter(|(b, _)| b.server_key == key)
+            .peekable();
+        let first = of_server.peek().map(|(b, _)| b.label.as_str());
+        of_server
+            .find(|(_, allowed)| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|allowed| Self::matches_allowed_tool_name(entry, allowed))
+            })
+            .map(|(b, _)| b.label.as_str())
+            .or(first)
+    }
+
+    /// A binding's allowlist as a set: the names trimmed, the empty dropped.
+    fn allowlist(tools: &[String]) -> HashSet<&str> {
+        tools
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     fn matches_allowed_tool_name(entry: &ToolEntry, allowed: &HashSet<&str>) -> bool {
@@ -1056,6 +1121,77 @@ mod tests {
         let listed = session.list_tools_for_server("server1");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].tool_name(), "brave_web_search");
+    }
+
+    /// A server bound under two labels lists each label's own tools, the
+    /// model sees the union, and a tool is attributed to the first label
+    /// whose allowlist admits it.
+    #[test]
+    fn a_server_bound_under_two_labels_lists_per_label_and_attributes_the_first() {
+        fn names(entries: &[ToolEntry]) -> Vec<&str> {
+            let mut names: Vec<&str> = entries.iter().map(ToolEntry::tool_name).collect();
+            names.sort_unstable();
+            names
+        }
+        let orchestrator = McpOrchestrator::new_test();
+        insert_test_tool(&orchestrator, "server1", "echo");
+        insert_test_tool(&orchestrator, "server1", "big");
+        let open = McpServerBinding {
+            label: "conf".to_string(),
+            server_key: "server1".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        };
+        let narrow = McpServerBinding {
+            label: "conf-b".to_string(),
+            server_key: "server1".to_string(),
+            allowed_tools: Some(vec!["echo".to_string()]),
+            list_error: None,
+        };
+
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![open.clone(), narrow.clone()],
+            "test-request",
+        );
+        assert_eq!(session.mcp_servers().len(), 2, "one binding per label");
+        assert_eq!(
+            names(session.mcp_tools()),
+            ["big", "echo"],
+            "the model sees the union"
+        );
+        assert_eq!(
+            names(&session.list_tools_for_binding(&open)),
+            ["big", "echo"]
+        );
+        assert_eq!(names(&session.list_tools_for_binding(&narrow)), ["echo"]);
+        assert_eq!(
+            names(&session.list_tools_for_label("conf-b", "server1")),
+            ["echo"]
+        );
+        assert_eq!(
+            names(&session.list_tools_for_label("unbound", "server1")),
+            ["big", "echo"]
+        );
+        assert_eq!(session.resolve_tool_server_label("echo"), "conf");
+        assert_eq!(session.resolve_tool_server_label("big"), "conf");
+
+        // Two allowlists: the model still sees both tools, each attributed
+        // to the first label admitting it.
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![
+                narrow,
+                McpServerBinding {
+                    allowed_tools: Some(vec!["big".to_string()]),
+                    ..open
+                },
+            ],
+            "test-request",
+        );
+        assert_eq!(names(session.mcp_tools()), ["big", "echo"]);
+        assert_eq!(session.resolve_tool_server_label("echo"), "conf-b");
+        assert_eq!(session.resolve_tool_server_label("big"), "conf");
     }
 
     #[test]
