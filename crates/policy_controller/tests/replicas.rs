@@ -153,8 +153,9 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         );
     };
 
-    // The scopes over the wire: a listener answers the calls of the scopes
-    // it mounts as unimplemented, and denies the others.
+    // The scopes over the wire: a listener denies the calls of the scopes
+    // it does not mount. Those of its own it refuses as unauthenticated: no
+    // listener of these replicas takes an identity as told.
     let follower = &replicas[(first + 1) % replicas.len()];
     for (listener, read, snapshot) in [
         (
@@ -162,11 +163,15 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
             Code::PermissionDenied,
             Code::PermissionDenied,
         ),
-        (follower.control, Code::Unimplemented, Code::Unimplemented),
+        (
+            follower.control,
+            Code::Unauthenticated,
+            Code::Unauthenticated,
+        ),
         (
             follower.replication,
             Code::PermissionDenied,
-            Code::Unimplemented,
+            Code::Unauthenticated,
         ),
     ] {
         let mut client = PolicyControllerClient::connect(format!("http://{listener}"))

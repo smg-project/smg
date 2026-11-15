@@ -12,7 +12,7 @@ use std::{
 use clap::Parser;
 use smg_policy_controller::{
     controller::{
-        Config, ConfigError, Controller, Election, LeasePlace, Listener, Scope, Tls, VERSION,
+        Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
     },
     elector::ElectionSettings,
 };
@@ -66,6 +66,21 @@ struct Cli {
     /// and /metrics
     #[arg(long, default_value = DEFAULT_ADMIN_LISTEN, help_heading = "Listeners")]
     admin_listen: SocketAddr,
+
+    /// The listeners, by name (gateway, ingestion, control, replication),
+    /// that take a caller's identity as told: the caller states its name in
+    /// the x-smg-principal metadata entry and nothing is verified, so
+    /// whoever reaches such a listener acts as any principal of its scopes.
+    /// For a loopback, or a mesh that verifies in front of the process; a
+    /// listener with a client CA takes none. A listener that is not named
+    /// refuses the calls that need a principal
+    #[arg(
+        long,
+        value_name = "LISTENER",
+        value_delimiter = ',',
+        help_heading = "Listeners"
+    )]
+    identity_as_told: Vec<String>,
 
     // ==================== TLS ====================
     /// The server certificate chain (PEM) of every gRPC listener; comes with
@@ -425,6 +440,16 @@ fn runtime(worker_threads: Option<u16>) -> std::io::Result<Runtime> {
     }
 }
 
+/// Binds the controller, then names the listeners that take identities as
+/// told: a refusal of either arrives before anything is served.
+async fn bind(config: Config, as_told: &[String]) -> Result<Controller, Error> {
+    let mut controller = Controller::bind(config).await?;
+    for listener in as_told {
+        controller.identity_as_told(listener)?;
+    }
+    Ok(controller)
+}
+
 /// The start-up sequence: parse, log, configure, then the runtime, built
 /// only now so a refusal costs no threads; bind and serve on it.
 fn main() -> ExitCode {
@@ -445,7 +470,7 @@ fn main() -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let controller = match Controller::bind(config).await {
+        let controller = match bind(config, &cli.identity_as_told).await {
             Ok(controller) => controller,
             Err(error) => {
                 error!(%error, "start refused");
@@ -472,11 +497,11 @@ mod tests {
 
     use clap::Parser;
     use smg_policy_controller::{
-        controller::{Config, ConfigError, Election, LeasePlace, Scope},
+        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope},
         elector::ElectionSettings,
     };
 
-    use super::{color_for, set, truthy, Cli};
+    use super::{bind, color_for, set, truthy, Cli};
 
     fn parse(args: &[&str]) -> Cli {
         let mut argv = vec!["smg-policy-controller", "--controller-id", "controller-0"];
@@ -838,6 +863,66 @@ mod tests {
             argv.extend_from_slice(refused);
             assert!(Cli::try_parse_from(argv).is_err(), "{refused:?}");
         }
+    }
+
+    #[test]
+    fn no_listener_takes_identities_as_told_unless_it_is_named() {
+        assert!(parse(&[]).identity_as_told.is_empty());
+        assert_eq!(
+            parse(&["--identity-as-told", "gateway,control"]).identity_as_told,
+            ["gateway", "control"]
+        );
+        assert_eq!(
+            parse(&[
+                "--identity-as-told",
+                "gateway",
+                "--identity-as-told",
+                "replication"
+            ])
+            .identity_as_told,
+            ["gateway", "replication"]
+        );
+    }
+
+    /// The flag's names reach the bound controller: a name the flags mount
+    /// no listener under refuses the start, by that name.
+    #[tokio::test]
+    async fn a_listener_named_as_told_is_one_the_flags_mount() {
+        const EPHEMERAL: [&str; 8] = [
+            "--gateway-listen",
+            "127.0.0.1:0",
+            "--control-listen",
+            "127.0.0.1:0",
+            "--replication-listen",
+            "127.0.0.1:0",
+            "--admin-listen",
+            "127.0.0.1:0",
+        ];
+        let start = |flags: &[&str]| {
+            let mut args = EPHEMERAL.to_vec();
+            args.extend_from_slice(flags);
+            let cli = parse(&args);
+            let config = cli.config().expect("the flags are in order");
+            async move { bind(config, &cli.identity_as_told).await.map(drop) }
+        };
+        // The relays' calls ride the gateways' listener unless they get
+        // their own: there is none of that name to take them as told.
+        let refused = start(&["--identity-as-told", "ingestion"]).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::Config(ConfigError::UnknownListener(name))) if name == "ingestion"
+            ),
+            "{refused:?}"
+        );
+        start(&[
+            "--identity-as-told",
+            "gateway,ingestion",
+            "--ingestion-listen",
+            "127.0.0.1:0",
+        ])
+        .await
+        .expect("both are listeners the flags mount");
     }
 
     #[test]

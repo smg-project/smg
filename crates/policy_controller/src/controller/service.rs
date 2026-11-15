@@ -2,27 +2,34 @@
 //! `smg.policy.v1.PolicyController`, mounted on every listener beside the
 //! health service, one instance a listener, holding that listener's scopes.
 //!
-//! `Leader` is served, on every listener and by every replica. Every other
-//! call is refused: `PERMISSION_DENIED` where the listener mounts none of
-//! the call's scopes (the contract: the scope does not cover the RPC),
-//! `UNIMPLEMENTED` where it does and no step serves the call yet. The step
-//! that serves a call replaces that call's one line here, behind
-//! [`Service::admit`], and adds what it reads to [`Shared`], which
-//! [`Shared::new`] alone builds.
+//! `Leader` is served, on every listener and by every replica, to a caller
+//! with a principal or with none. Every other call is refused:
+//! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
+//! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
+//! where it does and the listener's layer placed no principal on the call
+//! ([`principal`](super::principal)), `UNIMPLEMENTED` where one stands and
+//! no step serves the call yet. The step that serves a call replaces that
+//! call's one line here, behind [`Service::admit`], acts for the principal
+//! it hands back and for no other peer, and adds what it reads to
+//! [`Shared`], which [`Shared::new`] alone builds.
 
 use std::{sync::Arc, time::Instant};
 
 use tokio::sync::watch;
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{service::Routes, Request, Response, Status, Streaming};
 
 use super::{
     config::Scope,
     election::{split_identity, Standing},
+    principal::{self, Layer, Principal},
     PROTOCOL_VERSION,
 };
 use crate::{
     elector::{Elector, Fence},
-    proto::{self, policy_controller_server::PolicyController},
+    proto::{
+        self,
+        policy_controller_server::{PolicyController, PolicyControllerServer},
+    },
     store::MemoryStore,
 };
 
@@ -173,28 +180,46 @@ impl Service {
         Self { scopes, shared }
     }
 
-    /// Admits `call` on this listener, or refuses it: a listener answers
-    /// the calls of the scopes it mounts. The first line of every served
-    /// call's body.
-    pub(crate) fn admit(&self, call: Call) -> Result<(), Status> {
-        if call
+    /// This instance as its listener mounts it: behind the listener's one
+    /// layer, or behind none.
+    pub(crate) fn routes(self, layer: Layer) -> Routes {
+        match layer {
+            Layer::Off => Routes::new(PolicyControllerServer::new(self)),
+            Layer::AsTold => Routes::new(PolicyControllerServer::with_interceptor(
+                self,
+                |request: Request<()>| Ok(principal::as_told(request)),
+            )),
+        }
+    }
+
+    /// Admits `call` on this listener and hands back the peer it is from,
+    /// or refuses it. A listener answers the calls of the scopes it mounts
+    /// (`PERMISSION_DENIED` off them, whoever asks), to a caller its layer
+    /// placed a principal on (`UNAUTHENTICATED` with none). The first line
+    /// of every served call's body and the one place a body learns its
+    /// peer: a body holds no check of its own.
+    pub(crate) fn admit<'a, T>(
+        &self,
+        call: Call,
+        request: &'a Request<T>,
+    ) -> Result<&'a Principal, Status> {
+        if !call
             .scopes()
             .iter()
             .any(|scope| self.scopes.contains(scope))
         {
-            Ok(())
-        } else {
-            Err(Status::permission_denied(format!(
+            return Err(Status::permission_denied(format!(
                 "{} is not a call of this listener's scopes",
                 call.name()
-            )))
+            )));
         }
+        principal::principal(request)
     }
 
-    /// The answer to a call no step serves yet, behind the listener's scope
-    /// check.
-    fn unserved<T>(&self, call: Call) -> Result<T, Status> {
-        self.admit(call)?;
+    /// The answer to a call no step serves yet, behind the listener's
+    /// admission.
+    fn unserved<T, R>(&self, call: Call, request: &Request<T>) -> Result<R, Status> {
+        self.admit(call, request)?;
         Err(Status::unimplemented(format!(
             "{} is not served by this build",
             call.name()
@@ -260,97 +285,99 @@ impl PolicyController for Service {
 
     async fn session(
         &self,
-        _request: Request<Streaming<proto::GatewayFrame>>,
+        request: Request<Streaming<proto::GatewayFrame>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        self.unserved(Call::Session)
+        self.unserved(Call::Session, &request)
     }
 
     async fn decide(
         &self,
-        _request: Request<Streaming<proto::DecideRequest>>,
+        request: Request<Streaming<proto::DecideRequest>>,
     ) -> Result<Response<Self::DecideStream>, Status> {
-        self.unserved(Call::Decide)
+        self.unserved(Call::Decide, &request)
     }
 
     async fn watch_workers(
         &self,
-        _request: Request<proto::WatchWorkersRequest>,
+        request: Request<proto::WatchWorkersRequest>,
     ) -> Result<Response<Self::WatchWorkersStream>, Status> {
-        self.unserved(Call::WatchWorkers)
+        self.unserved(Call::WatchWorkers, &request)
     }
 
     async fn push_load(
         &self,
-        _request: Request<Streaming<proto::LoadReport>>,
+        request: Request<Streaming<proto::LoadReport>>,
     ) -> Result<Response<proto::Ack>, Status> {
-        self.unserved(Call::PushLoad)
+        self.unserved(Call::PushLoad, &request)
     }
 
     async fn push_kv_events(
         &self,
-        _request: Request<Streaming<proto::RelayKvFrame>>,
+        request: Request<Streaming<proto::RelayKvFrame>>,
     ) -> Result<Response<proto::Ack>, Status> {
-        self.unserved(Call::PushKvEvents)
+        self.unserved(Call::PushKvEvents, &request)
     }
 
     async fn register_worker(
         &self,
-        _request: Request<proto::RegisterWorkerRequest>,
+        request: Request<proto::RegisterWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::RegisterWorker)
+        self.unserved(Call::RegisterWorker, &request)
     }
 
     async fn patch_worker(
         &self,
-        _request: Request<proto::PatchWorkerRequest>,
+        request: Request<proto::PatchWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::PatchWorker)
+        self.unserved(Call::PatchWorker, &request)
     }
 
     async fn deregister_worker(
         &self,
-        _request: Request<proto::DeregisterWorkerRequest>,
+        request: Request<proto::DeregisterWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::DeregisterWorker)
+        self.unserved(Call::DeregisterWorker, &request)
     }
 
     async fn get_snapshot(
         &self,
-        _request: Request<proto::SnapshotRequest>,
+        request: Request<proto::SnapshotRequest>,
     ) -> Result<Response<proto::Snapshot>, Status> {
-        self.unserved(Call::GetSnapshot)
+        self.unserved(Call::GetSnapshot, &request)
     }
 
     async fn explain(
         &self,
-        _request: Request<proto::ExplainRequest>,
+        request: Request<proto::ExplainRequest>,
     ) -> Result<Response<proto::DecisionRecord>, Status> {
-        self.unserved(Call::Explain)
+        self.unserved(Call::Explain, &request)
     }
 
     async fn apply_policy_spec(
         &self,
-        _request: Request<proto::ApplyRequest>,
+        request: Request<proto::ApplyRequest>,
     ) -> Result<Response<proto::ApplyResult>, Status> {
-        self.unserved(Call::ApplyPolicySpec)
+        self.unserved(Call::ApplyPolicySpec, &request)
     }
 
     async fn get_policy_spec(
         &self,
-        _request: Request<proto::GetPolicySpecRequest>,
+        request: Request<proto::GetPolicySpecRequest>,
     ) -> Result<Response<proto::PolicySpecDocument>, Status> {
-        self.unserved(Call::GetPolicySpec)
+        self.unserved(Call::GetPolicySpec, &request)
     }
 
     async fn rollback_policy_spec(
         &self,
-        _request: Request<proto::RollbackRequest>,
+        request: Request<proto::RollbackRequest>,
     ) -> Result<Response<proto::ApplyResult>, Status> {
-        self.unserved(Call::RollbackPolicySpec)
+        self.unserved(Call::RollbackPolicySpec, &request)
     }
 
-    /// Every scope, every replica. One lease covers every model today, so a
-    /// named model reads the controller's own lease.
+    /// Every scope, every replica, any caller: no principal is read, since
+    /// the answer tells a caller where to go before it holds a session. One
+    /// lease covers every model today, so a named model reads the
+    /// controller's own lease.
     async fn leader(
         &self,
         _request: Request<proto::LeaderRequest>,
@@ -360,23 +387,23 @@ impl PolicyController for Service {
 
     async fn step_down(
         &self,
-        _request: Request<proto::StepDownRequest>,
+        request: Request<proto::StepDownRequest>,
     ) -> Result<Response<proto::Ack>, Status> {
-        self.unserved(Call::StepDown)
+        self.unserved(Call::StepDown, &request)
     }
 
     async fn watch_regime(
         &self,
-        _request: Request<proto::RegimeRequest>,
+        request: Request<proto::RegimeRequest>,
     ) -> Result<Response<Self::WatchRegimeStream>, Status> {
-        self.unserved(Call::WatchRegime)
+        self.unserved(Call::WatchRegime, &request)
     }
 
     async fn replicate(
         &self,
-        _request: Request<Streaming<proto::ReplicaFrame>>,
+        request: Request<Streaming<proto::ReplicaFrame>>,
     ) -> Result<Response<Self::ReplicateStream>, Status> {
-        self.unserved(Call::Replicate)
+        self.unserved(Call::Replicate, &request)
     }
 }
 
@@ -402,16 +429,17 @@ mod tests {
         controller::{
             config::Scope,
             election::{self, Standing},
+            principal::{
+                tests::{stating, told, NO_PRINCIPAL},
+                Layer,
+            },
             PROTOCOL_VERSION,
         },
         elector::{
             ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
             MemoryLease, Tick, Written,
         },
-        proto::{
-            self,
-            policy_controller_server::{PolicyController, PolicyControllerServer},
-        },
+        proto::{self, policy_controller_server::PolicyController},
         store::MemoryStore,
     };
 
@@ -586,8 +614,18 @@ mod tests {
         assert_eq!(Call::ALL.map(|call| (call.name(), call.scopes())), expected);
     }
 
+    /// `message` as a call the listener's layer placed `subject` on.
+    fn from<T>(subject: &str, message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(told(subject));
+        request
+    }
+
+    /// Admission hands back the principal the layer placed, on the scopes
+    /// the listener mounts. Off them the call is denied whoever asks; on
+    /// them a call with no principal is refused as unauthenticated.
     #[test]
-    fn a_listener_admits_the_calls_of_the_scopes_it_mounts() {
+    fn a_listener_admits_the_calls_of_its_scopes_from_a_caller_with_a_principal() {
         let listeners: [&[Scope]; 4] = [
             &[Scope::Gateway, Scope::Ingestion],
             &[Scope::Control],
@@ -598,8 +636,12 @@ mod tests {
             let (_elector, _standing, service) = service(scopes);
             for call in Call::ALL {
                 let mounted = call.scopes().iter().any(|scope| scopes.contains(scope));
-                match service.admit(call) {
-                    Ok(()) => assert!(mounted, "{} admitted on {scopes:?}", call.name()),
+                let placed = from("gateway-a", ());
+                match service.admit(call, &placed) {
+                    Ok(principal) => {
+                        assert!(mounted, "{} admitted on {scopes:?}", call.name());
+                        assert_eq!(principal, &told("gateway-a"));
+                    }
                     Err(status) => {
                         assert!(!mounted, "{} refused on {scopes:?}", call.name());
                         assert_eq!(status.code(), Code::PermissionDenied);
@@ -609,17 +651,29 @@ mod tests {
                         );
                     }
                 }
+                let status = service
+                    .admit(call, &Request::new(()))
+                    .expect_err("no principal stands on the call");
+                let code = if mounted {
+                    Code::Unauthenticated
+                } else {
+                    Code::PermissionDenied
+                };
+                assert_eq!(status.code(), code, "{} on {scopes:?}", call.name());
+                if mounted {
+                    assert_eq!(status.message(), NO_PRINCIPAL);
+                }
             }
         }
     }
 
     #[tokio::test]
-    async fn an_unserved_call_is_denied_off_its_scope_and_unimplemented_on_it() {
+    async fn an_unserved_call_is_denied_off_its_scope_and_unimplemented_to_a_principal_on_it() {
         let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
         let (_elector, _standing, control) = service(&[Scope::Control]);
         let (_elector, _standing, replication) = service(&[Scope::Replication]);
 
-        let read = || Request::new(proto::GetPolicySpecRequest::default());
+        let read = || from("operator-a", proto::GetPolicySpecRequest::default());
         let denied = gateway.get_policy_spec(read()).await.expect_err("refused");
         assert_eq!(denied.code(), Code::PermissionDenied);
         let unserved = control.get_policy_spec(read()).await.expect_err("refused");
@@ -628,9 +682,17 @@ mod tests {
             unserved.message(),
             "GetPolicySpec is not served by this build"
         );
+        // A caller no layer placed is refused before the call is named
+        // unserved: no call body is reached without a principal.
+        let unplaced = control
+            .get_policy_spec(Request::new(proto::GetPolicySpecRequest::default()))
+            .await
+            .expect_err("refused");
+        assert_eq!(unplaced.code(), Code::Unauthenticated);
+        assert_eq!(unplaced.message(), NO_PRINCIPAL);
 
         // The snapshot is the operators' read and a standby's re-sync base.
-        let snapshot = || Request::new(proto::SnapshotRequest::default());
+        let snapshot = || from("standby-a", proto::SnapshotRequest::default());
         for (listener, code) in [
             (&gateway, Code::PermissionDenied),
             (&control, Code::Unimplemented),
@@ -657,24 +719,36 @@ mod tests {
     }
 
     /// Every method of the contract, called by its own name over a socket
-    /// on a listener of each scope set. `Leader` is served; any other
-    /// answers in its own name, denied off the listener's scopes and
-    /// unimplemented on them. The names are read from the contract, so a
-    /// method added there joins the case, and fails it until the table
-    /// holds its call.
+    /// on a listener of each scope set, three ways: a name stated to a
+    /// listener with no layer, a name stated to one that takes identities
+    /// as told, and no name stated to that one. `Leader` is served every
+    /// way; any other answers in its own name: denied off the listener's
+    /// scopes, and on them unimplemented to the caller the layer placed
+    /// and unauthenticated to any other. The names are read from the
+    /// contract, so a method added there joins the case, and fails it until
+    /// the table holds its call.
     #[tokio::test]
-    async fn every_method_of_the_contract_answers_by_its_own_calls_scopes() {
+    async fn every_method_of_the_contract_answers_by_its_calls_scopes_and_its_callers_principal() {
         let methods = methods();
         assert_eq!(
             methods.len(),
             Call::ALL.len() + 1,
             "one call a method, and Leader: {methods:?}"
         );
-        for scopes in [
+        let listeners = [
             &[Scope::Gateway, Scope::Ingestion][..],
             &[Scope::Control],
             &[Scope::Replication],
-        ] {
+        ];
+        let ways = [
+            (Layer::Off, true),
+            (Layer::AsTold, true),
+            (Layer::AsTold, false),
+        ];
+        for (scopes, (layer, stated)) in listeners
+            .into_iter()
+            .flat_map(|scopes| ways.map(|way| (scopes, way)))
+        {
             let (_elector, _standing, service) = service(scopes);
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -684,7 +758,7 @@ mod tests {
             let mut serving = JoinSet::new();
             serving.spawn(
                 Server::builder()
-                    .add_service(PolicyControllerServer::new(service))
+                    .add_routes(service.routes(layer))
                     .serve_with_incoming(TcpIncoming::from(listener)),
             );
             let channel = Channel::from_shared(format!("http://{addr}"))
@@ -699,11 +773,17 @@ mod tests {
                         .expect("a path");
                 client.ready().await.expect("the channel is ready");
                 // An empty message is every request's default.
+                let request = if stated {
+                    stating("gateway-a")
+                } else {
+                    Request::new(())
+                };
                 let answered = client
-                    .unary(Request::new(()), path, ProstCodec::<(), ()>::default())
+                    .unary(request, path, ProstCodec::<(), ()>::default())
                     .await;
+                let round = format!("{method} on {scopes:?}, {layer:?}, a name stated: {stated}");
                 if *method == "Leader" {
-                    assert!(answered.is_ok(), "Leader on {scopes:?}: {answered:?}");
+                    assert!(answered.is_ok(), "{round}: {answered:?}");
                     continue;
                 }
                 let call = Call::ALL.into_iter().find(|call| call.name() == *method);
@@ -712,22 +792,24 @@ mod tests {
                     .into_iter()
                     .flat_map(Call::scopes)
                     .any(|scope| scopes.contains(scope));
-                let expected = if mounted {
+                let expected = if !mounted {
+                    (
+                        Code::PermissionDenied,
+                        format!("{method} is not a call of this listener's scopes"),
+                    )
+                } else if layer == Layer::AsTold && stated {
                     (
                         Code::Unimplemented,
                         format!("{method} is not served by this build"),
                     )
                 } else {
-                    (
-                        Code::PermissionDenied,
-                        format!("{method} is not a call of this listener's scopes"),
-                    )
+                    (Code::Unauthenticated, NO_PRINCIPAL.to_owned())
                 };
                 let status = answered.expect_err("no step serves the call");
                 assert_eq!(
                     (status.code(), status.message().to_owned()),
                     expected,
-                    "{method} on {scopes:?}"
+                    "{round}"
                 );
             }
         }
