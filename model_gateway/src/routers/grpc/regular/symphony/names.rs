@@ -100,10 +100,6 @@ pub(crate) enum Fallback {
     /// `passthrough`, as the tool-call name or alone as the reasoning name: the choice to leave a
     /// channel as written, which no table does.
     Passthrough,
-    /// A table reads the model and has no tag for the request's forced or required call: the older
-    /// registry's JSON schema constrains the output, which then has no markers for the table to
-    /// read, so the legacy parsers read it ([`assign_for`](super::reader::assign_for)).
-    ForcedCallWithoutTag,
 }
 
 /// What reads a model's responses under Symphony ([`decision`]).
@@ -113,8 +109,7 @@ pub(super) enum Decision {
     /// A table, shared with every request and engine that reads with it: the registry's, or
     /// the one the names select.
     Table(Arc<Format>),
-    /// The legacy parsers, for the reason the precedence names: never
-    /// [`Fallback::ForcedCallWithoutTag`], which the assignment decides.
+    /// The legacy parsers, for the reason the precedence names.
     Legacy(Fallback),
 }
 

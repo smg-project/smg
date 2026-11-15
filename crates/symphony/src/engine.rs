@@ -198,6 +198,16 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// pushes nothing for its bytes.
     fn ignored(&mut self, _text: &str, _declared: &Declared, _out: &mut Events) {}
 
+    /// Whether a marker the engine would take from the call without asking it is the call's text
+    /// where it arrives: a terminal the table ignores, which the engine drops ([`Self::ignored`]),
+    /// and the beginning of a terminal the end of the output cut short, which it drops as the
+    /// whole terminal. True inside the JSON a request's schema forces, whose string may hold any
+    /// marker ([`Format::with_forced_call`](crate::Format::with_forced_call)), and for no other
+    /// syntax. A terminal with a row out of the state is asked through [`Self::closes`].
+    fn markers_are_text(&self) -> bool {
+        false
+    }
+
     /// The call the engine entered through a matched header starts: the events of its start, and
     /// the bytes that followed the header, for the engine to read again inside the call. Every
     /// syntax but a shaped one starts with its first bytes and gives nothing back.
@@ -600,6 +610,17 @@ impl Engine {
         self.call.as_mut().is_none_or(|call| call.closes(terminal))
     }
 
+    /// Whether the call open in this state holds as its text a marker the engine would take
+    /// without asking it: one the table ignores, and the beginning of one the output's end cut
+    /// short ([`CallAssembler::markers_are_text`]).
+    fn call_holds_markers(&self) -> bool {
+        self.emits() == Emits::Arguments
+            && self
+                .call
+                .as_ref()
+                .is_some_and(|call| call.markers_are_text())
+    }
+
     /// A shaped call pending its header, when terminal `index` has a row into the call's state from
     /// this state, or, as the turn's first piece, from the state the turn starts in: the header is
     /// read before anything the row does, the turn's start included.
@@ -952,10 +973,16 @@ impl Engine {
     /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
     /// whose assembler holds bytes it is placed where it arrived once the bytes around it leave
     /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead, the
-    /// run a wrapping stay holds after its text) it keeps its place among them.
+    /// run a wrapping stay holds after its text) it keeps its place among them. Inside the JSON
+    /// a request's schema forces it is the value's text
+    /// ([`CallAssembler::markers_are_text`]).
     fn terminal(&mut self, index: usize, out: &mut Events) {
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
+            if self.call_holds_markers() {
+                self.text(Cow::Owned(text), out);
+                return;
+            }
             if self.emits() == Emits::Arguments {
                 if let Some(call) = &mut self.call {
                     let mut events: Events<'static> = std::mem::take(&mut self.scratch);
@@ -1327,9 +1354,13 @@ impl Engine {
     /// Whether `text`, a piece at the end of the output, is a tag the end cut short: one that
     /// begins with a whole structural token and is the beginning of a terminal the state has a
     /// row for (`<|close|>message` with no `<|sep|>` after it), which the model cannot have
-    /// written as text. A shaped call's header still being read takes every byte.
+    /// written as text. A shaped call's header still being read takes every byte, and so does a
+    /// call that holds every marker as its text ([`Self::call_holds_markers`]): the bytes the
+    /// output ended on are the value's, as the whole marker would be.
     fn cut_tag(&self, text: &str) -> bool {
-        self.pending.is_none() && self.format.is_cut_tag(self.state, text, self.stay.begun)
+        self.pending.is_none()
+            && !self.call_holds_markers()
+            && self.format.is_cut_tag(self.state, text, self.stay.begun)
     }
 
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the

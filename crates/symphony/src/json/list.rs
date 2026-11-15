@@ -36,11 +36,15 @@
 //! after prose, it is text. A list reads as before. [`Framing::Bare`] (the `xlam` table) keeps a
 //! `{` as prose.
 //!
-//! A region with no markers never closes by one, so [`Assembler::close`] is for a table that puts
-//! the list between markers after all; [`Assembler::finish`] is the end of the stream: an object
-//! still open is finished as the JSON assembler finishes one (a started call closed with what
-//! arrived, an object that never named a call `Malformed`), and a list left open reports what
-//! it held.
+//! A region with no markers closes by one only before its first byte that is not whitespace,
+//! where the variant a forced call makes of a table has the thought's opener
+//! ([`Format::with_forced_call`](crate::Format::with_forced_call)): [`Assembler::close`] drops the
+//! whitespace held there, and is otherwise for a table that puts the list between markers after
+//! all. In that variant the assembler is entered after the thought too, and a marker the table
+//! ignores is a call's text inside the call's object. [`Assembler::finish`] is the end of the
+//! stream: an object still open is finished as the JSON assembler finishes one (a started call
+//! closed with what arrived, an object that never named a call `Malformed`), and a list left
+//! open reports what it held.
 //!
 //! Between markers (Llama Nemotron's `<TOOLCALL>[…]</TOOLCALL>`) a row of the table opens the
 //! region and its closing marker ends it, so prose has no place inside: [`Framing::Framed`]
@@ -182,8 +186,14 @@ impl Assembler {
         }
     }
 
-    /// The region closed by a marker: a table that puts the list between markers.
-    pub fn close(self, out: &mut Events) {
+    /// The region closed by a marker: a table that puts the list between markers. With no
+    /// markers around the calls a marker closes the region only before its first byte that is
+    /// not whitespace (the engine asks the assembler whether it closes), and the whitespace held
+    /// there is the template's wrapping, not prose.
+    pub fn close(mut self, out: &mut Events) {
+        if !self.framed && matches!(self.stage, Stage::Deciding) {
+            self.drop_carried(out);
+        }
         self.finish(out);
     }
 
@@ -445,6 +455,23 @@ impl crate::engine::CallAssembler for Assembler {
     ) -> usize {
         self.feed(text, out);
         text.len()
+    }
+
+    /// Between markers the region's closing marker closes it, wherever it stands. With no
+    /// markers around the calls, a terminal with a row out of the state leaves it only before
+    /// the first byte that is not whitespace, where a table that reads a thought before the
+    /// calls has the thought's opener
+    /// ([`Format::with_forced_call`](crate::Format::with_forced_call)); once that byte decided,
+    /// every terminal is the calls' text, as a JSON string may hold any, or the prose's.
+    fn closes(&mut self, _terminal: &str) -> bool {
+        self.framed || matches!(self.stage, Stage::Deciding)
+    }
+
+    /// With no markers around the calls, a terminal the table ignores is a call's text inside
+    /// the call's object, where a string may hold it; between the objects and around the list
+    /// it is the template's wrapping, which the engine drops.
+    fn markers_are_text(&self) -> bool {
+        !self.framed && matches!(self.stage, Stage::Object(_))
     }
 
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
