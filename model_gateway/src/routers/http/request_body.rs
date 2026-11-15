@@ -342,8 +342,8 @@ mod tests {
     use crate::{
         routers::{grpc::backend_client::BackendClient, http::set_request_model},
         worker::{
-            basic::WorkerMetadata, circuit_breaker::CircuitState, BasicWorker, BasicWorkerBuilder,
-            ResolvedResilience, WorkerResult, WorkerType,
+            health::circuit_breaker::CircuitState, identity::basic::WorkerMetadata, BasicWorker,
+            BasicWorkerBuilder, ResolvedResilience, WorkerResult, WorkerType,
         },
     };
 

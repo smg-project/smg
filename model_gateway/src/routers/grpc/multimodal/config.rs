@@ -20,7 +20,7 @@ use super::{
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
-use crate::{observability::metrics::Metrics, worker::http_client::build_with};
+use crate::{observability::metrics::Metrics, worker::connection::http_client::build_with};
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug)]
