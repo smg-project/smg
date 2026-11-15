@@ -297,7 +297,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   such field. `TokenizeRequest` gains `add_special_tokens`. Breaking: the field is new, and the
   default answer changes with a tokenizer that adds special tokens (a Llama-style BOS): its
   `tokens` and `count` now carry them, as SGLang's do; `add_special_tokens: false` keeps the old
-  answer.
+  answer. The gateway's own gRPC `/generate` and `/v1/completions` text paths encode without
+  them, so with such a tokenizer the default answer carries tokens those routes do not send the
+  engine (one more, for a Llama-style BOS); `add_special_tokens: false` answers the ids they send.
 - A Responses function tool declared with `async`, `defer_loading`, `output_schema` or
   `allowed_callers`, and a custom tool declared with `async` or `allowed_callers`, as the public
   API's tools take them, parse and are forwarded as given. The crate refused each as an unknown

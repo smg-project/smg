@@ -3,11 +3,12 @@
 A request that carries ``input_ids`` instead of ``text`` bypasses the gateway's
 tokenizer: the ids reach the engine as they were sent, the engine counts them
 as the prompt, and the answer opens as the same prompt's answer as text. The
-ids come from the gateway's own ``/v1/tokenize`` (no special tokens, as the
-text path encodes), so the two requests describe one prompt. On a real engine
-the two answers are compared on their first token only: the second request may
-run over the engine's prefix cache, a different kernel path whose logits are
-not promised identical, so a near-tie further into a greedy run could flip.
+ids come from the gateway's own ``/v1/tokenize``, asked for no special tokens
+(``add_special_tokens: false``), as the text path encodes, so the two requests
+describe one prompt. On a real engine the two answers are compared on their
+first token only: the second request may run over the engine's prefix cache, a
+different kernel path whose logits are not promised identical, so a near-tie
+further into a greedy run could flip.
 
 On the mock engine the ids request's answer is filed under the exact ids
 (``input_ids=``): the mock serves it only when the prompt it receives has that
@@ -38,9 +39,10 @@ def _generate(gateway, model: str, prompt: dict, *, stream: bool = False) -> htt
 
 
 def _tokenize(gateway, model: str, text: str) -> list[int]:
-    resp = httpx.post(
-        f"{gateway.base_url}/v1/tokenize", json={"model": model, "prompt": text}, timeout=TIMEOUT
-    )
+    # Without the special tokens, as the text path encodes: the endpoint adds
+    # them by default, as SGLang's does.
+    body = {"model": model, "prompt": text, "add_special_tokens": False}
+    resp = httpx.post(f"{gateway.base_url}/v1/tokenize", json=body, timeout=TIMEOUT)
     assert resp.status_code == 200, resp.text
     ids = resp.json()["tokens"]
     assert ids and all(isinstance(i, int) for i in ids), ids

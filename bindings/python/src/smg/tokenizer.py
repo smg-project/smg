@@ -448,10 +448,11 @@ class Tokenizer:
 
         ``add_special_tokens`` adds what the tokenizer's post-processor adds
         (a BOS for Llama-style checkpoints, nothing for most byte-level ones),
-        as ``transformers`` does by default. SMG encodes ``/v1/completions``,
-        ``/generate`` and ``/v1/tokenize`` text with ``add_special_tokens=False``
-        and embedding input with ``True``; a chat prompt's special tokens come
-        from its template (see :meth:`apply_chat_template`). As in
+        as ``transformers`` does by default. SMG encodes ``/v1/completions``
+        and ``/generate`` text with ``add_special_tokens=False``, embedding
+        input with ``True``, and ``/v1/tokenize`` text with the request's
+        ``add_special_tokens``, ``true`` by default; a chat prompt's special
+        tokens come from its template (see :meth:`apply_chat_template`). As in
         ``transformers``, special-token text in the input (``<|im_end|>``)
         encodes to the special token.
         """
