@@ -838,11 +838,12 @@ mod tests {
             allowed_tools: None,
         };
 
+        let (first_input, second_input) = ([input()], [input()]);
         let (first, second) = tokio::join!(
-            connect_mcp_servers(&orchestrator, &format_registry, &[input()]),
+            connect_mcp_servers(&orchestrator, &format_registry, &first_input),
             async {
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                connect_mcp_servers(&orchestrator, &format_registry, &[input()]).await
+                connect_mcp_servers(&orchestrator, &format_registry, &second_input).await
             }
         );
         for (which, bindings) in [("first", first), ("second", second)] {

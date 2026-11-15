@@ -265,19 +265,20 @@ impl McpConnectionPool {
 
     /// Record where the connection's tool listing stands. A key the pool no
     /// longer holds is left alone.
-    pub fn set_listing(&self, key: &PoolKey, listing: Listing) {
+    pub(crate) fn set_listing(&self, key: &PoolKey, listing: Listing) {
         if let Some(cached) = self.connections.lock().peek_mut(key) {
             cached.listing = listing;
         }
     }
 
-    /// Where the listing of the connection under `key` stands; `None` when
-    /// the pool does not hold it. No promotion.
-    pub fn listing(&self, key: &PoolKey) -> Option<Listing> {
-        self.connections
-            .lock()
-            .peek(key)
-            .map(|cached| cached.listing.clone())
+    /// Whether the connection under `key` is pooled with its tools listed
+    /// (a plain hit); false for a pending or failed listing and for a key the
+    /// pool does not hold. No promotion.
+    pub(crate) fn is_listed(&self, key: &PoolKey) -> bool {
+        matches!(
+            self.connections.lock().peek(key),
+            Some(cached) if cached.listing == Listing::Listed
+        )
     }
 
     pub fn list_keys(&self) -> Vec<PoolKey> {

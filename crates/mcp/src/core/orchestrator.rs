@@ -1688,7 +1688,7 @@ impl McpOrchestrator {
         // arriving during another's listing takes no pending listing for a
         // success.
         let pooled = self.connection_pool.get(&pool_key);
-        if pooled.is_some() && self.connection_pool.listing(&pool_key) == Some(Listing::Listed) {
+        if pooled.is_some() && self.connection_pool.is_listed(&pool_key) {
             return Ok(ConnectedServer {
                 server_key,
                 list_error: None,
