@@ -85,8 +85,11 @@ pub(crate) enum MmRefsError {
     /// worker is selected, in the media connector's own words (`cause`): a
     /// url that is empty or begins with whitespace or a control character, a
     /// data URL whose header names no base64 payload or whose payload is
-    /// empty. The request's own fault, under the code the router-side
-    /// pipeline answers the same media (`invalid_multimodal_request`).
+    /// empty, an inline part whose media type is not one `type/subtype` pair
+    /// or whose payload itself opens with a data URL header. The request's
+    /// own fault, under the code the router-side pipeline answers invalid
+    /// media with (`invalid_multimodal_request`); the media type read has no
+    /// router-side counterpart (see `check_forwarded_references`).
     InvalidReference { index: usize, cause: String },
     /// An inline `data:` payload above the router's byte cap.
     RefTooLarge {
@@ -836,8 +839,16 @@ fn echoed_url(url: &str) -> String {
 /// `URL_ECHO_CHARS` characters of it), a data URL whose header names no base64
 /// payload and an empty payload are refused here in the connector's own
 /// words, instead of being forwarded to a worker no engine of which serves
-/// them. The symbols and the length of a base64 payload stay the engine's
-/// verdict: nothing here reads the payload.
+/// them. An inline part's header is read before the door builds its data URL
+/// (one `type/subtype` pair of the registration grammar's characters; a
+/// payload that does not itself open with a data URL header), since the
+/// request names the media type and the wire takes the URL as built. That
+/// read is this door's own, with no router-side counterpart: the router
+/// placement decodes a base64 source's payload alone and never its media
+/// type, so under the automatic placement a malformed header is answered by
+/// the placement the request lands on. The symbols and the length of a
+/// base64 payload stay the engine's verdict: nothing here reads the payload
+/// past the five bytes a data URL header would occupy.
 fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
     let refused = |index: usize, cause: MediaConnectorError| MmRefsError::InvalidReference {
         index,
@@ -859,21 +870,69 @@ fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
                         MediaConnectorError::InvalidUrl(echoed_url(url)),
                     ));
                 }
-                let is_data_url = url
-                    .get(..5)
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"));
-                if is_data_url {
+                if opens_a_data_url(url) {
                     data_url_payload(url).map_err(|cause| refused(index, cause))?;
                 }
             }
-            MediaContentPart::ImageBase64 { data, .. }
-            | MediaContentPart::AudioBase64 { data, .. } => {
+            MediaContentPart::ImageBase64 {
+                media_type, data, ..
+            }
+            | MediaContentPart::AudioBase64 {
+                media_type, data, ..
+            } => {
+                // The wire takes a data URL built here from the part's media
+                // type and payload (`data_url`); the header's shape is read
+                // before it is built, the payload's symbols are not. The chat
+                // door writes `audio/<format>` from `input_audio.format` as
+                // sent, so a MIME type or a stray character there is a media
+                // type that is not one type/subtype pair; a payload that
+                // itself opens with a data URL header (a data URL sent where
+                // bare base64 is documented; read trimmed, as the payload rule
+                // reads it) would be wrapped a second time. Either is refused
+                // as the invalid URL it would make, echoed from the payload's
+                // head alone: a refusal copies no payload whole.
+                if !media_type_is_a_type_pair(media_type) || opens_a_data_url(data.trim_start()) {
+                    let payload_head: String = data.chars().take(URL_ECHO_CHARS).collect();
+                    return Err(refused(
+                        index,
+                        MediaConnectorError::InvalidUrl(echoed_url(&data_url(
+                            media_type,
+                            &payload_head,
+                        ))),
+                    ));
+                }
                 base64_payload(data).map_err(|cause| refused(index, cause))?;
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Whether `media_type` is one `type/subtype` pair of the media type
+/// registration grammar's restricted-name characters (RFC 6838 section 4.2:
+/// an alphanumeric first, then alphanumerics and `!#$&-^_.+`), the shape a
+/// data URL header carries before its parameters: both halves present,
+/// neither holding a second slash, a parameter separator or whitespace.
+fn media_type_is_a_type_pair(media_type: &str) -> bool {
+    let Some((kind, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    let restricted_name = |part: &str| {
+        part.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$&-^_.+".contains(c))
+    };
+    restricted_name(kind) && restricted_name(subtype)
+}
+
+/// Whether `text` opens with a data URL header (`data:` in any case): a URL
+/// part's url that is a data URL, or a base64 payload where the request sent
+/// a data URL in place of the bare base64 documented.
+fn opens_a_data_url(text: &str) -> bool {
+    text.get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
 }
 
 /// Build the wire payload from the plan, in authored (prompt) order.
@@ -1061,6 +1120,90 @@ mod tests {
             };
             let w = worker(&scheme, runtime, connection, labels);
             assert_eq!(worker_accepts_media_refs(w.as_ref()), expected, "case {i}");
+        }
+    }
+
+    /// An inline clip or image whose data URL header the request got wrong
+    /// is refused at the door as the invalid URL it would make, echoed by a
+    /// bounded prefix: a media type that is not one type/subtype pair (the
+    /// chat door writes `audio/<format>` from `input_audio.format` as sent, so
+    /// a MIME type there doubles the header and an empty format breaks it),
+    /// or a payload that itself opens with a data URL header. A restricted-name
+    /// subtype of any case passes; the payload's symbols stay unread.
+    #[test]
+    fn an_inline_payload_whose_header_the_request_got_wrong_is_refused_at_the_door() {
+        fn clip(media_type: &str, data: &str) -> MediaContentPart {
+            MediaContentPart::AudioBase64 {
+                media_type: media_type.to_string(),
+                data: data.to_string().into(),
+                uuid: None,
+            }
+        }
+        fn image(media_type: &str, data: &str) -> MediaContentPart {
+            MediaContentPart::ImageBase64 {
+                media_type: media_type.to_string(),
+                data: data.to_string().into(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            }
+        }
+        let refused = |part: MediaContentPart, url: &str| {
+            assert_eq!(
+                check_forwarded_references(&plan(vec![part])),
+                Err(MmRefsError::InvalidReference {
+                    index: 0,
+                    cause: format!("invalid media URL: {url}"),
+                }),
+                "{url}"
+            );
+        };
+        // A MIME type as the format: the header the door would build doubles it.
+        refused(
+            clip("audio/audio/wav", "UklG"),
+            "data:audio/audio/wav;base64,UklG",
+        );
+        // An empty format: no subtype; a subtype opening with a separator.
+        refused(clip("audio/", "UklG"), "data:audio/;base64,UklG");
+        refused(clip("audio/+x", "UklG"), "data:audio/+x;base64,UklG");
+        // No slash (the Messages door copies `source.media_type` as sent), a
+        // parameter, a trailing space: not one type/subtype pair.
+        refused(image("jpeg", "AAAA"), "data:jpeg;base64,AAAA");
+        refused(
+            clip("audio/wav;rate=16000", "UklG"),
+            "data:audio/wav;rate=16000;base64,UklG",
+        );
+        refused(image("image/png ", "AAAA"), "data:image/png ;base64,AAAA");
+        // A data URL sent as the payload (read trimmed): wrapped a second time.
+        refused(
+            clip("audio/wav", " data:audio/wav;base64,UklG"),
+            "data:audio/wav;base64, data:audio/wav;base64,UklG",
+        );
+        refused(
+            image("image/png", "DATA:image/png;base64,AAAA"),
+            "data:image/png;base64,DATA:image/png;base64,AAAA",
+        );
+        // The echo is bounded.
+        let long = "A".repeat(200);
+        let Err(MmRefsError::InvalidReference { cause, .. }) =
+            check_forwarded_references(&plan(vec![clip("audio/x/y", &long)]))
+        else {
+            panic!("a doubled header is refused");
+        };
+        assert_eq!(
+            cause.len(),
+            "invalid media URL: ".len() + URL_ECHO_CHARS + 3
+        );
+        assert!(cause.ends_with("..."));
+        // Well-formed headers pass whatever the payload's symbols or the subtype's case.
+        for part in [
+            clip("audio/wav", "UklG"),
+            clip("audio/WAV", "UklG"),
+            clip("audio/x-wav", "UklG"),
+            clip("audio/xyz", "not base64 at all"),
+            image("image/svg+xml", "PHN2Zz4="),
+        ] {
+            check_forwarded_references(&plan(vec![part])).expect("a well-formed header passes");
         }
     }
 
