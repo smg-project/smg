@@ -282,6 +282,53 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // an older template without a thought; the recorded outputs follow the former.
     ("qwen-agentworld-35b-a3b", GenerationPrompt::OpensTheThought),
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
+    // Ripple-65B-Preview writes Qwen3's JSON calls under ChatML, and its generation prompt ends at
+    // the turn opener under every thinking kwarg: the model writes its own `<think>` or not.
+    ("ripple-65b-preview", GenerationPrompt::ModelDecides),
+    // Ornith-1.5-122B writes Qwen 3.5's tagged calls under ChatML with the thought opened in the
+    // prompt (`<think>\n`) and closed there as an empty block when the request turns thinking off.
+    ("ornith-1.5-122b", GenerationPrompt::OpensTheThought),
+    // MemT-1.0-Nano writes Qwen 3.5's tagged calls under ChatML with the thought opened in the
+    // prompt (`<think>\n`) and closed there as an empty block when the request turns thinking off.
+    ("memt-1.0-nano", GenerationPrompt::OpensTheThought),
+    // Sage-A1.5 writes Qwen 3.5's tagged calls under ChatML with the thought opened in the
+    // prompt (`<think>\n`) and closed there as an empty block when the request turns thinking off.
+    ("sage-a1.5", GenerationPrompt::OpensTheThought),
+    // Naive-N0.5-Flash writes MiMo's tagged calls under ChatML (the value between the tags
+    // directly, nothing after the close); its prompt ends bare (the model writes its own thought),
+    // and thinking off closes it in the prompt as `<think></think>`.
+    ("naive-n0.5-flash", GenerationPrompt::ModelWritesTheThought),
+    // flint writes GLM's keyed calls with nothing between the tags under a bare marker frame; its
+    // prompt ends bare at `<|assistant|>` under every kwarg (the model writes the thought or not).
+    ("flint", GenerationPrompt::ModelDecides),
+    // GLM5.3-Flash-E192-DGX-Spark writes GLM's keyed calls with nothing between the tags; its
+    // prompt opens the thought under every kwarg (an effort line, no thinking switch).
+    (
+        "glm5.3-flash-e192-dgx-spark",
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // Kolibri-1 writes Qwen 3's JSON calls under ChatML; its prompt ends bare (the model writes its
+    // own thought); thinking off closes it in the prompt as the empty `<think>` block.
+    ("kolibri-1", GenerationPrompt::ModelWritesTheThought),
+    // Spark-X2.6 writes GLM's keyed calls with nothing between the tags under a DeepSeek-style
+    // frame; the prompt opens the thought after `<|Bot|>` (`<think>`, no newline), or writes a
+    // bare `</think>` there when the request turns thinking off.
+    ("spark-x2.6-4b", GenerationPrompt::OpensTheThought),
+    // MiniMax-M3.1-Flash ships a template of its own in M3's spelling (the thought closed with
+    // `</mm:think>`, an XML tree of arguments); the generation prompt adds nothing.
+    ("minimax-m3.1-flash", GenerationPrompt::ModelDecides),
+    // A quantized Qwen 3.8 27B with a template of its own: Qwen 3.5's tagged calls under ChatML,
+    // the thought opened in the prompt (`<think>\n`), closed as an empty block under thinking off.
+    (
+        "qwen3.8-27b-w4a16-autoround-rtx3090",
+        GenerationPrompt::OpensTheThought,
+    ),
+    // OvisOCR3 writes Qwen 3.5's tagged calls under ChatML with a template of its own: the thought
+    // opened in the prompt only when the request turns thinking on, closed as an empty block otherwise.
+    ("ovisocr3", GenerationPrompt::OpensTheThoughtWhenAsked),
+    // SilentVision-52M writes content alone under ChatML (its template has no tool syntax and no
+    // thinking switch); the generation prompt is the assistant header and nothing more.
+    ("silentvision-52m", GenerationPrompt::Plain),
     // Mage-VL-Cowork writes Qwen3's JSON calls under ChatML with Qwen 3.5's thinking switch: the
     // thought opened in the prompt (`<think>\n`) and closed there when the request turns thinking
     // off.
@@ -420,6 +467,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
+    ("granite-switch-4.1-8b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
     // Step-5-Preview writes ChatML after a DeepSeek-style beginning-of-sentence marker, the tools
@@ -430,6 +478,19 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Arete-27B (a Qwen 3.5 stack) writes Qwen 3.5's prompt shapes with a reasoning-effort sentence
     // in the system turn.
     ("arete-27b", GenerationPrompt::OpensTheThought),
+    // LBS-27B writes Qwen 3.5's prompt shapes with a reasoning-effort sentence in the system turn
+    // (Arete-27B's template, the same bytes); SingVL_S1_4B and ZoomGain-9B write
+    // Qwen 3.5's own.
+    ("lbs-27b", GenerationPrompt::OpensTheThought),
+    ("singvl-s1-4b", GenerationPrompt::OpensTheThought),
+    ("zoomgain-9b", GenerationPrompt::OpensTheThought),
+    // ZwZ2 writes Qwen 3.5's shapes under a template of its own: a default system turn that asks
+    // for the reasoning and an `<answer>` block, and the thought opened only when the request
+    // turns thinking on (closed in the prompt otherwise, as Qwen3.5-2B's); bellwether's reference
+    // refused the thought-bearing probes, so each slug's common set holds eleven of the sixteen
+    // cases and its turns set eight of the twelve.
+    ("zwz2-27b", GenerationPrompt::OpensTheThoughtWhenAsked),
+    ("zwz2-9b", GenerationPrompt::OpensTheThoughtWhenAsked),
     // MiMo writes Qwen 3.5's tags with the value between them directly, and its own `<think>`.
     ("mimo-v2.5", GenerationPrompt::ModelWritesTheThought),
     // The V2.6 line writes the same tags with no newline between them; the generation prompt
@@ -1099,7 +1160,12 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "granite-4.1-3b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
+    (
+        "granite-switch-4.1-8b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
     ("laguna-xs.2", "<assistant>"),
+    ("spark-x2.6-4b", "<｜start▁of▁sentence｜><|Bot|>"),
     ("a.x-3.1-light", "<|im_start|><|assistant|>"),
     ("a.x-4.0", "<|im_start|><|assistant|>"),
     ("a.x-4.0-light", "<|im_start|><|assistant|>"),
