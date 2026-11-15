@@ -21,7 +21,7 @@ use std::sync::{
 };
 
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
+    builtins::{Best, Healthy, LeastRequests, PowerOfTwo},
     wasm::{
         Abi, Bound, BreakerSpec, Failure, LoadError, Plugin, PluginSpec, Reveal, Runtime,
         WasmFilter, WasmPicker, WasmScorer, World,
@@ -412,6 +412,79 @@ fn the_filters_answer_narrows_the_pool_once_per_decision_and_row_by_row() {
     };
     assert_eq!(pick.trace.survivors, 4);
     assert_eq!(plugin.stats().answered, 4, "filter asked once");
+}
+
+/// A plugin scorer under a picker that narrows is handed the set compared, as
+/// any scorer is: the guest scores its candidates once, the host reads the
+/// rows compared in the picker's order, and no line of the interface moves.
+/// Under the two-draw picker the better of the two drawn by the guest's score
+/// leads, the other follows, and the trace's top rows are the two.
+#[test]
+fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
+    let runtime = runtime();
+    for (name, component) in [
+        ("record", guest::record_guest()),
+        ("packed", guest::packed_guest()),
+    ] {
+        let plugin = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
+        let engine = single_engine(Profile {
+            name: "two-draw".into(),
+            filters: vec![],
+            scorers: vec![Weighted {
+                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+                weight: 1.0,
+            }],
+            picker: Box::new(PowerOfTwo),
+        });
+        // The in-flight counts descend, so of two rows the later scores
+        // higher: one less a hundredth a request in flight.
+        let candidates = pool(8);
+        let score = |id: u64| 1.0 - (108 - id) as f32 / 100.0;
+        let mut leads = std::collections::BTreeSet::new();
+        for seed in 1..=64 {
+            let decision = decide(&engine, &candidates, seed);
+            let ids = pick_ids(&decision);
+            assert_eq!(ids.len(), 2, "{name}, seed {seed}: the two drawn");
+            assert!(
+                ids[0] > ids[1],
+                "{name}, seed {seed}: the fewer in flight leads, {ids:?}"
+            );
+            let Some(pick) = decision.pick() else {
+                panic!("a pick, not {decision:?}")
+            };
+            assert_eq!(pick.trace.survivors, 8, "{name}: the filters' count");
+            let top = &pick.trace.top[..usize::from(pick.trace.top_len)];
+            assert_eq!(
+                top.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),
+                ids,
+                "{name}, seed {seed}: the trace's top rows are the two"
+            );
+            assert!(
+                top.iter().all(|(id, got)| (got - score(id.0)).abs() < 1e-6),
+                "{name}, seed {seed}: each row's own score, {top:?}"
+            );
+            leads.insert(ids[0]);
+        }
+        assert!(
+            leads.len() > 2,
+            "{name}: the draw moves the pair, {leads:?}"
+        );
+        let stats = plugin.stats();
+        assert_eq!(
+            stats.answered, 128,
+            "{name}: the constructor and one score a decision"
+        );
+        assert_eq!(
+            (
+                stats.declined,
+                stats.traps,
+                stats.fuel_exhausted,
+                stats.invalid
+            ),
+            (0, 0, 0, 0),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -1013,6 +1086,7 @@ fn pair_decide_under(engine: &Engine, budget_micros: u32) -> Decision {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1497,6 +1571,7 @@ fn a_pair_shares_one_decision_budget() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1555,6 +1630,7 @@ fn a_fault_on_one_side_of_a_two_profile_pair_rebuilds_once() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1832,6 +1908,7 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -3463,4 +3540,151 @@ fn a_decode_side_plugin_is_sampled_at_its_own_last_close() {
         "the decode plugin's own last close sampled its decision and the window opened it: {d:?}"
     );
     assert_eq!(p.breaker_opens, 0, "the prefill plugin stays: {p:?}");
+}
+
+/// A plugin's declared needs reach the profile's needs whichever stage it is
+/// bound as. A plugin that reads the affinity column as the filter alone, or
+/// as the picker alone, beside built-in stages that declare nothing, counts
+/// as a reader of it: a host that fills the column where it is declared
+/// leaves it empty only where nothing reads it.
+#[test]
+fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
+    let runtime = runtime();
+    let mut reading = spec("reader", guest::record_guest(), mode::LEAST_IN_FLIGHT);
+    reading.needs.affinity = true;
+    let plugin = Plugin::load(&runtime, reading).expect("the guest loads");
+    let scorers = || {
+        vec![Weighted {
+            scorer: Box::new(LeastRequests),
+            weight: 1.0,
+        }]
+    };
+    let as_filter = Profile {
+        name: "filter".into(),
+        filters: vec![Box::new(WasmFilter::new(plugin.bind(), None))],
+        scorers: scorers(),
+        picker: Box::new(Best),
+    };
+    let as_picker = Profile {
+        name: "picker".into(),
+        filters: vec![Box::new(Healthy)],
+        scorers: scorers(),
+        picker: Box::new(WasmPicker::new(plugin.bind(), None)),
+    };
+    assert!(as_filter.needs().affinity, "the plugin as the filter alone");
+    assert!(as_picker.needs().affinity, "the plugin as the picker alone");
+}
+
+/// A fallback answers when its plugin fails, so what it reads counts as
+/// what the plugin reads does: a plugin that declares nothing, bound over a
+/// fallback that reads the affinity column, is a reader of it. Each of the
+/// three adapters hands its own fallback's needs on, so the same reader is
+/// asked behind the filter, behind a scorer and behind the picker.
+#[test]
+fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
+    use smg_policy_controller::{Filter, Picker, Scorer, Targets, TieBand};
+
+    #[derive(Debug)]
+    struct ColumnReader;
+
+    fn reads_the_column() -> Needs {
+        Needs {
+            affinity: true,
+            ..Needs::default()
+        }
+    }
+
+    impl Lifecycle for ColumnReader {}
+
+    impl Filter for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    impl Scorer for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    impl Picker for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Best.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "plain",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    // The plugin declares nothing: alone, no adapter reads the column.
+    let alone: [(&str, Needs); 3] = [
+        ("the filter", WasmFilter::new(plugin.bind(), None).needs()),
+        ("a scorer", WasmScorer::new(plugin.bind(), None).needs()),
+        ("the picker", WasmPicker::new(plugin.bind(), None).needs()),
+    ];
+    // Over the reader, each adapter declares its fallback's needs.
+    let over: [(&str, Needs); 3] = [
+        (
+            "the filter",
+            WasmFilter::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+        (
+            "a scorer",
+            WasmScorer::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+        (
+            "the picker",
+            WasmPicker::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+    ];
+    for (bound_as, needs) in alone {
+        assert!(!needs.affinity, "the plugin alone, bound as {bound_as}");
+    }
+    for (bound_as, needs) in over {
+        assert!(needs.affinity, "the fallback's needs, bound as {bound_as}");
+    }
 }

@@ -15,7 +15,7 @@ use axum::{
 };
 use serde::de::DeserializeOwned;
 
-use crate::admin::json::refusal;
+use super::json::refusal;
 
 /// A query string of the control-plane management endpoints.
 pub(crate) struct AdminQuery<T>(pub T);

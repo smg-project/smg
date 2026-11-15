@@ -901,9 +901,10 @@ fn two_byte_characters_on_one_id_merge_as_the_model_does() {
 }
 
 /// The table is the hot grid (`HOT_SIDE` x `HOT_SIDE` words) and its
-/// entries: a power of two of buckets, one cache line of four sixteen-byte
-/// entries each, at a load of one half or less, the pair filter, and the
-/// pre-formed character analysis counted apart.
+/// entries: exactly the buckets its merges need at a load of one half, one
+/// cache line of four sixteen-byte entries per two merges (two buckets at the
+/// least), the pair filter, and the pre-formed character analysis counted
+/// apart.
 #[test]
 fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
@@ -917,13 +918,13 @@ fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less
     );
     let analysis = table.preformed.bytes();
     let entries = (table.bytes() - size_of::<MergeTable>() - grid - filter - analysis) / 16;
-    assert!(entries.is_power_of_two(), "{entries} entries");
-    assert!(
-        entries >= 2 * merges,
+    assert_eq!(
+        entries,
+        4 * merges.div_ceil(2).max(2),
         "{entries} entries for {merges} merges"
     );
     assert!(
-        entries < 4 * merges + 8,
+        entries >= 2 * merges,
         "{entries} entries for {merges} merges"
     );
 }
@@ -1015,6 +1016,38 @@ fn a_lookup_walks_a_full_bucket_into_the_next_and_stops_at_the_first_empty_entry
     // An absent pair that hashes to the full bucket and passes the filter
     // (its bits set as a merge's would be) is none: the walk crosses the
     // full bucket and ends at the next bucket's first empty entry.
+    let &(a, b) = rest.first().expect("a pair left over");
+    let (word, bits) = table.pair_filter_slot(MergeTable::pair_key(a, b));
+    table.pair_filter[word] |= bits;
+    assert!(table.pair_filter_admits(a, b));
+    assert_eq!(table.merge_of(a, b), Merge::NONE);
+}
+
+/// The walk goes on at the first bucket after the last: pairs that hash to
+/// the last bucket, one more than its entries, are all found (the walk
+/// wraps for the last of them at the latest), and a pair that hashes there
+/// too and passes the filter but was never inserted is none.
+#[test]
+fn a_lookup_walking_past_the_last_bucket_goes_on_at_the_first() {
+    let bpe = model_with(&merges(), false);
+    let mut table = table_of(&bpe);
+    let last = table.buckets.len() - 1;
+    // Pairs of ids no token of the model has whose first bucket is the last.
+    let pairs: Vec<(u32, u32)> = (1_000_000..1_100_000u32)
+        .map(|a| (a, a + 1))
+        .filter(|&(a, b)| table.first_bucket(MergeTable::pair_key(a, b)) == last)
+        .collect();
+    let (inserted, rest) = pairs.split_at(BUCKET + 1);
+    for (rank, &(a, b)) in inserted.iter().enumerate() {
+        table.insert(a, b, Merge::new(rank as u32, a));
+    }
+    for (rank, &(a, b)) in inserted.iter().enumerate() {
+        assert_eq!(
+            table.merge_of(a, b),
+            Merge::new(rank as u32, a),
+            "pair {rank}"
+        );
+    }
     let &(a, b) = rest.first().expect("a pair left over");
     let (word, bits) = table.pair_filter_slot(MergeTable::pair_key(a, b));
     table.pair_filter[word] |= bits;

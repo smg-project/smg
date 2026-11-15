@@ -31,7 +31,7 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     observability::metrics::{metrics_labels, Metrics},
-    worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
+    worker::{identity::endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
 };
 
