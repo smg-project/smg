@@ -1360,7 +1360,7 @@ mod tests {
     #[test]
     fn a_function_tool_has_a_name() {
         let tools = |names: &[&str]| -> Vec<InteractionsTool> {
-            let mut tools = vec![InteractionsTool::GoogleSearch {}];
+            let mut tools = vec![InteractionsTool::GoogleSearch { search_types: None }];
             tools.extend(names.iter().map(|name| {
                 serde_json::from_value::<InteractionsTool>(
                     serde_json::json!({"type": "function", "name": name}),
