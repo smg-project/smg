@@ -597,7 +597,10 @@ impl MediaConnector {
                 let bytes = decode_base64_with_limit(data.trim(), limit, media)?;
                 Ok((bytes.into(), RawFetchSource::DataUrl))
             }
-            MediaSource::InlineBytes(bytes) => Ok((bytes.into(), RawFetchSource::InlineBytes)),
+            MediaSource::InlineBytes(bytes) => {
+                ensure_input_byte_limit(bytes.len(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::InlineBytes))
+            }
             MediaSource::File(path) => {
                 let allowed_root = self.allowed_local_media_path.as_ref().ok_or_else(|| {
                     MediaConnectorError::DisallowedLocalPath(path.display().to_string())
