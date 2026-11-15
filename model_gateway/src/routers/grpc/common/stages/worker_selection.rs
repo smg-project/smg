@@ -1919,9 +1919,9 @@ impl WorkerSelectionStage {
         // a concurrent replacement and pair workers that never coexisted.
         // The pools hold the workers whose wire carries the PD bootstrap
         // info (see `RoutingPool::GrpcPrefill`; the wildcard model maps to
-        // the global snapshot). The pools must share a runtime, the
-        // rendezvous being runtime-specific, and a retry pins both to the
-        // retained plan's runtime.
+        // the global snapshot). A pair shares a runtime, the rendezvous
+        // being runtime-specific: the index keeps known runtimes apart,
+        // and a retry pins both sides to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let (prefill_pool, decode_pool) = PdWire::Grpc.pools();
