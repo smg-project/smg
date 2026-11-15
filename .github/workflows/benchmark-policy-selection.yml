@@ -115,7 +115,7 @@ jobs:
 
       - name: Run benchmark
         if: github.event_name != 'pull_request'
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: |
           source "$HOME/.cargo/env"
           set -o pipefail
