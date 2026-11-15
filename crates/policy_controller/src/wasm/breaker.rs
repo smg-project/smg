@@ -129,11 +129,14 @@ impl Breaker {
 /// so one outlier does not open the breaker, and a window that read slow is
 /// forgotten, so it does not open it twice.
 ///
-/// The ring also says whether its thread reads its CPU clock at the start of
-/// the plugin's calls ([`Latency::arm`]): the sample of a late call no
-/// reading covers is the time the call took, which a hold of the host makes
-/// slow, so the ring that is about to take one is armed until that sample
-/// has left it, and at most one of them is ever in a window.
+/// The ring also says whether its thread reads its CPU clock at the start
+/// and the end of the plugin's calls ([`Latency::arm`]): the sample of a
+/// late call no reading covers is the time the call took, which a hold of
+/// the host makes slow, so the ring that is about to take one is armed until
+/// that sample has left it, and at most one of them is ever in a window. A
+/// call that runs out under a decision's remainder arms it too where the
+/// two ends of the time nothing read part: by the time the plugin's unread
+/// calls took the run-out is its own, by their fuel it is not.
 #[derive(Debug)]
 pub(crate) struct Latency {
     ring: [u32; Self::SAMPLES],
@@ -165,7 +168,8 @@ impl Latency {
         self.armed = Self::SAMPLES;
     }
 
-    /// Whether the thread reads its CPU clock at the start of a call.
+    /// Whether the thread reads its CPU clock at the start and the end of a
+    /// call.
     pub(crate) fn armed(&self) -> bool {
         self.armed != 0
     }
