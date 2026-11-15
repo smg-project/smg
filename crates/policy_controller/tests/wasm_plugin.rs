@@ -287,6 +287,27 @@ fn a_component_of_another_world_has_no_policy_world() {
 }
 
 #[test]
+fn a_component_with_an_async_export_is_refused_at_its_compile() {
+    // The runtime's own engine keeps no state for concurrent calls, so a
+    // component that needs the async component support does not compile. An
+    // engine that kept it would compile this one, and the loader would
+    // refuse it later, for having no policy world.
+    let needs_it = wat::parse_str(
+        r#"(component
+            (core module $m
+                (func (export "run") (result i32) i32.const 0)
+                (func (export "cb") (param i32 i32 i32) (result i32) i32.const 0))
+            (core instance $i (instantiate $m))
+            (type $run (func async))
+            (func (export "run") (type $run)
+                (canon lift (core func $i "run") async (callback (core func $i "cb")))))"#,
+    )
+    .expect("the component assembles");
+    let err = Plugin::load(&runtime(), spec("async-export", needs_it, 0)).expect_err("refused");
+    assert!(matches!(err, LoadError::Compile { .. }), "{err}");
+}
+
+#[test]
 fn the_abi_pin_the_memory_floor_the_init_failure_and_bad_bytes_are_refused() {
     let runtime = runtime();
     let mut pinned = spec("pinned", guest::record_guest(), mode::LEAST_IN_FLIGHT);

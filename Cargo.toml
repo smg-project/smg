@@ -80,10 +80,16 @@ tokio = { version = "1.54.1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 uuid = { version = "1.23", features = ["v7", "serde"] }
-# The wasm runtime's default feature set as of wasmtime 49, named explicitly and without `cache`:
-# nothing configures wasmtime's compilation cache (no `Config::cache` call anywhere), and that
-# cache crate was the only path by which zstd 0.13 reached the lockfile. A wasmtime bump re-reads
-# the `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
+# The wasm runtime's default feature set as of wasmtime 49, named explicitly, without `cache` and
+# without `component-model-async`. Nothing configures wasmtime's compilation cache (no
+# `Config::cache` call anywhere), and that cache crate was the only path by which zstd 0.13
+# reached the lockfile. No crate here makes an async component call (a concurrent call, or a
+# stream or a future across the component boundary), and a runtime built with
+# `component-model-async` charges every component call that feature's task bookkeeping.
+# `wasmtime-wasi` turns the feature on for each build that links it (its `p3` default), so this
+# list decides for the builds that do not: the policy controller's. A crate that comes to make
+# such a call names the feature on its own dependency line. A wasmtime bump re-reads the
+# `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
 wasmtime = { version = "49.0", default-features = false, features = [
     "anyhow",
     "async",
@@ -103,7 +109,6 @@ wasmtime = { version = "49.0", default-features = false, features = [
     "debug-builtins",
     "runtime",
     "component-model",
-    "component-model-async",
     "threads",
     "stack-switching",
     "std",
