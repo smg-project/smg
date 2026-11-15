@@ -964,10 +964,11 @@ impl PrefillCachedTokens {
 pub struct TrackedStream {
     inner: ProtoStream,
     worker: Arc<dyn Worker>,
-    /// The worker's runtime, captured at the stream's start, that every
-    /// response is noted on (see [`Worker::runtime_state`]); `None` for a
-    /// worker that keeps no state: its responses are noted nowhere and only
-    /// end a standing veto.
+    /// The worker's state, captured at the stream's start (see
+    /// [`Worker::runtime_state`]): every response's progress is noted on it
+    /// and the output ticket is opened on it. `None` for a worker that keeps
+    /// no state: a response then notes no progress and opens a ticket that
+    /// counts nothing. It still ends a standing veto and samples the outcome.
     runtime: Option<Arc<WorkerRuntime>>,
     prefill: Option<PrefillTicket>,
     /// The request's place in the worker's pile; a non-streaming generation
@@ -1010,36 +1011,53 @@ impl FirstItem {
 }
 
 /// The request's place in its worker's tracked pile (see
-/// [`WorkerRuntime::tracked_load`]), held for the stream's life.
+/// [`WorkerRuntime::tracked_load`]), held for the stream's life. The ticket
+/// holds the state its dispatch took (see [`Worker::runtime_state`]), so its
+/// end lands where its start did; a worker that keeps no state has no pile.
 struct ProgressTicket {
-    worker: Arc<dyn Worker>,
+    runtime: Option<Arc<WorkerRuntime>>,
+}
+
+impl ProgressTicket {
+    /// The request joins the pile at `now_ms` on the gateway clock.
+    fn open(runtime: Option<Arc<WorkerRuntime>>, now_ms: u64) -> Self {
+        if let Some(runtime) = &runtime {
+            runtime.note_tracked_started_at(now_ms);
+        }
+        Self { runtime }
+    }
 }
 
 impl Drop for ProgressTicket {
     fn drop(&mut self) {
-        self.worker.note_tracked_ended();
+        if let Some(runtime) = &self.runtime {
+            runtime.note_tracked_ended();
+        }
     }
 }
 
 /// A stream the worker has produced output for and that has not ended (see
 /// [`Worker::output_silence`]): opened at the first response, given back at
-/// the stream's end, or when its reader lets go of it.
+/// the stream's end, or when its reader lets go of it. It holds the state
+/// its stream captured, as the other tickets hold their dispatch's.
 struct OutputTicket {
-    worker: Arc<dyn Worker>,
+    runtime: Option<Arc<WorkerRuntime>>,
 }
 
 impl OutputTicket {
-    fn open(worker: &Arc<dyn Worker>) -> Self {
-        worker.note_output_started();
-        Self {
-            worker: Arc::clone(worker),
+    fn open(runtime: Option<Arc<WorkerRuntime>>) -> Self {
+        if let Some(runtime) = &runtime {
+            runtime.note_output_started();
         }
+        Self { runtime }
     }
 }
 
 impl Drop for OutputTicket {
     fn drop(&mut self) {
-        self.worker.note_output_ended();
+        if let Some(runtime) = &self.runtime {
+            runtime.note_output_ended();
+        }
     }
 }
 
@@ -1048,7 +1066,10 @@ impl Drop for OutputTicket {
 /// (with the prefix-cache hit it reports, so the worker's rate learns the
 /// tokens the engine computed) or, failing that, when the stream is dropped.
 pub(crate) struct PrefillTicket {
-    worker: Arc<dyn Worker>,
+    /// The state the dispatch took (see [`Worker::runtime_state`]): the
+    /// prompt's start and its end are noted on it. `None` for a worker that
+    /// keeps no state: it has no backlog.
+    runtime: Option<Arc<WorkerRuntime>>,
     tokens: u64,
     /// The first response is the request's first token (a streaming
     /// generation), so the prompt's prefill is timed for the worker's rate;
@@ -1092,15 +1113,28 @@ impl PrefillTicket {
         timed: bool,
         now_ms: u64,
     ) -> Option<Self> {
-        (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started_at(prompt_tokens, timed, now_ms);
-            Self {
-                worker: Arc::clone(worker),
-                tokens: prompt_tokens,
-                timed,
-                released: false,
-            }
-        })
+        (prompt_tokens > 0)
+            .then(|| Self::open(worker.runtime_state(), prompt_tokens, timed, now_ms))
+    }
+
+    /// [`Self::book_as_at`] for a prompt that is not empty, on the state its
+    /// dispatch took.
+    fn open(
+        runtime: Option<Arc<WorkerRuntime>>,
+        prompt_tokens: u64,
+        timed: bool,
+        now_ms: u64,
+    ) -> Self {
+        if let Some(runtime) = &runtime {
+            // 0 is the runtime's unset stamp.
+            runtime.note_prefill_started_at(prompt_tokens, timed, now_ms.max(1));
+        }
+        Self {
+            runtime,
+            tokens: prompt_tokens,
+            timed,
+            released: false,
+        }
     }
 
     /// The first response came back at `now_ms` on the gateway clock (the
@@ -1109,8 +1143,10 @@ impl PrefillTicket {
     fn first_response_at(&mut self, cached: u64, now_ms: u64) {
         if !self.released {
             self.released = true;
-            self.worker
-                .note_prefill_ended_at(self.tokens, self.timed, Some(cached), now_ms);
+            if let Some(runtime) = &self.runtime {
+                // 0 is the runtime's unset stamp.
+                runtime.note_prefill_ended_at(self.tokens, self.timed, Some(cached), now_ms.max(1));
+            }
         }
     }
 }
@@ -1118,8 +1154,9 @@ impl PrefillTicket {
 impl Drop for PrefillTicket {
     fn drop(&mut self) {
         if !self.released {
-            self.worker
-                .note_prefill_ended(self.tokens, self.timed, None);
+            if let Some(runtime) = &self.runtime {
+                runtime.note_prefill_ended(self.tokens, self.timed, None);
+            }
         }
     }
 }
@@ -1150,17 +1187,36 @@ impl DispatchBooking {
         dispatched_at: Instant,
     ) -> Self {
         let now_ms = liveness::ms_at(dispatched_at);
-        let progress = streaming.then(|| {
-            worker.note_tracked_started_at(now_ms);
-            ProgressTicket {
-                worker: Arc::clone(worker),
-            }
-        });
-        Self {
-            prefill: PrefillTicket::book_as_at(worker, prompt_tokens, streaming, now_ms),
-            progress,
-        }
+        // The worker's state is taken once for both tickets, and only when
+        // there is a ticket to open.
+        let runtime = (streaming || prompt_tokens > 0)
+            .then(|| worker.runtime_state())
+            .flatten();
+        let progress = streaming.then(|| ProgressTicket::open(runtime.clone(), now_ms));
+        let prefill = (prompt_tokens > 0)
+            .then(|| PrefillTicket::open(runtime, prompt_tokens, streaming, now_ms));
+        Self { prefill, progress }
     }
+}
+
+/// The dispatch tickets' benchmark seam, what `benches/dispatch_tickets.rs`
+/// drives: one streaming request's tickets on `worker` for their whole life,
+/// with no stream behind them. The booking opens the request's place in the
+/// pile and its prompt's prefill, the first response ends the prefill and
+/// opens the output, and the drop gives all three back.
+#[cfg(any(test, feature = "test-util"))]
+pub fn dispatch_ticket_life(worker: &Arc<dyn Worker>, prompt_tokens: u64) {
+    let DispatchBooking {
+        mut prefill,
+        progress,
+    } = DispatchBooking::book(worker, prompt_tokens, true);
+    // What a stream does at its start and at its first response.
+    let runtime = worker.runtime_state();
+    let output = OutputTicket::open(runtime.clone());
+    if let Some(ticket) = prefill.as_mut() {
+        ticket.first_response_at(0, liveness::now_ms());
+    }
+    drop((output, prefill, progress, runtime));
 }
 
 #[cfg(test)]
@@ -1291,6 +1347,43 @@ mod tracked_tests {
         assert!(
             worker.stall_reason().is_none(),
             "the response clears the veto"
+        );
+    }
+
+    /// The output ticket lands on the state its stream captured at its start,
+    /// as the stream's other notes do, and not on what the door answers at
+    /// the first response; its end gives the output back there and leaves
+    /// none open on either state. The case swaps the worker's state under a
+    /// live stream, which the door's doc forbids, to pin where the output
+    /// goes.
+    #[tokio::test]
+    async fn a_streams_output_is_noted_on_the_state_the_stream_captured() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
+        let other: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
+        let captured = worker.runtime_state().unwrap();
+        let mut stream = one_chunk_tracked(&worker);
+
+        assert!(worker.inherit_shared_state_from(other.as_ref()));
+        let swapped_in = worker.runtime_state().unwrap();
+        assert!(
+            !Arc::ptr_eq(&captured, &swapped_in),
+            "the state was swapped"
+        );
+
+        assert!(stream.next().await.is_some_and(|item| item.is_ok()));
+        assert!(
+            captured.output_silence().is_some(),
+            "the output is open on the state the stream captured"
+        );
+        assert!(
+            swapped_in.output_silence().is_none(),
+            "and not on the state swapped in"
+        );
+
+        drop(stream);
+        assert!(
+            captured.output_silence().is_none() && swapped_in.output_silence().is_none(),
+            "given back where it was opened: none is left open on either state"
         );
     }
 
@@ -1480,6 +1573,32 @@ mod tracked_tests {
             worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::ZERO,
             "released with the stream"
+        );
+    }
+
+    /// 0 is the state's unset stamp, so a ticket notes its start and its
+    /// first response no lower than one (the worker's own notes held that
+    /// floor before the tickets wrote the state): a prompt booked and
+    /// answered at stamp 0 reads as answered, and as having taken no time.
+    #[test]
+    fn a_prefill_ticket_notes_its_start_and_its_answer_no_lower_than_stamp_one() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let state = worker.runtime_state().unwrap();
+        let mut ticket = PrefillTicket::book_as_at(&worker, 2_001, true, 0).unwrap();
+        ticket.first_response_at(0, 0);
+        assert_eq!(
+            state.prefill_answered_ago_at(1),
+            Some(std::time::Duration::ZERO),
+            "answered at one: an answer at 0 reads as none"
+        );
+        // Booked at one too, so the prompt put no time in the rate's window:
+        // the next one's 2,000 ms are the whole span its sample is taken over.
+        let mut next = PrefillTicket::book_as_at(&worker, 2_001, true, 1).unwrap();
+        next.first_response_at(0, 2_001);
+        assert_eq!(
+            state.prefill_rate_tps(),
+            2_001,
+            "4,002 tokens over 2,000 ms: a start at 0 makes the span 2,001 ms"
         );
     }
 
@@ -1993,12 +2112,14 @@ impl ProtoStream {
                     tracked.worker.record_outcome(200);
                 }
                 if tracked.output.is_none() {
-                    tracked.output = Some(OutputTicket::open(&tracked.worker));
+                    tracked.output = Some(OutputTicket::open(tracked.runtime.clone()));
                 }
-                if let Some(ticket) = tracked.prefill.as_mut() {
+                // The ticket is taken, not cleared after the fact: a clear
+                // of an empty slot still runs the slot's drop glue, on
+                // every message of the stream.
+                if let Some(mut ticket) = tracked.prefill.take() {
                     ticket.first_response_at(u64::from(response.cached_tokens()), now_ms);
                 }
-                tracked.prefill = None;
             }
             // The stream ended, or failed: what the worker was producing for
             // it is over, whenever its reader lets go of it.
@@ -3635,5 +3756,88 @@ mod wire_field_tests {
                 speculative
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod first_response_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::{vllm, FanoutStream, PrefillTicket, ProtoGenerateResponse, ProtoStream};
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    /// A timed stream's first response ends its prompt's prefill with the
+    /// cache hit the response reports, so the worker's rate learns the
+    /// tokens the engine computed and not the prompt's length. A prompt of
+    /// 100,000 tokens answered after a second with 90,000 of them cached
+    /// teaches 10,000 tokens a second at most; read at full length it would
+    /// teach some 95,000.
+    #[tokio::test]
+    async fn a_streams_first_response_teaches_the_rate_its_prompt_less_the_cache_hit() {
+        const PROMPT: u64 = 100_000;
+        const HIT: u32 = 90_000;
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
+        let state = worker.runtime_state().unwrap();
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk {
+                    cached_tokens: HIT,
+                    ..Default::default()
+                },
+            )),
+        }));
+        // The chunk reaches the stream's tracked layer as a response and not
+        // as a replay: a child stream hands it over through a fan-out.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let mut child =
+            ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(engine, 0, false);
+        if let ProtoStream::Tracked(tracked) = &mut child {
+            tracked.replay = Some(Some(Ok(chunk)));
+        }
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(vec![child])).tracked(
+            Arc::clone(&worker),
+            PROMPT,
+            true,
+        );
+        assert_eq!(state.prefill_rate_tps(), 0, "no rate before an answer");
+
+        // The rate takes its first sample from a second of prefill.
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        assert!(stream.next().await.is_some_and(|item| item.is_ok()));
+
+        let computed = PROMPT - u64::from(HIT);
+        let rate = state.prefill_rate_tps();
+        assert!(
+            (computed / 10..=computed).contains(&rate),
+            "{computed} tokens computed in a second or more teach at most {computed} a second: {rate}"
+        );
+    }
+
+    /// A prompt is ended once: answered at its first response, a ticket
+    /// notes nothing more at its drop. Two prompts are booked on one
+    /// worker; with the first answered and dropped, the second is still
+    /// pending at its whole length.
+    #[test]
+    fn a_prefill_ticket_answered_and_dropped_ends_its_prompt_once() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let state = worker.runtime_state().unwrap();
+        let mut first = PrefillTicket::book_as_at(&worker, 8_192, true, 1).unwrap();
+        let second = PrefillTicket::book_as_at(&worker, 4_096, true, 1).unwrap();
+        assert_eq!(
+            state.prefill_backlog(),
+            Duration::from_millis(1_228),
+            "both prompts are pending"
+        );
+
+        first.first_response_at(0, 2);
+        drop(first);
+        assert_eq!(
+            state.prefill_backlog(),
+            Duration::from_millis(409),
+            "the second prompt's 4,096 tokens are all still pending"
+        );
+
+        drop(second);
+        assert_eq!(state.prefill_backlog(), Duration::ZERO);
     }
 }

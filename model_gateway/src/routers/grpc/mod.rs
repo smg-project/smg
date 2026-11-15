@@ -14,6 +14,10 @@ pub(crate) mod mode;
 pub(crate) mod multimodal;
 pub(crate) mod pipeline;
 pub(crate) mod proto_wrapper;
+/// The dispatch tickets' benchmark seam: what `benches/dispatch_tickets.rs` drives,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use proto_wrapper::dispatch_ticket_life;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod sequential_pd;

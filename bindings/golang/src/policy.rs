@@ -243,18 +243,6 @@ impl Worker for GrpcWorker {
         // Not used by policies — the FFI layer handles the backend directly.
         Ok(None)
     }
-
-    async fn grpc_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn zmq_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn http_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
 }
 
 /// One request's unit of load on the worker a policy selected: counted on

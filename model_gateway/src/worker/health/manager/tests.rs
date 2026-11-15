@@ -1910,6 +1910,30 @@ fn test_state_machine_pending_to_failed_on_success_when_cap_exceeded() {
     );
 }
 
+/// A worker that keeps no state has no probe counted on it, so the Pending
+/// cap reads no pending probe for it: the verdict leaves it Pending on a
+/// passing probe and on a failing one, however many it was sent.
+#[test]
+fn the_pending_cap_reads_no_pending_probe_for_a_worker_with_no_state() {
+    let worker = make_worker("http://w:1", 2, 3);
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    // The worker's own state is past the cap; the verdict is handed none.
+    for _ in 0..30 {
+        worker
+            .runtime_state()
+            .unwrap()
+            .total_pending_probes_increment();
+    }
+    for probe_ok in [true, false] {
+        assert_eq!(
+            compute_next_status(&worker, None, probe_ok, &cfg(2, 3)),
+            None,
+            "probe_ok {probe_ok}"
+        );
+    }
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+}
+
 #[test]
 fn test_state_machine_failed_recovers_after_success_threshold() {
     let worker = make_worker("http://w:1", 2, 3);

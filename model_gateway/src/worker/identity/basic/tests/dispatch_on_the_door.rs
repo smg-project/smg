@@ -1,5 +1,5 @@
-//! The dispatch notes' defaults: a worker that answers the door with its state and overrides none
-//! of them has no request counted in and none counted out.
+//! A dispatch notes on the state its worker's door answers: a worker that only answers the door
+//! has its requests counted on that state, and a note's end lands where its start did.
 
 use std::{any::Any, sync::Arc, time::Duration};
 
@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use openai_protocol::worker::{ConnectionMode, WorkerStatus, WorkerType};
 
 use crate::{
-    routers::grpc::backend_client::BackendClient,
+    routers::grpc::{backend_client::BackendClient, proto_wrapper::DispatchBooking},
     worker::{
         health::circuit_breaker::CircuitState,
         identity::basic::{BasicWorker, WorkerMetadata},
@@ -18,7 +18,7 @@ use crate::{
 
 /// A worker that answers the door with its state and overrides nothing that
 /// has a default: the shape of a worker written outside this crate that
-/// keeps a [`WorkerRuntime`] and writes none of the dispatch notes itself.
+/// keeps a [`WorkerRuntime`].
 #[derive(Debug)]
 struct DoorOnly(BasicWorker);
 
@@ -99,38 +99,63 @@ impl Worker for DoorOnly {
     async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
         self.0.get_backend_client().await
     }
-    async fn grpc_health_check(&self) -> WorkerResult<bool> {
-        self.0.grpc_health_check().await
-    }
-    async fn zmq_health_check(&self) -> WorkerResult<bool> {
-        self.0.zmq_health_check().await
-    }
-    async fn http_health_check(&self) -> WorkerResult<bool> {
-        self.0.http_health_check().await
-    }
     fn runtime_state(&self) -> Option<Arc<WorkerRuntime>> {
         self.0.runtime_state()
     }
 }
 
-/// The trait's own dispatch notes are empty, the starts as the ends: a
-/// worker that answers the door and overrides none of them has no request
-/// counted in and none counted out, so its tracked load and its prefill
-/// backlog read zero after a start and after its end. A start that wrote
-/// through the door beside an empty end counted every dispatch in and none
-/// out.
+/// A worker that answers the door and overrides nothing has its dispatch
+/// counted on the state it returns: the request is in its pile and its
+/// prompt in its backlog from the booking, and both are given back with it.
 #[test]
-fn the_dispatch_note_defaults_count_nothing_in_and_nothing_out() {
-    let worker = DoorOnly(BasicWorkerBuilder::new("http://w:1").build());
+fn a_dispatch_on_a_worker_that_only_answers_the_door_is_counted_on_its_state() {
+    let worker: Arc<dyn Worker> = Arc::new(DoorOnly(BasicWorkerBuilder::new("http://w:1").build()));
     let state = worker.runtime_state().unwrap();
 
-    worker.note_tracked_started_at(1);
-    worker.note_prefill_started_at(8_192, true, 1);
-    assert_eq!(state.tracked_load(), 0, "a start counts no request in");
-    assert_eq!(state.prefill_backlog(), Duration::ZERO, "nor a prompt");
+    let booking = DispatchBooking::book(&worker, 8_192, true);
+    assert_eq!(state.tracked_load(), 1, "in the pile from the booking");
+    assert_eq!(
+        state.prefill_backlog(),
+        Duration::from_millis(819),
+        "and the prompt in the backlog"
+    );
 
-    worker.note_tracked_ended();
-    worker.note_prefill_ended(8_192, true, Some(0));
-    assert_eq!(state.tracked_load(), 0);
+    drop(booking);
+    assert_eq!(state.tracked_load(), 0, "given back with the booking");
     assert_eq!(state.prefill_backlog(), Duration::ZERO);
+}
+
+/// A note's end lands on the state its start was written on. The case swaps
+/// the worker's state under a live booking, which the door's doc forbids, to
+/// pin where the end goes: the state the booking took reads zero again, and
+/// the state swapped in never moved.
+#[test]
+fn a_bookings_end_lands_on_the_state_its_start_was_written_on() {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w:1").build());
+    let other: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w:1").build());
+    let booked_on = worker.runtime_state().unwrap();
+
+    let booking = DispatchBooking::book(&worker, 8_192, true);
+    assert_eq!(booked_on.tracked_load(), 1);
+
+    assert!(worker.inherit_shared_state_from(other.as_ref()));
+    let swapped_in = worker.runtime_state().unwrap();
+    assert!(
+        !Arc::ptr_eq(&booked_on, &swapped_in),
+        "the state was swapped"
+    );
+
+    drop(booking);
+    assert_eq!(
+        booked_on.tracked_load(),
+        0,
+        "the end lands where the start did"
+    );
+    assert_eq!(booked_on.prefill_backlog(), Duration::ZERO);
+    assert_eq!(
+        swapped_in.tracked_load(),
+        0,
+        "the state swapped in never moved"
+    );
+    assert_eq!(swapped_in.prefill_backlog(), Duration::ZERO);
 }
