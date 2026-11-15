@@ -1959,3 +1959,32 @@ async fn a_streamed_regular_response_persists_under_the_request_s_storage_contex
         "a store operation ran without the request's storage context: {seen:?}"
     );
 }
+
+/// The router is built at start-up, outside any request: the storage context
+/// its Responses contexts store is `None` by construction, not a read of
+/// whatever task-local happens to cover the constructor. Every Responses
+/// branch derives this request's context in the request task, and the inline
+/// paths run under the middleware's live task-local; a router built inside a
+/// storage-context scope stores none all the same.
+#[tokio::test]
+async fn a_router_built_inside_a_storage_context_scope_stores_no_request_context() {
+    use smg_data_connector::{with_request_context, RequestContext as StorageRequestContext};
+
+    let ctx = grpc_ctx_from(
+        &grpc_config(regular_routing_mode()).build_unchecked(),
+        mcp_orchestrator().await,
+    );
+    let mut scope = StorageRequestContext::new();
+    scope.set("tenant_id", "tenant-1");
+    let router = with_request_context(scope, async { GrpcRouter::new(&ctx, Mode::Regular) })
+        .await
+        .expect("regular router");
+    for context in [&router.responses_context, &router.harmony_responses_context] {
+        let context = context.as_ref().expect("a responses context");
+        assert!(
+            context.request_context.is_none(),
+            "the router stored a construction-time storage context: {:?}",
+            context.request_context
+        );
+    }
+}

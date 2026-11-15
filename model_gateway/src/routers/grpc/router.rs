@@ -220,8 +220,6 @@ impl GrpcRouter {
                 .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
                 .clone();
 
-            // Capture storage request context from middleware task-local (before any spawn)
-            let storage_request_context = smg_data_connector::current_request_context();
             // One registry of background responses for both contexts: one cap,
             // one place a cancel looks a running id up.
             let background_responses = Arc::new(BackgroundResponses::new(
@@ -238,7 +236,11 @@ impl GrpcRouter {
                     ctx.conversation_item_storage.clone(),
                     mcp_orchestrator.clone(),
                     ctx.mcp_format_registry.clone(),
-                    storage_request_context.clone(),
+                    // No storage context at start-up (outside any request):
+                    // each Responses branch of `route_responses_impl` derives
+                    // this request's context in the request task, and a cancel
+                    // runs under the middleware's live task-local.
+                    None,
                     background_responses.clone(),
                 )
             };
