@@ -29,7 +29,10 @@ use crate::{
     routers::grpc::{
         common::stages::RateLimitOutcome,
         test_engine::serve_on_loopback,
-        testing::{grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_with_parsers, mcp_orchestrator},
+        testing::{
+            grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_over_stores, grpc_ctx_with_parsers,
+            mcp_orchestrator,
+        },
     },
     tenant::TenantKey,
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType},
@@ -1836,4 +1839,123 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
             );
         });
     });
+}
+
+/// A streamed regular Responses request persists from a task of its own (the
+/// stream's transform), where the middleware's storage-context task-local is
+/// gone: the route hands this request's context on in the `ResponsesContext`,
+/// as the Harmony and the background routes do, and every write of the
+/// persist reaches the store under it. A hook on the stores reads the context
+/// each operation ran under.
+#[tokio::test]
+async fn a_streamed_regular_response_persists_under_the_request_s_storage_context() {
+    use smg_data_connector::{
+        create_storage, with_request_context, BeforeHookResult, ExtraColumns, HistoryBackend,
+        HookError, RequestContext as StorageRequestContext, StorageFactoryConfig, StorageHook,
+        StorageOperation,
+    };
+
+    /// Records the `tenant_id` of the storage context every operation ran
+    /// under.
+    struct ContextRecordingHook {
+        seen: std::sync::Mutex<Vec<(StorageOperation, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl StorageHook for ContextRecordingHook {
+        async fn before(
+            &self,
+            operation: StorageOperation,
+            context: Option<&StorageRequestContext>,
+            _payload: &serde_json::Value,
+        ) -> Result<BeforeHookResult, HookError> {
+            let tenant = context
+                .and_then(|ctx| ctx.get("tenant_id"))
+                .map(str::to_owned);
+            self.seen
+                .lock()
+                .expect("the recorded operations")
+                .push((operation, tenant));
+            Ok(BeforeHookResult::Continue(ExtraColumns::new()))
+        }
+
+        async fn after(
+            &self,
+            _operation: StorageOperation,
+            _context: Option<&StorageRequestContext>,
+            _payload: &serde_json::Value,
+            _result: &serde_json::Value,
+            extra: &ExtraColumns,
+        ) -> Result<ExtraColumns, HookError> {
+            Ok(extra.clone())
+        }
+    }
+
+    let hook = Arc::new(ContextRecordingHook {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let stores = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Memory,
+        oracle: None,
+        postgres: None,
+        redis: None,
+        memory: None,
+        hook: Some(hook.clone()),
+    })
+    .await
+    .expect("the hooked in-memory stores");
+    let ctx = grpc_ctx_over_stores(
+        &grpc_config(regular_routing_mode()).build_unchecked(),
+        mcp_orchestrator().await,
+        stores.response_storage,
+        stores.conversation_storage,
+        stores.conversation_item_storage,
+    );
+    register_tokenizer_for(&ctx, "m", CHAT_TEMPLATE, ("Hello", 100)).await;
+    let port = spawn_engine(vec![100]).await;
+    register_worker(
+        &ctx,
+        &format!("grpc://127.0.0.1:{port}"),
+        WorkerType::Regular,
+        ModelCard::new("m"),
+    );
+    // Built at start-up, outside any request, as the gateway builds it.
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    let body: ResponsesRequest =
+        serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+            .expect("responses request");
+    let mut request_context = StorageRequestContext::new();
+    request_context.set("tenant_id", "tenant-1");
+    // The middleware's scope: the request task carries the context; the
+    // stream's transform, spawned from it, does not.
+    let response = with_request_context(
+        request_context,
+        router.route_responses(None, &tenant_meta, body, "m"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the stream");
+    let frames = String::from_utf8_lossy(&bytes);
+    assert!(
+        frames.contains("response.completed"),
+        "the stream did not complete: {frames}"
+    );
+
+    let seen = hook.seen.lock().expect("the recorded operations").clone();
+    assert!(
+        seen.iter().any(|(operation, _)| matches!(
+            operation,
+            StorageOperation::StoreResponse | StorageOperation::CreateItem
+        )),
+        "the stream persisted nothing: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, tenant)| tenant.as_deref() == Some("tenant-1")),
+        "a store operation ran without the request's storage context: {seen:?}"
+    );
 }

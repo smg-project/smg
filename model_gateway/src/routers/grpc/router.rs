@@ -568,8 +568,15 @@ impl GrpcRouter {
                 }
             }
         } else {
+            // This request's storage context, read in the request task: the
+            // stream persists from a task of its own, where the middleware's
+            // task-local is gone.
+            let ctx = ResponsesContext {
+                request_context: smg_data_connector::current_request_context(),
+                ..responses_context.clone()
+            };
             responses::route_responses(
-                responses_context,
+                &ctx,
                 Arc::new(body),
                 headers.cloned(),
                 tenant_meta.clone(),
