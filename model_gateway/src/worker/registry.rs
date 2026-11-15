@@ -2015,7 +2015,7 @@ impl WorkerRegistry {
     /// removal aborts on a mismatch — a lock-free pre-check alone races
     /// `replace_inner`'s promotion (check Mesh, block on the lock, promotion
     /// lands, then delete a now locally-owned worker). When `condition` is
-    /// set, it is read of the worker under the same lock and the removal
+    /// set, it is read from the worker under the same lock and the removal
     /// returns `None` unless it holds.
     fn remove_inner(
         &self,
