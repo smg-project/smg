@@ -24,7 +24,8 @@ pub mod proto {
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
-pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, MlxEngineClient>;
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, MlxEngineClient>;
 
 /// gRPC client for MLX engine
 #[derive(Clone)]
@@ -41,7 +42,9 @@ impl MlxEngineClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::mlx_engine_client::MlxEngineClient<Channel>,
-        "MLX"
+        "MLX",
+        "mlx.grpc.engine.MlxEngine",
+        proto::mlx_engine_server::SERVICE_NAME
     );
 
     crate::impl_abort_without_reason!(proto);

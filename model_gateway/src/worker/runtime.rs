@@ -239,7 +239,7 @@ pub struct WorkerRuntime {
     /// registration or the last token before an idle spell.
     busy_since_ms: AtomicU64,
     /// Requests in flight whose responses the gateway sees one by one (see
-    /// [`Worker::tracked_load`]).
+    /// [`Self::tracked_load`]).
     tracked_in_flight: AtomicUsize,
     /// Open streams that have produced a token or completion (see
     /// [`Worker::output_silence`]).

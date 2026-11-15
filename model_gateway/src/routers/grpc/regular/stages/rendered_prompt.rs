@@ -177,7 +177,7 @@ pub(crate) async fn prepare_rendered_prompt(
                 Err(e) => {
                     error!(
                         function = stage,
-                        error = %multimodal::processing_failed_message(&e),
+                        error = %format!("{e:#}"),
                         "Multimodal processing failed"
                     );
                     return Err(multimodal::processing_failed_response(&e));

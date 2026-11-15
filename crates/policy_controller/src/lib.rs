@@ -36,7 +36,10 @@
 //!   cursors, reservations, sessions, leases), the one-process
 //!   [`store::MemoryStore`] behind them and the contract tests over it. A
 //!   gateway in the embedded mode implements the same traits over its own
-//!   structures; nothing decides through them yet.
+//!   structures. The store publishes what a decision reads
+//!   ([`store::World`]: every pool as whole candidate rows) and builds one
+//!   decision's view from it through no lock; the service that calls the
+//!   build is a later step.
 //! - 10, the election ([`elector`]): one [`elector::Elector`] over a
 //!   [`elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
@@ -45,13 +48,14 @@
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
 //!   package, one kept instance per deciding thread, every call under fuel,
-//!   bound to a profile as the framework's own stages.
+//!   bound to a profile as the framework's own stages. What every plugin
+//!   kind shares (the breaker, the counters, the stage adapters) is the
+//!   `plugins` module.
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the load helpers the gateway shares with the controller (the row
-//!   conversion, the scrape parser). The KV subscription, the prober and
-//!   discovery arrive in the step's later PRs.
+//!   the load helpers (the row conversion, the scrape parser). The KV
+//!   subscription, the prober and discovery arrive in the step's later PRs.
 //!
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
@@ -76,6 +80,10 @@ pub mod framework;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
+#[cfg(feature = "wasm")]
+pub mod plugins;
+#[cfg(feature = "controller")]
+pub mod proto;
 pub mod ring;
 pub mod sessions;
 pub mod spec;
@@ -89,8 +97,8 @@ pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, Picker, Plan, Profile, Scorer,
-    Scratch, TieBand, Weighted,
+    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
+    Plan, Profile, Scorer, Scratch, TieBand, Weighted,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
@@ -103,8 +111,8 @@ pub use spec::{
 };
 pub use view::{
     fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
-    LoadRow, MediaCounts, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource,
-    WireModes, WorkerId, ZoneCapacity,
+    LoadRow, MediaCounts, ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts, Role,
+    Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a

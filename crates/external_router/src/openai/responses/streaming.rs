@@ -1266,7 +1266,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
 /// Main entry point for streaming responses
 pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
-    use crate::mcp_utils::{ensure_request_mcp_client, request_uses_mcp_routing};
+    use crate::mcp_utils::{ensure_request_mcp_routing, request_uses_mcp_routing};
 
     let worker = match ctx.worker() {
         Some(w) => w.clone(),
@@ -1299,9 +1299,10 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
                 );
             };
             let registry = registry.clone();
-            ensure_request_mcp_client(&mcp_orchestrator, &registry, tools)
-                .await
-                .map(|servers| (servers, mcp_orchestrator, registry))
+            match ensure_request_mcp_routing(&mcp_orchestrator, &registry, tools).await {
+                Ok(servers) => servers.map(|servers| (servers, mcp_orchestrator, registry)),
+                Err(refusal) => return refusal,
+            }
         }
         _ => None,
     };

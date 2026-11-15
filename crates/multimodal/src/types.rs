@@ -970,6 +970,12 @@ mod tests {
         const CHILD: &str = "SMG_CAPPED_DECODE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             // Isolate the process-wide pool and bound a deadlock regression.
+            // The bound reads the child's own clock: a blocked child accrues
+            // no CPU time, while a child starved of the core by the other
+            // test threads accrues it slowly as it progresses, and a wall
+            // clock cannot tell the two apart. No CPU across a whole quiet
+            // window is the deadlock; the wall ceiling is the last resort,
+            // and the wall bound alone where there is no process table.
             let directory = tempfile::tempdir().expect("completion directory");
             let completed = directory.path().join("completed");
             let name = format!(
@@ -981,7 +987,11 @@ mod tests {
                 .env(CHILD, &completed)
                 .spawn()
                 .expect("start child");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            const QUIET: Duration = Duration::from_secs(3);
+            const CEILING: Duration = Duration::from_secs(120);
+            const WALL_ONLY: Duration = Duration::from_secs(10);
+            let started = Instant::now();
+            let mut progressed = (started, Duration::ZERO);
             loop {
                 if let Some(status) = child.try_wait().expect("child status") {
                     assert!(status.success(), "shared capped decode failed: {status}");
@@ -991,7 +1001,16 @@ mod tests {
                     );
                     return;
                 }
-                if Instant::now() >= deadline {
+                let blocked = match process_cpu_time(child.id()) {
+                    Some(cpu) => {
+                        if cpu > progressed.1 {
+                            progressed = (Instant::now(), cpu);
+                        }
+                        progressed.0.elapsed() >= QUIET || started.elapsed() >= CEILING
+                    }
+                    None => started.elapsed() >= WALL_ONLY,
+                };
+                if blocked {
                     child.kill().expect("kill blocked child");
                     child.wait().expect("reap child");
                     panic!("shared capped decode blocked the vision pool");
@@ -1055,6 +1074,20 @@ mod tests {
             b"completed",
         )
         .expect("record completed regression test");
+    }
+
+    /// The CPU time a process has used so far, user plus system, read from the
+    /// host's process table; `None` where there is no table to read.
+    fn process_cpu_time(pid: u32) -> Option<std::time::Duration> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name sits in parentheses and may hold spaces; the
+        // fixed fields follow it, utime and stime the 14th and 15th of the line.
+        let after_name = stat.rsplit_once(')')?.1;
+        let mut fields = after_name.split_whitespace().skip(11);
+        let user: u64 = fields.next()?.parse().ok()?;
+        let system: u64 = fields.next()?.parse().ok()?;
+        // The table counts in USER_HZ ticks, a hundred a second.
+        Some(std::time::Duration::from_millis((user + system) * 10))
     }
 
     /// A 2x1 RGBA PNG: a fully transparent black pixel, then an opaque colour.

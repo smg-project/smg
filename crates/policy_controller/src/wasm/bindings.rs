@@ -8,8 +8,8 @@ use std::{sync::Arc, time::Instant};
 
 use wasmtime::StoreLimits;
 
-use super::{config::LogLimit, counters::Counters};
-use crate::Draw;
+use super::config::LogLimit;
+use crate::{plugins::Counters, Draw};
 
 /// The record world, `smg:policy/policy`.
 pub(crate) mod record {

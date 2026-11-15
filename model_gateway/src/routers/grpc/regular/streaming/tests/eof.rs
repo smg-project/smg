@@ -2834,7 +2834,7 @@ async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate(
 }
 
 /// A processor with the registered parsers `tool` and `reasoning`.
-fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
+pub(super) fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
     streaming_processor(utils::ParserResolver::with_flags(
         Arc::new(WorkerRegistry::new()),
         Some(tool.to_string()),

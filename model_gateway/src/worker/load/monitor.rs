@@ -543,7 +543,9 @@ impl WorkerMonitor {
         let url = worker.url();
         // The stream pushes: silence from this worker is judged by the
         // stream's cadence from now on (`liveness`, the stale rule).
-        worker.note_load_record();
+        if let Some(state) = worker.runtime_state() {
+            state.note_load_record();
+        }
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
         // A worker's entries are made on its first record; the lookups that
@@ -2885,14 +2887,14 @@ mod native_loads_tests {
         // A transport failure noted on each rank worker: the one read's
         // contact must clear it on both.
         for worker in &workers {
-            worker.note_transport_failure();
+            worker.runtime_state().unwrap().note_transport_failure();
         }
         poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
 
         let snapshot = monitor.load_state.snapshot();
         for (worker, expected) in workers.iter().zip([(0, 3, 1, 300), (1, 9, 4, 900)]) {
             assert!(
-                !worker.transport_failure_pending(),
+                !worker.runtime_state().unwrap().transport_failure_pending(),
                 "the contact is every member's: {}",
                 worker.url()
             );
@@ -2983,7 +2985,7 @@ mod native_loads_tests {
         // A transport failure noted on each rank worker: the one GetLoads'
         // contact must clear it on both.
         for worker in &workers {
-            worker.note_transport_failure();
+            worker.runtime_state().unwrap().note_transport_failure();
         }
         poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
         assert_eq!(
@@ -3003,7 +3005,7 @@ mod native_loads_tests {
         );
         for worker in &workers {
             assert!(
-                !worker.transport_failure_pending(),
+                !worker.runtime_state().unwrap().transport_failure_pending(),
                 "the contact is every member's: {}",
                 worker.url()
             );
