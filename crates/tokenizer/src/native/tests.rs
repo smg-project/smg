@@ -4213,6 +4213,117 @@ fn long_pieces_stay_within_their_byte_share() {
     assert!(!cache.long.is_empty());
 }
 
+/// A thread's long tier grown under an earlier share keeps its map's slots
+/// through an eviction at the bound (four times the share at most); once
+/// the share fell below a quarter of what the tier holds (threads joined)
+/// the thread's next encode call makes the tier anew.
+#[test]
+fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode() {
+    let mut state = 0x1D1D_3C3C_5B5B_7A7Au64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let held = |native: &NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow()
+            .long_held_bytes()
+    };
+    let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
+    let text: String = (0..16_000)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect();
+    let before = native.encode(Some(model), &head, false).expect("ids");
+    native.encode(Some(model), &text, false).expect("ids");
+    let share = native.long_piece_bytes_share();
+    let grown = held(&native);
+    assert!(grown <= 4 * share, "{grown} for a share of {share}");
+    // Threads join: the share falls far below a quarter of what the tier
+    // holds (its slots alone are more); the next call makes the tier anew,
+    // the ids as before.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.long_piece_bytes_share();
+    assert!(grown > 4 * share, "{grown} for a share of {share}");
+    // A call that meets no long piece: only the check at the call's start
+    // can make the tier anew (a miss would, through the eviction).
+    native.encode(Some(model), &word(1), false).expect("ids");
+    let kept = held(&native);
+    assert!(kept <= 4 * share, "{kept} for a share of {share}");
+    assert_eq!(
+        native.encode(Some(model), &head, false).expect("ids"),
+        before
+    );
+}
+
+/// A long tier made anew for a smaller share keeps what the calls after
+/// it add: the check at a call's start counts the entries and the empty
+/// slots, and a clear in place would have kept a map grown under the wider
+/// share to just under the bound, over it again with its first entries
+/// back and emptied at every call.
+#[test]
+fn a_long_tier_made_anew_for_a_smaller_share_keeps_what_the_next_calls_add() {
+    let mut state = 0x2E2E_4D4D_6C6C_8B8Bu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let long = |native: &NativeEncoder| -> (usize, usize, usize) {
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        (
+            cache.long.len(),
+            cache.long.capacity() * LONG_PIECE_ENTRY_BYTES,
+            cache.long_held_bytes(),
+        )
+    };
+    let text: String = (0..64).map(|i| format!("{}\n", letters(80, i))).collect();
+    let before = native.encode(Some(model), &text, false).expect("ids");
+    let fill: String = (0..16_000)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect();
+    native.encode(Some(model), &fill, false).expect("ids");
+    let (_, slots, grown) = long(&native);
+    // Threads join until four times the share is just above the map's
+    // slots: the tier holds more than that, and a clear in place would keep
+    // the slots and leave the share's payload no room under the bound.
+    native
+        .threads
+        .store(4 * LONG_PIECE_BYTES_TOTAL / slots - 1, Ordering::Relaxed);
+    let share = native.long_piece_bytes_share();
+    assert!(grown > 4 * share, "{grown} for a share of {share}");
+    assert!(
+        slots <= 4 * share && 4 * share - slots < share / 8,
+        "{slots} of slots for a share of {share}"
+    );
+    assert_eq!(
+        native.encode(Some(model), &text, false).expect("ids"),
+        before
+    );
+    let (entries, _, held) = long(&native);
+    assert!(held <= share, "{held} for a share of {share}");
+    // The text's pieces are within the share. One more long piece, then the
+    // text again: the tier keeps the text's entries through both calls (a
+    // clear would take them, and the text's pieces would miss) and adds the
+    // one.
+    native
+        .encode(Some(model), &letters(80, 777_777), false)
+        .expect("ids");
+    let (added, _, held) = long(&native);
+    assert_eq!(added, entries + 1, "{held} for a share of {share}");
+    assert_eq!(
+        native.encode(Some(model), &text, false).expect("ids"),
+        before
+    );
+    let (after, _, held) = long(&native);
+    assert_eq!(after, entries + 1, "{held} for a share of {share}");
+}
+
 #[test]
 fn text_in_nfc_takes_the_native_path_when_the_quick_check_is_unsure() {
     let mut state = 0x6666_7777_8888_9999u64;
