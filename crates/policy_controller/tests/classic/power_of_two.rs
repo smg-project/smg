@@ -2,11 +2,14 @@
 //! has of them and one request shape, under one of the policy's four load
 //! metrics.
 
+use std::time::Instant;
+
+use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    builtins::DEFAULT_MEAN_PREFILL_TOKENS, Candidate, Constraints, Engine, Health, Lease,
-    Lifecycle, LoadRow, PolicySpec, PoolFacts, PowerOfTwoMetric, RequestFacts, Scratch, Side,
-    WorkerId,
+    builtins::DEFAULT_MEAN_PREFILL_TOKENS, ingest::rows, Candidate, Constraints, Engine, Health,
+    Lease, Lifecycle, LoadRow, PolicySpec, PoolFacts, PowerOfTwoMetric, RequestFacts, Role,
+    Scratch, Side, SignalSource, WorkerId,
 };
 
 use crate::{Outcome, Recorded, Replayed};
@@ -70,26 +73,61 @@ fn metric_of(text: &str) -> PowerOfTwoMetric {
     }
 }
 
-/// The report as a host writes it into the view: a report with no split of
-/// its KV usage carries the usage as the running requests' share too, and
-/// the rate of a worker that runs nothing is not carried: outside the
-/// prefill role a report's rate counts only while requests run.
-fn load_row(report: Report) -> LoadRow {
-    LoadRow {
-        running: report.running,
-        queued: report.queued,
-        waiting_uncached_tokens: report.waiting_tokens,
-        kv_usage_permille: report.kv_usage_permille,
-        active_kv_permille: report.kv_usage_permille,
-        live_rate: if report.running > 0 {
-            report.throughput
-        } else {
-            0
-        },
-        resident_tokens: report.resident_tokens.unwrap_or(0),
-        resident_counted: report.resident_tokens.is_some(),
-        ..LoadRow::default()
+/// The report as an engine of one rank sends it: the counts and the queue's
+/// token-work as recorded, the KV usage as a ratio, the drain rate as the
+/// rank's generation rate, the resident tokens when the engine counts them.
+fn wire(report: Report) -> WorkerLoadResponse {
+    let count = |n: u32| i32::try_from(n).expect("a recorded count fits the wire's field");
+    WorkerLoadResponse {
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            num_running_reqs: count(report.running),
+            num_waiting_reqs: count(report.queued),
+            num_waiting_uncached_tokens: count(report.waiting_tokens),
+            token_usage: f64::from(report.kv_usage_permille) / 1000.0,
+            gen_throughput: f64::from(report.throughput),
+            num_resident_tokens: report.resident_tokens.map(i64::from),
+            ..SchedulerLoadSnapshot::default()
+        }],
+        ..WorkerLoadResponse::default()
     }
+}
+
+/// The report as a host writes it into the view: through the crate's own
+/// row builder, as the polled report of a worker outside a pair, read at
+/// the instant it was sampled.
+fn load_row(report: Report) -> LoadRow {
+    let now = Instant::now();
+    rows::load_row(&wire(report), Role::Single, now, now, SignalSource::Poll)
+}
+
+/// Each field of a recorded report reaches its field of the row: a report
+/// with no split of its KV usage carries the usage as the running requests'
+/// share too, and resident tokens are counted only when the report has them.
+#[test]
+fn a_recorded_report_reaches_the_row_field_for_field() {
+    let report = Report {
+        running: 3,
+        queued: 2,
+        resident_tokens: Some(5_000),
+        waiting_tokens: 700,
+        throughput: 90,
+        kv_usage_permille: 250,
+    };
+    let row = load_row(report);
+    assert_eq!((row.running, row.queued), (3, 2));
+    assert_eq!(row.waiting_uncached_tokens, 700);
+    assert_eq!((row.kv_usage_permille, row.active_kv_permille), (250, 250));
+    assert_eq!(row.live_rate, 90);
+    assert_eq!((row.resident_tokens, row.resident_counted), (5_000, true));
+    let uncounted = load_row(Report {
+        resident_tokens: None,
+        ..report
+    });
+    assert_eq!(
+        (uncounted.resident_tokens, uncounted.resident_counted),
+        (0, false)
+    );
 }
 
 /// A recorded report of an idle worker with a rate replays with none:

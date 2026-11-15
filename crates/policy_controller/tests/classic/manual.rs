@@ -250,9 +250,7 @@ impl Recorded for Row {
     }
 }
 
-/// Rows copied from the recorded sheet, one or more of each assignment. The
-/// two rows of a request with no key while a worker is down are of a second
-/// recording of the same commit and join the sheet at its next publication.
+/// Rows copied from the recorded sheet, one or more of each assignment.
 pub const INLINE: &str = r#"{
   "recorded_from": "1b141d03b5ca9097f54f0ebc4b95d72e810a62c3",
   "policy": "manual",

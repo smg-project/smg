@@ -158,6 +158,11 @@ required-features = ["controller"]
 name = "binary"
 required-features = ["controller"]
 
+# Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
+[[test]]
+name = "classic_rows"
+required-features = ["ingest"]
+
 [[test]]
 name = "controller"
 required-features = ["controller"]
