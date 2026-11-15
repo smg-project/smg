@@ -383,15 +383,24 @@ fn worker_url_refusal(url: &str) -> Option<String> {
 /// is stored lowercase however the manifest spells it. An address with none
 /// may hold a `://` further in, in a path or a query, and the registration
 /// writes `http://` or `grpc://` before it, by what the engine answers.
-/// Such an address is asked under `http://` alone: what the door refuses
-/// under `grpc://` it refuses under `http://`, where a client reads a host
-/// in more forms and ends an authority at one character more. What stands
-/// behind the scheme is asked as given: the manifest's reader asks of the
-/// address as written, and again as it is kept.
+/// Such an address is asked under `http://`: what the door refuses under
+/// `grpc://` it refuses under `http://`, where a client reads a host in
+/// more forms and ends an authority at one character more. One the URL
+/// library cannot read under `http://` is asked under `grpc://`: no HTTP
+/// client builds it, so the registration stores it there or not at all.
+/// What stands behind the scheme is asked as given: the manifest's reader
+/// asks of the address as written, and again as it is kept.
 pub(crate) fn listed_worker_url_refusal(url: &str) -> Option<String> {
     match Scheme::split_from(url) {
         Some((scheme, rest)) => worker_url_refusal(&format!("{}{rest}", scheme.as_prefix())),
-        None => worker_url_refusal(&format!("http://{url}")),
+        None => {
+            let http = format!("http://{url}");
+            if ::url::Url::parse(&http).is_ok() {
+                worker_url_refusal(&http)
+            } else {
+                worker_url_refusal(&format!("grpc://{url}"))
+            }
+        }
     }
 }
 
@@ -3952,9 +3961,10 @@ mod tests {
     }
 
     /// The door as a discovery manifest's reader asks it: an address with no
-    /// scheme is asked under `http://`, a known scheme in any case under its
-    /// lowercase form, and the answer is the door's reason alone, which
-    /// names no part of the address behind its scheme.
+    /// scheme is asked under `http://`, or under `grpc://` where the URL
+    /// library cannot read it under `http://`, a known scheme in any case
+    /// under its lowercase form, and the answer is the door's reason alone,
+    /// which names no part of the address behind its scheme.
     #[test]
     fn a_listed_worker_url_is_asked_of_the_door_in_the_forms_it_is_stored_in() {
         for url in [
@@ -3964,6 +3974,9 @@ mod tests {
             "HTTP://10.0.0.11:8000",
             "grpc://decode.internal:9000",
             "ipc:///tmp/engine.sock",
+            // The URL library cannot read it under `http://`: asked under
+            // `grpc://`, the one scheme it can be stored with, and taken.
+            "256.1.1.1:8000",
         ] {
             assert_eq!(listed_worker_url_refusal(url), None, "{url}");
         }
@@ -3982,8 +3995,9 @@ mod tests {
                 "grpcs://adm1n:s3cret@w:9000",
                 "grpcs:// workers are not supported",
             ),
-            // Refused under `http://` alone: under `grpc://` the door takes it.
-            ("256.1.1.1:8000", "Invalid URL format: invalid IPv4 address"),
+            // The library reads it under `http://` and the door refuses it
+            // there alone: under `grpc://` the door takes it.
+            ("user\\@worker:50051", "the address reads two ways"),
         ] {
             let refusal = listed_worker_url_refusal(url).unwrap_or_default();
             assert!(refusal.contains(reason), "{url}: {refusal}");
