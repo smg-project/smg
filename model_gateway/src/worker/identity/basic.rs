@@ -36,8 +36,8 @@ use crate::{
     worker::{
         connection::{
             engine_admin::{
-                admin_backend_client, admin_grpc_result, admin_http_post, FLUSH_HTTP_TIMEOUT,
-                PROFILE_HTTP_TIMEOUT,
+                admin_backend_client, admin_grpc_result, admin_http_post, failed,
+                FLUSH_HTTP_TIMEOUT, PROFILE_HTTP_TIMEOUT,
             },
             http_client::LazyHttpClient,
         },
@@ -947,12 +947,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     async fn start_profile(&self, options: &ProfileOptions) -> WorkerResult<()> {
         match self.connection_mode() {
             ConnectionMode::Http => {
-                let body =
-                    serde_json::to_value(options).map_err(|e| WorkerError::OperationFailed {
-                        url: self.url().to_string(),
-                        operation: "start_profile".to_string(),
-                        reason: format!("failed to serialize profile options: {e}"),
-                    })?;
+                let body = serde_json::to_value(options).map_err(|e| {
+                    failed(
+                        self.url(),
+                        "start_profile",
+                        format!("failed to serialize profile options: {e}"),
+                    )
+                })?;
                 admin_http_post(
                     self.http_client(),
                     self.endpoint_url("/start_profile"),
