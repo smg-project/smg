@@ -11,14 +11,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import gc
 import inspect
 import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -687,6 +690,7 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2) -> dict:
         monkeypatch,
         "sglang.srt.utils",
         configure_logger=lambda args: recorded["calls"].append("configure_logger"),
+        common=SimpleNamespace(),
     )
     recorded["target"] = run_scheduler_process
     recorded["port_args"] = port_args
@@ -776,6 +780,39 @@ def test_a_failing_rank_ends_the_group_through_its_signal_not_the_servicer(
     assert engine.poll() == 1
     assert [process.events[0] for process in recorded["processes"]] == ["terminate", "terminate"]
     assert "SGLang scheduler: a scheduler process signalled a failure (signal 3)" in caplog.text
+
+
+def test_metrics_directory_survives_repeated_environment_setup(
+    monkeypatch, tmp_path, restore_fault_signals
+):
+    recorded = _stub_rank_launch(monkeypatch)
+    common = sys.modules["sglang.srt.utils"].common
+    common.prometheus_multiproc_dir = tempfile.TemporaryDirectory(dir=tmp_path)
+    directory = Path(common.prometheus_multiproc_dir.name)
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(directory))
+
+    def set_envs_and_config(_args):
+        # SGLang's gRPC entrypoint already set the directory. The engine's
+        # second setup replaces its owner with a nested TemporaryDirectory.
+        common.prometheus_multiproc_dir = tempfile.TemporaryDirectory(dir=directory)
+
+    monkeypatch.setattr(
+        sys.modules["sglang.srt.entrypoints.engine"], "_set_envs_and_config", set_envs_and_config
+    )
+    engine = rust.launch_scheduler_ranks(_preparable_args(recorded), handshake_port=24321)
+    engine._manager.ready_thread.join(5)
+    try:
+        gc.collect()
+        # The scheduler creates its mmap files after the launcher has returned.
+        with (directory / "counter_1000.db").open("a+b") as counter:
+            counter.write(b"scheduler metrics")
+        assert any(held.name == str(directory) for held in engine._manager.holding)
+    finally:
+        engine._manager.shutdown(timeout=0)
+        engine._manager.holding.clear()
+        common.prometheus_multiproc_dir.cleanup()
+    gc.collect()
+    assert not directory.exists()
 
 
 def test_launch_scheduler_ranks_off_the_main_thread_keeps_the_spawned_launcher(monkeypatch):
