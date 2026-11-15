@@ -1343,8 +1343,10 @@ impl Default for RoutingKeyOverrideConfig {
 /// class of the key's rank, and the decode side takes the same room. A
 /// batched or EPD request, or one on another runtime, keeps its random room.
 ///
-/// The flag and the configuration file take one spelling: the flag's values
-/// are this enum's clap [`ValueEnum`] names, and serde writes the same ones.
+/// The flag and the configuration file take one spelling, and so does a
+/// caller that parses the setting from a string: the flag's values are this
+/// enum's clap [`ValueEnum`] names, serde writes the same ones, and
+/// [`FromStr`](std::str::FromStr) reads them as clap does.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupedDpSticky {
@@ -1366,6 +1368,22 @@ impl GroupedDpSticky {
             Self::Off => "off",
             Self::Hash => "hash",
         }
+    }
+}
+
+impl std::str::FromStr for GroupedDpSticky {
+    type Err = String;
+
+    /// The flag's spelling, matched exactly as clap matches it, so a caller
+    /// outside clap refuses what the CLI refuses.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        <Self as ValueEnum>::from_str(value, false).map_err(|_| {
+            let known: Vec<&str> = Self::value_variants()
+                .iter()
+                .map(|sticky| sticky.as_str())
+                .collect();
+            format!("expected one of {}", known.join(", "))
+        })
     }
 }
 
@@ -3083,7 +3101,8 @@ mod tests {
         let read: RouterConfig = serde_json::from_value(json).unwrap();
         assert_eq!(read.grouped_dp_sticky, GroupedDpSticky::Off);
 
-        // One spelling everywhere: the flag's values are the file's.
+        // One spelling everywhere: the flag's values are the file's, and a
+        // parse outside clap takes them as the flag does, exactly.
         let flag_values: Vec<String> = GroupedDpSticky::value_variants()
             .iter()
             .filter_map(GroupedDpSticky::to_possible_value)
@@ -3097,6 +3116,10 @@ mod tests {
                 serde_json::from_value::<GroupedDpSticky>(json).unwrap(),
                 sticky
             );
+            assert_eq!(sticky.as_str().parse::<GroupedDpSticky>(), Ok(sticky));
+        }
+        for refused in ["least_load", "HASH", " hash", ""] {
+            assert!(refused.parse::<GroupedDpSticky>().is_err(), "{refused:?}");
         }
         assert!(serde_json::from_value::<GroupedDpSticky>(serde_json::json!("sticky")).is_err());
     }
