@@ -88,7 +88,12 @@ async fn tools_of<S: rmcp::service::Service<RoleClient>>(
             info!("Discovered {} tools from '{}'", tools.len(), server_key);
             Ok(tools
                 .into_iter()
-                .map(|tool| ToolEntry::from_server_tool(server_key, tool).with_category(category))
+                .enumerate()
+                .map(|(position, tool)| {
+                    ToolEntry::from_server_tool(server_key, tool)
+                        .with_category(category)
+                        .with_position(position)
+                })
                 .collect())
         }
         Err(e) => {
@@ -1806,22 +1811,26 @@ impl McpOrchestrator {
             .collect()
     }
 
-    /// List tools for specific servers.
+    /// List tools for specific servers: the servers in the order given, each
+    /// server's tools in its listing order (the inventory's maps keep neither),
+    /// an entry without a position after the listed ones, the name settling
+    /// ties. One walk of the inventory, cloning only these servers' entries.
     pub fn list_tools_for_servers(&self, server_keys: &[String]) -> Vec<ToolEntry> {
         // For small server lists (typical case: 1-5), linear scan is faster than HashSet
-        let is_allowed = |server_key: &str| -> bool { server_keys.iter().any(|s| s == server_key) };
+        let server_rank = |server_key: &str| server_keys.iter().position(|s| s == server_key);
 
-        self.tool_inventory
-            .list_tools()
-            .into_iter()
-            .filter_map(|(tool_name, server_key, _)| {
-                if is_allowed(&server_key) {
-                    self.tool_inventory.get_entry(&server_key, &tool_name)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let mut ranked = self
+            .tool_inventory
+            .entries_keyed(|entry| server_rank(entry.server_key()));
+        ranked.sort_by(|(rank_a, a), (rank_b, b)| {
+            (rank_a, a.position.is_none(), a.position, a.tool_name()).cmp(&(
+                rank_b,
+                b.position.is_none(),
+                b.position,
+                b.tool_name(),
+            ))
+        });
+        ranked.into_iter().map(|(_, entry)| entry).collect()
     }
 
     /// Get a tool by qualified name.
@@ -2225,6 +2234,55 @@ mod tests {
             Arc::new(serde_json::Map::new()),
         )
     }
+    /// The tools of the request's servers come in the request's server order,
+    /// then each server's listing order (the position the listing recorded),
+    /// an entry without a position last, however the inventory's maps hash
+    /// them.
+    #[test]
+    fn tools_are_listed_in_the_servers_listing_order() {
+        let orchestrator = McpOrchestrator::new_test();
+        let listed = [
+            "echo",
+            "sleep",
+            "fail",
+            "big",
+            "nested",
+            "multi",
+            "rpc_error",
+            "zeta",
+        ];
+        for (position, name) in listed.iter().enumerate() {
+            orchestrator.tool_inventory().insert_entry(
+                ToolEntry::from_server_tool("s1", create_test_tool(name)).with_position(position),
+            );
+        }
+        // made otherwise than by the listing (no position): last, whatever its name
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool("s1", create_test_tool("aaa")));
+        for (position, name) in ["second", "first"].iter().enumerate() {
+            orchestrator.tool_inventory().insert_entry(
+                ToolEntry::from_server_tool("s2", create_test_tool(name)).with_position(position),
+            );
+        }
+        let names = |keys: &[&str]| -> Vec<String> {
+            let keys: Vec<String> = keys.iter().map(ToString::to_string).collect();
+            orchestrator
+                .list_tools_for_servers(&keys)
+                .iter()
+                .map(|entry| format!("{}/{}", entry.server_key(), entry.tool_name()))
+                .collect()
+        };
+
+        let mut s1: Vec<String> = listed.iter().map(|name| format!("s1/{name}")).collect();
+        s1.push("s1/aaa".to_string());
+        let s2 = ["s2/second".to_string(), "s2/first".to_string()];
+        assert_eq!(names(&["s1"]), s1);
+        assert_eq!(names(&["s2", "s1"]), [&s2[..], &s1[..]].concat());
+        assert_eq!(names(&["s1", "s2"]), [&s1[..], &s2[..]].concat());
+        assert!(names(&["s3"]).is_empty());
+    }
+
     #[test]
     fn approval_elicitation_id_is_keyed_by_call_id() {
         assert_eq!(
