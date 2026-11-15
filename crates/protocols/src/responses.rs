@@ -2650,7 +2650,9 @@ fn content_part_refusal(
 /// otherwise the first field whose value alone, beside the kind, draws the
 /// same words (serde names the value and the rule, not the field, inside a
 /// tagged object), and inside an array value the element that does
-/// (`annotations[0]`); nothing for a field the object itself misses, which
+/// (`annotations[0]`), unless an empty array draws them too: the field
+/// takes no array, and the refusal is its own whatever the array holds
+/// (`arguments`); nothing for a field the object itself misses, which
 /// serde's words name (the extractor appends it). A missed field is told own
 /// from nested by one probe of the whole object with a trailing duplicate of
 /// each of its keys: serde refuses a duplicate known field at the end of its
@@ -2681,6 +2683,7 @@ fn refused_field(
     }
     let null = Value::Null;
     let empty = Value::Object(serde_json::Map::new());
+    let no_elements = Value::Array(Vec::new());
     let refused = |entries: &[(&str, &Value)]| read(entries).as_deref() == Some(reason);
     let kind: Vec<(&str, &Value)> = fields
         .get("type")
@@ -2711,6 +2714,9 @@ fn refused_field(
         let Some(elements) = value.as_array() else {
             return Some(name.to_string());
         };
+        if refused(&with(&kind, name, &no_elements, &null)) {
+            return Some(name.to_string());
+        }
         let element = elements.iter().position(|element| {
             let one = Value::Array(vec![element.clone()]);
             refused(&with(&kind, name, &one, &null))
