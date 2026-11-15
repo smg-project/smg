@@ -32,7 +32,7 @@ use crate::{
     load_tracker::LoadTracker,
     metrics::{MetricsListener, ServicerMetrics, ServicerState, Snapshot},
     requests::RequestRegistry,
-    ServerThread, ServicerConfig, ServicerError, Shutdown,
+    ServerThread, ServicerConfig, ServicerError, Shutdown, STOP_MARGIN,
 };
 
 /// The proto integers a handshake figure is read into, each with the value
@@ -330,6 +330,43 @@ pub(crate) struct Server {
     metrics_listener: Option<MetricsListener>,
 }
 
+/// How long the shutdown waits for an `ipc://` handshake endpoint file to
+/// disappear after the connect task is gone: the socket library unlinks it
+/// from a task of this runtime, a few polls away even on a starved host.
+/// Half the stop margin at most, so a file that stays leaves the thread the
+/// other half to wind down and cannot turn a stop that drained in time into
+/// a timeout.
+const HANDSHAKE_RELEASE_BOUND: Duration = Duration::from_millis(500);
+const _: () = assert!(HANDSHAKE_RELEASE_BOUND.as_millis() * 2 <= STOP_MARGIN.as_millis());
+
+/// The `ipc://` handshake endpoint file this servicer is about to bind, read
+/// before the connect is spawned: `None` when the address names no file, and
+/// when a file is already at the path. That file is another process's (the
+/// bind fails as in use), and nothing here would release it.
+fn own_handshake_endpoint(handshake_address: &str) -> Option<String> {
+    handshake_address
+        .strip_prefix("ipc://")
+        .filter(|path| std::fs::metadata(path).is_err())
+        .map(str::to_owned)
+}
+
+/// Wait until the handshake endpoint file at `path` is gone, or `bound` has
+/// passed; a file still there is reported, never an error (the server stops
+/// either way).
+async fn await_handshake_release(path: &str, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while std::fs::metadata(path).is_ok() {
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                path,
+                "the handshake endpoint file outlived the servicer's stop"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 impl Server {
     /// Bind `config.bind_address` and serve `routes` (the wire's service) with
     /// the health service beside it, on a dedicated runtime thread named
@@ -340,9 +377,10 @@ impl Server {
     /// Once the listener is bound, `connect` gets the inputs of the engine
     /// connect (the endpoints and the engine count off `config`, its two
     /// start-up bounds, its silence bounds and the server's last-error slot)
-    /// and the future it returns runs on the server runtime, fire-and-forget:
-    /// the wire's engine connect, which gates health; dropping the runtime
-    /// with the server thread cancels it. The listening line names `engine`
+    /// and the future it returns runs on the server runtime in the background:
+    /// the wire's engine connect, which gates health; the shutdown aborts it
+    /// after the drain and waits for an `ipc://` handshake endpoint file of
+    /// its own to go before the thread ends. The listening line names `engine`
     /// with the bound address as the engines log it (the listener's
     /// `local_addr`, empty when the read fails).
     pub(crate) fn start<S, C, Fut>(
@@ -413,11 +451,12 @@ impl Server {
                     .local_addr()
                     .map(|address| address.to_string())
                     .unwrap_or_default();
+                let handshake_endpoint = own_handshake_endpoint(&handshake_address);
                 #[expect(
                     clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
+                    reason = "engine connect runs in the background; the shutdown aborts it below"
                 )]
-                let _connect = tokio::spawn(connect(ConnectInputs {
+                let connect_task = tokio::spawn(connect(ConnectInputs {
                     ipc_base_url,
                     handshake_address,
                     engine_count,
@@ -462,13 +501,24 @@ impl Server {
                     let grace = shutdown.await;
                     tokio::time::sleep(grace).await;
                 };
-                tokio::select! {
+                let result = tokio::select! {
                     result = graceful => result.map_err(|error| error.to_string()),
                     () = forced => {
                         warn!("gRPC servicer closed its remaining connections after the drain grace");
                         Ok(())
                     }
+                };
+                // The handshake endpoint goes with the server, not with the
+                // runtime: a connect still waiting for its engine is ended
+                // here, so its socket drops while the runtime can still run
+                // the release of an `ipc://` endpoint file, and that release
+                // is awaited before the thread ends and `stop` returns.
+                connect_task.abort();
+                let _ = connect_task.await;
+                if let Some(path) = handshake_endpoint {
+                    await_handshake_release(&path, HANDSHAKE_RELEASE_BOUND).await;
                 }
+                result
             },
         )?;
         Ok(Self {
@@ -553,6 +603,24 @@ mod tests {
         assert_eq!(shared.rank_count(4), 4);
         assert_eq!(shared.rank_count(0), 1);
         assert_eq!(shared.rank_count(-2), 1);
+    }
+
+    /// The stop waits only for an endpoint file of its own: a path nothing
+    /// holds yet. A file already there is an earlier process's, and an
+    /// address that names no file leaves nothing to wait for.
+    #[test]
+    fn the_stop_waits_only_for_a_handshake_endpoint_of_its_own() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("handshake");
+        let address = format!("ipc://{}", path.display());
+        assert_eq!(
+            own_handshake_endpoint(&address),
+            Some(path.display().to_string())
+        );
+
+        std::fs::write(&path, b"").expect("an earlier process's file");
+        assert_eq!(own_handshake_endpoint(&address), None);
+        assert_eq!(own_handshake_endpoint("tcp://127.0.0.1:5555"), None);
     }
 
     /// The drain switch closes admission with health; the readiness switch
