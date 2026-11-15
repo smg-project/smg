@@ -1052,10 +1052,11 @@ mod tests {
     #[test]
     fn test_manual_ttl_eviction_logic() {
         let config = ManualConfig {
-            eviction_interval_secs: 2,
+            eviction_interval_secs: 1,
             max_idle_secs: 2,
             assignment_mode: ManualAssignmentMode::Random,
         };
+        let max_idle = Duration::from_secs(config.max_idle_secs);
         let policy = ManualPolicy::with_config(config);
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -1064,6 +1065,11 @@ mod tests {
         policy.select_worker_impl(&workers, &info);
 
         assert_eq!(policy.routing_map.len(), 1);
+        let last_access = policy
+            .routing_map
+            .get(&RoutingId::new("key-0"))
+            .expect("the selected key")
+            .last_access;
 
         assert!(policy._eviction_task.is_some());
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1079,6 +1085,11 @@ mod tests {
 
         assert_eq!(policy.routing_map.len(), 0);
         assert_eq!(policy.entry_count(), 0);
+        let observed_age = last_access.elapsed();
+        assert!(
+            observed_age >= max_idle,
+            "the background task evicted the key before its TTL: age={observed_age:?}, max_idle={max_idle:?}"
+        );
     }
 
     #[test]
