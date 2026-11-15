@@ -387,9 +387,9 @@ fn select_among(
 
     // The per-request predicate applies to every entry point, so a caller
     // that sets it can never dispatch to a worker it rejects. Each candidate
-    // is asked once. A predicate that refuses nobody (a first attempt's
-    // ledger, a media demand every worker meets) leaves the candidates as
-    // they were drawn: nothing is collected, and the pool keeps its name.
+    // is asked once. A predicate that refuses nobody (a media or context
+    // demand every worker meets) leaves the candidates as they were drawn:
+    // nothing is collected, and the pool keeps its name.
     let refused = inputs.candidate_filter.and_then(|accepts| {
         let first = candidates.iter().position(|w| !accepts(w.as_ref()))?;
         Some((accepts, first))
