@@ -84,6 +84,19 @@ impl EngineScript {
         Self { frames, tokens }
     }
 
+    /// [`Self::single_tokens`] with each chunk carrying its token's logprobs:
+    /// the sampled logprob and `candidates` ranked alternatives, the shape of
+    /// a logprobs stream's chunk on the wire.
+    pub fn single_tokens_with_logprobs(text: &str, candidates: u32) -> Self {
+        let tokens = text.chars().count();
+        let mut frames: Vec<Bytes> = text
+            .chars()
+            .map(|character| data_frame(&chunk_with_logprobs(u32::from(character), candidates)))
+            .collect();
+        frames.push(data_frame(&complete(tokens)));
+        Self { frames, tokens }
+    }
+
     /// The tokens of the script: its chunks, one each.
     pub fn tokens(&self) -> usize {
         self.tokens
@@ -105,6 +118,28 @@ fn chunk(id: u32) -> proto::GenerateResponse {
             index: 0,
             token_ids: vec![id],
             completion_tokens: 1,
+            ..Default::default()
+        })),
+    }
+}
+
+/// [`chunk`] with the token's logprobs: the sampled logprob and `candidates`
+/// ranked alternatives (the ids after the token's, one value each).
+fn chunk_with_logprobs(id: u32, candidates: u32) -> proto::GenerateResponse {
+    let value = |k: u32| -0.5 - f32::from(u8::try_from(k).unwrap_or(u8::MAX));
+    proto::GenerateResponse {
+        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
+            index: 0,
+            token_ids: vec![id],
+            completion_tokens: 1,
+            output_logprobs: Some(proto::OutputLogProbs {
+                token_logprobs: vec![-0.125],
+                token_ids: vec![id],
+                top_logprobs: vec![proto::TopLogProbs {
+                    values: (0..candidates).map(value).collect(),
+                    token_ids: (0..candidates).map(|k| id + 1 + k).collect(),
+                }],
+            }),
             ..Default::default()
         })),
     }
@@ -238,6 +273,8 @@ pub struct StreamBench {
     peer: JoinHandle<()>,
     chat: ChatResponseSpec,
     chat_symphony: ChatResponseSpec,
+    chat_logprobs: ChatResponseSpec,
+    chat_symphony_logprobs: ChatResponseSpec,
     completion: CompletionResponseSpec,
     messages: MessagesResponseSpec,
 }
@@ -260,8 +297,7 @@ impl StreamBench {
         }))
         .expect("a chat request");
         let chat = ChatResponseSpec::from(&request);
-        let mut chat_symphony = chat.clone();
-        chat_symphony.symphony = Some(Assignment {
+        let qwen3_assignment = || Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
@@ -272,7 +308,25 @@ impl StreamBench {
             json_answer: false,
             span: tracing::Span::none(),
             marked: Arc::default(),
-        });
+        };
+        let mut chat_symphony = chat.clone();
+        chat_symphony.symphony = Some(qwen3_assignment());
+        // The plain chat stream asking for the tokens' logprobs with five
+        // candidates each: no tools and no reasoning split, so every token
+        // goes out as a bare text delta carrying them.
+        let logprobs_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true,
+            "logprobs": true,
+            "top_logprobs": 5
+        }))
+        .expect("a chat request with logprobs");
+        let chat_logprobs = ChatResponseSpec::from(&logprobs_request);
+        // The same stream under Symphony's Qwen3 table: every token goes out
+        // as a text event of the step, which carries its logprobs.
+        let mut chat_symphony_logprobs = chat_logprobs.clone();
+        chat_symphony_logprobs.symphony = Some(qwen3_assignment());
         let completion_request: CompletionRequest = serde_json::from_value(json!({
             "model": MODEL, "prompt": COMPLETION_PROMPT, "stream": true
         }))
@@ -297,6 +351,8 @@ impl StreamBench {
             peer,
             chat,
             chat_symphony,
+            chat_logprobs,
+            chat_symphony_logprobs,
             completion: CompletionResponseSpec::new(&completion_request, Vec::new()),
             messages: MessagesResponseSpec {
                 thinking_requested: true,
@@ -331,6 +387,24 @@ impl StreamBench {
     /// reader the gateway assigns it: the bytes written.
     pub async fn chat_forced(&self, forced: &ForcedChat, script: &EngineScript) -> usize {
         self.chat_under(&forced.spec, script).await
+    }
+
+    /// A plain chat stream asking for the tokens' logprobs with five
+    /// candidates each (a script of [`EngineScript::single_tokens_with_logprobs`]):
+    /// the bytes written.
+    pub async fn chat_logprobs(&self, script: &EngineScript) -> usize {
+        self.chat_under(&self.chat_logprobs, script).await
+    }
+
+    /// [`Self::chat_logprobs`] under Symphony's Qwen3 table (the step writer's
+    /// path): the bytes written.
+    pub async fn chat_symphony_logprobs(&self, script: &EngineScript) -> usize {
+        self.chat_under(&self.chat_symphony_logprobs, script).await
+    }
+
+    /// The tokenizer the streams decode with (a character is a token).
+    pub fn tokenizer(&self) -> &Arc<dyn Tokenizer> {
+        &self.tokenizer
     }
 
     async fn chat_under(&self, spec: &ChatResponseSpec, script: &EngineScript) -> usize {
