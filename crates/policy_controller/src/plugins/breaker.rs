@@ -239,7 +239,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{Breaker, Latency};
-    use crate::wasm::config::BreakerSpec;
+    use crate::plugins::config::BreakerSpec;
 
     fn spec() -> BreakerSpec {
         BreakerSpec {

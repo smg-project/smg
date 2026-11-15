@@ -21,16 +21,17 @@ use wasmtime::{
 
 use super::{
     bindings::{packed, record, wit, HostState, LogGate, Watch},
-    breaker::{Breaker, Latency},
     config::{Abi, Exposure, Failure, FrameBudget, PluginSpec},
-    counters::Counters,
-    intern,
     view::{self as marshal, Packed, Records, TooLong},
 };
 use crate::{
     decision::{Decision, Target, MAX_TARGETS},
     framework::{self, DecisionScope},
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+    plugins::{
+        breaker::{Breaker, Latency},
+        intern, BoundPlugin, Counters, Fallback,
+    },
     spec::Needs,
     view::{Candidate, Phase, PoolFacts, RequestFacts},
     Draw,
@@ -1648,20 +1649,9 @@ impl fmt::Debug for Bound {
     }
 }
 
-/// The stage takes its fallback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Fallback;
-
 impl Bound {
     pub fn plugin(&self) -> &Arc<Plugin> {
         &self.plugin
-    }
-
-    /// The first scorer or picker adapter made from any bound set of the
-    /// build forwards the lifecycle; the others do not, so an event reaches
-    /// the plugin once per build, whichever of its profiles bind the plugin.
-    pub(crate) fn take_observer(&self) -> bool {
-        !self.observer_taken.swap(true, Ordering::Relaxed)
     }
 
     fn state(&self, phase: Phase) -> RefMut<'_, Open> {
@@ -1941,26 +1931,6 @@ impl Bound {
         }
     }
 
-    /// The filter's answer for the phase's decision, computed once: `kept`
-    /// keeps the positions the guest named.
-    pub(crate) fn retain(
-        &self,
-        facts: &RequestFacts<'_>,
-        kept: &mut Vec<u32>,
-    ) -> Result<(), Fallback> {
-        let mut open = self.state(facts.phase);
-        self.ensure_mask(&mut open)?;
-        kept.retain(|&i| bit(&open.mask, i));
-        Ok(())
-    }
-
-    /// One row of the filter's answer.
-    pub(crate) fn keep(&self, facts: &RequestFacts<'_>, position: u32) -> Result<bool, Fallback> {
-        let mut open = self.state(facts.phase);
-        self.ensure_mask(&mut open)?;
-        Ok(bit(&open.mask, position))
-    }
-
     /// One guest call of the open decision on this thread's instance, under
     /// the decision's fuel frame: `call` gets the instance and the decision's
     /// live resource. The slot's guard comes back with the answer, for the
@@ -2012,10 +1982,47 @@ impl Bound {
         open.mask_set = true;
         Ok(())
     }
+}
+
+impl BoundPlugin for Bound {
+    fn name(&self) -> &'static str {
+        self.plugin.name()
+    }
+
+    fn failure(&self) -> Failure {
+        self.plugin.failure()
+    }
+
+    fn needs(&self) -> Needs {
+        self.plugin.needs()
+    }
+
+    /// The first scorer or picker adapter made from any bound set of the
+    /// build forwards the lifecycle; the others do not, so an event reaches
+    /// the plugin once per build, whichever of its profiles bind the plugin.
+    fn take_observer(&self) -> bool {
+        !self.observer_taken.swap(true, Ordering::Relaxed)
+    }
+
+    /// The filter's answer for the phase's decision, computed once: `kept`
+    /// keeps the positions the guest named.
+    fn retain(&self, facts: &RequestFacts<'_>, kept: &mut Vec<u32>) -> Result<(), Fallback> {
+        let mut open = self.state(facts.phase);
+        self.ensure_mask(&mut open)?;
+        kept.retain(|&i| bit(&open.mask, i));
+        Ok(())
+    }
+
+    /// One row of the filter's answer.
+    fn keep(&self, facts: &RequestFacts<'_>, position: u32) -> Result<bool, Fallback> {
+        let mut open = self.state(facts.phase);
+        self.ensure_mask(&mut open)?;
+        Ok(bit(&open.mask, position))
+    }
 
     /// The scorer's answer for the phase's decision, computed once: `out[i]`
     /// is the score of `kept[i]`.
-    pub(crate) fn score(
+    fn score(
         &self,
         facts: &RequestFacts<'_>,
         kept: &[u32],
@@ -2061,7 +2068,7 @@ impl Bound {
     /// `kept[i]`; the guest sees one score per candidate, `-1.0` on a row
     /// the filters dropped, and names a surviving position or declines (a
     /// `none` is the pick's decline).
-    pub(crate) fn pick(
+    fn pick(
         &self,
         facts: &RequestFacts<'_>,
         kept: &[u32],
@@ -2121,7 +2128,7 @@ impl Bound {
         Ok(picked)
     }
 
-    pub(crate) fn observe_issued(&self, lease: &Lease, decision: &Decision) {
+    fn observe_issued(&self, lease: &Lease, decision: &Decision) {
         let mut targets: [wit::Target; MAX_TARGETS] = std::array::from_fn(|_| wit::Target {
             id: 0,
             dp_rank: 0,
@@ -2134,7 +2141,7 @@ impl Bound {
         )));
     }
 
-    pub(crate) fn observe_dispatched(
+    fn observe_dispatched(
         &self,
         lease: &Lease,
         target: &Target,
@@ -2150,7 +2157,7 @@ impl Bound {
             }));
     }
 
-    pub(crate) fn observe_completed(&self, lease: &Lease, outcome: &Outcome) {
+    fn observe_completed(&self, lease: &Lease, outcome: &Outcome) {
         self.plugin
             .observe(wit::LifecycleEvent::Completed(marshal::completed(
                 lease,
@@ -2159,14 +2166,14 @@ impl Bound {
             )));
     }
 
-    pub(crate) fn observe_released(&self, lease: &Lease, reason: ReleaseReason) {
+    fn observe_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.plugin.observe(wit::LifecycleEvent::Released((
             marshal::lease(lease, &self.plugin.exposure),
             marshal::release_reason(reason),
         )));
     }
 
-    pub(crate) fn observe_membership(&self, change: &Membership<'_>) {
+    fn observe_membership(&self, change: &Membership<'_>) {
         let plugin = &self.plugin;
         // The snapshot's ids are copied into the instance's own buffer; a
         // borrow of the slot for the copy and another for the call would
@@ -2188,7 +2195,7 @@ impl Bound {
         }
     }
 
-    pub(crate) fn observe_signal(&self, signal: &Signal) {
+    fn observe_signal(&self, signal: &Signal) {
         let now = self.plugin.runtime.now_micros();
         self.plugin
             .observe(wit::LifecycleEvent::Signal(marshal::signal(signal, now)));

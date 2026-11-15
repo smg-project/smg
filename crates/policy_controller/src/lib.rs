@@ -48,7 +48,9 @@
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
 //!   package, one kept instance per deciding thread, every call under fuel,
-//!   bound to a profile as the framework's own stages.
+//!   bound to a profile as the framework's own stages. What every plugin
+//!   kind shares (the breaker, the counters, the stage adapters) is the
+//!   `plugins` module.
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
@@ -78,6 +80,8 @@ pub mod framework;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
+#[cfg(feature = "wasm")]
+pub mod plugins;
 pub mod ring;
 pub mod sessions;
 pub mod spec;
