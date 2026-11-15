@@ -315,8 +315,8 @@ impl Records {
 /// change to the table changes these numbers and the test that pins them.
 pub mod layout {
     /// One candidate row, with the five affinity facts in it. The fields of
-    /// the engine's own row take 104 bytes WITHOUT them: the two numbers
-    /// are equal by accident, each pinned in its own file, and nothing ties
+    /// the engine's own row take 103 bytes WITHOUT them: the two numbers
+    /// are near by accident, each pinned in its own file, and nothing ties
     /// one to the other.
     pub const ROW: usize = 104;
     /// The request block's fixed header; the variable sections follow.
