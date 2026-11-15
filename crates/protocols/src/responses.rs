@@ -5548,7 +5548,9 @@ mod tests {
     /// A typed item refused at its own field says which: serde's words for a
     /// missing one (the extractor appends the field), the field before the
     /// reason for an invalid one, `type` for a kind with no variant, the
-    /// element of one of the item's arrays for a field missing inside it.
+    /// element of one of the item's arrays for a field missing inside it or
+    /// an element refused on its own, the field itself when it takes no
+    /// array and is sent one.
     #[test]
     fn a_typed_item_refused_at_its_own_field_names_it() {
         for (body, words) in [
@@ -5559,6 +5561,14 @@ mod tests {
             (
                 r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}]}"#,
                 "arguments: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":["{}"]}]}"#,
+                "arguments: invalid type: sequence, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search","input_schema":{}},{"name":7,"input_schema":{}}]}]}"#,
+                "tools[1]: invalid type: integer `7`, expected a string",
             ),
             (
                 r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}]}"#,

@@ -1792,7 +1792,9 @@ mod tests {
     /// refusal on this door does: a message with or without its `type` or
     /// its `id`, a part inside a typed item, a field inside a part's own
     /// array, a typed item's own field or the element of one of its arrays,
-    /// the kind of a typed item; the accepted shapes are unchanged.
+    /// a field sent an array it does not take (the field, not the array's
+    /// first element), the kind of a typed item; the accepted shapes are
+    /// unchanged.
     #[tokio::test]
     async fn a_responses_input_part_refusal_names_the_part_and_its_field() {
         let image = |part: &str| {
@@ -1818,6 +1820,14 @@ mod tests {
                 "invalid_type",
                 "input[0].content[1].image_url",
                 "input[0].content[1].image_url: invalid type: map, expected a string",
+            ),
+            // A part's field that takes no array, sent one, is refused
+            // itself, not at the array's first element.
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":["describe"]}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].text",
+                "input[0].content[0].text: invalid type: sequence, expected a string",
             ),
             (
                 r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_video","video_url":"http://127.0.0.1/clip.mp4"}]}],"max_output_tokens":2}"#.to_string(),
@@ -1882,6 +1892,14 @@ mod tests {
                 "invalid_type",
                 "input[0].arguments",
                 "input[0].arguments: invalid type: integer `7`, expected a string",
+            ),
+            // The same for an item's field: `arguments` takes a string, so
+            // an array there is the field's refusal.
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":["{}"]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].arguments",
+                "input[0].arguments: invalid type: sequence, expected a string",
             ),
             (
                 r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
