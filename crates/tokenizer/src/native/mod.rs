@@ -224,10 +224,10 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
-/// most (a thread's long tier keeps its map's slots through a clear, four
-/// times its share at most; a share that fell below a quarter of what the
-/// tier holds empties it at the thread's next call or eviction, and the map
-/// is made anew when its slots alone are more than four times the share). A
+/// most (a thread's long tier keeps its map's slots through an eviction's
+/// clear when they fit four times its share and gives them back when they
+/// do not; a share that fell below a quarter of what the tier holds, entries
+/// and empty slots together, makes it anew at the thread's next call). A
 /// thread reads its share at the start of every encode call and keeps
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
@@ -403,21 +403,31 @@ impl PieceCache {
 
     /// Bytes the long tier holds, used or not: its entries' pieces, ids and
     /// slots (`long_bytes`) and the empty slots of its map, which a clear
-    /// keeps.
+    /// in place keeps.
     fn long_held_bytes(&self) -> usize {
         self.long_bytes + (self.long.capacity() - self.long.len()) * LONG_PIECE_ENTRY_BYTES
     }
 
-    /// Empties the long tier for a share of `share` bytes: in place when its
-    /// map's slots fit four times the share (the next misses fill them again
-    /// without a growth), anew when they do not (a map grown under a wider
-    /// share gives its slots back).
+    /// Empties the long tier at an eviction for a share of `share` bytes: in
+    /// place when its map's slots fit four times the share (the next misses
+    /// fill them again without a growth), anew when they do not (a map grown
+    /// under a wider share gives its slots back).
     fn clear_long_within(&mut self, share: usize) {
         if self.long.capacity() * LONG_PIECE_ENTRY_BYTES > 4 * share {
-            self.long = PieceIds::default();
+            self.remake_long();
         } else {
             self.long.clear();
+            self.long_bytes = 0;
         }
+    }
+
+    /// Makes the long tier anew, its map's slots given back. The check at a
+    /// call's start takes this rather than a clear in place: what the tier
+    /// holds is never under its slots alone, so a map grown under a wider
+    /// share to just under the bound would be over it again with its first
+    /// entries back, and the check would empty the tier at every call.
+    fn remake_long(&mut self) {
+        self.long = PieceIds::default();
         self.long_bytes = 0;
     }
 
@@ -3426,9 +3436,9 @@ impl NativeEncoder {
     /// the capacity of its map (arrays grown for the earlier share keep
     /// their size through a clear at the bound; here the map is made anew for
     /// the share and the packed table is cut back to the share's slots inside
-    /// its reservation, see `ShortPieceTable::clear`), and empties its long
-    /// tier when it holds more than four times the long share, anew when the
-    /// map's slots alone are more (see `PieceCache::clear_long_within`), so
+    /// its reservation, see `ShortPieceTable::clear`), and makes its long
+    /// tier anew when it holds more than four times the long share, entries
+    /// and empty slots together (see `PieceCache::remake_long`), so
     /// every thread that still encodes is within the share
     /// from its next call on (the share is read here once and kept in the
     /// cache for the call's misses, so a call that was running when threads
@@ -3448,7 +3458,7 @@ impl NativeEncoder {
         }
         let long_share = self.long_piece_bytes_share();
         if cache.long_held_bytes() > 4 * long_share {
-            cache.clear_long_within(long_share);
+            cache.remake_long();
         }
         cache
     }
