@@ -3238,6 +3238,7 @@ mod tests {
                     PairPools {
                         prefills: &prefills,
                         decodes: &decodes,
+                        ..PairPools::default()
                     },
                     &Constraints::default(),
                     &Constraints::default(),
@@ -3347,6 +3348,7 @@ mod tests {
                 PairPools {
                     prefills: &prefills,
                     decodes: &decodes,
+                    ..PairPools::default()
                 },
                 &Constraints::default(),
                 &Constraints::default(),
