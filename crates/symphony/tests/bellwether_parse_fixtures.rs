@@ -292,6 +292,46 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // never opens or renders a thought: content alone, read with the plain table.
     ("flora-rewarder", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("flora-captioner", GenerationPrompt::Plain),
+    // MiniMax-H3-Image-PE is a Qwen3.8-27B fine-tune (the hub's base-model tag) that ships the
+    // base's chat template byte for byte: ChatML, Qwen 3.5's tagged calls, and the thought opened
+    // in the prompt (closed there when the request turns thinking off).
+    ("minimax-h3-image-pe", GenerationPrompt::OpensTheThought),
+    // MiniCPM-V 4.7 (the 35B-A3B on a Qwen 3.5 mixture-of-experts text stack, the 1B on the dense
+    // one, each with its own tokenizer) ships one chat template for both: ChatML, Qwen 3.5's tagged
+    // calls, and the thought opened in the prompt only when the request asks for it (closed there
+    // otherwise, by default too, as Qwen3.5-2B's).
+    (
+        "minicpm-v-4.7-1b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "minicpm-v-4.7-35b-a3b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    // MiniCPM-OCR-1.0 (its own OCR stack) and MiniCPM-OCR-Jev (a Qwen 3.5 stack) each ship a chat
+    // template and a tokenizer of their own with the MiniCPM-V-4.7 prompt shapes: ChatML, Qwen 3.5's
+    // tagged calls, and the thought opened in the prompt only when the request asks for it.
+    (
+        "minicpm-ocr-1.0",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "minicpm-ocr-jev",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    // The LightOnOCR-3 line: the 4B and the 0.8B (a Qwen 3.5 stack) write the MiniCPM-OCR prompt
+    // shapes under templates of their own (the 0.8B's is MiniCPM-OCR-Jev's byte for byte): ChatML,
+    // Qwen 3.5's tagged calls, the thought opened in the prompt only when the request asks for it;
+    // the 1B (a Mistral 3 stack under ChatML markers) renders no tool section and no thought.
+    (
+        "lightonocr-3-4b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "lightonocr-3-0.8b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    ("lightonocr-3-1b", GenerationPrompt::Plain),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
@@ -432,6 +472,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // and the turns set eight of the twelve.
     ("longcat-2.5", GenerationPrompt::OpensTheThoughtWhenAsked),
     ("ling-3.0-flash", GenerationPrompt::OpensTheThought),
+    ("ling-3.1-flash", GenerationPrompt::OpensTheThought),
     // GLM writes Ling's syntax with nothing between the tags; its prompt opens the thought
     // whatever the request says (the template has no thinking switch).
     ("glm-5.3-flash", GenerationPrompt::AlwaysOpensTheThought),

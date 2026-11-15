@@ -6,11 +6,6 @@
 //! the fleet to answer reads the failure at once, with the log that says why,
 //! instead of waiting on a process that serves nothing.
 #![cfg(unix)]
-#![expect(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "a test binary: a failed step panics with what failed"
-)]
 
 use std::{
     io::Read,
@@ -21,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use engine_zmq_client::{
     connect_handshake,
     mock_engine::MOCK_DEADLINE,
@@ -41,10 +37,10 @@ fn binary() -> String {
 }
 
 /// A port held by this test, so a worker told to bind it cannot.
-fn held_port() -> (TcpListener, String) {
-    let held = TcpListener::bind("127.0.0.1:0").expect("hold a port");
-    let port = held.local_addr().expect("listener address").port();
-    (held, port.to_string())
+fn held_port() -> anyhow::Result<(TcpListener, String)> {
+    let held = TcpListener::bind("127.0.0.1:0").context("hold a port")?;
+    let port = held.local_addr().context("listener address")?.port();
+    Ok((held, port.to_string()))
 }
 
 /// A mock worker process started with `args`, its log read as it comes (so a
@@ -66,7 +62,7 @@ impl Drop for Process {
 }
 
 impl Process {
-    fn start(args: &[&str]) -> Self {
+    fn start(args: &[&str]) -> anyhow::Result<Self> {
         let mut child = Command::new(binary())
             .args(["--host", "127.0.0.1"])
             .args(args)
@@ -74,8 +70,8 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn the mock worker");
-        let mut out = child.stdout.take().expect("piped stdout");
+            .context("spawn the mock worker")?;
+        let mut out = child.stdout.take().context("piped stdout")?;
         let log = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&log);
         let reader = thread::spawn(move || {
@@ -90,11 +86,11 @@ impl Process {
                 }
             }
         });
-        Self {
+        Ok(Self {
             child,
             log,
             reader: Some(reader),
-        }
+        })
     }
 
     /// The log so far.
@@ -119,29 +115,30 @@ impl Process {
     }
 
     /// SIGTERM, as a container runtime sends it.
-    fn terminate(&self) {
+    fn terminate(&self) -> anyhow::Result<()> {
         let status = Command::new("kill")
             .arg("-TERM")
             .arg(self.child.id().to_string())
             .status()
-            .expect("run kill");
+            .context("run kill")?;
         assert!(status.success(), "kill -TERM failed: {status}");
+        Ok(())
     }
 
     /// Wait up to `limit` for the exit; a process still alive by then is
     /// killed and the test fails. Returns the exit status and the log.
-    fn exit(mut self, limit: Duration) -> (ExitStatus, String) {
+    fn exit(mut self, limit: Duration) -> anyhow::Result<(ExitStatus, String)> {
         let deadline = Instant::now() + limit;
         loop {
-            if let Some(status) = self.child.try_wait().expect("try_wait") {
-                self.join_reader();
-                return (status, self.log());
+            if let Some(status) = self.child.try_wait().context("try_wait")? {
+                self.join_reader()?;
+                return Ok((status, self.log()));
             }
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                self.join_reader();
-                panic!(
+                self.join_reader()?;
+                anyhow::bail!(
                     "the mock worker did not exit within {limit:?}; log:\n{}",
                     self.log()
                 );
@@ -151,10 +148,13 @@ impl Process {
     }
 
     /// The whole log is in the buffer once the reader has seen the pipe close.
-    fn join_reader(&mut self) {
+    fn join_reader(&mut self) -> anyhow::Result<()> {
         if let Some(reader) = self.reader.take() {
-            reader.join().expect("stdout reader");
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("the stdout reader panicked"))?;
         }
+        Ok(())
     }
 }
 
@@ -176,8 +176,8 @@ fn the_last_workers_stop_ends_the_process_with_a_failure_status() {
     // bind its own. The process ends all the same, with status 1, and the
     // worker's own error line comes before the line that says the process
     // stops: a launcher that quotes a log's last error line quotes the cause.
-    let (held, held_port) = held_port();
-    let admin_port = free_port().to_string();
+    let (held, held_port) = held_port().expect("a held port");
+    let admin_port = free_port().expect("a free port").to_string();
     let mock = Process::start(&[
         "--grpc-base-port",
         &held_port,
@@ -185,8 +185,11 @@ fn the_last_workers_stop_ends_the_process_with_a_failure_status() {
         "1",
         "--admin-port",
         &admin_port,
-    ]);
-    let (status, log) = mock.exit(Duration::from_secs(20));
+    ])
+    .expect("the mock worker starts");
+    let (status, log) = mock
+        .exit(Duration::from_secs(20))
+        .expect("the mock worker exits");
     drop(held);
     assert_eq!(status.code(), Some(1), "exit code; log:\n{log}");
     let cause = log
@@ -203,8 +206,8 @@ fn the_last_workers_stop_ends_the_process_with_a_failure_status() {
 fn a_worker_that_stops_leaves_the_others_serving() {
     // One worker cannot bind, one can: the process stays up on the one that
     // serves, says so, and still stops cleanly on a signal.
-    let (held, held_port) = held_port();
-    let http_port = free_port();
+    let (held, held_port) = held_port().expect("a held port");
+    let http_port = free_port().expect("a free port");
     let mock = Process::start(&[
         "--grpc-base-port",
         &held_port,
@@ -214,7 +217,8 @@ fn a_worker_that_stops_leaves_the_others_serving() {
         &http_port.to_string(),
         "--http-count",
         "1",
-    ]);
+    ])
+    .expect("the mock worker starts");
     wait_until_listening(http_port);
     // The stopped worker's line first: a signal that won the supervisor's
     // select against the join would take the drain path without it.
@@ -222,8 +226,10 @@ fn a_worker_that_stops_leaves_the_others_serving() {
         "a mock worker stopped (likely a port bind failure); 1 still serving",
         Duration::from_secs(10),
     );
-    mock.terminate();
-    let (status, log) = mock.exit(Duration::from_secs(10));
+    mock.terminate().expect("the signal is sent");
+    let (status, log) = mock
+        .exit(Duration::from_secs(10))
+        .expect("the mock worker exits");
     drop(held);
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
@@ -240,15 +246,15 @@ fn past_the_mock_deadline() -> Duration {
 
 /// A rank's three ipc endpoints (handshake, input, output) in a directory of
 /// their own, which lives as long as the returned handle.
-fn ipc_endpoints() -> (tempfile::TempDir, String, String, String) {
-    let dir = tempfile::tempdir().expect("a directory for the ipc endpoints");
+fn ipc_endpoints() -> anyhow::Result<(tempfile::TempDir, String, String, String)> {
+    let dir = tempfile::tempdir().context("a directory for the ipc endpoints")?;
     let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
     let (handshake, input, output) = (
         endpoint("hs.sock"),
         endpoint("in.sock"),
         endpoint("out.sock"),
     );
-    (dir, handshake, input, output)
+    Ok((dir, handshake, input, output))
 }
 
 /// A request of four prompt tokens for four output tokens.
@@ -273,8 +279,9 @@ async fn a_zmq_rank_waits_for_a_frontend_that_binds_after_its_first_round() {
     // for it has ended (the rank's own line says so; no fixed margin, which a
     // slow start could eat): the rank registers, answers, and still stops
     // cleanly on a signal.
-    let (_dir, handshake, input, output) = ipc_endpoints();
-    let mock = Process::start(&["--zmq-handshake", &handshake, "--zmq-count", "1"]);
+    let (_dir, handshake, input, output) = ipc_endpoints().expect("the ipc endpoints");
+    let mock = Process::start(&["--zmq-handshake", &handshake, "--zmq-count", "1"])
+        .expect("the mock worker starts");
     mock.wait_for_log(
         "again (round 2 of 3)",
         MOCK_DEADLINE + Duration::from_secs(20),
@@ -292,8 +299,10 @@ async fn a_zmq_rank_waits_for_a_frontend_that_binds_after_its_first_round() {
         .await
         .expect("a batch of the request")
         .expect("ok");
-    mock.terminate();
-    let (status, log) = mock.exit(Duration::from_secs(10));
+    mock.terminate().expect("the signal is sent");
+    let (status, log) = mock
+        .exit(Duration::from_secs(10))
+        .expect("the mock worker exits");
     drop(answer);
     drop(client);
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
@@ -307,8 +316,9 @@ async fn a_connected_zmq_rank_waits_past_the_read_bound_for_its_requests() {
     // The frontend is there for the rank's first round. Then nothing arrives
     // for longer than the mock's read bound: the rank is still there for the
     // next request, as an engine is, and still stops cleanly on a signal.
-    let (_dir, handshake, input, output) = ipc_endpoints();
-    let mock = Process::start(&["--zmq-handshake", &handshake, "--zmq-count", "1"]);
+    let (_dir, handshake, input, output) = ipc_endpoints().expect("the ipc endpoints");
+    let mock = Process::start(&["--zmq-handshake", &handshake, "--zmq-count", "1"])
+        .expect("the mock worker starts");
     let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(20))
         .await
         .expect("the rank registers in its first round");
@@ -323,8 +333,10 @@ async fn a_connected_zmq_rank_waits_past_the_read_bound_for_its_requests() {
         .await
         .expect("a batch of the request after the idle")
         .expect("ok");
-    mock.terminate();
-    let (status, log) = mock.exit(Duration::from_secs(10));
+    mock.terminate().expect("the signal is sent");
+    let (status, log) = mock
+        .exit(Duration::from_secs(10))
+        .expect("the mock worker exits");
     drop(answer);
     drop(client);
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
