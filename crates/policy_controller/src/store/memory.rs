@@ -17,6 +17,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    spec::AppliedSpec,
     store::{
         health::HealthSink,
         kv_events::{
@@ -30,7 +31,7 @@ use crate::{
             identity, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
         },
-        world::{micros, Ask, Built, ViewBuffers, World, Writer, PUBLISH_WINDOW},
+        world::{micros, Ask, Built, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW},
         GatewayId,
     },
     view::{LoadRow, Role, WorkerId},
@@ -125,6 +126,22 @@ impl MemoryStore {
         }
     }
 
+    /// Apply a generation: every world from here on is published under
+    /// `spec`, the first at once, with the standing membership and its rows
+    /// as they are. The store's one entry for a generation; a store starts
+    /// under [`AppliedSpec::unbound`].
+    ///
+    /// The number only rises. A generation whose number is not above the
+    /// standing one is refused by naming the standing one, and nothing is
+    /// published: a reader that saw a generation never sees a lower one,
+    /// and a document that names no generation (number 0) is never applied.
+    pub fn apply(&self, spec: AppliedSpec) -> Result<(), StaleGeneration> {
+        let mut loads = self.loads.lock();
+        let world = loads.writer.apply(Arc::new(spec))?;
+        self.world.store(world);
+        Ok(())
+    }
+
     /// The world as the last publication left it, taken through no lock.
     /// Its identity moves with every publication: [`World::epoch`] says
     /// whether the membership moved.
@@ -169,9 +186,15 @@ impl MemoryStore {
         decode: &mut ViewBuffers,
     ) -> Option<(Built, Built)> {
         let world = self.world.load();
+        // The decode side is built only beside a prefill pool: a model
+        // with no prefill member costs one lookup, not a second build.
         let pair = world
             .build(model, Role::Prefill, ask, prefill)
-            .zip(world.build(model, Role::Decode, ask, decode));
+            .and_then(|first| {
+                world
+                    .build(model, Role::Decode, ask, decode)
+                    .map(|second| (first, second))
+            });
         if pair.is_none() {
             for side in [prefill, decode] {
                 side.candidates.clear();

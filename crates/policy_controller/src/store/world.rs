@@ -4,10 +4,11 @@
 //!
 //! One invariant: **a decision reads one publication.** A world is
 //! everything the store published together: a pool per model and role, its
-//! rows sorted by worker id, and the gateways' standing vetoes. One load
-//! hands a decision all of it, so both sides of a pair decision, their load
-//! records and the vetoes are of one publication, never a prefill pool of
-//! one and a decode pool of the next.
+//! rows sorted by worker id, the gateways' standing vetoes and the
+//! generation they were published under ([`World::spec`]). One load hands a
+//! decision all of it, so both sides of a pair decision, their load
+//! records, the vetoes and the engine with its number are of one
+//! publication, never a prefill pool of one and a decode pool of the next.
 //!
 //! What a membership write derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
@@ -36,19 +37,22 @@
 //!
 //! A decision's build is a copy and one pass ([`World::build`]): the rows,
 //! less another gateway's host-local ones, then what is the decision's own
-//! (the position, the report's age), then the pool's standing vetoes, each
-//! published with its row's place (the asking gateway's are masked by
-//! position in a pool every gateway copies whole, by id in a pool that
-//! holds host-local rows), then
-//! the pinned worker, found by its id in the slice the decision is made
-//! over: the sorted slice is its own index.
+//! (the position, the report's age), then the asking gateway's standing
+//! vetoes in the pool, reached by a walk among the few gateways that hold
+//! one there and by a search among many, each published with its row's
+//! place (masked by position in a pool every gateway copies whole, by id
+//! in a pool that holds host-local rows), then the pinned worker, found by
+//! its id in the slice the decision is made over: the sorted slice is its
+//! own index.
 //!
 //! **A veto is published in the form the build reads.** The writer keeps
-//! each gateway's list and derives each pool's standing vetoes by row at
-//! the three writes that change them: a veto's write, a membership write
-//! and a window's publication that drops a veto past its end. A veto
-//! leaves with its worker's row in the membership write's own step, so no
-//! publication shows the row without it.
+//! each gateway's list and publishes each pool's standing vetoes as one run
+//! a gateway, by row. A veto's write builds its own gateway's run again in
+//! the pools its worker has a row in and shares every other run with the
+//! publication before. A membership write, which moves the rows, and a
+//! window's publication that drops a veto past its end build every run
+//! again. A veto leaves with its worker's row in the membership write's own
+//! step, so no publication shows the row without it.
 
 use std::{
     sync::Arc,
@@ -58,6 +62,7 @@ use std::{
 use rustc_hash::FxHashMap;
 
 use crate::{
+    spec::AppliedSpec,
     store::{
         loads::LoadSample,
         workers::{Reachability, WorkerRow, WorkerStatus},
@@ -127,18 +132,22 @@ pub struct Built {
     /// The decision's instant in the rows' own clock: what the request's
     /// `now_micros` takes.
     pub now_micros: u64,
+    /// The number of the generation the world was published under
+    /// ([`World::spec`]): the rows and it are of one load.
+    pub generation: u64,
 }
 
 impl Built {
-    /// The pool facts of the decision under the spec `generation`. No ring,
-    /// no overload regime and no zone capacity are derived yet.
-    pub fn pool_facts(&self, generation: u64) -> PoolFacts<'static> {
+    /// The pool facts of the decision, under the generation the build read
+    /// with its rows. No ring, no overload regime and no zone capacity are
+    /// derived yet.
+    pub fn pool_facts(&self) -> PoolFacts<'static> {
         PoolFacts {
             pool_size: self.pool_size,
             membership_epoch: self.membership_epoch,
             ring_epoch: 0,
             regime: OverloadRegime::None,
-            generation,
+            generation: self.generation,
             zones: &[],
         }
     }
@@ -182,16 +191,127 @@ struct Derived {
     pools: Box<[PoolShape]>,
 }
 
-/// One standing veto as a pool carries it: the row it masks, by index and
-/// by id, the gateway that holds it and its end. The index finds the row in
-/// a pool every gateway copies whole, the id in a pool that holds host-local
+/// One standing veto as its gateway's run in a pool carries it: the row it
+/// masks, by index and by id, and its end. The index finds the row in a
+/// pool every gateway copies whole, the id in a pool that holds host-local
 /// rows, whichever gateway asks.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PoolVeto {
     row: u32,
     id: WorkerId,
-    gateway: GatewayId,
     until: Instant,
+}
+
+/// One gateway's standing vetoes in one pool, sorted by row: never empty.
+#[derive(Clone, Debug)]
+struct GatewayRun {
+    gateway: GatewayId,
+    vetoes: Arc<[PoolVeto]>,
+}
+
+/// One pool's standing vetoes: a run for each gateway that holds one in
+/// the pool, sorted by gateway. A build finds the asking gateway's run
+/// among the runs ([`run_of`]) and reads no other gateway's veto; a veto's
+/// write builds its own gateway's run again and shares every other.
+type PoolVetoes = Arc<[GatewayRun]>;
+
+/// The most runs a pool holds where a build still walks to its own, past
+/// half of them at the most; above it the run is found by search. A few
+/// gateways that each hold a veto in a pool is the shape a fleet has, and
+/// there a walk reads the runs in order while a search waits for each of
+/// its steps. The count is where the walk's farthest place, the middle,
+/// met the search when the two were timed alone.
+const WALKED_RUNS: usize = 160;
+
+/// `gateway`'s run among a pool's runs, sorted by gateway. While the runs
+/// are at most [`WALKED_RUNS`] the two ends are asked first, which is the
+/// whole answer where one gateway alone holds a veto, and a gateway
+/// between them is walked to from the nearer end: from the front to the
+/// first gateway not under it, or from the back to the first not above
+/// it. Above that count the run is found by one search.
+fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
+    if runs.len() > WALKED_RUNS {
+        let at = runs
+            .binary_search_by_key(&gateway, |run| run.gateway)
+            .ok()?;
+        return runs.get(at);
+    }
+    let (first, last) = (runs.first()?, runs.last()?);
+    if gateway <= first.gateway {
+        return (gateway == first.gateway).then_some(first);
+    }
+    if gateway >= last.gateway {
+        return (gateway == last.gateway).then_some(last);
+    }
+    // The middle run says which half holds the gateway's.
+    let middle = runs.get(runs.len() / 2)?;
+    let run = if gateway < middle.gateway {
+        runs.iter().find(|run| run.gateway >= gateway)
+    } else {
+        runs.iter().rev().find(|run| run.gateway <= gateway)
+    };
+    run.filter(|run| run.gateway == gateway)
+}
+
+/// A pool's runs with `gateway`'s veto on the row `row` of worker `id` set
+/// until `until`, or cleared: that gateway's run built again, each other
+/// run shared.
+fn with_veto(
+    runs: &PoolVetoes,
+    gateway: GatewayId,
+    row: u32,
+    id: WorkerId,
+    until: Option<Instant>,
+) -> PoolVetoes {
+    let found = runs.binary_search_by_key(&gateway, |run| run.gateway);
+    let own: &[PoolVeto] = match found {
+        Ok(at) => runs.get(at).map(|run| &*run.vetoes).unwrap_or_default(),
+        Err(_) => &[],
+    };
+    // Each arm is one pass of a known length: one allocation, the run's
+    // own, and no entry of another gateway is read.
+    let own: Arc<[PoolVeto]> = match (own.binary_search_by_key(&row, |veto| veto.row), until) {
+        (Ok(at), Some(until)) => own
+            .iter()
+            .enumerate()
+            .map(|(n, standing)| PoolVeto {
+                until: if n == at { until } else { standing.until },
+                ..*standing
+            })
+            .collect(),
+        (Ok(at), None) => {
+            let (before, after) = own.split_at(at);
+            let after = after.get(1..).unwrap_or_default();
+            before.iter().chain(after).copied().collect()
+        }
+        (Err(at), Some(until)) => {
+            let (before, after) = own.split_at(at);
+            before
+                .iter()
+                .copied()
+                .chain(std::iter::once(PoolVeto { row, id, until }))
+                .chain(after.iter().copied())
+                .collect()
+        }
+        // No veto of this gateway on the row: nothing to clear.
+        (Err(_), None) => return Arc::clone(runs),
+    };
+    let (at, held) = match found {
+        Ok(at) => (at, 1),
+        Err(at) => (at, 0),
+    };
+    let (before, after) = runs.split_at(at);
+    let after = after.get(held..).unwrap_or_default();
+    let own = (!own.is_empty()).then_some(GatewayRun {
+        gateway,
+        vetoes: own,
+    });
+    before
+        .iter()
+        .cloned()
+        .chain(own)
+        .chain(after.iter().cloned())
+        .collect()
 }
 
 /// The gateways' vetoes as the writer keeps them: per gateway its vetoed
@@ -199,7 +319,7 @@ struct PoolVeto {
 /// three writes that change them, all rare: a veto's write, a membership
 /// write that takes a departed worker's vetoes with its row, and a window's
 /// publication that drops a veto past its end. A world carries what is
-/// derived from them: each pool's list by row ([`PoolVeto`]).
+/// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
     by_gateway: FxHashMap<GatewayId, Arc<[(WorkerId, Instant)]>>,
@@ -253,8 +373,19 @@ impl Vetoes {
     /// some veto names a worker outside it: a worker's vetoes leave with
     /// its row.
     fn of_members(&self, members: &[WorkerId]) -> Option<Self> {
-        let member = |id: WorkerId| members.binary_search(&id).is_ok();
-        let whole = |list: &Arc<[(WorkerId, Instant)]>| list.iter().all(|&(id, _)| member(id));
+        /// The entries of `list` on a worker in `members`. Both rise by
+        /// worker id: one walk over each joins them.
+        fn kept<'a>(
+            list: &'a [(WorkerId, Instant)],
+            members: &'a [WorkerId],
+        ) -> impl Iterator<Item = (WorkerId, Instant)> + 'a {
+            let mut at = 0;
+            list.iter().copied().filter(move |&(id, _)| {
+                at = seek(members, at, id, |&member| member);
+                members.get(at) == Some(&id)
+            })
+        }
+        let whole = |list: &Arc<[(WorkerId, Instant)]>| kept(list, members).count() == list.len();
         if self.by_gateway.values().all(whole) {
             return None;
         }
@@ -264,14 +395,24 @@ impl Vetoes {
                 by_gateway.insert(*gateway, Arc::clone(list));
                 continue;
             }
-            let kept: Vec<(WorkerId, Instant)> =
-                list.iter().copied().filter(|&(id, _)| member(id)).collect();
+            let kept: Vec<(WorkerId, Instant)> = kept(list, members).collect();
             if !kept.is_empty() {
                 by_gateway.insert(*gateway, kept.into());
             }
         }
         Some(Self { by_gateway })
     }
+}
+
+/// Why a generation was not applied: its number is not above the standing
+/// one. The store's number only rises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("generation {offered} is not above the standing generation {standing}")]
+pub struct StaleGeneration {
+    /// The number of the generation the store holds.
+    pub standing: u64,
+    /// The number of the generation that was offered.
+    pub offered: u64,
 }
 
 /// Everything a decision reads, as one publication left it. A decision
@@ -287,9 +428,12 @@ pub struct World {
     /// Each pool's rows as this publication left them, sorted by worker id,
     /// at the pool's index.
     rows: Box<[Arc<[Candidate]>]>,
-    /// The standing vetoes by pool, each list by row: empty while no veto
-    /// stands in the store.
-    vetoes: Arc<[Box<[PoolVeto]>]>,
+    /// The standing vetoes by pool, each pool's by gateway: empty while no
+    /// veto stands in the store.
+    vetoes: Arc<[PoolVetoes]>,
+    /// The generation this publication was made under: its engine and its
+    /// number, read with the rows in one load.
+    spec: Arc<AppliedSpec>,
 }
 
 impl std::fmt::Debug for World {
@@ -308,6 +452,20 @@ impl World {
     /// between two membership writes is a new world of the same epoch.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The generation this world was published under: the engine a decision
+    /// over these rows runs, and its number. The store starts under the
+    /// unbound generation ([`AppliedSpec::unbound`]), and a reader that saw
+    /// a generation never sees a lower one: the store's one entry
+    /// ([`MemoryStore::apply`](crate::store::MemoryStore::apply)) admits a
+    /// number above the standing one alone.
+    ///
+    /// A door that decides is to hand the engine under the borrow its rows
+    /// are built from, never an owned world, whose shared count a deciding
+    /// thread would write. No door of this store decides yet.
+    pub fn spec(&self) -> &AppliedSpec {
+        &self.spec
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -380,13 +538,19 @@ impl World {
                 load.report_age_ms = age_ms(now_micros, sampled_at);
             }
         }
-        if let Some(vetoes) = self.vetoes.get(index) {
+        // The asking gateway's run among the gateways that hold a veto in
+        // this pool: no other gateway's veto is read.
+        let own = self
+            .vetoes
+            .get(index)
+            .and_then(|runs| run_of(runs, ask.gateway));
+        if let Some(run) = own {
             // A pool every gateway dials whole is copied whole: a veto's
             // row is its position. Another gateway's host-local rows are
             // left out, so there the row is found by its id.
             let whole = shape.locals.is_empty();
-            for veto in vetoes {
-                if veto.gateway != ask.gateway || veto.until <= ask.now {
+            for veto in run.vetoes.iter() {
+                if veto.until <= ask.now {
                     continue;
                 }
                 let row = if whole {
@@ -416,6 +580,7 @@ impl World {
             pool_size: out.candidates.len() as u32,
             membership_epoch: self.epoch,
             now_micros,
+            generation: self.spec.generation(),
         })
     }
 }
@@ -536,10 +701,14 @@ pub(super) struct Writer {
     /// models has a row in each model's pool.
     places: Vec<Place>,
     vetoes: Arc<Vetoes>,
-    /// The vetoes as the world carries them: derived from the gateways'
-    /// lists and the members' places at a veto's write, at a membership
-    /// write and at a window's publication that drops a veto past its end.
-    pool_vetoes: Arc<[Box<[PoolVeto]>]>,
+    /// The vetoes as the world carries them, by pool and by gateway. A
+    /// veto's write builds its own gateway's runs again; a membership write
+    /// and a window's publication that drops a veto past its end build
+    /// every run again.
+    pool_vetoes: Arc<[PoolVetoes]>,
+    /// The generation every world is published under until the next is
+    /// applied: the unbound one at the start.
+    spec: Arc<AppliedSpec>,
     /// The last publication the window counts from: a window's end, or a
     /// load write that published by itself.
     last_window: Option<Instant>,
@@ -561,6 +730,7 @@ impl Writer {
             places: Vec::new(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
+            spec: Arc::new(AppliedSpec::unbound()),
             last_window: None,
             waiting: false,
         }
@@ -575,7 +745,25 @@ impl Writer {
             derived: Arc::clone(&self.derived),
             rows: self.published.clone().into_boxed_slice(),
             vetoes: Arc::clone(&self.pool_vetoes),
+            spec: Arc::clone(&self.spec),
         })
+    }
+
+    /// Publish every world from here on under `spec`, the first at once:
+    /// the standing membership, its rows as they are, under the new
+    /// generation. A number at or under the standing one is refused by
+    /// naming the standing one, and nothing is published: the number only
+    /// rises, so no reader sees a generation and then a lower one.
+    pub(super) fn apply(&mut self, spec: Arc<AppliedSpec>) -> Result<Arc<World>, StaleGeneration> {
+        let standing = self.spec.generation();
+        if spec.generation() <= standing {
+            return Err(StaleGeneration {
+                standing,
+                offered: spec.generation(),
+            });
+        }
+        self.spec = spec;
+        Ok(self.publish())
     }
 
     /// Derive the pools of the membership `members` at the store's `epoch`,
@@ -684,32 +872,85 @@ impl Writer {
         self.publish()
     }
 
-    /// The standing vetoes by pool and row, from the gateways' lists and
-    /// the members' places: no list at all while no veto stands.
+    /// Every pool's runs built again from the gateways' lists and the
+    /// members' places: for a membership write, which moves the rows, and
+    /// for a window's publication that dropped a veto past its end. A
+    /// veto's own write builds its gateway's runs alone
+    /// ([`Self::write_veto`]). No list at all while no veto stands.
     fn derive_vetoes(&mut self) {
         if self.vetoes.by_gateway.is_empty() {
             self.pool_vetoes = Arc::default();
             return;
         }
-        let mut pools: Vec<Vec<PoolVeto>> = vec![Vec::new(); self.working.len()];
-        for (&gateway, list) in &self.vetoes.by_gateway {
+        // The gateways are taken in order, and a gateway's list is sorted
+        // by worker id as a pool's rows are: each pool's runs come out
+        // sorted by gateway and each run by row, with no sort of entries.
+        let mut gateways: Vec<_> = self.vetoes.by_gateway.iter().collect();
+        gateways.sort_unstable_by_key(|&(&gateway, _)| gateway);
+        let mut pools: Vec<Vec<(GatewayId, Vec<PoolVeto>)>> = vec![Vec::new(); self.working.len()];
+        for (&gateway, list) in gateways {
+            // The list and the places both rise by worker id: one walk
+            // over each joins them.
+            let mut at = 0;
             for &(id, until) in list.iter() {
-                for place in places_of(&self.places, id) {
-                    if let Some(pool) = pools.get_mut(place.pool as usize) {
-                        pool.push(PoolVeto {
-                            row: place.row,
-                            id,
-                            gateway,
-                            until,
-                        });
+                at = seek(&self.places, at, id, |place| place.id);
+                while let Some(place) = self.places.get(at).filter(|place| place.id == id) {
+                    at += 1;
+                    let Some(pool) = pools.get_mut(place.pool as usize) else {
+                        continue;
+                    };
+                    let veto = PoolVeto {
+                        row: place.row,
+                        id,
+                        until,
+                    };
+                    match pool.last_mut() {
+                        Some((owner, run)) if *owner == gateway => run.push(veto),
+                        // A run grows as its vetoes come: the gateway's
+                        // list spans every pool, and a run holds one
+                        // pool's share of it.
+                        _ => pool.push((gateway, vec![veto])),
                     }
                 }
             }
         }
-        for pool in &mut pools {
-            pool.sort_unstable_by_key(|veto| (veto.row, veto.gateway));
+        self.pool_vetoes = pools
+            .into_iter()
+            .map(|runs| {
+                runs.into_iter()
+                    .map(|(gateway, vetoes)| GatewayRun {
+                        gateway,
+                        vetoes: vetoes.into(),
+                    })
+                    .collect()
+            })
+            .collect();
+    }
+
+    /// One veto's write as the pools carry it: in each pool the worker has
+    /// a row in, the writing gateway's run takes the veto, moves its end
+    /// or loses it. No other gateway's run and no other pool's is built
+    /// again: a publication shares them with the one before.
+    fn write_veto(&mut self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
+        if self.vetoes.by_gateway.is_empty() {
+            // The last veto left: no list at all, as before the first.
+            self.pool_vetoes = Arc::default();
+            return;
         }
-        self.pool_vetoes = pools.into_iter().map(Vec::into_boxed_slice).collect();
+        // A worker's places stand by pool: one walk over the pools meets
+        // each. Before the first veto there is no list, so every pool
+        // starts from none.
+        let none = PoolVetoes::default();
+        let mut places = places_of(&self.places, id).peekable();
+        self.pool_vetoes = (0..self.working.len())
+            .map(|pool| {
+                let runs = self.pool_vetoes.get(pool).unwrap_or(&none);
+                match places.next_if(|place| place.pool as usize == pool) {
+                    Some(place) => with_veto(runs, gateway, place.row, id, until),
+                    None => Arc::clone(runs),
+                }
+            })
+            .collect();
     }
 
     /// Fold one rank's load record, or its absence, into the member's rows;
@@ -813,7 +1054,7 @@ impl Writer {
     ) -> Option<Arc<World>> {
         let vetoes = self.vetoes.with(gateway, id, until)?;
         self.vetoes = Arc::new(vetoes);
-        self.derive_vetoes();
+        self.write_veto(gateway, id, until);
         Some(self.publish())
     }
 
@@ -867,6 +1108,21 @@ impl Writer {
             self.derive_vetoes();
         }
         self.publish()
+    }
+}
+
+/// The first index at or after `from` whose worker id is not under `id`,
+/// in a list sorted by worker id: a few steps on foot, then a search of
+/// what is left. A walk over ids in rising order pays for the distance it
+/// moves: two sorted lists are joined in one pass, and a short list still
+/// skips a long one by search.
+fn seek<T>(sorted: &[T], from: usize, id: WorkerId, id_of: impl Fn(&T) -> WorkerId) -> usize {
+    const ON_FOOT: usize = 8;
+    let rest = sorted.get(from..).unwrap_or_default();
+    let (near, far) = rest.split_at(rest.len().min(ON_FOOT));
+    match near.iter().position(|entry| id_of(entry) >= id) {
+        Some(step) => from + step,
+        None => from + near.len() + far.partition_point(|entry| id_of(entry) < id),
     }
 }
 
