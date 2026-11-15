@@ -706,12 +706,12 @@ impl<'a> WireUrl<'a> {
     }
 }
 
-/// Lower-cased URL scheme; `data` for data URLs, empty for bare paths. Leading
-/// whitespace is not the scheme's: the URL standard, the router-side fetch and
-/// the worker's own reader all read past it.
+/// Lower-cased URL scheme; `data` for data URLs, empty for bare paths and for
+/// a url that begins with whitespace: the reference is forwarded as written and
+/// the byte caps read the scheme at offset zero, so nothing reads past it here
+/// (the door refuses such a url as an invalid URL).
 fn url_scheme(url: &str) -> String {
-    url.trim_start()
-        .split_once(':')
+    url.split_once(':')
         .map(|(scheme, _)| scheme)
         .filter(|scheme| {
             !scheme.is_empty()
@@ -808,8 +808,10 @@ fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
 
 /// The references a forwarded plan carries, read once at the door before any
 /// worker is selected, by the rules the router-side pipeline's fetch applies
-/// to the same media: an empty url, a data URL whose header names no base64
-/// payload and an empty payload are refused here in the connector's own
+/// to the same media: a url that is empty or begins with whitespace (the
+/// reference is forwarded as written and the byte caps read the scheme at
+/// offset zero), a data URL whose header names no base64 payload and an empty
+/// payload are refused here in the connector's own
 /// words, instead of being forwarded to a worker no engine of which serves
 /// them. The symbols and the length of a base64 payload stay the engine's
 /// verdict: nothing here reads the payload.
@@ -823,18 +825,20 @@ fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
             MediaContentPart::ImageUrl { url, .. }
             | MediaContentPart::VideoUrl { url, .. }
             | MediaContentPart::AudioUrl { url, .. } => {
-                let written = url.trim_start();
-                if written.is_empty() {
+                // The reference is forwarded as written and every byte cap reads
+                // the scheme at offset zero: nothing is trimmed here either, so a
+                // url that is empty or begins with whitespace is an invalid URL.
+                if url.is_empty() || url.starts_with(char::is_whitespace) {
                     return Err(refused(
                         index,
                         MediaConnectorError::InvalidUrl(url.to_string()),
                     ));
                 }
-                let is_data_url = written
+                let is_data_url = url
                     .get(..5)
                     .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"));
                 if is_data_url {
-                    data_url_payload(written).map_err(|cause| refused(index, cause))?;
+                    data_url_payload(url).map_err(|cause| refused(index, cause))?;
                 }
             }
             MediaContentPart::ImageBase64 { data, .. }
@@ -1049,6 +1053,10 @@ mod tests {
             (image_url(""), "invalid media URL: "),
             (image_url("   "), "invalid media URL:    "),
             (
+                image_url(" data:image/png;base64,AQ=="),
+                "invalid media URL:  data:image/png;base64,AQ==",
+            ),
+            (
                 image_url("data:image/png,%89PNG%0D%0A"),
                 "data URL parse error: only base64 encoded data URLs are supported",
             ),
@@ -1071,7 +1079,6 @@ mod tests {
         }
         for part in [
             image_url("data:image/png;base64,AQ=="),
-            image_url(" data:image/png;base64,AQ=="),
             image_url("https://a/1.png"),
             base64_image("AQ=="),
         ] {

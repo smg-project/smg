@@ -1,6 +1,9 @@
 //! The size of an inline `data:` URL's payload, read before anything decodes
 //! it: the router's plan check, the worker's item cap and the serving
 //! engine's own check bound inline media by this one rule.
+//! The module also holds the payload readers (`data_url_payload`,
+//! `base64_payload`): the header rule and the empty-payload rule the
+//! router-side fetch and the reference placement's door share.
 
 use crate::error::MediaConnectorError;
 
