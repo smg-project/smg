@@ -62,9 +62,9 @@ pub(crate) struct HostState {
 /// What the ticks keep of the guest call in flight on a store. A plugin's
 /// bound is measured on the clock the plugin can spend: a guest of these
 /// worlds cannot wait by itself (it has no WASI; of its four imports the
-/// counter, the clock and the draw return at once, and a log line returns
-/// when the host's log subscriber does, a wait the host serves), so the
-/// time its call is off the CPU is the host's, and its bound is the CPU its
+/// counter and the draw return at once, and the clock and a log line
+/// return when the host's code does, a wait the host serves), so the time
+/// its call is off the CPU is the host's, and its bound is the CPU its
 /// thread had since a reading of the thread's clock.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Watch {
@@ -75,8 +75,8 @@ pub(crate) struct Watch {
     /// deadline on the wall clock.
     pub(crate) watched: bool,
     /// The thread's CPU clock at the call's start, in microseconds: read
-    /// only on a thread that is armed, and the one reading that says what a
-    /// late call's thread had.
+    /// only on a thread that is armed, and the one reading that says what
+    /// the call's thread had.
     pub(crate) start: Option<u64>,
     /// The thread's CPU clock at the first tick that found the call in
     /// flight, where there is no reading of its start: the bound counts

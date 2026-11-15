@@ -30,11 +30,13 @@
 //! of fuel to microseconds, and under a bound on the clock of what the
 //! decision has left (at most the frame). Fuel prices every operator, a bulk
 //! memory operation by its size once it has run; the clock catches what the
-//! calibration underprices and the time a host call takes. A plugin's bound
+//! calibration underprices and the CPU a host call spends. A plugin's bound
 //! is measured on the clock the plugin can spend. A guest of these worlds
-//! cannot wait by itself (it has no WASI; of its four imports the counter,
-//! the clock and the draw return at once, and a log line returns when the
-//! host's log subscriber does, a wait the host serves), so the time its
+//! cannot wait by itself (it has no WASI; of its four imports the counter
+//! and the draw return at once, and the clock and a log line return when
+//! the host's code does: the clock is a number stored for a decision and
+//! the host's own clock outside one, a log line runs the host's log
+//! subscriber, and a wait there is one the host serves), so the time its
 //! call is off the CPU is the host's, and the bound counts the time its
 //! thread had the CPU since a reading of the thread's clock: a call ends
 //! at the tick that finds it has had its bound, and runs on otherwise,
@@ -49,10 +51,12 @@
 //! time it took, and counted by name (`unread`: the host held it, or it
 //! overran what its fuel did not price). It arms its thread: while its
 //! decision's sample is in the plugin's latency ring there (128 decisions)
-//! every call reads the clock at its start, meets no tick before the one its
-//! deadline on the wall clock falls on (a reading ends no call the wall
-//! clock would let run), and a late one is judged on its readings. Short of
-//! its bound on the CPU, a call that answered or declined is the host's
+//! every call reads the clock at its start, and at its end unless it is not
+//! late and its fuel covers the time it took (no reading moves that time).
+//! It meets no tick before the one its deadline on the wall clock falls on
+//! (a reading ends no call the wall clock would let run), and its time is
+//! its fuel or the CPU its thread had, late or not. Late and short of its
+//! bound on the CPU, a call that answered or declined is the host's
 //! (`stalls`: a starved or throttled thread, never a failure of the call):
 //! the hold itself drops no instance and moves no breaker, and the call's
 //! own time is its fuel or that CPU, never the hold. A hold excuses
@@ -75,9 +79,27 @@
 //! draws the decision's remainder by the larger of its fuel at the
 //! calibration and its elapsed time, so a call the calibration underprices
 //! and a held call draw it down too, and a later stage that falls back on a
-//! remainder a held call spent is nobody's failure. A frame budget gone on
-//! arrival is never forwarded: the stages fall back and the breaker counts a
-//! budget hit, the instance standing.
+//! remainder a held call spent is nobody's failure. Nor is a later call
+//! that runs out under one: time nothing read draws the decision's
+//! remainder, never the plugin's own spend. With no reading a call's time is
+//! an interval, from its fuel to its charge. The latency rule wants more
+//! than one slow sample and takes the high end. A run-out is one event and a
+//! verdict, so it convicts on the low end: it is the plugin's when the fuel
+//! of its unread calls and the grant reach the budget, the decision's budget
+//! spent otherwise (`budget_spent`, the breaker untouched). Where the time
+//! those calls took would have made it the plugin's, nothing says whether a
+//! hold or their own time past their fuel is the difference: the run-out is
+//! counted with the unread calls and arms the thread. There a reading gives
+//! every call one time, so a hold short of late leaves the sample too, and
+//! the next run-out has one answer. That answer is the plugin's only when
+//! every earlier call read whole: a reading is exact, and a thread's clock
+//! can run short of its call (a kernel that bills a thread no interrupt
+//! time), so behind a call of a millisecond a run-out stays the budget's.
+//! A guest slow for that long in what its fuel does not price is held by
+//! the latency rule: its decisions sample at their whole budget, and the
+//! ring's first read opens the breaker. A frame budget gone on arrival is
+//! never forwarded: the stages fall back and the breaker counts a budget
+//! hit, the instance standing.
 //!
 //! What a failure does: a `decline` falls back to the stage's configured
 //! fallback and keeps the instance; a trap, an exhausted budget or an answer
