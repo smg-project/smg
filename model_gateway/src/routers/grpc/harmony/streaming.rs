@@ -12,6 +12,7 @@ use openai_protocol::{
         ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
     },
     common::{ChatLogProbs, FunctionCallDelta, ToolCall, ToolCallDelta},
+    event_types::{FunctionCallEvent, McpEvent},
     responses::{
         InputTokensDetails, OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse,
         ResponsesUsage,
@@ -1049,11 +1050,13 @@ impl ResponsesDecode {
         else {
             return;
         };
-        let event = match response_format {
-            Some(_) => emitter.emit_mcp_call_arguments_delta(*output_index, item_id, args),
-            None => emitter.emit_function_call_arguments_delta(*output_index, item_id, args),
+        let kind = match response_format {
+            Some(_) => McpEvent::CALL_ARGUMENTS_DELTA,
+            None => FunctionCallEvent::ARGUMENTS_DELTA,
         };
-        emitter.send_event_best_effort(&event, tx).await;
+        emitter
+            .send_arguments_delta_best_effort(kind, args, *output_index, item_id, tx)
+            .await;
     }
 
     /// A new call: its item allocated for the tool's format (an MCP tool's, where the session
@@ -1121,11 +1124,13 @@ impl ResponsesDecode {
         // `*.searching` / `*.generating` events emitted above instead of streaming their
         // arguments.
         if streams_arguments(response_format.as_ref()) {
-            let event = match &response_format {
-                Some(_) => emitter.emit_mcp_call_arguments_delta(output_index, &item_id, ""),
-                None => emitter.emit_function_call_arguments_delta(output_index, &item_id, ""),
+            let kind = match &response_format {
+                Some(_) => McpEvent::CALL_ARGUMENTS_DELTA,
+                None => FunctionCallEvent::ARGUMENTS_DELTA,
             };
-            emitter.send_event_best_effort(&event, tx).await;
+            emitter
+                .send_arguments_delta_best_effort(kind, "", output_index, &item_id, tx)
+                .await;
         }
     }
 
