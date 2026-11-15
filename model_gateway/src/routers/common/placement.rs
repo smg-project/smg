@@ -28,8 +28,9 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        as_consistent_hashing, policy_filters_unavailable_workers, CacheNamespace,
-        LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        as_consistent_hashing, policy_filters_unavailable_workers, policy_reads_hash_ring,
+        CacheNamespace, LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo,
+        WorkerRole,
     },
     routers::{
         common::{
@@ -436,8 +437,12 @@ fn select_among(
         routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
-        // Cached hash ring for consistent hashing (O(log n) lookup).
-        hash_ring: registry.get_hash_ring(model_id),
+        // The cached hash ring (O(log n) lookup), for a policy that reads
+        // it: no other placement pays the registry's keyed read and the
+        // ring's shared count.
+        hash_ring: policy_reads_hash_ring(policy.as_ref())
+            .then(|| registry.get_hash_ring(model_id))
+            .flatten(),
         role: WorkerRole::Single,
         overload_lifted: false,
         named: None,
@@ -1450,8 +1455,8 @@ mod tests {
         },
         observability::logging::test_support::test_subscriber,
         policies::{
-            CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
-            PowerOfTwoPolicy, RoundRobinPolicy,
+            hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
+            LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
         worker::{
             load::state::{one_rank_load, TestFeed},
@@ -3041,6 +3046,72 @@ mod tests {
             owner.url(),
             "with every worker tried the pool is used whole again"
         );
+    }
+
+    /// A policy that places by the model's hash ring is handed it. Under
+    /// each of the two a keyed request lands where the policy itself puts it
+    /// with the registry's ring in hand, and some key lands elsewhere
+    /// without the ring (consistent hashing then counts the key over the
+    /// list, prefix hash takes the least loaded worker): a placement that
+    /// withheld the ring would move that key.
+    #[test]
+    fn a_policy_that_reads_the_hash_ring_is_handed_it() {
+        let urls: Vec<String> = (1..=8).map(|n| format!("http://h:{n}")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = http_registry(&urls);
+        let ring = registry.get_hash_ring(MODEL).expect("the model's ring");
+        let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
+        let pool = pool.as_slice();
+        let prefix_hash = PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: Vec::new(),
+        };
+        for config in [PolicyConfig::ConsistentHashing, prefix_hash] {
+            let policies = PolicyRegistry::new(config);
+            let policy = policies.get_policy_or_default(MODEL);
+            let mut moved_without_the_ring = 0;
+            for session in 0..32 {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-smg-routing-key",
+                    format!("session-{session}").parse().unwrap(),
+                );
+                let own_pick = |hash_ring: Option<Arc<HashRing>>| {
+                    let info = SelectWorkerInfo {
+                        headers: Some(&headers),
+                        routing_key: policies.sticky_header_key(Some(&headers)),
+                        hash_ring,
+                        ..Default::default()
+                    };
+                    policy
+                        .select_worker(pool, &info)
+                        .map(|idx| pool[idx].url().to_string())
+                };
+                let with_the_ring = own_pick(Some(Arc::clone(&ring)));
+                let placed = pick(
+                    &registry,
+                    &policies,
+                    PlacementInputs {
+                        headers: Some(&headers),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    Some(placed.url().to_string()),
+                    with_the_ring,
+                    "{} places session {session} by the ring",
+                    policy.name()
+                );
+                moved_without_the_ring += usize::from(own_pick(None) != with_the_ring);
+            }
+            assert!(
+                moved_without_the_ring > 0,
+                "{}: no key of the 32 tells a withheld ring",
+                policy.name()
+            );
+        }
     }
 
     /// Cache-aware routing pins a prompt to the worker holding its prefix;

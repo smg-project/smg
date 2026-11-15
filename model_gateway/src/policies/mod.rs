@@ -207,6 +207,17 @@ pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolic
         || policy.is::<PassthroughPolicy>()
 }
 
+/// Whether a built-in policy reads the model's hash ring
+/// ([`SelectWorkerInfo::hash_ring`]). Single-worker placement fetches the
+/// ring for these alone: the fetch is a keyed read of the registry and a
+/// shared count, up and down, on every request. A policy that starts to read
+/// the ring joins this list; left out, it is handed none and places by its
+/// ring-less fallback.
+pub(crate) fn policy_reads_hash_ring(policy: &dyn LoadBalancingPolicy) -> bool {
+    let policy = policy.as_any();
+    policy.is::<ConsistentHashingPolicy>() || policy.is::<PrefixHashPolicy>()
+}
+
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
     fn select_dp_rank(&self, worker: &dyn Worker, estimated_cost: isize) -> Option<isize>;
 }
@@ -463,7 +474,9 @@ pub struct SelectWorkerInfo<'a> {
     /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
-    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
+    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds.
+    /// Single-worker placement hands it to a policy that reads it
+    /// (`policy_reads_hash_ring`) and `None` to any other.
     pub hash_ring: Option<Arc<HashRing>>,
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
