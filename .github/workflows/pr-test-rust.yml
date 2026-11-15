@@ -1810,7 +1810,8 @@ jobs:
       matrix:
         include:
           - engine: vllm
-            timeout: 46
+            # Allow 45m cold setup + unchanged 40m tests + 10m overhead/cleanup.
+            timeout: 95
             min_selected: 202 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           # The TokenSpeed ZMQ lane restarts the engine per model group, and
           # DP doubles model load + warmup. The ~22-minute TokenSpeed source
@@ -1974,7 +1975,8 @@ jobs:
             timeout: 20
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
-            timeout: 20
+            # Allow 45m cold setup + unchanged 25m tests + 10m overhead/cleanup.
+            timeout: 80
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
