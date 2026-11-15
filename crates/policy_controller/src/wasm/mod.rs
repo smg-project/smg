@@ -62,17 +62,24 @@
 //! own time is its fuel or that CPU, never the hold. A hold excuses
 //! lateness, never a fault: a held call that failed by itself is that
 //! failure alone, and an answer the stage then refuses is counted under its
-//! own name beside its stall. At its bound a call is the plugin's. So a ring
-//! never holds two unread calls, and the latency rule, which wants two slow
-//! samples, never opens on unread calls alone; `unread` counts the first
-//! hold of each window and `stalls` the holds read inside one, and on a busy
-//! thread, where a window is short, the two are read together. This is the
-//! rule of this plugin form alone: a plugin that can wait (a remote one; a
-//! world that gained an import that blocks) is bounded on the wall clock, and
-//! so are every call on a host with no thread clock and an `init`: a cold
-//! slot's is charged the time it took with no reading, so a held one is a
-//! slow sample, and with an unread call in the same ring that is two. The
-//! thread's clock is the kernel's account of the thread: where a virtual
+//! own name beside its stall. At its bound a call is the plugin's. A hold
+//! short of late is no late call, and on a thread nothing armed its
+//! decision's sample takes the time the call took. So a sample that is slow
+//! by time nothing read alone (past half the budget, or past the budget,
+//! where the fuel of its unread calls leaves it short of that mark) arms
+//! the thread too, counted with the unread calls. So a ring never holds two
+//! slow samples no reading covered, and the latency rule, which wants two
+//! slow samples, never opens on time nothing read alone; `unread` counts
+//! the first event of each window no reading covered, the host's hold or
+//! the guest's own unpriced time, and `stalls` the late holds read inside
+//! one, and on a busy thread, where a window is short, the two are read
+//! together. This is the rule of this plugin form alone: a plugin that can
+//! wait (a remote one; a world that gained an import that blocks) is bounded
+//! on the wall clock, and so are every call on a host with no thread clock
+//! and an `init`. A cold slot's `init` is timed like a call all the same:
+//! its low end is its fuel, and an armed thread reads its clock around it,
+//! so a held one is no slow sample there. The thread's clock is the
+//! kernel's account of the thread: where a virtual
 //! machine's host takes the processor and the kernel counts no stolen time,
 //! that time reads as the thread's own, and a call so held is the plugin's,
 //! as before. The decision's own deadline stays on the wall clock: a call
@@ -82,11 +89,13 @@
 //! remainder a held call spent is nobody's failure. Nor is a later call
 //! that runs out under one: time nothing read draws the decision's
 //! remainder, never the plugin's own spend. With no reading a call's time is
-//! an interval, from its fuel to its charge. The latency rule wants more
-//! than one slow sample and takes the high end. A run-out is one event and a
-//! verdict, so it convicts on the low end: it is the plugin's when the fuel
-//! of its unread calls and the grant reach the budget, the decision's budget
-//! spent otherwise (`budget_spent`, the breaker untouched). Where the time
+//! an interval, from its fuel to its charge (on a host with no thread clock
+//! no reading can come, and it is the charge at both ends). The latency
+//! rule wants more than one slow sample and takes the high end. A run-out
+//! is one event and a verdict, so it convicts on the low end: it is the
+//! plugin's when the fuel of its unread calls and the grant reach the
+//! budget, the decision's budget spent otherwise (`budget_spent`, the
+//! breaker untouched). Where the time
 //! those calls took would have made it the plugin's, nothing says whether a
 //! hold or their own time past their fuel is the difference: the run-out is
 //! counted with the unread calls and arms the thread. There a reading gives
