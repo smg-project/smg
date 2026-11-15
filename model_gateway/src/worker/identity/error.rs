@@ -1,13 +1,17 @@
 //! The worker errors: what a worker operation reports when it fails, the
-//! worker's address masked where the message names it.
+//! worker's address redacted where the message names it (its credentials
+//! masked, a query or fragment dropped, an unparsable one replaced by a
+//! marker; a plain address passes through).
 
 use super::endpoint::Endpoint;
 
 /// Worker-related errors. An arm that names a worker writes its address
-/// masked ([`Endpoint::redacted_url`]): the message follows a masked field
-/// into log lines, step failures and response bodies, and must not repeat
-/// the address raw. The `url` field keeps the registered address for the
-/// code that matches on it.
+/// redacted ([`Endpoint::redacted_url`]: the credentials masked, a query
+/// or fragment dropped, a plain address byte for byte, an unparsable one
+/// replaced by a marker): the message follows a redacted field into log
+/// lines, step failures and response bodies, and must not repeat the
+/// address raw. The `url` field keeps the registered address for the code
+/// that matches on it.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     #[error("Health check failed for worker {}: {reason}", shown(.url))]
@@ -34,8 +38,9 @@ pub enum WorkerError {
 }
 
 /// The address as an error message writes it: masked when it carries
-/// userinfo, cut at a query; an error without one (a network error whose
-/// request had no URL) writes nothing where the address goes.
+/// userinfo, cut at a query or fragment, a marker when the parser refuses
+/// it; an error without one (a network error whose request had no URL)
+/// writes nothing where the address goes.
 fn shown(url: &str) -> String {
     if url.is_empty() {
         String::new()
