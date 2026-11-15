@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::{ser::SerializeMap, Deserialize, Serialize};
+use serde::{de::value::MapDeserializer, ser::SerializeMap, Deserialize, Serialize};
 use serde_json::Value;
 use validator::{Validate, ValidationError};
 
@@ -2244,8 +2244,9 @@ pub enum ResponseInputOutputItem {
 /// its tagged variant and lands in the same fallback. Both are read field
 /// by field instead, so the refusal names the field (`content[1].detail:
 /// unknown variant ...`); every other item takes the derived reader, its
-/// refusal traced to the part it is about when the item carries parts
-/// (see [`typed_item_refusal`]).
+/// refusal traced to the part it is about when the item carries parts, or
+/// to the item's own field by the reader of the tagged shapes alone (see
+/// [`typed_item_refusal`]).
 struct InputItem(ResponseInputOutputItem);
 
 impl<'de> Deserialize<'de> for InputItem {
@@ -2255,9 +2256,13 @@ impl<'de> Deserialize<'de> for InputItem {
         let kind = fields.get("type").and_then(Value::as_str);
         // A message without a `type` carries a role and a content, or one
         // of them and no `id`: an `{id, content}` or `{id, role}` stays the
-        // item reference the derived reader reads it as.
+        // item reference the derived reader reads it as. A `message` with an
+        // `id` and a string `content` is the untagged shape too (the derived
+        // reader drops the `id`), read field by field so its refusal names
+        // the field and not the `content` the shape takes.
         let by_field = if has("type") {
-            kind == Some("message") && !has("id")
+            kind == Some("message")
+                && (!has("id") || fields.get("content").is_some_and(Value::is_string))
         } else {
             (has("role") && has("content")) || (!has("id") && (has("role") || has("content")))
         };
@@ -2350,37 +2355,273 @@ fn content_parts(field: &str, parts: &[Value]) -> Result<Vec<ResponseContentPart
         .collect()
 }
 
-/// A typed item's refusal from the derived reader: when the item carries
-/// content parts (a `message`'s `content`, a `function_call_output`'s
-/// `output`) and serde refuses one on its own, that part's refusal, named;
-/// serde's own words otherwise. A refusal at a typed item's own field (a
-/// `function_call` without its `call_id`) keeps the derived reader's words:
-/// its fallback to the untagged shapes drops the tagged reading's reason,
-/// and naming it takes a reader of the tagged variants on their own.
-fn typed_item_refusal(item: &Value, error: serde_json::Error) -> String {
-    let field = match item.get("type").and_then(Value::as_str) {
-        Some("message") => "content",
-        Some("function_call_output") => "output",
-        _ => return error.to_string(),
+/// A typed item's refusal from the derived reader, named. When the item
+/// carries content parts (a `message`'s `content`, a `function_call_output`'s
+/// `output`) and serde refuses one on its own, that part's refusal. An
+/// `item_reference`, the untagged shape with a `type` of its own, is refused
+/// for its `id` alone, named by the field reader. Otherwise the words of the
+/// tagged shapes alone (see [`TaggedItem`]): the derived reader's fallback to
+/// the untagged shapes drops them, so a `function_call` without its `call_id`
+/// was "data did not match any variant of untagged enum
+/// ResponseInputOutputItem" to it; they stand at the field they are about
+/// (see [`refused_field`]). The derived reader's own words for an item
+/// without a `type`, and for one the tagged shapes read.
+fn typed_item_refusal(item: &Value, derived: serde_json::Error) -> String {
+    let kind = item.get("type").and_then(Value::as_str);
+    let parts = match kind {
+        Some("message") => Some("content"),
+        Some("function_call_output") => Some("output"),
+        _ => None,
     };
-    match item
-        .get(field)
-        .and_then(Value::as_array)
-        .map(|parts| content_parts(field, parts))
-    {
-        Some(Err(refusal)) => refusal,
-        _ => error.to_string(),
+    let refused_part = parts.and_then(|field| {
+        let parts = item.get(field)?.as_array()?;
+        content_parts(field, parts).err()
+    });
+    if let Some(refusal) = refused_part {
+        return refusal;
+    }
+    let (Some(fields), true) = (item.as_object(), item.get("type").is_some()) else {
+        return derived.to_string();
+    };
+    if kind == Some("item_reference") {
+        let mut fields = fields.clone();
+        return required_field::<String>(&mut fields, "id")
+            .err()
+            .unwrap_or_else(|| derived.to_string());
+    }
+    let Err(error) = TaggedItem::deserialize(item) else {
+        return derived.to_string();
+    };
+    let reason = error.to_string();
+    let field = refused_field(fields, &reason, |entries| {
+        TaggedItem::deserialize(MapDeserializer::<_, serde_json::Error>::new(
+            entries.iter().copied(),
+        ))
+        .err()
+        .map(|error| error.to_string())
+    });
+    match field {
+        Some(field) => format!("{field}: {reason}"),
+        None => reason,
     }
 }
 
-/// A part's refusal, naming the field it is about: `type` when the kind
-/// itself is refused; otherwise the first field whose value alone, with the
-/// kind, reproduces the refusal (serde names the value and the rule, not
-/// the field, inside a tagged part), and inside an array value the element
-/// that does; a missing field by serde's own words at the part (the
-/// extractor appends the field) or at the array element missing it. The
-/// bare refusal when nothing reproduces it. Every probe is one field or
-/// one element beside the kind, so the search costs the part's size.
+/// The tagged shapes of [`ResponseInputOutputItem`] on their own, read on the
+/// error path only (see [`typed_item_refusal`]): the public reader falls
+/// back to its two untagged shapes (a message sent without a tag, an item
+/// reference) and reports their fallthrough text when a tagged variant
+/// refuses an item, so a typed item it refused is read again here, where the
+/// words name the reason (``missing field `call_id` ``). The derive
+/// constructs the public type, so a field added to, removed from or retyped
+/// in a tagged variant of the public enum fails the build until it is
+/// mirrored here; a field's serde attribute (a default, a custom reader) is
+/// repeated by hand, and the test feeding every variant's smallest payload
+/// to both readers tells one that is not. Nothing constructs this enum.
+#[derive(Deserialize)]
+#[serde(
+    remote = "ResponseInputOutputItem",
+    tag = "type",
+    rename_all = "snake_case"
+)]
+enum TaggedItem {
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        role: String,
+        content: Vec<ResponseContentPart>,
+        status: Option<String>,
+        #[serde(default)]
+        phase: Option<MessagePhase>,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<SummaryTextContent>,
+        #[serde(default)]
+        content: Vec<ResponseReasoningContent>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionToolCall {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        namespace: Option<String>,
+        arguments: String,
+        output: Option<String>,
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        output: StringOrContentParts,
+        status: Option<String>,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "mcp_approval_response")]
+    McpApprovalResponse {
+        id: Option<String>,
+        approval_request_id: String,
+        approve: bool,
+        reason: Option<String>,
+    },
+    #[serde(rename = "image_generation_call")]
+    ImageGenerationCall {
+        id: String,
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        background: Option<String>,
+        #[serde(default)]
+        output_format: Option<String>,
+        #[serde(default)]
+        quality: Option<String>,
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
+        revised_prompt: Option<String>,
+        #[serde(default)]
+        size: Option<String>,
+        #[serde(default)]
+        status: Option<ImageGenerationCallStatus>,
+    },
+    #[serde(rename = "compaction")]
+    Compaction {
+        encrypted_content: String,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    #[serde(rename = "computer_call")]
+    ComputerCall {
+        id: String,
+        call_id: String,
+        #[serde(default)]
+        action: Option<ComputerAction>,
+        #[serde(default)]
+        actions: Option<Vec<ComputerAction>>,
+        status: ComputerCallStatus,
+        #[serde(default)]
+        pending_safety_checks: Vec<ComputerSafetyCheck>,
+    },
+    #[serde(rename = "computer_call_output")]
+    ComputerCallOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        output: ComputerCallOutputContent,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
+        #[serde(default)]
+        status: Option<ComputerCallStatus>,
+    },
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        call_id: String,
+        input: String,
+        name: String,
+        id: Option<String>,
+        namespace: Option<String>,
+    },
+    #[serde(rename = "custom_tool_call_output")]
+    CustomToolCallOutput {
+        call_id: String,
+        output: CustomToolCallOutputContent,
+        id: Option<String>,
+    },
+    #[serde(rename = "shell_call")]
+    ShellCall {
+        action: ShellCallAction,
+        call_id: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        environment: Option<ShellCallEnvironment>,
+        #[serde(default)]
+        status: Option<ShellCallStatus>,
+        #[serde(default)]
+        created_by: Option<String>,
+    },
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput {
+        call_id: String,
+        output: Vec<ShellOutputChunk>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        max_output_length: Option<u64>,
+        #[serde(default)]
+        status: Option<ShellCallStatus>,
+        #[serde(default)]
+        created_by: Option<String>,
+    },
+    #[serde(rename = "apply_patch_call")]
+    ApplyPatchCall {
+        call_id: String,
+        operation: ApplyPatchOperation,
+        status: ApplyPatchCallStatus,
+        id: Option<String>,
+    },
+    #[serde(rename = "apply_patch_call_output")]
+    ApplyPatchCallOutput {
+        call_id: String,
+        status: ApplyPatchCallOutputStatus,
+        id: Option<String>,
+        output: Option<String>,
+    },
+    #[serde(rename = "local_shell_call")]
+    LocalShellCall {
+        id: String,
+        call_id: String,
+        action: LocalShellExec,
+        status: LocalShellCallStatus,
+    },
+    #[serde(rename = "local_shell_call_output")]
+    LocalShellCallOutput {
+        id: String,
+        output: String,
+        #[serde(default)]
+        status: Option<LocalShellCallStatus>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        arguments: String,
+        name: String,
+        server_label: String,
+        #[serde(default)]
+        approval_request_id: Option<String>,
+        #[serde(default, deserialize_with = "mcp_call_error_compat")]
+        error: Option<McpToolCallError>,
+        #[serde(default)]
+        output: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+/// A part's refusal, naming the part (`content[1]`) and, when one is, the
+/// field it is about (see [`refused_field`]).
 fn content_part_refusal(
     field: &str,
     index: usize,
@@ -2388,65 +2629,98 @@ fn content_part_refusal(
     error: &serde_json::Error,
 ) -> String {
     let reason = error.to_string();
-    let at = format!("{field}[{index}]");
-    let Some(fields) = part.as_object() else {
-        return format!("{at}: {reason}");
-    };
-    let kind = fields.get("type");
-    let with_kind = |name: &str, value: Value| {
-        let mut probe = serde_json::Map::new();
-        if let Some(kind) = kind {
-            probe.insert("type".to_string(), kind.clone());
-        }
-        probe.insert(name.to_string(), value);
-        Value::Object(probe)
-    };
-    let refused = |probe: &Value| {
-        matches!(
-            ResponseContentPart::deserialize(probe),
-            Err(error) if error.to_string() == reason
-        )
-    };
-    let missing = reason.starts_with("missing field `");
-    if !missing
-        && kind.is_some_and(|kind| {
-            refused(&Value::Object(serde_json::Map::from_iter([(
-                "type".to_string(),
-                kind.clone(),
-            )])))
+    let located = part.as_object().and_then(|fields| {
+        refused_field(fields, &reason, |entries| {
+            ResponseContentPart::deserialize(MapDeserializer::<_, serde_json::Error>::new(
+                entries.iter().copied(),
+            ))
+            .err()
+            .map(|error| error.to_string())
         })
-    {
-        return format!("{at}.type: {reason}");
+    });
+    match located {
+        Some(name) => format!("{field}[{index}].{name}: {reason}"),
+        None => format!("{field}[{index}]: {reason}"),
     }
-    // Every probe holds the kind and one field, or one element of an array
-    // field, so the search costs the part's size, not its square.
-    for (name, value) in fields.iter().filter(|(name, _)| name.as_str() != "type") {
+}
+
+/// The field of a tagged object (a content part, a typed item) a refusal is
+/// about, `read` giving its reader's words for a probe, a list of entries
+/// (none when it reads them): `type` when the kind itself is refused;
+/// otherwise the first field whose value alone, beside the kind, draws the
+/// same words (serde names the value and the rule, not the field, inside a
+/// tagged object), and inside an array value the element that does
+/// (`annotations[0]`); nothing for a field the object itself misses, which
+/// serde's words name (the extractor appends it). A missed field is told own
+/// from nested by one probe of the whole object with a trailing duplicate of
+/// each of its keys: serde refuses a duplicate known field at the end of its
+/// walk, before it checks the object's own fields, so the same words from
+/// that probe came from inside a value, and other words mean the object's
+/// own field. Every field probe carries the same duplicate, so no probe can
+/// draw the object's own missing field; a key the reader does not know (the
+/// key and its duplicate ignored alike) is told by probing it with an
+/// object: a known field refuses it, or takes it (`logprobs`) and refuses
+/// the duplicate, so only an unknown key draws the kind's words alone.
+/// Every probe is one field or one element beside the kind, so the
+/// search costs the object's size, not its square.
+fn refused_field(
+    fields: &serde_json::Map<String, Value>,
+    reason: &str,
+    read: impl Fn(&[(&str, &Value)]) -> Option<String>,
+) -> Option<String> {
+    fn with<'a>(
+        kind: &[(&'a str, &'a Value)],
+        name: &'a str,
+        value: &'a Value,
+        null: &'a Value,
+    ) -> Vec<(&'a str, &'a Value)> {
+        let mut probe = kind.to_vec();
+        probe.push((name, value));
+        probe.push((name, null));
+        probe
+    }
+    let null = Value::Null;
+    let empty = Value::Object(serde_json::Map::new());
+    let refused = |entries: &[(&str, &Value)]| read(entries).as_deref() == Some(reason);
+    let kind: Vec<(&str, &Value)> = fields
+        .get("type")
+        .map(|kind| ("type", kind))
+        .into_iter()
+        .collect();
+    let others = || fields.iter().filter(|(name, _)| name.as_str() != "type");
+    let missing = reason.starts_with("missing field `");
+    if missing {
+        let mut probe = kind.clone();
+        probe.extend(others().map(|(name, value)| (name.as_str(), value)));
+        probe.extend(others().map(|(name, _)| (name.as_str(), &null)));
+        if !refused(&probe) {
+            return None;
+        }
+    } else if !kind.is_empty() && refused(&kind) {
+        return Some("type".to_string());
+    }
+    let kind_alone = read(&kind);
+    for (name, value) in others() {
+        let name = name.as_str();
+        if missing && read(&with(&kind, name, &empty, &null)) == kind_alone {
+            continue;
+        }
+        if !refused(&with(&kind, name, value, &null)) {
+            continue;
+        }
         let Some(elements) = value.as_array() else {
-            if !missing && refused(&with_kind(name, value.clone())) {
-                return format!("{at}.{name}: {reason}");
-            }
-            continue;
+            return Some(name.to_string());
         };
-        // A missing field is located inside an array only: the part's own
-        // missing field is reproduced by the emptied array too, a nested one
-        // by its element alone (serde meets the element before it checks the
-        // part's own fields).
-        if missing && refused(&with_kind(name, Value::Array(Vec::new()))) {
-            continue;
-        }
-        if !missing && !refused(&with_kind(name, value.clone())) {
-            continue;
-        }
-        let element = elements
-            .iter()
-            .position(|element| refused(&with_kind(name, Value::Array(vec![element.clone()]))));
-        match element {
-            Some(position) => return format!("{at}.{name}[{position}]: {reason}"),
-            None if missing => continue,
-            None => return format!("{at}.{name}: {reason}"),
-        }
+        let element = elements.iter().position(|element| {
+            let one = Value::Array(vec![element.clone()]);
+            refused(&with(&kind, name, &one, &null))
+        });
+        return Some(match element {
+            Some(position) => format!("{name}[{position}]"),
+            None => name.to_string(),
+        });
     }
-    format!("{at}: {reason}")
+    None
 }
 
 /// `fields[name]` as a `T`, the refusal naming the field; serde's words for
@@ -5319,6 +5593,87 @@ mod tests {
                 .expect_err("the typed item is refused");
             assert!(error.to_string().starts_with(words), "{body}: {error}");
         }
+    }
+
+    /// Every tagged variant's smallest payload reads the same through the
+    /// public reader and the tagged-only mirror, and the payloads' kinds are
+    /// the kinds the public schema lists: a serde attribute a mirrored field
+    /// does not repeat (a default, a custom reader), or a variant the mirror
+    /// lacks, shows here, where the compiler cannot see it.
+    #[test]
+    fn the_tagged_mirror_reads_every_variant_as_the_public_reader_does() {
+        // The kinds the public schema lists: every object shape whose `type`
+        // is pinned to one word, under the variants and not under the
+        // definitions (the named types the fields refer to, tagged in their
+        // own right); the two untagged shapes left out, whatever the
+        // generator makes of them.
+        fn pinned_kinds(schema: &Value, kinds: &mut std::collections::BTreeSet<String>) {
+            match schema {
+                Value::Object(fields) => {
+                    let pinned = fields
+                        .get("properties")
+                        .and_then(|properties| properties.get("type"))
+                        .and_then(|tag| {
+                            tag.get("const")
+                                .or_else(|| tag.get("enum")?.as_array()?.first())
+                        })
+                        .and_then(Value::as_str);
+                    if let Some(kind) = pinned {
+                        kinds.insert(kind.to_string());
+                    }
+                    for (key, value) in fields {
+                        if key != "$defs" && key != "definitions" {
+                            pinned_kinds(value, kinds);
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        pinned_kinds(item, kinds);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let payloads = [
+            r#"{"type":"message","id":"msg_1","role":"user","content":[]}"#,
+            r#"{"type":"reasoning","id":"rs_1"}"#,
+            r#"{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}"#,
+            r#"{"type":"function_call_output","call_id":"call_1","output":"found"}"#,
+            r#"{"type":"mcp_approval_request","id":"mcpr_1","server_label":"docs","name":"search","arguments":"{}"}"#,
+            r#"{"type":"mcp_approval_response","approval_request_id":"mcpr_1","approve":true}"#,
+            r#"{"type":"image_generation_call","id":"ig_1"}"#,
+            r#"{"type":"compaction","encrypted_content":"opaque"}"#,
+            r#"{"type":"computer_call","id":"cu_1","call_id":"call_1","status":"completed"}"#,
+            r#"{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":null}"#,
+            r#"{"type":"custom_tool_call","call_id":"call_1","input":"x","name":"grep"}"#,
+            r#"{"type":"custom_tool_call_output","call_id":"call_1","output":"y"}"#,
+            r#"{"type":"shell_call","call_id":"call_1","action":{"commands":["ls"]}}"#,
+            r#"{"type":"shell_call_output","call_id":"call_1","output":[]}"#,
+            r#"{"type":"apply_patch_call","call_id":"call_1","operation":{"type":"delete_file","path":"old.txt"},"status":"completed"}"#,
+            r#"{"type":"apply_patch_call_output","call_id":"call_1","status":"completed"}"#,
+            r#"{"type":"local_shell_call","id":"lsh_1","call_id":"call_1","action":{"type":"exec","command":["ls"],"env":{}},"status":"completed"}"#,
+            r#"{"type":"local_shell_call_output","id":"lsh_1","output":"ok"}"#,
+            r#"{"type":"mcp_call","id":"mcp_1","arguments":"{}","name":"search","server_label":"docs","error":"boom"}"#,
+            r#"{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[]}"#,
+        ];
+        let mut covered = std::collections::BTreeSet::new();
+        for payload in payloads {
+            let value: Value = serde_json::from_str(payload).expect("a JSON object");
+            covered.insert(value["type"].as_str().expect("a tag").to_string());
+            let public = ResponseInputOutputItem::deserialize(&value).expect(payload);
+            let mirror = TaggedItem::deserialize(&value).expect(payload);
+            assert_eq!(format!("{public:?}"), format!("{mirror:?}"), "{payload}");
+        }
+        let mut listed = std::collections::BTreeSet::new();
+        pinned_kinds(
+            &schemars::schema_for!(ResponseInputOutputItem).to_value(),
+            &mut listed,
+        );
+        for untagged in ["simple_input_message", "item_reference"] {
+            listed.remove(untagged);
+        }
+        assert_eq!(listed, covered, "the payloads cover the schema's kinds");
     }
 
     /// The three sampling knobs the request keeps as plain values read as set
