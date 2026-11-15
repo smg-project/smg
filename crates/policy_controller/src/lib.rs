@@ -50,6 +50,14 @@
 //!   [`elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`elector::Fence`] a shard thread reads before every decision it sends.
+//! - 5.4, replication ([`replication`]): the log of the store's replicated
+//!   writes (membership and status, load rows, a term's start), each at its
+//!   position under its term, told by the store through
+//!   [`store::Journal`], the watched kinds kept apart from the load
+//!   rows; the rejoin rule and the bounded read a standby or a watcher of
+//!   the rows is served by, and the store's cut at one position
+//!   ([`store::MemoryStore::cut`]). The stream, the standby and the watch
+//!   are later steps.
 //!
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
@@ -91,6 +99,7 @@ pub mod lease;
 pub mod plugins;
 #[cfg(feature = "controller")]
 pub mod proto;
+pub mod replication;
 pub mod ring;
 pub mod sessions;
 pub mod spec;

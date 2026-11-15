@@ -67,6 +67,7 @@
 
 pub mod health;
 pub mod index;
+pub mod journal;
 pub mod kv_events;
 pub mod leases;
 pub mod loads;
@@ -81,13 +82,14 @@ mod tests;
 
 pub use health::HealthSink;
 pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
+pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
 pub use leases::{LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::MemoryStore;
+pub use memory::{Cut, MemoryStore};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use workers::{
