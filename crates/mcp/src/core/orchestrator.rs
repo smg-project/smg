@@ -2930,7 +2930,7 @@ mod tests {
                 .and_then(|()| socket.write_all(body));
         });
 
-        let client = http_client_builder().build().unwrap();
+        let client = build_http_client(None, Some("token"), &HashMap::new()).unwrap();
         let response = client.get(format!("http://{addr}/")).send().await.unwrap();
         assert_eq!(response.status(), 200);
         let body: Value = response.json().await.unwrap();
