@@ -189,11 +189,19 @@ impl std::fmt::Display for MmRefsError {
                 f,
                 "media item {index}: inline payload is {bytes} bytes, above the {limit}-byte cap"
             ),
-            Self::SchemeNotAccepted { scheme, accepted } => write!(
-                f,
-                "the selected worker does not fetch '{scheme}' URLs (accepts: {accepted}); \
-                 file:// needs --allowed-local-media-path on the worker"
-            ),
+            Self::SchemeNotAccepted { scheme, accepted } => {
+                write!(
+                    f,
+                    "the selected worker does not fetch '{scheme}' URLs (accepts: {accepted})"
+                )?;
+                // The remedy is the refused scheme's own: a file URL needs the
+                // worker's local-media flag; any other scheme has none to name
+                // beyond the accepted list.
+                if scheme == "file" {
+                    f.write_str("; file:// needs --allowed-local-media-path on the worker")?;
+                }
+                Ok(())
+            }
             Self::EncodeNotSupported => f.write_str(
                 "media references cannot be routed through encode workers (encode-prefill-decode \
                  pipeline); run the router with --mm-processing auto or router",
@@ -1733,6 +1741,34 @@ mod tests {
             .expect("plain audio forwards"),
             MmProcessing::Worker
         );
+    }
+
+    /// The scheme refusal's remedy follows the refused scheme: a file URL
+    /// names the worker's local-media flag, a data URL (an inline image the
+    /// worker's labels leave out) gets the accepted list alone, and the
+    /// sentence's head is the same for both.
+    #[test]
+    fn the_scheme_refusal_names_the_file_remedy_for_a_file_url_alone() {
+        let file = MmRefsError::SchemeNotAccepted {
+            scheme: "file".to_string(),
+            accepted: "data,http,https".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            file,
+            "the selected worker does not fetch 'file' URLs (accepts: data,http,https); \
+             file:// needs --allowed-local-media-path on the worker"
+        );
+        let data = MmRefsError::SchemeNotAccepted {
+            scheme: "data".to_string(),
+            accepted: "http,https".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            data,
+            "the selected worker does not fetch 'data' URLs (accepts: http,https)"
+        );
+        assert!(!data.contains("allowed-local-media-path"));
     }
 
     #[test]
