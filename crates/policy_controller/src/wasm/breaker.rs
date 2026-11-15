@@ -136,7 +136,9 @@ impl Breaker {
 /// that sample has left it, and at most one of them is ever in a window. A
 /// call that runs out under a decision's remainder arms it too where the
 /// two ends of the time nothing read part: by the time the plugin's unread
-/// calls took the run-out is its own, by their fuel it is not.
+/// calls took the run-out is its own, by their fuel it is not. So does a
+/// sample slow at its high end alone ([`Latency::uncovered`]), late call or
+/// none: a window never holds two slow samples no reading covered.
 #[derive(Debug)]
 pub(crate) struct Latency {
     ring: [u32; Self::SAMPLES],
@@ -174,6 +176,31 @@ impl Latency {
         self.armed != 0
     }
 
+    /// A charge of `micros` as a share of a frame of `frame_micros`, in the
+    /// ring's unit. The frame is not zero.
+    fn share(micros: u32, frame_micros: u32) -> u32 {
+        let share = u64::from(micros) * u64::from(Self::FRAME) / u64::from(frame_micros);
+        u32::try_from(share).unwrap_or(u32::MAX)
+    }
+
+    /// How many of the two marks a read holds a window to a sample of
+    /// `share` is past: half the frame, where the median reads slow, and
+    /// the frame, where the tail does.
+    fn marks(share: u32) -> u8 {
+        u8::from(share > Self::FRAME / 2) + u8::from(share > Self::FRAME)
+    }
+
+    /// Whether a sample of `micros` is past a mark that `low_micros` is
+    /// short of, both under a frame of `frame_micros`. The second is the
+    /// same decision at the low end of the time nothing read, so such a
+    /// sample is slow by that time alone: no reading covers it. A sample
+    /// slow by both ends is not one, nor is one without a frame.
+    pub(crate) fn uncovered(micros: u32, low_micros: u32, frame_micros: u32) -> bool {
+        frame_micros != 0
+            && Self::marks(Self::share(micros, frame_micros))
+                != Self::marks(Self::share(low_micros, frame_micros))
+    }
+
     /// Records one call of `micros` under a frame of `frame_micros` (a call
     /// without a frame is not a sample); `true` when this call completed a
     /// window and the window reads slow, which forgets the window.
@@ -181,8 +208,7 @@ impl Latency {
         if frame_micros == 0 {
             return false;
         }
-        let share = u64::from(micros) * u64::from(Self::FRAME) / u64::from(frame_micros);
-        self.ring[self.next] = u32::try_from(share).unwrap_or(u32::MAX);
+        self.ring[self.next] = Self::share(micros, frame_micros);
         self.next = (self.next + 1) % Self::SAMPLES;
         self.filled = (self.filled + 1).min(Self::SAMPLES);
         // The arm falls by one where a sample is written, so it is counted
@@ -199,7 +225,7 @@ impl Latency {
         // is the window's second-slowest call, so one outlier is not it.
         let p50 = window[(self.filled.div_ceil(2)).saturating_sub(1)];
         let p99 = window[self.filled - 2];
-        let slow = p50 > Self::FRAME / 2 || p99 > Self::FRAME;
+        let slow = Self::marks(p50) >= 1 || Self::marks(p99) == 2;
         if slow {
             self.next = 0;
             self.filled = 0;
@@ -220,6 +246,46 @@ mod tests {
             failures: 3,
             window_micros: 1_000,
             cooldown_micros: 5_000,
+        }
+    }
+
+    /// A sample is uncovered where it is past a mark of the ring that its
+    /// low end is short of: each mark at its edge, in the ring's own unit.
+    #[test]
+    fn a_sample_past_a_mark_its_low_end_is_short_of_is_uncovered() {
+        // A sample, its low end and the frame, and whether no reading
+        // covers the sample.
+        let table = [
+            // At half the frame the high end is past no mark.
+            (500, 0, 1_000, false),
+            // Past half the frame by the high end alone.
+            (501, 0, 1_000, true),
+            (501, 500, 1_000, true),
+            // Past half the frame by both ends, and short of the frame by
+            // both.
+            (501, 501, 1_000, false),
+            (1_000, 501, 1_000, false),
+            // Past the frame by the high end alone, whatever half says.
+            (1_001, 0, 1_000, true),
+            (1_001, 501, 1_000, true),
+            (1_001, 1_000, 1_000, true),
+            // Past the frame by both ends.
+            (1_001, 1_001, 1_000, false),
+            (9_000, 1_001, 1_000, false),
+            // The share is the ring's: a frame that is no thousand.
+            (700, 5, 400, true),
+            (200, 5, 400, false),
+            (201, 5, 400, true),
+            (2, 1, 3, true),
+            // No frame, no sample.
+            (700, 5, 0, false),
+        ];
+        for (micros, low_micros, frame_micros, uncovered) in table {
+            assert_eq!(
+                Latency::uncovered(micros, low_micros, frame_micros),
+                uncovered,
+                "{micros} over {low_micros} under a frame of {frame_micros}"
+            );
         }
     }
 
@@ -503,6 +569,17 @@ mod tests {
         assert!(
             !tripped,
             "one call past the frame is not the p99 of the ring"
+        );
+
+        let mut at_the_frame = Latency::new();
+        let mut tripped = false;
+        for i in 0..Latency::SAMPLES {
+            let micros = if i == 5 || i == 9 { 100 } else { 10 };
+            tripped |= at_the_frame.record(micros, 100);
+        }
+        assert!(
+            !tripped,
+            "two calls at the frame, past its half, are not a slow p99"
         );
 
         let mut tail = Latency::new();

@@ -154,6 +154,8 @@ enum Verdict {
 /// fuel to its charge, and the two sums take its two ends; a reading makes
 /// it one number. The low end is lent against a reading to come: on a host
 /// with no thread clock none can, and a call's time is its charge in both.
+/// The `init` a decision pays on a cold slot is timed the same way: its two
+/// ends join the decision's sample, never the plugin's own spend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct OwnTime {
     /// For the decision's latency sample: what a reading says the call had;
@@ -164,8 +166,40 @@ struct OwnTime {
     /// For the plugin's own spend, which a later call that runs out is
     /// judged against: what a reading says the call had; with none, its
     /// fuel. One run-out is a verdict, so it convicts on the low end: the
-    /// time a host held a call is never the plugin's spend.
+    /// time a host held a call is never the plugin's spend. A host with no
+    /// thread clock has no low end to lend: there it is the charge.
     spend: u64,
+}
+
+impl OwnTime {
+    /// The time of a call or an `init` a reading covers, one number: what it
+    /// could spend, its fuel or the CPU its thread `had`, never more than
+    /// its charge.
+    fn read(fuel_micros: u64, had: u64, charged: u64) -> Self {
+        let read = fuel_micros.max(had).min(charged);
+        Self {
+            sample: read,
+            spend: read,
+        }
+    }
+
+    /// The time of one no reading covers, its two ends. With no thread
+    /// clock (`watched` is false) nothing will ever read it, and its bound
+    /// is the wall clock's: the time it took is its spend.
+    fn unread(watched: bool, fuel_micros: u64, charged: u64) -> Self {
+        Self {
+            sample: charged,
+            spend: if watched { fuel_micros } else { charged },
+        }
+    }
+
+    /// The two sums with `more` added.
+    fn plus(self, more: Self) -> Self {
+        Self {
+            sample: self.sample.saturating_add(more.sample),
+            spend: self.spend.saturating_add(more.spend),
+        }
+    }
 }
 
 /// A call's own time and its verdict, judged once, at its end. A reading
@@ -217,25 +251,26 @@ fn judge(
         } else {
             Verdict::Own
         };
-        let own = OwnTime {
-            sample: charged,
-            // With no thread clock nothing will ever read a call, and its
-            // bound is the wall clock's: the time it took is its spend.
-            spend: if watch.watched { fuel_micros } else { charged },
-        };
-        return (own, verdict);
+        return (
+            OwnTime::unread(watch.watched, fuel_micros, charged),
+            verdict,
+        );
     };
     let verdict = if late && had < watch.bound_micros && end == End::Answered {
         Verdict::Held
     } else {
         Verdict::Own
     };
-    let read = fuel_micros.max(had).min(charged);
-    let own = OwnTime {
-        sample: read,
-        spend: read,
-    };
-    (own, verdict)
+    (OwnTime::read(fuel_micros, had, charged), verdict)
+}
+
+/// Whether a plugin alone consumed its decision's budget: its own time in
+/// the decision before a call, `spent_micros`, and the call's grant in
+/// full, `granted_micros`, reach the budget as seeded. Exact: a microsecond
+/// short, some other draw took part of the budget, and a call that runs out
+/// there is the decision's budget spent.
+fn reaches_the_budget(spent_micros: u64, granted_micros: u64, seed_micros: u64) -> bool {
+    spent_micros.saturating_add(granted_micros) >= seed_micros
 }
 
 /// Tables one store may hold: a component built from one module has the
@@ -592,10 +627,14 @@ pub struct Stats {
     /// took. And a call that ran out under a remainder where the plugin's
     /// unread calls decide whose it was: by their fuel the budget's, by the
     /// time they took the plugin's. It is the budget's, and `budget_spent`
-    /// counts it too. One call can be both, and counts twice. Through the
-    /// next 128 decisions the plugin samples on an armed thread, each of its
-    /// calls reads the clock at its start, and at its end unless it is not
-    /// late and its fuel covers the time it took. That window is short on a
+    /// counts it too. One call can be both, and counts twice. And a
+    /// decision's sample that is slow by time nothing read alone, on a
+    /// thread nothing armed: past half the budget, or past the budget, by
+    /// the time its calls and a cold slot's `init` took, and short of that
+    /// mark by their fuel. Through the next 128 decisions the plugin samples
+    /// on an armed thread, each of its calls and a cold slot's `init` reads
+    /// the clock at its start, and at its end unless it is a call that is not
+    /// late and whose fuel covers the time it took. That window is short on a
     /// busy thread (128 ms at a thousand decisions a second), so a host that
     /// holds a thread less often leaves every hold here and none in
     /// `stalls`: read the two together.
@@ -667,11 +706,12 @@ pub struct Plugin {
     latency: ThreadLocal<RefCell<Latency>>,
     /// Per thread: the decision's number, this plugin's opens of it still to
     /// close (each side of a pair, each binding), so the decision's sample is
-    /// taken at the plugin's last close of it, the charge of a lazy `init`
-    /// the decision paid (part of its sample, not of its own spend), and
-    /// whether the plugin already failed the decision: the decision is the
-    /// breaker's unit, so it counts one failure however many opens fail.
-    decision_opens: ThreadLocal<Cell<(u64, u32, u64, bool)>>,
+    /// taken at the plugin's last close of it, the time of a lazy `init` the
+    /// decision paid at its two ends (part of its sample, not of its own
+    /// spend), and whether the plugin already failed the decision: the
+    /// decision is the breaker's unit, so it counts one failure however many
+    /// opens fail.
+    decision_opens: ThreadLocal<Cell<(u64, u32, OwnTime, bool)>>,
 }
 
 impl fmt::Debug for Plugin {
@@ -1150,9 +1190,10 @@ impl Plugin {
                 // not the clock, so a stalled call is not charged for the
                 // stall; and against the spend, the low end of the time the
                 // earlier calls took ([`OwnTime`]), so a call a hold starved is
-                // not charged for the hold before it.
+                // not charged for the hold before it. A host with no thread
+                // clock has no low end: there the spend is the time they took.
                 let granted = grant.div_ceil(fuel_per_micro);
-                let reaches = |spent: u64| spent.saturating_add(granted) >= frame.seed_micros;
+                let reaches = |spent: u64| reaches_the_budget(spent, granted, frame.seed_micros);
                 let own_bound = grant == frame.cap || reaches(before.spend);
                 if frame_ran_out && frame.decision != 0 && !own_bound {
                     tracing::debug!(
@@ -1250,27 +1291,27 @@ impl Plugin {
         let (count, init, failed) = if stamp == decision {
             (count, init, failed)
         } else {
-            (0, 0, false)
+            (0, OwnTime::default(), false)
         };
         opens.set((decision, count.saturating_add(1), init, failed));
         failed
     }
 
-    /// The charge of a lazy `init` decision `decision` paid on this thread:
+    /// The time of a lazy `init` decision `decision` paid on this thread:
     /// judged under the init frame, never the plugin's own spend, but part of
-    /// what the decision cost it.
-    fn note_init(&self, decision: u64, micros: u64) {
+    /// what the decision cost it, at its two ends like a call's.
+    fn note_init(&self, decision: u64, own: OwnTime) {
         let opens = self.decision_opens.get_or_default();
         let (stamp, count, init, failed) = opens.get();
         if stamp == decision {
-            opens.set((stamp, count, init.saturating_add(micros), failed));
+            opens.set((stamp, count, init.plus(own), failed));
         }
     }
 
     /// One of this plugin's closes of decision `decision`: the last one takes
     /// the decision's latency sample, the plugin's own charged time in the
     /// decision (its constructor and stage calls, whatever ended them) plus
-    /// the charge of a lazy `init` the decision paid, over the decision's
+    /// the time of a lazy `init` the decision paid, over the decision's
     /// budget. A decision that charged the plugin nothing records nothing.
     fn note_close(&self, decision: u64, seed_micros: u64) {
         let opens = self.decision_opens.get_or_default();
@@ -1284,27 +1325,40 @@ impl Plugin {
             return;
         }
         let (spent_stamp, spent) = self.spent.get_or_default().get();
-        let sample = if spent_stamp == decision {
-            spent.sample
+        let own = if spent_stamp == decision {
+            spent.plus(init)
         } else {
-            0
+            init
         };
-        let charged = sample.saturating_add(init);
-        if charged > 0 {
-            self.sample(charged, seed_micros);
+        if own.sample > 0 {
+            self.sample(own, seed_micros);
         }
     }
 
-    /// One latency sample into the thread's ring: a decision's charge as a
-    /// share of its budget; a window that reads slow opens the breaker.
-    fn sample(&self, charged: u64, seed_micros: u64) {
-        let sample = u32::try_from(charged).unwrap_or(u32::MAX);
-        let seed = u32::try_from(seed_micros).unwrap_or(u32::MAX);
-        let slow = self
-            .latency
-            .get_or(|| RefCell::new(Latency::new()))
-            .borrow_mut()
-            .record(sample, seed);
+    /// One latency sample into the thread's ring: a decision's time as a
+    /// share of its budget, at the high end of what nothing read; a window
+    /// that reads slow opens the breaker. A sample slow at that end alone
+    /// (past a mark of the ring its low end is short of) is slow by time
+    /// nothing read, a hold of the host or the guest's own, and nothing says
+    /// which. It is recorded as it is, counted with the unread calls, and
+    /// arms the thread: the decisions that share its window are read, so no
+    /// window holds two such samples. That bounds the samples no reading
+    /// covered, not what one of them completes: the ring's allowance of one
+    /// outlier is the window's, and a hold of the host spends it.
+    fn sample(&self, own: OwnTime, seed_micros: u64) {
+        let micros = |micros: u64| u32::try_from(micros).unwrap_or(u32::MAX);
+        let (sample, low, seed) = (micros(own.sample), micros(own.spend), micros(seed_micros));
+        let slow = {
+            let mut ring = self
+                .latency
+                .get_or(|| RefCell::new(Latency::new()))
+                .borrow_mut();
+            if !ring.armed() && Latency::uncovered(sample, low, seed) {
+                bump(&self.tally.unread);
+                ring.arm();
+            }
+            ring.record(sample, seed)
+        };
         if slow && self.breaker.slow(self.runtime.now_micros()) {
             self.opened("latency");
         }
@@ -1319,7 +1373,8 @@ impl Plugin {
     /// Arms this thread's ring. A late call here had no reading of its
     /// start, and its decision's sample is the time the call took; or a call
     /// here ran out under a remainder that the time its plugin's unread
-    /// calls took makes its own and their fuel does not.
+    /// calls took makes its own and their fuel does not. (A sample slow by
+    /// time nothing read arms the ring where it is taken.)
     fn arm(&self) {
         self.latency
             .get_or(|| RefCell::new(Latency::new()))
@@ -1344,11 +1399,7 @@ impl Plugin {
         } else {
             OwnTime::default()
         };
-        let after = OwnTime {
-            sample: before.sample.saturating_add(own.sample),
-            spend: before.spend.saturating_add(own.spend),
-        };
-        spent.set((decision, after));
+        spent.set((decision, before.plus(own)));
         before
     }
 
@@ -1693,19 +1744,35 @@ impl Bound {
             // slot still empty at the close is rebuilt under the full frame).
             // The budget is wall time here as in a call: the instantiation is
             // charged the larger of its fuel at the calibration and its
-            // elapsed time, however it ends.
+            // elapsed time, however it ends. Its own time has two ends like
+            // a call's. Nothing watches an `init` (its bound stays on the
+            // wall clock), so no tick reads it: its low end is its fuel, and
+            // an armed thread reads its clock around it, which makes the two
+            // one: a held `init` is no slow sample there.
             let fuel_per_micro = frame.fuel_per_micro.max(1);
             let left = budget.remaining_micros.saturating_mul(fuel_per_micro);
             let init_fuel = plugin.init_fuel();
+            let watched = plugin.runtime.thread_clock;
+            let start = if watched && plugin.armed() {
+                thread_cpu_micros()
+            } else {
+                None
+            };
             let started = Instant::now();
             let (made, used) = plugin.instantiate_metered(init_fuel.min(left));
             let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let charged = used.div_ceil(fuel_per_micro).max(elapsed);
+            let fuel_micros = used.div_ceil(fuel_per_micro);
+            let charged = fuel_micros.max(elapsed);
+            let own = match start.and_then(|start| Some(thread_cpu_micros()?.saturating_sub(start)))
+            {
+                Some(had) => OwnTime::read(fuel_micros, had, charged),
+                None => OwnTime::unread(watched, fuel_micros, charged),
+            };
             match made {
                 Ok(instance) => {
                     bump(&plugin.tally.lazy_instantiations);
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
-                    plugin.note_init(budget.stamp, charged);
+                    plugin.note_init(budget.stamp, own);
                     *guard = Some(instance);
                 }
                 Err(LoadError::Trap { .. })
@@ -1720,12 +1787,13 @@ impl Bound {
                     // again), the slot stays cold for the close to rebuild
                     // under the full frame, and the breaker, which judges
                     // `init` under its own frame, is untouched. The plugin's
-                    // sample is the larger of the remainder and the charge
-                    // above, so an `init` long on the clock reads as long
-                    // here too.
+                    // sample takes the time of this `init` as of any other:
+                    // a charge that reached the remainder, so one long on the
+                    // clock reads as long here too, unless a reading says
+                    // its thread did not have that time.
                     let init_micros = left.div_ceil(fuel_per_micro).max(charged);
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(init_micros);
-                    plugin.note_init(budget.stamp, init_micros);
+                    plugin.note_init(budget.stamp, own);
                     bump(&plugin.tally.budget_spent);
                     plugin.emptied.get_or_default().set(true);
                     open.bypass = true;
@@ -1738,7 +1806,7 @@ impl Bound {
                     // is the breaker's, the charge the decision's and part
                     // of the plugin's sample.
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
-                    plugin.note_init(budget.stamp, charged);
+                    plugin.note_init(budget.stamp, own);
                     plugin.fail(now);
                     open.bypass = true;
                     return;
@@ -2149,8 +2217,8 @@ mod tests {
     use wasmtime::{Trap, UpdateDeadline};
 
     use super::{
-        bit, deadline_ticks, first_deadline, import_version, judge, thread_cpu_micros, tick, End,
-        Verdict, Watch, EPOCH_TICK_MICROS,
+        bit, deadline_ticks, first_deadline, import_version, judge, reaches_the_budget,
+        thread_cpu_micros, tick, End, Verdict, Watch, EPOCH_TICK_MICROS,
     };
 
     /// Whether a tick ended the call; a tick that lets it run asks for the
@@ -2279,7 +2347,8 @@ mod tests {
     /// boundary, and the calls that read the clock again: every call whose
     /// start was read, but one that is not late and whose fuel covers the
     /// time it took. With no reading a call is sampled at its charge and
-    /// spends its fuel; a reading gives it one time, late or not.
+    /// spends its fuel (its charge on a host with no thread clock); a
+    /// reading gives it one time, late or not.
     #[test]
     fn a_late_call_is_judged_once_on_its_readings() {
         // A bound that is no whole number of ticks, and the wall time that
@@ -2541,6 +2610,33 @@ mod tests {
                 (own.sample, own.spend, verdict, reads.get()),
                 wanted,
                 "{case}"
+            );
+        }
+    }
+
+    /// The run-out's rule is exact: a plugin's own time and the grant in
+    /// full reach the budget or they do not, to the microsecond.
+    #[test]
+    fn a_spend_and_a_grant_reach_the_budget_to_the_microsecond() {
+        // A plugin's time before the call, the grant, the budget as seeded,
+        // and whether the plugin alone consumed it.
+        let table = [
+            (400, 599, 1_000, false),
+            (400, 600, 1_000, true),
+            (400, 601, 1_000, true),
+            (0, 999, 1_000, false),
+            (0, 1_000, 1_000, true),
+            (999, 0, 1_000, false),
+            (1_000, 0, 1_000, true),
+            // The sum saturates, and reaches.
+            (u64::MAX, 1, u64::MAX, true),
+            (u64::MAX - 1, 0, u64::MAX, false),
+        ];
+        for (spent, granted, seed, reached) in table {
+            assert_eq!(
+                reaches_the_budget(spent, granted, seed),
+                reached,
+                "{spent} and {granted} under {seed}"
             );
         }
     }
