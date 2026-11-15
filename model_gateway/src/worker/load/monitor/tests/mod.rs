@@ -59,7 +59,10 @@ async fn dp8_pushes_cannot_redirect_virtual_workers_to_active_ranks() {
             monitor.apply_pushed_load(&worker, pushing_rank, &active, now);
         }
         let is_active = rank == 0 || rank == 2;
-        assert_eq!(worker.pushes_load_records(), is_active);
+        assert_eq!(
+            worker.runtime_state().unwrap().pushes_load_records(),
+            is_active
+        );
         assert_eq!(
             monitor.poll_mode(worker.url(), now, interval),
             if is_active {
@@ -989,7 +992,7 @@ async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
     let past_a_tick = liveness::SWEEP_INTERVAL + Duration::from_millis(1);
 
     let first = ready_worker("http://w1:8000", "m");
-    first.note_tracked_started();
+    first.runtime_state().unwrap().note_tracked_started();
     registry.register(Arc::clone(&first)).unwrap();
     #[expect(
         clippy::disallowed_methods,
@@ -998,32 +1001,36 @@ async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
     let sweep = tokio::spawn(liveness_sweep_loop(Arc::downgrade(&monitor)));
     tokio::time::sleep(past_a_tick).await;
     assert_eq!(
-        first.swap_load_sample(0),
+        first.runtime_state().unwrap().swap_load_sample(0),
         1,
         "a worker registered before the loop started is swept"
     );
 
     let late = ready_worker("http://w2:8000", "m");
-    late.note_tracked_started();
-    late.note_tracked_started();
+    late.runtime_state().unwrap().note_tracked_started();
+    late.runtime_state().unwrap().note_tracked_started();
     let late_id = registry.register(Arc::clone(&late)).unwrap();
     tokio::time::sleep(past_a_tick).await;
     assert_eq!(
-        late.swap_load_sample(0),
+        late.runtime_state().unwrap().swap_load_sample(0),
         2,
         "a worker registered after the loop started is swept on the next tick"
     );
     assert_eq!(
-        first.swap_load_sample(0),
+        first.runtime_state().unwrap().swap_load_sample(0),
         1,
         "the first worker is swept on the same tick"
     );
 
     registry.remove(&late_id).unwrap();
     tokio::time::sleep(past_a_tick).await;
-    assert_eq!(late.swap_load_sample(0), 0, "a removed worker is not swept");
     assert_eq!(
-        first.swap_load_sample(0),
+        late.runtime_state().unwrap().swap_load_sample(0),
+        0,
+        "a removed worker is not swept"
+    );
+    assert_eq!(
+        first.runtime_state().unwrap().swap_load_sample(0),
         1,
         "the worker that stays is swept on the tick after the removal"
     );

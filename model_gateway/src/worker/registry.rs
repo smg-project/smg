@@ -2656,7 +2656,9 @@ impl WorkerRegistry {
             return;
         }
         // The warm-up slice (cache_aware) counts from here.
-        worker.note_admitted();
+        if let Some(state) = worker.runtime_state() {
+            state.note_admitted();
+        }
         // A worker promoted to Ready does not wait out its circuit breaker's
         // timeout: the failures that opened the breaker belong to the outage
         // its probes just saw end. An open breaker goes half-open now, so

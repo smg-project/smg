@@ -1,3 +1,4 @@
+mod dispatch_note_defaults;
 mod running_window_label;
 
 use std::{thread, time::Duration};
@@ -1131,7 +1132,6 @@ fn test_lazy_discovered_models_override_wildcard() {
 
     // Wildcard worker starts with no models listed, but accepts any model
     assert!(worker.models().is_empty());
-    assert!(!worker.has_models_discovered());
     assert!(worker.supports_model("gpt-4o-mini")); // wildcard accepts anything
 
     // Simulate lazy discovery via set_models
@@ -1146,7 +1146,6 @@ fn test_lazy_discovered_models_override_wildcard() {
     assert!(worker.supports_model("gpt-4o-mini"));
     assert!(worker.supports_model("text-embedding-3-small"));
     assert!(!worker.supports_model("non-existent-model"));
-    assert!(worker.has_models_discovered());
 }
 
 #[test]
@@ -1674,12 +1673,12 @@ fn output_silence_is_read_only_while_a_stream_that_produced_output_is_open() {
     // Nothing in flight it has shown output on: nothing to judge.
     assert!(worker.output_silence().is_none());
     worker.note_output_started();
-    worker.note_token_progress();
+    worker.runtime_state().unwrap().note_token_progress();
     thread::sleep(Duration::from_millis(20));
     let silence = worker.output_silence().expect("a producing stream is open");
     assert!(silence >= Duration::from_millis(20), "{silence:?}");
     // A token: the silence restarts.
-    worker.note_token_progress();
+    worker.runtime_state().unwrap().note_token_progress();
     assert!(worker.output_silence().expect("still open") < silence);
     // The stream ended: nothing to judge again, however quiet the worker.
     worker.note_output_ended();

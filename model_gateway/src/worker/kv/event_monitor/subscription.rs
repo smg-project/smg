@@ -1143,7 +1143,7 @@ mod tests {
             )]
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                worker.note_contact();
+                worker.runtime_state().unwrap().note_contact();
             })
         };
         assert!(matches!(
@@ -1647,7 +1647,7 @@ mod tests {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    worker.note_contact();
+                    worker.runtime_state().unwrap().note_contact();
                 }
             })
         };

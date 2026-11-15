@@ -3410,7 +3410,10 @@ pub(crate) mod tests {
         let answered_at = Duration::from_millis(500);
         let other_side = async {
             tokio::time::sleep(answered_at).await;
-            prefill.note_prefill_started(256, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(256, true);
             prefill.note_prefill_ended(256, true, Some(0));
         };
         let started = Instant::now();
@@ -3445,14 +3448,20 @@ pub(crate) mod tests {
     async fn a_prefill_dispatch_in_flight_before_a_longer_prompt_waits_through_the_build() {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(256, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(256, true);
         prefill.note_prefill_ended(256, true, Some(0));
         let bound = Duration::from_secs(1);
         let landed_at = Duration::from_millis(500);
         let shown_at = Duration::from_millis(2_500);
         let longer_prompt = async {
             tokio::time::sleep(landed_at).await;
-            prefill.note_prefill_started(8_192, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(8_192, true);
             tokio::time::sleep(shown_at - landed_at).await;
             prefill.note_prefill_ended(8_192, true, Some(0));
         };
@@ -3493,11 +3502,17 @@ pub(crate) mod tests {
     async fn a_prefill_dispatch_in_a_burst_after_an_idle_spell_waits_on_past_its_bound() {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(10_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(10_000, true);
         prefill.note_prefill_ended(10_000, true, Some(0));
         tokio::time::sleep(Duration::from_millis(2_500)).await;
         for _ in 0..2 {
-            prefill.note_prefill_started(10_000, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(10_000, true);
         }
         let bound = Duration::from_secs(1);
         let started = Instant::now();
@@ -3529,7 +3544,10 @@ pub(crate) mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         for _ in 0..40 {
-            prefill.note_prefill_started(100_000, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(100_000, true);
         }
         let bound = Duration::from_secs(1);
         let started = Instant::now();
@@ -3567,14 +3585,20 @@ pub(crate) mod tests {
         // short of the window when the verdict is given.
         let started = Instant::now();
         for _ in 0..2 {
-            prefill.note_prefill_started(10_000, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(10_000, true);
         }
         let bound = Duration::from_secs(1);
         let backlog = Duration::from_secs(2);
         let arrivals = async {
             tokio::time::sleep(bound + Duration::from_millis(500)).await;
             loop {
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
@@ -3596,6 +3620,8 @@ pub(crate) mod tests {
         // below, a millisecond of the worker's clock allowed, and from
         // above.
         let silent = prefill
+            .runtime_state()
+            .unwrap()
             .prefill_unanswered_run()
             .expect("the run never answered");
         let status = failure(result);
@@ -3622,8 +3648,14 @@ pub(crate) mod tests {
     ) {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(20_000, true);
-        prefill.note_prefill_started(2_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(20_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(2_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         prefill.note_prefill_ended(20_000, true, Some(0));
         let answered = Instant::now();
@@ -3631,7 +3663,10 @@ pub(crate) mod tests {
         let arrivals = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
             }
         };
         let result = tokio::select! {
@@ -3666,16 +3701,25 @@ pub(crate) mod tests {
     ) {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(20_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(20_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         prefill.note_prefill_ended(20_000, true, Some(0));
-        prefill.note_prefill_started(2_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(2_000, true);
         let bound = Duration::from_secs(1);
         let started = Instant::now();
         let arrivals = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
             }
         };
         let result = tokio::select! {
@@ -3710,19 +3754,28 @@ pub(crate) mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let decode = Arc::clone(workers.decode_worker().expect("a pair"));
-        prefill.note_prefill_started(20_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(20_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         prefill.note_prefill_ended(20_000, true, Some(0));
         decode.note_output_started();
-        decode.note_token_progress();
+        decode.runtime_state().unwrap().note_token_progress();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        prefill.note_prefill_started(2_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(2_000, true);
         let bound = Duration::from_secs(1);
         let started = Instant::now();
         let arrivals = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
             }
         };
         let result = tokio::select! {
@@ -3758,7 +3811,7 @@ pub(crate) mod tests {
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let decode = Arc::clone(workers.decode_worker().expect("a pair"));
         decode.note_output_started();
-        decode.note_token_progress();
+        decode.runtime_state().unwrap().note_token_progress();
         std::thread::sleep(Duration::from_millis(600));
         let dispatched = Instant::now()
             .checked_sub(Duration::from_secs(2))
@@ -3810,7 +3863,7 @@ pub(crate) mod tests {
                 // The decode holds a stream it had been producing for, and
                 // has produced nothing since: stalled mid-stream.
                 decode.note_output_started();
-                decode.note_token_progress();
+                decode.runtime_state().unwrap().note_token_progress();
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let started = Instant::now();
                 let status = failure(
@@ -3860,7 +3913,7 @@ pub(crate) mod tests {
                 // beside the dispatch and ends with it.)
                 let producing = async {
                     loop {
-                        decode.note_token_progress();
+                        decode.runtime_state().unwrap().note_token_progress();
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 };
@@ -4519,7 +4572,10 @@ pub(crate) mod tests {
     async fn a_single_dispatch_is_booked_on_its_worker_before_its_call_answers() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
         fn books(worker: &Arc<dyn Worker>) -> (Duration, usize) {
-            (worker.prefill_backlog(), worker.tracked_load())
+            (
+                worker.runtime_state().unwrap().prefill_backlog(),
+                worker.runtime_state().unwrap().tracked_load(),
+            )
         }
         // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
         let pending = Duration::from_millis(409);

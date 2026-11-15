@@ -965,8 +965,9 @@ pub struct TrackedStream {
     inner: ProtoStream,
     worker: Arc<dyn Worker>,
     /// The worker's runtime, captured at the stream's start, that every
-    /// response is noted on (see [`Worker::liveness_runtime`]); `None` for a
-    /// worker without one, whose notes go through the worker.
+    /// response is noted on (see [`Worker::runtime_state`]); `None` for a
+    /// worker that keeps no state: its responses are noted nowhere and only
+    /// end a standing veto.
     runtime: Option<Arc<WorkerRuntime>>,
     prefill: Option<PrefillTicket>,
     /// The request's place in the worker's pile; a non-streaming generation
@@ -1009,7 +1010,7 @@ impl FirstItem {
 }
 
 /// The request's place in its worker's tracked pile (see
-/// [`Worker::tracked_load`]), held for the stream's life.
+/// [`WorkerRuntime::tracked_load`]), held for the stream's life.
 struct ProgressTicket {
     worker: Arc<dyn Worker>,
 }
@@ -1043,7 +1044,7 @@ impl Drop for OutputTicket {
 }
 
 /// The prompt tokens a dispatched request adds to its worker's prefill
-/// backlog (see [`Worker::prefill_backlog`]), released by the first response
+/// backlog (see [`WorkerRuntime::prefill_backlog`]), released by the first response
 /// (with the prefix-cache hit it reports, so the worker's rate learns the
 /// tokens the engine computed) or, failing that, when the stream is dropped.
 pub(crate) struct PrefillTicket {
@@ -1208,11 +1209,23 @@ mod tracked_tests {
             0,
             true,
         );
-        assert_eq!(worker.tracked_load(), 1, "counted at dispatch");
+        assert_eq!(
+            worker.runtime_state().unwrap().tracked_load(),
+            1,
+            "counted at dispatch"
+        );
         let stream = stream.defer_abort_until_first_item();
-        assert_eq!(worker.tracked_load(), 1, "and across the stream's rewraps");
+        assert_eq!(
+            worker.runtime_state().unwrap().tracked_load(),
+            1,
+            "and across the stream's rewraps"
+        );
         drop(stream);
-        assert_eq!(worker.tracked_load(), 0, "released with the stream");
+        assert_eq!(
+            worker.runtime_state().unwrap().tracked_load(),
+            0,
+            "released with the stream"
+        );
     }
 
     #[tokio::test]
@@ -1225,13 +1238,25 @@ mod tracked_tests {
         let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
             .tracked(Arc::clone(&inner), 0, true)
             .tracked(Arc::clone(&outer), 0, true);
-        assert_eq!((inner.tracked_load(), outer.tracked_load()), (1, 1));
+        assert_eq!(
+            (
+                inner.runtime_state().unwrap().tracked_load(),
+                outer.runtime_state().unwrap().tracked_load()
+            ),
+            (1, 1)
+        );
         assert!(
             stream.next().await.is_none(),
             "an empty fanout ends at once"
         );
         drop(stream);
-        assert_eq!((inner.tracked_load(), outer.tracked_load()), (0, 0));
+        assert_eq!(
+            (
+                inner.runtime_state().unwrap().tracked_load(),
+                outer.runtime_state().unwrap().tracked_load()
+            ),
+            (0, 0)
+        );
     }
 
     /// A stream over one chunk, read through a fan-out so the chunk reaches
@@ -1283,18 +1308,18 @@ mod tracked_tests {
         let mut stream = one_chunk_tracked(&worker);
         // A token through this handle, then a failure through the other,
         // within one millisecond as far as the clock allows.
-        worker.note_token_progress();
-        other.note_transport_failure();
+        worker.runtime_state().unwrap().note_token_progress();
+        other.runtime_state().unwrap().note_transport_failure();
         assert!(
-            worker.transport_failure_pending(),
+            worker.runtime_state().unwrap().transport_failure_pending(),
             "the handles share the runtime"
         );
         assert!(stream.next().await.is_some_and(|item| item.is_ok()));
         assert!(
-            !worker.transport_failure_pending(),
+            !worker.runtime_state().unwrap().transport_failure_pending(),
             "the response clears it"
         );
-        assert!(!other.transport_failure_pending());
+        assert!(!other.runtime_state().unwrap().transport_failure_pending());
     }
 
     #[test]
@@ -1311,7 +1336,7 @@ mod tracked_tests {
             false,
         );
         assert_eq!(
-            worker.tracked_load(),
+            worker.runtime_state().unwrap().tracked_load(),
             0,
             "nothing to see progress on until it answers"
         );
@@ -1328,9 +1353,9 @@ mod tracked_tests {
             _ => panic!("a tracked stream"),
         }
         let stream = stream.defer_abort_until_first_item();
-        assert_eq!(worker.tracked_load(), 0);
+        assert_eq!(worker.runtime_state().unwrap().tracked_load(), 0);
         drop(stream);
-        assert_eq!(worker.tracked_load(), 0);
+        assert_eq!(worker.runtime_state().unwrap().tracked_load(), 0);
     }
 
     /// A disaggregated decode side earns its worker's breaker success at its
@@ -1382,18 +1407,22 @@ mod tracked_tests {
         );
         let ticket = PrefillTicket::book(&worker, 4_096);
         assert_eq!(
-            worker.prefill_backlog(),
+            worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::from_millis(409),
             "pending from the dispatch, before the call has answered"
         );
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
             .tracked_prefill_side_booked(Arc::clone(&worker), ticket);
         assert_eq!(
-            worker.prefill_backlog(),
+            worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::from_millis(409),
             "handed to the stream: booked once, not again"
         );
-        assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
+        assert_eq!(
+            worker.runtime_state().unwrap().tracked_load(),
+            0,
+            "a side is never part of a pile"
+        );
         match &stream {
             ProtoStream::Tracked(tracked) => {
                 assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
@@ -1402,7 +1431,7 @@ mod tracked_tests {
         }
         drop(stream);
         assert_eq!(
-            worker.prefill_backlog(),
+            worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::ZERO,
             "released with the stream"
         );
@@ -1413,12 +1442,12 @@ mod tracked_tests {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let ticket = PrefillTicket::book(&worker, 1_000);
         assert_eq!(
-            worker.prefill_backlog(),
+            worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::from_millis(100)
         );
         drop(ticket);
         assert_eq!(
-            worker.prefill_backlog(),
+            worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::ZERO,
             "a call that fails or is retired gives the prompt back untimed"
         );
@@ -1429,9 +1458,13 @@ mod tracked_tests {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
             .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 4_096));
-        assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
         assert_eq!(
-            worker.prefill_backlog(),
+            worker.runtime_state().unwrap().tracked_load(),
+            0,
+            "a side is never part of a pile"
+        );
+        assert_eq!(
+            worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::from_millis(409),
             "its prompt is pending prefill on the prefill worker (cold prior)"
         );
@@ -1444,7 +1477,7 @@ mod tracked_tests {
         }
         drop(stream);
         assert_eq!(
-            worker.prefill_backlog(),
+            worker.runtime_state().unwrap().prefill_backlog(),
             std::time::Duration::ZERO,
             "released with the stream"
         );
@@ -1584,7 +1617,12 @@ mod tracked_tests {
     #[test]
     fn a_dispatch_booking_holds_the_prompt_and_the_pile_until_its_stream_takes_over() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
-        let books = |worker: &Arc<dyn Worker>| (worker.prefill_backlog(), worker.tracked_load());
+        let books = |worker: &Arc<dyn Worker>| {
+            (
+                worker.runtime_state().unwrap().prefill_backlog(),
+                worker.runtime_state().unwrap().tracked_load(),
+            )
+        };
         // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
         let pending = std::time::Duration::from_millis(409);
         let none = (std::time::Duration::ZERO, 0);
@@ -1662,7 +1700,7 @@ impl ProtoStream {
     #[must_use]
     pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
         let DispatchBooking { prefill, progress } = booking;
-        let runtime = worker.liveness_runtime();
+        let runtime = worker.runtime_state();
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
@@ -1690,7 +1728,7 @@ impl ProtoStream {
         worker: Arc<dyn Worker>,
         prefill: Option<PrefillTicket>,
     ) -> Self {
-        let runtime = worker.liveness_runtime();
+        let runtime = worker.runtime_state();
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
@@ -3266,7 +3304,7 @@ mod watched_tests {
             .tracked(Arc::clone(&worker), 0, true)
             .until_client_gone(&client, "req-watched");
         assert!(stream.worker().is_some(), "tracked under the watch");
-        assert_eq!(worker.tracked_load(), 1);
+        assert_eq!(worker.runtime_state().unwrap().tracked_load(), 1);
         assert!(
             matches!(stream.next().await, Some(Ok(_))),
             "the first response is read"
@@ -3290,7 +3328,11 @@ mod watched_tests {
             stream.worker().is_none(),
             "the inner stream went with the client"
         );
-        assert_eq!(worker.tracked_load(), 0, "its load released with it");
+        assert_eq!(
+            worker.runtime_state().unwrap().tracked_load(),
+            0,
+            "its load released with it"
+        );
     }
 
     /// The client's leaving is seen through a decode-side wrapper too: dual
