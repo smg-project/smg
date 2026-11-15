@@ -35,6 +35,14 @@
 # 512-worker rows +37 to +85 %), confirmed by the re-measure round; the view build and the spec row, which the
 # mutant does not touch, read within 0.5 %.
 #
+# The view build's buffer has a placement of its own (benches/common/placed.rs): the three view_build rows
+# write into a buffer that starts on a page's start. A row is written field by field, and a page boundary
+# inside the buffer can split one of its stores, at 6.5 to 7.5 ns a split store: 20 to 26 % of the row at 8
+# workers, in 16 of the 256 places an allocator hands a buffer. The place follows what the process
+# allocated before (the length of the binary's path moved it), so each side sat in one state for a whole
+# job and the row could fail or pass a change that did not touch it. The identical-build spread of the
+# table above was read in one placement; the placed buffer makes it the only one.
+#
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread can be read from those and the thresholds tightened once it is known.
 
@@ -45,7 +53,11 @@ filter = "^policy_engine/"
 # pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
 # gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
 # bench target of its own.
-sources = ["crates/policy_controller/benches/decision.rs", "crates/policy_controller/benches/common/mod.rs"]
+sources = [
+    "crates/policy_controller/benches/decision.rs",
+    "crates/policy_controller/benches/common/mod.rs",
+    "crates/policy_controller/benches/common/placed.rs",
+]
 
 # The first gate whose pattern matches an id decides its threshold.
 [[gate]]

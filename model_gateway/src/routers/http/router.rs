@@ -108,8 +108,8 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        endpoint::Endpoint, ConnectionMode, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        identity::endpoint::Endpoint, ConnectionMode, RoutingPool, RuntimeType, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -2926,7 +2926,7 @@ mod tests {
         service_discovery::testing::create_test_app_context,
         tenant::TenantKey,
         worker::{
-            circuit_breaker::CircuitState,
+            health::circuit_breaker::CircuitState,
             test_support::{no_health_check, RefusedAddress},
             BasicWorker, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard,
         },

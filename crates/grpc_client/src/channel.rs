@@ -200,7 +200,7 @@ pub async fn connect_channel_with_timeout(
 ///
 /// The gateway's liveness asks a different question of the ends of its
 /// polls and streams, whether the peer is reachable for work, and answers
-/// it from the code alone (`worker::liveness::is_connection_code` in the
+/// it from the code alone (`worker::health::liveness::is_connection_code` in the
 /// gateway crate); the two are not interchangeable.
 pub fn is_transport_failure(status: &tonic::Status) -> bool {
     let mut source = std::error::Error::source(status);

@@ -83,7 +83,7 @@ use smg::{
     routers::RouterTrait,
     tenant::TenantKey,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         RuntimeType, Worker, WorkerType,
     },
 };

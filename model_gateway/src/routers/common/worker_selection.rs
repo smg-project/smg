@@ -18,8 +18,8 @@ use crate::{
         error,
     },
     worker::{
-        endpoint::Endpoint, overload::STAGE_SELECTION, ProviderType, RuntimeType, Worker,
-        WorkerRegistry,
+        health::overload::STAGE_SELECTION, identity::endpoint::Endpoint, ProviderType, RuntimeType,
+        Worker, WorkerRegistry,
     },
 };
 

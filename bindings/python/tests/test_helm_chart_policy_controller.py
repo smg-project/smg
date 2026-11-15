@@ -9,7 +9,7 @@ without it.
 
 This module renders the chart with its own few lines and not through
 ``test_helm_chart_args``: that module imports the gateway's launcher, which
-the job that builds the controller does not install.
+the job that runs these cases on the image's binary does not install.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 CHART = REPO / "deploy" / "helm" / "smg"
+# The job that builds the controller image runs these cases on its binary.
+IMAGE_WORKFLOW = REPO / ".github" / "workflows" / "pr-policy-controller-image.yml"
 VALUES = CHART / "values.yaml"
 SCHEMA = CHART / "values.schema.json"
 EXAMPLES = CHART / "examples"
@@ -52,6 +54,9 @@ DEFAULT_SETTLE_SECONDS = 5
 # The started controller is read on a loopback port: a proxy named in the
 # environment is not asked for it.
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# A pod's environment names none of the variables the controller's log reads
+# for its color.
+COLOR_VARIABLES = ("NO_COLOR", "FORCE_COLOR", "CLICOLOR_FORCE")
 
 needs_helm = pytest.mark.skipif(
     shutil.which("helm") is None or not CHART.exists(), reason="helm or the chart not present"
@@ -304,6 +309,48 @@ def test_no_other_selector_takes_the_controllers_pods():
 
 
 @needs_helm
+def test_the_controllers_selectors_take_the_controller_and_nothing_else():
+    """The Service and the budget select pods and the monitor selects
+    Services: each takes the controller's and no other of a release that also
+    has a router and a worker. A second budget over a router pod makes its
+    eviction fail; a monitor over every Service scrapes the router and the
+    workers twice."""
+    documents = render(
+        *ON,
+        "router.metrics.serviceMonitor.enabled=true",
+        "router.podDisruptionBudget.enabled=true",
+        "policyController.podDisruptionBudget.enabled=true",
+        "router.adminPort=9001",
+        files=(EXAMPLES / "with-vllm-http.yaml",),
+    )
+    pods = {
+        document["metadata"]["name"]: document["spec"]["template"]["metadata"]["labels"]
+        for document in documents
+        if document["kind"] == "Deployment"
+    }
+    services = {
+        document["metadata"]["name"]: document["metadata"]["labels"]
+        for document in documents
+        if document["kind"] == "Service"
+    }
+    assert len(pods) == 3 and len(services) == 4, "a router and a worker beside the controller"
+    selectors = {
+        "Service": (one(documents, "Service")["spec"]["selector"], pods),
+        "PodDisruptionBudget": (
+            one(documents, "PodDisruptionBudget")["spec"]["selector"]["matchLabels"],
+            pods,
+        ),
+        "ServiceMonitor": (
+            one(documents, "ServiceMonitor")["spec"]["selector"]["matchLabels"],
+            services,
+        ),
+    }
+    for kind, (selector, candidates) in selectors.items():
+        taken = sorted(name for name, labels in candidates.items() if selects(selector, labels))
+        assert taken == [NAME], f"the controller's {kind} selects {taken}"
+
+
+@needs_helm
 def test_the_pod_runs_under_the_routers_security_context_and_its_own_probes():
     documents = render(*ON)
     pod = one(documents, "Deployment")["spec"]["template"]["spec"]
@@ -393,6 +440,65 @@ def test_the_arguments_follow_the_values():
     # for every CPU the pod may use.
     unset = controller_args("policyController.runtimeWorkerThreads=0")
     assert "--runtime-worker-threads" not in unset
+    # A settle window of zero is a window: the flag is passed, not left to
+    # the controller's default.
+    zero = controller_args("policyController.shutdownSettleSeconds=0")
+    assert zero[zero.index("--shutdown-settle-secs") + 1] == "0"
+
+
+@needs_helm
+def test_the_values_the_chart_hands_on_reach_their_objects(tmp_path):
+    """The values the block hands on unread, set through one values file and
+    read in the object each lands in."""
+    handed_on = {
+        "replicas": 3,
+        "resources": {"limits": {"cpu": "2"}},
+        "nodeSelector": {"pool": "control"},
+        "tolerations": [{"key": "dedicated", "operator": "Exists"}],
+        "podAnnotations": {"example.com/scrape": "true"},
+        "podLabels": {"team": "routing"},
+        "extraEnv": [{"name": "EXAMPLE", "value": "1"}],
+        "securityContext": {"runAsUser": 1000},
+        "service": {"type": "NodePort", "annotations": {"example.com/zone": "a"}},
+        "podDisruptionBudget": {"enabled": True, "minAvailable": 2},
+        "livenessProbe": {"initialDelaySeconds": 7, "periodSeconds": 11},
+        "readinessProbe": {"initialDelaySeconds": 3, "periodSeconds": 13},
+    }
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        yaml.safe_dump(
+            {
+                "global": {
+                    "image": {"pullPolicy": "Always"},
+                    "imagePullSecrets": [{"name": "registry-key"}],
+                },
+                "policyController": handed_on,
+            }
+        )
+    )
+    documents = render(*ON, files=(values,))
+    deployment = one(documents, "Deployment")["spec"]
+    pod = deployment["template"]["spec"]
+    found = container(documents)
+    service = one(documents, "Service")
+    assert deployment["replicas"] == 3
+    assert found["resources"] == handed_on["resources"]
+    assert pod["nodeSelector"] == handed_on["nodeSelector"]
+    assert pod["tolerations"] == handed_on["tolerations"]
+    assert deployment["template"]["metadata"]["annotations"] == handed_on["podAnnotations"]
+    assert deployment["template"]["metadata"]["labels"]["team"] == "routing"
+    assert found["env"] == handed_on["extraEnv"]
+    # A map of the values file joins the default's: the other keys stay.
+    assert found["securityContext"]["runAsUser"] == 1000
+    assert found["securityContext"]["readOnlyRootFilesystem"] is True
+    assert found["imagePullPolicy"] == "Always"
+    assert pod["imagePullSecrets"] == [{"name": "registry-key"}]
+    assert service["spec"]["type"] == "NodePort"
+    assert service["metadata"]["annotations"] == handed_on["service"]["annotations"]
+    assert one(documents, "PodDisruptionBudget")["spec"]["minAvailable"] == 2
+    for probe in ("livenessProbe", "readinessProbe"):
+        for number, value in handed_on[probe].items():
+            assert found[probe][number] == value, f"{probe}.{number}"
 
 
 @needs_helm
@@ -505,6 +611,7 @@ def test_the_schema_refuses_a_value_the_block_does_not_have():
         assert "policyController.runtimeWorkerThreads" in render_error(
             *ON, f"policyController.runtimeWorkerThreads={threads}"
         )
+    assert "policyController.ports.admin" in render_error(*ON, "policyController.ports.admin=65536")
     # An empty path is no path: the kubelet would ask the root.
     for probe in ("livenessProbe", "readinessProbe"):
         assert f"policyController.{probe}.path" in render_error(
@@ -666,6 +773,7 @@ ARGUMENT_SETS = {
         "policyController.shutdownGracePeriodSeconds=60",
         "policyController.shutdownSettleSeconds=20",
     ),
+    "no-settle-window": ("policyController.shutdownSettleSeconds=0",),
     "no-thread-count": ("policyController.runtimeWorkerThreads=0",),
     "other-ports": (
         "policyController.ports.gateway=31100",
@@ -700,6 +808,82 @@ def test_the_binary_refuses_a_rendered_flag_spelled_wrong(binary):
         assert f"{flag}x" in refused.stderr
     unreadable = ["nowhere" if arg == "0.0.0.0:30103" else arg for arg in args]
     assert parse(binary, unreadable).returncode != 0
+
+
+# The form of a workflow path filter's entry that `starts_the_job` reads: an
+# optional leading ``!``, then names with ``*`` and a ``**`` that no slash
+# follows. The platform reads more: ``?``, ``+``, a bracket class, and a
+# ``**/`` that also matches no directory at all.
+READ_ENTRY = re.compile(r"!?(?!.*\*\*/)[A-Za-z0-9_./*-]+")
+
+
+def starts_the_job(path: str, entries: list[str]) -> bool:
+    """A workflow path filter's answer for one path, as the platform gives
+    it: the entries are read in order and the last one that matches decides,
+    so an entry led by ``!`` takes the path back out. ``**`` crosses
+    directories, ``*`` does not. An entry in a form this helper does not
+    read fails the case that asked: it is never read by its letters."""
+    started = False
+    for entry in entries:
+        assert READ_ENTRY.fullmatch(entry), f"this helper does not read the filter entry {entry!r}"
+        pattern = re.escape(entry.removeprefix("!")).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+        if re.fullmatch(pattern, path):
+            started = not entry.startswith("!")
+    return started
+
+
+def test_a_path_filter_is_read_as_the_platform_reads_it():
+    """The helper's rule on the platform's own examples: the last entry that
+    matches decides, so a negated entry takes a path back out and a later
+    entry puts it back in. An entry in a form the helper does not read fails
+    by name."""
+    notes = ["*.md", "!README.md"]
+    assert starts_the_job("hello.md", notes)
+    assert not starts_the_job("README.md", notes)
+    assert not starts_the_job("docs/hello.md", notes)
+    assert starts_the_job("README.md", [*notes, "README*"])
+    assert starts_the_job("README.doc", [*notes, "README*"])
+    assert not starts_the_job("README.md", ["!README.md"])
+    assert starts_the_job("docs/mona/octocat.txt", ["docs/**"])
+    assert not starts_the_job("docs/mona/octocat.txt", ["docs/*"])
+    for unread in ("docs/**/*.md", "*.jsx?", "v[12].md", "v1+.md", "v1\\*.md"):
+        with pytest.raises(AssertionError, match="does not read the filter entry"):
+            starts_the_job("docs/a.md", [unread])
+
+
+def test_the_image_job_starts_on_what_these_cases_read():
+    """The job that runs these cases on the image's binary starts when
+    something they read changes: this file, what configures its run and
+    every file of the chart a render reads. The chart's README and its alert
+    rule tests are read by no case, so they start nothing. The binary the
+    cases run is compiled from the crate's plugin contract too, so the job
+    starts on that file as on the crate's source."""
+    document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
+    # PyYAML reads the bare key `on` as the boolean true.
+    entries = document[True]["pull_request"]["paths"]
+    unread = (CHART / "README.md", CHART / "tests")
+    tests = Path(__file__).resolve().parent
+    read = [
+        Path(__file__).resolve(),
+        # pytest reads both for this run: the project file holds its settings.
+        tests / "conftest.py",
+        tests.parent / "pyproject.toml",
+        REPO / "crates" / "policy_controller" / "contracts" / "smg-policy.wit",
+    ] + [
+        path
+        for path in sorted(CHART.rglob("*"))
+        if path.is_file() and not any(path == skip or skip in path.parents for skip in unread)
+    ]
+    moved = [str(path.relative_to(REPO)) for path in read if not path.is_file()]
+    assert moved == [], f"{moved} is no file of the tree: the image job's filter follows it"
+    missed = [
+        str(path.relative_to(REPO))
+        for path in read
+        if not starts_the_job(str(path.relative_to(REPO)), entries)
+    ]
+    assert missed == [], f"a change of {missed} would not start the image job"
+    assert not starts_the_job("deploy/helm/smg/README.md", entries)
+    assert not starts_the_job("deploy/helm/smg/tests/rules/run.sh", entries)
 
 
 def free_ports(count: int) -> list[int]:
@@ -750,13 +934,27 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
         f"policyController.ports.admin={admin}",
         "policyController.shutdownGracePeriodSeconds=4",
         "policyController.shutdownSettleSeconds=1",
+        "router.metrics.serviceMonitor.enabled=true",
     )
     found = container(documents)
     probe = found["readinessProbe"]["httpGet"]
     ports = {port["name"]: port["containerPort"] for port in found["ports"]}
     url = f"http://127.0.0.1:{ports[probe['port']]}{probe['path']}"
+    # The other two requests the chart sets up: the liveness probe's, and the
+    # scrape of the ServiceMonitor through the Service's port (Prometheus
+    # asks /metrics when the endpoint names no path).
+    liveness = found["livenessProbe"]["httpGet"]
+    targets = {
+        port["name"]: port["targetPort"] for port in one(documents, "Service")["spec"]["ports"]
+    }
+    (endpoint,) = one(documents, "ServiceMonitor")["spec"]["endpoints"]
+    others = [
+        f"http://127.0.0.1:{ports[liveness['port']]}{liveness['path']}",
+        f"http://127.0.0.1:{ports[targets[endpoint['port']]]}{endpoint.get('path', '/metrics')}",
+    ]
     # Under Kubernetes HOSTNAME is the pod's name.
-    environment = dict(os.environ, HOSTNAME="smg-policy-controller-6d5f7c9b8-x2x4z")
+    environment = {k: v for k, v in os.environ.items() if k not in COLOR_VARIABLES}
+    environment["HOSTNAME"] = "smg-policy-controller-6d5f7c9b8-x2x4z"
     process = subprocess.Popen(
         [binary, *found["args"]],
         env=environment,
@@ -776,12 +974,20 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
             except (urllib.error.URLError, ConnectionError):
                 time.sleep(0.1)
         assert body == {"status": "ready"}
+        for other in others:
+            with DIRECT.open(other, timeout=2) as response:
+                assert response.status == 200, other
         # Every container port the Deployment names is a listener of the
         # started controller.
         for port in ports.values():
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
         process.send_signal(signal.SIGTERM)
-        assert process.wait(timeout=15) == 0, process.stdout.read()
+        output, _ = process.communicate(timeout=15)
+        assert process.returncode == 0, output
+        # The output is a pipe here, as it is under a container runtime: the
+        # log is plain text, with no color escape.
+        assert "smg_policy_controller" in output, "the controller logged nothing"
+        assert "\x1b" not in output, f"an escape byte with no terminal: {output!r}"
     finally:
         if process.poll() is None:
             process.kill()

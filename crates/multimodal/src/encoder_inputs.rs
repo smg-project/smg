@@ -66,15 +66,28 @@ impl fmt::Display for EncoderDtype {
 impl FromStr for EncoderDtype {
     type Err = String;
 
-    /// The wire names and their common spellings (`fp32`, `bf16`, `half`, ...).
+    /// The wire names and their common spellings (`fp32`, `bf16`, `half`, ...),
+    /// matched without regard to case and without copying the name.
     fn from_str(dtype: &str) -> Result<Self, Self::Err> {
-        match dtype.trim().to_ascii_lowercase().as_str() {
-            "float32" | "fp32" | "f32" => Ok(Self::Float32),
-            "bfloat16" | "bf16" => Ok(Self::BFloat16),
-            "float16" | "fp16" | "f16" | "half" => Ok(Self::Float16),
-            "uint8" | "u8" => Ok(Self::Uint8),
-            other => Err(format!("unsupported encoder input dtype {other:?}")),
-        }
+        const SPELLINGS: [(&str, EncoderDtype); 11] = [
+            ("float32", EncoderDtype::Float32),
+            ("fp32", EncoderDtype::Float32),
+            ("f32", EncoderDtype::Float32),
+            ("bfloat16", EncoderDtype::BFloat16),
+            ("bf16", EncoderDtype::BFloat16),
+            ("float16", EncoderDtype::Float16),
+            ("fp16", EncoderDtype::Float16),
+            ("f16", EncoderDtype::Float16),
+            ("half", EncoderDtype::Float16),
+            ("uint8", EncoderDtype::Uint8),
+            ("u8", EncoderDtype::Uint8),
+        ];
+        let name = dtype.trim();
+        SPELLINGS
+            .iter()
+            .find(|(spelling, _)| name.eq_ignore_ascii_case(spelling))
+            .map(|(_, dtype)| *dtype)
+            .ok_or_else(|| format!("unsupported encoder input dtype {name:?}"))
     }
 }
 
@@ -1657,6 +1670,48 @@ mod tests {
     use ndarray::Array4;
 
     use super::*;
+
+    /// The parser's table: each wire name and its common spellings parse in
+    /// their canonical, upper and mixed case and with surrounding whitespace;
+    /// a name outside the table is refused with its trimmed spelling.
+    #[test]
+    fn an_encoder_dtype_parses_from_each_of_its_spellings_in_any_case() {
+        let spellings = [
+            ("float32", EncoderDtype::Float32),
+            ("fp32", EncoderDtype::Float32),
+            ("f32", EncoderDtype::Float32),
+            ("bfloat16", EncoderDtype::BFloat16),
+            ("bf16", EncoderDtype::BFloat16),
+            ("float16", EncoderDtype::Float16),
+            ("fp16", EncoderDtype::Float16),
+            ("f16", EncoderDtype::Float16),
+            ("half", EncoderDtype::Float16),
+            ("uint8", EncoderDtype::Uint8),
+            ("u8", EncoderDtype::Uint8),
+        ];
+        for (spelling, dtype) in spellings {
+            let upper = spelling.to_ascii_uppercase();
+            let mixed: String = spelling
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            let padded = format!(" \t{spelling}\n");
+            for form in [spelling, upper.as_str(), mixed.as_str(), padded.as_str()] {
+                assert_eq!(form.parse::<EncoderDtype>(), Ok(dtype), "{form:?}");
+            }
+        }
+        assert_eq!(
+            " float64 ".parse::<EncoderDtype>(),
+            Err("unsupported encoder input dtype \"float64\"".to_string())
+        );
+    }
 
     /// A float tensor written out as wire bytes returns its storage to the
     /// thread's scratch pool: the next float take of that size on the thread

@@ -20,7 +20,7 @@ use crate::{
     observability::cache_trace,
     policies::expected_wait::ExpectedWait,
     worker::{
-        load_state::{LoadReceiver, LoadSnapshot},
+        load::state::{LoadReceiver, LoadSnapshot},
         Worker, WorkerType,
     },
 };
@@ -1171,7 +1171,7 @@ mod tests {
     use crate::{
         policies::test_support::{fed_pair, make_worker},
         worker::{
-            load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+            load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
             test_support::{no_health_check, worker_of},
             BasicWorkerBuilder, WorkerType,
         },

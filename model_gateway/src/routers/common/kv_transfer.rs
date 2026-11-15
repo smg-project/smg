@@ -14,7 +14,7 @@ use tracing::warn;
 use crate::{
     observability::metrics::metrics_labels,
     worker::{
-        pd_pairing::{connector_profile, KvTransferProfile},
+        pd::pairing::{connector_profile, KvTransferProfile},
         Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
         NIXL_CONNECTOR,
     },
