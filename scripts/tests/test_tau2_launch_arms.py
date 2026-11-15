@@ -124,6 +124,76 @@ def test_actual_executable_commands_and_visibility(invocation, monkeypatch, vend
 
 
 @pytest.mark.parametrize(
+    "arm,ready_after,expected_path",
+    [
+        pytest.param("a", 0, "/health", id="vllm-health"),
+        pytest.param("b", 1, "/readiness", id="gateway-delayed-readiness"),
+        pytest.param("b", None, "/readiness", id="gateway-not-ready-timeout"),
+    ],
+)
+def test_http_startup_waits_for_the_serving_endpoint(
+    invocation, monkeypatch, arm, ready_after, expected_path
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from urllib.error import HTTPError
+
+    run, _, _ = invocation
+    monkeypatch.setenv("TAU2_GPU_VENDOR", "amd")
+    monkeypatch.setenv("TAU2_GPU", "0,1" if arm == "a" else "2,3")
+    for key, number in {
+        "TAU2_ARM_A_PORT": "32114",
+        "TAU2_ARM_B_GRPC_PORT": "32111",
+        "TAU2_ARM_B_GW_PORT": "32112",
+        "TAU2_ARM_B_METRICS_PORT": "32113",
+    }.items():
+        monkeypatch.setenv(key, number)
+    spawned, http_requests, tcp_connections = [], [], []
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    def spawn(root, _scope, name, _command, _env):
+        spawned.append(name)
+        return root / (name + ".pid.json")
+
+    def connect(address, *, timeout):
+        assert timeout > 0
+        tcp_connections.append(address)
+        return nullcontext()
+
+    def request(url, *, timeout):
+        assert timeout > 0
+        http_requests.append(url)
+        # The gateway's liveness is always200, even before worker/tokenizer
+        # registration. Only readiness may become serving-ready here.
+        if url.endswith("/readiness"):
+            if ready_after is None or len(http_requests) <= ready_after:
+                raise HTTPError(url, 503, "not ready", None, None)
+        else:
+            assert url.endswith("/health")
+        return nullcontext(SimpleNamespace(status=200))
+
+    monkeypatch.setattr(arms, "spawn", spawn)
+    monkeypatch.setattr(arms, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    monkeypatch.setattr(arms, "socket", SimpleNamespace(create_connection=connect))
+    monkeypatch.setattr(arms, "urllib", SimpleNamespace(request=SimpleNamespace(urlopen=request)))
+    if ready_after is None:
+        with pytest.raises(TimeoutError, match="server startup timed out"):
+            call(monkeypatch, arm)
+        assert clock[0] >= float(os.environ["TAU2_STARTUP_TIMEOUT"])
+    else:
+        assert call(monkeypatch, arm) == 0
+        assert len(http_requests) == ready_after + 1
+    port = "32114" if arm == "a" else "32112"
+    assert http_requests and set(http_requests) == {f"http://127.0.0.1:{port}{expected_path}"}
+    assert spawned == (["arm_a"] if arm == "a" else ["arm_b_worker", "arm_b_gateway"])
+    assert tcp_connections == ([] if arm == "a" else [("127.0.0.1", 32111)])
+    assert not list(run.glob("*.pid.json"))
+
+
+@pytest.mark.parametrize(
     "key,value",
     [
         ("TAU2_GPU", "0,0"),

@@ -268,7 +268,7 @@ def port(variable):
         return sock.getsockname()[1]
 
 
-def wait_ready(root, scope, record, number, http):
+def wait_ready(root, scope, record, number, http, http_path="/health"):
     timeout = float(os.environ.get("TAU2_STARTUP_TIMEOUT", "420"))
     if not 0 < timeout <= 3600:
         raise ValueError("startup timeout must be finite and <=3600s")
@@ -280,7 +280,7 @@ def wait_ready(root, scope, record, number, http):
             remaining = max(0.01, min(1, deadline - time.monotonic()))
             if http:
                 with urllib.request.urlopen(
-                    f"http://127.0.0.1:{number}/health", timeout=remaining
+                    f"http://127.0.0.1:{number}{http_path}", timeout=remaining
                 ) as response:
                     if response.status == 200:
                         return
@@ -422,7 +422,7 @@ def main():
                 if env.get(key, default):
                     gateway += [flag, env.get(key, default)]
             record = spawn(root, scope, "arm_b_gateway", gateway, env)
-            wait_ready(root, scope, record, number, True)
+            wait_ready(root, scope, record, number, True, "/readiness")
         print(f"http://127.0.0.1:{number}")
     except BaseException:
         if not cleanup(root, scope):
