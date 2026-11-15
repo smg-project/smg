@@ -825,7 +825,11 @@ fn validate_chat_parts(
         let text_only_role = match message {
             ChatMessage::System { .. } => Some("system"),
             ChatMessage::Developer { .. } => Some("developer"),
-            _ => None,
+            ChatMessage::Assistant { .. } => Some("assistant"),
+            ChatMessage::Root { .. } => Some("root"),
+            ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
+                None
+            }
         };
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
@@ -862,7 +866,7 @@ fn validate_chat_parts(
                         if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
                             return Err(format!(
                                 "Unsupported chat content part type {kind:?} in a {role} message \
-                                 for gRPC backends: media parts are taken in user messages"
+                                 for gRPC backends: media parts are taken in user and tool messages"
                             ));
                         }
                     }
