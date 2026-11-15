@@ -591,6 +591,15 @@ pub(crate) const KV_TRANSPORT: &str = "mooncake";
 
 /// The name of the scheduler service a worker of `wire` serves: what the
 /// standard health service answers for, and what a gateway's detection asks.
+/// The vector the mock embeds an input into, deterministic from its ids so a
+/// bed can check an answer: eight dimensions, the first eight ids each over
+/// 1024, zero where the input is shorter.
+pub(super) fn embedding_of(input_ids: &[u32]) -> Vec<f32> {
+    (0..8)
+        .map(|i| input_ids.get(i).copied().unwrap_or(0) as f32 / 1024.0)
+        .collect()
+}
+
 pub(crate) fn service_name(wire: SchedulerWire) -> &'static str {
     match wire {
         SchedulerWire::TokenSpeed => <tokenspeed::Server as NamedService>::NAME,
@@ -3344,6 +3353,22 @@ mod tests {
             service.ranks[0].prefill_pending.load(Ordering::Relaxed),
             0,
             "settled once the queued choice streamed"
+        );
+    }
+
+    /// The mock's embedding of an input is deterministic from its ids: eight
+    /// dimensions, the first eight ids each over 1024, zero past the input.
+    #[test]
+    fn the_mock_embedding_is_the_first_eight_ids_over_1024() {
+        assert_eq!(
+            embedding_of(&[1024, 512, 0]),
+            vec![1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(embedding_of(&[]), vec![0.0; 8]);
+        let long: Vec<u32> = (1..=12).map(|i| i * 1024).collect();
+        assert_eq!(
+            embedding_of(&long),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
         );
     }
 }
