@@ -29,6 +29,7 @@ The ``type``-discrimination invariants exercised here live in:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -38,12 +39,14 @@ import pytest
 logger = logging.getLogger(__name__)
 
 
-def _post_responses(gateway, body: dict, timeout: float = 30.0) -> httpx.Response:
+def _post_responses(gateway, body: dict | str, timeout: float = 30.0) -> httpx.Response:
     """POST a raw JSON body to ``{gateway.base_url}/v1/responses``.
 
     We need full control over the wire payload (invalid ``type`` strings,
     empty discriminators, etc.), which the OpenAI SDK's typed client will
-    not emit, so all four cases drop to raw ``httpx``.
+    not emit, so all four cases drop to raw ``httpx``. A body given as text
+    goes on the wire as it is, for a shape a dict cannot carry (a repeated
+    key).
 
     Forwards ``OPENAI_API_KEY`` when present so the accept-path tests
     (``!= 400``) cannot be satisfied vacuously by a ``401`` from an
@@ -53,9 +56,10 @@ def _post_responses(gateway, body: dict, timeout: float = 30.0) -> httpx.Respons
     auth so the key value is irrelevant for them.
     """
     api_key = os.environ.get("OPENAI_API_KEY", "sk-not-used")
+    payload = {"content": body} if isinstance(body, str) else {"json": body}
     return httpx.post(
         f"{gateway.base_url}/v1/responses",
-        json=body,
+        **payload,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -297,3 +301,27 @@ class TestResponsesInputValidation:
         # second part's ``type``.
         err = _assert_validation_400(resp, code="invalid_value")
         assert err["error"]["param"] == "input[0].content[1].type", err
+
+    def test_repeated_key_inside_a_content_part_rejected_400(self, setup_backend):
+        """A key repeated inside a content part is refused, the part named.
+
+        An input item's own keys are read one at a time, and so is every
+        value below them, so a part written as ``{"type": "input_text",
+        "text": "a", "text": "b"}`` is refused with serde's words
+        (``duplicate field `text```, the code of a reason the public API
+        has no name for) at ``input[0].content[0]``, as the derived readers
+        refuse a repeated key, instead of the last value winning. The body
+        goes on the wire as text: a dict cannot carry the repeated key.
+        """
+        _, model_path, _, gw = setup_backend
+        body = (
+            '{"model": ' + json.dumps(model_path) + ', "input": [{"role": "user", '
+            '"content": [{"type": "input_text", "text": "a", "text": "b"}]}]}'
+        )
+        resp = _post_responses(gw, body)
+        err = _assert_validation_400(resp, code="json_parse_error")
+        assert err["error"]["param"] == "input[0].content[0]", err
+        message = err["error"]["message"]
+        assert "input[0].content[0]: duplicate field `text`" in message, (
+            f"expected the part to be named with serde's words, got message={message!r}"
+        )
