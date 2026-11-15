@@ -189,8 +189,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A Messages image or document whose source is a file uploaded through the Files API
   (`{"type": "file", "file_id": ...}`) is accepted and forwarded as written, as the public API
   takes it. The source was an unknown variant, which refused the whole request. The gRPC router,
-  which has no Files API to read the file from, refuses such an image or document naming the
-  block. Breaking: `ImageSource` and `DocumentSource` gain `File`.
+  which has no Files API to read the file from, refuses such an image naming the block wherever it
+  appears, and such a document at a message's top level; a document inside a tool result is left
+  out of its prompt, as every document there is today. Breaking: `ImageSource` and
+  `DocumentSource` gain `File`.
 - A Responses input file part with `detail: "auto"`, the public API's default (`FileInputDetail`),
   parses, and a prompt's file variable keeps its `detail` when the request is written back for an
   upstream. The crate refused the request with ``unknown variant `auto`, expected `low` or
