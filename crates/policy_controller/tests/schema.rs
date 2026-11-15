@@ -6,7 +6,7 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
-use smg_policy_controller::{spec::MAX_HEADERS, PolicySpec};
+use smg_policy_controller::{spec::MAX_HEADERS, Catalog, PolicySpec};
 
 fn schema_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("policyspec.schema.json")
@@ -122,33 +122,22 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
             .map(str::to_string)
             .collect()
     };
-    assert_eq!(
-        bare("ScoreSpec"),
-        [
-            "least-load",
-            "least-requests",
-            "fewest-sessions",
-            "session-affinity",
-            "prefix-affinity",
-            "kv-pressure",
-            "warmup-slice",
-            "bucket",
-            "consistent-hash",
-        ]
-    );
-    assert_eq!(
-        bare("PickSpec"),
-        [
-            "best",
-            "round-robin",
-            "random",
-            "power-of-two",
-            "count-first",
-            "power-of-two-count-first",
-            "passthrough",
-            "manual",
-        ]
-    );
+    // Read from the stock catalog, the one the validator resolves a name in:
+    // a built-in added to the catalog and not to the schema, or the other
+    // way round, fails here.
+    let stock = Catalog::builtin();
+    let scorers: Vec<&str> = stock
+        .scorers()
+        .filter(|name| *name != "resident-work")
+        .collect();
+    assert_eq!(bare("ScoreSpec"), scorers);
+    assert_eq!(scorers.len(), 9);
+    let pickers: Vec<&str> = stock
+        .pickers()
+        .filter(|name| *name != "best-with-temperature")
+        .collect();
+    assert_eq!(bare("PickSpec"), pickers);
+    assert_eq!(pickers.len(), 8);
     // The ranges the validator enforces are the schema's too, so an editor
     // refuses on shape what apply would refuse.
     let field = |def: &str, name: &str| defs[def]["properties"][name].clone();

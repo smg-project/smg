@@ -27,6 +27,10 @@
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
 //!   scorer owns its ring ([`ring`]), fed by the membership hooks.
+//! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
+//!   build knows by name, the stock build's and the ones a host registers.
+//!   A document names either kind the same way, and the validator resolves
+//!   every name once ([`PolicySpec::validate_in`]).
 //! - 4.6, the schema ([`spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists.
@@ -72,6 +76,7 @@
 
 pub mod affinity;
 pub mod builtins;
+pub mod catalog;
 #[cfg(feature = "controller")]
 pub mod controller;
 pub mod decision;
@@ -93,6 +98,7 @@ pub mod view;
 pub mod wasm;
 pub mod wit;
 
+pub use catalog::{Catalog, CatalogError, StageKind};
 pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
