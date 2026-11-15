@@ -394,9 +394,13 @@ pub(crate) async fn execute_plan(
             ExecutionPlan::EmbedBatch { requests, .. } => {
                 execute_embed(requests, clients, workers, ledger).await
             }
+            // The two disaggregated arms are boxed: their futures are over ten
+            // times the single arm's, and by value they would size every
+            // attempt's dispatch future (and the run's one box) for a path the
+            // request does not take.
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(
+                Box::pin(execute_pd_dispatch(
                     req,
                     clients,
                     workers,
@@ -405,7 +409,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
-                )
+                ))
                 .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
@@ -414,7 +418,7 @@ pub(crate) async fn execute_plan(
                 // request at request building and its encode jobs go with the
                 // prefill/decode pair; a push plan runs its encode call first.
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_epd_dispatch(
+                Box::pin(execute_epd_dispatch(
                     request,
                     clients,
                     workers,
@@ -423,7 +427,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
-                )
+                ))
                 .await
                 .map_err(|mut response| {
                     // A push may already have reserved buffers on this
