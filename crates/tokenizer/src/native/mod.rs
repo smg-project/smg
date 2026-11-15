@@ -2636,8 +2636,11 @@ impl NativeEncoder {
     /// while the next unit's first stage begins inside that match and may
     /// match otherwise: `[ a]{999}` then ` a` over a run of ` a`); else that
     /// is no cut. The three span lists are the caller's (`spans`, the
-    /// thread's scratch through `stable_cut`): cleared here, grown once per
-    /// thread, so a check allocates nothing after a thread's first.
+    /// thread's scratch through `stable_cut`): cleared here and grown once
+    /// per thread, so a check over prose allocates nothing after the
+    /// thread's first (a search whose window grew a list past
+    /// [`CUT_SPANS_KEPT`] gives that list back, and the next check grows it
+    /// again).
     fn piece_starts_at(&self, window: &str, at: usize, spans: &mut CutSpans) -> bool {
         let [whole, left, right] = spans;
         whole.clear();
