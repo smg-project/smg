@@ -32,9 +32,11 @@
 //!   apply, before any request exists.
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
-//!   which the controller's store is fed (membership, health, loads, KV event
-//!   cursors, reservations, sessions, leases), the one-process
-//!   [`store::MemoryStore`] behind them and the contract tests over it. A
+//!   which the controller's store is fed (membership, health, loads, KV
+//!   events, reservations, sessions, leases), the one-process
+//!   [`store::MemoryStore`] behind them and the contract tests over it. The
+//!   KV events feed the index the store holds for each model
+//!   ([`store::index`]), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
 //!   structures. The store publishes what a decision reads
 //!   ([`store::World`]: every pool as whole candidate rows) and builds one
