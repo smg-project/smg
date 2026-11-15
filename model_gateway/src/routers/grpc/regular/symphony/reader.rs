@@ -291,10 +291,11 @@ pub(crate) fn assign(
 /// say, the output's first bytes decide ([`Assignment::opener`]). One forced call has no opener
 /// to name there: a named function's arguments the schema does not hold to an object
 /// ([`holds_to_an_object`]), with the reasoning kept in the content. That JSON may open with any
-/// byte, and read after the replay it would be content and no call, so it starts in the call.
-/// With the reasoning separated the opener is named whatever the schema: an output that opens
-/// otherwise is read where the replay leaves the reader, and JSON alone inside a thought the
-/// prompt opened is that thought. `pool_start` says which start, for the model's workers together
+/// byte, and read after the replay it would be content and no call, so it starts in the call;
+/// a thought written first is the call's text there. With the reasoning separated the opener
+/// is named whatever the schema: an output that opens otherwise is read where the replay
+/// leaves the reader, and JSON alone inside a thought the prompt opened is that thought.
+/// `pool_start` says which start, for the model's workers together
 /// ([`grammar_start_of`](super::constraint::grammar_start_of)); it is asked for a forced call
 /// alone, so no other request pays for the answer.
 ///
@@ -400,10 +401,10 @@ enum ForcedStart {
     /// write after it, whitespace aside) is the call from the opener, with nothing of the prompt
     /// replayed ([`Reader::decide`]). What this start reads wrong, which no reader can tell
     /// apart while the workers do not say where they start a grammar: a thought that itself
-    /// opens as the JSON does, and a thought behind more whitespace than the output's deciding
-    /// bytes hold ([`DECIDING_BYTES`]), are read as the call; where the reasoning is separated,
-    /// a named call's JSON that opens with another byte than the brace is read as the thought
-    /// ([`assign_for`]).
+    /// opens as the JSON does, and a thought behind a run of whitespace that fills the output's
+    /// deciding bytes ([`DECIDING_BYTES`], the opener counted where one came), are read as the
+    /// call; where the reasoning is separated, a named call's JSON that opens with another byte
+    /// than the brace is read as the thought ([`assign_for`]).
     ByTheFirstBytes,
 }
 
@@ -698,10 +699,12 @@ impl Reader {
     /// thought that began with the opener's byte, read after the replay. Whitespace is the
     /// JSON's until a byte says otherwise: deciding bytes that run out on it, before the opener
     /// or after it, start the reader in the call, so the hold ends there however long the model
-    /// writes whitespace. The start's events and those of what was held before it go into `out`
-    /// ahead of the step's own, and the caller reads `delta` (`true`). A delta that decides
-    /// nothing (whitespace alone, or the opener with nothing after it, short of the deciding
-    /// bytes) is held with its tokens' spans, and the caller reads nothing (`false`).
+    /// writes whitespace. It is ASCII's whitespace, the form feed among it, which JSON does not
+    /// take: no grammar writes that byte, so none comes where the schema holds the output. The
+    /// start's events and those of what was held before it go into `out` ahead of the step's
+    /// own, and the caller reads `delta` (`true`). A delta that decides nothing (whitespace
+    /// alone, or the opener with nothing after it, short of the deciding bytes) is held with
+    /// its tokens' spans, and the caller reads nothing (`false`).
     fn decide(&mut self, delta: &Delta, out: &mut Events<'_>) -> Result<bool, SymphonyError> {
         let Some(mut undecided) = self.undecided.take() else {
             return Ok(true);

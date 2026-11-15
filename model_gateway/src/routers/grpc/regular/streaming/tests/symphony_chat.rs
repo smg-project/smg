@@ -2696,19 +2696,26 @@ async fn symphony_reads_the_thought_and_then_the_call_a_json_schema_forces() {
 }
 
 /// A forced call the token limit cut keeps the bytes that arrived, and its stream ends with the
-/// engine's `length`, never `tool_calls`. A required call's item without parameters is a call
-/// with an empty object. The stream and the collected message agree on every call byte for byte.
+/// engine's `length`, never `tool_calls`. What a required call's list still held at the cut is
+/// no content: behind a whole call the comma after an item and the next item cut before its
+/// arguments began, behind an item's whole arguments the rest of its object (the whitespace an
+/// indented list writes before the closing brace, a name written after the parameters). A list
+/// cut inside its first item made no call: the reader releases the output's own bytes from the
+/// bracket, as it releases any call block the table refused in an answer that made no call. A
+/// required call's item without parameters is a call with an empty object. The stream and the
+/// collected message agree on every call byte for byte.
 #[tokio::test]
 async fn a_forced_call_cut_short_or_without_parameters_reads_the_same_streamed_and_whole() {
     let named = json!({"type": "function", "function": {"name": "lookup"}});
     let required = json!("required");
-    for (tool_choice, output, engine_finish, arguments, finish) in [
+    for (tool_choice, output, engine_finish, arguments, content, finish) in [
         // The limit cut the arguments of the function the request names.
         (
             &named,
             r#"plan</think>{"q":"Par"#,
             "length",
             vec![r#"{"q":"Par"#],
+            "",
             "length",
         ),
         // The limit cut a required call's list inside its second item.
@@ -2717,6 +2724,54 @@ async fn a_forced_call_cut_short_or_without_parameters_reads_the_same_streamed_a
             r#"plan</think>[{"name":"lookup","parameters":{"q":"a"}},{"name":"lookup","parameters":{"q":"Par"#,
             "length",
             vec![r#"{"q":"a"}"#, r#"{"q":"Par"#],
+            "",
+            "length",
+        ),
+        // The limit cut a required call's list between two items: the comma is no content.
+        (
+            &required,
+            r#"plan</think>[{"name":"lookup","parameters":{"q":"a"}},"#,
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The limit cut the list's second item before its arguments began.
+        (
+            &required,
+            r#"plan</think>[{"name":"lookup","parameters":{"q":"a"}}, {"name":"loo"#,
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The limit cut an indented list behind an item's whole arguments, before the item's
+        // closing brace: the newline and the indent are no content, streamed or whole.
+        (
+            &required,
+            "plan</think>[\n  {\"name\":\"lookup\",\"parameters\":{\"q\":\"a\"}\n  ",
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The same cut behind a name written after the parameters.
+        (
+            &required,
+            r#"plan</think>[{"parameters":{"q":"a"},"name":"lookup""#,
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The limit cut the list's first item before its arguments began: no call was made,
+        // so the reader releases the output's own bytes from the bracket.
+        (
+            &required,
+            r#"plan</think>[{"name":"loo"#,
+            "length",
+            vec![],
+            r#"[{"name":"loo"#,
             "length",
         ),
         // A required call's item without parameters.
@@ -2725,6 +2780,7 @@ async fn a_forced_call_cut_short_or_without_parameters_reads_the_same_streamed_a
             r#"plan</think>[{"name":"lookup"}]"#,
             "stop",
             vec!["{}"],
+            "",
             "tool_calls",
         ),
     ] {
@@ -2747,7 +2803,7 @@ async fn a_forced_call_cut_short_or_without_parameters_reads_the_same_streamed_a
             "plan",
             "{output}"
         );
-        assert_eq!(chat_text(&events, 0, "content"), "", "{output}");
+        assert_eq!(chat_text(&events, 0, "content"), content, "{output}");
         assert_eq!(streamed_finish(&events), finish, "{output}");
 
         let choice = forced_whole(&spec, output, engine_finish).await;
@@ -2767,6 +2823,11 @@ async fn a_forced_call_cut_short_or_without_parameters_reads_the_same_streamed_a
         assert_eq!(
             choice.message.reasoning_content.as_deref(),
             Some("plan"),
+            "{output}"
+        );
+        assert_eq!(
+            choice.message.content.as_deref().unwrap_or_default(),
+            content,
             "{output}"
         );
         assert_eq!(choice.finish_reason.as_deref(), Some(finish), "{output}");
@@ -2917,6 +2978,66 @@ async fn a_message_reads_the_thought_and_then_the_tool_a_json_schema_forces() {
         ]
     );
     assert_eq!(message_stop_reason(&events), "tool_use");
+}
+
+/// A message whose `tool_choice` asks for any tool reads the list the JSON schema forces, and
+/// what that list still held when the token limit cut it (the comma after a tool, the next
+/// tool cut before its input began, a tool's name written after its input) opens no text block
+/// beside the tool's: the message is the thought and the tool, and its stop reason the limit's.
+#[tokio::test]
+async fn a_message_whose_required_tools_the_token_limit_cut_has_no_text_block() {
+    let request: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "Qwen/Qwen3-8B", "max_tokens": 64, "messages": [],
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "tool_choice": {"type": "any"},
+        "tools": [{"name": "lookup", "input_schema": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}]
+    }))
+    .expect("a Messages request");
+    let schema = ("json_schema".to_string(), "{}".to_string());
+    for output in [
+        r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}},"#,
+        r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}}, {"name":"loo"#,
+        r#"plan</think>[{"parameters":{"q":"Paris"},"name":"lookup""#,
+    ] {
+        let mut spec = MessagesResponseSpec::from(&request);
+        spec.symphony = assign_for(
+            Reading::Table(Table::Qwen3.shared(), false),
+            Asks::for_messages(&request, false),
+            Some(&schema),
+            "<|im_start|>assistant\n<think>\n",
+            ProviderProfile::for_model(&request.model),
+            || GrammarStart::Unknown,
+        );
+        assert_eq!(
+            spec.symphony.as_ref().map(Assignment::table),
+            Some("qwen3"),
+            "the model's table reads the required tools"
+        );
+        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        frames.push(complete(0, "length"));
+        let (result, events) = message_events(frames, spec, None).await;
+        assert!(result.is_ok(), "{output}: {result:?}");
+        assert_eq!(
+            message_blocks(&events),
+            vec![
+                ("thinking".to_string(), String::new(), json!("plan")),
+                (
+                    "tool_use".to_string(),
+                    "lookup".to_string(),
+                    json!({"q": "Paris"})
+                ),
+            ],
+            "{output}"
+        );
+        // Which of the limit's two reasons it is reads the budget against the window: the
+        // truncation cases' subject.
+        let stop = message_stop_reason(&events);
+        assert!(
+            stop == "max_tokens" || stop == "model_context_window_exceeded",
+            "{output}: {stop}"
+        );
+    }
 }
 
 /// Two calls a required choice forces arrive when one frame ends the first call and holds the
