@@ -1001,19 +1001,34 @@ mod tests {
                     );
                     return;
                 }
+                // Each bound names itself in the panic, so a red run says
+                // which one fired.
+                // The quiet window is judged at the sample's own instant: a
+                // parent held off the core between the read and the check
+                // must not turn an unobserved stretch into a deadlock.
+                let observed = Instant::now();
                 let blocked = match process_cpu_time(child.id()) {
                     Some(cpu) => {
                         if cpu > progressed.1 {
-                            progressed = (Instant::now(), cpu);
+                            progressed = (observed, cpu);
                         }
-                        progressed.0.elapsed() >= QUIET || started.elapsed() >= CEILING
+                        if observed.duration_since(progressed.0) >= QUIET {
+                            Some(format!(
+                                "no CPU accrued for {QUIET:?} (child CPU time {cpu:?})"
+                            ))
+                        } else if observed.duration_since(started) >= CEILING {
+                            Some(format!("the {CEILING:?} wall ceiling passed with the child still on CPU ({cpu:?})"))
+                        } else {
+                            None
+                        }
                     }
-                    None => started.elapsed() >= WALL_ONLY,
+                    None => (observed.duration_since(started) >= WALL_ONLY)
+                        .then(|| format!("{WALL_ONLY:?} of wall clock, no process table to read")),
                 };
-                if blocked {
+                if let Some(reason) = blocked {
                     child.kill().expect("kill blocked child");
                     child.wait().expect("reap child");
-                    panic!("shared capped decode blocked the vision pool");
+                    panic!("shared capped decode blocked the vision pool: {reason}");
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
