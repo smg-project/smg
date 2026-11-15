@@ -91,20 +91,29 @@ impl PoolKey {
     }
 }
 
+/// Where a pooled connection's tool listing stands: not returned yet (the
+/// connection is pooled before its opener lists, so a hit meanwhile lists
+/// for itself), made, or failed with the server's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Listing {
+    Pending,
+    Listed,
+    Failed(String),
+}
+
 /// Cached MCP connection.
 #[derive(Clone)]
 pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
-    /// Why this connection's tool listing failed; `None` once a listing
-    /// succeeded. It leaves the pool with the connection.
-    pub list_error: Option<String>,
+    /// The connection's tool listing. It leaves the pool with the connection.
+    pub listing: Listing,
 }
 
 impl CachedConnection {
     pub fn new(client: Arc<McpClient>) -> Self {
         Self {
             client,
-            list_error: None,
+            listing: Listing::Pending,
         }
     }
 }
@@ -254,22 +263,21 @@ impl McpConnectionPool {
         }
     }
 
-    /// Record the outcome of a connection's tool listing: the failure's
-    /// message, or `None` for a listing that succeeded. A key the pool no
+    /// Record where the connection's tool listing stands. A key the pool no
     /// longer holds is left alone.
-    pub fn set_list_error(&self, key: &PoolKey, error: Option<String>) {
+    pub fn set_listing(&self, key: &PoolKey, listing: Listing) {
         if let Some(cached) = self.connections.lock().peek_mut(key) {
-            cached.list_error = error;
+            cached.listing = listing;
         }
     }
 
-    /// The failure recorded for the connection under `key`; `None` when its
-    /// listing succeeded or the pool does not hold it. No promotion.
-    pub fn list_error(&self, key: &PoolKey) -> Option<String> {
+    /// Where the listing of the connection under `key` stands; `None` when
+    /// the pool does not hold it. No promotion.
+    pub fn listing(&self, key: &PoolKey) -> Option<Listing> {
         self.connections
             .lock()
             .peek(key)
-            .and_then(|cached| cached.list_error.clone())
+            .map(|cached| cached.listing.clone())
     }
 
     pub fn list_keys(&self) -> Vec<PoolKey> {

@@ -58,7 +58,7 @@ use super::{
     },
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
-    pool::{McpConnectionPool, PoolKey, UrlLookup},
+    pool::{Listing, McpConnectionPool, PoolKey, UrlLookup},
     reconnect::ReconnectionManager,
 };
 use crate::{
@@ -1681,11 +1681,14 @@ impl McpOrchestrator {
         let pool_key = PoolKey::from_config(&config, tenant_id);
         let server_key = pool_key.url.clone();
 
-        // A connection with the same auth and tenant is a pool hit, unless the
-        // listing made on it failed: that connection lists again, so a
-        // transient refusal does not stand until the connection is evicted.
+        // A connection with the same auth and tenant whose tools are listed
+        // is a pool hit. One whose listing failed, or has not returned yet
+        // (its opener is still listing), lists again for this caller: a
+        // transient refusal does not stand until eviction, and a caller
+        // arriving during another's listing takes no pending listing for a
+        // success.
         let pooled = self.connection_pool.get(&pool_key);
-        if pooled.is_some() && self.connection_pool.list_error(&pool_key).is_none() {
+        if pooled.is_some() && self.connection_pool.listing(&pool_key) == Some(Listing::Listed) {
             return Ok(ConnectedServer {
                 server_key,
                 list_error: None,
@@ -1748,8 +1751,13 @@ impl McpOrchestrator {
             }
             Err(message) => Some(message),
         };
-        self.connection_pool
-            .set_list_error(&pool_key, list_error.clone());
+        self.connection_pool.set_listing(
+            &pool_key,
+            match &list_error {
+                Some(message) => Listing::Failed(message.clone()),
+                None => Listing::Listed,
+            },
+        );
 
         if opened {
             self.metrics.record_connection_opened();

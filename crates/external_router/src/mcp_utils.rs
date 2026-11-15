@@ -444,7 +444,14 @@ pub fn prepare_hosted_dispatch_args(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use openai_protocol::{
         common::Function,
@@ -522,14 +529,21 @@ mod tests {
         )
     }
 
-    /// A local MCP server over HTTP that initializes and answers `tools/list`
-    /// with `tools` (each with an empty schema), or with a JSON-RPC error when
-    /// `tools` is `None` or the request carries the `refused_bearer` token;
-    /// the URL it serves on.
-    async fn serve_local_mcp_server(
+    /// What the local MCP server answers to `tools/list`: `tools` (each with
+    /// an empty schema), or a JSON-RPC error when `tools` is `None`, when the
+    /// request carries the `refused_bearer` token, or while `refusing` is
+    /// set; the answer comes after `list_delay`.
+    #[derive(Clone, Default)]
+    struct LocalServer {
         tools: Option<&'static [&'static str]>,
         refused_bearer: Option<&'static str>,
-    ) -> String {
+        refusing: Option<Arc<AtomicBool>>,
+        list_delay: Duration,
+    }
+
+    /// A local MCP server over HTTP that initializes and answers `tools/list`
+    /// as `server` says; the URL it serves on.
+    async fn serve_local_mcp_server(server: LocalServer) -> String {
         use axum::{
             extract::State,
             http::{HeaderMap, StatusCode},
@@ -538,10 +552,7 @@ mod tests {
         };
 
         async fn mcp(
-            State((tools, refused_bearer)): State<(
-                Option<&'static [&'static str]>,
-                Option<&'static str>,
-            )>,
+            State(server): State<LocalServer>,
             headers: HeaderMap,
             Json(message): Json<Value>,
         ) -> axum::response::Response {
@@ -558,13 +569,20 @@ mod tests {
                 }))
                 .into_response(),
                 Some("tools/list") => {
-                    let refused = refused_bearer.is_some_and(|token| {
-                        headers
-                            .get(axum::http::header::AUTHORIZATION)
-                            .and_then(|value| value.to_str().ok())
-                            .is_some_and(|value| value == format!("Bearer {token}"))
-                    });
-                    match tools {
+                    let refused = server
+                        .refusing
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                        || server.refused_bearer.is_some_and(|token| {
+                            headers
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .is_some_and(|value| value == format!("Bearer {token}"))
+                        });
+                    if !server.list_delay.is_zero() {
+                        tokio::time::sleep(server.list_delay).await;
+                    }
+                    match server.tools {
                         Some(names) if !refused => Json(json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": {"tools": names.iter().map(|name| json!({
@@ -603,14 +621,31 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new()
-                    .route("/mcp", post(mcp))
-                    .with_state((tools, refused_bearer)),
+                Router::new().route("/mcp", post(mcp)).with_state(server),
             )
             .await
             .expect("the local MCP server serves");
         });
         format!("http://127.0.0.1:{port}/mcp")
+    }
+
+    /// The `error` of the `mcp_list_tools` item a session over `bindings`
+    /// builds for `label`, as a request's response carries it.
+    fn list_item_error(
+        orchestrator: &McpOrchestrator,
+        bindings: Vec<McpServerBinding>,
+        label: &str,
+    ) -> Option<Value> {
+        let server_key = bindings
+            .iter()
+            .find(|binding| binding.label == label)
+            .expect("the label is bound")
+            .server_key
+            .clone();
+        let session = McpToolSession::new(orchestrator, bindings, "test-request");
+        openai_bridge::mcp_list_tools_json(&session, label, &server_key)
+            .get("error")
+            .cloned()
     }
 
     /// A server that connects but cannot list its tools is a binding whose
@@ -621,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_tools_list_is_the_list_items_error() {
         let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-        let url = serve_local_mcp_server(None, None).await;
+        let url = serve_local_mcp_server(LocalServer::default()).await;
         let inputs = [McpServerInput {
             label: "conf".to_string(),
             url: Some(url),
@@ -663,8 +698,12 @@ mod tests {
         config.pool.max_connections = 1;
         let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
         let format_registry = FormatRegistry::new();
-        let refusing = serve_local_mcp_server(None, None).await;
-        let listing = serve_local_mcp_server(Some(&["echo"]), None).await;
+        let refusing = serve_local_mcp_server(LocalServer::default()).await;
+        let listing = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            ..Default::default()
+        })
+        .await;
         let input = |label: &str, url: &str| McpServerInput {
             label: label.to_string(),
             url: Some(url.to_string()),
@@ -672,18 +711,7 @@ mod tests {
             headers: HashMap::new(),
             allowed_tools: None,
         };
-        let item_error = |bindings: Vec<McpServerBinding>, label: &str| {
-            let server_key = bindings
-                .iter()
-                .find(|binding| binding.label == label)
-                .expect("the label is bound")
-                .server_key
-                .clone();
-            let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-            openai_bridge::mcp_list_tools_json(&session, label, &server_key)
-                .get("error")
-                .cloned()
-        };
+        let item_error = |bindings, label| list_item_error(&orchestrator, bindings, label);
 
         let first =
             connect_mcp_servers(&orchestrator, &format_registry, &[input("a", &refusing)]).await;
@@ -711,7 +739,12 @@ mod tests {
     #[tokio::test]
     async fn a_listing_refused_for_one_caller_is_not_anothers_error() {
         let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-        let url = serve_local_mcp_server(Some(&["echo"]), Some("refused-token")).await;
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            refused_bearer: Some("refused-token"),
+            ..Default::default()
+        })
+        .await;
         let input = |label: &str, token: &str| McpServerInput {
             label: label.to_string(),
             url: Some(url.clone()),
@@ -720,11 +753,8 @@ mod tests {
             allowed_tools: None,
         };
         let item_error = |bindings: Vec<McpServerBinding>| {
-            let binding = bindings.first().expect("one binding").clone();
-            let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-            openai_bridge::mcp_list_tools_json(&session, &binding.label, &binding.server_key)
-                .get("error")
-                .cloned()
+            let label = bindings.first().expect("one binding").label.clone();
+            list_item_error(&orchestrator, bindings, &label)
         };
 
         let refused = connect_mcp_servers(
@@ -749,6 +779,80 @@ mod tests {
             None,
             "a refusal another caller met is not this caller's error"
         );
+    }
+
+    /// A pooled connection whose listing failed lists again for the next
+    /// caller with the same key: the server refuses the first request's
+    /// `tools/list` and lists for the second, whose item carries no error.
+    /// A transient refusal lasts one request, not until eviction.
+    #[tokio::test]
+    async fn a_hit_on_a_connection_whose_listing_failed_lists_again() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let refusing = Arc::new(AtomicBool::new(true));
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            refusing: Some(Arc::clone(&refusing)),
+            ..Default::default()
+        })
+        .await;
+        let input = || McpServerInput {
+            label: "conf".to_string(),
+            url: Some(url.clone()),
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+
+        let first = connect_mcp_servers(&orchestrator, &format_registry, &[input()]).await;
+        assert!(
+            list_item_error(&orchestrator, first, "conf").is_some_and(|error| error.is_string()),
+            "the first request's listing was refused"
+        );
+
+        refusing.store(false, Ordering::SeqCst);
+        let second = connect_mcp_servers(&orchestrator, &format_registry, &[input()]).await;
+        assert_eq!(
+            list_item_error(&orchestrator, second, "conf"),
+            None,
+            "the pooled connection listed again for the second request"
+        );
+    }
+
+    /// A caller that hits the pool while the connection's opener is still
+    /// listing takes no pending listing for a success: it lists for itself.
+    /// Two requests to one refusing server under one key, the second arriving
+    /// during the first's slowed listing: both items carry the refusal.
+    #[tokio::test]
+    async fn a_hit_during_anothers_listing_lists_for_itself() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let url = serve_local_mcp_server(LocalServer {
+            list_delay: Duration::from_millis(400),
+            ..Default::default()
+        })
+        .await;
+        let input = || McpServerInput {
+            label: "conf".to_string(),
+            url: Some(url.clone()),
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+
+        let (first, second) = tokio::join!(
+            connect_mcp_servers(&orchestrator, &format_registry, &[input()]),
+            async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                connect_mcp_servers(&orchestrator, &format_registry, &[input()]).await
+            }
+        );
+        for (which, bindings) in [("first", first), ("second", second)] {
+            assert_eq!(bindings.len(), 1, "the {which} request binds the server");
+            assert!(
+                list_item_error(&orchestrator, bindings, "conf")
+                    .is_some_and(|error| error.is_string()),
+                "the {which} request's item carries the refusal"
+            );
+        }
     }
 
     /// A server URL of a scheme the connector does not take is refused with
