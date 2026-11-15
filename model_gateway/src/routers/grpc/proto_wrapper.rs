@@ -41,7 +41,7 @@ use crate::{
             zmq_client::ZmqGenerateStream,
         },
     },
-    worker::{liveness, runtime::WorkerRuntime, Worker},
+    worker::{health::liveness, runtime::WorkerRuntime, Worker},
 };
 
 mod embed;
@@ -71,7 +71,10 @@ pub use self::{
 pub(crate) use self::{
     multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
-    shm::{cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request},
+    shm::{
+        cleanup_generate_request_shm, cleanup_tokenspeed_items_encoder_shm,
+        finish_tokenspeed_request, finish_vllm_request,
+    },
 };
 
 /// Helper macro to convert input logprobs from proto types to unified type.
@@ -839,7 +842,7 @@ pub enum ProtoStream {
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
     /// Any of the above, with the worker it came from: every response is a
-    /// sign of life for that worker (see [`crate::worker::liveness`]).
+    /// sign of life for that worker (see [`crate::worker::health::liveness`]).
     Tracked(Box<TrackedStream>),
     /// The decode side of a disaggregated request: every response restamped
     /// with the prefill side's prefix-cache hit (see [`PrefillCachedTokens`]).
@@ -1336,7 +1339,7 @@ mod tracked_tests {
     /// opens a breaker set to two.
     #[tokio::test]
     async fn a_decode_side_that_ends_with_nothing_on_it_earns_no_breaker_success() {
-        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        use crate::worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30000")
                 .circuit_breaker_config(CircuitBreakerConfig {
@@ -1475,7 +1478,7 @@ mod tracked_tests {
     /// at the replay: the decode worker's output, and its success.
     #[tokio::test]
     async fn a_first_item_pulled_ahead_is_replayed_once_and_booked_by_its_reader() {
-        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        use crate::worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
         type Item = Result<ProtoGenerateResponse, tonic::Status>;
         // Chunks told apart by the count each carries.
         let chunk = |cached_tokens| -> Item {
@@ -1679,7 +1682,7 @@ impl ProtoStream {
     /// for the worker's rate (the side's first response is the end of its
     /// prefill, on either dispatch shape), and every response is progress for
     /// the worker. The side joins no pile: the gateway bounds its silence per
-    /// request (see [`crate::worker::liveness::prefill_side_bound`]) instead
+    /// request (see [`crate::worker::health::liveness::prefill_side_bound`]) instead
     /// of judging the worker by sides it cannot see progress on.
     #[must_use]
     pub(crate) fn tracked_prefill_side_booked(

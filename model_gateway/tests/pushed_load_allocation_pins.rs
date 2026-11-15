@@ -29,7 +29,7 @@ use smg::{
     observability::metrics::{start_prometheus, PrometheusConfig},
     policies::PolicyRegistry,
     worker::{
-        monitor::WorkerMonitor, registry::WorkerRegistry, BasicWorkerBuilder, ConnectionMode,
+        load::monitor::WorkerMonitor, registry::WorkerRegistry, BasicWorkerBuilder, ConnectionMode,
         Worker, WorkerType,
     },
 };

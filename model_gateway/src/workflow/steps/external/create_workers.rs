@@ -9,10 +9,14 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     worker::{
-        basic::{RuntimeType, WorkerType},
-        circuit_breaker::CircuitBreakerConfig,
-        endpoint::Endpoint,
-        resilience::{resolve_resilience, ResolvedResilience},
+        health::{
+            circuit_breaker::CircuitBreakerConfig,
+            resilience::{resolve_resilience, ResolvedResilience},
+        },
+        identity::{
+            basic::{RuntimeType, WorkerType},
+            endpoint::Endpoint,
+        },
         BasicWorker, BasicWorkerBuilder, ConnectionMode, Worker,
     },
     workflow::data::{WorkerKind, WorkerList, WorkerWorkflowData},

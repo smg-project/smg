@@ -73,7 +73,7 @@ class _Gateway:
 
 
 _WORKERS = _Gateway.prefill_workers + _Gateway.decode_workers
-# The gateway's LOAD_POLL_DEADLINE (worker/monitor.rs): a tick's report reaches /loads up to
+# The gateway's LOAD_POLL_DEADLINE (worker/load/monitor.rs): a tick's report reaches /loads up to
 # this long after the tick. A test-side fact, so the suite pins the sweep's wait to the
 # gateway's bound instead of reading the wait back.
 _POLL_DEADLINE_S = 3.0

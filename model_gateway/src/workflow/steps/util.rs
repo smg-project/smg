@@ -8,7 +8,7 @@ use smg_grpc_client::connect_channel_with_timeout;
 
 use crate::{
     routers::grpc::client::{GrpcClient, HealthCheckResponse},
-    worker::endpoint::Endpoint,
+    worker::identity::endpoint::Endpoint,
 };
 
 fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {

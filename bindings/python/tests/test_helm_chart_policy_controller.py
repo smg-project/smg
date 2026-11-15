@@ -9,7 +9,7 @@ without it.
 
 This module renders the chart with its own few lines and not through
 ``test_helm_chart_args``: that module imports the gateway's launcher, which
-the job that builds the controller does not install.
+the job that runs these cases on the image's binary does not install.
 """
 
 from __future__ import annotations
@@ -31,6 +31,16 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 CHART = REPO / "deploy" / "helm" / "smg"
+# The job that builds the controller image runs these cases on its binary.
+IMAGE_WORKFLOW = REPO / ".github" / "workflows" / "pr-policy-controller-image.yml"
+# One run of each kind the two publishing workflows have, by the environment
+# its tags step reads.
+PUBLISHING_RUNS = {
+    "a final": ("release-docker.yml", {"VERSION": "1.16.0", "OWNER": "example"}),
+    "a candidate": ("release-docker.yml", {"VERSION": "1.16.0-rc.1", "OWNER": "example"}),
+    "a full nightly": ("nightly-docker.yml", {"OWNER": "example", "EXPRESS": "false"}),
+    "an express nightly": ("nightly-docker.yml", {"OWNER": "example", "EXPRESS": "true"}),
+}
 VALUES = CHART / "values.yaml"
 SCHEMA = CHART / "values.schema.json"
 EXAMPLES = CHART / "examples"
@@ -40,18 +50,17 @@ KUBE_VERSION = "1.30.0"
 BINARY_VARIABLE = "SMG_POLICY_CONTROLLER_BIN"
 COMPONENT = "policy-controller"
 NAME = "smg-policy-controller"
-# The block turned on: no controller image is published, so the chart takes
-# no default for the repository and the tag.
-ON = (
-    "policyController.enabled=true",
-    "policyController.image.repository=example/smg-policy-controller",
-    "policyController.image.tag=dev",
-)
+# The block turned on. The switch is all it takes: every other value holds a
+# default, and the image's is the router's.
+ON = ("policyController.enabled=true",)
 # The settle window the controller takes when the chart passes none.
 DEFAULT_SETTLE_SECONDS = 5
 # The started controller is read on a loopback port: a proxy named in the
 # environment is not asked for it.
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# A pod's environment names none of the variables the controller's log reads
+# for its color or its level.
+LOG_VARIABLES = ("NO_COLOR", "FORCE_COLOR", "CLICOLOR_FORCE", "RUST_LOG")
 
 needs_helm = pytest.mark.skipif(
     shutil.which("helm") is None or not CHART.exists(), reason="helm or the chart not present"
@@ -170,8 +179,6 @@ def answered_as_the_schema_names(chart: Path) -> tuple[list[set[str]], str, dict
     chart's own default for each value the schema names, until it renders:
     the names of each round, the render, and the block that was given."""
     defaults = yaml.safe_load(VALUES.read_text())["policyController"]
-    # The image ON names: the chart has no default for it.
-    defaults["image"].update(s.removeprefix("policyController.image.").split("=") for s in ON[1:])
     lists = schema_block()["then"]["properties"]
     given: dict = {"enabled": True}
     rounds: list[set[str]] = []
@@ -230,21 +237,161 @@ def test_only_its_own_example_turns_the_controller_on():
     assert on == ["with-policy-controller.yaml"]
 
 
+def router_image(documents: list[dict]) -> str:
+    (deployment,) = [d for d in documents if d["kind"] == "Deployment" and component(d) == "router"]
+    (found,) = deployment["spec"]["template"]["spec"]["containers"]
+    return found["image"]
+
+
 @needs_helm
-def test_the_controller_needs_an_image_named():
-    """No controller image is published: neither the repository nor the tag
-    has a default, and a release without either is refused."""
-    for settings in (
-        ("policyController.enabled=true",),
-        ("policyController.enabled=true", "policyController.image.repository=example/controller"),
-        ("policyController.enabled=true", "policyController.image.tag=dev"),
-    ):
-        error = render_error(*settings)
-        assert "policyController.image.repository" in error
-        assert "policyController.image.tag" in error
-    assert container(render(*ON))["image"] == "docker.io/example/smg-policy-controller:dev"
-    private = render(*ON, "policyController.image.registry=registry.example.com")
-    assert container(private)["image"] == "registry.example.com/example/smg-policy-controller:dev"
+@pytest.mark.parametrize(
+    "router",
+    [
+        (),
+        ("global.image.tag=1.16.1",),
+        ("global.image.registry=registry.example.com", "global.image.repository=mirror/smg"),
+    ],
+    ids=["the chart's own", "a tag", "a mirror"],
+)
+def test_the_image_follows_the_routers(router):
+    """With no part of it named, the controller's image is the router's with
+    -policy-controller appended to the tag, the tag a release publishes the
+    controller under: one version names both images. A named registry or tag
+    wins alone, an image of the operator's own names its repository and its
+    tag, and the router's own image never moves."""
+    of_the_router = router_image(render(*router))
+    registry, _, path = of_the_router.partition("/")
+    repository = path.rpartition(":")[0]
+
+    def image(*settings: str) -> str:
+        documents = render("policyController.enabled=true", *router, *settings)
+        assert router_image(documents) == of_the_router
+        return container(documents)["image"]
+
+    assert image() == f"{of_the_router}-policy-controller"
+    assert image("policyController.image=null") == f"{of_the_router}-policy-controller"
+    assert image("policyController.image.registry=ghcr.io") == f"ghcr.io/{path}-policy-controller"
+    assert image("policyController.image.tag=dev") == f"{registry}/{repository}:dev"
+    own = ("policyController.image.repository=example/controller", "policyController.image.tag=dev")
+    assert image(*own) == f"{registry}/example/controller:dev"
+
+
+@needs_helm
+def test_a_release_names_the_image_it_publishes():
+    """The chart's own values at a release: the router's image on Docker Hub
+    and the controller's beside it, under the suffixed tag."""
+    documents = render("policyController.enabled=true", "global.image.tag=1.16.0")
+    assert router_image(documents) == "docker.io/lightseekorg/smg:1.16.0"
+    assert container(documents)["image"] == "docker.io/lightseekorg/smg:1.16.0-policy-controller"
+
+
+@needs_helm
+def test_a_router_on_its_slurm_variant_takes_the_releases_controller():
+    """A release publishes one controller image. The Slurm variant is the
+    router's alone, so its suffix is cut before the controller's is appended:
+    the chart's own Slurm example, with the controller on. The variant's
+    suffix ends a tag: the same letters inside one are the tag's own."""
+    example = EXAMPLES / "with-slurm-discovery.yaml"
+    documents = render("policyController.enabled=true", files=(example,))
+    of_the_router = router_image(documents)
+    assert of_the_router.endswith("-slurm")
+    release = of_the_router.removesuffix("-slurm")
+    assert container(documents)["image"] == release + "-policy-controller"
+    inside = render("policyController.enabled=true", "global.image.tag=1.16.0-slurm-rc.1")
+    assert container(inside)["image"] == router_image(inside) + "-policy-controller"
+
+
+def published(workflow: str, environment: dict[str, str], tmp_path: Path) -> dict[str, list[str]]:
+    """The lists of image references a publishing workflow's own tags step
+    writes for one run, the step run under bash: each multi-line output, by
+    its name."""
+    document = yaml.safe_load((IMAGE_WORKFLOW.parent / workflow).read_text())
+    (step,) = [s for s in document["jobs"]["build-and-push"]["steps"] if s.get("id") == "tags"]
+    output = tmp_path / "output"
+    output.write_text("")
+    subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        env={"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(output), "GITHUB_SHA": "0" * 40}
+        | environment,
+        check=True,
+        capture_output=True,
+    )
+    lists: dict[str, list[str]] = {}
+    lines = output.read_text().splitlines()
+    while lines:
+        name, mark, end = lines.pop(0).partition("<<")
+        if mark:
+            stop = lines.index(end)
+            lists[name], lines = lines[:stop], lines[stop + 1 :]
+    return lists
+
+
+@needs_helm
+@pytest.mark.parametrize("run", list(PUBLISHING_RUNS))
+def test_every_published_router_tag_names_a_published_controller(run: str, tmp_path: Path):
+    """For every tag a run publishes the router's image under, its own list
+    and each variant's, the chart's default names a controller image the
+    same run publishes: the workflow's own tags step against the render. A
+    variant a workflow gains and the helper does not know is red here."""
+    lists = published(*PUBLISHING_RUNS[run], tmp_path)
+    (of_the_controller,) = [name for name in lists if name.startswith("controller")]
+    routers = [tag for name in lists if name != of_the_controller for tag in lists[name]]
+    assert routers, "the tags step wrote no router tag"
+    for reference in routers:
+        path, _, tag = reference.rpartition(":")
+        registry, repository = path.split("/", 1) if path.count("/") == 2 else ("docker.io", path)
+        documents = render(
+            "policyController.enabled=true",
+            f"global.image.registry={registry}",
+            f"global.image.repository={repository}",
+            f"global.image.tag={tag}",
+        )
+        assert router_image(documents).removeprefix("docker.io/") == reference
+        image = container(documents)["image"].removeprefix("docker.io/")
+        assert image in lists[of_the_controller], f"{reference}: {image} is not published"
+
+
+@needs_helm
+def test_an_image_the_suffix_cannot_name_is_refused():
+    """The default tag belongs to the router's repository and stands on the
+    router's tag: a repository of the operator's own needs its tag, and a
+    router named by a digest leaves the suffix nothing to stand on."""
+    on = "policyController.enabled=true"
+    error = render_error(on, "policyController.image.repository=example/controller")
+    assert "policyController.image.repository needs policyController.image.tag" in error
+    digest = "global.image.tag=1.16.0@sha256:" + "0" * 64
+    error = render_error(on, digest)
+    assert "policyController.image.tag is needed" in error
+    assert "global.image.tag" in error
+    named = render(on, digest, "policyController.image.tag=1.16.0-policy-controller")
+    assert container(named)["image"] == "docker.io/lightseekorg/smg:1.16.0-policy-controller"
+
+
+@needs_helm
+def test_a_release_older_than_the_first_with_a_controller_image_is_refused():
+    """No release older than the first that publishes a controller image has
+    one, and a release tag says which release it is: under such a tag the
+    chart refuses where its default would name a tag no registry holds, the
+    variant's suffix on it or not, until the controller's tag is named. The
+    README's table names the same first release. From that release on the
+    default stands, and under a tag that is no release's: only the three
+    numbers a release tag starts with are compared, so no tag fails the
+    render for its spelling."""
+    on = "policyController.enabled=true"
+    row = r"-policy-controller`, beside every release image from (\S+) on"
+    (first,) = re.findall(row, (CHART / "README.md").read_text())
+    for older in ("1.15.2", "1.15.2-slurm", "1.15.99-rc.1", "1.9.0", "0.9.0", "1.15.2-my_build"):
+        router = f"global.image.tag={older}"
+        error = render_error(on, router)
+        assert f"image.tag is needed: global.image.tag {older} is older than {first}" in error
+        named = render(on, router, "policyController.image.tag=mine")
+        assert container(named)["image"] == "docker.io/lightseekorg/smg:mine"
+        assert not of_the_controller(render(router))
+    newer = (first, f"{first}-rc.1", f"{first}-dev", f"{first}-my_build", f"{first}-0115")
+    no_release = ("nightly", "v1.15.2", "1.15", "1.15.2.1", "build-1.15.2", "9" * 20 + ".0.0")
+    for tag in newer + ("1.100.0", "2.0.0") + no_release:
+        documents = render(on, f"global.image.tag={tag}")
+        assert container(documents)["image"] == router_image(documents) + "-policy-controller", tag
 
 
 @needs_helm
@@ -301,6 +448,50 @@ def test_no_other_selector_takes_the_controllers_pods():
     ]
     router = one(documents, "Deployment", "smg-router")["spec"]["template"]["metadata"]["labels"]
     assert not selects(one(documents, "Service")["spec"]["selector"], router)
+
+
+@needs_helm
+def test_the_controllers_selectors_take_the_controller_and_nothing_else():
+    """The Service and the budget select pods and the monitor selects
+    Services: each takes the controller's and no other of a release that also
+    has a router and a worker. A second budget over a router pod makes its
+    eviction fail; a monitor over every Service scrapes the router and the
+    workers twice."""
+    documents = render(
+        *ON,
+        # The example's router is older than the first controller image.
+        "policyController.image.tag=1.16.0-policy-controller",
+        "router.metrics.serviceMonitor.enabled=true",
+        "router.podDisruptionBudget.enabled=true",
+        "policyController.podDisruptionBudget.enabled=true",
+        "router.adminPort=9001",
+        files=(EXAMPLES / "with-vllm-http.yaml",),
+    )
+    pods = {
+        document["metadata"]["name"]: document["spec"]["template"]["metadata"]["labels"]
+        for document in documents
+        if document["kind"] == "Deployment"
+    }
+    services = {
+        document["metadata"]["name"]: document["metadata"]["labels"]
+        for document in documents
+        if document["kind"] == "Service"
+    }
+    assert len(pods) == 3 and len(services) == 4, "a router and a worker beside the controller"
+    selectors = {
+        "Service": (one(documents, "Service")["spec"]["selector"], pods),
+        "PodDisruptionBudget": (
+            one(documents, "PodDisruptionBudget")["spec"]["selector"]["matchLabels"],
+            pods,
+        ),
+        "ServiceMonitor": (
+            one(documents, "ServiceMonitor")["spec"]["selector"]["matchLabels"],
+            services,
+        ),
+    }
+    for kind, (selector, candidates) in selectors.items():
+        taken = sorted(name for name, labels in candidates.items() if selects(selector, labels))
+        assert taken == [NAME], f"the controller's {kind} selects {taken}"
 
 
 @needs_helm
@@ -393,6 +584,65 @@ def test_the_arguments_follow_the_values():
     # for every CPU the pod may use.
     unset = controller_args("policyController.runtimeWorkerThreads=0")
     assert "--runtime-worker-threads" not in unset
+    # A settle window of zero is a window: the flag is passed, not left to
+    # the controller's default.
+    zero = controller_args("policyController.shutdownSettleSeconds=0")
+    assert zero[zero.index("--shutdown-settle-secs") + 1] == "0"
+
+
+@needs_helm
+def test_the_values_the_chart_hands_on_reach_their_objects(tmp_path):
+    """The values the block hands on unread, set through one values file and
+    read in the object each lands in."""
+    handed_on = {
+        "replicas": 3,
+        "resources": {"limits": {"cpu": "2"}},
+        "nodeSelector": {"pool": "control"},
+        "tolerations": [{"key": "dedicated", "operator": "Exists"}],
+        "podAnnotations": {"example.com/scrape": "true"},
+        "podLabels": {"team": "routing"},
+        "extraEnv": [{"name": "EXAMPLE", "value": "1"}],
+        "securityContext": {"runAsUser": 1000},
+        "service": {"type": "NodePort", "annotations": {"example.com/zone": "a"}},
+        "podDisruptionBudget": {"enabled": True, "minAvailable": 2},
+        "livenessProbe": {"initialDelaySeconds": 7, "periodSeconds": 11},
+        "readinessProbe": {"initialDelaySeconds": 3, "periodSeconds": 13},
+    }
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        yaml.safe_dump(
+            {
+                "global": {
+                    "image": {"pullPolicy": "Always"},
+                    "imagePullSecrets": [{"name": "registry-key"}],
+                },
+                "policyController": handed_on,
+            }
+        )
+    )
+    documents = render(*ON, files=(values,))
+    deployment = one(documents, "Deployment")["spec"]
+    pod = deployment["template"]["spec"]
+    found = container(documents)
+    service = one(documents, "Service")
+    assert deployment["replicas"] == 3
+    assert found["resources"] == handed_on["resources"]
+    assert pod["nodeSelector"] == handed_on["nodeSelector"]
+    assert pod["tolerations"] == handed_on["tolerations"]
+    assert deployment["template"]["metadata"]["annotations"] == handed_on["podAnnotations"]
+    assert deployment["template"]["metadata"]["labels"]["team"] == "routing"
+    assert found["env"] == handed_on["extraEnv"]
+    # A map of the values file joins the default's: the other keys stay.
+    assert found["securityContext"]["runAsUser"] == 1000
+    assert found["securityContext"]["readOnlyRootFilesystem"] is True
+    assert found["imagePullPolicy"] == "Always"
+    assert pod["imagePullSecrets"] == [{"name": "registry-key"}]
+    assert service["spec"]["type"] == "NodePort"
+    assert service["metadata"]["annotations"] == handed_on["service"]["annotations"]
+    assert one(documents, "PodDisruptionBudget")["spec"]["minAvailable"] == 2
+    for probe in ("livenessProbe", "readinessProbe"):
+        for number, value in handed_on[probe].items():
+            assert found[probe][number] == value, f"{probe}.{number}"
 
 
 @needs_helm
@@ -505,6 +755,7 @@ def test_the_schema_refuses_a_value_the_block_does_not_have():
         assert "policyController.runtimeWorkerThreads" in render_error(
             *ON, f"policyController.runtimeWorkerThreads={threads}"
         )
+    assert "policyController.ports.admin" in render_error(*ON, "policyController.ports.admin=65536")
     # An empty path is no path: the kubelet would ask the root.
     for probe in ("livenessProbe", "readinessProbe"):
         assert f"policyController.{probe}.path" in render_error(
@@ -533,9 +784,13 @@ def block_keys(values: dict, schema: dict, prefix: str = "") -> list[str]:
 
 
 # A null removes a value's default. These nulls are legal and render what
-# the defaults render: each default is empty.
+# the defaults render: each default is empty, and an empty part of the image
+# is the router's.
 SAME_AS_THE_DEFAULT = {
+    "image",
     "image.registry",
+    "image.repository",
+    "image.tag",
     "service.annotations",
     "logging.json",
     "resources",
@@ -563,6 +818,13 @@ def default_of(block: dict, key: str):
     return block
 
 
+def empty(default) -> bool:
+    """An empty default: nothing, or a map of nothing but empty members."""
+    if isinstance(default, dict):
+        return all(empty(member) for member in default.values())
+    return not default
+
+
 @needs_helm
 def test_a_null_is_refused_or_renders_what_this_case_names(chart_with_no_block):
     """Every key of the block set to null, one at a time, over the chart's
@@ -577,7 +839,7 @@ def test_a_null_is_refused_or_renders_what_this_case_names(chart_with_no_block):
     default or a switch: a value that holds a default is refused."""
     block = yaml.safe_load(VALUES.read_text())["policyController"]
     for key in SAME_AS_THE_DEFAULT:
-        assert not default_of(block, key), f"{key} holds a default: refuse its null"
+        assert empty(default_of(block, key)), f"{key} holds a default: refuse its null"
     for key in SWITCHED_OFF_BY_A_NULL:
         assert default_of(block, key) is False, f"{key} is no switch: refuse its null"
     switches = (*ON, "policyController.podDisruptionBudget.enabled=true")
@@ -666,6 +928,7 @@ ARGUMENT_SETS = {
         "policyController.shutdownGracePeriodSeconds=60",
         "policyController.shutdownSettleSeconds=20",
     ),
+    "no-settle-window": ("policyController.shutdownSettleSeconds=0",),
     "no-thread-count": ("policyController.runtimeWorkerThreads=0",),
     "other-ports": (
         "policyController.ports.gateway=31100",
@@ -700,6 +963,91 @@ def test_the_binary_refuses_a_rendered_flag_spelled_wrong(binary):
         assert f"{flag}x" in refused.stderr
     unreadable = ["nowhere" if arg == "0.0.0.0:30103" else arg for arg in args]
     assert parse(binary, unreadable).returncode != 0
+
+
+# The form of a workflow path filter's entry that `starts_the_job` reads: an
+# optional leading ``!``, then names with ``*`` and a ``**`` that no slash
+# follows. The platform reads more: ``?``, ``+``, a bracket class, and a
+# ``**/`` that also matches no directory at all.
+READ_ENTRY = re.compile(r"!?(?!.*\*\*/)[A-Za-z0-9_./*-]+")
+
+
+def starts_the_job(path: str, entries: list[str]) -> bool:
+    """A workflow path filter's answer for one path, as the platform gives
+    it: the entries are read in order and the last one that matches decides,
+    so an entry led by ``!`` takes the path back out. ``**`` crosses
+    directories, ``*`` does not. An entry in a form this helper does not
+    read fails the case that asked: it is never read by its letters."""
+    started = False
+    for entry in entries:
+        assert READ_ENTRY.fullmatch(entry), f"this helper does not read the filter entry {entry!r}"
+        pattern = re.escape(entry.removeprefix("!")).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+        if re.fullmatch(pattern, path):
+            started = not entry.startswith("!")
+    return started
+
+
+def test_a_path_filter_is_read_as_the_platform_reads_it():
+    """The helper's rule on the platform's own examples: the last entry that
+    matches decides, so a negated entry takes a path back out and a later
+    entry puts it back in. An entry in a form the helper does not read fails
+    by name."""
+    notes = ["*.md", "!README.md"]
+    assert starts_the_job("hello.md", notes)
+    assert not starts_the_job("README.md", notes)
+    assert not starts_the_job("docs/hello.md", notes)
+    assert starts_the_job("README.md", [*notes, "README*"])
+    assert starts_the_job("README.doc", [*notes, "README*"])
+    assert not starts_the_job("README.md", ["!README.md"])
+    assert starts_the_job("docs/mona/octocat.txt", ["docs/**"])
+    assert not starts_the_job("docs/mona/octocat.txt", ["docs/*"])
+    for unread in ("docs/**/*.md", "*.jsx?", "v[12].md", "v1+.md", "v1\\*.md"):
+        with pytest.raises(AssertionError, match="does not read the filter entry"):
+            starts_the_job("docs/a.md", [unread])
+
+
+def test_the_image_job_starts_on_what_these_cases_read():
+    """The job that runs these cases on the image's binary starts when
+    something they read changes: this file, what configures its run and
+    every file of the chart a render reads. The chart's README and its alert
+    rule tests are read by no case, so they start nothing. The two publishing
+    workflows are read by one render case and by no binary case: the unit
+    job, which starts on every pull request, runs that one. The binary the
+    cases run is built by the image's file from the crate's manifest, source
+    and plugin contract under the pinned toolchain: the job starts on each
+    of those too."""
+    document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
+    # PyYAML reads the bare key `on` as the boolean true.
+    entries = document[True]["pull_request"]["paths"]
+    unread = (CHART / "README.md", CHART / "tests")
+    tests = Path(__file__).resolve().parent
+    crate = REPO / "crates" / "policy_controller"
+    read = [
+        Path(__file__).resolve(),
+        # pytest reads both for this run: the project file holds its settings.
+        tests / "conftest.py",
+        tests.parent / "pyproject.toml",
+        # What the image's build reads: the binary the cases run comes of it.
+        REPO / "docker" / "policy-controller.Dockerfile",
+        REPO / "rust-toolchain.toml",
+        crate / "Cargo.toml",
+        crate / "src" / "main.rs",
+        crate / "contracts" / "smg-policy.wit",
+    ] + [
+        path
+        for path in sorted(CHART.rglob("*"))
+        if path.is_file() and not any(path == skip or skip in path.parents for skip in unread)
+    ]
+    moved = [str(path.relative_to(REPO)) for path in read if not path.is_file()]
+    assert moved == [], f"{moved} is no file of the tree: the image job's filter follows it"
+    missed = [
+        str(path.relative_to(REPO))
+        for path in read
+        if not starts_the_job(str(path.relative_to(REPO)), entries)
+    ]
+    assert missed == [], f"a change of {missed} would not start the image job"
+    assert not starts_the_job("deploy/helm/smg/README.md", entries)
+    assert not starts_the_job("deploy/helm/smg/tests/rules/run.sh", entries)
 
 
 def free_ports(count: int) -> list[int]:
@@ -750,13 +1098,27 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
         f"policyController.ports.admin={admin}",
         "policyController.shutdownGracePeriodSeconds=4",
         "policyController.shutdownSettleSeconds=1",
+        "router.metrics.serviceMonitor.enabled=true",
     )
     found = container(documents)
     probe = found["readinessProbe"]["httpGet"]
     ports = {port["name"]: port["containerPort"] for port in found["ports"]}
     url = f"http://127.0.0.1:{ports[probe['port']]}{probe['path']}"
+    # The other two requests the chart sets up: the liveness probe's, and the
+    # scrape of the ServiceMonitor through the Service's port (Prometheus
+    # asks /metrics when the endpoint names no path).
+    liveness = found["livenessProbe"]["httpGet"]
+    targets = {
+        port["name"]: port["targetPort"] for port in one(documents, "Service")["spec"]["ports"]
+    }
+    (endpoint,) = one(documents, "ServiceMonitor")["spec"]["endpoints"]
+    others = [
+        f"http://127.0.0.1:{ports[liveness['port']]}{liveness['path']}",
+        f"http://127.0.0.1:{ports[targets[endpoint['port']]]}{endpoint.get('path', '/metrics')}",
+    ]
     # Under Kubernetes HOSTNAME is the pod's name.
-    environment = dict(os.environ, HOSTNAME="smg-policy-controller-6d5f7c9b8-x2x4z")
+    environment = {k: v for k, v in os.environ.items() if k not in LOG_VARIABLES}
+    environment["HOSTNAME"] = "smg-policy-controller-6d5f7c9b8-x2x4z"
     process = subprocess.Popen(
         [binary, *found["args"]],
         env=environment,
@@ -776,12 +1138,20 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
             except (urllib.error.URLError, ConnectionError):
                 time.sleep(0.1)
         assert body == {"status": "ready"}
+        for other in others:
+            with DIRECT.open(other, timeout=2) as response:
+                assert response.status == 200, other
         # Every container port the Deployment names is a listener of the
         # started controller.
         for port in ports.values():
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
         process.send_signal(signal.SIGTERM)
-        assert process.wait(timeout=15) == 0, process.stdout.read()
+        output, _ = process.communicate(timeout=15)
+        assert process.returncode == 0, output
+        # The output is a pipe here, as it is under a container runtime: the
+        # log is plain text, with no color escape.
+        assert "smg_policy_controller" in output, "the controller logged nothing"
+        assert "\x1b" not in output, f"an escape byte with no terminal: {output!r}"
     finally:
         if process.poll() is None:
             process.kill()

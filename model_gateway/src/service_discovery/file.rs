@@ -50,7 +50,7 @@ use crate::{
     config::{ConfigError, ConfigResult, RoutingMode},
     fs_watch::{settle, DirectoryWatch},
     observability::metrics::metrics_labels,
-    worker::{endpoint::Endpoint, EndpointKey},
+    worker::{identity::endpoint::Endpoint, EndpointKey},
 };
 
 /// The manifest version this gateway reads.
@@ -922,7 +922,7 @@ mod tests {
     fn an_exported_fleet_parses_back_without_its_credentials() {
         use openai_protocol::model_card::ModelCard;
 
-        use crate::worker::{basic::worker_to_info, BasicWorkerBuilder, Worker};
+        use crate::worker::{identity::basic::worker_to_info, BasicWorkerBuilder, Worker};
 
         fn info(worker: BasicWorkerBuilder) -> WorkerInfo {
             let worker: Arc<dyn Worker> = Arc::new(worker.build());
@@ -1014,7 +1014,7 @@ mod tests {
     /// that one record, not one per rank.
     #[test]
     fn a_data_parallel_group_exports_as_one_record_at_its_base_address() {
-        use crate::worker::{basic::worker_to_info, BasicWorkerBuilder, Worker};
+        use crate::worker::{identity::basic::worker_to_info, BasicWorkerBuilder, Worker};
 
         let fleet: Vec<WorkerInfo> = (0..2)
             .map(|rank| {

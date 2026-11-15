@@ -17,7 +17,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::discover_metadata::ModelsResponse;
 use crate::{
-    worker::{endpoint::Endpoint, ConnectionMode},
+    worker::{identity::endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, grpc_health_answer, http_base_url},

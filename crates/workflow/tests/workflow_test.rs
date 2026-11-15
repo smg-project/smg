@@ -596,6 +596,71 @@ async fn test_dag_dependency_failure_blocks_dependents() {
     assert_eq!(b_executed.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn test_dag_failed_step_leaves_its_independent_sibling_running() {
+    // A root, then two steps that depend on the root alone: step B fails under
+    // FailWorkflow, step C runs. The failure neither cancels nor skips the
+    // sibling: C ran once, and the workflow ends Failed.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let c_executed = Arc::new(AtomicU32::new(0));
+
+    struct FailingStep;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for FailingStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("step_b"),
+                message: "Intentional failure".to_string(),
+            })
+        }
+
+        fn is_retryable(&self, _error: &WorkflowError) -> bool {
+            false
+        }
+    }
+
+    let workflow = WorkflowDefinition::new("sibling_workflow", "Sibling Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(FailingStep))
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["step_a"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                Arc::new(TrackingStep {
+                    counter: Arc::clone(&c_executed),
+                }),
+            )
+            .depends_on(&["step_a"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(c_executed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.step_states[&StepId::new("step_c")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("step_b")].status,
+        StepStatus::Failed
+    );
+}
+
 #[test]
 fn test_dag_validation_cycle_detection() {
     // Create a workflow with a cycle: A -> B -> C -> A
