@@ -40,7 +40,7 @@ use crate::{
         },
     },
     worker::{
-        sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
+        identity::sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
         DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };

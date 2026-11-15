@@ -78,28 +78,6 @@ impl StreamingResponseAccumulator {
             .and_then(|id| id.as_str())
     }
 
-    pub fn snapshot_final_response(&self) -> Option<Value> {
-        if let Some(resp) = &self.completed_response {
-            return Some(resp.clone());
-        }
-        self.build_fallback_response_snapshot()
-    }
-
-    fn build_fallback_response_snapshot(&self) -> Option<Value> {
-        let mut response = self.initial_response.clone()?;
-
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert("status".to_string(), Value::String("completed".to_string()));
-
-            let mut output_items = self.output_items.clone();
-            output_items.sort_by_key(|(index, _)| *index);
-            let outputs: Vec<Value> = output_items.into_iter().map(|(_, item)| item).collect();
-            obj.insert("output".to_string(), Value::Array(outputs));
-        }
-
-        Some(response)
-    }
-
     fn process_block(&mut self, block: &str) {
         let trimmed = block.trim();
         if trimmed.is_empty() {

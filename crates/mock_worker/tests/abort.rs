@@ -1,15 +1,9 @@
 //! Drive cancellation through the gateway's gRPC client, including its
 //! abort-on-drop path, and check the simulated engine's own load.
 
-#![expect(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "a test binary: a failed step panics with what failed"
-)]
-
 use std::time::Duration;
 
+use anyhow::Context as _;
 use futures::StreamExt;
 use mock_worker::{
     config::Config,
@@ -23,7 +17,7 @@ use ts::generate_response::Response as GenResp;
 
 mod common;
 
-async fn start(max_running: usize, overhead_ms: f64) -> TokenSpeedSchedulerClient {
+async fn start(max_running: usize, overhead_ms: f64) -> anyhow::Result<TokenSpeedSchedulerClient> {
     let cfg = Config {
         realistic: true,
         engine: EngineParams {
@@ -57,39 +51,43 @@ fn request(id: &str, max_new: u32, stream: bool) -> ts::GenerateRequest {
     }
 }
 
-async fn complete(stream: &mut AbortOnDropStream) -> ts::GenerateComplete {
+async fn complete(stream: &mut AbortOnDropStream) -> anyhow::Result<ts::GenerateComplete> {
     timeout(Duration::from_secs(2), async {
         while let Some(frame) = stream.next().await {
-            if let Some(GenResp::Complete(done)) = frame.unwrap().response {
+            if let Some(GenResp::Complete(done)) = frame?.response {
                 assert!(stream.next().await.is_none(), "nothing follows completion");
                 stream.mark_completed();
-                return done;
+                return anyhow::Ok(done);
             }
         }
-        panic!("stream ended without a completion");
+        anyhow::bail!("stream ended without a completion")
     })
     .await
-    .expect("the worker ends the stream promptly")
+    .context("the worker ends the stream promptly")?
 }
 
-async fn load(client: &TokenSpeedSchedulerClient, running: i32, waiting: i32) -> ts::SchedulerLoad {
+async fn load(
+    client: &TokenSpeedSchedulerClient,
+    running: i32,
+    waiting: i32,
+) -> anyhow::Result<ts::SchedulerLoad> {
     timeout(Duration::from_secs(2), async {
         loop {
-            let load = client.get_loads(vec![]).await.unwrap().loads.remove(0);
+            let load = client.get_loads(vec![]).await?.loads.remove(0);
             if (load.num_running_reqs, load.num_waiting_reqs) == (running, waiting) {
-                return load;
+                return anyhow::Ok(load);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the engine releases cancelled work")
+    .context("the engine releases cancelled work")?
 }
 
 #[tokio::test]
 async fn abort_ends_generation_without_affecting_another_request() {
     // Delayed delivery must keep tokens before the abort completion.
-    let client = start(2, 50.0).await;
+    let client = start(2, 50.0).await.expect("the worker starts");
     let mut cancelled = client
         .generate(request("cancelled", 4096, true))
         .await
@@ -102,7 +100,9 @@ async fn abort_ends_generation_without_affecting_another_request() {
         .await
         .unwrap();
 
-    let done = complete(&mut cancelled).await;
+    let done = complete(&mut cancelled)
+        .await
+        .expect("the stream completes");
     assert_eq!(done.finish_reason, "abort");
     assert!(done.completion_tokens < 4096);
     assert_eq!(done.output_ids.len(), done.completion_tokens as usize);
@@ -115,19 +115,25 @@ async fn abort_ends_generation_without_affecting_another_request() {
             .await
             .unwrap();
     }
-    let done = complete(&mut other).await;
+    let done = complete(&mut other).await.expect("the stream completes");
     assert_eq!(done.finish_reason, "length");
     assert_eq!(done.completion_tokens, 16);
     client
         .abort_request("other".into(), String::new())
         .await
         .unwrap();
-    assert_eq!(load(&client, 0, 0).await.num_used_tokens, 0);
+    assert_eq!(
+        load(&client, 0, 0)
+            .await
+            .expect("the load settles")
+            .num_used_tokens,
+        0
+    );
 }
 
 #[tokio::test]
 async fn abort_removes_a_queued_non_streaming_request() {
-    let client = start(1, 0.0).await;
+    let client = start(1, 0.0).await.expect("the worker starts");
     let mut running = client
         .generate(request("running", 4096, true))
         .await
@@ -137,31 +143,49 @@ async fn abort_removes_a_queued_non_streaming_request() {
         .generate(request("queued", 4096, false))
         .await
         .unwrap();
-    load(&client, 1, 1).await;
+    load(&client, 1, 1).await.expect("the load settles");
 
     client
         .abort_request("queued".into(), String::new())
         .await
         .unwrap();
-    let done = complete(&mut queued).await;
+    let done = complete(&mut queued).await.expect("the stream completes");
     assert_eq!(done.finish_reason, "abort");
     assert_eq!(done.completion_tokens, 0);
     assert!(done.output_ids.is_empty());
-    assert_eq!(load(&client, 1, 0).await.num_waiting_uncached_tokens, 0);
+    assert_eq!(
+        load(&client, 1, 0)
+            .await
+            .expect("the load settles")
+            .num_waiting_uncached_tokens,
+        0
+    );
 
     drop(running);
-    assert_eq!(load(&client, 0, 0).await.num_used_tokens, 0);
+    assert_eq!(
+        load(&client, 0, 0)
+            .await
+            .expect("the load settles")
+            .num_used_tokens,
+        0
+    );
 }
 
 #[tokio::test]
 async fn dropping_the_client_stream_releases_engine_work() {
-    let client = start(1, 0.0).await;
+    let client = start(1, 0.0).await.expect("the worker starts");
     let mut stream = client
         .generate(request("dropped", 4096, true))
         .await
         .unwrap();
     stream.next().await.unwrap().unwrap();
-    load(&client, 1, 0).await;
+    load(&client, 1, 0).await.expect("the load settles");
     drop(stream);
-    assert_eq!(load(&client, 0, 0).await.num_used_tokens, 0);
+    assert_eq!(
+        load(&client, 0, 0)
+            .await
+            .expect("the load settles")
+            .num_used_tokens,
+        0
+    );
 }

@@ -43,7 +43,7 @@ use crate::{
     app_context::AppContext,
     middleware::{into_messages_envelope, AuthConfig},
     routers::{common::header_utils::apply_provider_headers, error, provider_support},
-    worker::{endpoint::Endpoint, ProviderType, RuntimeType, WorkerRegistry},
+    worker::{identity::endpoint::Endpoint, ProviderType, RuntimeType, WorkerRegistry},
 };
 
 /// The API family a models request speaks, read from its headers.

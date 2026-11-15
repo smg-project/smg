@@ -93,7 +93,7 @@ use crate::{
     config::{ConfigError, ConfigResult, ConsulDiscoveryConfig, RoutingMode},
     observability::metrics::metrics_labels,
     server::http_client_builder,
-    worker::{http_client::build_client, EndpointKey},
+    worker::{connection::http_client::build_client, EndpointKey},
 };
 
 /// How long Consul may hold a blocking query before answering anyway.
