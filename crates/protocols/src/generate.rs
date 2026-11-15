@@ -229,9 +229,9 @@ impl Normalizable for GenerateRequest {
 /// prompt is sent with an empty `text`, as the engine reads it; a body with
 /// two of `text`, `input_ids` and `input_embeds` is served, the engine taking
 /// the ids over the text and the embeds only without a text), an empty batch
-/// of texts with no ids is refused, an empty `input_ids` is refused as the
-/// chat route refuses an empty `messages`, and a negative id in `input_ids` is
-/// refused.
+/// of texts is refused, as is a batch of texts beside `input_ids`, an empty
+/// `input_ids` is refused as the chat route refuses an empty `messages`, and a
+/// negative id in `input_ids` is refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
     // A body with no prompt at all is refused. `input_embeds` is a prompt on
     // the paths that forward the body as-is.
@@ -257,16 +257,26 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
         ));
     }
 
-    // An empty batch of texts is no prompt, as an empty list of ids is none.
-    // Beside ids it is not read, as an empty text beside ids is not.
-    if matches!(&req.text, Some(StringOrArray::Array(texts)) if texts.is_empty())
-        && req.input_ids.is_none()
-    {
-        return Err(invalid_at(
-            "text",
-            "empty_array",
-            "Invalid 'text': empty array. Expected an array with minimum length 1, but got an empty array instead.",
-        ));
+    // A batch of texts is no prompt when empty, as an empty list of ids is
+    // none, beside ids or not. Beside ids it is a second batch: SGLang sizes
+    // the batch from the texts (`_determine_batch_size` reads `text` before
+    // `input_ids`, and a list is a batch) while the gRPC path serves the ids
+    // as one prompt, so the two routes would answer different prompts.
+    if let Some(StringOrArray::Array(texts)) = &req.text {
+        if texts.is_empty() {
+            return Err(invalid_at(
+                "text",
+                "empty_array",
+                "Invalid 'text': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+            ));
+        }
+        if req.input_ids.is_some() {
+            return Err(invalid_at(
+                "text",
+                "invalid_value",
+                "a batch of texts cannot be sent beside input_ids: send the prompts as texts or as ids",
+            ));
+        }
     }
 
     // An empty list of ids is no prompt, as an empty `messages` is no
@@ -740,8 +750,9 @@ mod tests {
     /// SGLang's `text` takes a batch of prompts (`Union[List[str], str]`):
     /// one is read and written back as a list, and routes on its texts
     /// joined, as a batch of ids routes on its ids. An empty batch is no
-    /// prompt, refused as an empty `input_ids` is; beside ids it is not read,
-    /// as an empty text beside ids is not.
+    /// prompt, refused as an empty `input_ids` is, beside ids or not. Beside
+    /// ids a batch of texts is refused: SGLang sizes the batch from the texts
+    /// while the gRPC path serves the ids.
     #[test]
     fn a_generate_request_takes_a_batch_of_texts() {
         use validator::ValidationErrorsKind;
@@ -776,14 +787,23 @@ mod tests {
         assert_eq!(found[0].code, "empty_array");
         assert_eq!(found[0].params["field"], "text");
 
-        let beside_ids: GenerateRequest = serde_json::from_value(
-            serde_json::json!({"model": "m", "text": [], "input_ids": [1, 2]}),
-        )
-        .expect("an empty batch beside ids parses");
-        assert!(
-            beside_ids.validate().is_ok(),
-            "beside ids an empty batch is not read"
-        );
+        for (texts, code) in [
+            (serde_json::json!([]), "empty_array"),
+            (serde_json::json!(["a", "b"]), "invalid_value"),
+        ] {
+            let beside_ids: GenerateRequest = serde_json::from_value(
+                serde_json::json!({"model": "m", "text": texts, "input_ids": [1, 2]}),
+            )
+            .expect("a batch of texts beside ids parses");
+            let errors = beside_ids
+                .validate()
+                .expect_err("a batch of texts beside ids is refused");
+            let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+                panic!("the refusal is a rule over the request: {errors:?}");
+            };
+            assert_eq!(found[0].code, code, "{texts}");
+            assert_eq!(found[0].params["field"], "text", "{texts}");
+        }
     }
 
     /// A body names media when one of the three fields carries something; a
