@@ -104,3 +104,33 @@ async fn the_relay_forwards_the_classify_fields_the_type_does_not_model() {
 
     ctx.shutdown().await;
 }
+
+/// A classify body's list of rids names each input's request, as SGLang runs
+/// the i-th input under the i-th id: one id per input reaches the upstream as
+/// sent, and a list of another length, or one naming an id twice, is refused
+/// under `rid` before any worker sees it.
+#[tokio::test]
+async fn a_classify_list_of_rids_takes_one_id_per_input() {
+    let (ctx, app, recorder) = app_with_recorder(18135).await;
+    let sent = json!({"model": "mock-model", "input": ["a", "b"], "rid": ["r1", "r2"]});
+    let (status, answer) = post(&app, "/v1/classify", &sent).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    for rid in [
+        json!(["r1"]),
+        json!(["r1", "r2", "r3"]),
+        json!(["r1", "r1"]),
+    ] {
+        let body = json!({"model": "mock-model", "input": ["a", "b"], "rid": rid});
+        let (status, answer) = post(&app, "/v1/classify", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["error"]["param"], "rid", "{answer}");
+    }
+    assert_eq!(
+        recorder.only_body(),
+        sent,
+        "only the body with one id per input reached the worker"
+    );
+
+    ctx.shutdown().await;
+}

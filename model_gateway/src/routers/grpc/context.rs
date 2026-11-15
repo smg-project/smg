@@ -179,11 +179,10 @@ impl RequestType {
             Self::Generate(r) => r.rid.as_deref(),
             Self::Completion(r) => r.rid.as_deref(),
             Self::Embedding(r) => r.rid.as_deref(),
-            // a batch's first id, as the classify request routes by it
-            Self::Classify(r) => r
-                .rid
-                .as_ref()
-                .and_then(openai_protocol::common::StringOrArray::first),
+            // a batch's first id, as the classify request routes by it; a
+            // list's ids name the batch's engine requests one per input
+            // (`EmbeddingRequestBuildingStage`)
+            Self::Classify(r) => openai_protocol::common::GenerationRequest::rid(r.as_ref()),
             Self::Messages(r) => r.rid.as_deref(),
             Self::Responses(_) | Self::Decisions(_) | Self::Transcription { .. } => None,
         }
@@ -608,7 +607,8 @@ pub(crate) enum ExecutionPlan {
     },
     /// Batched embedding fan-out: one backend request per input, in the
     /// request's order, answered as one list. Sub-request ids are
-    /// `{shared_request_id}-p{i}`.
+    /// `{shared_request_id}-p{i}`, or, for a classify batch whose `rid` is a
+    /// list, the list's ids, the first of them the shared one.
     EmbedBatch {
         shared_request_id: String,
         requests: Vec<ProtoEmbedRequest>,

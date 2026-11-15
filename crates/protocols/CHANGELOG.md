@@ -328,8 +328,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A classify request's `rid` may be a list, one per input, and its `priority` any 64-bit
   integer, as SGLang's `/v1/classify` takes them: a list of ids and a priority past `i32` were
   refused as `invalid_type` and `invalid_value`. A batch routes by its first id, as a rerank request
-  does. Breaking: `ClassifyRequest.rid` is an `Option<StringOrArray>` and `priority` an
-  `Option<i64>`.
+  does, and runs the i-th input under the i-th id, as SGLang does: the HTTP router forwards the
+  list as sent, and the gRPC router names each input's engine request by its id, where one id
+  names them `{rid}-p{i}`. A list holds one id per input (a string or an array of token ids is one
+  input), none twice; another list is refused as `invalid_value` under `rid`. Breaking:
+  `ClassifyRequest.rid` is an `Option<StringOrArray>` and `priority` an `Option<i64>`.
 - An assistant message with its reasoning under both `reasoning_content` and `reasoning` (the key
   of vLLM and OpenRouter, which agent clients send too) is accepted when the two texts are the
   same. Since 1.12.0 the serde alias between the two keys refused such a message as a duplicate

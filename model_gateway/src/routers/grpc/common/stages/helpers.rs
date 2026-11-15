@@ -163,7 +163,8 @@ fn request_stamp_uuid(tenant_meta: Option<&TenantRequestMeta>) -> uuid::Uuid {
 /// its value is the caller's contract (matching /generate's long-standing
 /// behavior) and stays stable across attempts.
 pub(crate) enum IdStamp {
-    /// Bare client `rid` outside PD: stable across attempts.
+    /// Bare client ids outside PD, stable across attempts: a request's
+    /// `rid`, or a classify batch's one per input.
     Exact,
     /// `{base}-{uuid}` minted fresh per attempt (rid under PD,
     /// middleware-derived ids).

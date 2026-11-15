@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::common::StringOrArray;
 use tracing::error;
 
 use crate::routers::{
@@ -86,8 +87,10 @@ impl BuildStage for EmbeddingRequestBuildingStage {
         };
 
         // One backend request per input: a single input takes the one id the
-        // single-request endpoints mint, a batch the shared id with a
-        // per-input sub id, as a batch of completion prompts does.
+        // single-request endpoints mint; a classify batch whose `rid` lists
+        // one id per input runs each input under its own, as SGLang runs the
+        // i-th input under the i-th id; any other batch takes the shared id
+        // with a per-input sub id, as a batch of completion prompts does.
         let (plan, id_stamp) = match inputs.as_slice() {
             [] => {
                 return Err(error::internal_error(
@@ -107,30 +110,51 @@ impl BuildStage for EmbeddingRequestBuildingStage {
                     id_stamp,
                 )
             }
-            inputs => {
-                let (shared_request_id, batch_stamp) = helpers::resolve_batch_id_stamp(
-                    &ctx.input.request_type,
-                    ctx.input.tenant_request_meta.as_ref(),
-                    prefix,
-                    false,
-                );
-                let requests = inputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, input)| {
-                        let request_id =
-                            helpers::batch_sub_id(&shared_request_id, i, batch_stamp.unique_subs);
-                        build_embed_request(client, request_id, input)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                (
-                    ExecutionPlan::EmbedBatch {
-                        shared_request_id,
-                        requests,
-                    },
-                    helpers::IdStamp::Batch(batch_stamp),
-                )
-            }
+            inputs => match per_input_ids(&ctx.input.request_type, inputs.len()) {
+                // The client's ids are stable across attempts, as a single
+                // request's `rid` is, and the batch answers under the first.
+                Some(ids @ [first, ..]) => {
+                    let requests = inputs
+                        .iter()
+                        .zip(ids)
+                        .map(|(input, id)| build_embed_request(client, id.clone(), input))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (
+                        ExecutionPlan::EmbedBatch {
+                            shared_request_id: first.clone(),
+                            requests,
+                        },
+                        helpers::IdStamp::Exact,
+                    )
+                }
+                _ => {
+                    let (shared_request_id, batch_stamp) = helpers::resolve_batch_id_stamp(
+                        &ctx.input.request_type,
+                        ctx.input.tenant_request_meta.as_ref(),
+                        prefix,
+                        false,
+                    );
+                    let requests = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, input)| {
+                            let request_id = helpers::batch_sub_id(
+                                &shared_request_id,
+                                i,
+                                batch_stamp.unique_subs,
+                            );
+                            build_embed_request(client, request_id, input)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (
+                        ExecutionPlan::EmbedBatch {
+                            shared_request_id,
+                            requests,
+                        },
+                        helpers::IdStamp::Batch(batch_stamp),
+                    )
+                }
+            },
         };
 
         Ok(BuildOutput {
@@ -153,6 +177,19 @@ impl BuildStage for EmbeddingRequestBuildingStage {
     #[cfg(test)]
     fn signature(&self) -> String {
         "EmbeddingRequestBuildingStage".to_string()
+    }
+}
+
+/// The ids of a classify batch whose `rid` is a list of one per input, each
+/// input's engine id (`ClassifyRequest`'s rule refuses a list of another
+/// length, or one naming an id twice); `None` for any other request.
+fn per_input_ids(request_type: &RequestType, inputs: usize) -> Option<&[String]> {
+    match request_type {
+        RequestType::Classify(request) => match &request.rid {
+            Some(StringOrArray::Array(ids)) if ids.len() == inputs => Some(ids),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -209,5 +246,91 @@ fn build_embed_request(
             "unsupported_backend",
             "ZMQ backend does not support embeddings yet",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use openai_protocol::classify::ClassifyRequest;
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::routers::grpc::{
+        context::ClientSelection,
+        regular::stages::testing::{components, mock_backend_client},
+    };
+
+    const MODEL: &str = "test-model";
+
+    /// An embed batch's shared id and its engine requests' ids, in order.
+    fn embed_ids(plan: &ExecutionPlan) -> (String, Vec<String>) {
+        let ExecutionPlan::EmbedBatch {
+            shared_request_id,
+            requests,
+        } = plan
+        else {
+            panic!("an embed batch")
+        };
+        let ids = requests
+            .iter()
+            .map(|request| match request {
+                ProtoEmbedRequest::Sglang(request) => request.request_id.clone(),
+                ProtoEmbedRequest::Vllm(request) => request.request_id.clone(),
+            })
+            .collect();
+        (shared_request_id.clone(), ids)
+    }
+
+    /// A classify batch whose `rid` lists one id per input runs each input
+    /// under its own id, as SGLang runs the i-th input under the i-th id, and
+    /// answers under the first; a retry keeps the ids. A batch under one id
+    /// runs each input under that id's per-input sub id, as before.
+    #[tokio::test]
+    async fn a_classify_batch_runs_each_input_under_its_listed_id() {
+        let cases: [(Value, &str, [&str; 2]); 2] = [
+            (json!(["r1", "r2"]), "r1", ["r1", "r2"]),
+            (json!("r"), "r", ["r-p0", "r-p1"]),
+        ];
+        for (rid, shared, subs) in cases {
+            let (client, engine) = mock_backend_client(MODEL).await;
+            let request: Arc<ClassifyRequest> = Arc::new(
+                serde_json::from_value(json!({"model": MODEL, "input": ["a", "b"], "rid": rid}))
+                    .expect("a classify request"),
+            );
+            let mut ctx =
+                RequestContext::for_classify(request, None, MODEL.to_string(), components());
+            ctx.state.clients = Some(ClientSelection::Single { client });
+            ctx.state.preparation = Some(PreparationOutput::Embedding {
+                inputs: vec![
+                    EmbeddingInput {
+                        text: Some("a".to_string()),
+                        token_ids: vec![1],
+                    },
+                    EmbeddingInput {
+                        text: Some("b".to_string()),
+                        token_ids: vec![2],
+                    },
+                ],
+            });
+            let BuildOutput {
+                mut plan, stamp, ..
+            } = EmbeddingRequestBuildingStage::new()
+                .build(&mut ctx)
+                .await
+                .map_err(|refusal| refusal.status())
+                .expect("built");
+            engine.abort();
+            let built = (shared.to_string(), subs.map(str::to_string).to_vec());
+            assert_eq!(embed_ids(&plan), built, "{shared}");
+
+            stamp
+                .id
+                .restamp(&mut plan)
+                .map_err(|refusal| refusal.status())
+                .expect("restamped");
+            assert_eq!(embed_ids(&plan), built, "a retry keeps the ids: {shared}");
+        }
     }
 }
