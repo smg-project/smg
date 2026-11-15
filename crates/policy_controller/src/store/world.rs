@@ -148,6 +148,12 @@ pub struct Built {
     /// The number of the generation the world was published under
     /// ([`World::spec`]): the rows and it are of one load.
     pub generation: u64,
+    /// Which list of the pool was written, as [`PoolFacts::reach`] takes
+    /// it: the asking gateway's id where the pool holds a host-local row,
+    /// each gateway being handed a list of its own there, or where a veto
+    /// of that gateway masks a row of its copy, and `0` for a pool every
+    /// gateway dials whole and reads alike.
+    pub reach: u64,
 }
 
 impl Built {
@@ -162,6 +168,7 @@ impl Built {
             regime: OverloadRegime::None,
             generation: self.generation,
             zones: &[],
+            reach: self.reach,
         }
     }
 }
@@ -596,31 +603,6 @@ impl World {
                 load.report_age_ms = age_ms(now_micros, sampled_at);
             }
         }
-        // The asking gateway's run among the gateways that hold a veto in
-        // this pool: no other gateway's veto is read.
-        let own = self
-            .vetoes
-            .get(index)
-            .and_then(|runs| run_of(runs, ask.gateway));
-        if let Some(run) = own {
-            // A pool every gateway dials whole is copied whole: a veto's
-            // row is its position. Another gateway's host-local rows are
-            // left out, so there the row is found by its id.
-            let whole = shape.locals.is_empty();
-            for veto in run.vetoes.iter() {
-                if veto.until <= ask.now {
-                    continue;
-                }
-                let row = if whole {
-                    out.candidates.get_mut(veto.row as usize)
-                } else {
-                    row_of_id(&mut out.candidates, veto.id)
-                };
-                if let Some(row) = row {
-                    row.health.stalled = true;
-                }
-            }
-        }
         if let Some(row) = ask.pinned.and_then(|id| row_of_id(&mut out.candidates, id)) {
             row.session_hit = true;
         }
@@ -634,13 +616,60 @@ impl World {
                     }));
             }
         }
+        // The asking gateway's run among the gateways that hold a veto in
+        // this pool: no other gateway's veto is read.
+        let own = self
+            .vetoes
+            .get(index)
+            .and_then(|runs| run_of(runs, ask.gateway));
+        // Whether a veto of the asking gateway masks a row of its list:
+        // asked last, so no loop of the build holds the answer.
+        let masked =
+            own.is_some_and(|run| mask(run, ask.now, shape.locals.is_empty(), &mut out.candidates));
         Some(Built {
             pool_size: out.candidates.len() as u32,
             membership_epoch: self.epoch,
             now_micros,
             generation: self.spec.generation(),
+            // A copy a veto masks reads apart from the other gateways': it
+            // is the asking gateway's own list, as one short of another's
+            // host-local rows is.
+            reach: if shape.locals.is_empty() && !masked {
+                0
+            } else {
+                ask.gateway.0
+            },
         })
     }
+}
+
+/// Write the stalled bit on each row of `rows` a veto of `run` masks at
+/// `now`, and say whether one did.
+///
+/// A pool every gateway dials whole is copied whole (`whole`): a veto's row
+/// is its position. Another gateway's host-local rows are left out, so
+/// there the row is found by its id.
+///
+/// Out of line: a build that holds no veto of the asking gateway pays one
+/// test for this walk, and the build's row loop pays nothing for it.
+#[inline(never)]
+fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> bool {
+    let mut masked = false;
+    for veto in run.vetoes.iter() {
+        if veto.until <= now {
+            continue;
+        }
+        let row = if whole {
+            rows.get_mut(veto.row as usize)
+        } else {
+            row_of_id(rows, veto.id)
+        };
+        if let Some(row) = row {
+            row.health.stalled = true;
+            masked = true;
+        }
+    }
+    masked
 }
 
 /// The row of worker `id` in a slice sorted by worker id.

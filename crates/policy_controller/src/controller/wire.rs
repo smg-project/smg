@@ -367,7 +367,7 @@ const fn shed_reason(reason: ShedReason) -> proto::ShedReason {
 fn trace(trace: &Trace) -> proto::Trace {
     proto::Trace {
         profile: u32::from(trace.profile),
-        survivors: trace.survivors,
+        survivors: trace.survivors.get(),
         top: trace
             .top
             .iter()
@@ -388,7 +388,9 @@ fn trace(trace: &Trace) -> proto::Trace {
 mod tests {
     use super::{busy, decided, emptied, Checked, Lists, Refusal, Viewed};
     use crate::{
-        decision::{Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace},
+        decision::{
+            Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+        },
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         view::{
             fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
@@ -809,7 +811,7 @@ mod tests {
     fn traced() -> Trace {
         Trace {
             profile: 3,
-            survivors: 5,
+            survivors: Survivors::counted(5),
             // The third entry is past the trace's length: not a part of it.
             top: [
                 (WorkerId(31), 0.5),
@@ -825,7 +827,7 @@ mod tests {
     fn wire_trace() -> proto::Trace {
         proto::Trace {
             profile: 3,
-            survivors: 5,
+            survivors: Some(5),
             top: vec![
                 proto::Scored {
                     worker_id: 31,

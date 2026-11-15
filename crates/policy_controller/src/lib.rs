@@ -119,11 +119,12 @@ pub mod wit;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
 pub use decision::{
-    Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
+    TRACE_TOP,
 };
 pub use framework::{
     Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, TieBand, Weighted,
+    Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
@@ -146,7 +147,10 @@ pub use view::{
 /// The streams a decision opens are listed here, so that a new site derives
 /// one that none of them reads:
 ///
-/// - the seed's own stream: the profile's picker, and a plugin's draws;
+/// - the seed's own stream: the profile's picker, and a plugin's draws. A
+///   picker that draws first reads it too, and whatever follows that draw
+///   (the order of the rows drawn, or the whole pass behind a draw that kept
+///   nobody) reads it past those values;
 /// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
@@ -178,6 +182,12 @@ impl Draw {
         // Rejection-free: the bias of a modulo over 64 bits is below 2^-32
         // for any pool a gateway holds.
         (self.next_u64() % n as u64) as usize
+    }
+
+    /// The stream's state: [`Draw::new`] of it continues the stream past
+    /// the values read.
+    pub(crate) const fn state(self) -> u64 {
+        self.0
     }
 }
 

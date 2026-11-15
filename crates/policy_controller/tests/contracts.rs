@@ -212,6 +212,7 @@ fn pool_record() -> &'static [&'static str] {
             regime,
             generation,
             zones,
+            reach,
         }
     )
 }
@@ -671,7 +672,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &[],
+            host_only: &["reach"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -756,6 +757,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "shadow_pick",
                 "fallback",
                 "affinity_source",
+                // The record reads it from its count ([`Trace::drew_first`]).
+                "drew_first",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -769,9 +772,10 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("shadow_pick", Type::Fixed64),
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
+                ("drew_first", Type::Bool),
             ],
             repeated: &["top", "drops"],
-            optional: &[],
+            optional: &["survivors"],
         },
         ProtoMirror {
             message: "Lease",
@@ -868,7 +872,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &[],
+            host_only: &["reach"],
             before: &[],
             beside: &[],
         },

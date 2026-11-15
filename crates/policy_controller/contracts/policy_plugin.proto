@@ -409,13 +409,15 @@ message Lease {
 
 // Serves the routing trace header and Explain; positions into the generation's
 // spec. The record carries the first five fields (its `top` at most three
-// entries, each only `worker_id` and `score`); the observability contract
-// fills the rest, unset until then.
+// entries, each only `worker_id` and `score`) and reads `drew_first` from
+// its count, which a decision that drew first does not hold; the
+// observability contract fills the rest, unset until then.
 message Trace {
   // Zero-based position in the spec's profile names in ascending UTF-8 order.
   uint32 profile = 1;  // u16
-  // Candidates left after the filters.
-  uint32 survivors = 2;
+  // Candidates left after the filters, where the decision counted them:
+  // unset, never a zero, when it drew first (`drew_first`).
+  optional uint32 survivors = 2;
   // Best first; at most 3 (the record's TRACE_TOP).
   repeated Scored top = 3;
   fixed64 seed = 4;
@@ -435,6 +437,11 @@ message Trace {
   // The gateway's fallback profile decided.
   bool fallback = 10;
   AffinitySource affinity_source = 11;
+  // The decision drew first: its picker drew the rows it hands out and the
+  // filters were asked about each of them alone. No pass over the pool ran:
+  // `survivors` is unset and `drops` is empty, neither one a count, and
+  // `top` is of the rows drawn.
+  bool drew_first = 12;
 }
 
 message FilterDrop {

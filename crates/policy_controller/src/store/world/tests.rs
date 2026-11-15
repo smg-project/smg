@@ -19,8 +19,11 @@ use crate::{
         GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, Reachability,
         WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
-    view::{fingerprint, AffinityFacts, Candidate, LoadRow, Phase, Role, WireModes, WorkerId},
-    AppliedSpec, PolicySpec,
+    view::{
+        fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
+        WireModes, WorkerId,
+    },
+    AppliedSpec, PolicySpec, Scratch,
 };
 
 const MODEL: &str = "m";
@@ -218,6 +221,193 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
         },
     );
     assert!(rows.iter().all(|row| !row.session_hit));
+}
+
+#[test]
+fn a_build_names_the_asking_gateways_list_where_the_pool_holds_a_host_local_row() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let open = member(&store, "http://a:8000");
+    let built = |gateway: u64| {
+        let asked = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(now)
+        };
+        let (rows, _, built) = view(&store, &asked);
+        let mut ids: Vec<WorkerId> = rows.iter().map(|row| row.id).collect();
+        ids.sort_unstable();
+        (built.reach, ids)
+    };
+    // A pool every gateway dials whole is one list: no gateway's is named.
+    assert_eq!([built(1), built(2)], [(0, vec![open]), (0, vec![open])]);
+
+    let local = store
+        .upsert(WorkerFacts {
+            reachable_from: Reachability::Gateway(GatewayId(2)),
+            ..facts("unix:///b", Role::Single, &[MODEL])
+        })
+        .id();
+    let mut both = vec![open, local];
+    both.sort_unstable();
+    // One host-local row, and the pool's lists are two under one epoch:
+    // each gateway's is named by its id, the row's holder's and the others'.
+    assert_eq!(
+        [built(1), built(2), built(3)],
+        [(1, vec![open]), (2, both), (3, vec![open])]
+    );
+}
+
+#[test]
+fn a_build_names_the_asking_gateways_list_where_its_veto_masks_a_row() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let vetoed = member(&store, "http://a:8000");
+    let reach = |gateway: u64, at: Instant| {
+        let asked = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(at)
+        };
+        view(&store, &asked).2.reach
+    };
+    assert_eq!([reach(1, now), reach(2, now)], [0, 0]);
+
+    // A veto masks a row of its holder's copy and of no other: that
+    // gateway's list is its own, and the others still read the pool's one.
+    let until = now + Duration::from_secs(1);
+    store.gateway_veto(GatewayId(2), vetoed, Some(until));
+    assert_eq!([reach(1, now), reach(2, now), reach(3, now)], [0, 2, 0]);
+    // A veto that ended masks nothing.
+    assert_eq!(reach(2, until), 0);
+}
+
+#[test]
+fn two_gateways_lists_of_one_size_each_turn_their_own_rotation() {
+    // Twelve rows every gateway dials and four host-local rows a gateway:
+    // each of two gateways is handed sixteen rows under one membership
+    // epoch, the other's four left out.
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let ready = |facts: WorkerFacts| {
+        let id = store.upsert(facts).id();
+        status(&store, id, WorkerStatus::Ready);
+    };
+    for row in 0..12 {
+        ready(facts(
+            &format!("http://w{row}:8000"),
+            Role::Single,
+            &[MODEL],
+        ));
+    }
+    for gateway in [1, 2] {
+        for row in 0..4 {
+            ready(WorkerFacts {
+                reachable_from: Reachability::Gateway(GatewayId(gateway)),
+                ..facts(&format!("unix:///g{gateway}/{row}"), Role::Single, &[MODEL])
+            });
+        }
+    }
+    let engine = PolicySpec::preset("round_robin")
+        .expect("a preset of this build")
+        .validate()
+        .expect("a preset validates");
+    let (mut out, mut scratch) = (ViewBuffers::default(), Scratch::new());
+    let mut drawn = [Vec::new(), Vec::new()];
+    // Their asks alternate through one engine, as a controller's do.
+    for turn in 0..32u64 {
+        let asked = Ask {
+            gateway: GatewayId(1 + turn % 2),
+            ..ask(now)
+        };
+        let built = store
+            .build_view(MODEL, Role::Single, &asked, &mut out)
+            .expect("the pool");
+        assert_eq!(out.candidates.len(), 16);
+        let request = RequestFacts {
+            model: MODEL,
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide(
+            &request,
+            &built.pool_facts(),
+            &out.candidates,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        assert!(decision.trace().drew_first());
+        let pick = decision.pick().expect("a ready row");
+        drawn[(turn % 2) as usize].push(pick.targets.iter().next().expect("a target").id);
+    }
+    // One rotation turned by both lists would hand a gateway every other
+    // row of its own: sixteen decisions of a gateway visit its sixteen rows.
+    for ids in &mut drawn {
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 16);
+    }
+}
+
+#[test]
+fn two_gateways_in_strict_turn_leave_each_others_vetoed_rows_their_share() {
+    // Sixteen rows every gateway dials whole. Two gateways ask in strict
+    // turn, and each holds a veto on a row at each parity: whichever
+    // parity a gateway's turns land on, one of its vetoes stands there.
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    for row in 0..16 {
+        let id = store
+            .upsert(facts(
+                &format!("http://w{row}:8000"),
+                Role::Single,
+                &[MODEL],
+            ))
+            .id();
+        status(&store, id, WorkerStatus::Ready);
+    }
+    let (rows, _, _) = view(&store, &ask(now));
+    let ids: Vec<WorkerId> = rows.iter().map(|row| row.id).collect();
+    let until = now + Duration::from_secs(60);
+    for (at, &id) in ids[..4].iter().enumerate() {
+        store.gateway_veto(GatewayId(1 + at as u64 / 2), id, Some(until));
+    }
+    let engine = PolicySpec::preset("round_robin")
+        .expect("a preset of this build")
+        .validate()
+        .expect("a preset validates");
+    let (mut out, mut scratch) = (ViewBuffers::default(), Scratch::new());
+    let mut picked = [0u32; 16];
+    for turn in 0..224u64 {
+        let asked = Ask {
+            gateway: GatewayId(1 + turn % 2),
+            ..ask(now)
+        };
+        let built = store
+            .build_view(MODEL, Role::Single, &asked, &mut out)
+            .expect("the pool");
+        let request = RequestFacts {
+            model: MODEL,
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide(
+            &request,
+            &built.pool_facts(),
+            &out.candidates,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        let pick = decision.pick().expect("a ready row");
+        let id = pick.targets.iter().next().expect("a target").id;
+        let at = ids.iter().position(|&row| row == id).expect("a row");
+        picked[at] += 1;
+    }
+    // Each gateway turns its own rotation: its 112 asks hand each of its
+    // fourteen kept rows eight. A row one gateway vetoes is the other's
+    // alone. One rotation turned by both would leave a row vetoed at its
+    // vetoer's parity one pick, the other gateway never landing on it.
+    let mut want = [16u32; 16];
+    want[..4].fill(8);
+    assert_eq!(picked, want);
 }
 
 #[test]
