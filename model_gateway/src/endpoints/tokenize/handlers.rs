@@ -40,18 +40,20 @@ use crate::{
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 
-/// The tokenizer that serves a tokenize or detokenize body, and the model it
-/// is the tokenizer of (whose workers' context window a tokenize answer
-/// reports): the name or id as given, then the model the worker registry
-/// resolves an alias to (the name the serving routes use). A body that names
-/// no model (absent, empty or the unknown model) is the one served model's
-/// ([`WorkerRegistry::sole_served_model`], as the gRPC router serves such a
-/// body) when a tokenizer is loaded under its name, beside whatever else is
-/// loaded (a single-model gateway holds the startup load under its path and
-/// the worker's under the served name); else it is the one loaded
-/// tokenizer's. With several loaded and no served model's among them it
-/// names none of them, and is refused as `missing_model` rather than read
-/// with whichever vocabulary sorts first. A name no tokenizer serves is a
+/// The tokenizer that serves a tokenize or detokenize body, and the model
+/// whose workers' context window a tokenize answer reports (the model the
+/// tokenizer is taken to be of): the name or id as given, then the model the
+/// worker registry resolves an alias to (the name the serving routes use).
+/// A body that names no model (absent, empty or the unknown model) is the
+/// one served model's ([`WorkerRegistry::sole_served_model`], as the gRPC
+/// router serves such a body) when a tokenizer is loaded under its name,
+/// beside whatever else is loaded (a single-model gRPC gateway holds the
+/// startup load under its path and the worker's under the served name);
+/// else it is the one loaded tokenizer's, its window still the one served
+/// model's (a single-model HTTP gateway holds only the startup load, under
+/// its path). With several loaded and no served model's among them it names
+/// none of them, and is refused as `missing_model` rather than read with
+/// whichever vocabulary sorts first. A name no tokenizer serves is a
 /// `404 model_not_found`.
 fn get_tokenizer(
     workers: &WorkerRegistry,
@@ -77,12 +79,15 @@ fn get_tokenizer(
 
     // A body that names no model is the one served model's
     let model_less = model == UNKNOWN_MODEL_ID || model.is_empty();
-    if model_less {
-        if let Some(served) = workers.sole_served_model() {
-            if let Some(tokenizer) = registry.get(&served) {
-                debug!("Using the one served model's tokenizer '{}'", served);
-                return Ok((tokenizer, served));
-            }
+    let served = if model_less {
+        workers.sole_served_model()
+    } else {
+        None
+    };
+    if let Some(served) = &served {
+        if let Some(tokenizer) = registry.get(served) {
+            debug!("Using the one served model's tokenizer '{}'", served);
+            return Ok((tokenizer, served.clone()));
         }
     }
 
@@ -95,12 +100,16 @@ fn get_tokenizer(
             .join(", ")
     };
 
-    // ... else the one loaded tokenizer's
+    // ... else the one loaded tokenizer's, taken to be the one served model's
+    // when there is one, whose window the answer reports: an HTTP worker loads
+    // no tokenizer of its own, so a single-model HTTP gateway holds only the
+    // startup load, under the path it was given
     if model_less {
         match entries.as_slice() {
             [only] => {
                 debug!("Using the one loaded tokenizer '{}' as default", only.name);
-                return Ok((only.tokenizer.clone(), only.name.clone()));
+                let model = served.unwrap_or_else(|| only.name.clone());
+                return Ok((only.tokenizer.clone(), model));
             }
             [] => {}
             _ => {
@@ -500,12 +509,18 @@ mod tests {
         (status, field("code"), field("message"))
     }
 
-    /// A worker serving `model`, with no health check.
-    fn worker_serving(model: &str) -> Arc<dyn Worker> {
+    /// A worker serving `model`, reporting `window` as its context length when
+    /// given, with no health check.
+    fn worker_serving(model: &str, window: Option<u32>) -> Arc<dyn Worker> {
+        let card = ModelCard::new(model);
+        let card = match window {
+            Some(window) => card.with_context_length(window),
+            None => card,
+        };
         Arc::new(
             BasicWorkerBuilder::new(format!("http://{model}.invalid:8000"))
                 .worker_type(WorkerType::Regular)
-                .model(ModelCard::new(model))
+                .model(card)
                 .health_config(HealthCheckConfig {
                     disable_health_check: true,
                     ..Default::default()
@@ -586,7 +601,7 @@ mod tests {
         load_mock(&registry, "/models/alpha").await;
         load_mock(&registry, "alpha").await;
         workers
-            .register(worker_serving("alpha"))
+            .register(worker_serving("alpha", None))
             .expect("register the worker");
         for model in [UNKNOWN_MODEL_ID, ""] {
             let Ok((_, name)) = get_tokenizer(&workers, &registry, model) else {
@@ -596,7 +611,7 @@ mod tests {
         }
 
         workers
-            .register(worker_serving("beta"))
+            .register(worker_serving("beta", None))
             .expect("register the worker");
         let Err(refusal) = get_tokenizer(&workers, &registry, UNKNOWN_MODEL_ID) else {
             panic!("two served models and two tokenizers refuse the body");
@@ -606,5 +621,26 @@ mod tests {
             (status, code.as_str()),
             (StatusCode::BAD_REQUEST, "missing_model")
         );
+    }
+
+    /// A single-model HTTP gateway holds one tokenizer, the startup load under
+    /// its path (an HTTP worker loads none of its own), while its worker
+    /// serves the model under the engine's name. A body that names no model
+    /// is served by that tokenizer and reports the served model's window, not
+    /// the `-1` of a name no worker serves.
+    #[tokio::test]
+    async fn a_body_without_a_model_reports_the_one_served_models_window_beside_the_one_tokenizer()
+    {
+        let workers = WorkerRegistry::new();
+        let registry = TokenizerRegistry::new();
+        load_mock(&registry, "/models/alpha").await;
+        workers
+            .register(worker_serving("alpha", Some(8192)))
+            .expect("register the worker");
+        let Ok((_, model)) = get_tokenizer(&workers, &registry, UNKNOWN_MODEL_ID) else {
+            panic!("the one tokenizer serves the body");
+        };
+        assert_eq!(model, "alpha");
+        assert_eq!(model_context_window(&workers, &model), 8192);
     }
 }
