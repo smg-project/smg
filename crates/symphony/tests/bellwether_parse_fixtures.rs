@@ -308,6 +308,30 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "minicpm-v-4.7-35b-a3b",
         GenerationPrompt::OpensTheThoughtWhenAsked,
     ),
+    // MiniCPM-OCR-1.0 (its own OCR stack) and MiniCPM-OCR-Jev (a Qwen 3.5 stack) each ship a chat
+    // template and a tokenizer of their own with the MiniCPM-V-4.7 prompt shapes: ChatML, Qwen 3.5's
+    // tagged calls, and the thought opened in the prompt only when the request asks for it.
+    (
+        "minicpm-ocr-1.0",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "minicpm-ocr-jev",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    // The LightOnOCR-3 line: the 4B and the 0.8B (a Qwen 3.5 stack) write the MiniCPM-OCR prompt
+    // shapes under templates of their own (the 0.8B's is MiniCPM-OCR-Jev's byte for byte): ChatML,
+    // Qwen 3.5's tagged calls, the thought opened in the prompt only when the request asks for it;
+    // the 1B (a Mistral 3 stack under ChatML markers) renders no tool section and no thought.
+    (
+        "lightonocr-3-4b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "lightonocr-3-0.8b",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    ("lightonocr-3-1b", GenerationPrompt::Plain),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as

@@ -10,7 +10,9 @@
 #
 # An image for another architecture than the builder's (`--platform`) is
 # cross-compiled: the build stage runs on the builder's own architecture, and
-# the last stage's few commands alone run on the image's.
+# the last stage's few commands alone run on the image's. Every build needs a
+# builder that sets the platform arguments (BUILDPLATFORM, TARGETARCH and
+# BUILDARCH).
 
 FROM scratch AS local_src
 COPY . /src
@@ -43,11 +45,13 @@ RUN rustup toolchain install \
     && rustc --version && cargo --version && protoc --version
 
 # What a cross build needs, for an image of another architecture than the
-# builder's: that architecture's C compiler and C library (for the
-# dependencies that compile C, and for the link), its Rust standard library,
-# and the linker's name for cargo. /cross-target holds the Rust target's name
-# for the build below. The builder sets both arguments; they are named here
-# and not above, so the steps above are the same for every architecture.
+# builder's: that architecture's C and C++ compilers and its C library (for
+# the dependencies that compile C or C++, and for the link), its Rust standard
+# library, and the linker's name for cargo. The one package named, the C++
+# compiler's, brings the C compiler and the C library with it. /cross-target
+# holds the Rust target's name for the build below. The builder sets both
+# arguments; they are named here and not above, so the steps above are the
+# same for every architecture.
 ARG TARGETARCH
 ARG BUILDARCH
 RUN if [ "${TARGETARCH}" != "${BUILDARCH}" ]; then \
@@ -57,8 +61,7 @@ RUN if [ "${TARGETARCH}" != "${BUILDARCH}" ]; then \
             *) echo "no cross build is named here for ${TARGETARCH}" >&2; exit 1 ;; \
         esac \
         && apt update -y \
-        && apt install -y --no-install-recommends \
-            "gcc-$(echo "${cpu}" | tr _ -)-linux-gnu" "libc6-dev-${TARGETARCH}-cross" \
+        && apt install -y --no-install-recommends "g++-$(echo "${cpu}" | tr _ -)-linux-gnu" \
         && rm -rf /var/lib/apt/lists/* \
         && apt clean \
         && rustup target add "${cpu}-unknown-linux-gnu" \
