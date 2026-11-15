@@ -12,8 +12,7 @@
 //! is the settings' own with room for a loaded host.
 //!
 //! No stub server: the client is the generated one and the server is the
-//! binary. The two cells at the end are the Numbers table's rows, run by
-//! name.
+//! binary. The cells at the end are the Numbers table's rows, run by name.
 #![expect(
     clippy::expect_used,
     reason = "the case's helpers run inside the test; a failure there is the test's failure"
@@ -134,6 +133,12 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         }
         let held = stored(&lease);
         if agreed(&mut record, &mut replicas).await != (first, term) {
+            // Read again, under the loop's own clock: a lease that moves
+            // between every two looks is this case's failure, not its wait.
+            assert!(
+                Instant::now() < settled,
+                "the lease kept moving between two looks at it"
+            );
             continue;
         }
         assert_eq!(held.holder, replicas[first].identity());
@@ -274,8 +279,14 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
     writeln!(out, "LEADER_ANSWERS_RECORDED {}", record.len()).expect("stdout");
 }
 
-/// The middle of a sorted list and its last entry.
-fn median_and_worst(samples: &mut [u128]) -> (u128, u128) {
+/// The middle of a sorted list and its last entry. A group with no sample
+/// (no round ran, or none passed its filter) has neither and is refused by
+/// its name.
+fn median_and_worst(name: &str, samples: &mut [u128]) -> (u128, u128) {
+    assert!(
+        !samples.is_empty(),
+        "{name}: no sample; a summary needs one round at the least"
+    );
     samples.sort_unstable();
     (
         samples[samples.len() / 2],
@@ -294,6 +305,21 @@ fn spread(round: u64, offset: u64, period: Duration) -> Duration {
 
 /// A day in microseconds: a wall stamp's time of day, as a log line's.
 const DAY_MICROS: u64 = 86_400_000_000;
+
+/// One line a group of a measurement cell: its count, best, median and
+/// worst.
+fn summaries<const N: usize>(out: &mut impl Write, groups: [(&str, &mut Vec<u128>); N]) {
+    for (name, samples) in groups {
+        let n = samples.len();
+        let (median, worst) = median_and_worst(name, samples);
+        let best = samples.first().copied().unwrap_or_default();
+        writeln!(
+            out,
+            "{name} n={n} best={best} median={median} worst={worst}"
+        )
+        .expect("stdout");
+    }
+}
 
 fn rounds(variable: &str, default: u64) -> u64 {
     std::env::var(variable)
@@ -426,23 +452,17 @@ async fn promotion_times_over_repeated_kills_and_stops() {
         replicas.push(fresh(&lease));
     }
 
-    for (name, samples) in [
-        ("KILL_TO_LEADER_ANSWER_MS", &mut from_kill),
-        ("LAST_RENEWAL_TO_TAKE_MS", &mut from_renewal),
-        ("FENCE_CLOSE_TO_TAKE_MS", &mut from_close),
-        ("STOP_TO_LEADER_ANSWER_MS", &mut from_stop),
-        ("STOP_TO_RELEASE_US", &mut to_release),
-        ("STOP_SIGNAL_TO_TAKE_MS", &mut to_take),
-    ] {
-        let n = samples.len();
-        let (median, worst) = median_and_worst(samples);
-        let best = samples.first().copied().unwrap_or_default();
-        writeln!(
-            out,
-            "{name} n={n} best={best} median={median} worst={worst}"
-        )
-        .expect("stdout");
-    }
+    summaries(
+        &mut out,
+        [
+            ("KILL_TO_LEADER_ANSWER_MS", &mut from_kill),
+            ("LAST_RENEWAL_TO_TAKE_MS", &mut from_renewal),
+            ("FENCE_CLOSE_TO_TAKE_MS", &mut from_close),
+            ("STOP_TO_LEADER_ANSWER_MS", &mut from_stop),
+            ("STOP_TO_RELEASE_US", &mut to_release),
+            ("STOP_SIGNAL_TO_TAKE_MS", &mut to_take),
+        ],
+    );
     record.check().expect("the election's promise holds");
     writeln!(out, "LEADER_ANSWERS_RECORDED {}", record.len()).expect("stdout");
 }
@@ -491,4 +511,133 @@ async fn cpu_and_resident_memory_of_an_idle_leader_and_an_idle_follower() {
         "the idle leader kept its lease"
     );
     record.check().expect("the election's promise holds");
+}
+
+/// The longest run of samples in a row that met a condition, from the
+/// run's first sample to its last.
+#[derive(Default)]
+struct Stretch {
+    since: Option<Instant>,
+    longest: Duration,
+}
+
+impl Stretch {
+    fn read(&mut self, met: bool, at: Instant) {
+        if met {
+            let since = *self.since.get_or_insert(at);
+            self.longest = self.longest.max(at.duration_since(since));
+        } else {
+            self.since = None;
+        }
+    }
+}
+
+/// What a removed lease file costs, at the design's default settings or at
+/// the timings the environment names. Over `SMG_REPLICAS_ROUNDS` rounds
+/// (default 5) a replica starts over a new lease file and its first answer
+/// as the leader is timed from its start; a standby joins; the lease file
+/// is removed under the leader, at another point of the renew period each
+/// round; and both replicas are asked `Leader` every few milliseconds until
+/// one answers as the leader above the lost term and a renew deadline more.
+/// A removal is read four ways: the longest run of samples in which both
+/// answered as the leader, the longest in which neither did, the removal to
+/// the first answer above the lost term, and whether the election's promise
+/// held over the round's answers. A measurement, run by name with
+/// `--ignored`; it asserts nothing of the election, so it reads a binary
+/// that takes a removed record at once as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
+    let mut out = std::io::stdout();
+    let settings = replicas::timings(ElectionSettings::default(), &mut out);
+    let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
+    let period = settings.renew_period;
+    let within = settings.duration + 2 * period + ROOM;
+    let (mut first, mut two_ms, mut nobody_ms, mut take_ms) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut with_two, mut broken) = (0u64, 0u64);
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let mut record = Record::default();
+        let started = Instant::now();
+        let mut replicas = vec![start(&format!("replica-{round}-a"), &lease, settings)];
+        let (_, term) = agreed(&mut record, &mut replicas).await;
+        let first_ms = millis(started.elapsed());
+        tokio::time::sleep(spread(round, 333, period)).await;
+        replicas.push(start(&format!("replica-{round}-b"), &lease, settings));
+        agreed(&mut record, &mut replicas).await;
+        tokio::time::sleep(spread(round, 0, period)).await;
+        // The removal under the store's own lock, as a writer of the store
+        // moves the file: no renewal in flight puts the record back.
+        {
+            let lock = std::fs::File::create(dir.path().join("lease.lock")).expect("the lock");
+            lock.lock().expect("the store's lock");
+            std::fs::remove_file(&lease).expect("the removal");
+        }
+        let removed = Instant::now();
+        let (mut samples, mut both) = (0u64, 0u64);
+        let (mut two, mut nobody) = (Stretch::default(), Stretch::default());
+        let mut taken: Option<(Instant, u64)> = None;
+        loop {
+            let at = Instant::now();
+            let answers = record.sample(&mut replicas).await;
+            let leaders = answers.iter().filter(|a| a.info.is_leader).count();
+            samples += 1;
+            both += u64::from(leaders == 2);
+            two.read(leaders == 2, at);
+            nobody.read(leaders == 0, at);
+            if taken.is_none() {
+                taken = answers
+                    .iter()
+                    .find(|a| a.info.is_leader && a.info.term > term)
+                    .map(|a| (a.returned, a.info.term));
+            }
+            match taken {
+                Some((since, _)) if since.elapsed() >= settings.renew_deadline => break,
+                None if removed.elapsed() > within => break,
+                _ => tokio::time::sleep(Duration::from_millis(2)).await,
+            }
+        }
+        let Some((at, next)) = taken else {
+            writeln!(out, "REMOVED round={round} void: no take in {within:?}").expect("stdout");
+            continue;
+        };
+        let promise = if record.check().is_ok() {
+            "held"
+        } else {
+            broken += 1;
+            "broken"
+        };
+        with_two += u64::from(both > 0);
+        let (both_ms, none_ms, to_take_ms) = (
+            millis(two.longest),
+            millis(nobody.longest),
+            millis(at.duration_since(removed)),
+        );
+        writeln!(
+            out,
+            "REMOVED round={round} term={term}->{next} first_start_ms={first_ms} samples={samples} both={both} both_ms={both_ms} nobody_ms={none_ms} to_take_ms={to_take_ms} promise={promise}"
+        )
+        .expect("stdout");
+        first.push(first_ms);
+        two_ms.push(both_ms);
+        nobody_ms.push(none_ms);
+        take_ms.push(to_take_ms);
+    }
+    let counted = take_ms.len();
+    summaries(
+        &mut out,
+        [
+            ("FIRST_START_TO_LEADER_ANSWER_MS", &mut first),
+            ("REMOVED_TWO_LEADERS_MS", &mut two_ms),
+            ("REMOVED_NOBODY_LEADS_MS", &mut nobody_ms),
+            ("REMOVED_TO_TAKE_MS", &mut take_ms),
+        ],
+    );
+    writeln!(
+        out,
+        "REMOVED_ROUNDS n={counted} with_two_leaders={with_two} promise_broken={broken}"
+    )
+    .expect("stdout");
 }
