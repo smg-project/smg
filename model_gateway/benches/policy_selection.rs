@@ -535,7 +535,9 @@ fn regular_fleet(workers: usize, cache_aware: bool) -> (RegularPath, Vec<Vec<u32
 /// tried engine. Under round robin, and under cache-aware where each request's prompt has
 /// one holder (an index lookup and a hit), at 128 and 1,024 workers. The
 /// `cache_aware_filtered` cells run the cache-aware placement under a candidate filter that
-/// refuses nobody, as both routers hand one on a request's first attempt.
+/// refuses nobody and costs nothing itself. The `cache_aware_first_attempt` cells run it as
+/// the HTTP router does on a request's first attempt, under what a new request's attempt
+/// ledger hands.
 fn bench_regular_placement(c: &mut Criterion) {
     refuse_a_process_trace("regular_placement");
     let mut group = c.benchmark_group("regular_placement");
@@ -563,6 +565,18 @@ fn bench_regular_placement(c: &mut Criterion) {
                         let tokens = &prompts[next % prompts.len()];
                         next += 1;
                         black_box(path.place_filtered(Some(black_box(tokens))).unwrap())
+                    });
+                },
+            );
+            let mut next = 0usize;
+            group.bench_with_input(
+                BenchmarkId::new("cache_aware_first_attempt", workers),
+                &workers,
+                |b, _| {
+                    b.iter(|| {
+                        let tokens = &prompts[next % prompts.len()];
+                        next += 1;
+                        black_box(path.place_first_attempt(Some(black_box(tokens))).unwrap())
                     });
                 },
             );

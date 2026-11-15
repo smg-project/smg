@@ -748,23 +748,25 @@ impl Router {
         attempt: &TypedAttempt<'_, T>,
     ) -> Result<Arc<dyn Worker>, Response> {
         let model_id = attempt.model_id;
-        let ledger = attempt.ledger;
-        // A retry never goes back to a worker whose answer was definitive.
-        let admits = |worker: &dyn Worker| ledger.admits(worker);
         match attempt.lease.with_view(|view| {
             // A retry re-selects away from the engines this request already
             // tried, while another available worker is left to take it.
             let tried = attempt.tried.lock();
-            self.select_worker_for_model(
-                model_id,
-                view.text,
-                view.tokens,
-                attempt.headers,
-                view.rid_key,
-                view.cache_namespace,
-                Some(&admits),
-                &tried,
-            )
+            // A retry never goes back to a worker whose answer was
+            // definitive. Until a worker gave one the ledger hands no
+            // filter, and a first attempt asks nothing of each candidate.
+            attempt.ledger.with_candidate_filter(|candidate_filter| {
+                self.select_worker_for_model(
+                    model_id,
+                    view.text,
+                    view.tokens,
+                    attempt.headers,
+                    view.rid_key,
+                    view.cache_namespace,
+                    candidate_filter,
+                    &tried,
+                )
+            })
         }) {
             Some(worker) => Ok(worker),
             None => {
@@ -3531,6 +3533,68 @@ mod tests {
         assert_eq!(hits_b.load(AtomicOrdering::SeqCst), 1);
         for worker in router.worker_registry.get_all() {
             assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        }
+    }
+
+    /// One attempt's selection as the retry loop runs it: a first attempt
+    /// places over the whole pool, and once a worker answered the request
+    /// definitively no later attempt selects it, tried or not.
+    #[tokio::test]
+    async fn an_attempt_never_selects_the_worker_that_answered_definitively() {
+        let router = breaker_router(
+            &["http://w1:8080", "http://w2:8080"],
+            fast_retry_config(5),
+            5,
+        );
+        let request = DropProbeRequest {
+            text: "a prompt".to_string(),
+            _probe: Arc::new(()),
+        };
+        let routing = router.routing_derivatives(None, &request);
+        let lease = RequestLease::new(
+            request,
+            routing,
+            ReleasePoint::from_retry_config(&router.retry_config),
+        );
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        let attempt = TypedAttempt {
+            headers: None,
+            lease: &lease,
+            route: "/generate",
+            model_id: UNKNOWN_MODEL_ID,
+            canonical_model: None,
+            is_stream: false,
+            ledger: &ledger,
+            tried: &tried,
+        };
+        let select = || {
+            let worker = router
+                .select_worker_for_attempt(&attempt)
+                .expect("the pool has a worker to give");
+            worker.url().to_string()
+        };
+
+        // Round robin walks the pool it is handed.
+        let first_attempts: std::collections::HashSet<String> = (0..4).map(|_| select()).collect();
+        assert_eq!(
+            first_attempts.len(),
+            2,
+            "a first attempt places over the whole pool"
+        );
+
+        let pool = router.worker_registry.get_all();
+        let answering = &pool[0];
+        let mut failed = (StatusCode::INTERNAL_SERVER_ERROR, "upstream failed").into_response();
+        mark_upstream_answer(&mut failed);
+        ledger.settle(&mut failed, [answering], pool.iter());
+
+        for _ in 0..4 {
+            assert_ne!(
+                select(),
+                answering.url(),
+                "the worker that answered takes no later attempt"
+            );
         }
     }
 
