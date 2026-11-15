@@ -308,6 +308,17 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "minicpm-v-4.7-35b-a3b",
         GenerationPrompt::OpensTheThoughtWhenAsked,
     ),
+    // MiniCPM-OCR-1.0 (its own OCR stack) and MiniCPM-OCR-Jev (a Qwen 3.5 stack) each ship a chat
+    // template and a tokenizer of their own with the MiniCPM-V-4.7 prompt shapes: ChatML, Qwen 3.5's
+    // tagged calls, and the thought opened in the prompt only when the request asks for it.
+    (
+        "minicpm-ocr-1.0",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "minicpm-ocr-jev",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
