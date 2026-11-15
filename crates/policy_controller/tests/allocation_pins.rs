@@ -194,6 +194,52 @@ fn a_decision_over_credited_rows_allocates_nothing() {
 }
 
 #[test]
+fn a_pair_decision_under_a_table_allocates_nothing_after_the_first() {
+    let engine = PolicySpec::pair_presets("least_load", "least_load")
+        .expect("the pair spec")
+        .validate()
+        .expect("the engine");
+    let mut prefills = fleet(16);
+    for p in &mut prefills {
+        p.pair_class = p.position % 4 + 1;
+        p.has_capacity = true;
+    }
+    let mut decodes = fleet(64);
+    for d in &mut decodes {
+        d.pair_class = d.position % 8 + 1;
+        d.has_room = true;
+    }
+    // Prefill class k pairs with decode classes k and k + 4.
+    let (ends, classes) = ([2, 4, 6, 8], [1, 5, 2, 6, 3, 7, 4, 8]);
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let mut decide = |decodes: &[Candidate], seed: u64| {
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes,
+            table: smg_policy_controller::PairTable::new(&ends, &classes),
+            ..PairPools::default()
+        };
+        allocations_during(|| {
+            engine.decide_pair(&facts(seed), &pool(80), pools, &cx, &cx, &mut scratch)
+        })
+    };
+    // A pair, then a shed that reads the routable prefills' lists: each
+    // sizes the scratch once.
+    assert!(decide(&decodes, 1).0.pick().is_some(), "the pair routes");
+    let (decision, allocations) = decide(&decodes, 2);
+    assert!(decision.pick().is_some());
+    assert_eq!(allocations, 0, "a pair decision under a table allocated");
+    for d in &mut decodes {
+        d.health.healthy = false;
+    }
+    assert!(decide(&decodes, 3).0.pick().is_none(), "no decode is up");
+    let (decision, allocations) = decide(&decodes, 4);
+    assert!(decision.pick().is_none());
+    assert_eq!(allocations, 0, "a pair shed under a table allocated");
+}
+
+#[test]
 fn a_pair_decision_after_the_first_allocates_nothing() {
     let engine = PolicySpec::pair_presets("least_load", "least_load")
         .expect("the pair spec")

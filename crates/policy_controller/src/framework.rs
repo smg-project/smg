@@ -288,8 +288,14 @@ fn close_scopes(profile: &Profile) {
 pub struct Scratch {
     single: Buffers,
     decode: Buffers,
-    /// The pair classes with a decode the decode profile keeps, sorted.
+    /// The prefill classes with a partner the decode profile keeps, sorted;
+    /// once the prefill pool sheds, the decode classes its routable prefills
+    /// pair with.
     classes: Vec<u32>,
+    /// The decode classes of a pair table, a bit a class: the ones with a
+    /// decode the decode profile keeps, then the ones the routable prefills
+    /// pair with.
+    marks: ClassBits,
 }
 
 /// The buffers of one profile run: the survivors, the combined scores of the
@@ -308,6 +314,47 @@ struct Buffers {
 impl Scratch {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// A set of a pair table's decode classes: one bit a class number.
+#[derive(Debug, Default)]
+struct ClassBits {
+    words: Vec<u64>,
+}
+
+impl ClassBits {
+    /// Empties the set and sizes it for the class numbers below `width`.
+    fn reset(&mut self, width: usize) {
+        self.words.clear();
+        self.words.resize(width.div_ceil(64), 0);
+    }
+
+    /// Adds `class` and says whether the set holds it. A number the set was
+    /// not sized for is no class of the table and is left out.
+    fn insert(&mut self, class: u32) -> bool {
+        let Some(word) = self.words.get_mut(class as usize / 64) else {
+            return false;
+        };
+        *word |= 1 << (class % 64);
+        true
+    }
+
+    fn has(&self, class: u32) -> bool {
+        self.words
+            .get(class as usize / 64)
+            .is_some_and(|word| word >> (class % 64) & 1 == 1)
+    }
+
+    /// The classes of the set, ascending.
+    fn classes(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().zip(0u32..).flat_map(|(&word, at)| {
+            std::iter::successors((word != 0).then_some(word), |&left| {
+                let left = left & (left - 1);
+                (left != 0).then_some(left)
+            })
+            .map(move |left| at * 64 + left.trailing_zeros())
+        })
     }
 }
 
@@ -389,13 +436,29 @@ fn score_and_pick(
     }
 }
 
+/// Whether `class` is one of the sorted `classes`. Class 0 is outside any
+/// pairing, whatever a list names.
+fn classed(classes: &[u32], class: u32) -> bool {
+    class != 0 && classes.binary_search(&class).is_ok()
+}
+
+/// The class of a list of one class, the usual list: a pass over the rows
+/// compares each row's class with it and searches no list, as a decision
+/// by number always did. A list of class 0 alone names no class.
+fn only(classes: &[u32]) -> Option<u32> {
+    match classes {
+        [one] if *one != 0 => Some(*one),
+        _ => None,
+    }
+}
+
 /// The filters over `candidates`, stage by stage in profile order, each one
-/// pass over the survivors so far: the pair class, the partnered test, the
-/// `epd` plan's compatibility and vision rules, the hard filters, then each
-/// soft filter as long as it leaves something.
+/// pass over the survivors so far: the classes a chosen prefill pairs with,
+/// the partnered test, the `epd` plan's compatibility and vision rules, the
+/// hard filters, then each soft filter as long as it leaves something.
 /// Returns the name of the stage that emptied the pool, if one did (design
 /// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
-/// a class with no decode by the partners.
+/// a prefill whose classes hold no decode by the partners.
 fn filter(
     profile: &Profile,
     facts: &RequestFacts<'_>,
@@ -412,10 +475,15 @@ fn filter(
     let kept = &mut buf.kept;
     kept.clear();
     match class {
-        Some(k) => {
-            kept.extend(
-                (0..candidates.len() as u32).filter(|&i| candidates[i as usize].pair_class == k),
-            );
+        Some(classes) => {
+            let rows = 0..candidates.len() as u32;
+            match only(classes) {
+                Some(one) => {
+                    kept.extend(rows.filter(|&i| candidates[i as usize].pair_class == one));
+                }
+                None => kept
+                    .extend(rows.filter(|&i| classed(classes, candidates[i as usize].pair_class))),
+            }
             if kept.is_empty() {
                 return Some("partners");
             }
@@ -426,7 +494,10 @@ fn filter(
         return Some("none");
     }
     if let Some(p) = partnered {
-        kept.retain(|&i| p.binary_search(&candidates[i as usize].pair_class).is_ok());
+        match only(p) {
+            Some(one) => kept.retain(|&i| candidates[i as usize].pair_class == one),
+            None => kept.retain(|&i| classed(p, candidates[i as usize].pair_class)),
+        }
         if kept.is_empty() {
             return Some("partnered");
         }
@@ -524,13 +595,14 @@ fn reason_of(emptied_by: &str) -> ShedReason {
     }
 }
 
-/// A pool to decide over: narrowed to one pair class when the decision is a
-/// pair's decode side, or to the rows whose class is in the sorted partnered
-/// list when it is the prefill side.
+/// A pool to decide over: narrowed to the rows of the classes a chosen
+/// prefill's class pairs with when the decision is a pair's decode side
+/// (`class`: those classes, sorted), or to the rows whose class is in the
+/// sorted partnered list when it is the prefill side.
 #[derive(Clone, Copy)]
 struct Set<'a> {
     candidates: &'a [Candidate],
-    class: Option<u32>,
+    class: Option<&'a [u32]>,
     partnered: Option<&'a [u32]>,
     /// The `epd` plan's filters apply: the pool is the encode pool and the
     /// rows' compatibility and vision bits are read.
@@ -728,9 +800,9 @@ struct AssignmentStages {
 }
 
 /// The two pools of a pair decision: the open prefills and the decodes, each
-/// decode row carrying the pair class it belongs to; and beside each pool its
-/// affinity column, by the candidate's index, empty for a side nothing reads
-/// it on.
+/// row carrying its pair class; the pair table, which says which classes
+/// pair; and beside each pool its affinity column, by the candidate's index,
+/// empty for a side nothing reads it on.
 #[derive(Clone, Copy, Default)]
 pub struct PairPools<'a> {
     pub prefills: &'a [Candidate],
@@ -740,6 +812,202 @@ pub struct PairPools<'a> {
     pub prefill_affinity: &'a [AffinityFacts],
     /// The decodes' affinity facts, the same for the decode side's stages.
     pub decode_affinity: &'a [AffinityFacts],
+    /// The decode classes each prefill class pairs with. Left at its
+    /// default, classes pair by their number.
+    pub table: PairTable<'a>,
+}
+
+/// Which pair classes pair: for each prefill class, the decode classes it
+/// pairs with. A worker stands once in its pool and carries one class
+/// ([`Candidate::pair_class`]): prefills that pair with the same decodes
+/// share one, and so do decodes that pair with the same prefills. The table
+/// names classes, never rows or positions, so one table serves every pool
+/// narrowed from the same workers.
+///
+/// The default is no table: a prefill class then pairs with the decode
+/// class of its own number, as under a host that gives a decode the class
+/// of the prefills it partners.
+///
+/// A host builds a table ([`PairTable::new`]) and can ask once whether it
+/// is one the engine honours whole ([`PairTable::check`]). How a decision
+/// reads it is the engine's own.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PairTable<'a> {
+    /// Where each prefill class's list ends in `classes`.
+    ends: &'a [u32],
+    /// The lists, one after another.
+    classes: &'a [u32],
+}
+
+impl<'a> PairTable<'a> {
+    /// A table over the host's two slices. `classes` holds the lists one
+    /// after another, prefill class 1's first, and `ends[k - 1]` is where
+    /// prefill class `k`'s list ends in it. A list names decode classes in
+    /// ascending order.
+    ///
+    /// A host numbers its decode classes densely from 1, each named by some
+    /// list, so no number is above the count of the lists' entries. A
+    /// decision keeps one bit a class number up to that count, never more:
+    /// a number above it is no class of the table, and no decode pairs
+    /// through it.
+    ///
+    /// Nothing is checked here, so a decision of a release build pays for no
+    /// check: a table that fails [`PairTable::check`] costs it the pairs the
+    /// table misnames and a set of at most the table's own size, never the
+    /// process.
+    pub const fn new(ends: &'a [u32], classes: &'a [u32]) -> Self {
+        Self { ends, classes }
+    }
+
+    /// No table was handed: classes pair by their number.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The decode classes prefill class `class` pairs with, ascending: its
+    /// list under a table, its own number under none. Every read of a pair
+    /// decision asks here. Class 0 pairs with nothing, as does a class the
+    /// table holds no list for, and a list is read up to the count of the
+    /// lists' entries: a number above it is no class of the table. The
+    /// class is lent, so that under no table the list is the number itself.
+    pub(crate) fn of<'c>(&self, class: &'c u32) -> &'c [u32]
+    where
+        'a: 'c,
+    {
+        if *class == 0 {
+            return &[];
+        }
+        if self.is_empty() {
+            return std::slice::from_ref(class);
+        }
+        let list = self.list(*class as usize - 1);
+        // A list ascends, so the numbers above the count are its end.
+        let held = |listed: &u32| *listed as usize <= self.classes.len();
+        match list.last() {
+            Some(last) if !held(last) => &list[..list.partition_point(held)],
+            _ => list,
+        }
+    }
+
+    /// The list of the prefill class at `at`, as the host handed it; empty
+    /// for a class the table holds no list for.
+    fn list(&self, at: usize) -> &'a [u32] {
+        let Some(&end) = self.ends.get(at) else {
+            return &[];
+        };
+        let start = at.checked_sub(1).map_or(0, |before| self.ends[before]);
+        self.classes
+            .get(start as usize..end as usize)
+            .unwrap_or(&[])
+    }
+
+    /// The table's prefill classes.
+    fn prefill_classes(&self) -> std::ops::RangeInclusive<u32> {
+        1..=self.ends.len() as u32
+    }
+
+    /// The width of a set of bits over the table's decode classes: one past
+    /// the largest class a list names, which is at most the count of the
+    /// lists' entries ([`PairTable::of`]). A table costs a decision a set
+    /// of its own size, whatever numbers it names. Lists ascend, so a
+    /// list's last entry is its largest.
+    fn width(&self) -> usize {
+        let largest = self
+            .prefill_classes()
+            .filter_map(|class| self.of(&class).last().copied())
+            .max()
+            .unwrap_or(0);
+        largest as usize + 1
+    }
+
+    /// Whether this is a table the engine honours whole, and the first
+    /// clause it fails when it is not: the ends ascend and stay within the
+    /// lists, and each list names its classes in ascending order, none above
+    /// the count of the lists' entries. No table passes.
+    ///
+    /// One question, two askers: a host asks it once where it builds a
+    /// table, in every build, and a debug build asks it where a decision
+    /// takes one.
+    pub fn check(&self) -> Result<(), PairTableError> {
+        if !self.ends.windows(2).all(|pair| pair[0] <= pair[1]) {
+            return Err(PairTableError::EndsDescend);
+        }
+        let entries = self.classes.len();
+        if self.ends.last().is_some_and(|&end| end as usize > entries) {
+            return Err(PairTableError::EndPastLists);
+        }
+        for list in (0..self.ends.len()).map(|at| self.list(at)) {
+            if !list.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Err(PairTableError::ListOutOfOrder);
+            }
+            if list.last().is_some_and(|&last| last as usize > entries) {
+                return Err(PairTableError::NumberAboveCount);
+            }
+        }
+        Ok(())
+    }
+
+    /// The prefill classes with a partner, ascending, into `classes`. `open`
+    /// is the class of each decode the decode profile's hard filters keep.
+    /// Under a table the question is asked once a prefill class, each
+    /// stopping at the first open class it lists, and of no class when no
+    /// decode is open. Under none the open classes are the answer: a class
+    /// pairs with its own number.
+    fn partnered(
+        &self,
+        open: impl Iterator<Item = u32>,
+        classes: &mut Vec<u32>,
+        marks: &mut ClassBits,
+    ) {
+        classes.clear();
+        if self.is_empty() {
+            classes.extend(open);
+            classes.sort_unstable();
+            classes.dedup();
+            return;
+        }
+        marks.reset(self.width());
+        let mut any = false;
+        for class in open {
+            any |= marks.insert(class);
+        }
+        if any {
+            classes.extend(
+                self.prefill_classes()
+                    .filter(|class| self.of(class).iter().any(|&listed| marks.has(listed))),
+            );
+        }
+    }
+
+    /// Turns the prefill classes in `classes` into the decode classes they
+    /// pair with, both ascending. Under no table nothing moves: a class
+    /// pairs with its own number.
+    fn listed(&self, classes: &mut Vec<u32>, marks: &mut ClassBits) {
+        if self.is_empty() {
+            return;
+        }
+        marks.reset(self.width());
+        for class in classes.iter() {
+            for &listed in self.of(class) {
+                marks.insert(listed);
+            }
+        }
+        classes.clear();
+        classes.extend(marks.classes());
+    }
+}
+
+/// The clause of [`PairTable::check`] a host's table fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PairTableError {
+    #[error("an end stands before the end of the list before it")]
+    EndsDescend,
+    #[error("an end stands past the lists")]
+    EndPastLists,
+    #[error("a list names its classes out of ascending order")]
+    ListOutOfOrder,
+    #[error("a list names a number above the count of the lists' entries")]
+    NumberAboveCount,
 }
 
 /// One side of a pair decision.
@@ -1225,7 +1493,7 @@ impl Engine {
 
     /// The `pd-pair` plan, and the pair half of `epd`: the prefill profile
     /// over `prefills`, then the decode profile over the decodes of the
-    /// chosen prefill's pair class. A
+    /// classes the chosen prefill's class pairs with ([`PairTable`]). A
     /// prefill whose partners leave no decode is passed over for the next
     /// prefill target; the targets list carries the chosen pair first and the
     /// alternate decodes of the same prefill after it. Pair class `0` is
@@ -1289,22 +1557,28 @@ impl Engine {
         // profile's hard filters keep, before the prefill picker truncates to
         // its targets: a pair that exists is found. A decode of class 0 is
         // outside any pairing and partners nobody.
-        scratch.classes.clear();
-        scratch.classes.extend(
-            decodes
-                .iter()
-                .filter(|d| {
-                    d.pair_class != 0
-                        && decode_profile
-                            .filters
-                            .iter()
-                            .filter(|f| !f.soft())
-                            .all(|f| f.keep(&decode_facts, d, decode_cx))
-                })
-                .map(|d| d.pair_class),
+        debug_assert!(
+            pools.table.check().is_ok(),
+            "the pair table fails its check: {}",
+            pools
+                .table
+                .check()
+                .map_or_else(|clause| clause.to_string(), |()| String::new())
         );
-        scratch.classes.sort_unstable();
-        scratch.classes.dedup();
+        let open = decodes
+            .iter()
+            .filter(|d| {
+                d.pair_class != 0
+                    && decode_profile
+                        .filters
+                        .iter()
+                        .filter(|f| !f.soft())
+                        .all(|f| f.keep(&decode_facts, d, decode_cx))
+            })
+            .map(|d| d.pair_class);
+        pools
+            .table
+            .partnered(open, &mut scratch.classes, &mut scratch.marks);
         let prefill = run_profile(
             prefill_profile,
             binding.profile,
@@ -1365,6 +1639,9 @@ impl Engine {
                     if scratch.classes.is_empty() {
                         return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace);
                     }
+                    // Their partners are the decodes of the classes they
+                    // pair with.
+                    pools.table.listed(&mut scratch.classes, &mut scratch.marks);
                     // An empty decode pool is that class for every prefill:
                     // its "none" falls through to the prefill's shed.
                     if let Some(stage) = filter(
@@ -1398,8 +1675,9 @@ impl Engine {
                 continue;
             };
             // The decode profile runs over the chosen prefill's partners
-            // alone; the class is a per-candidate fact, so no host callback
-            // is needed to narrow the set.
+            // alone: the decodes of the classes its class pairs with. A
+            // class is a per-candidate fact and the table the decision's
+            // own, so no host callback is needed to narrow the set.
             let decision = run_profile(
                 decode_profile,
                 decode_index,
@@ -1407,7 +1685,7 @@ impl Engine {
                 pool,
                 Set {
                     candidates: decodes,
-                    class: Some(class),
+                    class: Some(pools.table.of(&class)),
                     partnered: None,
                     encode: false,
                 },
@@ -1942,6 +2220,7 @@ mod tests {
                 decodes,
                 prefill_affinity,
                 decode_affinity,
+                table: PairTable::default(),
             },
             &Constraints::default(),
             &Constraints::default(),
@@ -3369,6 +3648,695 @@ mod tests {
             pairs.iter().flatten().all(|n| (850..=1150).contains(n)),
             "{pairs:?}"
         );
+    }
+
+    /// The two slices of a table whose prefill class `k` pairs with the
+    /// decode classes `lists[k - 1]`.
+    fn table_of(lists: &[&[u32]]) -> (Vec<u32>, Vec<u32>) {
+        let ends = lists
+            .iter()
+            .scan(0u32, |end, list| {
+                *end += list.len() as u32;
+                Some(*end)
+            })
+            .collect();
+        (ends, lists.concat())
+    }
+
+    /// A pair decision under the table of `lists` ([`table_of`]).
+    fn decide_tabled(
+        engine: &Engine,
+        prefills: &[Candidate],
+        decodes: &[Candidate],
+        lists: &[&[u32]],
+    ) -> Decision {
+        let (ends, classes) = table_of(lists);
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        engine.decide_pair(
+            &facts,
+            &PoolFacts::default(),
+            PairPools {
+                prefills,
+                decodes,
+                table: PairTable::new(&ends, &classes),
+                ..PairPools::default()
+            },
+            &Constraints::default(),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    }
+
+    /// Routable idle rows of the given pair classes, in order.
+    fn classed_rows(classes: &[u32]) -> Vec<Candidate> {
+        classes
+            .iter()
+            .zip(0u32..)
+            .map(|(&pair_class, position)| Candidate {
+                pair_class,
+                ..candidate(position, 0)
+            })
+            .collect()
+    }
+
+    /// The decode positions a pick's targets name, ascending.
+    fn decodes_of(decision: &Decision) -> Vec<u32> {
+        let mut decodes: Vec<u32> = decision
+            .pick()
+            .into_iter()
+            .flat_map(|pick| pick.targets.iter())
+            .filter_map(|target| target.pair.map(|pair| pair.decode_position))
+            .collect();
+        decodes.sort_unstable();
+        decodes
+    }
+
+    /// The reason and the stage of a shed.
+    fn shed_of(decision: &Decision) -> Option<(ShedReason, &'static str)> {
+        match decision {
+            Decision::Shed(shed) => Some((shed.reason, shed.emptied_by)),
+            _ => None,
+        }
+    }
+
+    fn strict_pair_engine() -> Engine {
+        Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        )
+    }
+
+    #[test]
+    fn a_class_lists_what_the_table_holds_for_it_and_its_own_number_under_none() {
+        let none = PairTable::default();
+        assert!(none.is_empty());
+        assert_eq!(none.of(&7), [7], "by number");
+        assert!(none.of(&0).is_empty(), "class 0 pairs with nothing");
+
+        let (ends, classes) = table_of(&[&[1, 3], &[], &[2]]);
+        let table = PairTable::new(&ends, &classes);
+        assert!(!table.is_empty());
+        assert_eq!(table.of(&1), [1, 3]);
+        assert!(table.of(&2).is_empty(), "an empty list");
+        assert_eq!(table.of(&3), [2]);
+        assert!(table.of(&0).is_empty(), "class 0 under a table");
+        assert!(table.of(&4).is_empty(), "a class past the table");
+        assert_eq!(table.width(), 4, "one past the largest class named");
+
+        // Ends the lists do not hold cost a class its list.
+        let past = PairTable::new(&[3], &[1, 2]);
+        assert!(past.of(&1).is_empty());
+        let backwards = PairTable::new(&[2, 1], &[1, 2, 3]);
+        assert_eq!(backwards.of(&1), [1, 2]);
+        assert!(backwards.of(&2).is_empty());
+    }
+
+    /// The question a host asks once where it builds a table: each clause
+    /// is refused by its name, the first a table fails.
+    #[test]
+    fn a_hosts_check_names_the_clause_a_table_fails() {
+        let check = |ends: &[u32], classes: &[u32]| PairTable::new(ends, classes).check();
+        assert_eq!(PairTable::default().check(), Ok(()), "no table");
+        assert_eq!(check(&[2, 2, 3], &[1, 3, 2]), Ok(()), "an empty list too");
+        assert_eq!(check(&[2, 1], &[1, 2, 3]), Err(PairTableError::EndsDescend));
+        assert_eq!(check(&[3], &[1, 2]), Err(PairTableError::EndPastLists));
+        for misnamed in [[2, 1], [1, 1]] {
+            assert_eq!(
+                check(&[2], &misnamed),
+                Err(PairTableError::ListOutOfOrder),
+                "{misnamed:?}"
+            );
+        }
+        assert_eq!(check(&[2], &[1, 3]), Err(PairTableError::NumberAboveCount));
+        // The first clause a table fails is the one named.
+        assert_eq!(check(&[3, 1], &[2, 1]), Err(PairTableError::EndsDescend));
+        // Each clause reads as what it found.
+        assert_eq!(
+            PairTableError::NumberAboveCount.to_string(),
+            "a list names a number above the count of the lists' entries"
+        );
+    }
+
+    /// One invariant: a host's table costs a decision at most the table's
+    /// own size.
+    #[test]
+    fn a_number_above_the_count_of_a_tables_entries_is_no_class_of_the_table() {
+        // Two entries: the count itself is a class, as the largest number
+        // of a dense table is.
+        let dense = PairTable::new(&[2], &[1, 2]);
+        assert_eq!(dense.of(&1), [1, 2]);
+        assert_eq!(dense.check(), Ok(()));
+        // One above the count is no class.
+        let above = PairTable::new(&[2], &[1, 3]);
+        assert_eq!(above.of(&1), [1]);
+        assert_eq!(above.check(), Err(PairTableError::NumberAboveCount));
+
+        // Three entries, two of them near the top of the number's range.
+        let far = u32::MAX - 1;
+        let entries = [1, far, u32::MAX];
+        let sparse = PairTable::new(&[3], &entries);
+        assert_eq!(sparse.of(&1), [1], "every read asks here");
+        assert_eq!(sparse.check(), Err(PairTableError::NumberAboveCount));
+        assert_eq!(sparse.width(), 2);
+        // The partner question: a decode of such a number opens nothing,
+        // and the set of bits stays the table's size.
+        let mut scratch = Scratch::new();
+        let (classes, marks) = (&mut scratch.classes, &mut scratch.marks);
+        sparse.partnered([far].into_iter(), classes, marks);
+        assert!(classes.is_empty(), "{classes:?}");
+        sparse.partnered([far, 1].into_iter(), classes, marks);
+        assert_eq!(*classes, [1]);
+        // The shed's list: the routable class lists the one class it holds.
+        sparse.listed(classes, marks);
+        assert_eq!(*classes, [1]);
+        assert_eq!(marks.words.len(), 1, "one word of bits");
+
+        // A list of such numbers alone is an empty list.
+        let lone = PairTable::new(&[1], &[u32::MAX]);
+        assert!(lone.of(&1).is_empty());
+        assert_eq!(lone.width(), 1);
+    }
+
+    #[test]
+    fn a_set_of_classes_holds_the_numbers_it_was_sized_for() {
+        let mut set = ClassBits::default();
+        set.reset(130);
+        for class in [0, 1, 63, 64, 65, 129] {
+            assert!(set.insert(class), "{class}");
+        }
+        assert!(!set.insert(192), "a number past the set's last word");
+        assert!([0, 1, 63, 64, 65, 129].iter().all(|&class| set.has(class)));
+        assert!(![2, 62, 66, 128, 192, u32::MAX]
+            .iter()
+            .any(|&class| set.has(class)));
+        assert_eq!(set.classes().collect::<Vec<_>>(), [0, 1, 63, 64, 65, 129]);
+        // A reset empties it, whatever its new width.
+        set.reset(1);
+        assert_eq!(set.classes().count(), 0);
+        assert!(!set.has(1));
+    }
+
+    #[test]
+    fn a_prefill_pairs_with_the_decodes_of_every_class_its_class_lists() {
+        let engine = Engine::new(
+            vec![least_requests_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        // Decode class 3 pairs with both prefill classes and stands once;
+        // the last decode is outside any pairing.
+        let mut prefills = classed_rows(&[1, 2]);
+        let decodes = classed_rows(&[1, 2, 3, 0]);
+        let lists: [&[u32]; 2] = [&[1, 3], &[2, 3]];
+        prefills[1].in_flight = 5;
+        let first = decide_tabled(&engine, &prefills, &decodes, &lists);
+        assert_eq!(lead(&first), Some(0));
+        assert_eq!(decodes_of(&first), [0, 2], "class 1's decodes: {first:?}");
+        prefills[0].in_flight = 9;
+        let second = decide_tabled(&engine, &prefills, &decodes, &lists);
+        assert_eq!(lead(&second), Some(1));
+        assert_eq!(decodes_of(&second), [1, 2], "class 2's decodes: {second:?}");
+    }
+
+    #[test]
+    fn a_table_says_which_classes_pair_where_none_leaves_it_to_the_numbers() {
+        let engine = strict_pair_engine();
+        let prefills = classed_rows(&[1]);
+        // The second decode's class stands at the edge of a word of bits.
+        let decodes = classed_rows(&[1, 64]);
+        let by_number = decide_pair(&engine, &prefills, &decodes);
+        assert_eq!(decodes_of(&by_number), [0], "{by_number:?}");
+        // A second prefill class names the 63 classes under it: the table
+        // numbers densely.
+        let under: Vec<u32> = (1..=63).collect();
+        let by_table = decide_tabled(&engine, &prefills, &decodes, &[&[64], &under]);
+        assert_eq!(decodes_of(&by_table), [1], "{by_table:?}");
+        // A class the table lists nothing for has no partner, whatever its
+        // number; nor has a class past the table.
+        let unpartnered = Some((ShedReason::NoEndpoints, "partnered"));
+        assert_eq!(
+            shed_of(&decide_tabled(&engine, &prefills, &decodes, &[&[]])),
+            unpartnered
+        );
+        let past = classed_rows(&[2]);
+        assert_eq!(
+            shed_of(&decide_tabled(&engine, &past, &decodes, &[&[1]])),
+            unpartnered
+        );
+    }
+
+    #[test]
+    fn a_prefill_class_has_a_partner_when_any_class_it_lists_holds_an_open_decode() {
+        let engine = strict_pair_engine();
+        let prefills = classed_rows(&[1, 2]);
+        let mut decodes = classed_rows(&[1, 2, 3]);
+        let lists: [&[u32]; 2] = [&[1, 2], &[3]];
+        // Class 1's first listed class is down and its second is up; class
+        // 2's one class is down.
+        decodes[0].health.healthy = false;
+        decodes[2].health.healthy = false;
+        let decision = decide_tabled(&engine, &prefills, &decodes, &lists);
+        assert_eq!(lead(&decision), Some(0), "{decision:?}");
+        assert_eq!(decodes_of(&decision), [1]);
+        // The other way round: class 2 alone has a partner.
+        decodes[1].health.healthy = false;
+        decodes[2].health.healthy = true;
+        let decision = decide_tabled(&engine, &prefills, &decodes, &lists);
+        assert_eq!(lead(&decision), Some(1), "{decision:?}");
+        assert_eq!(decodes_of(&decision), [2]);
+    }
+
+    #[test]
+    fn under_a_table_a_shed_is_named_by_the_decodes_a_routable_prefill_lists() {
+        let engine = strict_pair_engine();
+        // A routable prefill of class 1 lists class 2, whose decode is
+        // unhealthy; an unhealthy prefill of class 2 lists that class and
+        // class 3, whose decode is overloaded; a healthy decode of class 1,
+        // the routable prefill's own number, is listed by neither.
+        let mut prefills = classed_rows(&[1, 2]);
+        prefills[1].health.healthy = false;
+        let mut decodes = classed_rows(&[2, 3, 1]);
+        decodes[0].health.healthy = false;
+        decodes[1].health.overloaded = true;
+        let lists: [&[u32]; 2] = [&[2], &[2, 3]];
+        assert_eq!(
+            shed_of(&decide_tabled(&engine, &prefills, &decodes, &lists)),
+            Some((ShedReason::NoEndpoints, "healthy")),
+            "the routable prefill's partner names the shed"
+        );
+        // Both prefills routable: the stage that drops the last of their
+        // partners names it, and that one is saturation.
+        prefills[1].health.healthy = true;
+        assert_eq!(
+            shed_of(&decide_tabled(&engine, &prefills, &decodes, &lists)),
+            Some((ShedReason::Saturated, "not-overloaded"))
+        );
+        // By number the routable prefill's partner is the decode of its own
+        // class, whatever the number: an overloaded one is saturation.
+        let prefills = classed_rows(&[100]);
+        let mut decodes = classed_rows(&[100]);
+        decodes[0].health.overloaded = true;
+        assert_eq!(
+            shed_of(&decide_pair(&engine, &prefills, &decodes)),
+            Some((ShedReason::Saturated, "not-overloaded"))
+        );
+    }
+
+    #[test]
+    fn by_number_a_class_is_found_wherever_its_decode_stands_in_the_pool() {
+        let engine = strict_pair_engine();
+        let prefills = classed_rows(&[1]);
+        // The classes of the open decodes arrive out of order.
+        let decodes = classed_rows(&[2, 3, 1]);
+        let decision = decide_pair(&engine, &prefills, &decodes);
+        assert_eq!(decodes_of(&decision), [2], "{decision:?}");
+    }
+
+    /// The partner question asks the hard filters alone: a class whose one
+    /// decode a retry just tried keeps its prefill, and the soft filter then
+    /// steps aside.
+    #[test]
+    fn a_decode_a_retry_just_tried_still_partners_its_prefill() {
+        let engine = Engine::new(
+            vec![least_requests_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let prefills = classed_rows(&[1]);
+        let decodes = classed_rows(&[1]);
+        let tried = [decodes[0].id];
+        let decode_cx = Constraints {
+            excluded: &tried,
+            ..Constraints::default()
+        };
+        for table in [PairTable::default(), PairTable::new(&[1], &[1])] {
+            let decision = engine.decide_pair(
+                &RequestFacts {
+                    model: "m",
+                    ..RequestFacts::default()
+                },
+                &PoolFacts::default(),
+                PairPools {
+                    prefills: &prefills,
+                    decodes: &decodes,
+                    table,
+                    ..PairPools::default()
+                },
+                &Constraints::default(),
+                &decode_cx,
+                &mut Scratch::new(),
+            );
+            assert_eq!(decodes_of(&decision), [0], "{decision:?}");
+        }
+    }
+
+    /// Hands the first survivor alone: no alternate follows it.
+    #[derive(Debug)]
+    struct FirstKept;
+
+    impl Lifecycle for FirstKept {}
+
+    impl Picker for FirstKept {
+        fn name(&self) -> &'static str {
+            "first-kept"
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            if let Some(&row) = kept.first() {
+                out.push(target_of(&candidates[row as usize]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_scratch_carries_no_class_from_one_pair_decision_into_the_next() {
+        let engine = Engine::new(
+            vec![Profile {
+                name: "first".into(),
+                filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+                scorers: vec![],
+                picker: Box::new(FirstKept),
+            }],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let prefills = classed_rows(&[1, 2]);
+        let mut decodes = classed_rows(&[1, 2]);
+        let (ends, classes) = table_of(&[&[1], &[2]]);
+        for table in [PairTable::default(), PairTable::new(&ends, &classes)] {
+            let mut scratch = Scratch::new();
+            let mut decide = |decodes: &[Candidate]| {
+                engine.decide_pair(
+                    &RequestFacts {
+                        model: "m",
+                        ..RequestFacts::default()
+                    },
+                    &PoolFacts::default(),
+                    PairPools {
+                        prefills: &prefills,
+                        decodes,
+                        table,
+                        ..PairPools::default()
+                    },
+                    &Constraints::default(),
+                    &Constraints::default(),
+                    &mut scratch,
+                )
+            };
+            decodes[0].health.healthy = true;
+            assert_eq!(lead(&decide(&decodes)), Some(0), "each class has a partner");
+            // The first class's decode goes down: the second prefill alone
+            // has a partner, and the picker hands no alternate.
+            decodes[0].health.healthy = false;
+            let next = decide(&decodes);
+            assert_eq!(lead(&next), Some(1), "{next:?}");
+        }
+    }
+
+    /// Class 0 pairs with nothing at the decode run too: a picker that hands
+    /// a class-0 prefill the filters dropped gets no decode for it, under no
+    /// table as under one.
+    #[test]
+    fn a_class_zero_prefill_pairs_with_no_decode_whoever_hands_it() {
+        /// Hands the pool's first row, whichever rows the filters kept.
+        #[derive(Debug)]
+        struct FirstRow;
+        impl Lifecycle for FirstRow {}
+        impl Picker for FirstRow {
+            fn name(&self) -> &'static str {
+                "first-row"
+            }
+            fn pick(
+                &self,
+                _: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                _: &[u32],
+                _: &[f32],
+                _: TieBand,
+                out: &mut Targets,
+            ) {
+                if let Some(first) = candidates.first() {
+                    out.push(target_of(first));
+                }
+            }
+        }
+        let engine = Engine::new(
+            vec![
+                Profile {
+                    name: "prefill".into(),
+                    filters: vec![Box::new(Healthy)],
+                    scorers: vec![],
+                    picker: Box::new(FirstRow),
+                },
+                strict_profile(),
+            ],
+            vec![Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        // The second prefill pairs with the second decode, so the prefill
+        // pool keeps a row; the picker hands the first, of class 0, beside a
+        // decode of class 0.
+        let prefills = classed_rows(&[0, 1]);
+        let decodes = classed_rows(&[0, 1]);
+        let lists: [&[u32]; 1] = [&[1]];
+        for (decision, how) in [
+            (decide_pair(&engine, &prefills, &decodes), "by number"),
+            (
+                decide_tabled(&engine, &prefills, &decodes, &lists),
+                "by a table",
+            ),
+        ] {
+            assert_eq!(
+                shed_of(&decision),
+                Some((ShedReason::NoEndpoints, "partners")),
+                "{how}: {decision:?}"
+            );
+        }
+        // A list that names class 0 pairs no decode of class 0: alone it is
+        // no partner, and beside a class it adds no decode to that class's.
+        let engine = strict_pair_engine();
+        let prefills = classed_rows(&[1]);
+        let decodes = classed_rows(&[0, 2]);
+        assert_eq!(
+            shed_of(&decide_tabled(&engine, &prefills, &decodes, &[&[0]])),
+            Some((ShedReason::NoEndpoints, "partnered"))
+        );
+        let beside = decide_tabled(&engine, &prefills, &decodes, &[&[0, 2]]);
+        assert_eq!(decodes_of(&beside), [1], "{beside:?}");
+        // Nor is a decode of class 0 a partner the decode profile lost: an
+        // unhealthy one beside that list names no stage of the shed.
+        let mut down = classed_rows(&[0, 2]);
+        down[0].health.healthy = false;
+        assert_eq!(
+            shed_of(&decide_tabled(&engine, &prefills, &down, &[&[0]])),
+            Some((ShedReason::NoEndpoints, "partnered"))
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(
+            expected = "the pair table fails its check: a list names its classes out of ascending order"
+        )
+    )]
+    fn a_misnamed_table_stops_a_debug_build_and_costs_a_release_build_its_pairs() {
+        let engine = strict_pair_engine();
+        let prefills = classed_rows(&[1]);
+        // A list out of order: the process stands, whatever the list pairs.
+        let decodes = classed_rows(&[1, 2]);
+        let decision = decide_tabled(&engine, &prefills, &decodes, &[&[2, 1]]);
+        assert!(decision.pick().is_some() || shed_of(&decision).is_some());
+    }
+
+    /// One invariant, over drawn fleets: a table over one row a decode
+    /// decides as the same fleet spelled without one, a decode row for each
+    /// prefill class it pairs with: the same shed by reason and stage, the
+    /// same prefills and the same decodes in the same order.
+    #[test]
+    fn a_table_decides_as_the_same_fleet_spelled_a_decode_row_a_prefill_class() {
+        fn engine_of(picker: Box<dyn Picker>) -> Engine {
+            let profile = Profile {
+                name: "drawn".into(),
+                filters: vec![
+                    Box::new(Healthy),
+                    Box::new(NotOverloaded),
+                    Box::new(NotTried),
+                ],
+                scorers: vec![Weighted {
+                    scorer: Box::new(LeastRequests),
+                    weight: 1.0,
+                }],
+                picker,
+            };
+            Engine::new(vec![profile], vec![pair_binding()], 1, Needs::default())
+        }
+        /// A row whose class runs from 0 (outside any pairing) to one past
+        /// its side's last class (a class the table does not hold).
+        fn row(draw: &mut Draw, position: u32, classes: u32) -> Candidate {
+            Candidate {
+                pair_class: draw.below(classes as usize + 2) as u32,
+                health: Health {
+                    healthy: draw.below(5) != 0,
+                    overloaded: draw.below(4) == 0,
+                    ..Health::default()
+                },
+                ..candidate(position, draw.below(6) as u32)
+            }
+        }
+        /// What a decision says, by worker: a shed's reason and stage, or
+        /// each target's prefill and decode; and the survivors it counted.
+        type Said = (
+            Option<(ShedReason, &'static str)>,
+            Vec<(WorkerId, Option<WorkerId>)>,
+            u32,
+        );
+        fn said(decision: &Decision) -> Said {
+            match decision {
+                Decision::Pick(pick) => (
+                    None,
+                    pick.targets
+                        .iter()
+                        .map(|target| (target.id, target.pair.map(|pair| pair.decode_id)))
+                        .collect(),
+                    pick.trace.survivors,
+                ),
+                Decision::Shed(shed) => (
+                    Some((shed.reason, shed.emptied_by)),
+                    Vec::new(),
+                    shed.trace.survivors,
+                ),
+                Decision::Queue(_) => panic!("no profile here queues"),
+            }
+        }
+        let engines = [
+            engine_of(Box::new(Best)),
+            engine_of(Box::new(PowerOfTwo)),
+            engine_of(Box::new(CountFirst)),
+        ];
+        let mut draw = Draw::new(0x7ab1e);
+        let (mut picks, mut sheds) = (0u32, 0u32);
+        for fleet in 0..600u64 {
+            let prefill_classes = 1 + draw.below(4) as u32;
+            let decode_classes = 1 + draw.below(5) as u32;
+            let mut lists: Vec<Vec<u32>> = (0..prefill_classes)
+                .map(|_| {
+                    (1..=decode_classes)
+                        .filter(|_| draw.below(2) == 0)
+                        .collect()
+                })
+                .collect();
+            // A table numbers densely: a class no list drew joins one.
+            for class in 1..=decode_classes {
+                if !lists.iter().any(|list| list.contains(&class)) {
+                    let list = &mut lists[draw.below(prefill_classes as usize)];
+                    list.push(class);
+                    list.sort_unstable();
+                }
+            }
+            let prefills: Vec<Candidate> = (0..draw.below(6) as u32)
+                .map(|position| row(&mut draw, position, prefill_classes))
+                .collect();
+            let decodes: Vec<Candidate> = (0..draw.below(9) as u32)
+                .map(|position| row(&mut draw, position, decode_classes))
+                .collect();
+            // The same fleet without a table: a decode row for each prefill
+            // class that lists its class, of that class's number; a decode
+            // no class lists keeps one row, outside any pairing.
+            let mut rows: Vec<Candidate> = Vec::new();
+            for decode in &decodes {
+                let before = rows.len();
+                rows.extend(
+                    lists
+                        .iter()
+                        .zip(1u32..)
+                        .filter(|(list, _)| {
+                            decode.pair_class != 0 && list.contains(&decode.pair_class)
+                        })
+                        .map(|(_, pair_class)| Candidate {
+                            pair_class,
+                            ..*decode
+                        }),
+                );
+                if rows.len() == before {
+                    rows.push(Candidate {
+                        pair_class: 0,
+                        ..*decode
+                    });
+                }
+            }
+            for (row, position) in rows.iter_mut().zip(0u32..) {
+                row.position = position;
+            }
+            let lists: Vec<&[u32]> = lists.iter().map(Vec::as_slice).collect();
+            let (ends, classes) = table_of(&lists);
+            // Some workers were just tried: the soft filter steps in.
+            let excluded: Vec<WorkerId> = (0..draw.below(3) as u64)
+                .map(|_| WorkerId(100 + draw.below(9) as u64))
+                .collect();
+            let cx = Constraints {
+                excluded: &excluded,
+                ..Constraints::default()
+            };
+            for (engine, seed) in engines.iter().zip(fleet..) {
+                let facts = RequestFacts {
+                    model: "m",
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let decide = |pools: PairPools<'_>| {
+                    engine.decide_pair(
+                        &facts,
+                        &PoolFacts::default(),
+                        pools,
+                        &cx,
+                        &cx,
+                        &mut Scratch::new(),
+                    )
+                };
+                let tabled = decide(PairPools {
+                    prefills: &prefills,
+                    decodes: &decodes,
+                    table: PairTable::new(&ends, &classes),
+                    ..PairPools::default()
+                });
+                let spelled = decide(PairPools {
+                    prefills: &prefills,
+                    decodes: &rows,
+                    ..PairPools::default()
+                });
+                assert_eq!(
+                    said(&tabled),
+                    said(&spelled),
+                    "fleet {fleet}, seed {seed}: lists {lists:?} over {prefills:?} and {decodes:?}"
+                );
+                match tabled {
+                    Decision::Pick(_) => picks += 1,
+                    _ => sheds += 1,
+                }
+            }
+        }
+        assert!(picks >= 300 && sheds >= 300, "{picks} picks, {sheds} sheds");
     }
 
     /// A sessions rule that delegates runs the profile's own stages through

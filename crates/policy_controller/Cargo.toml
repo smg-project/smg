@@ -177,6 +177,10 @@ name = "decision"
 harness = false
 
 [[bench]]
+name = "pair_table"
+harness = false
+
+[[bench]]
 name = "affinity"
 harness = false
 
