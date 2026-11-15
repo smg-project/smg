@@ -26,7 +26,7 @@ use crate::ServicerError;
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Part of a `stop` timeout kept back for the thread to wind down after the
 /// server future resolves.
-const STOP_MARGIN: Duration = Duration::from_secs(1);
+pub(crate) const STOP_MARGIN: Duration = Duration::from_secs(1);
 /// Least drain grace a server gets, however short the `stop` timeout.
 const MIN_GRACE: Duration = Duration::from_millis(100);
 
