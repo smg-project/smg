@@ -63,7 +63,7 @@ pub use sglang_encode::{
     SglangEncodeDispatcher,
 };
 pub use sglang_mm_hash::SglangCpuMmHasher;
-pub use sockets::{zmq_handshake_address, Handshake};
+pub use sockets::{is_leftover_handshake_socket, zmq_handshake_address, Handshake};
 pub use stream::{FrontendFinish, ZmqGenerateStream};
 pub use structured_outputs::{
     refuse_unenforceable_constraint, ConstraintKinds, ConstraintRef,

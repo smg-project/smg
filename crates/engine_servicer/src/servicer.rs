@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{is_leftover_handshake_socket, ZmqEngineClient};
 use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
 use futures::FutureExt;
 use tokio::net::TcpListener;
@@ -341,12 +341,16 @@ const _: () = assert!(HANDSHAKE_RELEASE_BOUND.as_millis() * 2 <= STOP_MARGIN.as_
 
 /// The `ipc://` handshake endpoint file this servicer is about to bind, read
 /// before the connect is spawned: `None` when the address names no file, and
-/// when a file is already at the path. That file is another process's (the
-/// bind fails as in use), and nothing here would release it.
+/// when something is already at the path that the bind sequence leaves there.
+/// That file is another process's (the bind fails as in use), and nothing
+/// here would release it. A leftover socket the bind sequence sweeps first
+/// counts as a free path: the file there at stop is this servicer's.
 fn own_handshake_endpoint(handshake_address: &str) -> Option<String> {
     handshake_address
         .strip_prefix("ipc://")
-        .filter(|path| std::fs::metadata(path).is_err())
+        .filter(|path| {
+            std::fs::metadata(path).is_err() || is_leftover_handshake_socket(handshake_address)
+        })
         .map(str::to_owned)
 }
 
@@ -610,6 +614,8 @@ mod tests {
     /// address that names no file leaves nothing to wait for.
     #[test]
     fn the_stop_waits_only_for_a_handshake_endpoint_of_its_own() {
+        use std::os::unix::net::UnixListener;
+
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("handshake");
         let address = format!("ipc://{}", path.display());
@@ -621,6 +627,14 @@ mod tests {
         std::fs::write(&path, b"").expect("an earlier process's file");
         assert_eq!(own_handshake_endpoint(&address), None);
         assert_eq!(own_handshake_endpoint("tcp://127.0.0.1:5555"), None);
+
+        std::fs::remove_file(&path).expect("the file goes");
+        drop(UnixListener::bind(&path).expect("a listener"));
+        assert_eq!(
+            own_handshake_endpoint(&address),
+            Some(path.display().to_string()),
+            "a leftover socket the bind sequence sweeps reads as free"
+        );
     }
 
     /// The drain switch closes admission with health; the readiness switch
