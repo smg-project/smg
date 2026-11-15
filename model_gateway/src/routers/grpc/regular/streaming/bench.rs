@@ -269,6 +269,7 @@ impl StreamBench {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: tracing::Span::none(),
             marked: Arc::default(),
         });

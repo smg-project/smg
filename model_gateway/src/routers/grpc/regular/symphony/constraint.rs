@@ -29,7 +29,7 @@ use crate::{
     config::ParserChoice,
     routers::grpc::{
         common::stages::helpers::TagForStart,
-        spec::scans_for_tool_calls_for,
+        spec::{scans_for_tool_calls_for, ChatResponseSpec},
         utils::{ModelNames, Names, TagVocabulary, WorkerDecoding},
     },
     worker::{Worker, WorkerType},
@@ -536,6 +536,20 @@ impl<'a> Asks<'a> {
         match self {
             Self::Chat(request) => request.ignore_eos,
             Self::Messages { .. } => false,
+        }
+    }
+
+    /// The request holds the answer to JSON: a chat request's `json_object` or `json_schema`
+    /// response format (the response spec's `json_mode`, the one rule both paths read through
+    /// [`ChatResponseSpec::json_mode_of`]; a structural tag is free text around its tags), a
+    /// Messages request's `output_config.format`. The table's engine then reads the answer's
+    /// quote state and keeps a marker the model spells inside one of the answer's strings as
+    /// the answer's text, as the family's own parsers do under their JSON mode
+    /// ([`Assignment::json_answer`](super::reader::Assignment::json_answer)).
+    pub(super) fn json_answer(self) -> bool {
+        match self {
+            Self::Chat(request) => ChatResponseSpec::json_mode_of(request),
+            Self::Messages { request, .. } => request.output_schema().is_some(),
         }
     }
 }
