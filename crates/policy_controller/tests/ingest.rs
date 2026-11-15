@@ -18,7 +18,7 @@ use axum::{routing::get, Router};
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
-    controller::{Config, Controller, Listener, Scope},
+    controller::{Config, Controller, Election, Listener, Scope},
     ingest::{
         loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
         probe::EngineProbe,
@@ -363,6 +363,7 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         // Long enough that the counter below reads the first poll alone,
         // however slow the host; the first tick polls at once.
         load_poll_interval: Duration::from_secs(10),
+        election: Election::default(),
     })
     .await
     .expect("the controller binds");

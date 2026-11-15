@@ -967,8 +967,8 @@ async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
     );
     // The record the relay pushes for a rank is the poll's entry for it: one
     // field set on both wires, the token counts and the KV capacity included,
-    // so a gateway's DP-rank token cache reads the same from a push as from
-    // a poll.
+    // so a gateway's load report for the worker reads the same from a push as
+    // from a poll.
     for load in &loads.loads {
         let pushed = kv_events::LoadSource::load(&source, Some(load.dp_rank))
             .expect("the rank's pushed record");

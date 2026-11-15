@@ -309,7 +309,7 @@ mod tests {
                 let remaining = remaining.clone();
                 async move {
                     if remaining
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
                         .is_ok()
                     {
                         Err(())
@@ -376,7 +376,7 @@ mod tests {
                     let remaining = remaining.clone();
                     async move {
                         if remaining
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
                             .is_ok()
                         {
                             (StatusCode::SERVICE_UNAVAILABLE, "fail").into_response()

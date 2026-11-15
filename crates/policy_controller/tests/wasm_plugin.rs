@@ -21,20 +21,27 @@ use std::sync::{
 };
 
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests},
+    builtins::{Best, Healthy, LeastRequests, PowerOfTwo},
     wasm::{
         Abi, Bound, BreakerSpec, Failure, LoadError, Plugin, PluginSpec, Reveal, Runtime,
         WasmFilter, WasmPicker, WasmScorer, World,
     },
-    Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Lease, Lifecycle, Needs,
-    PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scratch, ShedReason, Side, Target,
-    Weighted, WorkerId,
+    Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Identity, Lease, Lifecycle,
+    Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scratch, ShedReason, Side,
+    Target, Weighted, WorkerId,
 };
 use support::wasm_guest::{self as guest, canonical, counter, mode};
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::Resolve;
 
 const FRAME_MICROS: u32 = 10_000;
+/// The decision budget of a case that tests neither the frame nor the
+/// decision's budget: a minute, which no hold of a runner spends, so such a
+/// case is not decided by the wall clock. A call draws the decision's budget
+/// by its elapsed time: under a budget of the frame's ten milliseconds, one
+/// hold of that length inside one call sent every later stage to its
+/// fallback.
+const UNTIMED_BUDGET_MICROS: u32 = 60_000_000;
 /// A thousand times below this host's speed: a charge at this calibration is
 /// its fuel unless one call is held off the core for longer than a burn
 /// (near a tenth of a second), so a case's budget arithmetic in burns holds
@@ -156,13 +163,24 @@ fn pool(n: u32) -> Vec<Candidate> {
         .collect()
 }
 
+/// A request under the untimed budget. A case that tests the decision's
+/// budget names its own (`timed`, or the field).
 fn facts(seed: u64) -> RequestFacts<'static> {
     RequestFacts {
         model: "m",
-        budget_micros: FRAME_MICROS,
+        budget_micros: UNTIMED_BUDGET_MICROS,
         seed,
         now_micros: 777_000,
         ..RequestFacts::default()
+    }
+}
+
+/// A request whose decision budget is one frame: for the cases that assert
+/// what a spent budget does.
+fn timed(seed: u64) -> RequestFacts<'static> {
+    RequestFacts {
+        budget_micros: FRAME_MICROS,
+        ..facts(seed)
     }
 }
 
@@ -414,6 +432,79 @@ fn the_filters_answer_narrows_the_pool_once_per_decision_and_row_by_row() {
     assert_eq!(plugin.stats().answered, 4, "filter asked once");
 }
 
+/// A plugin scorer under a picker that narrows is handed the set compared, as
+/// any scorer is: the guest scores its candidates once, the host reads the
+/// rows compared in the picker's order, and no line of the interface moves.
+/// Under the two-draw picker the better of the two drawn by the guest's score
+/// leads, the other follows, and the trace's top rows are the two.
+#[test]
+fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
+    let runtime = runtime();
+    for (name, component) in [
+        ("record", guest::record_guest()),
+        ("packed", guest::packed_guest()),
+    ] {
+        let plugin = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
+        let engine = single_engine(Profile {
+            name: "two-draw".into(),
+            filters: vec![],
+            scorers: vec![Weighted {
+                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+                weight: 1.0,
+            }],
+            picker: Box::new(PowerOfTwo),
+        });
+        // The in-flight counts descend, so of two rows the later scores
+        // higher: one less a hundredth a request in flight.
+        let candidates = pool(8);
+        let score = |id: u64| 1.0 - (108 - id) as f32 / 100.0;
+        let mut leads = std::collections::BTreeSet::new();
+        for seed in 1..=64 {
+            let decision = decide(&engine, &candidates, seed);
+            let ids = pick_ids(&decision);
+            assert_eq!(ids.len(), 2, "{name}, seed {seed}: the two drawn");
+            assert!(
+                ids[0] > ids[1],
+                "{name}, seed {seed}: the fewer in flight leads, {ids:?}"
+            );
+            let Some(pick) = decision.pick() else {
+                panic!("a pick, not {decision:?}")
+            };
+            assert_eq!(pick.trace.survivors, 8, "{name}: the filters' count");
+            let top = &pick.trace.top[..usize::from(pick.trace.top_len)];
+            assert_eq!(
+                top.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),
+                ids,
+                "{name}, seed {seed}: the trace's top rows are the two"
+            );
+            assert!(
+                top.iter().all(|(id, got)| (got - score(id.0)).abs() < 1e-6),
+                "{name}, seed {seed}: each row's own score, {top:?}"
+            );
+            leads.insert(ids[0]);
+        }
+        assert!(
+            leads.len() > 2,
+            "{name}: the draw moves the pair, {leads:?}"
+        );
+        let stats = plugin.stats();
+        assert_eq!(
+            stats.answered, 128,
+            "{name}: the constructor and one score a decision"
+        );
+        assert_eq!(
+            (
+                stats.declined,
+                stats.traps,
+                stats.fuel_exhausted,
+                stats.invalid
+            ),
+            (0, 0, 0, 0),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn a_declined_filter_keeps_the_instance_and_takes_its_fallback() {
     let runtime = runtime();
@@ -499,9 +590,16 @@ fn a_trap_drops_the_instance_and_the_close_rebuilds_it() {
 #[test]
 fn an_exhausted_budget_is_a_fuel_fault_and_the_scorer_falls_back() {
     let runtime = runtime();
-    let mut spinning = spec("spinning", guest::record_guest(), mode::SPIN_IN_SCORE);
-    spinning.budget_micros = 200;
-    let plugin = Plugin::load(&runtime, spinning).expect("loads");
+    // The slow calibration: the frame's fuel is gone a thousand times sooner
+    // than its bound on the clock, so the fuel ends the spin on any host. At
+    // the default calibration the two race, and a spin its bound ended first
+    // is the same fault with less than the frame's fuel used.
+    let plugin = load_slow(
+        &runtime,
+        "spinning",
+        guest::record_guest(),
+        mode::SPIN_IN_SCORE,
+    );
     let engine = single_engine(plugin_profile(
         &plugin,
         None,
@@ -518,7 +616,10 @@ fn an_exhausted_budget_is_a_fuel_fault_and_the_scorer_falls_back() {
     let stats = plugin.stats();
     assert_eq!(stats.fuel_exhausted, 1);
     assert_eq!(stats.traps, 0);
-    assert!(stats.fuel_used >= 200 * PluginSpec::DEFAULT_FUEL_PER_MICRO);
+    assert!(
+        stats.fuel_used >= u64::from(SLOW_FRAME_MICROS) * SLOW_CALIBRATION,
+        "the spin used its frame's fuel: {stats:?}"
+    );
     assert!(
         plugin.is_warm(),
         "the faulted instance went and the close rebuilt the slot"
@@ -668,13 +769,36 @@ fn the_breaker_opens_on_the_failure_threshold_and_bypasses_the_guest() {
 }
 
 /// What the host says: a subscriber that keeps every warning of this crate
-/// as its level and its fields.
+/// as its level and its fields. It also takes a guest's own log lines (the
+/// plugin host writes them at their level), keeps none of them, and holds
+/// the calling thread in one where a case asked ([`hold`]).
 struct Said(Arc<std::sync::Mutex<Vec<String>>>);
+
+/// The holds the cases asked: a plugin's name, how long, how many lines.
+static HOLDS: std::sync::Mutex<Vec<(String, std::time::Duration, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds the thread that writes `plugin`'s next `lines` log lines, `nap`
+/// each: the guest's log line is a host call, so the thread is off the CPU
+/// inside a guest call for as long as the case says, whatever the load. The
+/// cases that hold run where the host reads a thread's clock: elsewhere
+/// nothing is watched, and a held call ends at its deadline on the wall
+/// clock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hold(plugin: &str, nap: std::time::Duration, lines: u32) {
+    said();
+    HOLDS
+        .lock()
+        .expect("the holds")
+        .push((format!("plugin=\"{plugin}\""), nap, lines));
+}
 
 impl tracing::Subscriber for Said {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::WARN
-            && metadata.target().starts_with("smg_policy_controller")
+        (*metadata.level() <= tracing::Level::WARN
+            && metadata.target().starts_with("smg_policy_controller"))
+            || (*metadata.level() == tracing::Level::INFO
+                && metadata.target() == "smg_policy_controller::wasm::bindings")
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -691,7 +815,23 @@ impl tracing::Subscriber for Said {
         }
         let mut fields = Fields(event.metadata().level().to_string());
         event.record(&mut fields);
-        self.0.lock().expect("the kept lines").push(fields.0);
+        if *event.metadata().level() <= tracing::Level::WARN {
+            self.0.lock().expect("the kept lines").push(fields.0);
+            return;
+        }
+        // A guest's own line: held where a case asked, kept nowhere.
+        let nap = HOLDS
+            .lock()
+            .expect("the holds")
+            .iter_mut()
+            .find(|(named, _, lines)| *lines > 0 && fields.0.contains(named.as_str()))
+            .map(|(_, nap, lines)| {
+                *lines -= 1;
+                *nap
+            });
+        if let Some(nap) = nap {
+            std::thread::sleep(nap);
+        }
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
@@ -986,7 +1126,7 @@ fn pair_engine(profiles: Vec<Profile>, decode_profile: u16) -> Engine {
 /// Three prefills (100..102) and four decodes (200..203) of one pair class,
 /// each pool's last row the least loaded.
 fn pair_decide(engine: &Engine) -> Decision {
-    pair_decide_under(engine, FRAME_MICROS)
+    pair_decide_under(engine, UNTIMED_BUDGET_MICROS)
 }
 
 /// `pair_decide` under a decision budget of the case's own.
@@ -1013,6 +1153,7 @@ fn pair_decide_under(engine: &Engine, budget_micros: u32) -> Decision {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1139,8 +1280,16 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
         withheld.view.session_key = Reveal::None;
         let withheld = Plugin::load(&runtime, withheld).expect("the guest loads");
         let hashed = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
+        // A lease carries a request's session, which the request's facts
+        // alone make.
+        let session = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(0xBEEF),
+            ..RequestFacts::default()
+        }
+        .session();
         let lease = Lease {
-            session_key: 0xBEEF,
+            session,
             ..Lease::default()
         };
         for plugin in [&withheld, &hashed] {
@@ -1153,8 +1302,8 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
         );
         assert_eq!(
             counter_value(&hashed, counter::OBSERVE_SESSION),
-            0xBEEF,
-            "{name}: the fingerprint, as in the request"
+            session.get(),
+            "{name}: the session's value, as in the request"
         );
     }
 }
@@ -1399,11 +1548,12 @@ fn a_plugin_bound_into_a_later_engine_observes_through_it() {
     assert_eq!(counter_value(&plugin, counter::OBSERVED), 4);
 }
 
-/// Fuel prices operators, not bytes: a loop of whole-memory fills burns a
-/// few units per millisecond. The frame's epoch deadline stops it on the
-/// clock, counted as the frame running out.
+/// A loop of whole-memory fills under a calibration that underprices it:
+/// fuel prices a fill by its size, and at this calibration the frame's fuel
+/// lasts seconds of them. The frame's bound on the clock ends the call, on
+/// the time its thread had the CPU, counted as the frame running out.
 #[test]
-fn a_bulk_memory_loop_meets_the_frames_wall_bound() {
+fn a_bulk_memory_loop_meets_the_frames_bound_on_the_clock() {
     let runtime = runtime();
     // A calibration no host has: at it the frame's fuel lasts seconds of
     // fills (a fill is charged by its length), so only the clock can end the
@@ -1413,26 +1563,45 @@ fn a_bulk_memory_loop_meets_the_frames_wall_bound() {
     filler.fuel_per_micro = 20_000_000;
     let plugin = Plugin::load(&runtime, filler).expect("the guest loads");
     let engine = plugin_engine(&plugin);
-    let started = std::time::Instant::now();
+    let (wall, started) = (std::time::Instant::now(), bound_clock());
     assert!(
         matches!(decide(&engine, &pool(4), 1), Decision::Pick(_)),
         "the fallback scorer decided"
     );
-    let elapsed = started.elapsed();
+    let had = bound_clock().saturating_sub(started);
+    let off_the_cpu = wall.elapsed().saturating_sub(had);
     let stats = plugin.stats();
     assert_eq!(
         (stats.fuel_exhausted, stats.traps),
         (1, 0),
         "the frame ran out on the clock, not on fuel: {stats:?}"
     );
-    // The fills cost a few units each under a frame of ten thousand million
-    // units, so the loop would run for seconds on fuel alone; the deadline
-    // ends it within a few ticks of the frame (a trapped call's fuel reads
-    // as spent: the store's counter is not synced on an interrupt).
+    // The bound ended the call, so the call is the plugin's and never
+    // unread. A call of the decision the runner itself held is unread by
+    // right, so the count is asserted where the decision kept its thread on
+    // the CPU.
+    if off_the_cpu < std::time::Duration::from_micros(u64::from(FRAME_MICROS) / 4) {
+        assert_eq!(
+            stats.unread, 0,
+            "a call its bound ended is never unread: {stats:?}"
+        );
+    } else {
+        excused(
+            "a bulk-memory loop",
+            "the decision's thread was off the CPU a quarter of the frame",
+        );
+    }
+    // A fill costs its sixteen million bytes under a frame of two hundred
+    // thousand million units, so the loop would run for seconds on fuel
+    // alone; the bound ends it within a few ticks of the frame (a trapped
+    // call's fuel reads as spent: the store's counter is not synced on an
+    // interrupt). The bound counts the time this thread had the CPU, so the
+    // case reads the clock the bound counts: on a starved runner the wall
+    // clock reads more, by the share of the CPU the thread was given.
     let bound = std::time::Duration::from_micros(u64::from(FRAME_MICROS) * 20);
     assert!(
-        elapsed < bound,
-        "the wall bound held: {elapsed:?} for a {FRAME_MICROS} us frame"
+        had < bound,
+        "the bound held: {had:?} on the clock it counts, for a {FRAME_MICROS} us frame"
     );
     assert!(
         plugin.is_warm(),
@@ -1497,6 +1666,7 @@ fn a_pair_shares_one_decision_budget() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1555,6 +1725,7 @@ fn a_fault_on_one_side_of_a_two_profile_pair_rebuilds_once() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1629,12 +1800,25 @@ fn a_spent_budget_drops_no_healthy_instance() {
     );
 }
 
-/// The budget is wall time: a long call that answers, then an endless one,
-/// end at the budget together, because the second call's deadline is what
-/// the first one left, not its whole frame. Fuel cannot end either call
-/// inside the bound at this calibration; the clock does.
+/// A long call that answers, then an endless one, end at the budget
+/// together, because the second call's bound is what the first one left, not
+/// its whole frame. Fuel cannot end either call inside the bound at this
+/// calibration; the clock does, counting the time the thread had the CPU.
+/// The decision's own deadline is the wall clock's: where the runner holds
+/// the thread past the budget inside the first call, the remainder is spent
+/// and the second is never made. The case names both worlds, and in both
+/// the decision ends at its budget on the clock its bound counts. In both
+/// the decision's budget is spent and the breaker is told nothing: the long
+/// call answered with no reading, so by its fuel the run-out under what it
+/// left is the budget's and by the time it took the plugin's, and nothing
+/// says which. It is the budget's, counted with the calls nothing read, and
+/// it arms the thread; what holds a guest like this one is its decisions'
+/// samples. These are the counts of a host that reads a thread's clock: where
+/// none is, a call spends its charge, the run-out under what the long call
+/// left is the plugin's own, and nothing is counted unread.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn the_decisions_wall_is_bounded_by_its_budget_whatever_the_fuel() {
+fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
     let runtime = runtime();
     let mut spec = spec(
         "fill-then-fill",
@@ -1645,6 +1829,7 @@ fn the_decisions_wall_is_bounded_by_its_budget_whatever_the_fuel() {
     spec.budget_micros = 1_000_000;
     let plugin = Plugin::load(&runtime, spec).expect("the guest loads");
     let engine = plugin_engine(&plugin);
+    let cpu_before = bound_clock();
     let started = std::time::Instant::now();
     let decision = engine.decide(
         &RequestFacts {
@@ -1665,26 +1850,102 @@ fn the_decisions_wall_is_bounded_by_its_budget_whatever_the_fuel() {
         matches!(decision, Decision::Pick(_)),
         "the fallbacks decide"
     );
+    let cpu = bound_clock().saturating_sub(cpu_before);
     let stats = plugin.stats();
+    assert_eq!(stats.traps, 0, "{stats:?}");
     assert_eq!(
-        (stats.fuel_exhausted, stats.traps),
-        (1, 0),
-        "the endless fill ran out on the clock: {stats:?}"
+        (
+            stats.fuel_exhausted,
+            stats.budget_spent,
+            stats.breaker_opens
+        ),
+        (0, 1, 0),
+        "the decision's budget was spent, by a run-out or with no call: {stats:?}"
     );
-    // Eight hundred fills take near four hundred milliseconds and answer;
-    // the endless fill then gets what the second has left, plus a tick, the
-    // fill in flight and the runner's slack (a fifth of a hundred-millisecond
-    // budget seen with sibling test threads on a loaded host). A whole-frame
-    // deadline would run the endless fill the frame's whole second on top:
-    // near one and a half.
+    if elapsed.saturating_sub(cpu) < std::time::Duration::from_millis(500) {
+        // The thread had the CPU: the long fill answered inside its bound
+        // and the endless one was called and ran out on the clock, mid-call.
+        assert_eq!(
+            (stats.unread, stats.stalls, stats.lazy_instantiations),
+            (1, 0, 1),
+            "the run-out was counted with the calls nothing read, and its instance went: {stats:?}"
+        );
+    }
+    // Eight hundred fills take two to four hundred milliseconds, by the
+    // host, and answer; the endless fill then gets what the second has
+    // left, plus a tick and the fill in flight, so the decision ends within
+    // milliseconds of its budget. A whole-frame bound would run the endless
+    // fill the frame's whole second on top: a fifth of a second past the
+    // budget at the least. The line is the budget and a tenth. The bound
+    // counts the time this thread had the CPU, so the case reads the clock
+    // the bound counts: on a starved runner the wall clock reads more, by
+    // the share of the CPU the thread was given.
     assert!(
-        elapsed < std::time::Duration::from_millis(1_200),
-        "the decision ended at its budget: {elapsed:?}"
+        cpu < std::time::Duration::from_millis(1_100),
+        "the decision ended at its budget on the clock its bound counts: {cpu:?}, {elapsed:?} on the wall"
     );
     assert!(
         plugin.is_warm(),
         "the interrupted instance went and the close rebuilt the slot"
     );
+}
+
+/// A plugin that alone spends its decisions' budget is charged for it on an
+/// armed thread. A lone plugin whose score spins, under a frame of the whole
+/// budget at the default calibration, where a call takes longer than its
+/// fuel (the host's marshalling is time and no fuel). On a quiet thread its
+/// first run-out is the decision's budget spent, counted with the calls
+/// nothing read, and it arms the thread. From then on a reading gives each
+/// earlier call its one time, the plugin's own spend and the grant reach
+/// the budget, and the run-out is the plugin's own: the failure rule opens
+/// the breaker at the fifth, long before the ring's first read at the
+/// sixty-fourth decision. A reading can run a microsecond short of its
+/// call, and that run-out is the budget's: the case asserts the opening and
+/// its floor, never every decision. Both are asserted where no hold moved
+/// the run: a call the host held is short by its reading, and its
+/// decision's run-out is the budget's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_lone_spinner_on_an_armed_thread_is_charged_and_the_failure_rule_opens_it() {
+    let runtime = runtime();
+    let spinner = load(
+        &runtime,
+        "lone-spinner",
+        guest::record_guest(),
+        mode::SPIN_IN_SCORE,
+    );
+    let engine = plugin_engine(&spinner);
+    let candidates = pool(4);
+    let decide = |seed: u64| {
+        engine.decide(
+            &timed(seed),
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    };
+    let (decisions, on_the_cpu) = decide_until_open(&spinner, decide);
+    let s = spinner.stats();
+    assert_eq!(
+        (s.traps, s.breaker_opens),
+        (0, 1),
+        "the spinner's breaker opened once, on no trap: {s:?}"
+    );
+    assert!(
+        s.unread >= 1,
+        "the first run-out of a quiet thread was counted with the calls nothing read: {s:?}"
+    );
+    if no_hold("a lone spinner", on_the_cpu, &[&spinner]) {
+        assert!(
+            s.fuel_exhausted >= 5,
+            "on the armed thread the run-outs were the plugin's own: {s:?}"
+        );
+        assert!(
+            decisions < 64,
+            "the failure rule opened it before the ring's first read: {decisions} decisions, {s:?}"
+        );
+    }
 }
 
 /// Two plugins in one profile: the scorer spends most of the budget, the
@@ -1765,6 +2026,11 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
         "the picker ran out under the scorer's clamp: {p:?}"
     );
     assert_eq!(
+        (p.unread, p.stalls),
+        (0, 0),
+        "by its fuel and by its time the run-out is the budget's: no reading was owed: {p:?}"
+    );
+    assert_eq!(
         (p.instantiations, p.lazy_instantiations),
         (2, 1),
         "the picker's interrupted instance went and the close rebuilt it: {p:?}"
@@ -1832,6 +2098,7 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it() {
         PairPools {
             prefills: &prefills,
             decodes: &decodes,
+            ..PairPools::default()
         },
         &Constraints::default(),
         &Constraints::default(),
@@ -1853,13 +2120,13 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it() {
     assert!(plugin.is_warm(), "the close rebuilt the slot");
 }
 
-/// A destructor long on the clock but cheap in fuel runs under its own wall
+/// A destructor long on the clock but cheap in fuel runs under its own
 /// bound of two milliseconds and is no latency sample: sixty-five decisions
 /// of it open no breaker. Its fifty host calls cost a few microseconds each,
-/// a small fraction of the wall; one held off the core past the wall on a
-/// loaded runner is dropped and rebuilt, the mechanism's answer, no failure.
+/// a small fraction of the bound; one held off the core past it on a loaded
+/// runner is not ended, the bound counting the time its thread had the CPU.
 #[test]
-fn a_slow_destructor_within_its_own_wall_opens_nothing() {
+fn a_slow_destructor_within_its_own_bound_opens_nothing() {
     let runtime = runtime();
     let plugin = load(
         &runtime,
@@ -1882,6 +2149,987 @@ fn a_slow_destructor_within_its_own_wall_opens_nothing() {
         "no sample, no failure: {stats:?}"
     );
     assert!(plugin.is_warm());
+}
+
+/// A destructor the host holds past its bound is not ended: the bound counts
+/// the time its thread had the CPU. The guest's log line is a host call, and
+/// the case holds the thread in it for four bounds, off the CPU whatever the
+/// load, in two decisions. The promise is exact in both: the destructor
+/// finishes, the instance stays, the pick is the guest's, and nothing counts
+/// on the breaker (one failure would open it). The two tallies are floors,
+/// for a hold of the runner's own is a hold too: the first hold has no
+/// reading of its start, so it is unread and arms the thread; the second is
+/// read, and is the host's.
+///
+/// A runner that stops the whole process makes another lawful world: the
+/// kernel's stop path runs on each stopped thread's own clock (about this
+/// destructor's whole bound in a process of two hundred threads), so the
+/// held destructor is a call whose thread had its bound. The case reads its
+/// thread's clock across each decision: where the clock says the thread had
+/// the bound, that world's two outcomes are asserted by their counts and the
+/// run says which in one line; a count off anywhere else fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_destructor_the_host_held_past_its_bound_is_not_ended() {
+    const CASE: &str = "a held destructor";
+    // The promise's counts: calls past a frame, traps, instances made,
+    // openings, bypasses. Kept: nothing was ended. Ended: a tick found the
+    // destructor's thread had its bound, and the one-failure breaker opened.
+    const KEPT: [u64; 5] = [0, 0, 1, 0, 0];
+    const ENDED: [u64; 5] = [1, 0, 1, 1, 0];
+    let runtime = runtime();
+    let mut held = spec("held-dtor", guest::record_guest(), mode::LOG_IN_DESTRUCTOR);
+    held.breaker = BreakerSpec {
+        failures: 1,
+        window_micros: 60_000_000,
+        cooldown_micros: 60_000_000,
+    };
+    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    // The destructor's bound (the host's own constant, private to it, so by
+    // copy) and the grain of the host's readings of the thread's clock (whole
+    // microseconds).
+    let bound = std::time::Duration::from_millis(2);
+    let grain = std::time::Duration::from_micros(1);
+    // One decision: the guest decided; the promise's counts after it; and
+    // the case's witness, the thread's own clock across the decision. That
+    // bounds what the destructor's thread had inside its call from above:
+    // short of the bound by the grain, no reading of the host's can say the
+    // thread had its bound.
+    let decide_and_read = |seed: u64, when: &str| {
+        let cpu = bound_clock();
+        let decision = decide(&engine, &candidates, seed);
+        let on_the_cpu = bound_clock().saturating_sub(cpu);
+        assert_eq!(
+            pick_ids(&decision),
+            vec![103, 102, 101, 100],
+            "{when}: the guest's pick"
+        );
+        let stats = plugin.stats();
+        let counts = [
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.instantiations,
+            stats.breaker_opens,
+            stats.bypassed,
+        ];
+        (stats, counts, on_the_cpu + grain > bound)
+    };
+    // The promise in the world the case makes: the destructor was not ended.
+    let kept = |counts: [u64; 5], stats: &dyn std::fmt::Debug, when: &str| {
+        assert_eq!(
+            counts, KEPT,
+            "{when}: it was not ended: the instance stays and nothing counts: {stats:?}"
+        );
+        assert!(plugin.is_warm(), "{when}");
+    };
+    // The one line of a run in the other world.
+    let stopped = |when: &str, outcome: &str| {
+        other_world(
+            CASE,
+            &format!("{when}: the thread's clock says it had the destructor's bound: {outcome}"),
+        );
+    };
+    let nap = 4 * bound;
+    hold("held-dtor", nap, 1);
+    let (stats, counts, had_the_bound) = decide_and_read(1, "the first hold");
+    if had_the_bound && counts == ENDED {
+        stopped("the first hold", "ended at a tick");
+        return;
+    }
+    kept(counts, &stats, "the first hold");
+    assert!(
+        stats.unread >= 1,
+        "no reading covered the first hold: {stats:?}"
+    );
+    let unread = stats.unread;
+    hold("held-dtor", nap, 1);
+    let (stats, counts, had_the_bound) = decide_and_read(2, "the second hold");
+    if had_the_bound && counts == ENDED {
+        stopped("the second hold", "ended at a tick");
+        return;
+    }
+    if had_the_bound && counts == KEPT && (stats.stalls, stats.unread) == (0, unread) {
+        stopped("the second hold", "judged the plugin's own at its end");
+        return;
+    }
+    kept(counts, &stats, "the second hold");
+    assert!(
+        stats.stalls >= 1,
+        "the thread was armed: the second hold is read, and the host's: {stats:?}"
+    );
+    // The next decision, not held, runs on the same instance.
+    let (stats, counts, had_the_bound) = decide_and_read(3, "no hold");
+    if had_the_bound && counts == ENDED {
+        stopped("no hold", "ended at a tick");
+        return;
+    }
+    kept(counts, &stats, "no hold");
+}
+
+/// A stage call the host holds past its frame is not ended, so the instance
+/// stays and nothing fails. Three scores are held, three budgets each. The
+/// first has no reading of its start: it is unread, its decision's sample is
+/// the time it took, and it arms the thread. The other two are read: each is
+/// the host's, and its decision's sample is the plugin's own time, never the
+/// hold. So the ring of sixty-four holds one slow sample and opens nothing;
+/// sampled by the wall clock the three are its slowest, and the second
+/// slowest opens the breaker. The decision's deadline stays real: the pick
+/// after a held score finds the budget spent and falls back, nobody's
+/// failure. The promise is exact; the tallies are floors, for a hold of the
+/// runner's own is a hold too.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_stage_the_host_held_past_its_frame_fails_nothing_and_opens_nothing() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "held-score",
+        guest::record_guest(),
+        mode::LOG_IN_SCORE,
+    );
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    hold(
+        "held-score",
+        std::time::Duration::from_micros(u64::from(FRAME_MICROS) * 3),
+        3,
+    );
+    for seed in 0..64 {
+        let decision = engine.decide(
+            &timed(seed),
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.instantiations,
+            stats.breaker_opens
+        ),
+        (0, 0, 1, 0),
+        "none was ended, and one slow sample opens nothing: {stats:?}"
+    );
+    assert!(
+        stats.unread >= 1,
+        "no reading covered the first held score: {stats:?}"
+    );
+    assert!(
+        stats.stalls >= 2,
+        "the thread was armed: the next two are read, and the host's: {stats:?}"
+    );
+    assert!(
+        stats.budget_spent >= 3,
+        "the pick after each held score found the decision's budget spent: {stats:?}"
+    );
+}
+
+/// A hold excuses lateness, never a fault. A score the host holds past its
+/// frame that then traps by itself is the plugin's failure: the trap is
+/// counted, the instance goes and the breaker is told, both times, and the
+/// breaker opens at its threshold of two. The first held score has no
+/// reading of its start: it is unread and arms the thread, as any late call
+/// no reading covers. The second is read, the host held it, and its trap is
+/// still its own: no stall is counted for it. That count is exact where the
+/// case's own witness says no hold but the case's two fell in its decisions:
+/// a hold of the runner's own on a call that answered is a stall too. The
+/// two decisions run under the helper's budget, which no hold spends: the
+/// score's bound is still the plugin's frame, so the case's hold makes it
+/// late.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_score_the_host_held_that_then_traps_is_the_plugins_failure_and_no_stall() {
+    let runtime = runtime();
+    let mut held = spec("held-trap", guest::record_guest(), mode::LOG_IN_SCORE);
+    held.breaker = BreakerSpec {
+        failures: 2,
+        window_micros: 60_000_000,
+        cooldown_micros: 60_000_000,
+    };
+    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    // On three candidates the guest's score traps after its log line.
+    let candidates = pool(3);
+    let three = PoolFacts {
+        pool_size: 3,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    let nap = std::time::Duration::from_micros(u64::from(FRAME_MICROS) * 3);
+    let slack = std::time::Duration::from_micros(u64::from(FRAME_MICROS) / 4);
+    hold("held-trap", nap, 2);
+    // No hold but the case's own two fell in its decisions.
+    let mut quiet = true;
+    for (seed, traps) in [(1, 1), (2, 2)] {
+        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        let decision = engine.decide(
+            &facts(seed),
+            &three,
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        let off_the_cpu = wall
+            .elapsed()
+            .saturating_sub(bound_clock().saturating_sub(cpu));
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: the fallbacks decide"
+        );
+        let stats = plugin.stats();
+        quiet &= off_the_cpu < nap + slack;
+        assert_eq!(
+            (stats.traps, stats.fuel_exhausted, stats.instantiations),
+            (traps, 0, 2),
+            "decision {seed}: the held score's trap is the plugin's and its instance went: {stats:?}"
+        );
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.traps, stats.breaker_opens, stats.bypassed),
+        (2, 1, 0),
+        "the breaker was told of both traps and opened at its threshold: {stats:?}"
+    );
+    assert!(
+        stats.unread >= 1,
+        "no reading covered the first held score: {stats:?}"
+    );
+    if quiet {
+        assert_eq!(
+            stats.stalls, 0,
+            "a held call that failed by itself is no stall: {stats:?}"
+        );
+    } else {
+        excused(
+            "a held score that then traps",
+            "a decision's thread was off the CPU past the case's own hold",
+        );
+    }
+}
+
+/// One decision of a plugin at the slow calibration whose score the host
+/// holds for `held` inside its log line and whose pick then burns. A burn is
+/// 117 ms of fuel-time there, more than `held` leaves of the decision's
+/// `budget_micros`, so the pick runs out under the decision's remainder. One
+/// failure opens the plugin's breaker: an opening is a failure the breaker
+/// was told. Returns the plugin, its engine and the case's own witness: the
+/// decision took no longer than the hold and half of what the hold leaves,
+/// so a remainder reached the pick and the route is the case's to assert.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn burn_after_a_hold(
+    name: &str,
+    frame_micros: u32,
+    budget_micros: u32,
+    held: std::time::Duration,
+) -> (Arc<Plugin>, Engine, bool) {
+    let runtime = runtime();
+    let mut slow = spec(name, guest::record_guest(), mode::LOG_THEN_BURN);
+    slow.fuel_per_micro = SLOW_CALIBRATION;
+    slow.budget_micros = frame_micros;
+    slow.breaker = BreakerSpec {
+        failures: 1,
+        window_micros: 60_000_000,
+        cooldown_micros: 60_000_000,
+    };
+    let plugin = Plugin::load(&runtime, slow).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    hold(name, held, 1);
+    let wall = std::time::Instant::now();
+    let decision = engine.decide(
+        &RequestFacts {
+            budget_micros,
+            ..facts(1)
+        },
+        &four(),
+        &candidates,
+        &Constraints::default(),
+        &mut Scratch::new(),
+    );
+    let took = wall.elapsed();
+    assert!(
+        matches!(decision, Decision::Pick(_)),
+        "the fallbacks decide"
+    );
+    let left = std::time::Duration::from_micros(u64::from(budget_micros)).saturating_sub(held);
+    (plugin, engine, took < held + left / 2)
+}
+
+/// Whether the close rebuilt the instance a run-out dropped. Two other
+/// worlds are lawful, and a run in either asserts that world's counts here,
+/// says so, and asserts no more. A host that holds the decision's thread
+/// past the case's own hold can end the budget inside the score: the pick
+/// has no grant and is not called, nothing runs out and the instance stays.
+/// Only a run whose witness is silent can be that one (`quiet`: a remainder
+/// reached the pick). And the rebuild is an `init`, judged under its own
+/// frame on the wall clock: one the host holds for that frame fails, and
+/// that failure is the breaker's, where the run-out itself told it nothing.
+/// That run says so with the host's own line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rebuilt(case: &str, plugin: &Plugin, quiet: bool) -> bool {
+    let stats = plugin.stats();
+    if stats.lazy_instantiations != 0 {
+        return true;
+    }
+    if !quiet && stats.instantiations == 1 {
+        assert_eq!(
+            stats.breaker_opens, 0,
+            "a score held past the whole budget fails nothing: {stats:?}"
+        );
+        other_world(
+            case,
+            "the hold spent the whole budget and the pick was not called",
+        );
+        return false;
+    }
+    assert_eq!(
+        (stats.instantiations, stats.breaker_opens),
+        (2, 1),
+        "a rebuild that failed is one failure, and the one-failure breaker opened on it: {stats:?}"
+    );
+    let named = format!("plugin=\"{}\"", plugin.name());
+    let said = said()
+        .lock()
+        .expect("the kept lines")
+        .iter()
+        .filter(|line| line.contains("rebuild") && line.contains(&named))
+        .cloned()
+        .collect::<Vec<_>>();
+    other_world(case, &format!("the close's rebuild failed: {said:?}"));
+    false
+}
+
+/// Time nothing read draws the decision's remainder, never the plugin's own
+/// spend. A score the host holds for nearly half of the decision's budget is
+/// short of late, so nothing reads the thread's clock for it and its own
+/// spend is its fuel, not the time it took. The pick's burn then needs more
+/// than the hold left and runs out: the decision's budget is spent, the
+/// interrupted instance goes and the breaker is told nothing, for the plugin
+/// spent a burn's fuel of a budget the host's hold ended. Charged the hold,
+/// the plugin's spend with the grant reached the budget and the run-out was
+/// its own failure. Nothing said whether the time before the run-out was a
+/// hold or the plugin's own past its fuel, so the run-out is counted with
+/// the calls nothing read and arms the thread: a second score, held past its
+/// bound this time, has a reading of its start and is the host's stall,
+/// where a thread that was not armed counts it unread too. The promise is
+/// exact in every run where the pick ran out and the close rebuilt the
+/// dropped instance (a hold past the whole budget leaves the pick no call,
+/// and a rebuild that fails is a failure of `init`, the breaker's: either
+/// run says so); the route is asserted where the case's witness says a
+/// remainder reached the pick.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_burn_that_runs_out_under_what_a_hold_short_of_late_left_is_the_decisions_budget_spent() {
+    // The hold leaves 110 ms of fuel-time, under a burn's 117: the pick runs
+    // out. It leaves more than half the budget, so the pick's grant counted
+    // twice into the plugin's spend would reach the budget.
+    let (plugin, engine, quiet) = burn_after_a_hold(
+        "starved-short",
+        SLOW_FRAME_MICROS,
+        200_000,
+        std::time::Duration::from_millis(90),
+    );
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.fuel_exhausted, stats.budget_spent),
+        (0, 1),
+        "a run-out under what a hold left is the decision's budget spent: {stats:?}"
+    );
+    if !rebuilt("a burn after a hold short of late", &plugin, quiet) {
+        return;
+    }
+    assert_eq!(
+        stats.breaker_opens, 0,
+        "the breaker was told nothing of the run-out: {stats:?}"
+    );
+    if quiet {
+        assert_eq!(
+            (stats.instantiations, stats.unread, stats.stalls),
+            (2, 1, 0),
+            "the pick ran out mid-call behind a score short of late, and nothing read which: {stats:?}"
+        );
+    } else {
+        excused(
+            "a burn after a hold short of late",
+            "the decision's thread was held past the case's own hold",
+        );
+    }
+    // The second decision: its budget (20 ms) is short of this hold (30 ms),
+    // so the held score is late past its bound and spends the remainder.
+    hold("starved-short", std::time::Duration::from_millis(30), 1);
+    let decision = engine.decide(
+        &RequestFacts {
+            budget_micros: 20_000,
+            ..facts(2)
+        },
+        &four(),
+        &pool(4),
+        &Constraints::default(),
+        &mut Scratch::new(),
+    );
+    assert!(
+        matches!(decision, Decision::Pick(_)),
+        "the fallbacks decide"
+    );
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.fuel_exhausted,
+            stats.breaker_opens,
+            stats.budget_spent
+        ),
+        (0, 0, 2),
+        "the held score spent the second decision's budget, and the pick was not called: {stats:?}"
+    );
+    assert!(
+        stats.stalls >= 1,
+        "the thread was armed: the late score was read, and the host's: {stats:?}"
+    );
+    if quiet {
+        assert_eq!(
+            stats.unread, 1,
+            "the run-out armed the thread: the late score after it did not go unread: {stats:?}"
+        );
+    }
+}
+
+/// The same end by the other path: a frame under the decision's budget. The
+/// held score is late by its frame and, on a thread that read no clock at
+/// its start, unread; an unread call's own spend is its fuel too. The hold
+/// leaves an eighth of the budget, the pick's burn runs out under it, and it
+/// is the decision's budget spent as above, counted with the calls nothing
+/// read beside the late score.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_burn_that_runs_out_under_what_an_unread_late_hold_left_is_the_decisions_budget_spent() {
+    let (plugin, _engine, quiet) = burn_after_a_hold(
+        "starved-late",
+        200_000,
+        400_000,
+        std::time::Duration::from_millis(350),
+    );
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.fuel_exhausted, stats.budget_spent),
+        (0, 1),
+        "a run-out under what a hold left is the decision's budget spent: {stats:?}"
+    );
+    if !rebuilt("a burn after an unread late hold", &plugin, quiet) {
+        return;
+    }
+    assert_eq!(
+        stats.breaker_opens, 0,
+        "the breaker was told nothing of the run-out: {stats:?}"
+    );
+    if quiet {
+        assert_eq!(
+            (stats.instantiations, stats.unread, stats.stalls),
+            (2, 2, 0),
+            "no reading covered the held score, nor said whose the pick's run-out was: {stats:?}"
+        );
+    } else {
+        excused(
+            "a burn after an unread late hold",
+            "the decision's thread was held past the case's own hold",
+        );
+    }
+}
+
+/// A hold excuses a decline as it does an answer: the guest said the stage
+/// does not apply, late because the host held it. Two scores the host holds
+/// past the frame, each declining after its log line: both are declines,
+/// nothing fails, the instance is kept and the breaker is told nothing. The
+/// first has no reading of its start and is unread; the second is read, and
+/// the host's stall. The decline count is exact; the two late tallies are
+/// floors, for a hold of the runner's own is a hold too.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_score_the_host_held_that_then_declines_is_a_decline_and_the_hosts_stall() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "held-decline",
+        guest::record_guest(),
+        mode::LOG_THEN_DECLINE,
+    );
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    hold(
+        "held-decline",
+        std::time::Duration::from_micros(u64::from(FRAME_MICROS) * 3),
+        2,
+    );
+    for seed in [1, 2] {
+        let decision = decide(&engine, &candidates, seed);
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: a declined score has no veto"
+        );
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.declined,
+            stats.traps,
+            stats.fuel_exhausted,
+            stats.instantiations,
+            stats.breaker_opens
+        ),
+        (2, 0, 0, 1, 0),
+        "both held scores declined, and a decline fails nothing: {stats:?}"
+    );
+    assert!(
+        stats.unread >= 1,
+        "no reading covered the first held score: {stats:?}"
+    );
+    assert!(
+        stats.stalls >= 1,
+        "the second was read: the host held it, and it declined: {stats:?}"
+    );
+}
+
+/// Sixty-four decisions of a plugin whose score the host holds inside its
+/// log line for six tenths of the decision's budget, short of late. With
+/// `arm`, the first is held past the frame instead: unread, it arms the
+/// thread. Returns the plugin and a witness: the thread's own clock across
+/// each decision says none had a quarter of the budget on the CPU.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool) {
+    let runtime = runtime();
+    let mut held = spec(name, guest::record_guest(), mode::LOG_IN_SCORE);
+    // Every score's log line reaches the host's subscriber, where the case
+    // holds it.
+    held.log.per_second = 1_000;
+    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    let frame = std::time::Duration::from_micros(u64::from(FRAME_MICROS));
+    let short = frame * 6 / 10;
+    if arm {
+        hold(name, 3 * frame, 1);
+        hold(name, short, 63);
+    } else {
+        hold(name, short, 64);
+    }
+    let mut cheap = true;
+    for seed in 0..64 {
+        let cpu = bound_clock();
+        let decision = engine.decide(
+            &timed(seed),
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        cheap &= bound_clock().saturating_sub(cpu) < frame / 4;
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+    }
+    (plugin, cheap)
+}
+
+/// A reading gives a call one time, late or not. On an armed thread a score
+/// the host holds for six tenths of the decision's budget is short of late,
+/// and its time is what its thread had, not the hold: sixty-three such
+/// decisions are no slow samples. The ring of sixty-four holds one slow
+/// sample, the unread call that armed the thread, and opens nothing. The
+/// unread tally is one: the event that arms a thread is counted once, at
+/// the arming, and on an armed thread nothing is counted again, a hold of
+/// the runner's own included (it is read).
+/// That the breaker stays shut is asserted where the case's witness says no
+/// decision had a quarter of the budget on the CPU: a stop of the whole
+/// process is off the CPU by the thread's own clock, but one that lands
+/// inside the case's own hold makes that sleep end on the CPU: the clock
+/// moves by about the hold, and that time is the call's by any reading.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
+    let (plugin, cheap) = a_window_of_short_holds("held-short", true);
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.fuel_exhausted, stats.traps, stats.instantiations),
+        (0, 0, 1),
+        "a hold fails nothing: {stats:?}"
+    );
+    assert!(
+        stats.unread >= 1,
+        "no reading covered the first held score: {stats:?}"
+    );
+    if cheap {
+        assert_eq!(
+            stats.unread, 1,
+            "one event armed the thread, and nothing on an armed thread is counted again: {stats:?}"
+        );
+        assert_eq!(
+            stats.breaker_opens, 0,
+            "a window of holds short of late on an armed thread reads no slow median: {stats:?}"
+        );
+    } else {
+        excused(
+            "a window of holds short of late",
+            "a decision's thread had a quarter of the budget on the CPU",
+        );
+    }
+}
+
+/// The other end of the same interval. On a thread nothing armed no reading
+/// covers a call, and nothing tells a hold of the host from a guest slow in
+/// what its fuel does not price that answers in time: the ring takes the
+/// time the call took. So the first of the same sixty-four scores, held for
+/// six tenths of the budget and not late, is a sample slow by time nothing
+/// read alone: past half the budget by the time the score took, nowhere
+/// near it by its fuel. It is counted with the unread calls and arms the
+/// thread, and the sixty-three after it are read as the armed window's are:
+/// the ring holds one slow sample and opens nothing. Before that rule all
+/// sixty-four read slow and the window opened at its first read. A guest
+/// slow by itself is slow by those readings and opens all the same (the
+/// case of the guest slow in what fuel does not price). That the breaker
+/// stays shut is asserted under the armed case's witness.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_window_of_holds_short_of_late_on_a_thread_nothing_armed_is_one_slow_sample() {
+    let (plugin, cheap) = a_window_of_short_holds("held-quiet", false);
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.fuel_exhausted, stats.traps, stats.instantiations),
+        (0, 0, 1),
+        "a hold fails nothing: {stats:?}"
+    );
+    assert!(
+        stats.unread >= 1,
+        "the first held score's sample was slow by time nothing read: {stats:?}"
+    );
+    if cheap {
+        assert_eq!(
+            stats.breaker_opens, 0,
+            "one slow sample, the first: the sixty-three after it were read: {stats:?}"
+        );
+    } else {
+        excused(
+            "a window of holds short of late on a thread nothing armed",
+            "a decision's thread had a quarter of the budget on the CPU",
+        );
+    }
+}
+
+/// An arming at a decision's close lasts the ring's own length and no
+/// longer: the sample that armed the thread and the 127 after it, so the
+/// next sample no reading covers overwrites the first. A score the host
+/// holds for six tenths of the budget is short of late. At the first
+/// decision its sample is slow by time nothing read: counted, it arms the
+/// thread. At the 128th the thread is still armed: the hold is read and
+/// counts nothing. At the 129th the arm has fallen: the same hold is
+/// counted again, and arms again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_arming_at_a_close_lasts_the_rings_length_and_no_longer() {
+    let name = "held-a-ring-apart";
+    let runtime = runtime();
+    let mut held = spec(name, guest::record_guest(), mode::LOG_IN_SCORE);
+    // Every score's log line reaches the host's subscriber, where the case
+    // holds three of them.
+    held.log.per_second = 1_000;
+    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    let short = std::time::Duration::from_micros(u64::from(FRAME_MICROS)) * 6 / 10;
+    let unread_after = |seed: u64, held: bool| {
+        if held {
+            hold(name, short, 1);
+        }
+        let decision = engine.decide(
+            &timed(seed),
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+        plugin.stats().unread
+    };
+    assert_eq!(
+        unread_after(1, true),
+        1,
+        "the first hold is slow by time nothing read"
+    );
+    for seed in 2..=127 {
+        unread_after(seed, false);
+    }
+    assert_eq!(
+        unread_after(128, true),
+        1,
+        "the 128th decision is the last of the arming: its hold is read"
+    );
+    assert_eq!(
+        unread_after(129, true),
+        2,
+        "the 129th decision finds the arm fallen: its hold is counted again"
+    );
+}
+
+/// Where the host reads a thread's clock, no hold opens a neighbour's
+/// breaker either. A scorer the host holds inside its log line for seven
+/// tenths of the budget, short of late, in thirty-three of its first
+/// sixty-four decisions, in front of a scorer that spins. The first held
+/// score is a sample slow by time nothing read alone: it is counted with
+/// the unread calls and arms the thread, and the thirty-two after it are
+/// read, so the held scorer's window holds one slow sample and reads no
+/// slow median. Before that rule thirty-three of the sixty-four read slow
+/// and its own window opened it. A held decision leaves the spinner three
+/// tenths of the budget, a sample under half, so the spinner's first window
+/// reads no slow median either and its second opens it: the case decides
+/// until that opening. That the held scorer stays shut, and that the unread
+/// tally is the one arming, is asserted where no held decision's thread had
+/// the hold's own length on the CPU: the spinner behind a hold has what the
+/// hold left and two ticks, and a stop of the whole process that lands
+/// inside the case's own hold makes that sleep end on the CPU, where the
+/// time is the call's by any reading.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_scorer_held_short_of_late_through_half_a_window_before_a_spinner_stays_shut() {
+    const HELD: u32 = 33;
+    let name = "held-neighbour";
+    let runtime = runtime();
+    let mut held = spec(name, guest::record_guest(), mode::LOG_IN_SCORE);
+    // Every score's log line reaches the host's subscriber, where the case
+    // holds the first thirty-three.
+    held.log.per_second = 1_000;
+    let held = Plugin::load(&runtime, held).expect("the guest loads");
+    let spinner = load(
+        &runtime,
+        "spinner-behind",
+        guest::record_guest(),
+        mode::SPIN_IN_SCORE,
+    );
+    let scorer = |plugin: &Arc<Plugin>| Weighted {
+        scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+        weight: 1.0,
+    };
+    let engine = single_engine(Profile {
+        name: "held-first".into(),
+        filters: vec![],
+        scorers: vec![scorer(&held), scorer(&spinner)],
+        picker: Box::new(Best),
+    });
+    let candidates = pool(4);
+    let frame = std::time::Duration::from_micros(u64::from(FRAME_MICROS));
+    let short = frame * 7 / 10;
+    hold(name, short, HELD);
+    let (mut decisions, mut cheap) = (0, true);
+    while spinner.stats().breaker_opens == 0 {
+        decisions += 1;
+        assert!(
+            decisions <= 256,
+            "no opening in 256 decisions: {:?}",
+            spinner.stats()
+        );
+        let cpu = bound_clock();
+        let decision = engine.decide(
+            &timed(decisions),
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        if decisions <= u64::from(HELD) {
+            cheap &= bound_clock().saturating_sub(cpu) < short;
+        }
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "the fallbacks decide"
+        );
+    }
+    let (s, h) = (spinner.stats(), held.stats());
+    assert_eq!(
+        (s.traps, s.breaker_opens),
+        (0, 1),
+        "the spinner's breaker opened once, on no trap: {s:?}"
+    );
+    assert_eq!(h.traps, 0, "a hold traps nothing: {h:?}");
+    if cheap {
+        assert_eq!(
+            h.breaker_opens, 0,
+            "one slow sample, the first: the thirty-two after it were read, and no hold opens the held scorer: {h:?}"
+        );
+        // The arming holds for the ring's length, a hundred and twenty-eight
+        // decisions: within it nothing is counted again.
+        if decisions <= 128 {
+            assert_eq!(h.unread, 1, "one event, one count, at the arming: {h:?}");
+        }
+    } else {
+        excused(
+            "a scorer held through half a window before a spinner",
+            "a held decision's thread had the hold's own length on the CPU",
+        );
+    }
+    assert!(
+        h.unread >= 1,
+        "the first held score's sample was slow by time nothing read: {h:?}"
+    );
+}
+
+/// The ring's tail is its second-slowest sample, so two samples past the
+/// budget open a window. Under a budget that is no whole number of ticks a
+/// score the host holds past the budget and short of late (the budget in
+/// whole ticks) is no late call, and on a thread nothing armed its decision
+/// is sampled at the time the score took. The first such sample is slow by
+/// time nothing read alone: it is counted with the unread calls and arms
+/// the thread. The second held score is read, and its time is what its
+/// thread had. So a window of sixty-four with two held scores holds one
+/// slow sample and opens nothing; before that rule it held two, and opened.
+/// A hold the runner stretches to late arms the thread by the late call's
+/// own rule, and the counts are the same. That nothing ran out and the
+/// breaker stays shut is asserted where no decision's thread had half the
+/// budget on the CPU: a stop of the whole process that lands inside the
+/// case's own hold makes that sleep end on the CPU, the thread's clock
+/// moves by about the hold, and a held score that had its bound by that
+/// reading is ended as the plugin's own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn two_scores_held_past_a_small_budget_and_short_of_late_are_one_slow_sample() {
+    // No whole number of ticks: late is two ticks, and the hold is between
+    // the budget and late.
+    const BUDGET_MICROS: u32 = 1_500;
+    const HOLD_MICROS: u64 = 1_700;
+    let name = "held-twice";
+    let runtime = runtime();
+    let mut held = spec(name, guest::record_guest(), mode::LOG_IN_SCORE);
+    // Every score's log line reaches the host's subscriber, where the case
+    // holds the first two.
+    held.log.per_second = 1_000;
+    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    hold(name, std::time::Duration::from_micros(HOLD_MICROS), 2);
+    let half = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
+    let mut cheap = true;
+    for seed in 1..=64 {
+        let cpu = bound_clock();
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: BUDGET_MICROS,
+                ..facts(seed)
+            },
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        cheap &= bound_clock().saturating_sub(cpu) < half;
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+    }
+    let stats = plugin.stats();
+    assert_eq!(stats.traps, 0, "a hold traps nothing: {stats:?}");
+    assert!(
+        stats.unread >= 1,
+        "the first held score's sample was slow by time nothing read: {stats:?}"
+    );
+    if cheap {
+        assert_eq!(
+            (stats.fuel_exhausted, stats.instantiations),
+            (0, 1),
+            "a hold fails nothing: {stats:?}"
+        );
+        assert_eq!(
+            stats.breaker_opens, 0,
+            "two held scores are one slow sample: the second was read: {stats:?}"
+        );
+    } else {
+        excused(
+            "two scores held past a small budget",
+            "a decision's thread had half the budget on the CPU",
+        );
+    }
+}
+
+/// What holds a guest slow in what its fuel does not price is its
+/// decisions' samples. A filter long on the CPU for milliseconds, cheap in
+/// fuel, answers; the score then fills without end and its bound ends it
+/// under what the filter left, every decision. Behind a call that long no
+/// run-out need be the plugin's own by readings (a thread's clock reads
+/// short of its call by what the kernel does not bill it), so the failure
+/// rule, put out of reach here, may never count one. Each decision's sample
+/// is the whole budget all the same: the ring is read at the sixty-fourth
+/// decision, not before, and opens the breaker there. That opening is
+/// asserted where the case's witness says no decision's thread was off the
+/// CPU for half the budget: the time a filter is held leaves the score less,
+/// and a decision held that long samples under half.
+#[test]
+fn a_guest_slow_in_what_fuel_does_not_price_is_opened_by_its_samples_at_the_first_window() {
+    const BUDGET_MICROS: u32 = 20_000;
+    // The opening's line is read below: the subscriber is installed before
+    // the first decision.
+    said();
+    let runtime = runtime();
+    let mut slow = spec(
+        "brief-fill",
+        guest::record_guest(),
+        mode::FILL_BRIEFLY_THEN_FILL,
+    );
+    slow.fuel_per_micro = 20_000_000;
+    slow.budget_micros = BUDGET_MICROS;
+    slow.breaker = BreakerSpec {
+        failures: 1_000,
+        window_micros: 60_000_000,
+        cooldown_micros: 60_000_000,
+    };
+    let plugin = Plugin::load(&runtime, slow).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let hold = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
+    let mut on_the_cpu = true;
+    for seed in 1..=64 {
+        assert_eq!(
+            plugin.stats().breaker_opens,
+            0,
+            "decision {seed}: the ring is not read before the sixty-fourth"
+        );
+        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: BUDGET_MICROS,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        let off_the_cpu = wall
+            .elapsed()
+            .saturating_sub(bound_clock().saturating_sub(cpu));
+        on_the_cpu &= off_the_cpu < hold;
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "decision {seed}: the fallbacks decide"
+        );
+    }
+    let stats = plugin.stats();
+    assert_eq!(stats.traps, 0, "{stats:?}");
+    assert_eq!(
+        stats.budget_spent + stats.fuel_exhausted,
+        64,
+        "every decision's budget was spent, the budget's or the plugin's by what its thread's clock read: {stats:?}"
+    );
+    if on_the_cpu {
+        assert_eq!(
+            stats.breaker_opens, 1,
+            "no hold moved the run: the window opened at its first read: {stats:?}"
+        );
+        let lines = openings("brief-fill");
+        assert_eq!(lines.len(), 1, "one opening, one line: {lines:?}");
+        assert!(lines[0].contains("rule=\"latency\""), "{}", lines[0]);
+    } else {
+        excused(
+            "a guest slow in what fuel does not price",
+            "a decision's thread was off the CPU half the budget",
+        );
+    }
 }
 
 /// Reads `VmRSS` of this process, in KiB.
@@ -2027,13 +3275,152 @@ fn four() -> PoolFacts<'static> {
     }
 }
 
+/// Decides once, and says with the decision whether its thread kept the
+/// CPU: its time on the wall clock passed the thread's CPU time over it by
+/// less than a quarter of the budget.
+fn decide_on_the_cpu(decide: impl FnOnce() -> Decision) -> (Decision, bool) {
+    let hold = std::time::Duration::from_micros(u64::from(FRAME_MICROS) / 4);
+    let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+    let decision = decide();
+    let off_the_cpu = wall
+        .elapsed()
+        .saturating_sub(bound_clock().saturating_sub(cpu));
+    (decision, off_the_cpu < hold)
+}
+
+/// Decides until `plugin`'s breaker has opened; says how many decisions that
+/// took, and whether each of them kept its thread on the CPU (its time on
+/// the wall clock passed the thread's CPU time over it by less than a
+/// quarter of the budget). The latency window is sixty-four SAMPLES, and a
+/// decision that charged the plugin nothing writes none: a hold of the
+/// runner inside an earlier call can spend a ten-millisecond budget before
+/// the plugin's first call. So a case that waits for the window waits for
+/// what opens it, never for sixty-four decisions, and asserts its counts only
+/// where no hold can have moved them. A hold under a quarter of the budget
+/// leaves the plugin its call and a sample past half the budget. The
+/// plugins' counters do not say that much: a hold that leaves a call short
+/// of late is in neither where nothing read the call, and can spend what a
+/// later call needed. On a host with no thread clock the two clocks are one
+/// and the word is always yes. Red past 256 decisions.
+fn decide_until_open(plugin: &Plugin, decide: impl Fn(u64) -> Decision) -> (u64, bool) {
+    let (mut decisions, mut on_the_cpu) = (0, true);
+    while plugin.stats().breaker_opens == 0 {
+        decisions += 1;
+        assert!(
+            decisions <= 256,
+            "no opening in 256 decisions: {:?}",
+            plugin.stats()
+        );
+        let (decision, kept) = decide_on_the_cpu(|| decide(decisions));
+        on_the_cpu &= kept;
+        assert!(
+            matches!(decision, Decision::Pick(_)),
+            "the fallbacks decide"
+        );
+    }
+    (decisions, on_the_cpu)
+}
+
+/// A count a host can excuse says when it was excused: the one line of a
+/// run that does not assert it, with the word that failed (read under
+/// `--nocapture`), so a row of runs can say in how many the count was held.
+#[expect(
+    clippy::print_stdout,
+    reason = "a run that excuses a count reports it on stdout under --nocapture"
+)]
+fn excused(case: &str, why: &str) {
+    println!("{case}: a count is not asserted in this run: {why}");
+}
+
+/// A run its host put in another lawful world says so: the one line of a
+/// run that asserted that world's counts in place of the made one's, with
+/// what the case's witness read (under `--nocapture`), so a row of runs can
+/// say in how many the host made which world.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    clippy::print_stdout,
+    reason = "a run in another lawful world reports it on stdout under --nocapture"
+)]
+fn other_world(case: &str, what: &str) {
+    println!("{case}: this run asserted another lawful world: {what}");
+}
+
+/// What a run on a host with no thread clock says when a hold opened the
+/// honest neighbour's breaker. No thread arms there: a call's two ends are
+/// one, a held call is its plugin's time, and a window of holds short of
+/// late inside the neighbour's own calls opens it.
+const A_HOLD_OPENED_THE_NEIGHBOUR: &str =
+    "on a host with no thread clock a hold opened the honest neighbour's breaker";
+
+/// The honest neighbour's breaker after a window case. Where the host reads
+/// a thread's clock no hold opens it: a hold inside the neighbour's own
+/// call is a sample slow by time nothing read, the first arms its thread
+/// and the rest are read, so it is asserted shut in every run, hold or no
+/// hold. On a host with no thread clock it is asserted where the case's
+/// witness saw no hold (`quiet`), and a run a hold moved says when it
+/// opened ([`excused`]).
+fn the_neighbour_stays(case: &str, quiet: bool, neighbour: &Plugin) {
+    let stats = neighbour.stats();
+    if quiet || cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert_eq!(
+            stats.breaker_opens, 0,
+            "{case}: the honest neighbour stays: {stats:?}"
+        );
+    } else if stats.breaker_opens != 0 {
+        excused(case, A_HOLD_OPENED_THE_NEIGHBOUR);
+    }
+}
+
+/// Whether a run asserts a count a hold of the runner's own can move: every
+/// decision kept its thread on the CPU (`on_the_cpu`, the case's own
+/// witness) and no call was counted held on these plugins (`stalls`). Then
+/// no hold moved a route, and the route is the case's to assert; otherwise
+/// the run says so ([`excused`]). The unread count is not read here: it
+/// takes a plugin's own first slow sample of a window too, a spinner's in
+/// every run, and that arms its thread as a late call would. A hold that
+/// only makes a call at its bound late does no more, and a hold long enough
+/// to move a count is off the CPU a quarter of the budget.
+fn no_hold(case: &str, on_the_cpu: bool, plugins: &[&Plugin]) -> bool {
+    let held: u64 = plugins.iter().map(|plugin| plugin.stats().stalls).sum();
+    if !on_the_cpu {
+        excused(
+            case,
+            "a decision's thread was off the CPU a quarter of the budget",
+        );
+    } else if held != 0 {
+        excused(case, &format!("{held} held call(s) counted"));
+    }
+    on_the_cpu && held == 0
+}
+
+/// The clock a call's bound counts on this host, from an origin of its own:
+/// the thread's CPU time where the host has a thread clock, the wall clock
+/// elsewhere.
+fn bound_clock() -> std::time::Duration {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+        std::time::Duration::new(
+            u64::try_from(now.tv_sec).unwrap_or(0),
+            u32::try_from(now.tv_nsec).unwrap_or(0),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        ORIGIN.get_or_init(std::time::Instant::now).elapsed()
+    }
+}
+
 /// Case (a) of the shared budget, in both scope orders: an honest scorer and
 /// a scorer that spins, both with a frame of the whole budget. Neither
 /// order charges the spinner on the breaker's failure count: it never consumed
 /// the budget alone (the other's constructor spent first), so each decision
 /// is the decision's budget spent. Its stage samples score the remainder it
 /// took of the budget, the ring survives its rebuilds, and the window (64
-/// stage calls) opens its breaker; the honest scorer's never opens.
+/// samples) opens its breaker; the honest scorer's never opens. The case
+/// decides until that opening: a decision whose budget a hold of the runner
+/// spent before the spinner's constructor writes no sample.
 #[test]
 fn a_spinner_behind_an_honest_scorer_opens_its_breaker_at_the_window_in_either_order() {
     for spinner_first in [false, true] {
@@ -2067,34 +3454,45 @@ fn a_spinner_behind_an_honest_scorer_opens_its_breaker_at_the_window_in_either_o
         });
         let decide = |seed: u64| {
             engine.decide(
-                &facts(seed),
+                &timed(seed),
                 &four(),
                 &pool(4),
                 &Constraints::default(),
                 &mut Scratch::new(),
             )
         };
-        for seed in 1..=64 {
+        let (decisions, on_the_cpu) = decide_until_open(&spinner, decide);
+        let s = spinner.stats();
+        assert_eq!(
+            (s.traps, s.breaker_opens),
+            (0, 1),
+            "spinner first {spinner_first}: the spinner's breaker opened once, on no trap: {s:?}"
+        );
+        let quiet = no_hold(
+            "a spinner behind an honest scorer",
+            on_the_cpu,
+            &[&spinner, &honest],
+        );
+        if quiet {
+            assert_eq!(
+                s.answered, 64,
+                "spinner first {spinner_first}: the window opened at the spinner's 64th sample, one a decision that reached its constructor: {s:?}"
+            );
+            assert_eq!(
+                decisions, 64,
+                "spinner first {spinner_first}: no hold moved the run, so every decision reached the spinner"
+            );
+            assert_eq!(
+                s.fuel_exhausted, 0,
+                "spinner first {spinner_first}: the window opened the spinner's breaker, no charge: {s:?}"
+            );
             assert!(
-                matches!(decide(seed), Decision::Pick(_)),
-                "the fallbacks decide"
+                s.budget_spent >= 64,
+                "spinner first {spinner_first}: every decision was the budget spent: {s:?}"
             );
         }
-        let (s, h) = (spinner.stats(), honest.stats());
-        assert_eq!(
-            (s.fuel_exhausted, s.traps, s.breaker_opens),
-            (0, 0, 1),
-            "spinner first {spinner_first}: the window opened the spinner's breaker, no charge: {s:?}"
-        );
-        assert!(
-            s.budget_spent >= 64,
-            "spinner first {spinner_first}: every decision was the budget spent: {s:?}"
-        );
-        assert_eq!(
-            h.breaker_opens, 0,
-            "spinner first {spinner_first}: the honest scorer stays: {h:?}"
-        );
-        decide(65);
+        the_neighbour_stays("a spinner behind an honest scorer", quiet, &honest);
+        decide(decisions + 1);
         assert!(
             spinner.stats().bypassed >= 1,
             "spinner first {spinner_first}: open, the spinner is bypassed"
@@ -2346,6 +3744,33 @@ fn decide_on_a_cold_slot(
     );
 }
 
+/// An `init` its fuel does not end is ended at its bound on the wall clock.
+/// Nothing watches an `init` (a cold slot's is charged the time it took), so
+/// its deadline ends it: the arm every call takes on a host with no thread
+/// clock. The guest's `init` spins without end under a calibration that gives
+/// its frame of a hundred milliseconds the fuel of seconds: the load fails on
+/// the clock, no sooner than the frame and long before the fuel.
+#[test]
+fn an_init_its_fuel_does_not_end_is_ended_at_its_bound_on_the_wall_clock() {
+    // The clock's answer of two makes the guest's `init` spin.
+    let clock = Arc::new(AtomicU8::new(3));
+    let runtime = steered_runtime(&clock, std::time::Duration::ZERO);
+    let mut spins = spec("init-spins", guest::record_guest(), mode::LEAST_IN_FLIGHT);
+    spins.config.push(mode::INIT_ASKS_THE_CLOCK);
+    spins.fuel_per_micro = 100_000;
+    let started = std::time::Instant::now();
+    let err = Plugin::load(&runtime, spins).expect_err("the init was ended");
+    let took = started.elapsed();
+    assert!(
+        matches!(&err, LoadError::Trap { reason, .. } if reason.contains("interrupt")),
+        "ended on the clock, not on its fuel: {err}"
+    );
+    assert!(
+        took >= std::time::Duration::from_millis(100) && took < std::time::Duration::from_secs(2),
+        "at its frame of a hundred milliseconds on the wall clock: {took:?}"
+    );
+}
+
 /// A cold slot's `init` that is long on the clock and cheap in fuel: one host
 /// call the host takes 20 ms to answer, under a 10 ms decision. The budget is
 /// wall time for `init` as for a call, so the decision's budget is spent: the
@@ -2533,14 +3958,24 @@ fn a_kept_lazy_init_is_charged_the_larger_of_its_terms_not_their_sum() {
     );
 }
 
-/// The lazy init's charge is the plugin's latency sample of its decision,
-/// however the init ends: 3 ms on every cold slot under a 4 ms budget is past
-/// half of it, so the window of sixty-four reads slow at its first evaluation
-/// and opens the breaker, over inits that keep their instance and over inits
-/// that refuse (a threshold of a hundred failures keeps their count out of
-/// it).
+/// A lazy init's time is part of its decision's latency sample, however the
+/// init ends, at its two ends like a call's. This `init` waits 3 ms on a
+/// host call on every cold slot, under a 4 ms budget: nothing watches an
+/// `init`, so on a thread nothing armed its sample is the time it took,
+/// past half the budget, and its low end is its fuel, nowhere near it. The
+/// first is slow by time nothing read alone: counted with the unread calls,
+/// it arms the thread, and the thread's clock is read around the sixty-three
+/// after it, whose time is what the thread had. The window of sixty-four
+/// holds one slow sample and opens nothing, over inits that keep their
+/// instance and over inits that refuse (a threshold of a hundred failures
+/// keeps their count out of it). Before that rule a wait the host serves
+/// was the plugin's sixty-four times, and the window opened. That it stays
+/// shut is asserted where no cold decision's thread had half the budget on
+/// the CPU: an `init` that long by a reading is slow by it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_lazy_init_long_on_the_clock_is_sampled_however_it_ends() {
+fn a_lazy_init_the_host_holds_on_every_cold_slot_is_one_slow_sample_however_it_ends() {
+    const BUDGET_MICROS: u32 = 4_000;
     for steer in [1, 2] {
         let (clock, _runtime, plugin) = plugin_whose_init_asks(3, |row| {
             row.breaker = BreakerSpec {
@@ -2549,12 +3984,15 @@ fn a_lazy_init_long_on_the_clock_is_sampled_however_it_ends() {
             };
         });
         let engine = plugin_engine(&plugin);
-        let decide_cold = |seed: u64| {
+        let half = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
+        let mut cheap = true;
+        for seed in 1..=64 {
             plugin.forget_instance();
             clock.store(steer, Ordering::Relaxed);
+            let cpu = bound_clock();
             let decision = engine.decide(
                 &RequestFacts {
-                    budget_micros: 4_000,
+                    budget_micros: BUDGET_MICROS,
                     ..facts(seed)
                 },
                 &four(),
@@ -2562,46 +4000,266 @@ fn a_lazy_init_long_on_the_clock_is_sampled_however_it_ends() {
                 &Constraints::default(),
                 &mut Scratch::new(),
             );
+            cheap &= bound_clock().saturating_sub(cpu) < half;
             clock.store(0, Ordering::Relaxed);
             assert!(matches!(decision, Decision::Pick(_)), "steer {steer}");
-        };
-        for seed in 1..=63 {
-            decide_cold(seed);
         }
-        assert_eq!(
-            plugin.stats().breaker_opens,
-            0,
-            "steer {steer}: sixty-three decisions are one sample short of the window: {:?}",
-            plugin.stats()
-        );
-        decide_cold(64);
         let s = plugin.stats();
+        assert!(
+            s.unread >= 1,
+            "steer {steer}: the first held init's sample was slow by time nothing read: {s:?}"
+        );
+        if cheap {
+            assert_eq!(
+                s.breaker_opens, 0,
+                "steer {steer}: one slow sample, the first: the inits after it were read: {s:?}"
+            );
+        } else {
+            excused(
+                "a lazy init the host holds on every cold slot",
+                "a cold decision's thread had half the budget on the CPU",
+            );
+        }
+    }
+}
+
+/// The second half of that rule alone: on an armed thread an `init` is read
+/// like a call. A score the host holds past its frame is late and unread,
+/// and it arms the thread by the late call's own rule, whatever a sample
+/// says. Each of the sixty-three cold slots after it waits 3 ms on a host
+/// call in `init`, under a 4 ms budget: the thread's clock is read around
+/// each, its time is what the thread had, and none is a slow sample. The
+/// window of sixty-four opens nothing and the unread tally stays at the one
+/// late call. Without the reading each is sampled at the time it took, past
+/// half the budget, and the window opens at its first read. That it stays
+/// shut is asserted where no cold decision's thread had half the budget on
+/// the CPU: an `init` that long by a reading is slow by it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_held_init_on_a_thread_a_late_call_armed_is_no_slow_sample() {
+    const BUDGET_MICROS: u32 = 4_000;
+    let name = "init-asks-armed";
+    let clock = Arc::new(AtomicU8::new(0));
+    let runtime = steered_runtime(&clock, std::time::Duration::from_millis(3));
+    let mut row = spec(name, guest::record_guest(), mode::LOG_IN_SCORE);
+    row.config.push(mode::INIT_ASKS_THE_CLOCK);
+    // The held score's log line reaches the host's subscriber.
+    row.log.per_second = 1_000;
+    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    let engine = plugin_engine(&plugin);
+    let candidates = pool(4);
+    // The first decision, on the warm slot: its score is held for three
+    // frames, late, with no reading of its start.
+    hold(
+        name,
+        3 * std::time::Duration::from_micros(u64::from(FRAME_MICROS)),
+        1,
+    );
+    let decision = decide(&engine, &candidates, 0);
+    assert!(matches!(decision, Decision::Pick(_)), "the held decision");
+    assert_eq!(
+        plugin.stats().unread,
+        1,
+        "the late score was unread, and it armed the thread: {:?}",
+        plugin.stats()
+    );
+    let half = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
+    let mut cheap = true;
+    for seed in 1..=63 {
+        plugin.forget_instance();
+        clock.store(1, Ordering::Relaxed);
+        let cpu = bound_clock();
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: BUDGET_MICROS,
+                ..facts(seed)
+            },
+            &four(),
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        cheap &= bound_clock().saturating_sub(cpu) < half;
+        clock.store(0, Ordering::Relaxed);
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+    }
+    let s = plugin.stats();
+    if cheap {
         assert_eq!(
-            s.breaker_opens, 1,
-            "steer {steer}: the sixty-fourth sample reads the window slow: {s:?}"
+            s.unread, 1,
+            "the held inits were read: nothing on an armed thread is counted again: {s:?}"
+        );
+        assert_eq!(
+            s.breaker_opens, 0,
+            "no held init was a slow sample: the window of sixty-four opens nothing: {s:?}"
+        );
+    } else {
+        excused(
+            "a held init on a thread a late call armed",
+            "a cold decision's thread had half the budget on the CPU",
         );
     }
 }
 
-/// A cold slot's `init` the remainder clamps, long on the clock as well: a
-/// 200 us decision whose `init` waits 2 ms for the host and is then ended by
-/// its clamp, the burn out of fuel or the wall bound's tick, whichever is
-/// first (both are the clamp's, and the sample is the clock either way).
-/// The draw is the whole remainder; the plugin's sample is the larger of
-/// that and the charge of the rule, here the clock. Two such decisions in a
-/// window of sixty-four are its second-slowest sample past the budget, which
-/// is slow. Sampled at the remainder alone they would read at the budget,
-/// never past it.
+/// The other side: an `init` slow by its own fuel. At a calibration that
+/// prices this guest's `init` at three quarters of the decision's budget
+/// every cold slot's sample is past half the budget at both its ends: no
+/// time nothing read made it slow, so it arms nothing, and a reading (where
+/// a hold of the runner's armed the thread) says no less than its fuel. The
+/// window of sixty-four reads slow at its first evaluation and opens the
+/// breaker, as before.
 #[test]
-fn a_clamped_init_long_on_the_clock_is_sampled_by_its_clock() {
+fn a_lazy_init_slow_by_its_own_fuel_on_every_cold_slot_opens_the_window() {
+    const CALIBRATION: u64 = 10;
+    let runtime = runtime();
+    let mut row = spec("init-burns", guest::record_guest(), mode::BURN_IN_INIT);
+    row.fuel_per_micro = CALIBRATION;
+    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    // The load ran `init` once: its fuel at the calibration, the same every
+    // time.
+    let init_micros = u32::try_from(plugin.stats().fuel_used.div_ceil(CALIBRATION)).expect("fits");
+    let engine = plugin_engine(&plugin);
+    let decide_cold = |seed: u64| {
+        plugin.forget_instance();
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: init_micros / 3 * 4,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+    };
+    for seed in 1..=63 {
+        decide_cold(seed);
+    }
+    assert_eq!(
+        plugin.stats().breaker_opens,
+        0,
+        "sixty-three decisions are one sample short of the window: {:?}",
+        plugin.stats()
+    );
+    decide_cold(64);
+    let s = plugin.stats();
+    assert_eq!(
+        s.breaker_opens, 1,
+        "the sixty-fourth sample reads the window slow, by its fuel: {s:?}"
+    );
+}
+
+/// A sample slow by time nothing read is in its window as it is: the rule
+/// keeps a second one out, it excuses none. This `init` burns the same fuel
+/// on every cold slot, and a decision's budget sets what share of it that
+/// is. The first decision's `init` also waits on a host call past half its
+/// budget, with its fuel a third of it: slow at its high end alone, the
+/// sample is counted with the unread calls and arms the thread. Thirty-two
+/// decisions follow whose `init` is three quarters of the budget by its
+/// fuel, then thirty-one where it is a quarter. The window of sixty-four
+/// holds thirty-three slow samples and the held one is its median: it
+/// reads slow, and the breaker opens at the sixty-fourth. Taken at its low
+/// end the held sample would leave thirty-two, and the window would open
+/// nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_sample_slow_by_time_nothing_read_is_in_its_window_as_it_is() {
+    const CALIBRATION: u64 = 30;
+    const WAIT_MICROS: u32 = 60_000;
     let clock = Arc::new(AtomicU8::new(0));
-    let runtime = steered_runtime(&clock, std::time::Duration::from_millis(2));
+    let runtime = steered_runtime(
+        &clock,
+        std::time::Duration::from_micros(u64::from(WAIT_MICROS)),
+    );
+    let mut row = spec("init-burns-held", guest::record_guest(), mode::BURN_IN_INIT);
+    row.config.push(mode::INIT_ASKS_THE_CLOCK);
+    row.fuel_per_micro = CALIBRATION;
+    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    // The load ran `init` once, with no wait: its fuel at the calibration,
+    // the same every time.
+    let init_micros = u32::try_from(plugin.stats().fuel_used.div_ceil(CALIBRATION)).expect("fits");
+    assert!(
+        init_micros / 2 * 3 < WAIT_MICROS,
+        "the wait is past half a budget of three such inits: {init_micros}"
+    );
+    let engine = plugin_engine(&plugin);
+    let decide_cold = |seed: u64, steer: u8, budget_micros: u32| {
+        plugin.forget_instance();
+        clock.store(steer, Ordering::Relaxed);
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros,
+                ..facts(seed)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        clock.store(0, Ordering::Relaxed);
+        assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+    };
+    // Held: the wait is past half the budget, the fuel a third of it.
+    decide_cold(1, 1, init_micros * 3);
+    assert_eq!(
+        plugin.stats().unread,
+        1,
+        "the held init's sample was slow by time nothing read: {:?}",
+        plugin.stats()
+    );
+    // Slow by fuel: three quarters of the budget at both ends.
+    for seed in 2..=33 {
+        decide_cold(seed, 0, init_micros / 3 * 4);
+    }
+    // A quarter of the budget.
+    for seed in 34..=63 {
+        decide_cold(seed, 0, init_micros * 4);
+    }
+    assert_eq!(
+        plugin.stats().breaker_opens,
+        0,
+        "sixty-three decisions are one sample short of the window: {:?}",
+        plugin.stats()
+    );
+    decide_cold(64, 0, init_micros * 4);
+    let s = plugin.stats();
+    assert_eq!(
+        (s.unread, s.breaker_opens),
+        (1, 1),
+        "thirty-three slow samples, the held one as it is: the median reads slow: {s:?}"
+    );
+}
+
+/// A cold slot's `init` the remainder clamps, held by the host as well: a
+/// 2 ms decision whose `init` waits 4 ms for the host, so the wall bound's
+/// tick ends it under its clamp when the wait returns. The draw is the
+/// whole remainder; the plugin's sample is the time of this `init` as of
+/// any other, at its two ends. On a thread nothing armed that is its clock,
+/// twice the budget, over a fuel nowhere near it: slow by time nothing read
+/// alone, it is counted with the unread calls and arms the thread. The
+/// second such `init` is read, and its time is what its thread had, a
+/// fraction of the budget: the wait is the host's. So two such decisions in
+/// a window of sixty-four are one sample past the budget, and the ring's
+/// tail, its second-slowest sample, opens nothing; before that rule they
+/// were two, and it opened. The close's rebuild waits as long and is no
+/// sample. That the breaker stays shut is asserted where neither cold
+/// decision's thread had the budget on the CPU.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn two_clamped_inits_the_host_holds_are_one_slow_sample() {
+    const BUDGET_MICROS: u32 = 2_000;
+    let clock = Arc::new(AtomicU8::new(0));
+    let runtime = steered_runtime(&clock, std::time::Duration::from_millis(4));
     let mut heavy = spec(
-        "clamped-and-slow",
+        "clamped-and-held",
         guest::record_guest(),
         mode::BURN_IN_INIT,
     );
     heavy.config.push(mode::INIT_ASKS_THE_CLOCK);
+    // A tenth of the default calibration: in fuel the init's burn outlasts
+    // the 2 ms budget, so the remainder clamps it.
+    heavy.fuel_per_micro = 100;
     let plugin = Plugin::load(&runtime, heavy).expect("the guest loads");
     let engine = plugin_engine(&plugin);
     let decide = |seed: u64, budget_micros: u32| {
@@ -2618,11 +4276,15 @@ fn a_clamped_init_long_on_the_clock_is_sampled_by_its_clock() {
         assert!(matches!(decision, Decision::Pick(_)), "seed {seed}");
     };
     // Two cold decisions under a budget the init's burn outlasts; the clock
-    // takes 2 ms to answer each init, the clamped one and the close's rebuild.
+    // takes 4 ms to answer each init, the clamped one and the close's rebuild.
     clock.store(1, Ordering::Relaxed);
+    let budget = std::time::Duration::from_micros(u64::from(BUDGET_MICROS));
+    let mut cheap = true;
     for seed in 1..=2 {
         plugin.forget_instance();
-        decide(seed, 200);
+        let cpu = bound_clock();
+        decide(seed, BUDGET_MICROS);
+        cheap &= bound_clock().saturating_sub(cpu) < budget;
     }
     clock.store(0, Ordering::Relaxed);
     let s = plugin.stats();
@@ -2631,15 +4293,26 @@ fn a_clamped_init_long_on_the_clock_is_sampled_by_its_clock() {
         (2, 2, 0),
         "two clamped inits, each rebuilt at its close: {s:?}"
     );
+    assert!(
+        s.unread >= 1,
+        "the first clamped init's sample was slow by time nothing read: {s:?}"
+    );
     // Sixty-two honest decisions on the warm slot fill the window.
     for seed in 3..=64 {
         decide(seed, FRAME_MICROS);
     }
     let s = plugin.stats();
-    assert_eq!(
-        s.breaker_opens, 1,
-        "the two clamped inits are the window's tail, past the budget by their clock: {s:?}"
-    );
+    if cheap {
+        assert_eq!(
+            s.breaker_opens, 0,
+            "one sample past the budget, the first: the second init was read: {s:?}"
+        );
+    } else {
+        excused(
+            "two clamped inits the host holds",
+            "a cold decision's thread had the budget on the CPU",
+        );
+    }
 }
 
 /// A clock the test steers for a few asks: while `asks` is above zero an ask
@@ -2651,7 +4324,7 @@ fn runtime_steered_for(steer: &Arc<AtomicU8>, asks: &Arc<AtomicU8>) -> Arc<Runti
     Arc::new(
         Runtime::with_clock(move || {
             let armed = asks
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok();
             match steer.load(Ordering::Relaxed) {
                 value if armed && value != 0 => u64::from(value - 1),
@@ -2926,20 +4599,23 @@ fn an_observe_fault_leaves_no_mark_for_a_decision_that_never_touched_the_slot() 
 }
 
 /// A destructor that fills its memory without end: little fuel per fill, so
-/// its fuel frame never ends it. Its wall bound is its own, in milliseconds,
-/// not the decision's frame: a decision at a 100 ms budget is not stretched
-/// by one; the run-out drops the instance and the close rebuilds it.
+/// its fuel frame never ends it. Its bound on the clock is its own, in
+/// milliseconds, not the decision's frame: a decision at a 100 ms budget is
+/// not stretched by one; the run-out drops the instance and the close
+/// rebuilds it. A destructor is a watched call: its bound counts the time
+/// its thread had the CPU, so the case reads the clock the bound counts.
 #[test]
-fn a_destructors_wall_bound_is_its_own_not_the_decisions_frame() {
+fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
     let runtime = runtime();
     let mut filler = spec("fill-dtor", guest::record_guest(), mode::FILL_IN_DESTRUCTOR);
     // The frame is the request's 100 ms, and the calibration makes the
-    // destructor's fuel frame outlast it: only a wall bound ends the fill.
+    // destructor's fuel frame outlast it: only its bound on the clock ends
+    // the fill.
     filler.budget_micros = 0;
     filler.fuel_per_micro = 100_000_000;
     let plugin = Plugin::load(&runtime, filler).expect("the guest loads");
     let engine = plugin_engine(&plugin);
-    let started = std::time::Instant::now();
+    let started = bound_clock();
     let decision = engine.decide(
         &RequestFacts {
             budget_micros: 100_000,
@@ -2950,11 +4626,11 @@ fn a_destructors_wall_bound_is_its_own_not_the_decisions_frame() {
         &Constraints::default(),
         &mut Scratch::new(),
     );
-    let elapsed = started.elapsed();
+    let had = bound_clock().saturating_sub(started);
     assert!(matches!(decision, Decision::Pick(_)), "the decision stands");
     assert!(
-        elapsed < std::time::Duration::from_millis(30),
-        "the destructor's wall bound is its own, not the 100 ms frame: {elapsed:?}"
+        had < std::time::Duration::from_millis(30),
+        "the destructor's bound is its own, not the 100 ms frame: {had:?} on the clock it counts"
     );
     let s = plugin.stats();
     assert_eq!(
@@ -3077,7 +4753,7 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged() {
 /// grant (the whole remainder behind an honest scorer) in a fraction of the
 /// budget's wall: sampled by the clock it never reads slow and spends the
 /// decision's budget forever; sampled by its charge, the remainder it took,
-/// the window opens its breaker.
+/// the window opens its breaker. The case decides until it does.
 #[test]
 fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     let runtime = runtime();
@@ -3100,38 +4776,51 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
         scorers: vec![scorer(&honest), scorer(&spinner)],
         picker: Box::new(Best),
     });
-    let started = std::time::Instant::now();
-    for seed in 1..=64 {
-        let decision = engine.decide(
-            &facts(seed),
+    let started = bound_clock();
+    let (decisions, on_the_cpu) = decide_until_open(&spinner, |seed| {
+        engine.decide(
+            &timed(seed),
             &four(),
             &pool(4),
             &Constraints::default(),
             &mut Scratch::new(),
-        );
-        assert!(
-            matches!(decision, Decision::Pick(_)),
-            "the fallbacks decide"
-        );
-    }
-    let wall = started.elapsed();
+        )
+    });
+    let had = bound_clock().saturating_sub(started);
     let s = spinner.stats();
     assert_eq!(
-        (s.fuel_exhausted, s.traps, s.breaker_opens),
-        (0, 0, 1),
-        "the spinner's charge, the remainder, opened its breaker at the window: {s:?}"
+        (s.traps, s.breaker_opens),
+        (0, 1),
+        "the spinner's breaker opened once, on no trap: {s:?}"
     );
+    let quiet = no_hold("a fuel-fast spinner", on_the_cpu, &[&spinner, &honest]);
+    if quiet {
+        assert_eq!(
+            s.answered, 64,
+            "the window opened at the spinner's 64th sample, one a decision that reached its constructor: {s:?}"
+        );
+        assert_eq!(
+            decisions, 64,
+            "no hold moved the run, so every decision reached the spinner"
+        );
+        assert_eq!(
+            s.fuel_exhausted, 0,
+            "the spinner's charge, the remainder, opened its breaker at the window: {s:?}"
+        );
+        assert!(
+            s.budget_spent >= 64,
+            "every decision was the budget spent: {s:?}"
+        );
+    }
+    the_neighbour_stays("a fuel-fast spinner", quiet, &honest);
+    // A decision that ran to its bound would have had its whole budget of
+    // this thread's CPU: the spinner's fuel ran out long before, in under
+    // five eighths of it a decision. Read on the clock the bound counts: a
+    // hold of the runner adds to the wall clock, never to this one.
     assert!(
-        s.budget_spent >= 64,
-        "every decision was the budget spent: {s:?}"
+        had < std::time::Duration::from_micros(decisions * u64::from(FRAME_MICROS) * 5 / 8),
+        "the fuel ended the calls early, not their bound: {had:?} over {decisions} decisions"
     );
-    // Sixty-four decisions at a 10 ms budget would be 640 ms on the clock:
-    // the spinner's fuel ran out long before its wall.
-    assert!(
-        wall < std::time::Duration::from_millis(400),
-        "the fuel ended the calls early, not the wall: {wall:?}"
-    );
-    assert_eq!(honest.stats().breaker_opens, 0, "the honest scorer stays");
 }
 
 /// A plugin that spins in its constructor, behind another plugin's
@@ -3140,6 +4829,9 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
 /// no stage sample: the call the remainder ended is sampled all the same, so
 /// its one sample per decision opens the breaker at the window. Its scope
 /// first, the constructor had its whole frame and the failure count opens it.
+/// Behind the honest constructor the case decides until the opening: a
+/// decision whose budget a hold of the runner spent inside the honest call
+/// leaves the spinner no sample, or one under half the budget.
 #[test]
 fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_order() {
     for spinner_first in [false, true] {
@@ -3173,45 +4865,69 @@ fn a_constructor_spinner_behind_another_constructor_opens_its_breaker_in_either_
         });
         let decide = |seed: u64| {
             engine.decide(
-                &facts(seed),
+                &timed(seed),
                 &four(),
                 &pool(4),
                 &Constraints::default(),
                 &mut Scratch::new(),
             )
         };
-        for seed in 1..=64 {
-            assert!(
-                matches!(decide(seed), Decision::Pick(_)),
-                "the fallbacks decide"
-            );
-        }
-        let (s, h) = (spinner.stats(), honest.stats());
+        let (decisions, on_the_cpu) = if spinner_first {
+            let mut on_the_cpu = true;
+            for seed in 1..=64 {
+                let (decision, kept) = decide_on_the_cpu(|| decide(seed));
+                on_the_cpu &= kept;
+                assert!(
+                    matches!(decision, Decision::Pick(_)),
+                    "the fallbacks decide"
+                );
+            }
+            (64, on_the_cpu)
+        } else {
+            decide_until_open(&spinner, decide)
+        };
+        let s = spinner.stats();
         assert!(
             s.breaker_opens >= 1,
             "spinner first {spinner_first}: the spinner's breaker opened: {s:?}"
         );
         if spinner_first {
-            assert!(
-                s.fuel_exhausted >= 5,
-                "its scope first, the constructor had its whole frame: charged: {s:?}"
+            // A budget a hold of the runner spent before the spinner's
+            // constructor is a budget hit, and the breaker counts it in a
+            // run-out's place: the floor is asserted where no hold moved
+            // the sixty-four decisions.
+            let quiet = no_hold(
+                "a constructor spinner, its scope first",
+                on_the_cpu,
+                &[&spinner, &honest],
             );
+            if quiet {
+                assert!(
+                    s.fuel_exhausted >= 5,
+                    "its scope first, the constructor had its whole frame: charged: {s:?}"
+                );
+            }
+            the_neighbour_stays("a constructor spinner, its scope first", quiet, &honest);
         } else {
-            assert_eq!(
-                (s.fuel_exhausted, s.traps),
-                (0, 0),
-                "behind the honest constructor, never charged: {s:?}"
-            );
-            assert!(
-                s.budget_spent >= 64,
-                "every decision was the budget spent: {s:?}"
-            );
+            assert_eq!(s.traps, 0, "behind the honest constructor, no trap: {s:?}");
+            let quiet = no_hold("a constructor spinner", on_the_cpu, &[&spinner, &honest]);
+            if quiet {
+                assert_eq!(
+                    decisions, 64,
+                    "no hold moved the run: the window opened at the sixty-fourth decision"
+                );
+                assert_eq!(
+                    s.fuel_exhausted, 0,
+                    "behind the honest constructor, never charged: {s:?}"
+                );
+                assert!(
+                    s.budget_spent >= 64,
+                    "every decision was the budget spent: {s:?}"
+                );
+            }
+            the_neighbour_stays("a constructor spinner", quiet, &honest);
         }
-        assert_eq!(
-            h.breaker_opens, 0,
-            "spinner first {spinner_first}: the honest plugin stays: {h:?}"
-        );
-        decide(65);
+        decide(decisions + 1);
         assert!(
             spinner.stats().bypassed >= 1,
             "spinner first {spinner_first}: open, the spinner is bypassed"
@@ -3301,7 +5017,7 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
 /// decision, the plugin's whole charge is the remainder's share and the
 /// window opens it, whichever scorer runs first. Behind an honest
 /// neighbour's spend the spinning pick is the decision's budget spent, never
-/// a charge.
+/// a charge. The case decides until the opening.
 #[test]
 fn a_third_stage_spinner_behind_its_own_cheap_stages_opens_at_the_window() {
     for spinner_first in [false, true] {
@@ -3338,33 +5054,37 @@ fn a_third_stage_spinner_behind_its_own_cheap_stages_opens_at_the_window() {
             scorers,
             picker: Box::new(WasmPicker::new(bound, None)),
         });
-        for seed in 1..=64 {
-            let decision = engine.decide(
-                &facts(seed),
+        let (decisions, on_the_cpu) = decide_until_open(&spinner, |seed| {
+            engine.decide(
+                &timed(seed),
                 &four(),
                 &pool(4),
                 &Constraints::default(),
                 &mut Scratch::new(),
+            )
+        });
+        let s = spinner.stats();
+        assert_eq!(
+            (s.traps, s.breaker_opens),
+            (0, 1),
+            "spinner first {spinner_first}: the spinner's breaker opened once, on no trap: {s:?}"
+        );
+        let quiet = no_hold("a third-stage spinner", on_the_cpu, &[&spinner, &honest]);
+        if quiet {
+            assert_eq!(
+                decisions, 64,
+                "spinner first {spinner_first}: no hold moved the run: the window opened at the sixty-fourth decision"
+            );
+            assert_eq!(
+                s.fuel_exhausted, 0,
+                "spinner first {spinner_first}: the spinning pick was the budget spent and the window opened it: {s:?}"
             );
             assert!(
-                matches!(decision, Decision::Pick(_)),
-                "the fallback picker decides"
+                s.budget_spent >= 64,
+                "spinner first {spinner_first}: every decision was the budget spent: {s:?}"
             );
         }
-        let (s, h) = (spinner.stats(), honest.stats());
-        assert_eq!(
-            (s.fuel_exhausted, s.traps, s.breaker_opens),
-            (0, 0, 1),
-            "spinner first {spinner_first}: the spinning pick was the budget spent and the window opened it: {s:?}"
-        );
-        assert!(
-            s.budget_spent >= 64,
-            "spinner first {spinner_first}: every decision was the budget spent: {s:?}"
-        );
-        assert_eq!(
-            h.breaker_opens, 0,
-            "spinner first {spinner_first}: the honest plugin stays: {h:?}"
-        );
+        the_neighbour_stays("a third-stage spinner", quiet, &honest);
     }
 }
 
@@ -3463,4 +5183,151 @@ fn a_decode_side_plugin_is_sampled_at_its_own_last_close() {
         "the decode plugin's own last close sampled its decision and the window opened it: {d:?}"
     );
     assert_eq!(p.breaker_opens, 0, "the prefill plugin stays: {p:?}");
+}
+
+/// A plugin's declared needs reach the profile's needs whichever stage it is
+/// bound as. A plugin that reads the affinity column as the filter alone, or
+/// as the picker alone, beside built-in stages that declare nothing, counts
+/// as a reader of it: a host that fills the column where it is declared
+/// leaves it empty only where nothing reads it.
+#[test]
+fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
+    let runtime = runtime();
+    let mut reading = spec("reader", guest::record_guest(), mode::LEAST_IN_FLIGHT);
+    reading.needs.affinity = true;
+    let plugin = Plugin::load(&runtime, reading).expect("the guest loads");
+    let scorers = || {
+        vec![Weighted {
+            scorer: Box::new(LeastRequests),
+            weight: 1.0,
+        }]
+    };
+    let as_filter = Profile {
+        name: "filter".into(),
+        filters: vec![Box::new(WasmFilter::new(plugin.bind(), None))],
+        scorers: scorers(),
+        picker: Box::new(Best),
+    };
+    let as_picker = Profile {
+        name: "picker".into(),
+        filters: vec![Box::new(Healthy)],
+        scorers: scorers(),
+        picker: Box::new(WasmPicker::new(plugin.bind(), None)),
+    };
+    assert!(as_filter.needs().affinity, "the plugin as the filter alone");
+    assert!(as_picker.needs().affinity, "the plugin as the picker alone");
+}
+
+/// A fallback answers when its plugin fails, so what it reads counts as
+/// what the plugin reads does: a plugin that declares nothing, bound over a
+/// fallback that reads the affinity column, is a reader of it. Each of the
+/// three adapters hands its own fallback's needs on, so the same reader is
+/// asked behind the filter, behind a scorer and behind the picker.
+#[test]
+fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
+    use smg_policy_controller::{Filter, Picker, Scorer, Targets, TieBand};
+
+    #[derive(Debug)]
+    struct ColumnReader;
+
+    fn reads_the_column() -> Needs {
+        Needs {
+            affinity: true,
+            ..Needs::default()
+        }
+    }
+
+    impl Lifecycle for ColumnReader {}
+
+    impl Filter for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    impl Scorer for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    impl Picker for ColumnReader {
+        fn name(&self) -> &'static str {
+            "column-reader"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Best.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn needs(&self) -> Needs {
+            reads_the_column()
+        }
+    }
+
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "plain",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    // The plugin declares nothing: alone, no adapter reads the column.
+    let alone: [(&str, Needs); 3] = [
+        ("the filter", WasmFilter::new(plugin.bind(), None).needs()),
+        ("a scorer", WasmScorer::new(plugin.bind(), None).needs()),
+        ("the picker", WasmPicker::new(plugin.bind(), None).needs()),
+    ];
+    // Over the reader, each adapter declares its fallback's needs.
+    let over: [(&str, Needs); 3] = [
+        (
+            "the filter",
+            WasmFilter::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+        (
+            "a scorer",
+            WasmScorer::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+        (
+            "the picker",
+            WasmPicker::new(plugin.bind(), Some(Box::new(ColumnReader))).needs(),
+        ),
+    ];
+    for (bound_as, needs) in alone {
+        assert!(!needs.affinity, "the plugin alone, bound as {bound_as}");
+    }
+    for (bound_as, needs) in over {
+        assert!(needs.affinity, "the fallback's needs, bound as {bound_as}");
+    }
 }

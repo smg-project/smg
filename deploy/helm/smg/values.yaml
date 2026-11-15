@@ -412,11 +412,15 @@ router:
 policyController:
   enabled: false
 
-  # -- The controller's image. No image is published yet, so repository and
-  #    tag have no default, and a release that turns the controller on
-  #    without them is refused at render. registry "" takes
-  #    global.image.registry; the pull policy and the pull secrets are the
-  #    global ones.
+  # -- The controller's image. Each part left empty is the router's: registry
+  #    "" takes global.image.registry, repository "" takes
+  #    global.image.repository, and tag "" takes the router's tag with
+  #    -policy-controller appended, the tag a release publishes the
+  #    controller under (a release publishes one controller image, so the
+  #    router's -slurm suffix is cut first). A repository of your own needs
+  #    its tag, and so does a router image named by a digest or by a release
+  #    older than the first with a controller image. The pull policy and
+  #    the pull secrets are the global ones.
   image:
     registry: ""
     repository: ""
@@ -484,8 +488,9 @@ policyController:
     enabled: false
     minAvailable: 1
 
-  # -- Security context of the controller container: the router's. Your image
-  #    runs as UID 65532 under it; for an image built with another user set
+  # -- Security context of the controller container: the router's. The image
+  #    built from docker/policy-controller.Dockerfile runs as UID 65532 and
+  #    names it by number; for an image built with another user set
   #    runAsUser as for the router. The controller writes no file, so the
   #    read-only root filesystem needs no volume. With the controller on the
   #    schema refuses a null here: to run with none, set each member to null.

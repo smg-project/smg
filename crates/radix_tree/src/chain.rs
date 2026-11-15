@@ -1231,8 +1231,8 @@ impl RadixTree {
             }
             // start/end lineage coherence.
             let mut l = cd.start_lineage;
-            for i in 1..cd.contents.len() {
-                l = lineage_step(l, cd.contents[i]);
+            for &content in cd.contents.iter().skip(1) {
+                l = lineage_step(l, content);
             }
             if l != cd.end_lineage {
                 return Err(format!("chain {ci} end_lineage stale"));

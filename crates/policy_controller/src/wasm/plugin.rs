@@ -16,21 +16,22 @@ use std::{
 use thread_local::ThreadLocal;
 use wasmtime::{
     component::{Component, HasSelf, Linker, ResourceAny},
-    Config, Engine, OptLevel, Store, StoreLimitsBuilder, Trap,
+    Config, Engine, OptLevel, Store, StoreLimitsBuilder, Trap, UpdateDeadline,
 };
 
 use super::{
-    bindings::{packed, record, wit, HostState, LogGate},
-    breaker::{Breaker, Latency},
+    bindings::{packed, record, wit, HostState, LogGate, Watch},
     config::{Abi, Exposure, Failure, FrameBudget, PluginSpec},
-    counters::Counters,
-    intern,
     view::{self as marshal, Packed, Records, TooLong},
 };
 use crate::{
     decision::{Decision, Target, MAX_TARGETS},
     framework::{self, DecisionScope},
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+    plugins::{
+        breaker::{Breaker, Latency},
+        intern, BoundPlugin, Counters, Fallback,
+    },
     spec::Needs,
     view::{Candidate, Phase, PoolFacts, RequestFacts},
     Draw,
@@ -48,15 +49,229 @@ const OBSERVE_FRAME_MICROS: u32 = 1_000;
 /// The most elements one table of an instance may hold: a policy's tables
 /// are its indirect calls and its handles, hundreds at most.
 const TABLE_ELEMENTS: usize = 1 << 16;
-/// The epoch ticker's period: the wall bound of a call is its frame rounded
-/// up to whole ticks, plus the tick in flight. Fuel is the fine bound (one
-/// unit per operator); the tick catches what fuel does not price, a bulk
-/// memory operation over the whole cap costing one unit.
+/// The epoch ticker's period. A tick that finds a guest call in flight reads
+/// its thread's CPU clock ([`tick`]): a call's bound on the clock counts the
+/// time its thread had the CPU, and the call ends at the first tick that
+/// finds it has had the bound. Fuel is the fine bound (one unit per
+/// operator, a bulk memory operation by its size once it has run); the
+/// ticks catch what the calibration underprices and the CPU a host call
+/// spends.
 const EPOCH_TICK_MICROS: u64 = 1_000;
 
-/// The epoch deadline of a call whose frame is `frame_micros`.
+/// A bound of `bound_micros` on the wall clock in whole ticks, rounded up:
+/// no deadline there ends a call sooner.
+fn whole_ticks(bound_micros: u64) -> u64 {
+    bound_micros.div_ceil(EPOCH_TICK_MICROS)
+}
+
+/// The epoch deadline of a call whose bound is `frame_micros` on the wall
+/// clock: the bound in whole ticks, plus the tick in flight.
 fn deadline_ticks(frame_micros: u32) -> u64 {
-    u64::from(frame_micros).div_ceil(EPOCH_TICK_MICROS) + 1
+    whole_ticks(u64::from(frame_micros)) + 1
+}
+
+/// The first epoch deadline of a call, in ticks from its start. A watched
+/// call with no reading of its start meets its next tick, which takes the
+/// reading its bound counts from. A call whose start was read meets the tick
+/// its deadline on the wall clock falls on and none before it, so that
+/// reading ends only a call that is late: no call the wall clock would let
+/// run is ended because its thread is armed. A call nothing watches (an
+/// `init`; a host with no thread clock) ends at that deadline.
+fn first_deadline(watched: bool, start_read: bool, bound_micros: u32) -> u64 {
+    if watched && !start_read {
+        1
+    } else {
+        deadline_ticks(bound_micros)
+    }
+}
+
+/// The calling thread's CPU time, in microseconds; `None` on a host with no
+/// thread clock, where a call's bound stays on the wall clock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn thread_cpu_micros() -> Option<u64> {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    let secs = u64::try_from(now.tv_sec).ok()?;
+    let nanos = u64::try_from(now.tv_nsec).ok()?;
+    Some(secs.saturating_mul(1_000_000).saturating_add(nanos / 1_000))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn thread_cpu_micros() -> Option<u64> {
+    None
+}
+
+/// One tick with a guest call in flight on its store, run on the call's own
+/// thread at the guest's next check. A watched call ends at the tick that
+/// finds it has had its bound on the CPU since a reading, and runs on
+/// otherwise, however late the wall clock says it is: the guest of a thread
+/// the host held finishes in its own microseconds when the thread has the
+/// CPU back. The reading is the call's start where the thread took one;
+/// otherwise the call's first tick takes it, and the bound counts from
+/// there. A first tick knows nothing of the time before it: it can end a
+/// call (a call that has its bound on the CPU after it), it never says a
+/// call was held. A call nothing watches ends here, on the wall clock.
+fn tick(watch: &mut Watch) -> wasmtime::Result<UpdateDeadline> {
+    let (true, Some(cpu)) = (watch.watched, thread_cpu_micros()) else {
+        return Err(Trap::Interrupt.into());
+    };
+    let since = match watch.start {
+        Some(start) => start,
+        None => *watch.first_tick.get_or_insert(cpu),
+    };
+    if cpu.saturating_sub(since) >= watch.bound_micros {
+        return Err(Trap::Interrupt.into());
+    }
+    Ok(UpdateDeadline::Continue(1))
+}
+
+/// How a call ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// It answered or declined.
+    Answered,
+    /// It failed by itself: a trap, or its fuel ran out.
+    Failed,
+    /// Its bound on the clock ended it.
+    OnTheClock,
+}
+
+/// What the end of a call says of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The call's time is the plugin's own: it was not late, or its bound
+    /// ended it, or a reading of its start says it had its bound, or it
+    /// failed by itself.
+    Own,
+    /// Late, answered or declined, and a reading of its start says its
+    /// thread had less than the bound on the CPU: the host held it.
+    Held,
+    /// Late, not ended, and no reading of its start: the host held it or it
+    /// overran a bound its fuel did not price, and nothing says which.
+    Unread,
+}
+
+/// A call's own time in its plugin's two sums of a decision, in
+/// microseconds. With no reading a call's time is an interval, from its
+/// fuel to its charge, and the two sums take its two ends; a reading makes
+/// it one number. The low end is lent against a reading to come: on a host
+/// with no thread clock none can, and a call's time is its charge in both.
+/// The `init` a decision pays on a cold slot is timed the same way: its two
+/// ends join the decision's sample, never the plugin's own spend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OwnTime {
+    /// For the decision's latency sample: what a reading says the call had;
+    /// with none, its charge. The ring wants more than one slow sample, so
+    /// it takes the high end: a guest slow in what its fuel does not price
+    /// reads slow there.
+    sample: u64,
+    /// For the plugin's own spend, which a later call that runs out is
+    /// judged against: what a reading says the call had; with none, its
+    /// fuel. One run-out is a verdict, so it convicts on the low end: the
+    /// time a host held a call is never the plugin's spend. A host with no
+    /// thread clock has no low end to lend: there it is the charge.
+    spend: u64,
+}
+
+impl OwnTime {
+    /// The time of a call or an `init` a reading covers, one number: what it
+    /// could spend, its fuel or the CPU its thread `had`, never more than
+    /// its charge.
+    fn read(fuel_micros: u64, had: u64, charged: u64) -> Self {
+        let read = fuel_micros.max(had).min(charged);
+        Self {
+            sample: read,
+            spend: read,
+        }
+    }
+
+    /// The time of one no reading covers, its two ends. With no thread
+    /// clock (`watched` is false) nothing will ever read it, and its bound
+    /// is the wall clock's: the time it took is its spend.
+    fn unread(watched: bool, fuel_micros: u64, charged: u64) -> Self {
+        Self {
+            sample: charged,
+            spend: if watched { fuel_micros } else { charged },
+        }
+    }
+
+    /// The two sums with `more` added.
+    fn plus(self, more: Self) -> Self {
+        Self {
+            sample: self.sample.saturating_add(more.sample),
+            spend: self.spend.saturating_add(more.spend),
+        }
+    }
+}
+
+/// A call's own time and its verdict, judged once, at its end. A reading
+/// covers a call whose start was read (its thread is armed): `cpu` reads the
+/// thread's clock again, and the call's time is what it could spend, its
+/// fuel or the CPU its thread had, never the time the host held it, late or
+/// not. Late, such a call is the host's when its thread had less than the
+/// bound and it answered or declined, the plugin's otherwise. A hold excuses
+/// lateness, never a fault: a call that failed by itself is the plugin's
+/// whatever its thread had. One call there is not read again: not late,
+/// with fuel that covers the time it took, its time is its fuel whatever
+/// its thread had. No reading covers any other call. It is sampled at its
+/// charge (`fuel_micros` or `elapsed_micros`, whichever is more), what it
+/// was before the bound counted the CPU, and late it is unread unless its
+/// bound ended it; it spends its fuel, for nothing says how much of its
+/// time its thread had. Time nothing read draws the decision's remainder,
+/// never the plugin's own spend. A host with no thread clock watches no
+/// call and can never read one: there a call spends its charge, the time
+/// the wall clock that bounds it says it took.
+///
+/// Late is the wall clock at or past the bound in whole ticks, the earliest
+/// a deadline there could have ended the call. Not a tick more: a call the
+/// host held for between the two would be charged its hold and counted
+/// nowhere, and two such samples in a ring read slow. Not the bound itself:
+/// under a frame shorter than a tick a call inside its fuel runs past its
+/// bound on the wall clock and is ended by nothing.
+// A call that is not late on a thread that is not armed pays two compares
+// here: inlined, it pays no call.
+#[inline]
+fn judge(
+    watch: &Watch,
+    elapsed_micros: u64,
+    fuel_micros: u64,
+    end: End,
+    cpu: impl FnOnce() -> Option<u64>,
+) -> (OwnTime, Verdict) {
+    let charged = fuel_micros.max(elapsed_micros);
+    let late = watch.watched
+        && elapsed_micros >= whole_ticks(watch.bound_micros).saturating_mul(EPOCH_TICK_MICROS);
+    // Not late and covered by its fuel, a call takes its fuel in both arms
+    // below: no reading can move its time, so none is taken.
+    let Some(had) = watch
+        .start
+        .filter(|_| watch.watched && (late || fuel_micros < elapsed_micros))
+        .and_then(|start| Some(cpu()?.saturating_sub(start)))
+    else {
+        let verdict = if late && end != End::OnTheClock {
+            Verdict::Unread
+        } else {
+            Verdict::Own
+        };
+        return (
+            OwnTime::unread(watch.watched, fuel_micros, charged),
+            verdict,
+        );
+    };
+    let verdict = if late && had < watch.bound_micros && end == End::Answered {
+        Verdict::Held
+    } else {
+        Verdict::Own
+    };
+    (OwnTime::read(fuel_micros, had, charged), verdict)
+}
+
+/// Whether a plugin alone consumed its decision's budget: its own time in
+/// the decision before a call, `spent_micros`, and the call's grant in
+/// full, `granted_micros`, reach the budget as seeded. Exact: a microsecond
+/// short, some other draw took part of the budget, and a call that runs out
+/// there is the decision's budget spent.
+fn reaches_the_budget(spent_micros: u64, granted_micros: u64, seed_micros: u64) -> bool {
+    spent_micros.saturating_add(granted_micros) >= seed_micros
 }
 
 /// Tables one store may hold: a component built from one module has the
@@ -69,11 +284,13 @@ const INSTANCES: usize = 8;
 /// has a small fuel frame of its own outside the decision's remainder (a
 /// spent budget drops no healthy instance).
 const DESTRUCTOR_FRAME_MICROS: u32 = 100;
-/// The wall bound of a destructor: its own, in milliseconds, so a fuel-cheap
-/// destructor (a bulk memory loop) cannot stretch a decision by a frame;
-/// wide beside the fuel frame, so the host's scheduling noise is not a fault.
-const DESTRUCTOR_WALL_MILLIS: u32 = 2;
-const DESTRUCTOR_WALL_MICROS: u32 = DESTRUCTOR_WALL_MILLIS * 1_000;
+/// The bound of a destructor on the clock: its own, in milliseconds, so a
+/// destructor the calibration underprices, or one long on the CPU in its
+/// host calls, cannot stretch a decision by a frame. Like every call's it
+/// counts the time the thread had the CPU: a destructor the host held is
+/// not ended.
+const DESTRUCTOR_BOUND_MILLIS: u32 = 2;
+const DESTRUCTOR_BOUND_MICROS: u32 = DESTRUCTOR_BOUND_MILLIS * 1_000;
 
 /// The budget of the decision open on a thread, in microseconds of the
 /// request's: seeded by its first open, drawn down by every call of every
@@ -144,6 +361,9 @@ pub struct Runtime {
     ticker: std::thread::Thread,
     /// The budget of the decision open on each thread.
     budgets: ThreadLocal<RefCell<DecisionBudget>>,
+    /// Whether this host has a thread CPU clock: a call's bound then counts
+    /// the time its thread had the CPU, and is the wall clock's otherwise.
+    thread_clock: bool,
 }
 
 impl Drop for Runtime {
@@ -181,9 +401,10 @@ impl Runtime {
         let mut linker = Linker::<HostState>::new(&engine);
         record::smg::policy::host::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|e| LoadError::Runtime(e.to_string()))?;
-        // The wall clock of every call: one thread per runtime advances the
+        // The clock of every call: one thread per runtime advances the
         // engine's epoch each tick while a call is in flight (parked while
-        // none is), and a call past its deadline traps.
+        // none is), and a tick that finds a call in flight runs `tick` on
+        // the call's thread.
         let ticking = Arc::new(Ticking::default());
         let shared = (Arc::clone(&ticking), engine.clone());
         // The name fits the kernel's fifteen characters, so `/proc` shows it
@@ -215,6 +436,7 @@ impl Runtime {
             ticking,
             ticker: handle.thread().clone(),
             budgets: ThreadLocal::new(),
+            thread_clock: thread_cpu_micros().is_some(),
         })
     }
 
@@ -354,7 +576,8 @@ pub struct Stats {
     /// Calls that trapped.
     pub traps: u64,
     /// Calls that ran past the plugin's own frame: out of fuel under a grant
-    /// its own spend bounded, or over the wall bound.
+    /// its own spend bounded, or their bound had on the thread's CPU clock
+    /// (on the wall clock where a host has no thread clock).
     pub fuel_exhausted: u64,
     /// Decisions whose frame budget was gone on arrival: no call, the stages
     /// fell back, the breaker counted a budget hit.
@@ -364,7 +587,11 @@ pub struct Stats {
     /// not consume the budget alone): no call, a call out of fuel (its
     /// instance goes, mid-call) or a cold slot's `init` clamped below its
     /// cost; the stage fell back, nothing counted on the breaker, which
-    /// judges a plugin against its own frames.
+    /// judges a plugin against its own frames. What a plugin consumed holds
+    /// no time nothing read: a call no reading covered spent its fuel, so a
+    /// call starved by a hold before it is counted here (and in `unread`,
+    /// where the time the earlier calls took would have made it the
+    /// plugin's own).
     pub budget_spent: u64,
     /// Calls whose answer broke a validity rule.
     pub invalid: u64,
@@ -381,6 +608,38 @@ pub struct Stats {
     pub fuel_used: u64,
     /// `observe` calls made.
     pub observed: u64,
+    /// Late calls the host held that answered or declined, by a reading: the
+    /// wall clock put the call at or past its bound in whole ticks, and the
+    /// thread's CPU clock, read at the call's start and at its end, says the
+    /// thread had less than the bound. The host's signal (a starved or
+    /// throttled thread), never a failure of the call: the hold itself drops
+    /// no instance and moves no breaker. A hold excuses lateness, never a
+    /// fault: a held call that failed by itself (a trap, its fuel) is that
+    /// failure alone, and an answer the stage then refuses is counted in
+    /// `invalid`, the answer's own count, beside its stall. A thread reads
+    /// its clock at a call's start only while it is armed (`unread`), so the
+    /// first hold of a quiet thread is not here.
+    pub stalls: u64,
+    /// Events no reading covers, each of which arms its thread. A late
+    /// call: the wall clock put it at or past its bound in whole ticks, the
+    /// bound did not end it, and its thread had not read its clock at the
+    /// call's start. The host held it, or it overran a bound its fuel did
+    /// not price; nothing says which, so the call is sampled at the time it
+    /// took. And a call that ran out under a remainder where the plugin's
+    /// unread calls decide whose it was: by their fuel the budget's, by the
+    /// time they took the plugin's. It is the budget's, and `budget_spent`
+    /// counts it too. One call can be both, and counts twice. And a
+    /// decision's sample that is slow by time nothing read alone, on a
+    /// thread nothing armed: past half the budget, or past the budget, by
+    /// the time its calls and a cold slot's `init` took, and short of that
+    /// mark by their fuel. Through the next 128 decisions the plugin samples
+    /// on an armed thread, each of its calls and a cold slot's `init` reads
+    /// the clock at its start, and at its end unless it is a call that is not
+    /// late and whose fuel covers the time it took. That window is short on a
+    /// busy thread (128 ms at a thousand decisions a second), so a host that
+    /// holds a thread less often leaves every hold here and none in
+    /// `stalls`: read the two together.
+    pub unread: u64,
     /// Times the breaker opened.
     pub breaker_opens: u64,
 }
@@ -400,6 +659,8 @@ struct Tally {
     lazy_instantiations: AtomicU64,
     fuel_used: AtomicU64,
     observed: AtomicU64,
+    stalls: AtomicU64,
+    unread: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -434,23 +695,24 @@ pub struct Plugin {
     /// Per thread: this decision emptied the slot (a dropped instance), so
     /// its later opens make no instance and its close rebuilds it.
     emptied: ThreadLocal<Cell<bool>>,
-    /// Per thread: the decision's number and this plugin's own spend in it
-    /// (its constructor and stage calls, in microseconds), so a call the
-    /// budget ends is charged to the plugin only once that spend reached its
-    /// own frame.
-    spent: ThreadLocal<Cell<(u64, u64)>>,
+    /// Per thread: the decision's number and this plugin's own time in it
+    /// (its constructor and stage calls): its spend, so a call the budget
+    /// ends is charged to the plugin only once that spend reached the
+    /// decision's budget, and its part of the decision's latency sample.
+    spent: ThreadLocal<Cell<(u64, OwnTime)>>,
     /// Per thread: the latency ring, one sample per decision (the plugin's
-    /// own charged spend in it and a lazy `init` the decision paid, over the
+    /// own charged time in it and a lazy `init` the decision paid, over the
     /// decision's budget), kept across rebuilds so a plugin dropped every
     /// decision still completes a window.
     latency: ThreadLocal<RefCell<Latency>>,
     /// Per thread: the decision's number, this plugin's opens of it still to
     /// close (each side of a pair, each binding), so the decision's sample is
-    /// taken at the plugin's last close of it, the charge of a lazy `init`
-    /// the decision paid (part of its sample, not of its own spend), and
-    /// whether the plugin already failed the decision: the decision is the
-    /// breaker's unit, so it counts one failure however many opens fail.
-    decision_opens: ThreadLocal<Cell<(u64, u32, u64, bool)>>,
+    /// taken at the plugin's last close of it, the time of a lazy `init` the
+    /// decision paid at its two ends (part of its sample, not of its own
+    /// spend), and whether the plugin already failed the decision: the
+    /// decision is the breaker's unit, so it counts one failure however many
+    /// opens fail.
+    decision_opens: ThreadLocal<Cell<(u64, u32, OwnTime, bool)>>,
 }
 
 impl fmt::Debug for Plugin {
@@ -625,11 +887,9 @@ impl Plugin {
         self.failure
     }
 
-    /// What the host must feed for the plugin's stages, as declared. The
-    /// engine's summary folds the needs of a profile's scorers, so a plugin
-    /// bound as a scorer carries these into it; a plugin bound as a filter
-    /// or a picker alone does not (those stage kinds declare no needs), and
-    /// a host that must feed it reads them here.
+    /// What the host must feed for the plugin's stages, as declared. Each
+    /// stage the plugin is bound as carries these into its profile's needs
+    /// ([`crate::Profile::needs`]), and so into the engine's summary.
     pub fn needs(&self) -> Needs {
         self.needs
     }
@@ -655,6 +915,8 @@ impl Plugin {
             lazy_instantiations: t.lazy_instantiations.load(Ordering::Relaxed),
             fuel_used: t.fuel_used.load(Ordering::Relaxed),
             observed: t.observed.load(Ordering::Relaxed),
+            stalls: t.stalls.load(Ordering::Relaxed),
+            unread: t.unread.load(Ordering::Relaxed),
             breaker_opens: self.breaker.opens(),
         }
     }
@@ -720,9 +982,12 @@ impl Plugin {
                 counters: self.counters.clone(),
                 log: LogGate::new(self.log, now),
                 clock: Arc::clone(&self.runtime.clock),
+                watch: Watch::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
+        // A tick that finds a guest call in flight on this store.
+        store.epoch_deadline_callback(|mut context| tick(&mut context.data_mut().watch));
         let fuel = init_cap;
         if let Err(e) = store.set_fuel(fuel) {
             return (Err(LoadError::Runtime(e.to_string())), 0);
@@ -810,16 +1075,34 @@ impl Plugin {
         if inst.store.set_fuel(grant).is_err() {
             return Call::Failed;
         }
-        // The wall bound is what the decision has left, at most the frame.
-        let wall = frame
+        // The bound on the clock is what the decision has left, at most the
+        // frame. On a host with a thread clock it counts the time this thread
+        // has the CPU since a reading (`tick`): the call's start on a thread
+        // whose ring is armed, the reading the call's end is judged on;
+        // otherwise the first tick the call meets. Elsewhere the call ends at
+        // its deadline on the wall clock.
+        let bound = frame
             .frame_micros
             .min(u32::try_from(*frame.remaining_micros).unwrap_or(u32::MAX));
-        inst.store.set_epoch_deadline(deadline_ticks(wall));
+        let watched = self.runtime.thread_clock;
+        let start = if watched && self.armed() {
+            thread_cpu_micros()
+        } else {
+            None
+        };
+        inst.store
+            .set_epoch_deadline(first_deadline(watched, start.is_some(), bound));
         let state = inst.store.data_mut();
         state.decision_micros = frame.now;
         if let Some(draw) = frame.draw.as_deref_mut() {
             std::mem::swap(&mut state.draw, draw);
         }
+        state.watch = Watch {
+            bound_micros: u64::from(bound),
+            watched,
+            start,
+            first_tick: None,
+        };
         let started = Instant::now();
         let answer = {
             let _running = Running::start(&self.runtime);
@@ -827,22 +1110,52 @@ impl Plugin {
         };
         let elapsed = u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX);
         let used = grant.saturating_sub(inst.store.get_fuel().unwrap_or(0));
-        // The budget is wall time: the call is charged the larger of its fuel
-        // at the calibration and its elapsed time, so a fuel-cheap long call
-        // (a bulk memory loop) draws the remainder down too.
-        let charged = used.div_ceil(fuel_per_micro).max(u64::from(elapsed));
+        // The decision's deadline is on the wall clock: the call draws the
+        // remainder by the larger of its fuel at the calibration and its
+        // elapsed time, so a call the calibration underprices, a call long in
+        // its host calls and a call the host held all draw it down.
+        let fuel_micros = used.div_ceil(fuel_per_micro);
+        let charged = fuel_micros.max(u64::from(elapsed));
         *frame.remaining_micros = frame.remaining_micros.saturating_sub(charged);
-        // The plugin's own spend in the decision before this call.
-        let own_before = if frame.decision == 0 {
-            0
-        } else {
-            self.spend(frame.decision, charged).saturating_sub(charged)
-        };
         let state = inst.store.data_mut();
         state.decision_micros = None;
+        let watch = std::mem::take(&mut state.watch);
         if let Some(draw) = frame.draw {
             std::mem::swap(&mut state.draw, draw);
         }
+        let end = match &answer {
+            Ok(_) => End::Answered,
+            Err(error) if error.downcast_ref::<Trap>() == Some(&Trap::Interrupt) => End::OnTheClock,
+            Err(_) => End::Failed,
+        };
+        // The plugin's own time in the call is what it could spend; a late
+        // call is judged once, here, with its answer read. One a reading
+        // says the host held, and that answered, is the host's signal, not
+        // the plugin's failure; one that failed by itself is that failure
+        // alone. One no reading covers is counted by its own name and arms
+        // the thread: the next calls there have a reading.
+        let (own, verdict) = judge(
+            &watch,
+            u64::from(elapsed),
+            fuel_micros,
+            end,
+            thread_cpu_micros,
+        );
+        match verdict {
+            Verdict::Own => {}
+            Verdict::Held => bump(&self.tally.stalls),
+            Verdict::Unread => {
+                bump(&self.tally.unread);
+                self.arm();
+            }
+        }
+        // The plugin's own time in the decision before this call: its two
+        // sums.
+        let before = if frame.decision == 0 {
+            OwnTime::default()
+        } else {
+            self.spend(frame.decision, own)
+        };
         self.tally.fuel_used.fetch_add(used, Ordering::Relaxed);
         match answer {
             Ok(Ok(value)) => {
@@ -858,7 +1171,8 @@ impl Plugin {
                 Call::Declined
             }
             Err(error) => {
-                // Out of fuel or over the wall bound: the frame ran out.
+                // Out of fuel, or its bound had on the clock: the frame ran
+                // out.
                 let frame_ran_out = matches!(
                     error.downcast_ref::<Trap>(),
                     Some(Trap::OutOfFuel | Trap::Interrupt)
@@ -868,21 +1182,38 @@ impl Plugin {
                 // its whole frame and burned it, or the plugin's own spend in
                 // the decision (its constructor, its earlier calls and this
                 // grant in full) reaches the budget, so it alone consumed it.
-                // Short of both, the remainder other plugins drew clamped the
-                // call, and it is the decision's budget spent, whichever scope
-                // ran first: the interrupted instance goes (its memory is
-                // mid-call), the breaker is untouched, and chronic slowness
-                // opens it through the decision's latency sample instead.
-                // Judged on the grant, not the clock, so a stalled call is not
-                // charged for the stall.
-                let own_with_grant = own_before.saturating_add(grant.div_ceil(fuel_per_micro));
-                let own_bound = grant == frame.cap || own_with_grant >= frame.seed_micros;
+                // Short of both, the remainder clamped the call (other plugins
+                // drew it, or the host held a call of this one), and it is
+                // the decision's budget spent, whichever scope ran first: the
+                // interrupted instance goes (its memory is mid-call), the
+                // breaker is untouched, and chronic slowness opens it through
+                // the decision's latency sample instead. Judged on the grant,
+                // not the clock, so a stalled call is not charged for the
+                // stall; and against the spend, the low end of the time the
+                // earlier calls took ([`OwnTime`]), so a call a hold starved is
+                // not charged for the hold before it. A host with no thread
+                // clock has no low end: there the spend is the time they took.
+                let granted = grant.div_ceil(fuel_per_micro);
+                let reaches = |spent: u64| reaches_the_budget(spent, granted, frame.seed_micros);
+                let own_bound = grant == frame.cap || reaches(before.spend);
                 if frame_ran_out && frame.decision != 0 && !own_bound {
                     tracing::debug!(
                         plugin = self.name,
                         "a call ran out under the decision's remainder"
                     );
                     bump(&self.tally.budget_spent);
+                    if reaches(before.sample) {
+                        // The two ends part: the time the plugin's unread
+                        // calls took reaches the budget, their fuel does
+                        // not, and nothing says whether a hold or their own
+                        // time past their fuel is the difference. The
+                        // run-out is the budget's, counted with the calls
+                        // nothing read, and it arms the thread: its next
+                        // calls are read, and a run-out behind them has one
+                        // answer.
+                        bump(&self.tally.unread);
+                        self.arm();
+                    }
                     self.drop_instance(instance);
                     return Call::Failed;
                 }
@@ -961,27 +1292,27 @@ impl Plugin {
         let (count, init, failed) = if stamp == decision {
             (count, init, failed)
         } else {
-            (0, 0, false)
+            (0, OwnTime::default(), false)
         };
         opens.set((decision, count.saturating_add(1), init, failed));
         failed
     }
 
-    /// The charge of a lazy `init` decision `decision` paid on this thread:
+    /// The time of a lazy `init` decision `decision` paid on this thread:
     /// judged under the init frame, never the plugin's own spend, but part of
-    /// what the decision cost it.
-    fn note_init(&self, decision: u64, micros: u64) {
+    /// what the decision cost it, at its two ends like a call's.
+    fn note_init(&self, decision: u64, own: OwnTime) {
         let opens = self.decision_opens.get_or_default();
         let (stamp, count, init, failed) = opens.get();
         if stamp == decision {
-            opens.set((stamp, count, init.saturating_add(micros), failed));
+            opens.set((stamp, count, init.plus(own), failed));
         }
     }
 
     /// One of this plugin's closes of decision `decision`: the last one takes
-    /// the decision's latency sample, the plugin's own charged spend in the
+    /// the decision's latency sample, the plugin's own charged time in the
     /// decision (its constructor and stage calls, whatever ended them) plus
-    /// the charge of a lazy `init` the decision paid, over the decision's
+    /// the time of a lazy `init` the decision paid, over the decision's
     /// budget. A decision that charged the plugin nothing records nothing.
     fn note_close(&self, decision: u64, seed_micros: u64) {
         let opens = self.decision_opens.get_or_default();
@@ -995,26 +1326,61 @@ impl Plugin {
             return;
         }
         let (spent_stamp, spent) = self.spent.get_or_default().get();
-        let spent = if spent_stamp == decision { spent } else { 0 };
-        let charged = spent.saturating_add(init);
-        if charged > 0 {
-            self.sample(charged, seed_micros);
+        let own = if spent_stamp == decision {
+            spent.plus(init)
+        } else {
+            init
+        };
+        if own.sample > 0 {
+            self.sample(own, seed_micros);
         }
     }
 
-    /// One latency sample into the thread's ring: a decision's charge as a
-    /// share of its budget; a window that reads slow opens the breaker.
-    fn sample(&self, charged: u64, seed_micros: u64) {
-        let sample = u32::try_from(charged).unwrap_or(u32::MAX);
-        let seed = u32::try_from(seed_micros).unwrap_or(u32::MAX);
-        let slow = self
-            .latency
-            .get_or(|| RefCell::new(Latency::new()))
-            .borrow_mut()
-            .record(sample, seed);
+    /// One latency sample into the thread's ring: a decision's time as a
+    /// share of its budget, at the high end of what nothing read; a window
+    /// that reads slow opens the breaker. A sample slow at that end alone
+    /// (past a mark of the ring its low end is short of) is slow by time
+    /// nothing read, a hold of the host or the guest's own, and nothing says
+    /// which. It is recorded as it is, counted with the unread calls, and
+    /// arms the thread: the decisions that share its window are read, so no
+    /// window holds two such samples. That bounds the samples no reading
+    /// covered, not what one of them completes: the ring's allowance of one
+    /// outlier is the window's, and a hold of the host spends it.
+    fn sample(&self, own: OwnTime, seed_micros: u64) {
+        let micros = |micros: u64| u32::try_from(micros).unwrap_or(u32::MAX);
+        let (sample, low, seed) = (micros(own.sample), micros(own.spend), micros(seed_micros));
+        let slow = {
+            let mut ring = self
+                .latency
+                .get_or(|| RefCell::new(Latency::new()))
+                .borrow_mut();
+            if !ring.armed() && Latency::uncovered(sample, low, seed) {
+                bump(&self.tally.unread);
+                ring.arm();
+            }
+            ring.record(sample, seed)
+        };
         if slow && self.breaker.slow(self.runtime.now_micros()) {
             self.opened("latency");
         }
+    }
+
+    /// Whether this thread reads its CPU clock at the start and the end of
+    /// the plugin's calls: its ring is armed.
+    fn armed(&self) -> bool {
+        self.latency.get().is_some_and(|ring| ring.borrow().armed())
+    }
+
+    /// Arms this thread's ring. A late call here had no reading of its
+    /// start, and its decision's sample is the time the call took; or a call
+    /// here ran out under a remainder that the time its plugin's unread
+    /// calls took makes its own and their fuel does not. (A sample slow by
+    /// time nothing read arms the ring where it is taken.)
+    fn arm(&self) {
+        self.latency
+            .get_or(|| RefCell::new(Latency::new()))
+            .borrow_mut()
+            .arm();
     }
 
     /// Drops this thread's instance: its store is gone with it, and this
@@ -1024,15 +1390,18 @@ impl Plugin {
         self.emptied.get_or_default().set(true);
     }
 
-    /// Adds `micros` to this plugin's own spend in decision `decision` on
-    /// this thread and returns the spend so far.
-    fn spend(&self, decision: u64, micros: u64) -> u64 {
+    /// Adds a call's own time to this plugin's two sums of decision
+    /// `decision` on this thread and returns the sums before it.
+    fn spend(&self, decision: u64, own: OwnTime) -> OwnTime {
         let spent = self.spent.get_or_default();
         let (stamp, before) = spent.get();
-        let before = if stamp == decision { before } else { 0 };
-        let after = before.saturating_add(micros);
-        spent.set((decision, after));
-        after
+        let before = if stamp == decision {
+            before
+        } else {
+            OwnTime::default()
+        };
+        spent.set((decision, before.plus(own)));
+        before
     }
 
     /// Delivers one lifecycle event to this thread's kept instance.
@@ -1280,20 +1649,9 @@ impl fmt::Debug for Bound {
     }
 }
 
-/// The stage takes its fallback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Fallback;
-
 impl Bound {
     pub fn plugin(&self) -> &Arc<Plugin> {
         &self.plugin
-    }
-
-    /// The first scorer or picker adapter made from any bound set of the
-    /// build forwards the lifecycle; the others do not, so an event reaches
-    /// the plugin once per build, whichever of its profiles bind the plugin.
-    pub(crate) fn take_observer(&self) -> bool {
-        !self.observer_taken.swap(true, Ordering::Relaxed)
     }
 
     fn state(&self, phase: Phase) -> RefMut<'_, Open> {
@@ -1376,19 +1734,35 @@ impl Bound {
             // slot still empty at the close is rebuilt under the full frame).
             // The budget is wall time here as in a call: the instantiation is
             // charged the larger of its fuel at the calibration and its
-            // elapsed time, however it ends.
+            // elapsed time, however it ends. Its own time has two ends like
+            // a call's. Nothing watches an `init` (its bound stays on the
+            // wall clock), so no tick reads it: its low end is its fuel, and
+            // an armed thread reads its clock around it, which makes the two
+            // one: a held `init` is no slow sample there.
             let fuel_per_micro = frame.fuel_per_micro.max(1);
             let left = budget.remaining_micros.saturating_mul(fuel_per_micro);
             let init_fuel = plugin.init_fuel();
+            let watched = plugin.runtime.thread_clock;
+            let start = if watched && plugin.armed() {
+                thread_cpu_micros()
+            } else {
+                None
+            };
             let started = Instant::now();
             let (made, used) = plugin.instantiate_metered(init_fuel.min(left));
             let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let charged = used.div_ceil(fuel_per_micro).max(elapsed);
+            let fuel_micros = used.div_ceil(fuel_per_micro);
+            let charged = fuel_micros.max(elapsed);
+            let own = match start.and_then(|start| Some(thread_cpu_micros()?.saturating_sub(start)))
+            {
+                Some(had) => OwnTime::read(fuel_micros, had, charged),
+                None => OwnTime::unread(watched, fuel_micros, charged),
+            };
             match made {
                 Ok(instance) => {
                     bump(&plugin.tally.lazy_instantiations);
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
-                    plugin.note_init(budget.stamp, charged);
+                    plugin.note_init(budget.stamp, own);
                     *guard = Some(instance);
                 }
                 Err(LoadError::Trap { .. })
@@ -1403,12 +1777,13 @@ impl Bound {
                     // again), the slot stays cold for the close to rebuild
                     // under the full frame, and the breaker, which judges
                     // `init` under its own frame, is untouched. The plugin's
-                    // sample is the larger of the remainder and the charge
-                    // above, so an `init` long on the clock reads as long
-                    // here too.
+                    // sample takes the time of this `init` as of any other:
+                    // a charge that reached the remainder, so one long on the
+                    // clock reads as long here too, unless a reading says
+                    // its thread did not have that time.
                     let init_micros = left.div_ceil(fuel_per_micro).max(charged);
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(init_micros);
-                    plugin.note_init(budget.stamp, init_micros);
+                    plugin.note_init(budget.stamp, own);
                     bump(&plugin.tally.budget_spent);
                     plugin.emptied.get_or_default().set(true);
                     open.bypass = true;
@@ -1421,7 +1796,7 @@ impl Bound {
                     // is the breaker's, the charge the decision's and part
                     // of the plugin's sample.
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
-                    plugin.note_init(budget.stamp, charged);
+                    plugin.note_init(budget.stamp, own);
                     plugin.fail(now);
                     open.bypass = true;
                     return;
@@ -1495,16 +1870,17 @@ impl Bound {
                     // The destructor is the guest's code, run for the host's
                     // cleanup: a small fuel frame of its own, outside the
                     // decision's remainder, so a spent budget drops no healthy
-                    // instance; a wall bound of its own in milliseconds, so a
-                    // fuel-cheap destructor cannot stretch the decision by a
-                    // frame; not a latency sample. Running out of either drops
-                    // the instance through the call's own fault path.
-                    let mut remaining = u64::from(DESTRUCTOR_WALL_MICROS);
+                    // instance; a bound on the clock of its own in milliseconds,
+                    // so a destructor long on the clock cannot stretch the
+                    // decision by a frame; not a latency sample. Running out
+                    // of either drops the instance through the call's own
+                    // fault path.
+                    let mut remaining = u64::from(DESTRUCTOR_BOUND_MICROS);
                     let frame = Frame {
                         cap: plugin.frame.fuel_of(DESTRUCTOR_FRAME_MICROS),
                         remaining_micros: &mut remaining,
                         fuel_per_micro: plugin.frame.fuel_per_micro,
-                        frame_micros: DESTRUCTOR_WALL_MICROS,
+                        frame_micros: DESTRUCTOR_BOUND_MICROS,
                         now: Some(open.now),
                         draw: Some(&mut open.draw),
                         quiet: true,
@@ -1553,26 +1929,6 @@ impl Bound {
                 }
             }
         }
-    }
-
-    /// The filter's answer for the phase's decision, computed once: `kept`
-    /// keeps the positions the guest named.
-    pub(crate) fn retain(
-        &self,
-        facts: &RequestFacts<'_>,
-        kept: &mut Vec<u32>,
-    ) -> Result<(), Fallback> {
-        let mut open = self.state(facts.phase);
-        self.ensure_mask(&mut open)?;
-        kept.retain(|&i| bit(&open.mask, i));
-        Ok(())
-    }
-
-    /// One row of the filter's answer.
-    pub(crate) fn keep(&self, facts: &RequestFacts<'_>, position: u32) -> Result<bool, Fallback> {
-        let mut open = self.state(facts.phase);
-        self.ensure_mask(&mut open)?;
-        Ok(bit(&open.mask, position))
     }
 
     /// One guest call of the open decision on this thread's instance, under
@@ -1626,10 +1982,47 @@ impl Bound {
         open.mask_set = true;
         Ok(())
     }
+}
+
+impl BoundPlugin for Bound {
+    fn name(&self) -> &'static str {
+        self.plugin.name()
+    }
+
+    fn failure(&self) -> Failure {
+        self.plugin.failure()
+    }
+
+    fn needs(&self) -> Needs {
+        self.plugin.needs()
+    }
+
+    /// The first scorer or picker adapter made from any bound set of the
+    /// build forwards the lifecycle; the others do not, so an event reaches
+    /// the plugin once per build, whichever of its profiles bind the plugin.
+    fn take_observer(&self) -> bool {
+        !self.observer_taken.swap(true, Ordering::Relaxed)
+    }
+
+    /// The filter's answer for the phase's decision, computed once: `kept`
+    /// keeps the positions the guest named.
+    fn retain(&self, facts: &RequestFacts<'_>, kept: &mut Vec<u32>) -> Result<(), Fallback> {
+        let mut open = self.state(facts.phase);
+        self.ensure_mask(&mut open)?;
+        kept.retain(|&i| bit(&open.mask, i));
+        Ok(())
+    }
+
+    /// One row of the filter's answer.
+    fn keep(&self, facts: &RequestFacts<'_>, position: u32) -> Result<bool, Fallback> {
+        let mut open = self.state(facts.phase);
+        self.ensure_mask(&mut open)?;
+        Ok(bit(&open.mask, position))
+    }
 
     /// The scorer's answer for the phase's decision, computed once: `out[i]`
     /// is the score of `kept[i]`.
-    pub(crate) fn score(
+    fn score(
         &self,
         facts: &RequestFacts<'_>,
         kept: &[u32],
@@ -1675,7 +2068,7 @@ impl Bound {
     /// `kept[i]`; the guest sees one score per candidate, `-1.0` on a row
     /// the filters dropped, and names a surviving position or declines (a
     /// `none` is the pick's decline).
-    pub(crate) fn pick(
+    fn pick(
         &self,
         facts: &RequestFacts<'_>,
         kept: &[u32],
@@ -1735,7 +2128,7 @@ impl Bound {
         Ok(picked)
     }
 
-    pub(crate) fn observe_issued(&self, lease: &Lease, decision: &Decision) {
+    fn observe_issued(&self, lease: &Lease, decision: &Decision) {
         let mut targets: [wit::Target; MAX_TARGETS] = std::array::from_fn(|_| wit::Target {
             id: 0,
             dp_rank: 0,
@@ -1748,7 +2141,7 @@ impl Bound {
         )));
     }
 
-    pub(crate) fn observe_dispatched(
+    fn observe_dispatched(
         &self,
         lease: &Lease,
         target: &Target,
@@ -1764,7 +2157,7 @@ impl Bound {
             }));
     }
 
-    pub(crate) fn observe_completed(&self, lease: &Lease, outcome: &Outcome) {
+    fn observe_completed(&self, lease: &Lease, outcome: &Outcome) {
         self.plugin
             .observe(wit::LifecycleEvent::Completed(marshal::completed(
                 lease,
@@ -1773,14 +2166,14 @@ impl Bound {
             )));
     }
 
-    pub(crate) fn observe_released(&self, lease: &Lease, reason: ReleaseReason) {
+    fn observe_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.plugin.observe(wit::LifecycleEvent::Released((
             marshal::lease(lease, &self.plugin.exposure),
             marshal::release_reason(reason),
         )));
     }
 
-    pub(crate) fn observe_membership(&self, change: &Membership<'_>) {
+    fn observe_membership(&self, change: &Membership<'_>) {
         let plugin = &self.plugin;
         // The snapshot's ids are copied into the instance's own buffer; a
         // borrow of the slot for the copy and another for the call would
@@ -1802,7 +2195,7 @@ impl Bound {
         }
     }
 
-    pub(crate) fn observe_signal(&self, signal: &Signal) {
+    fn observe_signal(&self, signal: &Signal) {
         let now = self.plugin.runtime.now_micros();
         self.plugin
             .observe(wit::LifecycleEvent::Signal(marshal::signal(signal, now)));
@@ -1826,7 +2219,434 @@ fn bit(mask: &[u64], position: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bit, import_version};
+    use std::cell::Cell;
+
+    use wasmtime::{Trap, UpdateDeadline};
+
+    use super::{
+        bit, deadline_ticks, first_deadline, import_version, judge, reaches_the_budget,
+        thread_cpu_micros, tick, End, Verdict, Watch, EPOCH_TICK_MICROS,
+    };
+
+    /// Whether a tick ended the call; a tick that lets it run asks for the
+    /// next one.
+    fn ended(tick: wasmtime::Result<UpdateDeadline>) -> bool {
+        match tick {
+            Ok(UpdateDeadline::Continue(1)) => false,
+            Ok(_) => panic!("a tick that lets a call run asks for the next tick"),
+            Err(error) => {
+                assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::Interrupt));
+                true
+            }
+        }
+    }
+
+    /// Keeps the calling thread on the CPU for `micros` of its own clock.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn burn(micros: u64) {
+        let from = thread_cpu_micros().expect("a thread clock");
+        while thread_cpu_micros().expect("a thread clock") < from + micros {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// A tick ends a call on the CPU its thread had since a reading, never
+    /// on the wall clock: a thread that slept past the bound (the host held
+    /// it) runs on, and the same thread once it has burned the bound is
+    /// ended. With no reading of the start the first tick takes one and ends
+    /// nothing; with one, no stand-in is taken.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_tick_ends_a_call_on_the_cpu_its_thread_had_since_a_reading() {
+        const BOUND: u64 = 2_000;
+        let held = std::time::Duration::from_micros(3 * BOUND);
+
+        let mut unread = Watch {
+            bound_micros: BOUND,
+            watched: true,
+            start: None,
+            first_tick: None,
+        };
+        assert!(!ended(tick(&mut unread)), "a first tick ends nothing");
+        assert!(unread.first_tick.is_some(), "it took the reading");
+        std::thread::sleep(held);
+        assert!(
+            !ended(tick(&mut unread)),
+            "three bounds on the wall clock, off the CPU: not ended"
+        );
+        burn(BOUND);
+        assert!(
+            ended(tick(&mut unread)),
+            "the bound had on the CPU since the first tick"
+        );
+
+        let mut read = Watch {
+            bound_micros: BOUND,
+            watched: true,
+            start: thread_cpu_micros(),
+            first_tick: None,
+        };
+        std::thread::sleep(held);
+        assert!(
+            !ended(tick(&mut read)),
+            "held since its start: short of the bound on the CPU"
+        );
+        assert!(
+            read.first_tick.is_none(),
+            "a start reading needs no stand-in"
+        );
+        burn(BOUND);
+        assert!(
+            ended(tick(&mut read)),
+            "the bound had on the CPU since the start"
+        );
+    }
+
+    /// A call nothing watches ends at its deadline on the wall clock: an
+    /// `init`, and every call on a host with no thread clock, which takes
+    /// the same arm.
+    #[test]
+    fn a_tick_ends_a_call_nothing_watches() {
+        assert!(ended(tick(&mut Watch::default())), "an init's watch");
+        let mut unwatched = Watch {
+            bound_micros: u64::MAX,
+            watched: false,
+            start: None,
+            first_tick: None,
+        };
+        assert!(ended(tick(&mut unwatched)), "whatever its bound");
+    }
+
+    /// A watched call with no reading of its start meets its next tick,
+    /// which takes one. A call whose start was read meets the tick its
+    /// deadline on the wall clock falls on and none before it, like a call
+    /// nothing watches: a reading never ends a call the wall clock would let
+    /// run.
+    #[test]
+    fn a_start_reading_meets_no_tick_before_the_wall_clocks_deadline() {
+        assert_eq!(
+            (
+                deadline_ticks(1),
+                deadline_ticks(1_000),
+                deadline_ticks(1_001)
+            ),
+            (2, 2, 3),
+            "the bound in whole ticks and the tick in flight"
+        );
+        for bound in [1, 20, 1_000, 1_001, 10_000] {
+            assert_eq!(first_deadline(true, false, bound), 1, "{bound}: unread");
+            assert_eq!(
+                first_deadline(true, true, bound),
+                deadline_ticks(bound),
+                "{bound}: its start read"
+            );
+            assert_eq!(
+                first_deadline(false, false, bound),
+                deadline_ticks(bound),
+                "{bound}: nothing watched"
+            );
+        }
+    }
+
+    /// The judgement of a call at its end is a function of its readings and
+    /// of how it ended: the wall time, the reading at its start or none, the
+    /// reading at its end, its fuel and the bound. Every branch, each at its
+    /// boundary, and the calls that read the clock again: every call whose
+    /// start was read, but one that is not late and whose fuel covers the
+    /// time it took. With no reading a call is sampled at its charge and
+    /// spends its fuel (its charge on a host with no thread clock); a
+    /// reading gives it one time, late or not.
+    #[test]
+    fn a_late_call_is_judged_once_on_its_readings() {
+        // A bound that is no whole number of ticks, and the wall time that
+        // makes its call late: the bound in whole ticks.
+        const BOUND: u64 = 1_500;
+        const LATE: u64 = 2 * EPOCH_TICK_MICROS;
+        const START: u64 = 100;
+        let watch = |start: Option<u64>| Watch {
+            bound_micros: BOUND,
+            watched: true,
+            start,
+            first_tick: None,
+        };
+        let read = watch(Some(START));
+        let unread = watch(None);
+        let ticked = Watch {
+            first_tick: Some(START),
+            ..unread
+        };
+        let unwatched = Watch {
+            watched: false,
+            ..read
+        };
+        // The case; the watch; the CPU clock at the end; the wall time; the
+        // fuel in microseconds; how the call ended; the own time (its
+        // sample, its spend), the verdict and whether the clock was read
+        // again.
+        let rows = [
+            (
+                "past its bound, a microsecond short of late, read: no stall, and no time but its fuel",
+                read,
+                START,
+                LATE - 1,
+                7,
+                End::Answered,
+                (7, 7, Verdict::Own, 1),
+            ),
+            (
+                "not late, read, the CPU at the wall time: its charge",
+                read,
+                START + 900,
+                900,
+                7,
+                End::Answered,
+                (900, 900, Verdict::Own, 1),
+            ),
+            (
+                "not late, read, the CPU short of the wall time: a hold is no time of the call",
+                read,
+                START + 40,
+                900,
+                7,
+                End::Answered,
+                (40, 40, Verdict::Own, 1),
+            ),
+            (
+                "not late, read, the fuel above the CPU: its fuel",
+                read,
+                START + 40,
+                900,
+                600,
+                End::Answered,
+                (600, 600, Verdict::Own, 1),
+            ),
+            (
+                "not late, read, the CPU above the wall time: never more than the charge",
+                read,
+                START + 5 * BOUND,
+                900,
+                7,
+                End::Failed,
+                (900, 900, Verdict::Own, 1),
+            ),
+            (
+                "not late, read, the fuel at the wall time: its fuel, and the clock is not read again",
+                read,
+                START + 40,
+                600,
+                600,
+                End::Answered,
+                (600, 600, Verdict::Own, 0),
+            ),
+            (
+                "not late, read, the fuel above the wall time: its fuel, and no reading",
+                read,
+                START + 40,
+                10,
+                900,
+                End::Failed,
+                (900, 900, Verdict::Own, 0),
+            ),
+            (
+                "not late, read, the wall time a microsecond past the fuel: read again",
+                read,
+                START + 40,
+                601,
+                600,
+                End::Answered,
+                (600, 600, Verdict::Own, 1),
+            ),
+            (
+                "late, read, the fuel above the wall time: read again, for a reading judges lateness",
+                read,
+                START + 40,
+                LATE,
+                LATE + 5,
+                End::Answered,
+                (LATE + 5, LATE + 5, Verdict::Held, 1),
+            ),
+            (
+                "late at its bound in whole ticks, the CPU one short of the bound: held",
+                read,
+                START + BOUND - 1,
+                LATE,
+                7,
+                End::Answered,
+                (BOUND - 1, BOUND - 1, Verdict::Held, 1),
+            ),
+            (
+                "a bound of whole ticks: late at the bound itself",
+                Watch {
+                    bound_micros: 10 * EPOCH_TICK_MICROS,
+                    ..unread
+                },
+                START,
+                10 * EPOCH_TICK_MICROS,
+                7,
+                End::Answered,
+                (10 * EPOCH_TICK_MICROS, 7, Verdict::Unread, 0),
+            ),
+            (
+                "a bound under a tick, twice had on the wall clock: not late",
+                Watch {
+                    bound_micros: 20,
+                    ..unread
+                },
+                START,
+                45,
+                7,
+                End::Answered,
+                (45, 7, Verdict::Own, 0),
+            ),
+            (
+                "late, the CPU at the bound: the plugin's, at its CPU",
+                read,
+                START + BOUND,
+                LATE,
+                7,
+                End::Answered,
+                (BOUND, BOUND, Verdict::Own, 1),
+            ),
+            (
+                "held, the fuel above the CPU: its own time is its fuel",
+                read,
+                START + 40,
+                9 * BOUND,
+                600,
+                End::Answered,
+                (600, 600, Verdict::Held, 1),
+            ),
+            (
+                "held on the CPU, failed by itself: the plugin's, at its CPU",
+                read,
+                START + BOUND - 1,
+                LATE,
+                7,
+                End::Failed,
+                (BOUND - 1, BOUND - 1, Verdict::Own, 1),
+            ),
+            (
+                "held on the CPU, ended on the clock: the plugin's",
+                read,
+                START + BOUND - 1,
+                LATE,
+                7,
+                End::OnTheClock,
+                (BOUND - 1, BOUND - 1, Verdict::Own, 1),
+            ),
+            (
+                "the CPU above the wall time: never more than the charge",
+                read,
+                START + 5 * BOUND,
+                LATE,
+                7,
+                End::Answered,
+                (LATE, LATE, Verdict::Own, 1),
+            ),
+            (
+                "late, read, ended on the clock: the plugin's, never the hold",
+                read,
+                START + BOUND + 300,
+                9 * BOUND,
+                7,
+                End::OnTheClock,
+                (BOUND + 300, BOUND + 300, Verdict::Own, 1),
+            ),
+            (
+                "late, no reading of its start, not ended: unread, sampled at its charge, spent at its fuel",
+                unread,
+                START,
+                9 * BOUND,
+                7,
+                End::Answered,
+                (9 * BOUND, 7, Verdict::Unread, 0),
+            ),
+            (
+                "late, no reading of its start, failed by itself: unread all the same",
+                unread,
+                START,
+                9 * BOUND,
+                7,
+                End::Failed,
+                (9 * BOUND, 7, Verdict::Unread, 0),
+            ),
+            (
+                "late, no reading of its start, ended on the clock: the plugin's",
+                unread,
+                START,
+                9 * BOUND,
+                7,
+                End::OnTheClock,
+                (9 * BOUND, 7, Verdict::Own, 0),
+            ),
+            (
+                "a first tick's reading is no reading of the start",
+                ticked,
+                START + 40,
+                9 * BOUND,
+                7,
+                End::Answered,
+                (9 * BOUND, 7, Verdict::Unread, 0),
+            ),
+            (
+                "nothing watched: the wall clock's call, its charge twice, and no reading",
+                unwatched,
+                START,
+                9 * BOUND,
+                7,
+                End::Answered,
+                (9 * BOUND, 9 * BOUND, Verdict::Own, 0),
+            ),
+            (
+                "not late, no reading, the fuel above the wall time: the charge is the fuel",
+                unread,
+                START,
+                10,
+                900,
+                End::Answered,
+                (900, 900, Verdict::Own, 0),
+            ),
+        ];
+        for (case, watch, cpu_at_end, elapsed, fuel, end, wanted) in rows {
+            let reads = Cell::new(0);
+            let (own, verdict) = judge(&watch, elapsed, fuel, end, || {
+                reads.set(reads.get() + 1);
+                Some(cpu_at_end)
+            });
+            assert_eq!(
+                (own.sample, own.spend, verdict, reads.get()),
+                wanted,
+                "{case}"
+            );
+        }
+    }
+
+    /// The run-out's rule is exact: a plugin's own time and the grant in
+    /// full reach the budget or they do not, to the microsecond.
+    #[test]
+    fn a_spend_and_a_grant_reach_the_budget_to_the_microsecond() {
+        // A plugin's time before the call, the grant, the budget as seeded,
+        // and whether the plugin alone consumed it.
+        let table = [
+            (400, 599, 1_000, false),
+            (400, 600, 1_000, true),
+            (400, 601, 1_000, true),
+            (0, 999, 1_000, false),
+            (0, 1_000, 1_000, true),
+            (999, 0, 1_000, false),
+            (1_000, 0, 1_000, true),
+            // The sum saturates, and reaches.
+            (u64::MAX, 1, u64::MAX, true),
+            (u64::MAX - 1, 0, u64::MAX, false),
+        ];
+        for (spent, granted, seed, reached) in table {
+            assert_eq!(
+                reaches_the_budget(spent, granted, seed),
+                reached,
+                "{spent} and {granted} under {seed}"
+            );
+        }
+    }
 
     #[test]
     fn an_interface_name_yields_its_version_and_nothing_else_matches() {

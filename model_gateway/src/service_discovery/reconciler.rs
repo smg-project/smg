@@ -31,7 +31,7 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     observability::metrics::{metrics_labels, Metrics},
-    worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
+    worker::{identity::endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
 };
 
@@ -409,7 +409,7 @@ pub(super) async fn reconcile(
                 target
                     .guards
                     .iter()
-                    .map(|(id, revision)| (id.as_str().to_string(), *revision))
+                    .map(|(id, revision)| (id.as_str().to_string(), Some(*revision)))
                     .collect(),
             ),
         };

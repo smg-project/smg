@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::{
     bed::{enqueue, script_counts, Bed, BedConfig, ScriptCounts},
-    counters::{parse_jemalloc, snapshot, PerfStat, Snapshot},
+    counters::{parse_jemalloc, settled_snapshot, snapshot, PerfStat, Snapshot},
     gate, hms, loadavg, now_seconds,
     paths::{answers, interleaved_order, PathSpec},
     py_g,
@@ -295,7 +295,9 @@ fn measure(
     };
     thread::sleep(Duration::from_secs(1));
     let counters = perf.map(PerfStat::stop).unwrap_or_default();
-    let s1 = snapshot(bed)?;
+    // The memory after the window is the gated figure: it is read once the purge this
+    // snapshot's scrape starts has ended.
+    let s1 = settled_snapshot(bed)?;
     let script = spec.map(|_| script_counts(bed));
     Ok(Measured {
         summary,
@@ -838,10 +840,11 @@ fn soak_windows(
     let seconds = window_seconds(settings.requests, rate);
     let mut rows = Vec::new();
     let mut summaries = Vec::new();
+    // Every row is a memory read after idle seconds, as a cell's read after its window is.
     let row = |after: String| -> Result<SoakRow> {
         Ok(SoakRow {
             after,
-            snap: snapshot(bed)?,
+            snap: settled_snapshot(bed)?,
         })
     };
     thread::sleep(Duration::from_secs(2));

@@ -573,8 +573,8 @@ impl<'de> Deserialize<'de> for WireEvent {
                         fields.lora_name = lora_name.map(Loose::Text);
                         fields.cache_salt = cache_salt.map(Loose::Text);
                         fields.extra_keys = Some(next());
-                        for slot in 1..=7 {
-                            fields.tail[slot] = Some(next());
+                        for tail in &mut fields.tail[1..=7] {
+                            *tail = Some(next());
                         }
                     }
                     "BlockRemoved" => {
