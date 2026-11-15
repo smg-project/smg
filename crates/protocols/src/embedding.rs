@@ -31,7 +31,9 @@ pub struct EmbeddingRequest {
     pub input: Value,
 
     /// Optional encoding format of the vectors: `float`, `base64`, or one the
-    /// serving engine answers; the gateway does not read it.
+    /// serving engine answers. The gRPC path encodes `base64` itself (the
+    /// engine's wire carries floats) and answers floats for any other value;
+    /// the HTTP path forwards it to the engine.
     pub encoding_format: Option<String>,
 
     /// Optional user identifier

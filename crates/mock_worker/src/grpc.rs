@@ -589,8 +589,6 @@ pub(crate) type TokenizerStream =
 /// no KV cache, and the gateway pairs its workers on this one transport.
 pub(crate) const KV_TRANSPORT: &str = "mooncake";
 
-/// The name of the scheduler service a worker of `wire` serves: what the
-/// standard health service answers for, and what a gateway's detection asks.
 /// The vector the mock embeds an input into, deterministic from its ids so a
 /// bed can check an answer: eight dimensions, the first eight ids each over
 /// 1024, zero where the input is shorter.
@@ -600,6 +598,8 @@ pub(super) fn embedding_of(input_ids: &[u32]) -> Vec<f32> {
         .collect()
 }
 
+/// The name of the scheduler service a worker of `wire` serves: what the
+/// standard health service answers for, and what a gateway's detection asks.
 pub(crate) fn service_name(wire: SchedulerWire) -> &'static str {
     match wire {
         SchedulerWire::TokenSpeed => <tokenspeed::Server as NamedService>::NAME,
