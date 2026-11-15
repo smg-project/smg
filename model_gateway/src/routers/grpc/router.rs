@@ -302,6 +302,38 @@ impl GrpcRouter {
             .to_string()
     }
 
+    /// The model a body that names none is served as: it lands here carrying
+    /// the wildcard placeholder, and when the fleet serves exactly one real
+    /// model there is only one sane target, so it defaults to that model
+    /// instead of 404ing a request the registry could otherwise route
+    /// without ambiguity. Zero or several served models keep the
+    /// placeholder, and so the answer `model_not_found`. An untagged worker
+    /// (no model card, no `model_id` label) registers under the wildcard
+    /// itself (`Worker::model_id`'s fallback), so it is filtered out here:
+    /// otherwise it would mask a real single-model fleet behind a spurious
+    /// second entry. A named model is returned as given.
+    fn model_less_target<'a>(&self, model_id: &'a str) -> Cow<'a, str> {
+        if model_id != UNKNOWN_MODEL_ID {
+            return Cow::Borrowed(model_id);
+        }
+        let served_models: Vec<String> = self
+            .worker_registry
+            .get_models()
+            .into_iter()
+            .filter(|served| served != UNKNOWN_MODEL_ID)
+            .collect();
+        match served_models.as_slice() {
+            [only] => {
+                debug!(
+                    "Defaulting a model-less request to the single served model: {}",
+                    only
+                );
+                Cow::Owned(only.clone())
+            }
+            _ => Cow::Borrowed(model_id),
+        }
+    }
+
     /// Run a pipeline call for the canonical `model_id` under a tenant
     /// rate-limit reservation: the cell the pipeline reserves into, the
     /// model's retry config (keyed by the canonical id, see
@@ -414,35 +446,8 @@ impl GrpcRouter {
 
         // slime (and other native RL clients) never send `model` on
         // `/generate`, so the request lands here carrying the wildcard
-        // placeholder. When the fleet serves exactly one real model there is
-        // only one sane target, so default to it instead of 404ing a
-        // request the registry could otherwise route without ambiguity.
-        // Zero or several served models keep the current behavior:
-        // model_not_found. An untagged worker (no model card, no
-        // `model_id` label) registers under the wildcard itself
-        // (`Worker::model_id`'s fallback), so it is filtered out here:
-        // otherwise it would mask a real single-model fleet behind a
-        // spurious second entry.
-        let resolved_model_id: Cow<'_, str> = if model_id == UNKNOWN_MODEL_ID {
-            let served_models: Vec<String> = self
-                .worker_registry
-                .get_models()
-                .into_iter()
-                .filter(|served| served != UNKNOWN_MODEL_ID)
-                .collect();
-            match served_models.as_slice() {
-                [only] => {
-                    debug!(
-                        "Defaulting model-less generate request to the single served model: {}",
-                        only
-                    );
-                    Cow::Owned(only.clone())
-                }
-                _ => Cow::Borrowed(model_id),
-            }
-        } else {
-            Cow::Borrowed(model_id)
-        };
+        // placeholder.
+        let resolved_model_id = self.model_less_target(model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
@@ -1127,7 +1132,7 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ClassifyRequest,
+        mut body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
         let Some(classify_pipeline) = self.classify_pipeline.as_ref() else {
@@ -1135,9 +1140,15 @@ impl GrpcRouter {
         };
         debug!("Processing classify request for model: {}", model_id);
 
+        // SGLang's `/v1/classify` takes a body without `model`: it is served
+        // as the one model the fleet serves, as a model-less `/generate` is,
+        // and the body names that model from here on.
+        let model_id = self.model_less_target(model_id).into_owned();
+        body.model.clone_from(&model_id);
+
         // One dispatch, no retry loop, as before.
         self.execute_reserved(
-            model_id.to_string(),
+            model_id,
             |model_id, rate_limit_cell, _retry_config| async move {
                 classify_pipeline
                     .execute_classify(

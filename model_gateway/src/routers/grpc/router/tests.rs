@@ -102,6 +102,52 @@ async fn a_mode_without_the_endpoint_refuses_it_with_the_json_error_object() {
     }
 }
 
+/// A classify body without `model` is served as the one model the fleet
+/// serves, as a model-less `/generate` is: it reads that model's tokenizer
+/// and is answered as the body naming the model (here both refuse an id past
+/// the mock's vocabulary, before any worker is spoken to), not as a `404`
+/// for the placeholder. Beside a second served model it names neither, and
+/// is the `404 model_not_found`.
+#[tokio::test]
+async fn a_classify_body_without_model_is_served_as_the_one_served_model() {
+    async fn answer(router: &GrpcRouter, body: serde_json::Value) -> (StatusCode, String) {
+        let request: ClassifyRequest = serde_json::from_value(body).expect("a classify body");
+        let model = request.model.clone();
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let response = router
+            .route_classify(None, &tenant_meta, request, &model)
+            .await;
+        let code = error::extract_error_code_from_response(&response).to_owned();
+        (response.status(), code)
+    }
+    let (ctx, router) = regular_router_over_m(None).await;
+
+    let named = answer(&router, json!({"model": "m", "input": [99_999]})).await;
+    assert_eq!(
+        named,
+        (StatusCode::BAD_REQUEST, "invalid_input_token".to_owned()),
+        "the id is no token of the mock"
+    );
+    assert_eq!(answer(&router, json!({"input": [99_999]})).await, named);
+
+    let second = BasicWorkerBuilder::new("grpc://worker-n:30000")
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Grpc)
+        .model(ModelCard::new("n"))
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        })
+        .build();
+    ctx.worker_registry
+        .register(Arc::new(second))
+        .expect("register worker");
+    assert_eq!(
+        answer(&router, json!({"input": [99_999]})).await,
+        (StatusCode::NOT_FOUND, "model_not_found".to_owned())
+    );
+}
+
 /// The bound on a request to a gRPC worker is opt-in: a router built from a
 /// configuration that leaves `grpc_request_timeout_secs` at its default arms
 /// no deadline on any of its pipelines, whatever the HTTP bound

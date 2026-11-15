@@ -20,7 +20,8 @@ use super::validated::Normalizable;
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct TokenizeRequest {
     /// Model name for tokenizer selection. SGLang's `/tokenize` takes a body
-    /// without one; such a body is served by a loaded tokenizer.
+    /// without one; such a body is served by the one loaded tokenizer, and
+    /// refused while more than one is loaded.
     #[serde(
         default = "super::common::default_unknown_model",
         skip_serializing_if = "super::common::is_unknown_model"
@@ -77,8 +78,8 @@ pub enum CountResult {
 /// validation rule, as [`TokenizeRequest`] does not.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct DetokenizeRequest {
-    /// Model name for tokenizer selection; absent, a loaded tokenizer serves
-    /// the body, as for [`TokenizeRequest`].
+    /// Model name for tokenizer selection; absent, the one loaded tokenizer
+    /// serves the body, as for [`TokenizeRequest`].
     #[serde(
         default = "super::common::default_unknown_model",
         skip_serializing_if = "super::common::is_unknown_model"

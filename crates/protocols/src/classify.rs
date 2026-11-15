@@ -30,8 +30,8 @@ use super::{
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct ClassifyRequest {
     /// ID of the model to use. SGLang's `/v1/classify` takes a body without
-    /// one; such a body routes to any worker, as a model-less `/generate`
-    /// does, and is forwarded without it.
+    /// one; such a body is served as a model-less `/generate` body is, and is
+    /// forwarded without it.
     #[serde(
         default = "super::common::default_unknown_model",
         skip_serializing_if = "super::common::is_unknown_model"

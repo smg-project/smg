@@ -16,6 +16,7 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
     Router,
 };
+use llm_tokenizer::{traits::Tokenizer, MockTokenizer};
 use openai_protocol::{
     model_card::ModelCard,
     tokenize::{AddTokenizerResponse, TokenizeResponse, TokenizerInfo},
@@ -257,13 +258,30 @@ async fn a_model_alias_tokenizes_and_detokenizes_as_the_model_it_names() {
 
 /// SGLang's `/tokenize` and `/detokenize` take a body without `model`: the
 /// loaded tokenizer serves it, and the answer is the one a body naming the
-/// loaded model gets.
+/// loaded model gets, the context window of that model's worker included.
 #[tokio::test]
 async fn a_tokenize_or_detokenize_body_without_model_is_served_by_the_loaded_tokenizer() {
-    let app = app_with_a_loaded_tokenizer().await;
+    let (app, context) = app_and_context_with_a_loaded_tokenizer().await;
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://tokenize-model-less.invalid:8000")
+            .worker_type(WorkerType::Regular)
+            .models(vec![ModelCard::new(LOADED).with_context_length(8192)])
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    );
+    context.worker_registry.register(worker);
     let named = format!(r#"{{"model":"{LOADED}","prompt":"hi"}}"#);
     let (status, by_model) = send(&app, "POST", "/v1/tokenize", Some(&named)).await;
     assert_eq!(status, StatusCode::OK, "tokenize by the model: {by_model}");
+    let answer: TokenizeResponse = serde_json::from_str(&by_model)
+        .unwrap_or_else(|e| panic!("not a TokenizeResponse ({e}): {by_model}"));
+    assert_eq!(
+        answer.max_model_len, 8192,
+        "the worker's window: {by_model}"
+    );
     let (status, without) = send(&app, "POST", "/v1/tokenize", Some(r#"{"prompt":"hi"}"#)).await;
     assert_eq!(
         (status, without.as_str()),
@@ -289,6 +307,42 @@ async fn a_tokenize_or_detokenize_body_without_model_is_served_by_the_loaded_tok
         (status, by_model.as_str()),
         "detokenize without a model answers as by the loaded model"
     );
+}
+
+/// With a second tokenizer loaded, a tokenize or detokenize body without
+/// `model` names neither: it is refused as a `400 missing_model` in the
+/// public envelope, not read with whichever vocabulary sorts first. A body
+/// naming a model is served by its tokenizer.
+#[tokio::test]
+async fn a_body_without_model_is_refused_while_two_tokenizers_are_loaded() {
+    let (app, context) = app_and_context_with_a_loaded_tokenizer().await;
+    let second: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    context
+        .tokenizer_registry
+        .load(
+            "second-id",
+            "second-model",
+            "test",
+            || async move { Ok(second) },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("load the second tokenizer: {e}"));
+
+    for (path, body) in [
+        ("/v1/tokenize", r#"{"prompt":"hi"}"#),
+        ("/v1/detokenize", r#"{"tokens":[1,2,3]}"#),
+    ] {
+        let (status, text) = send(&app, "POST", path, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
+        assert_eq!(
+            public_envelope(&text)["code"],
+            "missing_model",
+            "{path}: {text}"
+        );
+    }
+    let named = format!(r#"{{"model":"{LOADED}","prompt":"hi"}}"#);
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(&named)).await;
+    assert_eq!(status, StatusCode::OK, "tokenize by the model: {text}");
 }
 
 /// An empty or whitespace name is refused before anything is queued: the

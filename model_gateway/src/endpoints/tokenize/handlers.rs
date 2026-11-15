@@ -8,7 +8,9 @@
 //! the worker routes use; an empty or whitespace name or source is refused
 //! up front, before a load job is queued for it. The tokenize and detokenize
 //! routes refuse in the gateway's public envelope, as the model routes do (an
-//! unknown model is a `404 model_not_found`).
+//! unknown model is a `404 model_not_found`); a body that names no model is
+//! served by the one loaded tokenizer, and refused as `missing_model` while
+//! more than one is loaded.
 
 use std::sync::Arc;
 
@@ -37,19 +39,23 @@ use crate::{
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 
-/// Get a tokenizer by model name, with fallback strategies: the name or id as
-/// given, then the model the worker registry resolves an alias to (the
-/// name the serving routes use), then any tokenizer for the unknown or empty
-/// model.
+/// The tokenizer that serves a tokenize or detokenize body, and the model it
+/// is the tokenizer of (whose workers' context window a tokenize answer
+/// reports): the name or id as given, then the model the worker registry
+/// resolves an alias to (the name the serving routes use), then, for a body
+/// that names no model (absent, empty or the unknown model), the one loaded
+/// tokenizer. With several loaded such a body names none of them, and is
+/// refused as `missing_model` rather than read with whichever vocabulary
+/// sorts first. A name no tokenizer serves is a `404 model_not_found`.
 fn get_tokenizer(
     workers: &WorkerRegistry,
     registry: &TokenizerRegistry,
     model: &str,
-) -> Result<Arc<dyn Tokenizer>, String> {
+) -> Result<(Arc<dyn Tokenizer>, String), Response> {
     // First, try exact match (by name or ID)
     if let Some(tokenizer) = registry.get(model) {
         debug!("Found tokenizer for model: {}", model);
-        return Ok(tokenizer);
+        return Ok((tokenizer, model.to_owned()));
     }
 
     // An alias tokenizes as the model it resolves to
@@ -59,35 +65,50 @@ fn get_tokenizer(
                 "Found tokenizer for model: {} (alias of {})",
                 model, canonical
             );
-            return Ok(tokenizer);
+            return Ok((tokenizer, canonical.to_string()));
         }
     }
 
-    // Try UNKNOWN_MODEL_ID if model is "unknown" or empty
+    let entries = registry.list();
+    let names = || {
+        entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // A body that names no model is the one loaded tokenizer's
     if model == UNKNOWN_MODEL_ID || model.is_empty() {
-        // Try to find any tokenizer as fallback
-        let entries = registry.list();
-        if let Some(first) = entries.first() {
-            debug!(
-                "Using first available tokenizer '{}' as default",
-                first.name
-            );
-            return Ok(first.tokenizer.clone());
+        match entries.as_slice() {
+            [only] => {
+                debug!("Using the one loaded tokenizer '{}' as default", only.name);
+                return Ok((only.tokenizer.clone(), only.name.clone()));
+            }
+            [] => {}
+            _ => {
+                return Err(error::bad_request(
+                    "missing_model",
+                    format!(
+                        "model is required while more than one tokenizer is loaded: name one of {}",
+                        names()
+                    ),
+                ));
+            }
         }
     }
 
     // List available tokenizers for error message
-    let entries = registry.list();
-    if entries.is_empty() {
-        Err("No tokenizers available. Use POST /v1/tokenizers to add one.".to_string())
+    let message = if entries.is_empty() {
+        "No tokenizers available. Use POST /v1/tokenizers to add one.".to_string()
     } else {
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        Err(format!(
+        format!(
             "Tokenizer for model '{}' not found. Available: {}",
             model,
-            names.join(", ")
-        ))
-    }
+            names()
+        )
+    };
+    Err(error::not_found("model_not_found", message))
 }
 
 // ============================================================================
@@ -98,15 +119,13 @@ fn get_tokenizer(
 pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Response {
     debug!("Tokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(
+    let (tokenizer, model) = match get_tokenizer(
         &context.worker_registry,
         &context.tokenizer_registry,
         &request.model,
     ) {
-        Ok(t) => t,
-        Err(e) => {
-            return error::not_found("model_not_found", e);
-        }
+        Ok(found) => found,
+        Err(refusal) => return refusal,
     };
 
     let texts = request.prompt.as_strings();
@@ -159,7 +178,7 @@ pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Re
         tokens,
         count,
         char_count,
-        max_model_len: model_context_window(&context.worker_registry, &request.model),
+        max_model_len: model_context_window(&context.worker_registry, &model),
     })
     .into_response()
 }
@@ -183,15 +202,13 @@ fn model_context_window(workers: &WorkerRegistry, model: &str) -> i64 {
 pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -> Response {
     debug!("Detokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(
+    let (tokenizer, _) = match get_tokenizer(
         &context.worker_registry,
         &context.tokenizer_registry,
         &request.model,
     ) {
-        Ok(t) => t,
-        Err(e) => {
-            return error::not_found("model_not_found", e);
-        }
+        Ok(found) => found,
+        Err(refusal) => return refusal,
     };
 
     let sequences = request.tokens.sequences();
@@ -449,16 +466,77 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
 
 #[cfg(test)]
 mod tests {
+    use llm_tokenizer::MockTokenizer;
+
     use super::*;
 
-    #[test]
-    fn test_get_tokenizer_empty_registry() {
+    /// The status, code and message of a refusal in the public envelope.
+    async fn refusal_of(response: Response) -> (StatusCode, String, String) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("the error envelope");
+        let field = |key: &str| body["error"][key].as_str().unwrap_or_default().to_owned();
+        (status, field("code"), field("message"))
+    }
+
+    /// Loads the mock tokenizer under `name` (its id too).
+    async fn load_mock(registry: &TokenizerRegistry, name: &str) {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        registry
+            .load(name, name, "test", || async move { Ok(tokenizer) })
+            .await
+            .expect("load the mock tokenizer");
+    }
+
+    #[tokio::test]
+    async fn test_get_tokenizer_empty_registry() {
         let workers = WorkerRegistry::new();
-        let registry = Arc::new(TokenizerRegistry::new());
-        let result = get_tokenizer(&workers, &registry, "any");
-        match result {
-            Err(e) => assert!(e.contains("No tokenizers available")),
-            Ok(_) => panic!("Expected error"),
+        let registry = TokenizerRegistry::new();
+        let Err(refusal) = get_tokenizer(&workers, &registry, "any") else {
+            panic!("Expected error");
+        };
+        let (status, code, message) = refusal_of(refusal).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::NOT_FOUND, "model_not_found")
+        );
+        assert!(message.contains("No tokenizers available"), "{message}");
+    }
+
+    /// A body that names no model (absent, which reads as the unknown model,
+    /// or empty) is served by the one loaded tokenizer, under that
+    /// tokenizer's name. With a second loaded it names neither, and is
+    /// refused as `missing_model`, the message naming both; a body naming
+    /// one is served by it.
+    #[tokio::test]
+    async fn a_body_without_a_model_is_served_only_while_one_tokenizer_is_loaded() {
+        let workers = WorkerRegistry::new();
+        let registry = TokenizerRegistry::new();
+        load_mock(&registry, "alpha").await;
+        for model in [UNKNOWN_MODEL_ID, ""] {
+            let Ok((_, name)) = get_tokenizer(&workers, &registry, model) else {
+                panic!("one tokenizer serves {model:?}");
+            };
+            assert_eq!(name, "alpha");
         }
+
+        load_mock(&registry, "beta").await;
+        for model in [UNKNOWN_MODEL_ID, ""] {
+            let Err(refusal) = get_tokenizer(&workers, &registry, model) else {
+                panic!("two tokenizers refuse {model:?}");
+            };
+            let (status, code, message) = refusal_of(refusal).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::BAD_REQUEST, "missing_model")
+            );
+            assert!(message.contains("alpha, beta"), "{message}");
+        }
+        let Ok((_, name)) = get_tokenizer(&workers, &registry, "beta") else {
+            panic!("a named tokenizer serves its model");
+        };
+        assert_eq!(name, "beta");
     }
 }
