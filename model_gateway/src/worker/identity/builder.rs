@@ -383,7 +383,7 @@ impl BasicWorkerBuilder {
         // URL through host:port parsing (which would warn and default to
         // localhost).
         if self.spec.connection_mode != ConnectionMode::Zmq {
-            self.spec.bootstrap_host = parse_bootstrap_host(&self.spec.url);
+            self.spec.bootstrap_host = bootstrap_host(&self.spec);
         }
 
         // Resolve health config: use explicit config if set, otherwise
@@ -465,49 +465,40 @@ impl BasicWorkerBuilder {
     }
 }
 
-/// Parse bootstrap hostname from a URL, falling back to "localhost".
+/// The host a worker's partners reach it at for the bootstrap handshake:
+/// the host of the address the worker is dialled at, as a client reads it,
+/// falling back to "localhost" for an address no client reads.
 ///
-/// Handles DP-aware URLs like `http://host:8080@3` by stripping the `@rank`
-/// suffix before parsing, since `@` is otherwise interpreted as a userinfo
-/// delimiter per RFC 3986.
-fn parse_bootstrap_host(url: &str) -> String {
-    // Strip DP rank suffix (e.g., "http://host:8080@3" -> "http://host:8080")
-    let clean_url = match url.rfind('@') {
-        Some(at_pos)
-            if !url[at_pos + 1..].is_empty()
-                && url[at_pos + 1..].chars().all(|c| c.is_ascii_digit()) =>
-        {
-            &url[..at_pos]
-        }
-        _ => url,
+/// A rank-expanded worker is dialled at its base, which the registration
+/// keeps beside the address it writes as `{base}@{rank}`. Any other worker
+/// is dialled at its address as written: an `@` and digits at its end are a
+/// userinfo and a host there, and no rank to strip. Stripped as one, they
+/// leave what stands before them as the host, and that may be a token:
+/// `http://token@8080` is the host `8080` behind a userinfo.
+fn bootstrap_host(spec: &WorkerSpec) -> String {
+    let dialled = match (&spec.dp_base_url, spec.dp_rank) {
+        (Some(base), Some(_)) => base.as_str(),
+        _ => spec.url.as_str(),
     };
-
-    // Try parsing as-is first. If the URL lacks a scheme (e.g., "worker1:8080"),
-    // Url::parse may treat the host as a scheme — detect this via missing host_str()
-    // and fall back to prefixing "http://".
-    let try_parse = |u: &str| -> Option<String> {
-        url::Url::parse(u)
+    let host_of = |address: &str| {
+        url::Url::parse(address)
             .ok()
-            .and_then(|p| p.host_str().map(|h| h.to_string()))
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
     };
-
-    if let Some(host) = try_parse(clean_url) {
-        host
-    } else if !clean_url.contains("://") {
-        try_parse(&format!("http://{clean_url}")).unwrap_or_else(|| {
-            tracing::warn!(
-                "Failed to parse URL '{}', defaulting to localhost",
-                Endpoint::redacted_str(url)
-            );
-            "localhost".to_string()
-        })
-    } else {
+    // Without a scheme (`worker1:8080`) the URL library takes the host for
+    // one and finds no host: such an address is read again behind `http://`.
+    let host = host_of(dialled).or_else(|| {
+        (!dialled.contains("://"))
+            .then(|| host_of(&format!("http://{dialled}")))
+            .flatten()
+    });
+    host.unwrap_or_else(|| {
         tracing::warn!(
             "Failed to parse URL '{}', defaulting to localhost",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_str(&spec.url)
         );
         "localhost".to_string()
-    }
+    })
 }
 
 #[cfg(test)]
@@ -838,31 +829,65 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_bootstrap_host_normal_url() {
-        assert_eq!(parse_bootstrap_host("http://worker1:8080"), "worker1");
-        assert_eq!(parse_bootstrap_host("https://10.0.0.5:443"), "10.0.0.5");
-        assert_eq!(
-            parse_bootstrap_host("grpc://cluster.local"),
-            "cluster.local"
-        );
+    /// The bootstrap host of a worker built from `url` alone, with no rank.
+    fn bootstrap_host_of(url: &str) -> String {
+        let worker = BasicWorkerBuilder::new(url).build();
+        worker.metadata().spec.bootstrap_host.clone()
     }
 
     #[test]
+    fn test_parse_bootstrap_host_normal_url() {
+        assert_eq!(bootstrap_host_of("http://worker1:8080"), "worker1");
+        assert_eq!(bootstrap_host_of("https://10.0.0.5:443"), "10.0.0.5");
+        assert_eq!(bootstrap_host_of("grpc://cluster.local"), "cluster.local");
+    }
+
+    /// A rank-expanded worker's bootstrap host is the host of its base: the
+    /// rank the registration appended is no part of it.
+    #[test]
     fn test_parse_bootstrap_host_dp_aware_url() {
-        // DP-aware URLs use @rank suffix — must extract host, not rank
-        assert_eq!(parse_bootstrap_host("http://worker1:8080@0"), "worker1");
-        assert_eq!(parse_bootstrap_host("http://worker1:8080@3"), "worker1");
-        assert_eq!(
-            parse_bootstrap_host("grpc://prefill.local@7"),
-            "prefill.local"
-        );
+        let rank_of = |base: &str, rank: usize| {
+            let worker = BasicWorkerBuilder::new(base).dp_config(rank, 8).build();
+            worker.metadata().spec.bootstrap_host.clone()
+        };
+        assert_eq!(rank_of("http://worker1:8080", 0), "worker1");
+        assert_eq!(rank_of("http://worker1:8080", 3), "worker1");
+        assert_eq!(rank_of("grpc://prefill.local", 7), "prefill.local");
     }
 
     #[test]
     fn test_parse_bootstrap_host_bare_host() {
-        assert_eq!(parse_bootstrap_host("worker1:8080"), "worker1");
-        assert_eq!(parse_bootstrap_host("localhost"), "localhost");
+        assert_eq!(bootstrap_host_of("worker1:8080"), "worker1");
+        assert_eq!(bootstrap_host_of("localhost"), "localhost");
+    }
+
+    /// A worker the registration did not expand has no rank to strip: an
+    /// `@` and digits at the end of its address are a userinfo and a host,
+    /// and its bootstrap host is that host, as a client dials it. Stripped
+    /// as a rank, they left the userinfo as the host: a token, written in
+    /// the registration probe's line and handed to the worker's partners.
+    #[test]
+    fn the_bootstrap_host_of_a_worker_with_no_rank_is_the_host_a_client_dials() {
+        for (url, host) in [
+            ("http://s3cret-token@2130706433", "127.0.0.1"),
+            ("https://s3cret-token@2130706433", "127.0.0.1"),
+            ("grpc://s3cret-token@2130706433", "2130706433"),
+            ("http://adm1n:s3cret@2130706433", "127.0.0.1"),
+            ("s3cret-token@2130706433", "127.0.0.1"),
+            ("http://s3cret-token@2130706433/", "127.0.0.1"),
+            ("http://adm1n:s3cret@2130706433/", "127.0.0.1"),
+        ] {
+            assert_eq!(bootstrap_host_of(url), host, "{url}");
+        }
+    }
+
+    /// An address no client reads falls back to "localhost".
+    #[test]
+    fn the_bootstrap_host_of_an_address_no_client_reads_is_localhost() {
+        assert_eq!(
+            bootstrap_host_of("http://s3cret-token@99999999999"),
+            "localhost"
+        );
     }
 
     #[test]
