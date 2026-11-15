@@ -52,7 +52,9 @@ class SchedulerOutputAdapter:
         """Own one stream; only the Python consumer permits absent legacy rows."""
         self._allow_empty_rows = allow_empty_rows
         self._rows: Callable[[Any], list[list[int]]] | None = None
-        self._usage: Callable[[Any], tuple[list[int], list[int]]] | None = None
+        self._usage: Callable[[SchedulerOutputAdapter, Any], tuple[list[int], list[int]]] | None = (
+            None
+        )
         self._counts: dict[str, tuple[int, int]] = {}
         self._has_dense_usage = False
 
@@ -82,8 +84,12 @@ class SchedulerOutputAdapter:
             if fields is None:
                 fields = vars(out)
             self._has_dense_usage = "prompt_tokens" in fields and "cached_tokens" in fields
-            self._usage = self._sparse_usage if "request_stats" in fields else self._dense_usage
-        return self._usage(out)
+            # Store an unbound reader: a bound sparse method would retain this
+            # adapter until cyclic GC, including one-shot embedding adapters.
+            self._usage = (
+                type(self)._sparse_usage if "request_stats" in fields else type(self)._dense_usage
+            )
+        return self._usage(self, out)
 
     def forget(self, rid: str) -> None:
         """Release retained counts on cancellation or terminal output."""
@@ -126,8 +132,7 @@ class SchedulerOutputAdapter:
             rows.append(tokens[start:end])
         return rows
 
-    @staticmethod
-    def _dense_usage(out: Any) -> tuple[list[int], list[int]]:
+    def _dense_usage(self, out: Any) -> tuple[list[int], list[int]]:
         """Reuse complete legacy columns without creating request state."""
 
         def column(values: list[int] | None) -> list[int]:

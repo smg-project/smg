@@ -1,5 +1,8 @@
 """Token rows and sparse usage remain lossless across SGLang output layouts."""
 
+import gc
+import platform
+import weakref
 from array import array
 from types import SimpleNamespace
 
@@ -95,7 +98,7 @@ def test_selection_is_once_per_socket_and_state_is_not_shared():
     assert adapter.read(empty_stats)[1:] == ([100, 200, 300], [20, 30, 40])
     assert other.read(empty_stats)[1:] == ([0, 0, 0], [0, 0, 0])
     assert adapter._rows == adapter._flat_rows
-    assert adapter._usage == adapter._sparse_usage
+    assert adapter._usage is SchedulerOutputAdapter._sparse_usage
 
 
 def test_empty_batch_can_select_the_msgspec_schema():
@@ -236,3 +239,28 @@ def test_counts_are_indexable_for_every_request(sparse):
         rows, prompts, cached = SchedulerOutputAdapter().read(out)
         assert len(rows) == len(prompts) == len(cached) == len(out.rids)
         assert prompts == cached == ([9, 0, 0] if values else [0, 0, 0])
+
+
+@pytest.mark.skipif(
+    platform.python_implementation() != "CPython", reason="requires reference counting"
+)
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("usage_only", [False, True], ids=["generation", "embedding"])
+def test_adapter_is_released_without_cyclic_gc(sparse, terminal, usage_only):
+    """Dropping a stream or temporary embedding adapter needs no cyclic collection."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        adapter = SchedulerOutputAdapter()
+        out = batch(sparse=sparse, finished_reasons=[{"type": "stop"}] * 3 if terminal else None)
+        if usage_only:
+            assert adapter.read_usage(out) == ([100, 200, 300], [20, 30, 40])
+        else:
+            assert adapter.read(out)[1:] == ([100, 200, 300], [20, 30, 40])
+        reference = weakref.ref(adapter)
+        del adapter
+        assert reference() is None
+    finally:
+        if was_enabled:
+            gc.enable()
