@@ -496,6 +496,7 @@ mod tests {
                 Ok(symphony::Prepared::Constraint {
                     constraint,
                     first_token,
+                    ..
                 }) => {
                     assert!(!first_token, "{extra}");
                     Some(constraint.to_tuple())
