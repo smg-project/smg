@@ -18,6 +18,7 @@ use smg::{
 };
 
 use crate::common::{
+    create_test_context, create_test_context_with_mcp_config,
     mock_mcp_server::{MockFailingMCPServer, MockMCPServer},
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
@@ -91,9 +92,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     let router_cfg = worker_router_config(worker_url);
 
     // Create router and context with MCP config from file
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
@@ -284,9 +283,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -422,9 +419,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -546,9 +541,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -669,9 +662,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let mcp_tool = ResponseTool::Mcp(McpTool {
@@ -842,9 +833,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -931,14 +920,18 @@ async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
-    let create_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_body.clone())
-            .await;
+    let create_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_body.clone(),
+    )
+    .await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
@@ -1009,11 +1002,16 @@ async fn ok_json(
 #[tokio::test]
 async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+    let ctx = create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
@@ -1033,11 +1031,16 @@ async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
 #[tokio::test]
 async fn items_added_with_string_content_are_listed_as_typed_parts(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+    let ctx = create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1131,11 +1134,16 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
 #[tokio::test]
 async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+    let ctx = create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1219,6 +1227,9 @@ fn test_responses_request_creation() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::Medium),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Auto),
         store: Some(true),
@@ -1380,6 +1391,9 @@ fn test_reasoning_param_default() {
     let param = ResponseReasoningParam {
         effort: Some(ReasoningEffort::Medium),
         summary: None,
+        mode: None,
+        context: None,
+        generate_summary: None,
     };
 
     let json = serde_json::to_string(&param).unwrap();
@@ -1419,6 +1433,9 @@ fn test_json_serialization() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::High),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Priority),
         store: Some(false),
@@ -1499,7 +1516,7 @@ async fn test_multi_turn_loop_with_mcp() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
@@ -1653,7 +1670,7 @@ async fn test_max_tool_calls_limit() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -1779,9 +1796,7 @@ async fn setup_streaming_mcp_test() -> (
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
@@ -2239,13 +2254,18 @@ async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
@@ -2343,13 +2363,14 @@ async fn items_of_one_add_call_are_listed_in_request_order(
     // Items that share a stamp are listed by their random ids, which is request order about
     // half of the time: twenty rounds, each with two items in one call and a third in the next.
     let router_cfg = conversation_router_config();
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     for round in 0..20 {
         let conv = conversation_json(
             conversations::create_conversation(
                 &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
                 None,
                 serde_json::json!({}),
             )
@@ -2461,7 +2482,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
 async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let router_cfg = conversation_router_config();
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let add_items = |conv_id: String, items: serde_json::Value| {
@@ -2499,8 +2520,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
     };
 
     let conv = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2536,8 +2562,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 
     // The same reference into another conversation links the item there, once.
     let other = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2574,13 +2605,18 @@ async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2675,13 +2711,18 @@ async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2721,13 +2762,18 @@ async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2766,22 +2812,30 @@ async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
-    let conv_a_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_a_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
     let conv_a_id = conv_a_json["id"].as_str().unwrap();
 
-    let conv_b_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_b_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -3193,7 +3247,7 @@ async fn external_router_with_mcp_yaml(
         .max_concurrent_requests(8)
         .build_unchecked();
     let cfg_path = cfg_path.to_str().expect("a utf-8 path");
-    let ctx = crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path).await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path).await;
     // A running gateway's registration job populates the format registry as
     // it connects each configured server; the test context connects them
     // itself, so the registry is populated here the same way.

@@ -62,7 +62,7 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
 /// with the public API's own codes.
 pub fn validate_with_betas(
     req: &CreateMessageRequest,
-    betas: &MessagesBetas,
+    betas: MessagesBetas,
 ) -> Result<(), ValidationError> {
     validate_thinking_budget(req, betas)?;
     validate_thread_beta(req, betas)
@@ -74,7 +74,7 @@ pub fn validate_with_betas(
 /// above `max_tokens`.
 fn validate_thinking_budget(
     req: &CreateMessageRequest,
-    betas: &MessagesBetas,
+    betas: MessagesBetas,
 ) -> Result<(), ValidationError> {
     let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking else {
         return Ok(());
@@ -97,7 +97,7 @@ fn validate_thinking_budget(
 /// never reaches this rule: it is forwarded unparsed, `thread` and all.
 fn validate_thread_beta(
     req: &CreateMessageRequest,
-    betas: &MessagesBetas,
+    betas: MessagesBetas,
 ) -> Result<(), ValidationError> {
     if req.thread.is_none() || betas.message_threads() {
         Ok(())
@@ -873,13 +873,18 @@ mod tests {
     fn betas_are_the_headers_dated_names() {
         let none = MessagesBetas::from_header_values([]);
         assert!(!none.message_threads() && !none.interleaved_thinking());
-        let listed = MessagesBetas::from_header_values([
+        let values = [
             "fine-grained-tool-streaming-2025-05-14, interleaved-thinking-2025-05-14",
             "message-threads-2026-08-12",
-        ]);
+        ];
+        let listed = MessagesBetas::from_header_values(values);
         assert!(listed.interleaved_thinking() && listed.message_threads());
-        assert!(listed.names("fine-grained-tool-streaming"));
-        assert!(!listed.names("fine-grained") && !listed.names("threads"));
+        assert!(MessagesBetas::values_name(
+            values,
+            "fine-grained-tool-streaming"
+        ));
+        assert!(!MessagesBetas::values_name(values, "fine-grained"));
+        assert!(!MessagesBetas::values_name(values, "threads"));
         for undated in [
             "message-threads",
             "message-threads-2026-8-12",
@@ -914,8 +919,8 @@ mod tests {
             }))
         };
         let plain = MessagesBetas::default();
-        assert!(validate_with_betas(&with_budget(4096, 1024), &plain).is_ok());
-        let refused = validate_with_betas(&with_budget(1024, 1024), &plain).expect_err("refused");
+        assert!(validate_with_betas(&with_budget(4096, 1024), plain).is_ok());
+        let refused = validate_with_betas(&with_budget(1024, 1024), plain).expect_err("refused");
         assert_eq!(refused.code, "thinking_budget_exceeds_max_tokens");
         assert_eq!(
             refused.message.as_deref(),
@@ -924,8 +929,8 @@ mod tests {
         let interleaved = MessagesBetas::from_header_values([
             "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
         ]);
-        assert!(validate_with_betas(&with_budget(1024, 1024), &interleaved).is_ok());
-        assert!(validate_with_betas(&with_budget(1024, 8192), &interleaved).is_ok());
+        assert!(validate_with_betas(&with_budget(1024, 1024), interleaved).is_ok());
+        assert!(validate_with_betas(&with_budget(1024, 8192), interleaved).is_ok());
     }
 
     /// A `thread` field needs the message-threads beta, as the public API
@@ -934,8 +939,8 @@ mod tests {
     fn a_thread_field_needs_the_message_threads_beta() {
         let thread = request(json!({"thread": {"type": "create"}}));
         let plain = MessagesBetas::default();
-        assert!(validate_with_betas(&request(json!({})), &plain).is_ok());
-        let refused = validate_with_betas(&thread, &plain).expect_err("refused");
+        assert!(validate_with_betas(&request(json!({})), plain).is_ok());
+        let refused = validate_with_betas(&thread, plain).expect_err("refused");
         assert_eq!(refused.code, "thread_beta_required");
         assert_eq!(
             refused.message.as_deref(),
@@ -944,7 +949,7 @@ mod tests {
         let named = MessagesBetas::from_header_values([
             "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
         ]);
-        assert!(validate_with_betas(&thread, &named).is_ok());
+        assert!(validate_with_betas(&thread, named).is_ok());
     }
 
     #[test]

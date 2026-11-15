@@ -9,7 +9,10 @@ use serde_with::skip_serializing_none;
 use validator::{Validate, ValidationError};
 
 use super::{
-    common::{default_true, deserialize_null_as_false, invalid, Function, GenerationRequest},
+    common::{
+        default_true, deserialize_null_as_false, empty_tool_name, invalid, Function,
+        GenerationRequest,
+    },
     sampling_params::validate_top_p_value,
     validated::Normalizable,
 };
@@ -108,40 +111,48 @@ impl GenerationRequest for InteractionsRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        fn extract_from_content(content: &Content) -> Option<String> {
+        fn text_of(content: &Content) -> Option<&str> {
             match content {
-                Content::Text { text, .. } => text.clone(),
+                Content::Text { text, .. } => text.as_deref(),
                 _ => None,
             }
         }
 
-        fn extract_from_turn(turn: &Turn) -> String {
-            match &turn.content {
-                Some(TurnContent::Text(text)) => text.clone(),
-                Some(TurnContent::Contents(contents)) => contents
-                    .iter()
-                    .filter_map(extract_from_content)
-                    .collect::<Vec<String>>()
-                    .join(" "),
-                None => String::new(),
+        /// `texts` into `buffer`, a space between each: the shape `join(" ")`
+        /// gives, empty pieces included.
+        fn push_joined<'a>(buffer: &mut String, texts: impl Iterator<Item = &'a str>) {
+            for (index, text) in texts.enumerate() {
+                if index > 0 {
+                    buffer.push(' ');
+                }
+                buffer.push_str(text);
             }
         }
 
         match &self.input {
             InteractionsInput::Text(text) => text.clone(),
-            InteractionsInput::Content(content) => {
-                extract_from_content(content).unwrap_or_default()
+            InteractionsInput::Content(content) => text_of(content).unwrap_or_default().to_owned(),
+            InteractionsInput::Contents(contents) => {
+                let mut buffer = String::new();
+                push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                buffer
             }
-            InteractionsInput::Contents(contents) => contents
-                .iter()
-                .filter_map(extract_from_content)
-                .collect::<Vec<String>>()
-                .join(" "),
-            InteractionsInput::Turns(turns) => turns
-                .iter()
-                .map(extract_from_turn)
-                .collect::<Vec<String>>()
-                .join(" "),
+            InteractionsInput::Turns(turns) => {
+                let mut buffer = String::new();
+                for (index, turn) in turns.iter().enumerate() {
+                    if index > 0 {
+                        buffer.push(' ');
+                    }
+                    match &turn.content {
+                        Some(TurnContent::Text(text)) => buffer.push_str(text),
+                        Some(TurnContent::Contents(contents)) => {
+                            push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                        }
+                        None => {}
+                    }
+                }
+                buffer
+            }
         }
     }
 }
@@ -1127,6 +1138,12 @@ fn validate_tools(tools: &[InteractionsTool]) -> Result<(), ValidationError> {
     {
         return Err(ValidationError::new("file_search_tool_not_supported"));
     }
+    // A function has a name
+    for (index, tool) in tools.iter().enumerate() {
+        if matches!(tool, InteractionsTool::Function(function) if function.name.is_empty()) {
+            return Err(empty_tool_name(&format!("tools[{index}].name")));
+        }
+    }
     Ok(())
 }
 
@@ -1244,6 +1261,34 @@ mod tests {
         )
     }
 
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: no client can dispatch a call that names nothing. The place
+    /// counts every tool, the built-in one ahead of the functions too. A
+    /// named function and a built-in tool, which has no name, pass.
+    #[test]
+    fn a_function_tool_has_a_name() {
+        let tools = |names: &[&str]| -> Vec<InteractionsTool> {
+            let mut tools = vec![InteractionsTool::GoogleSearch {}];
+            tools.extend(names.iter().map(|name| {
+                serde_json::from_value::<InteractionsTool>(
+                    serde_json::json!({"type": "function", "name": name}),
+                )
+                .expect("a function tool")
+            }));
+            tools
+        };
+        assert_eq!(
+            refusal(validate_tools(&tools(&["f", ""]))),
+            (
+                "empty_string".to_string(),
+                "Invalid 'tools[2].name': empty string. Expected a string with minimum length 1, \
+                 but got an empty string instead."
+                    .to_string()
+            )
+        );
+        assert!(validate_tools(&tools(&["f", "g"])).is_ok());
+    }
+
     /// Each cross-field refusal keeps its code and its message.
     #[test]
     fn the_cross_field_refusals_keep_their_codes_and_messages() {
@@ -1327,5 +1372,43 @@ mod tests {
                 "Stop sequences cannot contain empty strings".to_string()
             )
         );
+    }
+
+    /// The routing text joins every text piece with one space, empty pieces
+    /// and content-less turns included, and drops non-text content: the
+    /// shape `join(" ")` gave, which a request's prefix-cache hash depends on.
+    #[test]
+    fn the_routing_text_joins_each_text_with_one_space() {
+        let cases = [
+            (serde_json::json!("plain"), "plain"),
+            (serde_json::json!({"type": "text", "text": "one"}), "one"),
+            (serde_json::json!({"type": "image", "uri": "u"}), ""),
+            (
+                serde_json::json!([
+                    {"type": "text", "text": "a"},
+                    {"type": "image", "uri": "u"},
+                    {"type": "text"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "b"}
+                ]),
+                "a  b",
+            ),
+            (
+                serde_json::json!([
+                    {"role": "user", "content": "first"},
+                    {"role": "model"},
+                    {"role": "user", "content": [{"type": "image", "uri": "u"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}
+                ]),
+                "first   x y",
+            ),
+        ];
+        for (input, expected) in cases {
+            let request = InteractionsRequest {
+                input: serde_json::from_value(input.clone()).expect("an input"),
+                ..Default::default()
+            };
+            assert_eq!(request.extract_text_for_routing(), expected, "{input}");
+        }
     }
 }

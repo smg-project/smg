@@ -1,16 +1,21 @@
 //! The grammar spelled for the grammar backend a worker's engine runs: the one place a [`Grammar`]
 //! becomes the text a request carries. xgrammar takes the structural tag the tree serializes to
 //! ([`Grammar::payload_text`]), in the vocabulary the worker's compiler reads
-//! ([`Grammar::in_older_vocabulary`] for an older one). The other backends the engines run take
-//! other spellings of the same tree, each added beside this one; a backend with no spelling for a
-//! grammar refuses it by name here, before the request leaves, instead of sending a text its
-//! compiler would reject with its own words after the prompt ran.
+//! ([`Grammar::in_older_vocabulary`] for an older one); outlines takes a JSON schema alone, as its
+//! text. The other backends the engines run take other spellings of the same tree, each added
+//! beside this one; a backend with no spelling for a grammar refuses it by name here, before the
+//! request leaves, instead of sending a text its compiler would reject with its own words after
+//! the prompt ran.
 
 use std::fmt;
 
 use openai_protocol::worker::TagVocabulary;
 
 use super::Grammar;
+
+mod lark;
+
+pub use self::lark::{AddedTokens, Inexpressible, Lark};
 
 /// The grammar backend a worker's engine compiles constraints on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,6 +51,9 @@ impl fmt::Display for GrammarBackend {
 pub enum Spelling {
     /// The structural tag, written straight from the tree.
     StructuralTag(String),
+    /// A JSON schema alone, written as the text the engines' JSON-schema constraint takes: the
+    /// outlines backend's one spelling, for an answer the engine starts at the schema.
+    JsonSchema(String),
 }
 
 /// A grammar the backend has no spelling for. The request is refused with the backend's name.
@@ -70,8 +78,9 @@ impl std::error::Error for Unspelled {}
 impl Grammar {
     /// The grammar spelled for `backend`, in the `vocabulary` its compiler reads: for xgrammar
     /// the structural tag [`Grammar::payload_text`] writes, byte for byte, spelled without the
-    /// newer nodes for an older compiler ([`Grammar::in_older_vocabulary`]). A backend with no
-    /// spelling of the tree refuses it by name.
+    /// newer nodes for an older compiler ([`Grammar::in_older_vocabulary`]); for outlines a JSON
+    /// schema alone, as its text ([`Grammar::json_schema_alone`]). A backend with no spelling of
+    /// the tree refuses it by name.
     pub fn spelled(
         self,
         backend: GrammarBackend,
@@ -82,7 +91,30 @@ impl Grammar {
                 TagVocabulary::Current => self.payload_text(),
                 TagVocabulary::Older => self.in_older_vocabulary().payload_text(),
             })),
-            GrammarBackend::Llguidance | GrammarBackend::Outlines => Err(Unspelled { backend }),
+            GrammarBackend::Outlines => self
+                .json_schema_alone()
+                .map(Spelling::JsonSchema)
+                .ok_or(Unspelled { backend }),
+            GrammarBackend::Llguidance => Err(Unspelled { backend }),
+        }
+    }
+
+    /// The text of a grammar that is one JSON schema alone, in the plain JSON style and with no
+    /// excluded words: the one tree the outlines backend has a spelling of, since it builds a
+    /// regular expression from a schema and nothing wider (no text around the schema, no tag, no
+    /// words held out of its strings). Its whitespace bound is not written: that backend keeps
+    /// its own whitespace pattern, as an older xgrammar does.
+    pub fn json_schema_alone(&self) -> Option<String> {
+        match self {
+            Self::JsonSchema {
+                schema,
+                style,
+                excludes,
+                ..
+            } if style.as_deref().is_none_or(|style| style == "json") && excludes.is_empty() => {
+                Some(schema.to_string())
+            }
+            _ => None,
         }
     }
 }

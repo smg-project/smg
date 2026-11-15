@@ -27,7 +27,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::{common::retry::mark_non_retryable, error},
     worker::{
-        overload::{
+        health::overload::{
             BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_OVERLOADED_SHED,
             BRANCH_ALL_STALLED_FALLBACK, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
             STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn fallback_respects_open_and_half_open_circuit_execution() {
-        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        use crate::worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
 
         let w: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://127.0.0.1:9871")
@@ -564,7 +564,7 @@ mod tests {
     /// to an overloaded one.
     #[test]
     fn all_stalled_falls_back_to_the_least_loaded_ready_worker() {
-        use crate::worker::basic::StallReason;
+        use crate::worker::identity::basic::StallReason;
 
         let a = worker("http://127.0.0.1:9841", "m");
         let b = worker("http://127.0.0.1:9842", "m");

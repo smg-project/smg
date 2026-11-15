@@ -75,9 +75,10 @@ impl ToolLoopState {
 
     /// The `mcp_list_tools` items of the bindings this loop announces: every
     /// server of the session without an item in the history the request
-    /// continues, the internal servers' among them (the final response leaves
-    /// those out). Built once, each tool's schema copied into them once: the
-    /// stream's start and the final response render the same items.
+    /// continues, the internal servers' left out (the stream announces what
+    /// the final response and the stored record carry). Built once, each
+    /// tool's schema copied into them once: the stream's start and the final
+    /// response render the same items.
     pub fn mcp_list_tools_items(&mut self, session: &McpToolSession<'_>) -> &[Value] {
         self.mcp_list_tools_items.get_or_insert_with(|| {
             mcp_list_tools_bindings_to_emit(
@@ -85,6 +86,7 @@ impl ToolLoopState {
                 session.mcp_servers(),
             )
             .iter()
+            .filter(|(server_label, _)| !session.is_internal_non_builtin_server_label(server_label))
             .map(|(server_label, server_key)| {
                 openai_bridge::mcp_list_tools_json(session, server_label, server_key)
             })
@@ -870,22 +872,10 @@ pub(crate) fn mcp_list_tools_bindings_to_emit(
         .collect()
 }
 
-/// Inject MCP metadata into a streaming response: the loop's output prefix
-/// in front of the response's output, the kept `mcp_list_tools` items copied
-/// (the `response.completed` event, which is not the last render; see
-/// [`inject_mcp_metadata_last`]).
-pub(crate) fn inject_mcp_metadata_streaming(
-    response: &mut Value,
-    state: &mut ToolLoopState,
-    session: &McpToolSession<'_>,
-) {
-    let prefix = mcp_output_prefix(state, session, 0);
-    inject_mcp_output_prefix(response, prefix);
-}
-
-/// Inject MCP metadata into a response's last render: the stored record on
-/// the streaming path, the answered response on the non-streaming path. The
-/// kept `mcp_list_tools` items move into it; nothing reads them afterwards.
+/// Inject MCP metadata into a response's last render: the streamed loop's
+/// final response (the wire and the record share it), the answered response
+/// on the non-streaming path. The kept `mcp_list_tools` items move into it;
+/// nothing reads them afterwards.
 pub(crate) fn inject_mcp_metadata_last(
     response: &mut Value,
     state: &mut ToolLoopState,
@@ -906,44 +896,24 @@ fn inject_mcp_output_prefix(response: &mut Value, prefix: Vec<Value>) {
     }
 }
 
-/// The items the loop renders in front of a response's output: its
-/// `mcp_list_tools` items (copied: the `response.completed` render, which is
-/// not the last reader; see [`mcp_output_prefix_last`]), then the calls it
-/// executed (the stored transformed items, no reconstruction), the internal
-/// servers' left out; with room for `extra` items the caller appends.
-fn mcp_output_prefix(
-    state: &mut ToolLoopState,
-    session: &McpToolSession<'_>,
-    extra: usize,
-) -> Vec<Value> {
-    let list_tools_items: Vec<Value> = state
-        .mcp_list_tools_items(session)
-        .iter()
-        .filter(|item| !is_internal_list_tools_item(item, session))
-        .cloned()
-        .collect();
-    mcp_output_prefix_with(list_tools_items, state, session, extra)
-}
-
 /// The prefix of a response's last render: the kept `mcp_list_tools` items
 /// moved, not copied (the answered, the approval and the tool-call-limit
-/// responses of the non-streaming path, the stored record of the streaming
-/// one); nothing reads them afterwards.
+/// responses of the non-streaming path, the streamed loop's final response
+/// that the wire and the record share), then the calls the loop executed
+/// (the stored transformed items, no reconstruction), the internal servers'
+/// left out; with room for `extra` items the caller appends. Nothing reads
+/// the moved items afterwards.
 fn mcp_output_prefix_last(
     state: &mut ToolLoopState,
     session: &McpToolSession<'_>,
     extra: usize,
 ) -> Vec<Value> {
-    let list_tools_items: Vec<Value> = state
-        .take_mcp_list_tools_items(session)
-        .into_iter()
-        .filter(|item| !is_internal_list_tools_item(item, session))
-        .collect();
+    let list_tools_items = state.take_mcp_list_tools_items(session);
     mcp_output_prefix_with(list_tools_items, state, session, extra)
 }
 
-/// The prefix around `mcp_list_tools` items the caller already owns (copied
-/// or taken), then the executed calls.
+/// The prefix around the `mcp_list_tools` items the caller took, then the
+/// executed calls.
 fn mcp_output_prefix_with(
     list_tools_items: Vec<Value>,
     state: &ToolLoopState,
@@ -961,13 +931,6 @@ fn mcp_output_prefix_with(
             .cloned(),
     );
     prefix
-}
-
-/// An `mcp_list_tools` item of one of the session's internal servers.
-fn is_internal_list_tools_item(item: &Value, session: &McpToolSession<'_>) -> bool {
-    item.get("server_label")
-        .and_then(Value::as_str)
-        .is_some_and(|server_label| session.is_internal_server_label(server_label))
 }
 
 fn build_approval_response(
@@ -2663,6 +2626,86 @@ mod tests {
             series[0].contains("result=\"error\"") && series[0].ends_with(" 1"),
             "counted once: {}",
             series[0]
+        );
+    }
+
+    /// The loop announces only what a client may see: an internal server's
+    /// `mcp_list_tools` item is left out of the kept items, so the stream's
+    /// start, the completed event and the stored record agree; a visible
+    /// server keeps its item when an internal builtin-routed binding shares
+    /// its label (the predicate the other renders use, not the label-wide one).
+    #[tokio::test]
+    async fn an_internal_servers_list_tools_item_is_not_announced() {
+        let server = |name: &str, port: u16, internal: bool| McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Sse {
+                url: format!("http://localhost:{port}/sse"),
+                token: None,
+                headers: Default::default(),
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: None,
+            builtin_tool_name: None,
+            internal,
+        };
+        let orchestrator = McpOrchestrator::new(McpConfig {
+            servers: vec![
+                server("wiki-server", 3000, false),
+                server("ledger-server", 3001, true),
+                McpServerConfig {
+                    builtin_type: Some(BuiltinToolType::WebSearchPreview),
+                    builtin_tool_name: Some("brave_web_search".to_string()),
+                    ..server("search-server", 3002, true)
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("orchestrator");
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "wiki-server",
+                test_tool("ask_wiki"),
+            ));
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "ledger-server",
+                test_tool("post_entry"),
+            ));
+        let binding = |label: &str, server_key: &str| McpServerBinding {
+            label: label.to_string(),
+            server_key: server_key.to_string(),
+            allowed_tools: None,
+        };
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![
+                binding("wiki", "wiki-server"),
+                binding("ledger", "ledger-server"),
+                // An internal builtin-routed binding under the visible server's label.
+                binding("wiki", "search-server"),
+            ],
+            "test-request",
+        );
+        assert!(session.is_internal_non_builtin_server_label("ledger"));
+        // The label-wide predicate would drop the visible server's item.
+        assert!(session.is_internal_server_label("wiki"));
+        assert!(!session.is_internal_non_builtin_server_label("wiki"));
+
+        let mut state = ToolLoopState::new(Vec::new());
+        let labels: Vec<&str> = state
+            .mcp_list_tools_items(&session)
+            .iter()
+            .map(|item| item["server_label"].as_str().unwrap_or("?"))
+            .collect();
+        assert_eq!(
+            labels,
+            ["wiki"],
+            "the internal server's item is not announced"
         );
     }
 

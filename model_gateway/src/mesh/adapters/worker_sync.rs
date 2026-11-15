@@ -78,8 +78,10 @@ use tracing::{debug, info, warn};
 use crate::{
     service_discovery::DISCOVERY_ID_LABEL,
     worker::{
-        endpoint::Endpoint, endpoint_key, event::WorkerEvent, registry::WorkerId, ConnectionMode,
-        EndpointKey, Worker, WorkerOrigin, WorkerRegistry,
+        endpoint_key,
+        identity::endpoint::Endpoint,
+        registry::{event::WorkerEvent, WorkerId},
+        ConnectionMode, EndpointKey, Worker, WorkerOrigin, WorkerRegistry,
     },
 };
 

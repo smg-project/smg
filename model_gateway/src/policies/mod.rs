@@ -9,7 +9,8 @@ use rand::RngExt as _;
 
 use crate::{
     config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker, UNKNOWN_MODEL_ID},
+    policies::hash_ring::HashRing,
+    worker::{load::state::LoadReceiver, runtime::RoutingState, Worker, UNKNOWN_MODEL_ID},
 };
 
 mod bucket;
@@ -18,9 +19,9 @@ mod cache_namespace;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
-pub mod engine_host;
+pub mod expected_wait;
 mod factory;
-pub mod host_stores;
+pub mod hash_ring;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -38,7 +39,6 @@ pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
-pub use engine_host::Decider;
 pub use factory::PolicyFactory;
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
@@ -479,6 +479,44 @@ pub struct SelectWorkerInfo<'a> {
     /// placement over regular workers also sets it for a request its policy
     /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
     pub overload_lifted: bool,
+    /// The list of the routing snapshot the candidates are cut from, when
+    /// the caller names it ([`NamedList`]). A policy that keeps state per
+    /// list finds it by the list's own address, whatever part of the list
+    /// this request may use; without a name the policy reads which workers
+    /// it was handed.
+    pub named: Option<NamedList<'a>>,
+}
+
+/// The candidates of a selection as a part of a list the routing snapshot
+/// owns. The list never changes while it lives (a membership change makes a
+/// new one), so its address names it, and a candidate is a position in it.
+#[derive(Clone, Copy)]
+pub struct NamedList<'a> {
+    /// The snapshot's own list.
+    pub list: &'a Arc<[Arc<dyn Worker>]>,
+    /// Candidate `k` is `list[positions[k]]`, ascending; `None` when the
+    /// candidates are the whole list in its order.
+    pub positions: Option<&'a [usize]>,
+}
+
+impl NamedList<'_> {
+    /// The candidate that is the list's worker at `row`, when the request
+    /// may use that worker.
+    pub(crate) fn candidate(&self, row: usize) -> Option<usize> {
+        match self.positions {
+            None => Some(row),
+            Some(positions) => positions.binary_search(&row).ok(),
+        }
+    }
+}
+
+impl Debug for NamedList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamedList")
+            .field("list", &self.list.len())
+            .field("positions", &self.positions.map(<[usize]>::len))
+            .finish()
+    }
 }
 
 impl SelectWorkerInfo<'_> {
@@ -678,7 +716,9 @@ mod tests {
 
         use openai_protocol::worker::WorkerStatus;
 
-        use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker};
+        use crate::worker::{
+            health::circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker,
+        };
 
         fn worker(url: &str) -> Arc<dyn Worker> {
             let worker: Arc<dyn Worker> = Arc::new(

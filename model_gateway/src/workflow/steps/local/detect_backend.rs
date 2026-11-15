@@ -17,7 +17,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::discover_metadata::ModelsResponse;
 use crate::{
-    worker::{endpoint::Endpoint, ConnectionMode},
+    worker::{identity::endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
@@ -515,9 +515,8 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn http_detection_failures_name_the_worker_masked() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
 
         let err = detect_http_backend(
             &format!("http://user:secret@127.0.0.1:{port}"),

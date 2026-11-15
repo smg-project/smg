@@ -7,7 +7,7 @@ use super::*;
 use crate::{
     observability::worker_metrics::{self, WorkerSeriesRecorder},
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         test_support::no_health_check,
         BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
     },
@@ -1260,7 +1260,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
+            .remove_inner(&id, Some(WorkerOrigin::Mesh))
             .is_none(),
         "removal must abort when the origin no longer matches"
     );
@@ -1748,9 +1748,9 @@ fn routing_pool_alias_reuses_canonical_snapshot() {
     assert!(Arc::ptr_eq(&canonical, &alias));
 }
 
-// Health-checker integration tests moved to worker/manager.rs along with
+// Health-checker integration tests moved to worker/health/manager.rs along with
 // the loop itself. The registry is now a pure collection — see
-// `worker::manager::WorkerManager` tests.
+// `worker::health::manager::WorkerManager` tests.
 
 #[test]
 fn test_transition_status_emits_event_and_changes_status() {

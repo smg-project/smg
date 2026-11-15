@@ -8,8 +8,9 @@ use serde_json::json;
 
 use super::*;
 use crate::{
+    format::Whitespace,
     formats::Table,
-    grammar::{GrammarStart, Options},
+    grammar::{Bound, GrammarStart, Options, Tag},
 };
 
 fn tool(name: &str, parameters: serde_json::Value) -> Tool {
@@ -25,7 +26,7 @@ fn tool(name: &str, parameters: serde_json::Value) -> Tool {
     }
 }
 
-fn tools() -> Vec<Tool> {
+pub(super) fn tools() -> Vec<Tool> {
     vec![
         tool(
             "get_weather",
@@ -37,7 +38,7 @@ fn tools() -> Vec<Tool> {
 
 /// Every registry table's forced tag, `auto` tag and JSON answer, for both bounds on the calls
 /// and every start: the grammars the gateway sends.
-fn every_grammar() -> Vec<(String, Grammar)> {
+pub(super) fn every_grammar() -> Vec<(String, Grammar)> {
     let tools = tools();
     let schema = Arc::new(json!({"type": "object", "properties": {"answer": {"type": "string"}}}));
     let mut grammars = Vec::new();
@@ -103,6 +104,83 @@ fn xgrammar_spelling_is_the_structural_tag_byte_for_byte() {
             "{name}"
         );
     }
+}
+
+/// The outlines backend builds a regular expression from one JSON schema and nothing wider: a
+/// schema alone, in the plain JSON style and with no excluded words, is spelled as its text (the
+/// whitespace bound left to the backend); a schema the template's text leads or follows, a tag, a
+/// schema in an XML style or one with excluded words is refused by the backend's name. Over the
+/// registry, the answers an engine starts at the schema spell and every call grammar is refused.
+#[test]
+fn outlines_takes_a_json_schema_alone_and_refuses_the_rest() {
+    let backend = GrammarBackend::Outlines;
+    let schema = Arc::new(json!({"type": "object", "properties": {"answer": {"type": "string"}}}));
+    let node =
+        |style: Option<&str>, excludes: &[&str], whitespace: Whitespace| Grammar::JsonSchema {
+            schema: Arc::clone(&schema),
+            style: style.map(str::to_string),
+            excludes: excludes.iter().map(|word| word.to_string()).collect(),
+            whitespace,
+        };
+    for (plain, vocabulary) in [
+        (node(None, &[], Whitespace::Free), TagVocabulary::Current),
+        (
+            node(Some("json"), &[], Whitespace::Bounded(4)),
+            TagVocabulary::Older,
+        ),
+    ] {
+        let spelled = plain
+            .spelled(backend, vocabulary)
+            .expect("a schema alone is spelled");
+        let Spelling::JsonSchema(text) = &spelled else {
+            panic!("{spelled:?}");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text).expect("the schema's text"),
+            *schema
+        );
+    }
+    let led = Grammar::Sequence(vec![
+        Grammar::ConstString("\n".to_string()),
+        node(None, &[], Whitespace::Free),
+    ]);
+    for (name, wider) in [
+        ("an XML style", node(Some("glm_xml"), &[], Whitespace::Free)),
+        (
+            "excluded words",
+            node(None, &["</answer>"], Whitespace::Free),
+        ),
+        ("text before the schema", led),
+        (
+            "a tag",
+            Grammar::Tag(Tag {
+                begin: "<a>".to_string(),
+                content: Box::new(node(None, &[], Whitespace::Free)),
+                end: Bound::Text("</a>".to_string()),
+            }),
+        ),
+    ] {
+        assert_eq!(
+            wider.spelled(backend, TagVocabulary::Current),
+            Err(Unspelled { backend }),
+            "{name}"
+        );
+    }
+    let grammars = every_grammar();
+    let mut answers = 0;
+    for (name, grammar) in &grammars {
+        let outcome = grammar.clone().spelled(backend, TagVocabulary::Current);
+        if name.contains(" calls ") {
+            assert_eq!(outcome, Err(Unspelled { backend }), "{name}");
+        } else if outcome.is_ok() {
+            assert!(
+                matches!(grammar, Grammar::JsonSchema { .. }),
+                "{name}: {grammar:?}"
+            );
+            answers += 1;
+        }
+    }
+    assert!(answers > 0, "no answer spelled for outlines");
 }
 
 #[test]

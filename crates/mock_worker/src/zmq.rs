@@ -928,7 +928,7 @@ pub async fn serve_until(
                             forward.await;
                         })
                     }
-                    late => forwarders.spawn(async move {
+                    late @ HandOver::After(..) => forwarders.spawn(async move {
                         let _unfinished = late.landed().await;
                         start();
                         forward.await;

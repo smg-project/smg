@@ -1273,7 +1273,7 @@ impl Health for MockHealth {
                         ));
                     }
                     let stopping = tokio::select! {
-                        _ = tokio::time::sleep(HEALTH_WATCH_INTERVAL) => false,
+                        () = tokio::time::sleep(HEALTH_WATCH_INTERVAL) => false,
                         _ = stopped.wait_for(|stop| *stop) => true,
                     };
                     if stopping {
@@ -1557,13 +1557,13 @@ fn scripted_stream(
     struct Choice {
         index: u32,
         answer: Answer,
-        frames: std::collections::VecDeque<script::Frame>,
+        frames: VecDeque<script::Frame>,
         /// Output tokens sent so far (the chunks' running `completion_tokens`).
         sent: u32,
         started: bool,
     }
     struct Scripted {
-        choices: std::collections::VecDeque<Choice>,
+        choices: VecDeque<Choice>,
         prompt_len: usize,
         stream_chunks: bool,
         logprobs: Option<usize>,
@@ -1726,7 +1726,7 @@ fn pending_u32(counter: &AtomicU64) -> u32 {
 
 /// The engine's silence on its in-flight requests, as the Rust servicer's
 /// record carries it (`EngineLoad.engine_silence_ms`).
-fn silence_ms(engine: &engine::Engine) -> Option<u32> {
+fn silence_ms(engine: &Engine) -> Option<u32> {
     engine
         .output_silence()
         .map(|silence| u32::try_from(silence.as_millis()).unwrap_or(u32::MAX))
@@ -1771,7 +1771,7 @@ const HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
 /// Where a rank's load record comes from: its engine and the prompt tokens
 /// handed to it with no token yet.
 struct RankLoadSource {
-    engine: engine::Engine,
+    engine: Engine,
     prefill_pending: Arc<AtomicU64>,
 }
 
@@ -1812,7 +1812,7 @@ struct LoadRecordsOnly {
     clocks: Vec<RankClock>,
     like: LoadsLike,
     step_reports: bool,
-    pending: std::collections::VecDeque<common::KvEventBatch>,
+    pending: VecDeque<common::KvEventBatch>,
     next_tick: Instant,
     sample: u64,
 }
@@ -1888,7 +1888,7 @@ fn load_records_only(
         ranks,
         like,
         step_reports,
-        pending: std::collections::VecDeque::new(),
+        pending: VecDeque::new(),
         next_tick: Instant::now(),
         sample: 0,
     };
@@ -2075,6 +2075,7 @@ fn profile_response(result: Result<String, String>) -> common::ProfileResponse {
 #[cfg(test)]
 mod tests {
     use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
+    use tokio::sync::oneshot;
     use tonic::{transport::Channel, Code};
     use tonic_health::pb::health_client::HealthClient;
     use ts::{
@@ -2102,7 +2103,7 @@ mod tests {
     async fn an_open_watch_ends_when_the_worker_stops() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (stop, stopped) = oneshot::channel::<()>();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test joins the server's task: its drain is what it checks"
@@ -2343,7 +2344,7 @@ mod tests {
     fn chunk_ids(item: Option<Result<Frame, Status>>) -> Vec<u32> {
         match item.expect("an item").expect("ok") {
             Frame::Chunk(chunk) => chunk.token_ids,
-            other => panic!("not a chunk: {other:?}"),
+            other @ Frame::Complete(_) => panic!("not a chunk: {other:?}"),
         }
     }
 
@@ -2735,7 +2736,7 @@ mod tests {
         let (service, _stop) = scheduler_with_ranks(1, 65_113);
         service.ranks[0].engine.fault_fail(Some(RequestFault {
             status: 503,
-            stall: std::time::Duration::ZERO,
+            stall: Duration::ZERO,
             after_tokens: Some(1),
             finish_error: true,
             scope: FaultScope::Requests(1),
@@ -3132,7 +3133,7 @@ mod tests {
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
-        assert!(matches!(cut, Err(ref status) if status.code() == tonic::Code::Unavailable));
+        assert!(matches!(cut, Err(ref status) if status.code() == Code::Unavailable));
         assert!(stream.next().await.is_none(), "nothing after the cut");
         assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
     }
@@ -3165,7 +3166,7 @@ mod tests {
                 );
                 assert_eq!(complete.completion_tokens, 2);
             }
-            other => panic!("not an error completion: {other:?}"),
+            other @ Frame::Chunk(_) => panic!("not an error completion: {other:?}"),
         }
         assert!(stream.next().await.is_none(), "nothing after the cut");
         assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
@@ -3197,22 +3198,22 @@ mod tests {
 
     #[test]
     fn injected_statuses_map_to_the_closest_grpc_code() {
-        assert_eq!(injected_status(503).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(500).code(), tonic::Code::Internal);
-        assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
-        assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
-        assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
-        assert_eq!(injected_status(499).code(), tonic::Code::Cancelled);
+        assert_eq!(injected_status(503).code(), Code::Unavailable);
+        assert_eq!(injected_status(502).code(), Code::Unavailable);
+        assert_eq!(injected_status(500).code(), Code::Internal);
+        assert_eq!(injected_status(429).code(), Code::ResourceExhausted);
+        assert_eq!(injected_status(504).code(), Code::DeadlineExceeded);
+        assert_eq!(injected_status(400).code(), Code::InvalidArgument);
+        assert_eq!(injected_status(499).code(), Code::Cancelled);
         // The three non-inverse cases (408 and 502 read back as 504 and 503,
         // 499 as 502) and a 4xx without its own code (read back as 400).
-        assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
-        assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(418).code(), tonic::Code::InvalidArgument);
+        assert_eq!(injected_status(408).code(), Code::DeadlineExceeded);
+        assert_eq!(injected_status(502).code(), Code::Unavailable);
+        assert_eq!(injected_status(418).code(), Code::InvalidArgument);
         // 422 is the engine's report that it could not continue the request
         // under its constraint, which the gateway reads back as its 422.
         let constraint = injected_status(422);
-        assert_eq!(constraint.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(constraint.code(), Code::FailedPrecondition);
         assert!(smg_grpc_client::is_constraint_failure(&constraint));
     }
 
@@ -3258,7 +3259,7 @@ mod tests {
         let (service, _stop) = scheduler_with_ranks(1, 65_114);
         service.ranks[0].engine.fault_fail(Some(RequestFault {
             status: 503,
-            stall: std::time::Duration::ZERO,
+            stall: Duration::ZERO,
             after_tokens: None,
             finish_error: false,
             scope: FaultScope::Requests(1),
@@ -3274,7 +3275,7 @@ mod tests {
             .await
             .err()
             .expect("refused");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error:?}");
+        assert_eq!(error.code(), Code::InvalidArgument, "{error:?}");
         let status = service.ranks[0].engine.fault_status();
         assert_eq!(status.failed_total, 0, "the fault hook was not consulted");
         assert!(
