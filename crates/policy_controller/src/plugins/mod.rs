@@ -1,8 +1,10 @@
-//! What every plugin kind shares: the breaker with its latency ring, the
-//! counters a plugin declares, the parts of its row that are not about its
-//! kind, the names its stages carry, and the three adapters that bind a
-//! plugin's decision to a profile as the framework's filter, scorer and
-//! picker, each with the fallback stage its row names.
+//! What every plugin kind shares: the decisions open on the deciding threads,
+//! which each kind's runtime is built over (a decision's number and its
+//! budget), the breaker with its latency ring, the counters a plugin
+//! declares, the parts of its row that are not about its kind, the names its
+//! stages carry, and the three adapters that bind a plugin's decision to a
+//! profile as the framework's filter, scorer and picker, each with the
+//! fallback stage its row names.
 //!
 //! A kind (the WebAssembly host in the `wasm` module) implements
 //! `BoundPlugin`, a trait of this crate alone, for the plugin it bound and
@@ -13,6 +15,7 @@
 pub(crate) mod breaker;
 pub mod config;
 mod counters;
+mod open;
 mod stages;
 
 use std::{
@@ -22,6 +25,8 @@ use std::{
 
 pub use config::{BreakerSpec, Exposure, Failure, HeaderSet, Reveal};
 pub use counters::Counters;
+pub use open::OpenDecisions;
+pub(crate) use open::{OpenDecision, Part};
 pub(crate) use stages::{BoundPlugin, Fallback};
 pub use stages::{PluginFilter, PluginPicker, PluginScorer};
 

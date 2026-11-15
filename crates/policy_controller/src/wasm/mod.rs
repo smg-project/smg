@@ -26,7 +26,9 @@
 //! decision opens one per side) and the stages read one `decision` resource,
 //! dropped at the end. Every call runs under fuel: the plugin's frame budget
 //! clamped to the decision's remaining budget (one remainder per thread per
-//! decision, shared by every plugin and side it opens), times the host's calibration
+//! decision, shared by every plugin and side it opens, of any runtime built
+//! over the same [`OpenDecisions`](crate::plugins::OpenDecisions)), times the
+//! host's calibration
 //! of fuel to microseconds, and under a bound on the clock of what the
 //! decision has left (at most the frame). Fuel prices every operator, a bulk
 //! memory operation by its size once it has run; the clock catches what the

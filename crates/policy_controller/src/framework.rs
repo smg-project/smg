@@ -203,8 +203,12 @@ pub trait Picker: Lifecycle + Debug {
 /// (a plugin's `decision` resource over the view): the engine opens it once
 /// before the profile's first stage of a decision reads it and closes it
 /// after the last, on every path out, so a stage set used by several stages
-/// of one profile, or asked row by row, reads one state. A built-in stage
-/// holds none; the profile's flag ([`Profile::scoped`]) is read once in the
+/// of one profile, or asked row by row, reads one state. The unwinding path
+/// is one of them: when a scope panics at its open, the engine closes the
+/// scopes whose open returned, and neither that scope nor any after it.
+/// So a `close` always follows an `open` that returned, and an `open`
+/// that stops half-way undoes what it did itself. A built-in stage holds
+/// none; the profile's flag ([`Profile::scoped`]) is read once in the
 /// engine, so a profile without one pays nothing per decision.
 pub trait DecisionScope: Send + Sync + Debug {
     fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>);
@@ -266,9 +270,19 @@ impl Profile {
         candidates: &[Candidate],
         pool: &PoolFacts<'_>,
     ) -> Opened<'a> {
+        // While the scopes open, a guard of this function's own counts each
+        // scope whose open returned: if an open unwinds, those are closed,
+        // and neither the scope that panicked nor any after it.
+        let mut opening = Opening {
+            profile: self,
+            returned: 0,
+        };
         for scope in self.scopes() {
             scope.open(facts, candidates, pool);
+            opening.returned += 1;
         }
+        // Every open returned: the decision's guard closes them all.
+        opening.returned = 0;
         Opened(self)
     }
 }
@@ -287,6 +301,28 @@ impl Drop for Opened<'_> {
 fn close_scopes(profile: &Profile) {
     for scope in profile.scopes() {
         scope.close();
+    }
+}
+
+/// The scopes of one profile whose open returned while a decision opens
+/// them: the first `returned` in the profile's order. Its drop closes those,
+/// which is what the unwinding of a later scope's open runs; once every open
+/// returned the count is cleared and `Opened` holds the scopes.
+struct Opening<'a> {
+    profile: &'a Profile,
+    returned: usize,
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        for scope in self.profile.scopes().take(self.returned) {
+            // A close here runs inside the unwinding of a later scope's
+            // open, where a second panic would end the process. So each
+            // runs under a catch of its own: a close that panics stops
+            // there, the rest are still closed, and the open's panic is the
+            // one that reaches the host.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.close()));
+        }
     }
 }
 
