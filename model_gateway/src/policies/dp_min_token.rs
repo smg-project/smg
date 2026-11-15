@@ -1,7 +1,7 @@
 //! The DP minimum-tokens policy: for an engine that takes an external DP
 //! dispatch, the rank with the lowest token load. The pick adds the
-//! request's estimated tokens to that rank's cached load, so the requests
-//! that arrive before the next load report spread across the ranks.
+//! request's estimated tokens to that rank's cached load, so the picks
+//! before the next load report count what was already sent its way.
 
 use std::sync::Arc;
 
