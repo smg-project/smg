@@ -5,12 +5,14 @@
 //! report takes from its best reporting peer. The gateway's policies narrow
 //! first and estimate after, so a worker they passed over moves neither.
 //!
-//! Each cell here is a pool of two to four workers and one of the three
-//! narrowing pickers, decided 6,000 times from the starting state, one seed
-//! a decision. The expected counts were recorded by running the gateway's
-//! policy code at 058a0c016 over the same pool, 6,000 single decisions each
-//! from a fresh policy. A drawn cell is one sample, so the two are compared
-//! as the recorded rows' replay compares them: share for share.
+//! Each cell here is a pool of two to four workers under one form of the
+//! `power_of_two` preset as the spec builds it: the expected wait or the
+//! requests over two draws, or the least requests. A cell is decided 6,000
+//! times from the starting state, one seed a decision. The expected counts
+//! were recorded by running the gateway's policy code at 058a0c016 over the
+//! same pool, 6,000 single decisions each from a fresh policy. A drawn cell
+//! is one sample, so the two are compared as the recorded rows' replay
+//! compares them: share for share.
 //!
 //! The pools of one count hold the tie band. The gateway draws among waits
 //! within a microsecond of each other, so a picker that compares scores
@@ -36,8 +38,9 @@
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 use smg_policy_controller::{
-    Candidate, Constraints, Engine, Health, LoadRow, PolicySpec, PoolFacts, RequestFacts, Scratch,
-    WorkerId,
+    Candidate, Constraints, Engine, Health, LoadRow, PolicySpec, PoolFacts,
+    PowerOfTwoMetric::{self, ExpectedWait, LeastRequests, Requests},
+    RequestFacts, Scratch, WorkerId,
 };
 
 const DRAWS: u32 = 6_000;
@@ -67,22 +70,20 @@ const fn reporting(in_flight: u32, throughput: u32) -> Worker {
     }
 }
 
-/// The least-load scorer under `pick`: the power-of-two preset is the
-/// expected-wait form, and the two count forms differ by the picker alone.
-fn form(pick: &str) -> Engine {
-    let mut spec = PolicySpec::preset("power_of_two").expect("the preset");
-    spec.profiles
-        .get_mut("power_of_two")
-        .expect("the preset's profile")
-        .pick = pick.into();
-    spec.validate().expect("the form validates")
+/// The preset's form under `metric`, as the spec builds it: the least-load
+/// scorer under the two-draw picker, or under one of the two count pickers.
+fn form(metric: PowerOfTwoMetric) -> Engine {
+    PolicySpec::power_of_two(metric)
+        .expect("the preset's form")
+        .validate()
+        .expect("the form validates")
 }
 
 /// How often each worker leads over [`DRAWS`] decisions for a prompt of
 /// `prompt_tokens` from the starting state: nothing is dispatched, so the
 /// engine holds no credit between them.
-fn counts(pick: &str, workers: &[Worker], prompt_tokens: u32) -> Vec<u32> {
-    let engine = form(pick);
+fn counts(metric: PowerOfTwoMetric, workers: &[Worker], prompt_tokens: u32) -> Vec<u32> {
+    let engine = form(metric);
     let clock = 1_000;
     let pool: Vec<Candidate> = workers
         .iter()
@@ -150,14 +151,19 @@ fn one_distribution(here: &[u32], recorded: &[u32]) -> bool {
         })
 }
 
-/// The cells of one pool: the picker and the counts it is held to, the
+/// The cells of one pool: the form and the counts it is held to, the
 /// gateway's recorded ones wherever the pool names no rule left.
-fn hold(pool: &str, workers: &[Worker], prompt_tokens: u32, recorded: [(&str, &[u32]); 3]) {
+fn hold(
+    pool: &str,
+    workers: &[Worker],
+    prompt_tokens: u32,
+    recorded: [(PowerOfTwoMetric, &[u32]); 3],
+) {
     let mut parted = Vec::new();
-    for (pick, recorded) in recorded {
-        let here = counts(pick, workers, prompt_tokens);
+    for (metric, recorded) in recorded {
+        let here = counts(metric, workers, prompt_tokens);
         if !one_distribution(&here, recorded) {
-            parted.push(format!("{pick}: recorded {recorded:?}, here {here:?}"));
+            parted.push(format!("{metric:?}: recorded {recorded:?}, here {here:?}"));
         }
     }
     assert!(parted.is_empty(), "{pool}:\n{}", parted.join("\n"));
@@ -182,9 +188,9 @@ fn a_fast_worker_passed_over_lifts_no_worker_without_a_report() {
         &workers,
         0,
         [
-            ("count-first", &[6000, 0, 0]),
-            ("power-of-two-count-first", &[3968, 2032, 0]),
-            ("power-of-two", &[1985, 0, 4015]),
+            (LeastRequests, &[6000, 0, 0]),
+            (Requests, &[3968, 2032, 0]),
+            (ExpectedWait, &[1985, 0, 4015]),
         ],
     );
 }
@@ -206,9 +212,9 @@ fn a_slow_worker_passed_over_changes_nothing_either() {
         &workers,
         0,
         [
-            ("count-first", &[6000, 0, 0]),
-            ("power-of-two-count-first", &[3976, 2024, 0]),
-            ("power-of-two", &[3966, 0, 2034]),
+            (LeastRequests, &[6000, 0, 0]),
+            (Requests, &[3976, 2024, 0]),
+            (ExpectedWait, &[3966, 0, 2034]),
         ],
     );
 }
@@ -224,9 +230,9 @@ fn a_missing_rate_stands_in_from_the_workers_compared() {
         &workers,
         0,
         [
-            ("count-first", &[2953, 3047, 0]),
-            ("power-of-two-count-first", &[2957, 3043, 0]),
-            ("power-of-two", &[3034, 951, 2015]),
+            (LeastRequests, &[2953, 3047, 0]),
+            (Requests, &[2957, 3043, 0]),
+            (ExpectedWait, &[3034, 951, 2015]),
         ],
     );
 }
@@ -244,9 +250,9 @@ fn waits_within_a_microsecond_are_one_tie_and_drawn() {
         &workers,
         512,
         [
-            ("count-first", &[3062, 2938]),
-            ("power-of-two-count-first", &[2968, 3032]),
-            ("power-of-two", &[2971, 3029]),
+            (LeastRequests, &[3062, 2938]),
+            (Requests, &[2968, 3032]),
+            (ExpectedWait, &[2971, 3029]),
         ],
     );
 }
@@ -261,9 +267,9 @@ fn waits_further_apart_are_no_tie() {
         &workers,
         512,
         [
-            ("count-first", &[0, 6000]),
-            ("power-of-two-count-first", &[0, 6000]),
-            ("power-of-two", &[0, 6000]),
+            (LeastRequests, &[0, 6000]),
+            (Requests, &[0, 6000]),
+            (ExpectedWait, &[0, 6000]),
         ],
     );
 }
@@ -291,9 +297,9 @@ fn a_chain_of_waits_is_drawn_within_a_microsecond_of_the_least() {
         512,
         [
             // The shares of this crate's rule, not a recorded row.
-            ("count-first", &[2000, 0, 2000, 2000]),
-            ("power-of-two-count-first", &[1444, 992, 2031, 1533]),
-            ("power-of-two", &[1469, 1026, 2039, 1466]),
+            (LeastRequests, &[2000, 0, 2000, 2000]),
+            (Requests, &[1444, 992, 2031, 1533]),
+            (ExpectedWait, &[1469, 1026, 2039, 1466]),
         ],
     );
 }
