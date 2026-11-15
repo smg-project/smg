@@ -1863,6 +1863,12 @@ impl McpOrchestrator {
             .and_then(|entry| entry.list_error.clone())
     }
 
+    /// Whether a configured server is held under `server_key`: connected at
+    /// startup (an optional server whose connect failed is not held).
+    pub fn has_static_server(&self, server_key: &str) -> bool {
+        self.static_servers.contains_key(server_key)
+    }
+
     /// Get the approval manager.
     pub fn approval_manager(&self) -> Arc<ApprovalManager> {
         Arc::clone(&self.approval_manager)
