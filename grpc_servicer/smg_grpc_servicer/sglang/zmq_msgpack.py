@@ -802,6 +802,47 @@ class MsgpackSendSocket:
             return
         self.socket.send(_ENC.encode(slim), copy=False)
 
+    def prefill_completion_endpoint(self) -> str | None:
+        """Scheduler-thread discovery for a separate completion PUSH socket."""
+        if self.socket is None:
+            return None
+        return self.socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+
+    def prepare_prefill_completion(self, output: Any) -> bytes:
+        """Freeze a self-contained terminal on the scheduler thread, without I/O.
+
+        Prefill has no preceding token stream. Its terminal must carry usage;
+        a fresh adapter avoids consuming the live sender's per-request state
+        before all participating ranks agree. Auxiliary hidden-state returns stay on the
+        ordinary path. No load tail is sampled: a delayed snapshot must not
+        overwrite newer scheduler load (kv_total_tokens=0 means no snapshot).
+        """
+        reasons = getattr(output, "finished_reasons", None) or []
+        rids = getattr(output, "rids", None) or []
+        if not rids or len(reasons) != len(rids) or not all(reasons):
+            raise ValueError("Prefill completion requires a terminal for every row")
+        if any(row is not None for row in (getattr(output, "output_hidden_states", None) or [])):
+            raise ValueError("Hidden-state output requires the scheduler output path")
+        stats = getattr(output, "request_stats", None) or []
+        prompts = getattr(output, "prompt_tokens", None) or []
+        cached = getattr(output, "cached_tokens", None) or []
+        # Match the adapter's per-row sparse-to-dense fallback, but forbid
+        # missing usage: this terminal has no earlier header to fall back to.
+        if any(
+            not (i < len(stats) and stats[i] is not None)
+            and not (i < len(prompts) and i < len(cached))
+            for i in range(len(rids))
+        ):
+            raise ValueError("Prefill completion requires self-contained usage")
+        slim = BatchTokenIDSlimOutput.from_full(output, engine_index=self.engine_index)
+        return _ENC.encode(slim)
+
+    def finish_prefill_completion(self, rid: str) -> None:
+        """Clear scheduler-owned state once publication and retirement are safe."""
+        self.traces.finish(rid)
+        self.hidden_rows.forget(rid)
+        self.output_adapter.forget(rid)
+
     def send_control_reply(self, call_id: int, success: bool, message: str | None) -> None:
         self._send_slim(
             ControlReplySlim(
