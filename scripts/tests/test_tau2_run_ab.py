@@ -1080,3 +1080,151 @@ def test_valid_budget_keeps_quality_only_diagnostic_flag(monkeypatch, tmp_path, 
     payload = json.loads(report.read_text())
     assert payload["incomplete"] and "budget" not in payload["incomplete"]
     assert payload["budget"]["halted"] is False
+
+
+def _infra_placeholder(trial=0):
+    # Pinned run_with_retry(max_retries=0) writes this schema, not a zero reward.
+    return {
+        "task_id": "task",
+        "trial": trial,
+        "seed": 300 + trial,
+        "termination_reason": "infrastructure_error",
+        "reward_info": None,
+        "info": {
+            "error_type": "TimeoutError",
+            "error": "sensitive provider detail must not enter reports",
+            "error_traceback": "private raw traceback",
+            "failed_after_attempts": 1,
+        },
+    }
+
+
+def test_known_infra_null_preserves_unscored_and_scored_identities():
+    zero = {"task_id": "task", "trial": 1, "seed": 301, "reward_info": {"reward": 0.0}}
+    with pytest.raises(run_ab.InfrastructureResults) as failure:
+        run_ab.load_results({"simulations": [_infra_placeholder(), zero]})
+    assert failure.value.unscored == [
+        {
+            "task_id": "task",
+            "trial": 0,
+            "seed": 300,
+            "termination_reason": "infrastructure_error",
+            "error_type": "TimeoutError",
+        }
+    ]
+    assert failure.value.scored == [{"task_id": "task", "trial": 1, "seed": 301, "reward": 0.0}]
+    assert "sensitive" not in str(failure.value.unscored)
+    assert "traceback" not in str(failure.value.unscored)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"task_id": "task", "trial": 0, "reward_info": None},
+        {"task_id": "task", "trial": 0, "termination_reason": "unknown", "reward_info": None},
+        {"task_id": "task", "trial": 0},
+        {**_infra_placeholder(), "reward_info": {"reward": 0.0}},
+        {**_infra_placeholder(), "trial": None},
+        {**_infra_placeholder(), "task_id": None},
+        {**_infra_placeholder(), "seed": True},
+        {"task_id": "task", "trial": 0, "reward_info": {"reward": True}},
+        {"task_id": "task", "trial": 0, "reward_info": {"reward": float("nan")}},
+    ],
+)
+def test_unknown_or_contradictory_null_contract_is_not_normalized(row):
+    with pytest.raises(ValueError) as failure:
+        run_ab.load_results({"simulations": [_infra_placeholder(), row]})
+    assert not isinstance(failure.value, run_ab.InfrastructureResults)
+
+
+def test_genuine_zero_reward_still_loads_without_infra_relabeling():
+    assert run_ab.load_results(_raw_trials((0,), reward=0.0)) == [
+        {"task_id": "task", "trial": 0, "reward": 0.0}
+    ]
+
+
+@pytest.mark.parametrize("allow_incomplete", [False, True])
+def test_infra_results_report_identities_rawhash_and_force_incomplete(
+    monkeypatch, tmp_path, allow_incomplete
+):
+    raw = _raw_trials((1,), reward=0.0)
+    raw["simulations"].insert(0, _infra_placeholder())
+    written = []
+
+    def fake_run(command, **kwargs):
+        folder = tmp_path / "simulations" / command[command.index("--save-to") + 1]
+        folder.mkdir(parents=True)
+        body = json.dumps(raw).encode()
+        (folder / "results.json").write_bytes(body)
+        written.append(body)
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_ab.subprocess, "run", fake_run)
+    arm = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(arm, tmp_path, domain="retail", num_trials=2, expected_task_ids=["task"])
+    invocation = arm.invocations["retail"]
+    assert not arm.scores
+    assert invocation["failure_kind"] == "infrastructure_error_results"
+    assert invocation["results_sha256"] == hashlib.sha256(written[0]).hexdigest()
+    assert invocation["n_infrastructure_errors"] == 1
+    assert invocation["unscored_cases"][0]["trial"] == 0
+    assert invocation["unscored_cases"][0]["seed"] == 300
+    assert invocation["scored_case_diagnostics"] == [{"task_id": "task", "trial": 1, "reward": 0.0}]
+    candidate = run_ab.Arm("smg", "", scores={"retail": run_ab.domain_scores(_rows(), 2)})
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=tmp_path / "infra-comparison.json",
+        tolerance=0.02,
+        allow_incomplete=allow_incomplete,
+        expected_task_ids={"retail": ["task"]},
+    )
+    assert (
+        run_ab.write_report_and_gate(arm, candidate, ["retail"], 2, args) == run_ab.EXIT_INCOMPLETE
+    )
+    payload = json.loads(args.json_out.read_text())
+    assert payload["overall"]["passk"]["delta"] is None
+    assert payload["baseline"]["invocations"]["retail"] == invocation
+    assert "infrastructure_error_results" in payload["incomplete"]["vllm"]
+
+
+@pytest.mark.parametrize("gate", ["nonzero", "pending", "unknown", "halted"])
+def test_infra_placeholder_does_not_bypass_existing_paid_or_process_gate(
+    monkeypatch, tmp_path, gate
+):
+    descriptor = run_ab.prepare_budget()
+    ledger = run_ab.budget_guard.read_descriptor(descriptor)
+    if gate in ("pending", "unknown"):
+        proof = types.SimpleNamespace(
+            summary=ledger.summary,
+            audit=lambda invocation: {
+                "pending": int(gate == "pending"),
+                "unknown": int(gate == "unknown"),
+            },
+        )
+        monkeypatch.setattr(run_ab.budget_guard, "read_descriptor", lambda _: proof)
+    elif gate == "halted":
+        ledger.halt()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        folder = tmp_path / "simulations" / command[command.index("--save-to") + 1]
+        folder.mkdir(parents=True)
+        (folder / "results.json").write_text(json.dumps({"simulations": [_infra_placeholder()]}))
+        return types.SimpleNamespace(returncode=2 if gate == "nonzero" else 0)
+
+    monkeypatch.setattr(run_ab.subprocess, "run", fake_run)
+    arm = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(arm, tmp_path, domain="retail", budget_descriptor=descriptor)
+    invocation = arm.invocations["retail"]
+    expected = (
+        "invalid_budget"
+        if gate == "halted"
+        else "nonzero_exit"
+        if gate == "nonzero"
+        else "invocation_budget_incomplete"
+    )
+    assert invocation["failure_kind"] == expected
+    assert "unscored_cases" not in invocation and "results_sha256" not in invocation
+    assert not arm.scores
+    assert len(calls) == (0 if gate == "halted" else 1)
