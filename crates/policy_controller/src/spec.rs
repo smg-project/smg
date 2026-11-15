@@ -3536,7 +3536,10 @@ mod tests {
     /// One profile for every assignment: the `manual` preset's picker
     /// leaves the placement to the binding's rule, the rule names the
     /// classic default, and each other assignment is that one field and
-    /// validates. The recorded rows hold where each one places.
+    /// validates. The recorded rows hold where each one places. The built
+    /// engine answers each rule with the assignment the document names:
+    /// under this picker it places a `delegate` by the fewest in flight,
+    /// and a reader of the binding still reads `delegate`.
     #[test]
     fn the_manual_preset_is_one_profile_for_every_assignment() {
         let mut spec = PolicySpec::preset("manual").expect("the preset");
@@ -3566,13 +3569,19 @@ mod tests {
                 assignment == Assignment::MinGroup,
                 "{assignment:?}"
             );
+            let read_back = engine
+                .binding("m", Phase::Single)
+                .and_then(|binding| binding.sessions)
+                .map(|rule| rule.assignment);
+            assert_eq!(read_back, Some(assignment), "read back as declared");
         }
     }
 
     /// The `manual` preset's whole rule, as the gateway's keyed policy runs
     /// today: the routing-key header as the session key and the view's one
-    /// header, four hours of idle time swept each minute, a random
-    /// assignment, no in-flight cap, the first worker back in the lead.
+    /// header, no header list of the rule's own, four hours of idle time
+    /// swept each minute, a random assignment, no in-flight cap, no session
+    /// id issued, the first worker back in the lead.
     #[test]
     fn the_manual_preset_states_its_whole_rule() {
         let spec = PolicySpec::preset("manual").expect("the preset");

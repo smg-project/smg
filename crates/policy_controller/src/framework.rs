@@ -756,7 +756,9 @@ impl Binding {
 #[derive(Debug)]
 pub struct Engine {
     profiles: Vec<Profile>,
-    bindings: Vec<Binding>,
+    /// The bindings in the spec's order, each beside what the build derived
+    /// from it ([`Entry`]).
+    bindings: Vec<Entry>,
     generation: u64,
     needs: Needs,
     /// The needs of every binding that covers a phase, its profile's stages
@@ -812,6 +814,20 @@ const fn placed_by(assignment: Assignment, by_assignment: bool) -> Assignment {
         Assignment::Delegate if by_assignment => Assignment::MinLoad,
         other => other,
     }
+}
+
+/// A binding as the engine holds it: the binding as the spec declared it,
+/// which is what [`Engine::binding`] answers, and beside it what the build
+/// derived from it for the engine's own decisions.
+#[derive(Debug)]
+struct Entry {
+    binding: Binding,
+    /// The assignment that places a request of the binding ([`placed_by`]):
+    /// the rule's own, or `delegate` where no rule stands, as the binding's
+    /// profile reads it under the single plan. Written once when the engine
+    /// is built, so no decision asks and the binding keeps the rule as
+    /// declared.
+    placing: Assignment,
 }
 
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
@@ -1183,7 +1199,7 @@ impl Engine {
     /// ([`Self::needs`]) holds a stage's needs however the engine was built.
     pub fn new(
         profiles: Vec<Profile>,
-        mut bindings: Vec<Binding>,
+        bindings: Vec<Binding>,
         generation: u64,
         needs: Needs,
     ) -> Self {
@@ -1235,17 +1251,25 @@ impl Engine {
         let sessions = SessionTable::new(shortest_sweep(&bindings));
         let marks: Vec<Marks> = profiles.iter().map(Marks::of).collect();
         // A picker that leaves the placement to its rule has no stages to
-        // delegate to: the rule's assignment is written here as the one
-        // that places, once, so no decision asks.
-        for binding in &mut bindings {
-            let by_assignment = binding.plan == Plan::Single
-                && marks
-                    .get(usize::from(binding.profile))
-                    .is_some_and(|marks| marks.by_assignment());
-            if let Some(rule) = &mut binding.sessions {
-                rule.assignment = placed_by(rule.assignment, by_assignment);
-            }
-        }
+        // delegate to: the assignment that places is written beside each
+        // binding here, once, so no decision asks. The binding itself keeps
+        // the rule as the spec declared it.
+        let bindings = bindings
+            .into_iter()
+            .map(|binding| {
+                let by_assignment = binding.plan == Plan::Single
+                    && marks
+                        .get(usize::from(binding.profile))
+                        .is_some_and(|marks| marks.by_assignment());
+                let declared = binding
+                    .sessions
+                    .map_or(Assignment::Delegate, |rule| rule.assignment);
+                Entry {
+                    placing: placed_by(declared, by_assignment),
+                    binding,
+                }
+            })
+            .collect();
         Self {
             profiles,
             bindings,
@@ -1282,7 +1306,7 @@ impl Engine {
     pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
         let own = self
             .resolve(model, phase)
-            .map(|(binding, _, profile)| profile.needs().or(session_needs(binding)))
+            .map(|(entry, _, profile)| profile.needs().or(session_needs(&entry.binding)))
             .unwrap_or_default();
         match phase {
             Phase::Decode => own.or(self.pair_decode_needs(model)),
@@ -1312,9 +1336,19 @@ impl Engine {
         &self.profiles
     }
 
-    /// The first binding that matches, as the spec orders them.
+    /// The first binding that matches, as the spec orders them, and as the
+    /// spec declared it: a sessions rule reads back with the assignment the
+    /// document names, whichever assignment the engine places by.
     pub fn binding(&self, model: &str, phase: Phase) -> Option<&Binding> {
-        self.bindings.iter().find(|b| b.matches(model, phase))
+        self.entry(model, phase).map(|entry| &entry.binding)
+    }
+
+    /// The first binding that matches, beside what the build derived from
+    /// it: the engine's own lookup.
+    fn entry(&self, model: &str, phase: Phase) -> Option<&Entry> {
+        self.bindings
+            .iter()
+            .find(|entry| entry.binding.matches(model, phase))
     }
 
     /// The profile a request resolves to for its phase; `None` when no
@@ -1327,11 +1361,11 @@ impl Engine {
     /// The binding a request resolves to, with its profile for the phase: one
     /// walk of the bindings per decision; `None` when no binding matches or
     /// the binding's plan has no side for the phase.
-    fn resolve(&self, model: &str, phase: Phase) -> Option<(&Binding, u16, &Profile)> {
-        let binding = self.binding(model, phase)?;
-        let index = profile_index(binding, phase)?;
+    fn resolve(&self, model: &str, phase: Phase) -> Option<(&Entry, u16, &Profile)> {
+        let entry = self.entry(model, phase)?;
+        let index = profile_index(&entry.binding, phase)?;
         let profile = self.profiles.get(usize::from(index))?;
-        Some((binding, index, profile))
+        Some((entry, index, profile))
     }
 
     /// One profile over `candidates`: the `single` plan, or one encode item
@@ -1359,9 +1393,10 @@ impl Engine {
         if !column_fits(facts.affinity, candidates) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
-        let Some((binding, index, profile)) = self.resolve(facts.model, facts.phase) else {
+        let Some((entry, index, profile)) = self.resolve(facts.model, facts.phase) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
+        let Entry { binding, placing } = entry;
         let marks = self.marks[usize::from(index)];
         let _opened = if marks == Marks::NONE {
             None
@@ -1371,23 +1406,21 @@ impl Engine {
                 .then(|| profile.open(facts, candidates, pool));
             // A picker that leaves the placement to its rule is not asked:
             // the rule's pin takes a keyed request first, below, and the
-            // assignment places every other.
+            // binding's placing assignment places every other, under a rule
+            // or under none.
             let pinned_first = binding.sessions.is_some() && !facts.session_key.is_none();
             if marks.by_assignment() && binding.plan == Plan::Single && !pinned_first {
-                // With no rule the assignment is `delegate`, as placed for
-                // such a picker.
-                let unruled = placed_by(Assignment::Delegate, true);
-                let assignment = binding.sessions.map_or(unruled, |rule| rule.assignment);
                 return self.assign(
-                    profile, index, assignment, facts, pool, candidates, cx, scratch,
+                    profile, index, *placing, facts, pool, candidates, cx, scratch,
                 );
             }
             opened
         };
         if let Some(rule) = binding.sessions {
             if binding.plan == Plan::Single && !facts.session_key.is_none() {
-                return self
-                    .decide_session(profile, index, &rule, facts, pool, candidates, cx, scratch);
+                return self.decide_session(
+                    profile, index, &rule, *placing, facts, pool, candidates, cx, scratch,
+                );
             }
         }
         let encode = matches!(
@@ -1417,8 +1450,9 @@ impl Engine {
     /// over the cap is reassigned by the stages over the candidates under the
     /// cap (the pin stays when every candidate is over it); a key with no
     /// routable pin is placed by the stages. The stages are the profile's own
-    /// under `delegate`, else the assignment's. The pin is written by the
-    /// dispatch (`on_dispatched`), never here.
+    /// under `delegate`, else the assignment's, and `placing` names which:
+    /// the binding's placing assignment, not the rule's declared one. The
+    /// pin is written by the dispatch (`on_dispatched`), never here.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -1428,6 +1462,7 @@ impl Engine {
         profile: &Profile,
         index: u16,
         rule: &SessionRule,
+        placing: Assignment,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
         candidates: &[Candidate],
@@ -1459,15 +1494,8 @@ impl Engine {
                 {
                     buf.kept
                         .retain(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap);
-                    let mut decision = self.place(
-                        profile,
-                        index,
-                        rule.assignment,
-                        facts,
-                        pool,
-                        candidates,
-                        buf,
-                    );
+                    let mut decision =
+                        self.place(profile, index, placing, facts, pool, candidates, buf);
                     if let Decision::Pick(pick) = &mut decision {
                         pick.session_verdict = SessionVerdict::Respill;
                     }
@@ -1496,15 +1524,7 @@ impl Engine {
                 session_verdict: SessionVerdict::Pinned,
             });
         }
-        let mut decision = self.place(
-            profile,
-            index,
-            rule.assignment,
-            facts,
-            pool,
-            candidates,
-            buf,
-        );
+        let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
         if let Decision::Pick(pick) = &mut decision {
             pick.session_verdict = SessionVerdict::Pinned;
             // No routable pin (a fresh key, or every pin down): the key is
@@ -1570,7 +1590,9 @@ impl Engine {
     /// The stages of an assignment over the survivors in `buf.kept`: the
     /// profile's own scorers and picker under `delegate`, else the
     /// assignment's stage over the same survivors. The assignment is the
-    /// one that places ([`placed_by`]), as the engine's build wrote it.
+    /// one that places ([`placed_by`]): every caller hands the binding's
+    /// placing assignment, which the engine's build wrote for a binding
+    /// under a rule and for one under none.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -5270,6 +5292,46 @@ mod tests {
         assert!(engine.sessions.is_empty());
     }
 
+    /// A reader reads back the document: the binding the engine answers
+    /// holds its rule as it was handed in, under every assignment and under
+    /// none. Under `delegate` the `manual` picker's requests still go to
+    /// the fewest in flight: the assignment that places is the engine's own
+    /// and no reader of the binding sees it.
+    #[test]
+    fn the_engine_answers_a_binding_as_it_was_declared() {
+        for assignment in [
+            Assignment::Random,
+            Assignment::MinLoad,
+            Assignment::MinGroup,
+            Assignment::Delegate,
+        ] {
+            let rule = SessionRule {
+                assignment,
+                ..SESSIONS
+            };
+            let engine = manual_engine(Some(rule));
+            let read_back = engine
+                .binding("m", Phase::Single)
+                .and_then(|binding| binding.sessions);
+            assert_eq!(read_back, Some(rule), "{assignment:?}");
+        }
+        let unruled = manual_engine(None);
+        let read_back = unruled
+            .binding("m", Phase::Single)
+            .map(|binding| binding.sessions);
+        assert_eq!(read_back, Some(None), "no rule declared, none read back");
+        // One engine, both halves: the rule reads back `delegate` and the
+        // request is placed by the fewest in flight.
+        let engine = manual_engine(Some(SESSIONS));
+        let declared = engine
+            .binding("m", Phase::Single)
+            .and_then(|binding| binding.sessions)
+            .map(|rule| rule.assignment);
+        assert_eq!(declared, Some(Assignment::Delegate));
+        let pool = vec![candidate(0, 3), candidate(1, 1)];
+        assert_eq!(place_keyed(&engine, &pool, 0, 10).position, 1);
+    }
+
     /// The keyed path under the `manual` picker is the engine's own: the
     /// key stays on its worker past the load, moves when the worker is
     /// unroutable, and the first owner leads again once it is back.
@@ -5296,6 +5358,22 @@ mod tests {
             engine.sessions.pins(session(7)),
             Some([WorkerId(101), WorkerId(102)])
         );
+    }
+
+    /// A pin over the rule's in-flight cap respills by the binding's placing
+    /// assignment too: under the `manual` picker a `delegate` rule hands the
+    /// key to the fewest in flight of the candidates under the cap, and the
+    /// decision says a respill.
+    #[test]
+    fn a_respill_under_the_manual_picker_takes_the_fewest_in_flight() {
+        let engine = manual_engine(Some(SESSIONS));
+        let mut pool = vec![candidate(0, 5), candidate(1, 0), candidate(2, 3)];
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 1);
+        pool[1].session_in_flight = SESSIONS.inflight_cap;
+        let decision = decide_keyed(&engine, &pool, 7, 20);
+        let pick = decision.pick().expect("the respill places");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        assert_eq!(pick.targets.first().map(|t| t.position), Some(2));
     }
 
     /// On a side of a pair no sessions rule runs, so nothing places a
