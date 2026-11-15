@@ -494,10 +494,15 @@ fn bootstrap_host(spec: &WorkerSpec) -> String {
             .flatten()
     });
     host.unwrap_or_else(|| {
-        tracing::warn!(
-            "Failed to parse URL '{}', defaulting to localhost",
-            Endpoint::redacted_str(&spec.url)
+        // Named as it was read, with no rank read out of it. The mask a log
+        // line names a worker by reads digits behind the last `@` as a rank
+        // and writes what stands before them as the host: a token, where
+        // the digits are a host no client reads.
+        let shown = Endpoint::parse(dialled).map_or_else(
+            |_| "<unparsable address>".to_string(),
+            |address| address.redacted(),
         );
+        tracing::warn!("Failed to parse URL '{shown}', defaulting to localhost");
         "localhost".to_string()
     })
 }
@@ -882,13 +887,34 @@ mod tests {
         }
     }
 
-    /// An address no client reads falls back to "localhost".
+    /// An address no client reads falls back to "localhost", and the
+    /// fallback's warning names it with no rank read out of it. The digits
+    /// are a host here: read as a rank, they left the token before them to
+    /// be written whole, as the host. An address the address type reads
+    /// with no rank is named as before, its userinfo masked: the third
+    /// spelling, whose digits fit no rank, and a socket path.
     #[test]
+    #[tracing_test::traced_test]
     fn the_bootstrap_host_of_an_address_no_client_reads_is_localhost() {
-        assert_eq!(
-            bootstrap_host_of("http://s3cret-token@99999999999"),
-            "localhost"
-        );
+        for url in [
+            "http://s3cret-token@99999999999",
+            "s3cret-token@99999999999",
+            "http://s3cret-token@18446744073709551616",
+        ] {
+            assert_eq!(bootstrap_host_of(url), "localhost", "{url}");
+        }
+        assert!(!logs_contain("s3cret-token"));
+        assert!(logs_contain(
+            "Failed to parse URL '<unparsable address>', defaulting to localhost"
+        ));
+        assert!(logs_contain(
+            "Failed to parse URL 'http://***@18446744073709551616', defaulting to localhost"
+        ));
+
+        assert_eq!(bootstrap_host_of("ipc:///tmp/engine.sock"), "localhost");
+        assert!(logs_contain(
+            "Failed to parse URL 'ipc:///tmp/engine.sock', defaulting to localhost"
+        ));
     }
 
     /// The bootstrap host is the host of the address requests dial
