@@ -152,6 +152,20 @@ pub(crate) enum Candidates {
 }
 
 impl Candidates {
+    /// `pool` whole, or its part on `wire` when a retry pins the retained
+    /// plan's runtime and transport.
+    fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
+        match wire {
+            None => Self::Shared(pool),
+            Some(_) => Self::Pinned(
+                pool.iter()
+                    .filter(|w| WireConstraint::admits(wire, w.as_ref()))
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+
     pub(crate) fn as_slice(&self) -> &[Arc<dyn Worker>] {
         match self {
             Self::Shared(shared) => shared,
@@ -322,16 +336,7 @@ pub(crate) fn candidates(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
 ) -> Candidates {
-    let pool = registry.get_routing_pool(model_id, pool);
-    match wire {
-        None => Candidates::Shared(pool),
-        Some(_) => Candidates::Pinned(
-            pool.iter()
-                .filter(|w| WireConstraint::admits(wire, w.as_ref()))
-                .cloned()
-                .collect(),
-        ),
-    }
+    Candidates::of(registry.get_routing_pool(model_id, pool), wire)
 }
 
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
@@ -345,7 +350,23 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
-    let candidates = candidates(registry, model_id, pool, wire);
+    let pool = registry.get_routing_pool(model_id, pool);
+    select_single_of(registry, policies, model_id, pool, wire, inputs)
+}
+
+/// [`select_single`] over a pool the caller drew from a snapshot it read
+/// something else from too (the pool's window floor), so that both come from
+/// one membership generation. The pool keeps its name on the way to the
+/// policy, as in [`select_single`].
+pub(crate) fn select_single_of(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pool: Arc<[Arc<dyn Worker>]>,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Arc<dyn Worker>> {
+    let candidates = Candidates::of(pool, wire);
     select_among(
         registry,
         policies,

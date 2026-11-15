@@ -30,6 +30,11 @@ pub mod utils; // Used by routers/http and bindings/golang
 #[cfg(any(test, feature = "test-util"))]
 pub use regular::streaming::bench::{EngineScript, ForcedChat, StreamBench};
 pub(crate) mod wire;
+/// The worker selection stage's benchmark seam: what
+/// `benches/policy_selection.rs` drives for the stage's own placements,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use common::stages::SelectionBench;
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
 // Re-export for convenience

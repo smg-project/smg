@@ -876,6 +876,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Set models for this worker (for lazy discovery).
     /// Default implementation does nothing - only BasicWorker supports this.
+    ///
+    /// A worker in a registry takes new cards through the registry's
+    /// `refresh_models`: a snapshot keeps figures read from the cards, and
+    /// the refresh publishes the snapshots again.
     fn set_models(&self, _models: Vec<ModelCard>) {
         // Default: no-op. BasicWorker overrides this.
     }
