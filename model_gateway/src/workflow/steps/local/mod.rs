@@ -43,7 +43,7 @@ use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use crate::{
     app_context::AppContext,
-    worker::{endpoint::Endpoint, Worker, WorkerRegistry},
+    worker::{identity::endpoint::Endpoint, Worker, WorkerRegistry},
     workflow::data::{WorkerRemovalWorkflowData, WorkerUpdateWorkflowData},
 };
 

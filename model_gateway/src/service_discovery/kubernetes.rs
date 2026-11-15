@@ -49,8 +49,8 @@ use super::{
 use crate::{
     app_context::AppContext,
     worker::{
-        endpoint::Endpoint,
-        pd_pairing::{connector_profile, KvTransferProfile},
+        identity::endpoint::Endpoint,
+        pd::pairing::{connector_profile, KvTransferProfile},
         MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
     },
 };
@@ -706,7 +706,7 @@ mod tests {
     use super::*;
     use crate::{
         service_discovery::testing::make_labeled_pod,
-        worker::{endpoint::Endpoint, endpoint_key, registry::WorkerId, EndpointKey},
+        worker::{endpoint_key, identity::endpoint::Endpoint, registry::WorkerId, EndpointKey},
     };
 
     /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),

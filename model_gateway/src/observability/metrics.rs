@@ -1604,7 +1604,7 @@ pub fn init_startup_series() {
         ENDPOINT_SYSTEMONE, WORKER_DECODE, WORKER_PREFILL, WORKER_REGULAR,
     };
 
-    use crate::worker::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
+    use crate::worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
 
     // Shedding happens at every stage; the two fallbacks only while the
     // candidate pool is assembled.

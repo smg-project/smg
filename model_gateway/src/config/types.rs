@@ -15,8 +15,8 @@ use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{
-        endpoint::Endpoint,
-        overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        identity::endpoint::Endpoint,
         ConnectionMode, RuntimeType,
     },
 };
