@@ -614,10 +614,11 @@ pub(crate) fn resume_payload_in_place(
 }
 
 /// Send the `mcp_list_tools` events of one item to the client at the start of
-/// streaming: the item added empty, the listing in progress and completed,
-/// the item done with its tools. The item is written to the wire where it
-/// stands (the loop keeps it for the final response), not copied into the
-/// events. Returns false if the client disconnected.
+/// streaming: the item added empty, the listing in progress and completed
+/// (or failed, when the item carries the listing's `error`), the item done
+/// with its tools. The item is written to the wire where it stands (the loop
+/// keeps it for the final response), not copied into the events. Returns
+/// false if the client disconnected.
 pub(crate) async fn send_mcp_list_tools_events(
     tx: &SseSender,
     enc: &mut SseEncoder,
@@ -670,19 +671,22 @@ pub(crate) async fn send_mcp_list_tools_events(
         return false;
     }
 
-    // Event 3: response.mcp_list_tools.completed
+    // Event 3: response.mcp_list_tools.completed, or .failed when the item
+    // carries the listing's error (the done item below carries it to the
+    // client; the event itself names only the outcome)
+    let event3_type = if item.get("error").is_some_and(|error| !error.is_null()) {
+        McpEvent::LIST_TOOLS_FAILED
+    } else {
+        McpEvent::LIST_TOOLS_COMPLETED
+    };
     let event3_payload = json!({
-        "type": McpEvent::LIST_TOOLS_COMPLETED,
+        "type": event3_type,
         "sequence_number": *sequence_number,
         "output_index": output_index,
         "item_id": item_id
     });
     *sequence_number += 1;
-    let event3 = format!(
-        "event: {}\ndata: {}\n\n",
-        McpEvent::LIST_TOOLS_COMPLETED,
-        event3_payload
-    );
+    let event3 = format!("event: {event3_type}\ndata: {event3_payload}\n\n");
     if tx.send(Ok(Bytes::from(event3))).await.is_err() {
         return false;
     }
@@ -1640,7 +1644,8 @@ mod tests {
     use super::{
         build_transformed_mcp_call_item, extract_openai_response_output_items,
         is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
-        not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
+        not_executed_tool_call_item, ItemType, McpEvent, OutputItemEvent, SseEncoder,
+        ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
     use crate::{
         openai::mcp::test_support,
@@ -1772,11 +1777,13 @@ mod tests {
                 label: "deepwiki_ask".to_string(),
                 server_key: "server-ask".to_string(),
                 allowed_tools: Some(vec!["ask_question".to_string()]),
+                list_error: None,
             },
             McpServerBinding {
                 label: "deepwiki_read".to_string(),
                 server_key: "server-read".to_string(),
                 allowed_tools: Some(vec!["read_wiki_structure".to_string()]),
+                list_error: None,
             },
         ];
 
@@ -1795,6 +1802,7 @@ mod tests {
             label: "deepwiki_ask".to_string(),
             server_key: "server-ask".to_string(),
             allowed_tools: Some(vec!["ask_question".to_string()]),
+            list_error: None,
         }];
 
         let bindings_to_emit = mcp_list_tools_bindings_to_emit(&existing_labels, &bindings);
@@ -2253,6 +2261,7 @@ mod tests {
             label: "wiki".to_string(),
             server_key: "wiki-server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }];
         (orchestrator, bindings)
     }
@@ -2629,6 +2638,67 @@ mod tests {
         );
     }
 
+    /// The list item's third event names the listing's outcome as the gRPC
+    /// stream does: `response.mcp_list_tools.failed` for an item carrying
+    /// the listing's `error`, `completed` for one without; the event's `type`
+    /// and its SSE `event:` line are one kind, the payload carries the
+    /// item's id and no error (the done item does).
+    #[tokio::test]
+    async fn a_failed_listings_item_is_announced_as_failed() {
+        for (error, kind) in [
+            (None, McpEvent::LIST_TOOLS_COMPLETED),
+            (
+                Some("tools/list refused by the server"),
+                McpEvent::LIST_TOOLS_FAILED,
+            ),
+        ] {
+            let mut item = json!({
+                "type": ItemType::MCP_LIST_TOOLS,
+                "id": "mcpl_test",
+                "server_label": "conf",
+                "tools": []
+            });
+            if let Some(error) = error {
+                item["error"] = json!(error);
+            }
+            let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+            let mut enc = SseEncoder::new();
+            let mut sequence_number: u64 = 0;
+
+            let ok =
+                super::send_mcp_list_tools_events(&tx, &mut enc, &item, 0, &mut sequence_number)
+                    .await;
+            assert!(ok, "the client is connected");
+            drop(tx);
+
+            let events = drain_channel(&mut rx);
+            let types: Vec<String> = events
+                .iter()
+                .map(|block| event_type_from_sse_block(block))
+                .collect();
+            assert_eq!(
+                types,
+                [
+                    OutputItemEvent::ADDED,
+                    McpEvent::LIST_TOOLS_IN_PROGRESS,
+                    kind,
+                    OutputItemEvent::DONE,
+                ],
+                "the event lines for error {error:?}"
+            );
+            let data = events[2]
+                .split("data: ")
+                .nth(1)
+                .expect("the third event's data line")
+                .trim();
+            let payload: serde_json::Value = serde_json::from_str(data).expect("json");
+            assert_eq!(payload["type"], kind);
+            assert_eq!(payload["item_id"], "mcpl_test");
+            assert_eq!(payload["output_index"], 0);
+            assert_eq!(payload.get("error"), None, "the failure is on the item");
+        }
+    }
+
     /// The loop announces only what a client may see: an internal server's
     /// `mcp_list_tools` item is left out of the kept items, so the stream's
     /// start, the completed event and the stored record agree; a visible
@@ -2680,6 +2750,7 @@ mod tests {
             label: label.to_string(),
             server_key: server_key.to_string(),
             allowed_tools: None,
+            list_error: None,
         };
         let session = McpToolSession::new(
             &orchestrator,

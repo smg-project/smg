@@ -221,10 +221,11 @@ async fn execute_mcp_tool_loop_streaming(
 
     // Emit mcp_list_tools on first iteration
     for binding in session.mcp_servers() {
-        let tools_for_server = session.list_tools_for_server(&binding.server_key);
+        let tools_for_server = session.list_tools_for_binding(binding);
+        let list_error = binding.list_error.as_deref();
 
         if emitter
-            .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, tx)
+            .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, list_error, tx)
             .await
             .is_err()
         {

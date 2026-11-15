@@ -76,10 +76,9 @@
 //! - `fallback`: a request Symphony was configured for (the gateway's flag, or the request's
 //!   header) that the legacy parsers read instead of a table, by the reason the seam names
 //!   ([`Fallback`]): no table for the model, a reasoning name alone, a legacy tool-call name,
-//!   `passthrough`, or a table without a tag for the request's forced call; counted once per
-//!   request where the assignment is decided (`assign`), under the table that had no tag, or
-//!   `none`. The response's `x-smg-parser` header says `legacy` for the same request; the
-//!   counter says how often, and why, across a deployment.
+//!   or `passthrough`; counted once per request where the assignment is decided (`assign`),
+//!   under the table `none`. The response's `x-smg-parser` header says `legacy` for the same
+//!   request; the counter says how often, and why, across a deployment.
 //!
 //! And, after an output was read, what the response could not carry:
 //!
@@ -141,8 +140,8 @@ pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
 /// Calls the model wrote under `tool_choice: none`, read whole and dropped, by `table`: the
 /// request forbade them, as the engine's own server reads and withholds such a call.
 pub(crate) const CALLS_FORBIDDEN: &str = "smg_symphony_calls_forbidden_total";
-/// Requests Symphony was configured for that the legacy parsers read, by `reason` and `table`
-/// ([`record_fallback`]).
+/// Requests Symphony was configured for that the legacy parsers read, by `reason`, under the
+/// table `none` ([`record_fallback`]).
 pub(crate) const FALLBACK: &str = "smg_symphony_fallback_total";
 /// Whole Messages responses refused after the output was read (counted under its own outcome),
 /// by `table` and `reason` ([`record_refused`]): `tool_use_input`, a `tool_use` block that cannot
@@ -210,13 +209,12 @@ const OUTCOMES: [&str; 6] = [
     "panicked",
 ];
 /// The `reason` labels of [`FALLBACK`], in the order of [`fallback_index`]: the four decisions
-/// that leave a model to the legacy parsers, and the table that has no tag for a forced call.
-const FALLBACK_REASONS: [&str; 5] = [
+/// that leave a model to the legacy parsers.
+const FALLBACK_REASONS: [&str; 4] = [
     "no_table",
     "reasoning_name_only",
     "legacy_tool_name",
     "passthrough",
-    "forced_call_without_tag",
 ];
 /// The `reason` label of [`REFUSED`]: the one refusal the Messages fold names.
 const REFUSED_TOOL_USE_INPUT: &str = "tool_use_input";
@@ -307,13 +305,8 @@ fn fallback_index(why: Fallback) -> usize {
         Fallback::ReasoningNameOnly => 1,
         Fallback::LegacyToolName => 2,
         Fallback::Passthrough => 3,
-        Fallback::ForcedCallWithoutTag => FORCED_CALL_WITHOUT_TAG,
     }
 }
-
-/// The place of `forced_call_without_tag` in [`FALLBACK_REASONS`]: the one fallback counted under
-/// a table of its own ([`record_fallback`]); the other four count under `none`.
-const FORCED_CALL_WITHOUT_TAG: usize = 4;
 
 /// The bytes an event accounts for in the output.
 pub(super) fn bytes_of(event: &Event) -> usize {
@@ -946,20 +939,16 @@ pub(crate) fn record_panicked(table: &'static str) {
     increment(&series(table).outputs[PANICKED], 1);
 }
 
-/// Records a request Symphony was configured for that the legacy parsers read, for `why`: under
-/// `table` where a table reads the model and had no tag for the request's forced call, under
-/// `none` where no table reads it. One increment through a key built once, no allocation.
-pub(crate) fn record_fallback(why: Fallback, table: Option<&'static str>) {
-    increment(
-        &series(table.unwrap_or(NO_TABLE)).fallback[fallback_index(why)],
-        1,
-    );
+/// Records a request Symphony was configured for that the legacy parsers read, for `why`, under
+/// the table `none`: no table reads it. One increment through a key built once, no allocation.
+pub(crate) fn record_fallback(why: Fallback) {
+    increment(&series(NO_TABLE).fallback[fallback_index(why)], 1);
 }
 
 /// Publishes the series of the table labelled `table` at zero, so a dashboard or an alert finds
 /// `failed`, `malformed` and the rest before the first such output instead of no series at all:
-/// the outcomes, the malformed reasons, the suppressed calls, the forbidden calls, the refusal, the
-/// fallback of a forced call the table has no tag for, and the empty distribution of the malformed
+/// the outcomes, the malformed reasons, the suppressed calls, the forbidden calls, the refusal,
+/// and the empty distribution of the malformed
 /// bytes. Called where the table that reads a model becomes known: by the registration step once a
 /// worker of the model is in the registry (`workflow::steps::shared::register`; the create step
 /// resolves the table); a table published again sets nothing.
@@ -969,7 +958,6 @@ pub(crate) fn init_table_series(table: &'static str) {
         &series.calls_suppressed,
         &series.calls_forbidden,
         &series.refused,
-        &series.fallback[FORCED_CALL_WITHOUT_TAG],
     ]) {
         publish(key);
     }
@@ -984,11 +972,8 @@ pub(crate) fn init_table_series(table: &'static str) {
 /// four decisions that leave a model to the legacy parsers are known before any worker registers.
 /// Called once the recorder is installed, under `--parser symphony`.
 pub(crate) fn init_startup_series() {
-    let series = series(NO_TABLE);
-    for (index, key) in series.fallback.iter().enumerate() {
-        if index != FORCED_CALL_WITHOUT_TAG {
-            publish(key);
-        }
+    for key in &series(NO_TABLE).fallback {
+        publish(key);
     }
 }
 
@@ -1048,9 +1033,9 @@ struct Series {
     malformed_bytes: Key,
     calls_suppressed: Key,
     calls_forbidden: Key,
-    /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of the table
-    /// that had no tag for a forced call, or of `none`, under which the other reasons count.
-    fallback: [Key; 5],
+    /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of `none`, the
+    /// one table label the reasons count under.
+    fallback: [Key; FALLBACK_REASONS.len()],
     /// [`REFUSED`] under its one reason.
     refused: Key,
     /// The buckets of the lines on malformed outputs, one per reason of the output's first run,
@@ -2525,12 +2510,11 @@ mod tests {
     }
 
     #[test]
-    fn a_request_the_legacy_parsers_read_is_counted_by_reason_under_the_table_or_none() {
+    fn a_request_the_legacy_parsers_read_is_counted_by_reason_under_none() {
         let scrape = rendered(|| {
-            record_fallback(Fallback::NoTable, None);
-            record_fallback(Fallback::NoTable, None);
-            record_fallback(Fallback::Passthrough, None);
-            record_fallback(Fallback::ForcedCallWithoutTag, Some("qwen3"));
+            record_fallback(Fallback::NoTable);
+            record_fallback(Fallback::NoTable);
+            record_fallback(Fallback::Passthrough);
         });
         let none = line_with(
             &scrape,
@@ -2546,19 +2530,12 @@ mod tests {
         )
         .expect("the passthrough counter");
         assert!(passthrough.ends_with(" 1"), "{passthrough}");
-        let forced = line_with(
-            &scrape,
-            FALLBACK,
-            &["reason=\"forced_call_without_tag\"", "table=\"qwen3\""],
-        )
-        .expect("the forced call counter");
-        assert!(forced.ends_with(" 1"), "{forced}");
         assert_eq!(
             scrape
                 .lines()
                 .filter(|line| line.starts_with(FALLBACK))
                 .count(),
-            3,
+            2,
             "{scrape}"
         );
         assert!(!scrape.contains(OUTPUTS), "{scrape}");
@@ -2568,7 +2545,6 @@ mod tests {
             (Fallback::ReasoningNameOnly, "reasoning_name_only"),
             (Fallback::LegacyToolName, "legacy_tool_name"),
             (Fallback::Passthrough, "passthrough"),
-            (Fallback::ForcedCallWithoutTag, "forced_call_without_tag"),
         ];
         for (why, label) in every {
             assert_eq!(FALLBACK_REASONS[fallback_index(why)], label);
@@ -3014,15 +2990,8 @@ mod tests {
             zero(REFUSED, &["table=\"qwen3\"", "reason=\"tool_use_input\""]),
             "{scrape}"
         );
-        assert!(
-            zero(
-                FALLBACK,
-                &["table=\"qwen3\"", "reason=\"forced_call_without_tag\""]
-            ),
-            "{scrape}"
-        );
-        // The other fallback reasons count under `none`, never under a table.
-        for reason in &FALLBACK_REASONS[..FORCED_CALL_WITHOUT_TAG] {
+        // The fallback reasons count under `none`, never under a table.
+        for reason in &FALLBACK_REASONS {
             assert!(
                 line_with(
                     &scrape,
@@ -3043,11 +3012,12 @@ mod tests {
     }
 
     /// The requests no table reads are counted under `none` by four reasons known at start-up:
-    /// their series exist at zero before any worker registers, and not the fifth, a table's own.
+    /// their series exist at zero before any worker registers.
     #[test]
     fn the_startup_series_are_the_four_fallbacks_of_a_request_no_table_reads() {
         let scrape = rendered(init_startup_series);
-        for reason in &FALLBACK_REASONS[..FORCED_CALL_WITHOUT_TAG] {
+        assert_eq!(FALLBACK_REASONS.len(), 4);
+        for reason in &FALLBACK_REASONS {
             let line = line_with(
                 &scrape,
                 FALLBACK,
@@ -3056,10 +3026,6 @@ mod tests {
             .expect(reason);
             assert!(line.ends_with(" 0"), "{line}");
         }
-        assert!(
-            line_with(&scrape, FALLBACK, &["reason=\"forced_call_without_tag\""]).is_none(),
-            "{scrape}"
-        );
         assert!(!scrape.contains(OUTPUTS), "{scrape}");
     }
 

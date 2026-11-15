@@ -9,7 +9,10 @@ use std::{
 };
 
 use axum::response::Response;
-use llm_multimodal::{data_url::data_url_payload_bytes, media, MediaContentPart, Modality};
+use llm_multimodal::{
+    data_url::{base64_payload, data_url_payload, data_url_payload_bytes},
+    media, MediaConnectorError, MediaContentPart, MediaErrorCode, Modality,
+};
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 
@@ -78,6 +81,13 @@ pub(crate) enum MmRefsError {
     ModalityUnsupported(Modality),
     /// A part kind with no reference form (inline bytes or embeddings).
     UnsupportedPart(&'static str),
+    /// A reference the request got wrong, refused at the door before any
+    /// worker is selected, in the media connector's own words (`cause`): a
+    /// url that is empty or begins with whitespace or a control character, a
+    /// data URL whose header names no base64 payload or whose payload is
+    /// empty. The request's own fault, under the code the router-side
+    /// pipeline answers the same media (`invalid_multimodal_request`).
+    InvalidReference { index: usize, cause: String },
     /// An inline `data:` payload above the router's byte cap.
     RefTooLarge {
         index: usize,
@@ -111,6 +121,7 @@ impl MmRefsError {
             Self::ModalityUnsupported(_)
             | Self::UnsupportedPart(_)
             | Self::PipelineTakesNoAudio => "multimodal_not_supported",
+            Self::InvalidReference { .. } => MediaErrorCode::InvalidRequest.as_str(),
             Self::RefTooLarge { .. } => "media_ref_too_large",
             Self::SchemeNotAccepted { .. } => "media_ref_scheme_not_accepted",
             Self::EncodeNotSupported | Self::WorkerNotCapable | Self::RouterSpecMissing => {
@@ -169,6 +180,7 @@ impl std::fmt::Display for MmRefsError {
             Self::UnsupportedPart(kind) => {
                 write!(f, "{kind} cannot be forwarded as a media reference")
             }
+            Self::InvalidReference { index, cause } => write!(f, "media item {index}: {cause}"),
             Self::RefTooLarge {
                 index,
                 bytes,
@@ -562,6 +574,13 @@ pub(crate) fn resolve_mm_processing(
         }
     };
 
+    if resolved == MmProcessing::Worker {
+        // The references a worker would be handed, read once at the door:
+        // a shape no engine serves is refused here, in the connector's
+        // words, before a worker is selected.
+        check_forwarded_references(plan)?;
+    }
+
     if resolved == MmProcessing::Router && placeholders.is_worker_only() {
         // No spec: the router has nothing to process the media with.
         return Err(MmRefsError::RouterSpecMissing);
@@ -688,7 +707,10 @@ impl<'a> WireUrl<'a> {
     }
 }
 
-/// Lower-cased URL scheme; `data` for data URLs, empty for bare paths.
+/// Lower-cased URL scheme; `data` for data URLs, empty for bare paths and for
+/// a url that begins with whitespace: the reference is forwarded as written and
+/// the byte caps read the scheme at offset zero, so nothing reads past it here
+/// (the door refuses such a url as an invalid URL).
 fn url_scheme(url: &str) -> String {
     url.split_once(':')
         .map(|(scheme, _)| scheme)
@@ -783,6 +805,67 @@ fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
         }
     }
     Ok(hinted)
+}
+
+/// The characters of a refused url its refusal echoes, at most: the sentence
+/// names the url the client sent, never a whole inline payload.
+const URL_ECHO_CHARS: usize = 64;
+
+/// The first `URL_ECHO_CHARS` characters of a refused url, an ellipsis when cut.
+fn echoed_url(url: &str) -> String {
+    let mut echoed: String = url.chars().take(URL_ECHO_CHARS).collect();
+    if url.chars().nth(URL_ECHO_CHARS).is_some() {
+        echoed.push_str("...");
+    }
+    echoed
+}
+
+/// The references a forwarded plan carries, read once at the door before any
+/// worker is selected, by the rules the router-side pipeline's fetch applies
+/// to the same media: a url that is empty or begins with whitespace or a
+/// control character (the reference is forwarded as written and the byte caps
+/// read the scheme at offset zero; the refusal echoes at most the first
+/// `URL_ECHO_CHARS` characters of it), a data URL whose header names no base64
+/// payload and an empty payload are refused here in the connector's own
+/// words, instead of being forwarded to a worker no engine of which serves
+/// them. The symbols and the length of a base64 payload stay the engine's
+/// verdict: nothing here reads the payload.
+fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
+    let refused = |index: usize, cause: MediaConnectorError| MmRefsError::InvalidReference {
+        index,
+        cause: cause.to_string(),
+    };
+    for (index, part) in plan.parts().iter().enumerate() {
+        match part {
+            MediaContentPart::ImageUrl { url, .. }
+            | MediaContentPart::VideoUrl { url, .. }
+            | MediaContentPart::AudioUrl { url, .. } => {
+                // The reference is forwarded as written and every byte cap reads
+                // the scheme at offset zero: nothing is trimmed here either, so a
+                // url that is empty or begins with a control character, a space
+                // or any whitespace (the leading set a URL parser strips) is an
+                // invalid URL, echoed by a bounded prefix.
+                if url.is_empty() || url.starts_with(|c: char| c <= ' ' || c.is_whitespace()) {
+                    return Err(refused(
+                        index,
+                        MediaConnectorError::InvalidUrl(echoed_url(url)),
+                    ));
+                }
+                let is_data_url = url
+                    .get(..5)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"));
+                if is_data_url {
+                    data_url_payload(url).map_err(|cause| refused(index, cause))?;
+                }
+            }
+            MediaContentPart::ImageBase64 { data, .. }
+            | MediaContentPart::AudioBase64 { data, .. } => {
+                base64_payload(data).map_err(|cause| refused(index, cause))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Build the wire payload from the plan, in authored (prompt) order.
@@ -970,6 +1053,70 @@ mod tests {
             };
             let w = worker(&scheme, runtime, connection, labels);
             assert_eq!(worker_accepts_media_refs(w.as_ref()), expected, "case {i}");
+        }
+    }
+
+    /// A reference no engine serves is refused at the door, before a worker
+    /// is selected, in the media connector's own words under the router-side
+    /// pipeline's code for the same media: an empty url, a data URL whose
+    /// header names no base64 payload, an empty payload (a URL part's or a
+    /// base64 source's); a well-formed reference still forwards untouched.
+    #[test]
+    fn a_reference_no_engine_serves_is_refused_at_the_door() {
+        let components = components(MmProcessingMode::Worker);
+        let registry = registry_with(vec![]);
+        let worker_only = PlaceholderTokens::worker_only();
+        let long = format!(" data:image/png;base64,{}", "A".repeat(200));
+        let long_echo = format!("invalid media URL: {}...", &long[..64]);
+        for (part, cause) in [
+            (image_url(""), "invalid media URL: "),
+            (image_url("   "), "invalid media URL:    "),
+            (
+                image_url(" data:image/png;base64,AQ=="),
+                "invalid media URL:  data:image/png;base64,AQ==",
+            ),
+            (image_url(&long), long_echo.as_str()),
+            (
+                image_url("\u{1}data:image/png;base64,AQ=="),
+                "invalid media URL: \u{1}data:image/png;base64,AQ==",
+            ),
+            (
+                image_url("data:image/png,%89PNG%0D%0A"),
+                "data URL parse error: only base64 encoded data URLs are supported",
+            ),
+            (
+                image_url("data:image/png;base64,"),
+                "data URL parse error: empty payload",
+            ),
+            (base64_image(""), "data URL parse error: empty payload"),
+        ] {
+            let error = resolve_mm_processing(
+                &components,
+                &registry,
+                MODEL,
+                &plan(vec![part]),
+                &worker_only,
+            )
+            .expect_err(cause);
+            assert_eq!(error.code(), "invalid_multimodal_request", "{cause}");
+            assert_eq!(error.to_string(), format!("media item 0: {cause}"));
+        }
+        for part in [
+            image_url("data:image/png;base64,AQ=="),
+            image_url("https://a/1.png"),
+            base64_image("AQ=="),
+        ] {
+            assert_eq!(
+                resolve_mm_processing(
+                    &components,
+                    &registry,
+                    MODEL,
+                    &plan(vec![part]),
+                    &worker_only
+                )
+                .expect("a well-formed reference forwards"),
+                MmProcessing::Worker
+            );
         }
     }
 

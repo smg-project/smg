@@ -41,8 +41,8 @@ kube = { version = "3.0.1", default-features = false, features = ["client", "rus
 
 # The ingestion drivers (the `ingest` feature): the load path over the
 # store's ingress traits (the `GetLoads` poll through the engines' gRPC
-# clients, the metrics scrape over HTTP) and the load helpers the gateway
-# shares with the controller (the row conversion, the scrape parser).
+# clients, the metrics scrape over HTTP) and the load helpers (the row
+# conversion, the scrape parser).
 openai-protocol = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
 smg-grpc-client = { workspace = true, optional = true }
@@ -80,9 +80,8 @@ rustix = { version = "1", default-features = false, features = ["std", "time", "
 [features]
 # The ingestion drivers over the store: the load path (the `GetLoads` poll
 # per engine under the store's poll arbitration, the metrics scrape of an
-# engine without a servicer) and the load helpers the gateway shares. Off by
-# default; the gateway turns it on for the helpers, the controller for the
-# drivers.
+# engine without a servicer) and the load helpers. Off by default; the
+# controller turns it on.
 ingest = [
     "dep:openai-protocol",
     "dep:reqwest",
@@ -125,8 +124,7 @@ axum = { workspace = true }
 http = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
-# The corpus test reads YAML documents; the gateway reads its spec file with
-# the same crate.
+# The corpus test reads YAML documents.
 serde_yaml = { workspace = true }
 # The contract tests (tests/contracts.rs) compile the protocol to a
 # descriptor set through protoc and resolve the WebAssembly world; no code
@@ -160,6 +158,11 @@ required-features = ["controller"]
 name = "binary"
 required-features = ["controller"]
 
+# Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
+[[test]]
+name = "classic_rows"
+required-features = ["ingest"]
+
 [[test]]
 name = "controller"
 required-features = ["controller"]
@@ -174,6 +177,10 @@ required-features = ["controller"]
 
 [[bench]]
 name = "decision"
+harness = false
+
+[[bench]]
+name = "pair_table"
 harness = false
 
 [[bench]]
@@ -195,6 +202,10 @@ harness = false
 
 [[bench]]
 name = "contention"
+harness = false
+
+[[bench]]
+name = "store_view"
 harness = false
 
 [[bench]]

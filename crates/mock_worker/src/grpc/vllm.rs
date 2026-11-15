@@ -147,11 +147,24 @@ impl VllmEngine for MockScheduler {
         )))
     }
 
+    /// One vector per request, deterministic from the input's ids
+    /// ([`super::embedding_of`]); the prompt tokens are the ids' count.
     async fn embed(
         &self,
-        _request: Request<vllm::EmbedRequest>,
+        request: Request<vllm::EmbedRequest>,
     ) -> Result<Response<vllm::EmbedResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        let request = request.into_inner();
+        let input_ids = request
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.as_slice())
+            .unwrap_or(&[]);
+        let embedding = super::embedding_of(input_ids);
+        Ok(Response::new(vllm::EmbedResponse {
+            embedding_dim: embedding.len() as u32,
+            embedding,
+            prompt_tokens: input_ids.len() as u32,
+        }))
     }
 
     async fn health_check(

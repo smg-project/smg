@@ -277,6 +277,9 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
         prompt: "<|im_start|>assistant\n".to_string(),
         forbids_calls: false,
         past_the_end: false,
+        forcing: None,
+        opener: None,
+        forced_ids: None,
         span: tracing::Span::none(),
         marked: Arc::default(),
     };

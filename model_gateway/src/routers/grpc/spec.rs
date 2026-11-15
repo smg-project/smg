@@ -34,12 +34,23 @@ pub(crate) enum ResponseSpec {
     Generate(GenerateResponseSpec),
     Completion(CompletionResponseSpec),
     Messages(Box<MessagesResponseSpec>),
-    /// Embedding/classify response processing needs only dispatch metadata.
-    Embedding,
+    /// Embedding response processing: the encoding the request asked for;
+    /// the rest is dispatch metadata.
+    Embedding(EmbeddingResponseSpec),
+    /// Classify response processing needs only dispatch metadata.
     Classify,
     Decisions(DecisionsResponseSpec),
     Harmony(HarmonyResponseSpec),
     Transcription(TranscriptionResponseSpec),
+}
+
+/// Response-phase contract for an embeddings request: whether the answer's
+/// vectors leave as the base64 of their little-endian f32 bytes
+/// (`encoding_format: "base64"`) or as float arrays, as read by request
+/// building where the request is at hand.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmbeddingResponseSpec {
+    pub base64: bool,
 }
 
 #[derive(Clone)]

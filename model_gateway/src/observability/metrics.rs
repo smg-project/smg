@@ -853,7 +853,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         symphony_telemetry::FALLBACK,
-        "Requests Symphony was configured for (the --parser flag or the request's X-SMG-Parser header) that the legacy parsers read instead of a table, by reason (no_table: the registry has no table for the model and nothing names one; reasoning_name_only: a reasoning parser name alone that no table answers to; legacy_tool_name: a legacy tool-call parser name no table answers to; passthrough; forced_call_without_tag: the table has no structural tag for the request's forced or required call, so the older registry's JSON schema constrains the output) and table (the table that had no tag; none where no table reads the model)"
+        "Requests Symphony was configured for (the --parser flag or the request's X-SMG-Parser header) that the legacy parsers read instead of a table, by reason (no_table: the registry has no table for the model and nothing names one; reasoning_name_only: a reasoning parser name alone that no table answers to; legacy_tool_name: a legacy tool-call parser name no table answers to; passthrough), under the table none"
     );
     describe_counter!(
         symphony_telemetry::REFUSED,

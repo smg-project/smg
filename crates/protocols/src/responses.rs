@@ -2235,6 +2235,263 @@ pub enum ResponseInputOutputItem {
     },
 }
 
+/// One `input` item read by its shape. The derived reader of
+/// [`ResponseInputOutputItem`] (the `type` tag, with the two shapes sent
+/// without one as its fallbacks) reports a refusal inside a message sent
+/// without a tag, the shape every client sends, as "data did not match any
+/// variant of untagged enum ResponseInputOutputItem", naming no part and no
+/// field, and the same for a `message` sent without an `id`, which fails
+/// its tagged variant and lands in the same fallback. Both are read field
+/// by field instead, so the refusal names the field (`content[1].detail:
+/// unknown variant ...`); every other item takes the derived reader, its
+/// refusal traced to the part it is about when the item carries parts
+/// (see [`typed_item_refusal`]).
+struct InputItem(ResponseInputOutputItem);
+
+impl<'de> Deserialize<'de> for InputItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let ItemFields(fields) = ItemFields::deserialize(deserializer)?;
+        let has = |name: &str| fields.contains_key(name);
+        let kind = fields.get("type").and_then(Value::as_str);
+        // A message without a `type` carries a role and a content, or one
+        // of them and no `id`: an `{id, content}` or `{id, role}` stays the
+        // item reference the derived reader reads it as.
+        let by_field = if has("type") {
+            kind == Some("message") && !has("id")
+        } else {
+            (has("role") && has("content")) || (!has("id") && (has("role") || has("content")))
+        };
+        let tag = (kind == Some("message")).then_some(SimpleInputMessageTypeTag::Message);
+        let item = if by_field {
+            simple_input_message(fields, tag)
+        } else {
+            let item = Value::Object(fields);
+            ResponseInputOutputItem::deserialize(&item)
+                .map_err(|error| typed_item_refusal(&item, error))
+        };
+        item.map(InputItem).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An item's fields, read one entry at a time so a repeated key is refused
+/// with serde's own words (`duplicate field `role``), as the derived readers
+/// refuse it, instead of the last value winning.
+struct ItemFields(serde_json::Map<String, Value>);
+
+impl<'de> Deserialize<'de> for ItemFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = ItemFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an input item")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut entries: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some((key, value)) = entries.next_entry::<String, Value>()? {
+                    if fields.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                    fields.insert(key, value);
+                }
+                Ok(ItemFields(fields))
+            }
+        }
+
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
+/// A message read field by field (see [`InputItem`]): the fields of
+/// [`ResponseInputOutputItem::SimpleInputMessage`] one by one so a refusal
+/// names its field, the content parts each from the buffered value so a
+/// part's refusal names its field too (see [`content_part_refusal`]).
+fn simple_input_message(
+    mut fields: serde_json::Map<String, Value>,
+    r#type: Option<SimpleInputMessageTypeTag>,
+) -> Result<ResponseInputOutputItem, String> {
+    let role = required_field(&mut fields, "role")?;
+    let content = match fields.remove("content") {
+        Some(Value::String(text)) => StringOrContentParts::String(text),
+        Some(Value::Array(parts)) => StringOrContentParts::Array(content_parts("content", &parts)?),
+        Some(other) => {
+            let expected: &dyn serde::de::Expected = &"a string or an array of content parts";
+            let error =
+                <serde_json::Error as serde::de::Error>::invalid_type(unexpected(&other), expected);
+            return Err(format!("content: {error}"));
+        }
+        None => return Err("missing field `content`".to_string()),
+    };
+    let phase = optional_field(&mut fields, "phase")?;
+    Ok(ResponseInputOutputItem::SimpleInputMessage {
+        content,
+        role,
+        r#type,
+        phase,
+    })
+}
+
+/// The parts under `field`, each from its buffered value so a refusal names
+/// the part and its field.
+fn content_parts(field: &str, parts: &[Value]) -> Result<Vec<ResponseContentPart>, String> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            ResponseContentPart::deserialize(part)
+                .map_err(|error| content_part_refusal(field, index, part, &error))
+        })
+        .collect()
+}
+
+/// A typed item's refusal from the derived reader: when the item carries
+/// content parts (a `message`'s `content`, a `function_call_output`'s
+/// `output`) and serde refuses one on its own, that part's refusal, named;
+/// serde's own words otherwise. A refusal at a typed item's own field (a
+/// `function_call` without its `call_id`) keeps the derived reader's words:
+/// its fallback to the untagged shapes drops the tagged reading's reason,
+/// and naming it takes a reader of the tagged variants on their own.
+fn typed_item_refusal(item: &Value, error: serde_json::Error) -> String {
+    let field = match item.get("type").and_then(Value::as_str) {
+        Some("message") => "content",
+        Some("function_call_output") => "output",
+        _ => return error.to_string(),
+    };
+    match item
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|parts| content_parts(field, parts))
+    {
+        Some(Err(refusal)) => refusal,
+        _ => error.to_string(),
+    }
+}
+
+/// A part's refusal, naming the field it is about: `type` when the kind
+/// itself is refused; otherwise the first field whose value alone, with the
+/// kind, reproduces the refusal (serde names the value and the rule, not
+/// the field, inside a tagged part), and inside an array value the element
+/// that does; a missing field by serde's own words at the part (the
+/// extractor appends the field) or at the array element missing it. The
+/// bare refusal when nothing reproduces it. Every probe is one field or
+/// one element beside the kind, so the search costs the part's size.
+fn content_part_refusal(
+    field: &str,
+    index: usize,
+    part: &Value,
+    error: &serde_json::Error,
+) -> String {
+    let reason = error.to_string();
+    let at = format!("{field}[{index}]");
+    let Some(fields) = part.as_object() else {
+        return format!("{at}: {reason}");
+    };
+    let kind = fields.get("type");
+    let with_kind = |name: &str, value: Value| {
+        let mut probe = serde_json::Map::new();
+        if let Some(kind) = kind {
+            probe.insert("type".to_string(), kind.clone());
+        }
+        probe.insert(name.to_string(), value);
+        Value::Object(probe)
+    };
+    let refused = |probe: &Value| {
+        matches!(
+            ResponseContentPart::deserialize(probe),
+            Err(error) if error.to_string() == reason
+        )
+    };
+    let missing = reason.starts_with("missing field `");
+    if !missing
+        && kind.is_some_and(|kind| {
+            refused(&Value::Object(serde_json::Map::from_iter([(
+                "type".to_string(),
+                kind.clone(),
+            )])))
+        })
+    {
+        return format!("{at}.type: {reason}");
+    }
+    // Every probe holds the kind and one field, or one element of an array
+    // field, so the search costs the part's size, not its square.
+    for (name, value) in fields.iter().filter(|(name, _)| name.as_str() != "type") {
+        let Some(elements) = value.as_array() else {
+            if !missing && refused(&with_kind(name, value.clone())) {
+                return format!("{at}.{name}: {reason}");
+            }
+            continue;
+        };
+        // A missing field is located inside an array only: the part's own
+        // missing field is reproduced by the emptied array too, a nested one
+        // by its element alone (serde meets the element before it checks the
+        // part's own fields).
+        if missing && refused(&with_kind(name, Value::Array(Vec::new()))) {
+            continue;
+        }
+        if !missing && !refused(&with_kind(name, value.clone())) {
+            continue;
+        }
+        let element = elements
+            .iter()
+            .position(|element| refused(&with_kind(name, Value::Array(vec![element.clone()]))));
+        match element {
+            Some(position) => return format!("{at}.{name}[{position}]: {reason}"),
+            None if missing => continue,
+            None => return format!("{at}.{name}: {reason}"),
+        }
+    }
+    format!("{at}: {reason}")
+}
+
+/// `fields[name]` as a `T`, the refusal naming the field; serde's words for
+/// a missing one.
+fn required_field<T: serde::de::DeserializeOwned>(
+    fields: &mut serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<T, String> {
+    match fields.remove(name) {
+        Some(value) => serde_json::from_value(value).map_err(|error| format!("{name}: {error}")),
+        None => Err(format!("missing field `{name}`")),
+    }
+}
+
+/// `fields[name]` as a `T` when present and not null, the refusal naming
+/// the field.
+fn optional_field<T: serde::de::DeserializeOwned>(
+    fields: &mut serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<T>, String> {
+    match fields.remove(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| format!("{name}: {error}")),
+    }
+}
+
+/// The value as serde describes a refused one (`integer `7``, `map`, ...).
+fn unexpected(value: &Value) -> serde::de::Unexpected<'_> {
+    match value {
+        Value::Null => serde::de::Unexpected::Unit,
+        Value::Bool(flag) => serde::de::Unexpected::Bool(*flag),
+        Value::Number(number) => number
+            .as_u64()
+            .map(serde::de::Unexpected::Unsigned)
+            .or_else(|| number.as_i64().map(serde::de::Unexpected::Signed))
+            .or_else(|| number.as_f64().map(serde::de::Unexpected::Float))
+            .unwrap_or(serde::de::Unexpected::Other("a number")),
+        Value::String(text) => serde::de::Unexpected::Str(text),
+        Value::Array(_) => serde::de::Unexpected::Seq,
+        Value::Object(_) => serde::de::Unexpected::Map,
+    }
+}
+
 /// Single-value tag enum pinning [`ResponseInputOutputItem::ItemReference`]'s
 /// optional `type` discriminator to the spec's only permitted value,
 /// `"item_reference"`. Used because the outer enum is `type`-tagged and the
@@ -3477,11 +3734,53 @@ pub struct ResponsesRequest {
     pub repetition_penalty: f32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// The request's `input`: the conversation as an array of input items, or
+/// one text.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ResponseInput {
     Items(Vec<ResponseInputOutputItem>),
     Text(String),
+}
+
+/// `input` read by its JSON type. The derived untagged reader buffered the
+/// whole value, tried the items and then the text, and reported a refusal
+/// inside one item as "data did not match any variant of untagged enum
+/// ResponseInput" at `input`, naming no item; this one keeps the item's own
+/// refusal under its index, each item read by its shape (see `InputItem`).
+impl<'de> Deserialize<'de> for ResponseInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for InputVisitor {
+            type Value = ResponseInput;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string or an array of input items")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(ResponseInput::Text(text.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(ResponseInput::Text(text))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut items: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut read = Vec::new();
+                while let Some(InputItem(item)) = items.next_element()? {
+                    read.push(item);
+                }
+                Ok(ResponseInput::Items(read))
+            }
+        }
+
+        deserializer.deserialize_any(InputVisitor)
+    }
 }
 
 impl ResponsesRequest {
@@ -4858,6 +5157,99 @@ mod tests {
     #[test]
     fn a_function_tools_fields_end_with_its_tool_keys() {
         assert!(FunctionTool::FIELDS.ends_with(FunctionTool::TOOL_KEYS));
+    }
+
+    /// A twelve-turn conversation input (text turns and part turns, an
+    /// image, a function call and its output), read two hundred times: the
+    /// readers' cost on a representative request, for the measurement of a
+    /// change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_input_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut items = Vec::new();
+        for _ in 0..5 {
+            items.push(serde_json::json!({"role": "user", "content": [
+                {"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"},
+            ]}));
+            items.push(serde_json::json!({"role": "assistant", "content": text}));
+        }
+        items.push(serde_json::json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}", "status": "completed"}));
+        items.push(serde_json::json!({"type": "function_call_output", "call_id": "call_1", "output": text}));
+        let body =
+            serde_json::json!({"model": "m", "input": items, "max_output_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ResponsesRequest = serde_json::from_str(&body).expect("the body reads");
+            let ResponseInput::Items(items) = &request.input else {
+                panic!("the input is the items")
+            };
+            assert_eq!(items.len(), 12);
+        }
+    }
+
+    /// A long part is read in its own size: a missing field inside the last
+    /// of many annotations is located at its element, and a part with many
+    /// array-valued keys is refused at the part, both within one generous
+    /// wall-clock bound (the quadratic shapes took tens of seconds here).
+    #[test]
+    fn a_long_part_is_located_in_linear_time() {
+        let started = std::time::Instant::now();
+        let mut annotations: Vec<Value> = (0..20_000)
+            .map(|index| {
+                serde_json::json!({"type": "file_citation", "file_id": "f", "filename": "n", "index": index})
+            })
+            .collect();
+        annotations.push(serde_json::json!({"type": "file_citation", "index": 20_000}));
+        let part =
+            serde_json::json!({"type": "output_text", "text": "hi", "annotations": annotations});
+        let error = ResponseContentPart::deserialize(&part)
+            .expect_err("the last annotation lacks its file_id");
+        assert_eq!(
+            content_part_refusal("content", 0, &part, &error),
+            "content[0].annotations[20000]: missing field `file_id`"
+        );
+        let mut fields = serde_json::Map::new();
+        fields.insert("type".to_string(), Value::String("input_text".to_string()));
+        for index in 0..20_000 {
+            fields.insert(format!("k{index}"), serde_json::json!([{}]));
+        }
+        let part = Value::Object(fields);
+        let error = ResponseContentPart::deserialize(&part).expect_err("the part lacks its text");
+        assert_eq!(
+            content_part_refusal("content", 0, &part, &error),
+            "content[0]: missing field `text`"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "located in {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An input item with a repeated key is refused with serde's words, as
+    /// the derived readers refuse it, instead of the last value winning.
+    #[test]
+    fn an_input_item_with_a_repeated_key_is_refused() {
+        for (body, key) in [
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","role":"system"}]}"#,
+                "role",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","type":"message","role":"user","content":"hi"}]}"#,
+                "type",
+            ),
+        ] {
+            let error = serde_json::from_str::<ResponsesRequest>(body)
+                .expect_err("the repeated key is refused");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("duplicate field `{key}`")),
+                "{error}"
+            );
+        }
     }
 
     /// The three sampling knobs the request keeps as plain values read as set

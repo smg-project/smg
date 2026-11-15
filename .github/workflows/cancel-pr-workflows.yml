@@ -40,6 +40,8 @@ jobs:
             group: benchmark-policy-engine-refs/pull/{0}/merge
           - workflow: Bellwether Fixtures
             group: bellwether-fixtures-pr-{0}
+          - workflow: Policy Recorded Rows
+            group: policy-recorded-rows-pr-{0}
           - workflow: Release SMG+Engine Docker Image
             group: release-engine-docker-pr-{0}
     concurrency:

@@ -172,6 +172,7 @@ pub enum McpEvent {
     CallFailed,
     ListToolsInProgress,
     ListToolsCompleted,
+    ListToolsFailed,
 }
 
 impl McpEvent {
@@ -182,6 +183,7 @@ impl McpEvent {
     pub const CALL_FAILED: &'static str = "response.mcp_call.failed";
     pub const LIST_TOOLS_IN_PROGRESS: &'static str = "response.mcp_list_tools.in_progress";
     pub const LIST_TOOLS_COMPLETED: &'static str = "response.mcp_list_tools.completed";
+    pub const LIST_TOOLS_FAILED: &'static str = "response.mcp_list_tools.failed";
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -192,6 +194,7 @@ impl McpEvent {
             Self::CallFailed => Self::CALL_FAILED,
             Self::ListToolsInProgress => Self::LIST_TOOLS_IN_PROGRESS,
             Self::ListToolsCompleted => Self::LIST_TOOLS_COMPLETED,
+            Self::ListToolsFailed => Self::LIST_TOOLS_FAILED,
         }
     }
 }
