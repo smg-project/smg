@@ -1341,6 +1341,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "inkling-2-small",
+        model: "thinkingmachines/Inkling-2-Small",
+        also: &["Inkling-2-Small-MXFP8"],
+        released: "2026-11-04",
+        smg: (Some("inkling"), Some("inkling")),
+        table: Some(Table::Inkling2),
+        set: Some(31),
+        status: Status::Replaying,
+    },
+    Group {
         slug: "iquest-q1",
         model: "IQuestLab/IQuest-Q1",
         also: &[],

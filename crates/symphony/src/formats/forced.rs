@@ -760,15 +760,16 @@ mod tests {
     /// reads the output there. Swept over every table of the registry, wherever the engines
     /// start a grammar, the prompt's thought open, closed by the prompt or never opened, one call
     /// and many, and over the tools a request may carry. For tools every syntax writes, every
-    /// table has a tag but two: a table that reads no calls (`plain`), and `inkling` with the
-    /// prompt's thought open where the grammar starts at the first token. A request whose every
-    /// tool the table's syntax cannot write leaves that table without a tag in every cell: a
-    /// name with a space, a quote or a newline on `kimi_k2`; a name or a required key with a
-    /// quote and a bracket, or an empty required key, on `muse_spark`; a tool with no name on
-    /// every table. One tool the syntax writes keeps the tag. A table that gains or loses a tag
-    /// moves this list, and with it the outputs the variant reads.
+    /// table has a tag but three: a table that reads no calls (`plain`), and the Inkling tables
+    /// (`inkling`, `inkling2`) with the prompt's thought open where the grammar starts at the
+    /// first token. A request whose every tool the table's syntax cannot write leaves that table
+    /// without a tag in every cell: a name with a space, a quote or a newline on `kimi_k2`; a
+    /// name or a required key with a quote and a bracket, or an empty required key, on
+    /// `muse_spark`; a tool with no name on every table. One tool the syntax writes keeps the
+    /// tag. A table that gains or loses a tag moves this list, and with it the outputs the
+    /// variant reads.
     #[test]
-    fn a_forced_call_has_its_own_tag_but_on_two_tables_and_for_tools_a_table_cannot_write() {
+    fn a_forced_call_has_its_own_tag_but_on_three_tables_and_for_tools_a_table_cannot_write() {
         use serde_json::json;
         let tool = |name: &str, parameters: Value| -> Tool {
             serde_json::from_value(json!({
@@ -850,7 +851,7 @@ mod tests {
             let expected = swept(|table, options| {
                 table.name() == "plain"
                     || nowhere.contains(&table.name())
-                    || (table.name() == "inkling"
+                    || (matches!(table.name(), "inkling" | "inkling2")
                         && options.reasoning_open
                         && options.start == GrammarStart::FirstToken)
             });

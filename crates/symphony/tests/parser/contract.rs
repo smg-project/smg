@@ -468,6 +468,13 @@ fn inkling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Inkling.format(), Declared::default()))
 }
 
+/// Inkling 2 reads the same messages after the opener: the contract feeds every subject an empty
+/// prompt, which no table reads as an unopened turn, so the outputs are the shapes after
+/// `<|message_model|>`; the turn the model opens itself is the table's own tests' and the corpus's.
+fn inkling2() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Inkling2.format(), Declared::default()))
+}
+
 /// Inkling as a request without tools reads it: the message header content, its markers dropped.
 fn inkling_without_calls() -> Box<dyn Parser> {
     Box::new(Engine::new(
@@ -1042,6 +1049,12 @@ const FORMATS: &[Subject] = &[
         new: inkling,
         outputs: INKLING_OUTPUTS,
         table: Some(Table::Inkling),
+    },
+    Subject {
+        name: "inkling2",
+        new: inkling2,
+        outputs: INKLING_OUTPUTS,
+        table: Some(Table::Inkling2),
     },
     Subject {
         name: "inkling, no tools",

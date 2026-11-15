@@ -84,6 +84,7 @@
   {"model": "tencent/Hy-Memory-30B-A3B", "also": ["Hy-Memory-30B-A3B-FP8"], "table": "hy_v3", "opener": null, "after": null},
   {"model": "tencent/Hy4-preview", "also": [], "table": "hy4", "opener": null, "after": null},
   {"model": "thinkingmachines/Inkling", "also": ["Inkling-Small", "Inkling-NVFP4"], "table": "inkling", "opener": null, "after": null},
+  {"model": "thinkingmachines/Inkling-2-Small", "also": ["Inkling-2-Small-MXFP8"], "table": "inkling2", "opener": null, "after": null},
   {"model": "IQuestLab/IQuest-Q1", "also": [], "table": "iquest", "opener": null, "after": null},
   {"model": "IFM/Jais-3-32B-FP8", "also": ["Jais-3-3.7B-FP8", "Jais-3-375B-A23B-FP8", "Jais-3-7B-FP8"], "table": "k2_horizon", "opener": null, "after": null},
   {"model": "IFM/Jais-3-MoVA-36B-A4B-FP8", "also": [], "table": "k2_horizon", "opener": null, "after": null},

@@ -601,6 +601,9 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // request says (a system message carries the reasoning effort); the model writes the thought
     // or not, and its markers are its own.
     ("inkling", GenerationPrompt::ModelDecides),
+    // Inkling 2: the template writes no turn opener (the model writes `<|message_model|>` itself),
+    // so the output starts between the messages; the replay feeds the last message's close alone.
+    ("inkling-2-small", GenerationPrompt::ModelOpensTheTurn),
     // MiniCPM5: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
     // prompt.
     ("minicpm5-2b", GenerationPrompt::ModelWritesTheThought),
@@ -885,7 +888,7 @@ impl Recorded for Table {
             Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
             Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
             Self::MuseSpark => (" to=self<|message|>", "<|eom|>"),
-            Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
+            Self::Inkling | Self::Inkling2 => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
             Self::LongCat => ("<longcat_think>", "</longcat_think>"),
@@ -899,7 +902,10 @@ impl Recorded for Table {
     /// separators=(",", ":"))` does: a case whose arguments differ from the reference's only so,
     /// equal as values, is counted as respelled, not as a difference.
     fn respells_arguments(self) -> bool {
-        matches!(self, Self::Inkling | Self::Gemma4 | Self::FunctionGemma)
+        matches!(
+            self,
+            Self::Inkling | Self::Inkling2 | Self::Gemma4 | Self::FunctionGemma
+        )
     }
 
     /// Whether the table's template writes every value between double quotes without escaping
@@ -942,6 +948,7 @@ impl Recorded for Table {
             | Self::MuseSpark
             | Self::K2Horizon
             | Self::Inkling
+            | Self::Inkling2
             | Self::Gemma4
             | Self::FunctionGemma
             | Self::Mistral
@@ -1072,6 +1079,11 @@ enum GenerationPrompt {
     /// so the output starts inside the thought; otherwise (the default) its closer alone, which
     /// closes a thought never opened and leaves the output in content.
     MarkerAlone,
+    /// Inkling 2: the template writes no turn opener at all (the model writes `<|message_model|>`
+    /// itself, whatever the request says), so the generation prompt ends with the last message's
+    /// close and the output starts between the messages, where the table's unopened row starts
+    /// it (`Format::unopened_turn_starts_in`). The replay feeds that close alone, and no opener.
+    ModelOpensTheTurn,
 }
 
 impl GenerationPrompt {
@@ -1082,13 +1094,20 @@ impl GenerationPrompt {
     /// that starts a turn the prompt opens no turn for in a state of its own (DeepSeek V4: inside
     /// the thought) reads a tail with no opener as such a turn, whatever the tail closed, so the
     /// opener is what tells the closed thought of a thinking-off request from an unopened turn;
-    /// a table without a turn opener gets the tail alone, as before.
+    /// a table without a turn opener gets the tail alone, as before, as does a template that
+    /// writes none (`Self::ModelOpensTheTurn`: the tail is the last message's close, and the
+    /// turn starts unopened).
     fn text(self, fixture: &Fixture, format: &Format, table: Table) -> String {
         self.text_for(&fixture.request, format, table)
     }
 
     fn text_for(self, request: &Request, format: &Format, table: Table) -> String {
-        let mut text = format.turn_opener().unwrap_or_default().to_string();
+        // A template that writes no turn opener feeds none: the tail alone leaves the turn
+        // unopened, as the prompt does.
+        let mut text = match self {
+            Self::ModelOpensTheTurn => String::new(),
+            _ => format.turn_opener().unwrap_or_default().to_string(),
+        };
         text.push_str(&self.tail_for(request, table));
         text
     }
@@ -1100,6 +1119,8 @@ impl GenerationPrompt {
         let opened = format!("{open}\n");
         let closed = format!("{open}\n\n{close}\n\n");
         match (self, request.thinking_off()) {
+            // The close of the last message, the user's, which the model's messages end with too.
+            (Self::ModelOpensTheTurn, _) => close.to_string(),
             (Self::Plain | Self::ModelDecides, _) | (Self::ModelWritesTheThought, false) => {
                 String::new()
             }

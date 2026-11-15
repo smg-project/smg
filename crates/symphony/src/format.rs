@@ -762,6 +762,12 @@ impl Format {
         self.start
     }
 
+    /// The state the unopened row names, if the table has one: where a turn starts when the
+    /// prompt opens no turn for the model ([`Self::unopened_turn_starts_in`]).
+    pub(crate) fn unopened_start(&self) -> Option<usize> {
+        self.unopened.as_ref().map(|unopened| unopened.state)
+    }
+
     /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
     /// row in [`crate::format`]): the prompt holds no turn opener, or `turn_end`, the text that
     /// ends a turn the model wrote in the prompt (`<｜end▁of▁sentence｜>`), follows the last one.

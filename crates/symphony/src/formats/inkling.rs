@@ -19,7 +19,9 @@
 //! both there ([`Format::answer_grammar`]: the tag admits the thought and the marker before the
 //! schema for an engine that starts at the first token, and cannot tell the two starts apart).
 //! Recorded as `inkling` (thinkingmachines/Inkling); Inkling-Small and Inkling-NVFP4 ship the
-//! same template byte for byte and read with it.
+//! same template byte for byte and read with it. Inkling 2 writes the same messages from a
+//! template that opens no turn for the model, and reads with `inkling2`, which is these rows,
+//! the unopened row for that start and the opener read as framing inside a body.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -30,7 +32,15 @@ pub const INVOKE_JSON: &str = "<|content_invoke_tool_json|>";
 
 /// The Inkling table.
 pub fn inkling() -> Format {
-    Format::new("inkling")
+    rows(Format::new("inkling"))
+}
+
+/// The family's rows on `format`: Inkling's terminals, states, transitions, call syntax and turn
+/// opener, which the tables of its two generations share: `inkling`, and `inkling2`, whose
+/// template opens no turn for the model and which adds the unopened row for it and the opener
+/// said again inside a body.
+pub(crate) fn rows(format: Format) -> Format {
+    format
         .terminal("thinking", "<|content_thinking|>")
         .terminal("text", "<|content_text|>")
         .terminal("end_message", "<|end_message|>")
@@ -1195,6 +1205,49 @@ mod json_answer_tests {
             assert_eq!(with.content, "after", "{output}");
             assert_eq!(the_same_at_every_cut(|pieces| under(pieces), output), with);
         }
+    }
+
+    #[test]
+    fn a_quoted_close_inside_a_list_calls_arguments_is_the_arguments_text() {
+        // A table whose calls are one JSON list between markers: the engine hands the option to
+        // the list's assembler when it opens the call, so the closing marker's spelling inside an
+        // argument string is the string's text, the call reads whole and the text after the real
+        // close is content, whole and at every cut; the table alone ends the region at the quoted
+        // close. The case pins that hand-over: without it the list reads as without the option.
+        let table = crate::formats::llama_nemotron();
+        let prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        let output = concat!(
+            "<TOOLCALL>[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"</TOOLCALL>\"}}]",
+            "</TOOLCALL>after"
+        );
+        let under = |pieces: &[&str]| {
+            drive(
+                &mut Engine::new(table.clone(), Declared::default()).reads_json_answer(),
+                prompt,
+                pieces,
+            )
+        };
+        let events = under(&[output]);
+        assert_eq!(bytes(&events), output);
+        let with = said(&events);
+        assert_eq!(with.content, "after");
+        assert_eq!(
+            with.calls,
+            [(
+                "get_weather".to_string(),
+                "{\"city\":\"</TOOLCALL>\"}".to_string()
+            )]
+        );
+        assert_eq!(the_same_at_every_cut(|pieces| under(pieces), output), with);
+        let alone = said(&drive(
+            &mut Engine::new(table.clone(), Declared::default()),
+            prompt,
+            &[output],
+        ));
+        assert_ne!(
+            alone, with,
+            "the table alone ends the region at the quoted close"
+        );
     }
 
     #[test]

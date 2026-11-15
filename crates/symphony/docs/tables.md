@@ -523,6 +523,50 @@ table has no terminal for it, so such a message sits in the named-JSON header un
 `<|end_message|>` and comes back whole as `Malformed` (a name without a call), no byte lost; a
 recording of one decides what it is.
 
+## Inkling 2 (`inkling2`)
+
+What the table says beyond `inkling`, whose rows it shares:
+
+- **The model opens its own turn.** Inkling 2's template writes the message headers and closes
+  as tokens and no generation opener for the model: a prompt ends with the last message's close,
+  `<|end_message|>`, whatever the request says, and the model writes `<|message_model|>` itself.
+  The table's unopened row (`Format::unopened_turn_starts_in("ended", "<|end_message|>")`)
+  starts such a turn between the messages, where `<|message_model|>` opens the header as it does
+  after any message's close; a prompt whose last `<|message_model|>` is followed by
+  `<|end_message|>` (an assistant message in the history) starts there too, and a prompt that
+  continues an assistant message (`<|message_model|><|content_text|>Partial`, the template's
+  continuation) replays from the opener as Inkling's does. Every recorded output of the group
+  starts with the opener, and the corpus replay feeds the close alone before it, no opener.
+- **A JSON answer's tag writes the opener first.** The way into the answer from where the turn
+  starts is `<|message_model|>` and then `<|content_text|>`: `Format::answer_grammar` leads the
+  tag with the rows from the unopened state to the turn's own state, owed outright before the
+  thought the model may write first where the engine starts the grammar at the first token, and
+  inside the optional way in otherwise, as an engine that starts after its reasoning parser has
+  consumed them with the kind's marker. Without the lead the derivation, which starts from the
+  turn's own state, wrote Inkling's tag: from the first token it owed the thought's or the
+  answer's marker where the model writes `<|message_model|>`, a marker with no row out of the
+  state the turn starts in. The forced call's tag is Inkling's unchanged: the call marker
+  triggers it inside whatever message the model is writing, and the opener before it is free
+  text.
+- **The opener said again inside a message is the opener.** A row on `<|message_model|>` from
+  each body back into it, framing as a kind said again is, the kind marker after it the kind.
+  The answer tag's optional way in admits the opener and the kind marker after an engine that
+  has consumed them (a start other than the first token cannot say), and Inkling's rows read
+  `<|message_model|>` out of `ended` alone, so without the rows a second opener was the answer's
+  text in front of the JSON; with them every prefix the tag admits parses as framing, whichever
+  way the engine started.
+- **The JSON-answer option reads as for Inkling.** The group's native set holds a JSON answer
+  with a quoted spelling; under `Engine::reads_json_answer` the spelling is the answer's text
+  (`docs/engine.md`).
+- **One table for the group.** Inkling-2-Small and its MXFP8 build ship one template and read
+  with the one table; the recorded sets (16 common, 3 native and 12 multi-turn parse cases)
+  replay through the corpus harness, which feeds no opener for the group.
+
+What the table leaves out: the two contracts of a JSON answer (the reasoning kept apart from the
+content; no continued message) are the renderer's, checked before any parse, so the table carries
+no copy of them; image parts are the prompt's and never in the output; the text-mode invocation,
+as for Inkling.
+
 ## Mistral v13 (`mistral_v13`)
 
 What the table says beyond the others:
