@@ -23,6 +23,10 @@
 //! arrive relayed. The engines are asked through a [`LoadProbe`], so the
 //! tests drive the arbitration without a socket and the binary dials the
 //! engines.
+//!
+//! The loop also keeps the instant the store names for its publication
+//! ([`LoadSink::publish_due`]): a row that lands inside the store's window
+//! is shown to decisions at the window's end, with no later write.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -329,6 +333,14 @@ fn now() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
+/// Wait for the instant; for ever when there is none.
+async fn at(instant: Option<Instant>) {
+    match instant {
+        Some(instant) => tokio::time::sleep_until(tokio::time::Instant::from_std(instant)).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// What a log line calls an engine: the host and port of its address, never
 /// the address whole (a worker URL may carry userinfo, which no log line
 /// gets; the gRPC client names its peers the same way). An address with an
@@ -380,12 +392,18 @@ where
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
         loop {
+            // The instant the store names for the rows its publication
+            // window still holds, read after every write of this loop: the
+            // last row of a burst is shown within one window of its
+            // receipt, with no later write.
+            let due = self.store.publish_due();
             // The stop first; then the answers before the tick, which finds
             // the engines whose calls landed free to be asked again.
             tokio::select! {
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
                 Some(joined) = schedule.calls.join_next() => self.land(&mut schedule.due, joined),
+                () = at(due) => self.store.publish(now()),
                 _ = ticker.tick() => self.tick(&mut schedule),
             }
         }

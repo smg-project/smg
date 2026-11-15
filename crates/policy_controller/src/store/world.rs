@@ -1,0 +1,768 @@
+//! The world a decision reads (design 4.1 and 5.5): every pool derived
+//! from one membership, each a slice of whole candidate rows, and the build
+//! of one decision's view from it.
+//!
+//! One invariant: **a decision reads one publication.** A world is
+//! everything the store published together: a pool per model and role, its
+//! rows sorted by worker id, and the gateways' standing vetoes. One load
+//! hands a decision all of it, so both sides of a pair decision, their load
+//! records and the vetoes are of one publication, never a prefill pool of
+//! one and a decode pool of the next.
+//!
+//! What a membership write derives (where each pool stands, each pool's
+//! shape) is built once and shared by every world until the next membership
+//! write. A world's epoch is the membership's and is the one thing to
+//! compare: a world's identity moves with every publication. Between two
+//! membership writes a publication derives nothing: it is one small object,
+//! a pointer per pool, and new rows for each pool a write was folded into.
+//!
+//! A row in a pool is the candidate row itself. Its fixed fields are
+//! written when the membership's first world is built. Its moving facts
+//! (the load record with its sample instant, the two status bits) are
+//! folded into the writer's own copy of the pool, and a publication copies
+//! each pool that moved, whole. A published world never changes: a decision
+//! copies one run of memory nobody is writing and sees each row as one
+//! publication left it, through no lock.
+//!
+//! **The store publishes at its own rate, never at its writers'.** Every
+//! deciding thread fetches every publication, so there is one world a
+//! window for the whole store: the load records folded into any pool are
+//! published together once per [`PUBLISH_WINDOW`], and a status change, a
+//! veto or a membership change at once, through the same door, with
+//! whatever else waits. A load write publishes by itself when the last
+//! window is a window old; one that lands inside the window waits, and the
+//! sink names the instant it is due
+//! ([`LoadSink::publish_due`](crate::store::LoadSink::publish_due)).
+//!
+//! A decision's build is a copy and one pass ([`World::build`]): the rows,
+//! less another gateway's host-local ones, then what is the decision's own
+//! (the position, the report's age), then the facts that arrive by a
+//! worker's id (the asking gateway's vetoes, the pinned worker), each found
+//! in the slice the decision is made over: the sorted slice is its own
+//! index.
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use rustc_hash::FxHashMap;
+
+use crate::{
+    store::{
+        loads::LoadSample,
+        workers::{Reachability, WorkerRow, WorkerStatus},
+        GatewayId,
+    },
+    view::{
+        fingerprint, AffinityFacts, Candidate, Health, OverloadRegime, PoolFacts, Role, WorkerId,
+    },
+};
+
+#[cfg(test)]
+mod tests;
+
+/// How long a folded load record may wait for its publication: the window
+/// the gateway's load monitor already publishes pushed records by. A record
+/// steers within one window of its receipt. The value is inherited, so a
+/// comparison against that monitor differs by one thing fewer; a test hands
+/// its own to [`MemoryStore::with_publish_window`](crate::store::MemoryStore::with_publish_window).
+pub const PUBLISH_WINDOW: Duration = Duration::from_millis(20);
+
+/// Microseconds from `origin` to `at`, saturating at both ends.
+pub(super) fn micros(origin: Instant, at: Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(origin).as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Milliseconds from `at_micros` to `now_micros`, saturating at `u32::MAX`
+/// and at zero; never wrapping.
+fn age_ms(now_micros: u64, at_micros: u64) -> u32 {
+    u32::try_from(now_micros.saturating_sub(at_micros) / 1_000).unwrap_or(u32::MAX)
+}
+
+/// What a decision brings to the build of its view.
+#[derive(Clone, Copy, Debug)]
+pub struct Ask {
+    /// The gateway the decision is for: its vetoes mask a worker for it
+    /// alone, and a host-local worker of another gateway is not its worker.
+    pub gateway: GatewayId,
+    /// The decision's instant on the host's clock.
+    pub now: Instant,
+    /// The worker the request's session key is pinned to, when the host
+    /// found one.
+    pub pinned: Option<WorkerId>,
+    /// Whether the profile's stages declared the affinity column
+    /// ([`Needs::affinity`](crate::Needs::affinity)): the build fills it
+    /// then, and leaves it empty otherwise.
+    pub affinity: bool,
+}
+
+/// The buffers a host keeps across decisions: a build clears and fills
+/// them, and allocates only while they grow.
+#[derive(Debug, Default)]
+pub struct ViewBuffers {
+    /// The decision's candidate slice.
+    pub candidates: Vec<Candidate>,
+    /// The affinity column: one entry per candidate under a profile that
+    /// declared it, empty otherwise.
+    pub affinity: Vec<AffinityFacts>,
+}
+
+/// What a build read beside the rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Built {
+    /// The rows written: the pool as the asking gateway reaches it.
+    pub pool_size: u32,
+    /// The store's epoch at the membership write the world was built by.
+    pub membership_epoch: u64,
+    /// The decision's instant in the rows' own clock: what the request's
+    /// `now_micros` takes.
+    pub now_micros: u64,
+}
+
+impl Built {
+    /// The pool facts of the decision under the spec `generation`. No ring,
+    /// no overload regime and no zone capacity are derived yet.
+    pub fn pool_facts(&self, generation: u64) -> PoolFacts<'static> {
+        PoolFacts {
+            pool_size: self.pool_size,
+            membership_epoch: self.membership_epoch,
+            ring_epoch: 0,
+            regime: OverloadRegime::None,
+            generation,
+            zones: &[],
+        }
+    }
+}
+
+/// One pool's shape: what a membership write derives of it and no
+/// publication changes.
+struct PoolShape {
+    /// Each row's admission instant, in the rows' clock.
+    admitted_micros: Box<[u64]>,
+    /// The host-local rows, by index, each with the gateway that holds its
+    /// socket; empty for a pool every gateway dials whole.
+    locals: Box<[(u32, GatewayId)]>,
+}
+
+/// The roles a model's pools are derived for: one slot each.
+const ROLES: usize = 4;
+
+/// A role's slot among a model's pools. A role added to the enum stops the
+/// build here until it has a slot of its own and [`ROLES`] counts it.
+const fn role_slot(role: Role) -> usize {
+    match role {
+        Role::Single => 0,
+        Role::Prefill => 1,
+        Role::Decode => 2,
+        Role::Encode => 3,
+    }
+}
+
+/// What one membership write derives: where each pool stands in a world's
+/// rows, and each pool's shape. Built once per membership write and shared
+/// by every world published until the next.
+#[derive(Default)]
+struct Derived {
+    /// The pools by model, then by role: each an index into a world's rows.
+    /// A pool is every member serving one model in one role, whatever its
+    /// status (a status change is a health signal and moves no position).
+    by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
+    pools: Box<[PoolShape]>,
+}
+
+/// The gateways' standing vetoes as a decision reads them: per gateway its
+/// vetoed workers by id, each until an instant. Replaced whole at a veto's
+/// write, which is rare, and published with the world.
+#[derive(Debug, Default)]
+struct Vetoes {
+    by_gateway: FxHashMap<GatewayId, Arc<[(WorkerId, Instant)]>>,
+}
+
+impl Vetoes {
+    /// The vetoes with `gateway`'s veto on `id` set until `until`, or
+    /// cleared; `None` when that changes nothing.
+    fn with(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) -> Option<Self> {
+        let mut list: Vec<(WorkerId, Instant)> = self
+            .by_gateway
+            .get(&gateway)
+            .map(|list| list.to_vec())
+            .unwrap_or_default();
+        match (list.binary_search_by_key(&id, |&(worker, _)| worker), until) {
+            (Ok(at), Some(until)) if list[at].1 == until => return None,
+            (Ok(at), Some(until)) => list[at].1 = until,
+            (Ok(at), None) => {
+                list.remove(at);
+            }
+            (Err(at), Some(until)) => list.insert(at, (id, until)),
+            (Err(_), None) => return None,
+        }
+        let mut by_gateway = self.by_gateway.clone();
+        if list.is_empty() {
+            by_gateway.remove(&gateway);
+        } else {
+            by_gateway.insert(gateway, list.into());
+        }
+        Some(Self { by_gateway })
+    }
+
+    /// The vetoes without any on `id`, when some gateway holds one: a
+    /// worker's vetoes leave with its row.
+    fn without(&self, id: WorkerId) -> Option<Self> {
+        let named = |list: &Arc<[(WorkerId, Instant)]>| {
+            list.binary_search_by_key(&id, |&(worker, _)| worker)
+                .is_ok()
+        };
+        if !self.by_gateway.values().any(named) {
+            return None;
+        }
+        let mut by_gateway = FxHashMap::default();
+        for (gateway, list) in &self.by_gateway {
+            if !named(list) {
+                by_gateway.insert(*gateway, Arc::clone(list));
+                continue;
+            }
+            let kept: Vec<(WorkerId, Instant)> = list
+                .iter()
+                .copied()
+                .filter(|&(worker, _)| worker != id)
+                .collect();
+            if !kept.is_empty() {
+                by_gateway.insert(*gateway, kept.into());
+            }
+        }
+        Some(Self { by_gateway })
+    }
+}
+
+/// Everything a decision reads, as one publication left it. Taken once per
+/// decision ([`MemoryStore::world`](crate::store::MemoryStore::world)); both
+/// sides of a pair decision are built from the same one. A world never
+/// changes once published.
+pub struct World {
+    epoch: u64,
+    origin: Instant,
+    derived: Arc<Derived>,
+    /// Each pool's rows as this publication left them, sorted by worker id,
+    /// at the pool's index.
+    rows: Box<[Arc<[Candidate]>]>,
+    vetoes: Arc<Vetoes>,
+}
+
+impl std::fmt::Debug for World {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("World")
+            .field("epoch", &self.epoch)
+            .field("pools", &self.rows.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl World {
+    /// The store's epoch at the membership write this world's pools were
+    /// derived by: the one thing to compare between two worlds. A status
+    /// change moves the store's epoch and no world's, and a publication
+    /// between two membership writes is a new world of the same epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// `at` in the rows' clock: microseconds since the store's origin.
+    pub fn micros(&self, at: Instant) -> u64 {
+        micros(self.origin, at)
+    }
+
+    /// How many members serve `model` in `role`, every status and every
+    /// gateway's host-local rows counted; `None` when none does.
+    pub fn members(&self, model: &str, role: Role) -> Option<usize> {
+        self.pool(model, role).map(|(rows, _)| rows.len())
+    }
+
+    fn pool(&self, model: &str, role: Role) -> Option<(&[Candidate], &PoolShape)> {
+        let index = self.derived.by_model.get(model)?[role_slot(role)]? as usize;
+        Some((self.rows.get(index)?, self.derived.pools.get(index)?))
+    }
+
+    /// Build one decision's view of the pool serving `model` in `role` into
+    /// `out`; `None`, with the buffers cleared, when no member serves it.
+    ///
+    /// The candidates are the pool's rows in the pool's order, by worker
+    /// id, less the host-local rows of another gateway: the asking gateway
+    /// holds no socket to those, so its pool is the pool without them.
+    /// Each row is as this publication left it, with what is the
+    /// decision's own written over it: its position in the slice, its
+    /// report's age at `ask.now`, the stalled bit where the asking
+    /// gateway's veto stands at that instant, whichever kind of veto it
+    /// is, and the session bit on the pinned worker. Under `ask.affinity`
+    /// the column holds one entry per candidate with the worker's age
+    /// since admission.
+    ///
+    /// What no fact of the store feeds yet reads as the row's default: the
+    /// in-flight and session counts, the two admission bits, the overload
+    /// bit, the breaker bit, the four positions into declared lists, the
+    /// vision and encode bits, and the column's four index facts. The
+    /// healthy bit is the status alone: the health sink's precedence rule
+    /// (a gateway's completed dispatches against the prober) is not
+    /// applied here yet.
+    pub fn build(
+        &self,
+        model: &str,
+        role: Role,
+        ask: &Ask,
+        out: &mut ViewBuffers,
+    ) -> Option<Built> {
+        out.candidates.clear();
+        out.affinity.clear();
+        let (rows, shape) = self.pool(model, role)?;
+        let now_micros = micros(self.origin, ask.now);
+        for (from, to) in Segments::of(&shape.locals, ask.gateway, rows.len()) {
+            out.candidates.extend_from_slice(&rows[from..to]);
+        }
+        for (position, row) in out.candidates.iter_mut().enumerate() {
+            row.position = position as u32;
+            let sampled_at = row.load_sampled_at_micros;
+            if let Some(load) = &mut row.load {
+                load.report_age_ms = age_ms(now_micros, sampled_at);
+            }
+        }
+        if let Some(vetoed) = self.vetoes.by_gateway.get(&ask.gateway) {
+            for &(id, until) in vetoed.iter() {
+                if until > ask.now {
+                    if let Some(row) = row_of_id(&mut out.candidates, id) {
+                        row.health.stalled = true;
+                    }
+                }
+            }
+        }
+        if let Some(row) = ask.pinned.and_then(|id| row_of_id(&mut out.candidates, id)) {
+            row.session_hit = true;
+        }
+        if ask.affinity {
+            let admitted = &shape.admitted_micros;
+            for (from, to) in Segments::of(&shape.locals, ask.gateway, admitted.len()) {
+                out.affinity
+                    .extend(admitted[from..to].iter().map(|&admitted| AffinityFacts {
+                        admitted_age_ms: age_ms(now_micros, admitted),
+                        ..AffinityFacts::default()
+                    }));
+            }
+        }
+        Some(Built {
+            pool_size: out.candidates.len() as u32,
+            membership_epoch: self.epoch,
+            now_micros,
+        })
+    }
+}
+
+/// The row of worker `id` in a slice sorted by worker id.
+fn row_of_id(rows: &mut [Candidate], id: WorkerId) -> Option<&mut Candidate> {
+    let at = rows.binary_search_by_key(&id, |row| row.id).ok()?;
+    rows.get_mut(at)
+}
+
+/// The runs of a pool's rows a gateway's view takes: every row but the
+/// host-local ones of another gateway, as index ranges in order.
+struct Segments<'a> {
+    locals: std::slice::Iter<'a, (u32, GatewayId)>,
+    gateway: GatewayId,
+    from: usize,
+    len: usize,
+    done: bool,
+}
+
+impl<'a> Segments<'a> {
+    fn of(locals: &'a [(u32, GatewayId)], gateway: GatewayId, len: usize) -> Self {
+        Self {
+            locals: locals.iter(),
+            gateway,
+            from: 0,
+            len,
+            done: false,
+        }
+    }
+}
+
+impl Iterator for Segments<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        if self.done {
+            return None;
+        }
+        for &(index, owner) in self.locals.by_ref() {
+            let index = (index as usize).min(self.len);
+            if owner == self.gateway {
+                continue;
+            }
+            let run = (self.from, index);
+            self.from = (index + 1).min(self.len);
+            if run.0 < run.1 {
+                return Some(run);
+            }
+        }
+        self.done = true;
+        (self.from < self.len).then_some((self.from, self.len))
+    }
+}
+
+/// The candidate row of one member: its fixed fields from its registration,
+/// its status bits, and its load record when one is on file.
+fn row_of(member: &WorkerRow, sample: Option<&LoadSample>, origin: Instant) -> Candidate {
+    let facts = &member.facts;
+    Candidate {
+        id: member.id,
+        role: facts.role,
+        dp_rank: facts.dp_rank,
+        dp_size: facts.dp_size,
+        health: health_of(member.status),
+        wire_modes: facts.wire_modes,
+        load: sample.map(|sample| sample.row),
+        load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
+        pair_class: facts.pair_class,
+        host_local: facts.reachable_from != Reachability::Any,
+        // The low 32 bits of the registration key's fingerprint.
+        key: fingerprint(facts.key.as_bytes()) as u32,
+        ..Candidate::default()
+    }
+}
+
+/// The two bits a status sets: only a ready worker is healthy, and a
+/// draining one says so.
+fn health_of(status: WorkerStatus) -> Health {
+    Health {
+        healthy: status == WorkerStatus::Ready,
+        draining: status == WorkerStatus::Draining,
+        ..Health::default()
+    }
+}
+
+/// One member's row in one pool of the writer's working copy.
+#[derive(Clone, Copy)]
+struct Place {
+    id: WorkerId,
+    pool: u32,
+    row: u32,
+}
+
+/// The writer's own copy of one pool: what records and status changes are
+/// folded into between two publications.
+struct Working {
+    rows: Vec<Candidate>,
+    /// Folded since the last publication.
+    dirty: bool,
+}
+
+/// The write side of the world, behind the store's load lock: the working
+/// copy of every pool, where each member's rows stand in them, what the
+/// last publication held, and the publication window. Every write that
+/// publishes hands back the world it made; the store shows it under the
+/// same lock, so the worlds reach the deciders in the order they were made.
+pub(super) struct Writer {
+    window: Duration,
+    origin: Instant,
+    /// The store's epoch at the last membership write.
+    epoch: u64,
+    derived: Arc<Derived>,
+    /// Each pool's rows as the last publication left them.
+    published: Vec<Arc<[Candidate]>>,
+    working: Vec<Working>,
+    /// Every member's rows, sorted by worker id: a worker serving several
+    /// models has a row in each model's pool.
+    places: Vec<Place>,
+    vetoes: Arc<Vetoes>,
+    /// The last publication the window counts from: a window's end, or a
+    /// load write that published by itself.
+    last_window: Option<Instant>,
+    /// A folded load record waits for the window's end.
+    waiting: bool,
+}
+
+impl Writer {
+    /// The write side of a store with no member, whose rows' clock starts
+    /// at `origin`.
+    pub(super) fn new(window: Duration, origin: Instant) -> Self {
+        Self {
+            window,
+            origin,
+            epoch: 0,
+            derived: Arc::default(),
+            published: Vec::new(),
+            working: Vec::new(),
+            places: Vec::new(),
+            vetoes: Arc::default(),
+            last_window: None,
+            waiting: false,
+        }
+    }
+
+    /// A world of everything published so far: one small object, a pointer
+    /// per pool. Nothing derived is built here.
+    pub(super) fn world(&self) -> Arc<World> {
+        Arc::new(World {
+            epoch: self.epoch,
+            origin: self.origin,
+            derived: Arc::clone(&self.derived),
+            rows: self.published.clone().into_boxed_slice(),
+            vetoes: Arc::clone(&self.vetoes),
+        })
+    }
+
+    /// Derive the pools of the membership `members` at the store's `epoch`,
+    /// each row with its load record on file, make them the working copy
+    /// and publish them through the one door: every pool is new, so the
+    /// door copies none, every earlier fold is in the world this returns
+    /// and nothing waits.
+    pub(super) fn rebuild<'a>(
+        &mut self,
+        epoch: u64,
+        members: impl Iterator<Item = &'a WorkerRow>,
+        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+    ) -> Arc<World> {
+        #[derive(Clone, Copy)]
+        struct Entry {
+            row: Candidate,
+            admitted_micros: u64,
+            local: Option<GatewayId>,
+        }
+        let origin = self.origin;
+        let mut groups: FxHashMap<Box<str>, [Vec<Entry>; ROLES]> = FxHashMap::default();
+        for member in members {
+            let facts = &member.facts;
+            let sample = sample_of(member.id, facts.dp_rank);
+            let entry = Entry {
+                row: row_of(member, sample.as_ref(), origin),
+                admitted_micros: micros(origin, member.admitted_at),
+                local: match facts.reachable_from {
+                    Reachability::Any => None,
+                    Reachability::Gateway(gateway) => Some(gateway),
+                },
+            };
+            for (n, model) in facts.models.iter().enumerate() {
+                // A model listed twice is one pool's one row.
+                if facts.models[..n].contains(model) {
+                    continue;
+                }
+                let side = role_slot(facts.role);
+                match groups.get_mut(model.as_str()) {
+                    Some(sides) => sides[side].push(entry),
+                    None => {
+                        let mut sides: [Vec<Entry>; ROLES] = Default::default();
+                        sides[side].push(entry);
+                        groups.insert(model.as_str().into(), sides);
+                    }
+                }
+            }
+        }
+        self.working.clear();
+        self.published.clear();
+        self.places.clear();
+        let mut by_model = FxHashMap::default();
+        let mut pools = Vec::new();
+        for (model, sides) in groups {
+            let mut indexes = [None; ROLES];
+            for (side, mut entries) in sides.into_iter().enumerate() {
+                if entries.is_empty() {
+                    continue;
+                }
+                entries.sort_unstable_by_key(|entry| (entry.row.id, entry.row.dp_rank));
+                let rows: Vec<Candidate> = entries.iter().map(|entry| entry.row).collect();
+                let index = self.working.len() as u32;
+                self.places
+                    .extend(rows.iter().enumerate().map(|(row, candidate)| Place {
+                        id: candidate.id,
+                        pool: index,
+                        row: row as u32,
+                    }));
+                pools.push(PoolShape {
+                    admitted_micros: entries.iter().map(|entry| entry.admitted_micros).collect(),
+                    locals: entries
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, entry)| entry.local.map(|gateway| (row as u32, gateway)))
+                        .collect(),
+                });
+                self.published.push(Arc::from(rows.as_slice()));
+                self.working.push(Working { rows, dirty: false });
+                indexes[side] = Some(index);
+            }
+            by_model.insert(model, indexes);
+        }
+        self.places
+            .sort_unstable_by_key(|place| (place.id, place.pool));
+        self.epoch = epoch;
+        self.derived = Arc::new(Derived {
+            by_model,
+            pools: pools.into_boxed_slice(),
+        });
+        self.publish()
+    }
+
+    /// Fold one rank's load record, or its absence, into the member's rows;
+    /// whether a row took it. The caller says when the write is whole
+    /// ([`Writer::folded_at`]).
+    pub(super) fn fold_load(
+        &mut self,
+        id: WorkerId,
+        rank: u16,
+        sample: Option<&LoadSample>,
+    ) -> bool {
+        let Self {
+            places,
+            working,
+            origin,
+            ..
+        } = self;
+        let mut folded = false;
+        for place in places_of(places, id) {
+            let Some(pool) = working.get_mut(place.pool as usize) else {
+                continue;
+            };
+            let Some(row) = pool.rows.get_mut(place.row as usize) else {
+                continue;
+            };
+            if row.dp_rank != rank {
+                continue;
+            }
+            row.load = sample.map(|sample| sample.row);
+            row.load_sampled_at_micros =
+                sample.map_or(0, |sample| micros(*origin, sample.sampled_at));
+            pool.dirty = true;
+            folded = true;
+        }
+        folded
+    }
+
+    /// A load write folded its rows at `at`: it publishes by itself when
+    /// the last window is a window old, else it waits for the window's end.
+    /// The world to show, when it published.
+    #[must_use]
+    pub(super) fn folded_at(&mut self, at: Instant) -> Option<Arc<World>> {
+        match self.last_window {
+            Some(last) if self.window_end(last).is_none_or(|end| at < end) => {
+                self.waiting = true;
+                None
+            }
+            _ => Some(self.publish_window(at)),
+        }
+    }
+
+    /// A load write with no instant of its own folded its rows: it waits
+    /// for the window's end, or publishes when no window ever opened.
+    #[must_use]
+    pub(super) fn folded(&mut self) -> Option<Arc<World>> {
+        if self.last_window.is_some() {
+            self.waiting = true;
+            None
+        } else {
+            Some(self.publish())
+        }
+    }
+
+    /// Fold a status change into the member's rows and publish at once: a
+    /// decision does not wait a window for a worker that left rotation.
+    /// `None` for a worker with no row, and for a change between two
+    /// statuses a row reads alike: nothing a decision reads moved.
+    #[must_use]
+    pub(super) fn fold_status(&mut self, id: WorkerId, status: WorkerStatus) -> Option<Arc<World>> {
+        let Self {
+            places, working, ..
+        } = self;
+        let health = health_of(status);
+        let mut folded = false;
+        for place in places_of(places, id) {
+            let Some(pool) = working.get_mut(place.pool as usize) else {
+                continue;
+            };
+            let Some(row) = pool.rows.get_mut(place.row as usize) else {
+                continue;
+            };
+            if (row.health.healthy, row.health.draining) == (health.healthy, health.draining) {
+                continue;
+            }
+            row.health.healthy = health.healthy;
+            row.health.draining = health.draining;
+            pool.dirty = true;
+            folded = true;
+        }
+        folded.then(|| self.publish())
+    }
+
+    /// Set `gateway`'s veto on `id` until `until`, or clear it, and publish
+    /// at once; `None` when the write changes no veto.
+    #[must_use]
+    pub(super) fn veto(
+        &mut self,
+        gateway: GatewayId,
+        id: WorkerId,
+        until: Option<Instant>,
+    ) -> Option<Arc<World>> {
+        let vetoes = self.vetoes.with(gateway, id, until)?;
+        self.vetoes = Arc::new(vetoes);
+        Some(self.publish())
+    }
+
+    /// A worker's row is gone: its vetoes leave with it. Nothing is
+    /// published here; the membership write that removed the row publishes.
+    pub(super) fn forget_vetoes(&mut self, id: WorkerId) {
+        if let Some(vetoes) = self.vetoes.without(id) {
+            self.vetoes = Arc::new(vetoes);
+        }
+    }
+
+    /// When the waiting folds are due: the end of the window the last
+    /// publication opened; `None` when nothing waits, and for a window the
+    /// clock cannot add.
+    pub(super) fn due(&self) -> Option<Instant> {
+        if !self.waiting {
+            return None;
+        }
+        self.last_window.and_then(|last| self.window_end(last))
+    }
+
+    /// The end of the window `last` opened; `None` for a window so long
+    /// that the clock cannot add it, which no instant ends.
+    fn window_end(&self, last: Instant) -> Option<Instant> {
+        last.checked_add(self.window)
+    }
+
+    /// The window's end: publish what waits when `now` is at or past the
+    /// due instant; a call before it publishes nothing, so a caller cannot
+    /// publish faster than the window.
+    #[must_use]
+    pub(super) fn publish_if_due(&mut self, now: Instant) -> Option<Arc<World>> {
+        self.due()
+            .is_some_and(|due| now >= due)
+            .then(|| self.publish_window(now))
+    }
+
+    /// The one door every publication goes through: each pool folded since
+    /// the last publication takes new rows, whole, and one world holds
+    /// every pool. What waited for the window rides along.
+    fn publish(&mut self) -> Arc<World> {
+        for (pool, published) in self.working.iter_mut().zip(&mut self.published) {
+            if pool.dirty {
+                *published = Arc::from(pool.rows.as_slice());
+                pool.dirty = false;
+            }
+        }
+        self.waiting = false;
+        self.world()
+    }
+
+    fn publish_window(&mut self, at: Instant) -> Arc<World> {
+        self.last_window = Some(at);
+        self.publish()
+    }
+}
+
+/// The places of worker `id` in a list sorted by worker id.
+fn places_of(places: &[Place], id: WorkerId) -> impl Iterator<Item = Place> + '_ {
+    let from = places.partition_point(|place| place.id < id);
+    places
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(move |place| place.id == id)
+        .copied()
+}

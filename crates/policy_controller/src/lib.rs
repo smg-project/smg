@@ -36,7 +36,10 @@
 //!   cursors, reservations, sessions, leases), the one-process
 //!   [`store::MemoryStore`] behind them and the contract tests over it. A
 //!   gateway in the embedded mode implements the same traits over its own
-//!   structures; nothing decides through them yet.
+//!   structures. The store publishes what a decision reads
+//!   ([`store::World`]: every pool as whole candidate rows) and builds one
+//!   decision's view from it through no lock; the service that calls the
+//!   build is a later step.
 //! - 10, the election ([`elector`]): one [`elector::Elector`] over a
 //!   [`elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
@@ -49,9 +52,8 @@
 //! - Behind the `ingest` feature, the ingestion drivers (`ingest`): the load
 //!   path (the `GetLoads` poll per engine under the store's poll
 //!   arbitration, the metrics scrape of an engine without a servicer) and
-//!   the load helpers the gateway shares with the controller (the row
-//!   conversion, the scrape parser). The KV subscription, the prober and
-//!   discovery arrive in the step's later PRs.
+//!   the load helpers (the row conversion, the scrape parser). The KV
+//!   subscription, the prober and discovery arrive in the step's later PRs.
 //!
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the

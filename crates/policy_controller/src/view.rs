@@ -283,7 +283,7 @@ pub struct AffinityFacts {
 }
 
 /// One candidate row: a worker, or one DP rank of a data-parallel worker:
-/// what every decision reads. Its fields take 104 bytes, and the row is
+/// what every decision reads. Its fields take 103 bytes, and the row is
 /// aligned to a 64-byte cache line: 128 bytes in memory, every row on a
 /// line's start.
 ///
@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn a_candidate_rows_fields_end_within_104_bytes() {
+    fn a_candidate_rows_fields_take_103_bytes() {
         // The row is written once per candidate per decision, so what its
         // fields take is a cost every policy pays. The alignment leaves
         // spare bytes, so the row's size no longer says it, and a field
@@ -558,9 +558,8 @@ mod tests {
         // (a new one does not compile until it is named here) and pins
         // where the last one ends. A fact one stage family reads belongs in
         // a column beside the rows, as the affinity facts are. The plugin
-        // view's packed row is 104 bytes too, WITH the five facts in it:
-        // nothing ties that number to this one, and each is pinned in its
-        // own file.
+        // view's packed row is 104 bytes WITH the five facts in it: nothing
+        // ties that number to this one, and each is pinned in its own file.
         fn end<T>(at: usize, _field: &T) -> usize {
             at + size_of::<T>()
         }

@@ -2,13 +2,16 @@
 //! mutexes. The controller's own store once its drivers move in (soft state
 //! its sources republish, no log), and the double the contract tests and the
 //! controller's tests run over. Nothing here is on a decision path: a view is
-//! built from snapshots the store hands out, not through these locks.
+//! built from the world the store publishes ([`MemoryStore::world`]), not
+//! through these locks.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
@@ -27,9 +30,10 @@ use crate::{
             identity, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
         },
+        world::{micros, Ask, Built, ViewBuffers, World, Writer, PUBLISH_WINDOW},
         GatewayId,
     },
-    view::{LoadRow, WorkerId},
+    view::{LoadRow, Role, WorkerId},
 };
 
 /// Membership changes kept for watchers; a watcher further behind snapshots
@@ -37,7 +41,6 @@ use crate::{
 const CHANGE_LOG: usize = 1_024;
 
 /// The store. `Default` is empty with term `0`.
-#[derive(Default)]
 pub struct MemoryStore {
     workers: Mutex<Workers>,
     health: Mutex<HealthTables>,
@@ -46,12 +49,28 @@ pub struct MemoryStore {
     /// first, as the health writers take it). A load write goes into its
     /// worker's entry or is dropped, under this lock alone: the entry is the
     /// membership test, so a read that lands after a removal re-creates
-    /// nothing and a replaced incarnation starts empty.
-    loads: Mutex<FxHashMap<WorkerId, Ranks>>,
+    /// nothing and a replaced incarnation starts empty. The world's write
+    /// side sits behind the same lock: a record is on file and folded into
+    /// the working rows in one step, and every world is made and shown
+    /// under it, so the deciders see the worlds in the order they were
+    /// made. It is the last lock a writer takes: the workers lock, then the
+    /// health lock, then this one.
+    loads: Mutex<Loads>,
     kv: Mutex<Kv>,
     reservations: Mutex<Reservations>,
     sessions: Mutex<FxHashMap<u64, Pin>>,
     leases: Mutex<Leases>,
+    /// What a decision reads, through one load: swapped whole at each
+    /// publication.
+    world: ArcSwap<World>,
+    /// Where the rows' clock starts.
+    origin: Instant,
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::with_publish_window(PUBLISH_WINDOW)
+    }
 }
 
 impl std::fmt::Debug for MemoryStore {
@@ -77,6 +96,109 @@ impl MemoryStore {
         Self::default()
     }
 
+    /// A store whose folded load records wait at most `window` for their
+    /// publication, where [`MemoryStore::new`] takes [`PUBLISH_WINDOW`]:
+    /// for a test of the window itself. A window the clock cannot add to
+    /// an instant never ends: a waiting record is then shown by the next
+    /// status or membership write.
+    pub fn with_publish_window(window: Duration) -> Self {
+        let now = Instant::now();
+        // An hour before the store was made, where the host's clock reaches
+        // that far: a sample older than the store keeps an instant of its
+        // own.
+        let origin = now.checked_sub(Duration::from_secs(3_600)).unwrap_or(now);
+        let writer = Writer::new(window, origin);
+        let world = ArcSwap::new(writer.world());
+        Self {
+            workers: Mutex::default(),
+            health: Mutex::default(),
+            loads: Mutex::new(Loads {
+                ranks: FxHashMap::default(),
+                writer,
+            }),
+            kv: Mutex::default(),
+            reservations: Mutex::default(),
+            sessions: Mutex::default(),
+            leases: Mutex::default(),
+            world,
+            origin,
+        }
+    }
+
+    /// The world as the last publication left it: what one decision reads.
+    /// Taken once per decision and through no lock; a pair decision builds
+    /// both its sides from the one it took. Its identity moves with every
+    /// publication: [`World::epoch`] says whether the membership moved.
+    ///
+    /// This door hands an owned pointer: taking it and dropping it each
+    /// write the count every holder of that world shares, so deciding
+    /// threads write one cache line twice a decision.
+    /// [`build_view`](Self::build_view) borrows the world and writes no
+    /// shared count.
+    pub fn world(&self) -> Arc<World> {
+        self.world.load_full()
+    }
+
+    /// Build one decision's view of the pool serving `model` in `role`
+    /// ([`World::build`]) from the world of this instant.
+    pub fn build_view(
+        &self,
+        model: &str,
+        role: Role,
+        ask: &Ask,
+        out: &mut ViewBuffers,
+    ) -> Option<Built> {
+        self.world.load().build(model, role, ask, out)
+    }
+
+    /// `at` in the rows' clock: microseconds since the store's origin.
+    pub fn micros(&self, at: Instant) -> u64 {
+        micros(self.origin, at)
+    }
+
+    /// Derive the pools of the membership as this write left it and publish
+    /// them in one world. Called under the workers lock by every membership
+    /// write; it takes the load lock, as those writes do, so each row
+    /// carries the load record on file and no record is lost across the
+    /// swap.
+    fn rebuild_world(&self, workers: &Workers) {
+        let mut loads = self.loads.lock();
+        let Loads { ranks, writer } = &mut *loads;
+        let ranks = &*ranks;
+        let world = writer.rebuild(
+            workers.epoch,
+            workers.rows.values().map(|row| &row.row),
+            |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
+        );
+        self.world.store(world);
+    }
+
+    /// Show the deciders the world a write made, when it made one. Called
+    /// with the load lock held: the worlds reach the cell in the order the
+    /// writer made them.
+    fn show(&self, world: Option<Arc<World>>) {
+        if let Some(world) = world {
+            self.world.store(world);
+        }
+    }
+
+    /// Fold a status change into the world and publish it at once. Called
+    /// under the workers lock, as the status was written.
+    fn show_status(&self, id: WorkerId, status: WorkerStatus) {
+        let mut loads = self.loads.lock();
+        let world = loads.writer.fold_status(id, status);
+        self.show(world);
+    }
+
+    /// Publish `gateway`'s veto on `id`, or its clearing, at once. Called
+    /// under the health lock, which serializes the vetoes' writers, so the
+    /// published vetoes follow the health table's own order.
+    fn show_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
+        let mut loads = self.loads.lock();
+        let world = loads.writer.veto(gateway, id, until);
+        self.show(world);
+    }
+
     /// How many entries the health tables hold, over every gateway.
     #[cfg(test)]
     pub(super) fn health_entries(&self) -> usize {
@@ -87,7 +209,7 @@ impl MemoryStore {
     /// How many workers the load table holds an entry for.
     #[cfg(test)]
     pub(super) fn load_entries(&self) -> usize {
-        self.loads.lock().len()
+        self.loads.lock().ranks.len()
     }
 
     /// A worker's row is gone (removed, or replaced by a new incarnation):
@@ -98,8 +220,14 @@ impl MemoryStore {
     /// worker's entry or nowhere, so a write racing the removal finds the
     /// row gone or lands before the tables are cleared.
     fn forget_worker(&self, id: WorkerId) {
-        self.health.lock().forget(id);
-        self.loads.lock().remove(&id);
+        // The health lock is held across the load lock: the published
+        // vetoes lose the worker in the order the health table did. Nothing
+        // is published here: the membership write that calls this does.
+        let mut health = self.health.lock();
+        health.forget(id);
+        let mut loads = self.loads.lock();
+        loads.ranks.remove(&id);
+        loads.writer.forget_vetoes(id);
     }
 
     /// How many resyncs were recorded for `reason`.
@@ -196,11 +324,13 @@ impl WorkersStore for MemoryStore {
                 let resized = row.row.facts.dp_size != facts.dp_size;
                 row.row.facts = facts;
                 row.row.revision += 1;
-                return workers.record(if resized {
+                let change = workers.record(if resized {
                     MembershipChange::Resized { id: old_id }
                 } else {
                     MembershipChange::Relabelled { id: old_id }
                 });
+                self.rebuild_world(&workers);
+                return change;
             }
             // A new incarnation under the key: the old id leaves with its
             // counters; its status carries over when the registration
@@ -239,7 +369,8 @@ impl WorkersStore for MemoryStore {
             // The new incarnation starts with an empty load entry: nothing
             // the old one reported is the new one's.
             self.forget_worker(old_id);
-            self.loads.lock().insert(new_id, Ranks::default());
+            self.loads.lock().ranks.insert(new_id, Ranks::default());
+            self.rebuild_world(&workers);
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -259,8 +390,10 @@ impl WorkersStore for MemoryStore {
         );
         // The row's load entry, created with it: what a member's load
         // writes go into.
-        self.loads.lock().insert(id, Ranks::default());
-        workers.record(MembershipChange::Registered { id })
+        self.loads.lock().ranks.insert(id, Ranks::default());
+        let change = workers.record(MembershipChange::Registered { id });
+        self.rebuild_world(&workers);
+        change
     }
 
     fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
@@ -276,7 +409,9 @@ impl WorkersStore for MemoryStore {
             row.row.facts.overload = overload;
         }
         row.row.revision += 1;
-        Some(workers.record(MembershipChange::Relabelled { id }))
+        let change = workers.record(MembershipChange::Relabelled { id });
+        self.rebuild_world(&workers);
+        Some(change)
     }
 
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
@@ -291,6 +426,7 @@ impl WorkersStore for MemoryStore {
         // poll or a record that lands later finds no load entry and writes
         // nothing.
         self.forget_worker(id);
+        self.rebuild_world(&workers);
         Some(change)
     }
 
@@ -302,7 +438,9 @@ impl WorkersStore for MemoryStore {
     ) -> Option<MembershipChange> {
         let mut workers = self.workers.lock();
         workers.guarded(id, revision)?;
-        workers.set_status(id, status)
+        let change = workers.set_status(id, status)?;
+        self.show_status(id, status);
+        Some(change)
     }
 
     fn get(&self, id: WorkerId) -> Option<WorkerRow> {
@@ -428,7 +566,9 @@ impl HealthSink for MemoryStore {
         let row = workers.guarded(id, revision)?;
         let from = row.row.status;
         let to = next_status(row, ok)?;
-        workers.set_status(id, to).map(|_| (from, to))
+        workers.set_status(id, to)?;
+        self.show_status(id, to);
+        Some((from, to))
     }
 
     fn connected(&self, id: WorkerId, revision: u64) -> Option<(WorkerStatus, WorkerStatus)> {
@@ -439,9 +579,9 @@ impl HealthSink for MemoryStore {
             return None;
         }
         row.probes = Probes::default();
-        workers
-            .set_status(id, WorkerStatus::Ready)
-            .map(|_| (from, WorkerStatus::Ready))
+        workers.set_status(id, WorkerStatus::Ready)?;
+        self.show_status(id, WorkerStatus::Ready);
+        Some((from, WorkerStatus::Ready))
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
@@ -455,10 +595,14 @@ impl HealthSink for MemoryStore {
                 if !workers.rows.contains_key(&id) {
                     return;
                 }
-                self.health.lock().vetoes.insert((gateway, id), until);
+                let mut health = self.health.lock();
+                health.vetoes.insert((gateway, id), until);
+                self.show_veto(gateway, id, Some(until));
             }
             None => {
-                self.health.lock().vetoes.remove(&(gateway, id));
+                let mut health = self.health.lock();
+                health.vetoes.remove(&(gateway, id));
+                self.show_veto(gateway, id, None);
             }
         }
     }
@@ -517,6 +661,12 @@ struct Ranks {
     pushed_at: BTreeMap<u16, Instant>,
 }
 
+/// The load table and the world's write side, behind one lock.
+struct Loads {
+    ranks: FxHashMap<WorkerId, Ranks>,
+    writer: Writer,
+}
+
 impl LoadSink for MemoryStore {
     fn record(
         &self,
@@ -534,15 +684,23 @@ impl LoadSink for MemoryStore {
             source,
         };
         let mut loads = self.loads.lock();
+        let Loads {
+            ranks: table,
+            writer,
+        } = &mut *loads;
         // No entry, no member: the worker left (or never registered) and
         // the record is dropped, never an entry of its own.
-        let Some(ranks) = loads.get_mut(&id) else {
+        let Some(ranks) = table.get_mut(&id) else {
             return;
         };
         if source.pushes() {
             ranks.pushed_at.insert(rank, received_at);
         }
         ranks.samples.insert(rank, sample);
+        if writer.fold_load(id, rank, Some(&sample)) {
+            let world = writer.folded_at(received_at);
+            self.show(world);
+        }
     }
 
     fn report(
@@ -553,11 +711,18 @@ impl LoadSink for MemoryStore {
         source: LoadSource,
     ) {
         let mut loads = self.loads.lock();
+        let Loads {
+            ranks: table,
+            writer,
+        } = &mut *loads;
         // A report that lands after its worker left (the poll was out when
         // the row went) finds no entry and is dropped.
-        let Some(ranks) = loads.get_mut(&id) else {
+        let Some(ranks) = table.get_mut(&id) else {
             return;
         };
+        // The report is folded whole before any publication: its ranks are
+        // read as one report left them.
+        let mut folded = false;
         for &(rank, row) in rows {
             let pushed_since = ranks
                 .pushed_at
@@ -567,21 +732,24 @@ impl LoadSink for MemoryStore {
                 continue;
             }
             let age = Duration::from_millis(u64::from(row.report_age_ms));
-            ranks.samples.insert(
-                rank,
-                LoadSample {
-                    row,
-                    received_at: polled_at,
-                    sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
-                    source,
-                },
-            );
+            let sample = LoadSample {
+                row,
+                received_at: polled_at,
+                sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
+                source,
+            };
+            ranks.samples.insert(rank, sample);
+            folded |= writer.fold_load(id, rank, Some(&sample));
+        }
+        if folded {
+            let world = writer.folded_at(polled_at);
+            self.show(world);
         }
     }
 
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode {
         let loads = self.loads.lock();
-        let Some(ranks) = loads.get(&id) else {
+        let Some(ranks) = loads.ranks.get(&id) else {
             return PollMode::Poll;
         };
         // The receipts, not the samples: a poll's row replaces a silent
@@ -600,12 +768,19 @@ impl LoadSink for MemoryStore {
     }
 
     fn load(&self, id: WorkerId, rank: u16) -> Option<LoadSample> {
-        self.loads.lock().get(&id)?.samples.get(&rank).copied()
+        self.loads
+            .lock()
+            .ranks
+            .get(&id)?
+            .samples
+            .get(&rank)
+            .copied()
     }
 
     fn ranks(&self, id: WorkerId) -> usize {
         self.loads
             .lock()
+            .ranks
             .get(&id)
             .map_or(0, |ranks| ranks.samples.len())
     }
@@ -615,9 +790,32 @@ impl LoadSink for MemoryStore {
     /// row alone (`remove`, a replacing `upsert`). A worker that left has no
     /// entry and nothing on file already.
     fn evict(&self, id: WorkerId) {
-        if let Some(ranks) = self.loads.lock().get_mut(&id) {
+        let mut loads = self.loads.lock();
+        let Loads {
+            ranks: table,
+            writer,
+        } = &mut *loads;
+        if let Some(ranks) = table.get_mut(&id) {
+            let mut folded = false;
+            for &rank in ranks.samples.keys() {
+                folded |= writer.fold_load(id, rank, None);
+            }
             *ranks = Ranks::default();
+            if folded {
+                let world = writer.folded();
+                self.show(world);
+            }
         }
+    }
+
+    fn publish_due(&self) -> Option<Instant> {
+        self.loads.lock().writer.due()
+    }
+
+    fn publish(&self, now: Instant) {
+        let mut loads = self.loads.lock();
+        let world = loads.writer.publish_if_due(now);
+        self.show(world);
     }
 }
 

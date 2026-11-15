@@ -1,0 +1,60 @@
+# Regression gate for `cargo bench -p smg-policy-controller --bench store_view`, run by
+# .github/workflows/benchmark-policy-store.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the twelve single-threaded rows of the store's view at 8, 64 and 512 workers: a decision's build
+# from the published world without the affinity column (`policy_store/view_build/<n>`) and with it
+# (`policy_store/view_build_column/<n>`), one load record's write inside the publication window
+# (`policy_store/load_write/<n>`) and one publication (`policy_store/publish/<n>`). The binary's nine
+# `policy_store_cadence/` rows run the build beside a writer thread on a second core: they are for a run pinned to
+# two cores, and the filter leaves them out.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of the
+# per-run criterion medians over six runs of one build pinned to one core, read through this gate as three base
+# and three pull-request runs (the base a copy of the binary with one byte appended, so the gate does not take
+# the two for one file), on a shared many-core build host at a load of 36 to 48:
+#
+#   rows                                        identical build   threshold
+#   view_build/{8,64,512}                       1.2 - 4.4 %       10 %
+#   view_build_column/64                        2.0 %             10 %
+#   load_write/{8,64,512}                       1.8 - 3.7 %       10 %
+#   publish/{8,64,512}                          1.0 - 4.5 %       10 %
+#   view_build_column/{8,512}                   5.1 - 7.0 %       15 %
+#
+# The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never under
+# 10 % (the hosted runner is noisier than the build host). The build with the column read the widest spread at 8
+# and at 512 workers, one slow run of six each, so those two rows take 15 %; every other row takes 10 %. On top of
+# the threshold the gate fails an id only when every pull-request run is slower than every base run
+# (scripts/bench_gate.py), so one slow run cannot fail the job. The null case passed: 0 failed, 0 suspect of 12
+# ids, the largest change of medians -2.4 %.
+#
+# Placement, as policy-engine.toml records it: the workflow builds both binaries with every function on a 64-byte
+# boundary, and the build rows write into a buffer that starts on a page's start (benches/common/placed.rs). An
+# inserted regression in the build (20 dependent multiply-adds plus 2 per candidate before it returns, never
+# committed) is caught, read at a host load of 55 to 127: 6 of 12 ids failed and 0 were suspect, the six build
+# rows at +26 to +111 % (the eight-worker rows +26 and +28 %), each confirmed by the re-measure round; the write
+# and publish rows, which the mutant does not touch, passed at -2.9 to +8.5 %.
+#
+# Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
+# own spread can be read from those and the thresholds tightened once it is known.
+
+repeats = 3
+filter = "^policy_store/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining. A new row goes to a bench target of its own.
+sources = [
+    "crates/policy_controller/benches/store_view.rs",
+    "crates/policy_controller/benches/common/placed.rs",
+]
+
+# The first gate whose pattern matches an id decides its threshold.
+[[gate]]
+pattern = "^policy_store/view_build_column/(8|512)$"
+threshold = 0.15
+note = "identical build 5.1 - 7.0 %"
+
+[[gate]]
+pattern = "^policy_store/"
+threshold = 0.10
+note = "identical build 1.0 - 4.5 %"
