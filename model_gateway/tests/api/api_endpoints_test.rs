@@ -1723,6 +1723,7 @@ mod load_balancing_tests {
 #[cfg(test)]
 mod pd_mode_tests {
     use super::*;
+    use crate::common::create_test_context;
 
     #[tokio::test]
     async fn test_pd_mode_routing() {
@@ -1770,7 +1771,7 @@ mod pd_mode_tests {
         config.health_check.disable_health_check = true;
 
         // Create app context
-        let app_context = crate::common::create_test_context(config).await;
+        let app_context = create_test_context(config).await;
 
         let router_result = RouterFactory::create_router(&app_context).await;
 
