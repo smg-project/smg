@@ -472,8 +472,7 @@ impl HarmonyBuilder {
         let (instructions, messages) = split_instructions(&request.messages);
         let tools = chat_tools(request).filter(|tools| !tools.is_empty());
         if instructions.is_some() || tools.is_some() {
-            let dev_msg =
-                self.build_developer_message_from_chat(instructions.as_deref(), tools.as_ref());
+            let dev_msg = self.build_developer_message(tools.as_ref(), instructions.as_deref());
             all_messages.push(dev_msg);
         }
 
@@ -684,27 +683,6 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    fn build_developer_message_from_chat(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<Tool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
-    /// Build developer message from Responses request
-    ///
-    /// # Arguments
-    /// * `instructions` - Optional instructions (Responses API specific)
-    /// * `tools` - Optional list of tools
-    fn build_developer_message_from_responses(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<ResponseTool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
     /// Construct input messages for Responses API with Harmony
     ///
     /// Handles both new conversations and continuations of previous responses.
@@ -742,9 +720,9 @@ impl HarmonyBuilder {
 
             // Add developer message if we have custom tools or instructions
             if with_custom_tools || request.instructions.is_some() {
-                let dev_msg = self.build_developer_message_from_responses(
-                    request.instructions.as_deref(),
+                let dev_msg = self.build_developer_message(
                     request.tools.as_ref(),
+                    request.instructions.as_deref(),
                 );
                 all_messages.push(dev_msg);
             }
@@ -1944,7 +1922,7 @@ mod tests {
             });
             assert_eq!(commentary, !expected.is_empty(), "{case}");
             // The developer message describes the same tools.
-            let developer = builder.build_developer_message_from_chat(None, tools.as_ref());
+            let developer = builder.build_developer_message(tools.as_ref(), None);
             assert_eq!(developer.content.len(), 1, "{case}");
             let described: Vec<String> = developer
                 .content
