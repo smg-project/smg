@@ -1012,13 +1012,16 @@ elect a second leader beside the first.
 {{/*
 Policy controller replicas -- more than one only with the election on. With
 it off every replica is a controller of its own, and two would each lead
-alone: the render refuses them. The count is compared as a number and
-written as the values hold it: a null stays the API's default.
+alone: the render refuses them. The count is compared as a reader of the
+rendered manifest takes it: a text that reads there as a number above one
+(2e0, or a 2 after a blank) is refused as that number is. It is written as
+the values hold it: a null stays the API's default.
 */}}
 {{- define "smg.policyControllerReplicas" -}}
 {{- $replicas := .Values.policyController.replicas -}}
-{{- if and (gt (int $replicas) 1) (not (include "smg.policyControllerElection" .)) -}}
-{{- fail (printf "policyController.replicas is %d with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" (int $replicas)) -}}
+{{- $read := (fromYaml (printf "count: %v" $replicas)).count -}}
+{{- if and (gt (int $read) 1) (not (include "smg.policyControllerElection" .)) -}}
+{{- fail (printf "policyController.replicas is %v with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
 {{- end -}}
 {{- $replicas -}}
 {{- end }}

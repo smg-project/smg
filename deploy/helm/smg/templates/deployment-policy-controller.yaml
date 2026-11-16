@@ -18,12 +18,20 @@ spec:
   {{- if $elected }}
   {{- /* With the election on, one pod more at a time and none unavailable:
        the new pod stands by, and the old leader's stop hands the Lease
-       over. Off, no strategy is named, as before the election. */}}
+       over. */}}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
+  {{- else }}
+  {{- /* Off, every pod leads alone: an upgrade ends the old pod before it
+       starts the new one. The null takes the rolling update's fields off
+       the live object, where the API refuses them beside Recreate: a
+       Deployment that named no strategy holds the server's own. */}}
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   {{- end }}
   selector:
     matchLabels:

@@ -59,6 +59,10 @@ ON = ("policyController.enabled=true",)
 ELECTED = (*ON, "policyController.election.enabled=true")
 # The spellings of an election that is off.
 OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
+# The strategy of a controller with the election off: the old pod ends
+# before the new one starts. The null takes the rolling update's fields off
+# a live object, where the API refuses them beside Recreate.
+LONE_STRATEGY = {"type": "Recreate", "rollingUpdate": None}
 # The variable the elected controller's address is read from: the kubelet
 # writes the pod's address in place of $(POD_IP).
 POD_IP = {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}
@@ -905,18 +909,41 @@ def test_the_rollout_follows_the_election():
 
 
 @needs_helm
+def test_with_the_election_off_an_upgrade_ends_the_old_pod_first():
+    """Off, every pod leads alone, and a rolling update starts the new pod
+    beside the old one: two leaders for the overlap. The lone controller's
+    Deployment is recreated in its place. A live Deployment holds
+    rolling-update fields, the server's own where the manifest named no
+    strategy and the chart's where the election was on, and the API refuses
+    them beside Recreate: the manifest names them null, which an upgrade's
+    patch takes off the live object."""
+    for off in OFF:
+        assert one(render(*ON, *off), "Deployment")["spec"]["strategy"] == LONE_STRATEGY, off
+    served = {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxSurge": "25%", "maxUnavailable": "25%"},
+    }
+    elected = one(render(*ELECTED), "Deployment")["spec"]["strategy"]
+    for live in (served, elected):
+        patched = {**live, **LONE_STRATEGY}
+        assert {field: value for field, value in patched.items() if value is not None} == {
+            "type": "Recreate"
+        }, live
+
+
+@needs_helm
 def test_with_the_election_off_nothing_of_it_is_rendered():
-    """A release that does not turn the election on renders what it rendered
-    before the election, in each spelling of off: no object of the
-    election, and on the controller's Deployment of one replica no strategy,
-    no account, no variable and neither flag."""
+    """A release that does not turn the election on renders, in each spelling
+    of off, no object of the election, and on the controller's Deployment
+    of one replica the lone controller's strategy, no account, no variable
+    and neither flag."""
     for off in OFF:
         documents = render(*ON, *off)
         kinds = sorted(document["kind"] for document in of_the_controller(documents))
         assert kinds == ["Deployment", "Service"], off
         deployment = one(documents, "Deployment")["spec"]
         assert deployment["replicas"] == 1, off
-        assert "strategy" not in deployment, off
+        assert deployment["strategy"] == LONE_STRATEGY, off
         pod = deployment["template"]["spec"]
         assert "serviceAccountName" not in pod, off
         assert "serviceAccount" not in pod, off
@@ -927,10 +954,13 @@ def test_with_the_election_off_nothing_of_it_is_rendered():
 
 
 @needs_helm
-def test_more_than_one_replica_needs_the_election():
+def test_more_than_one_replica_needs_the_election(tmp_path):
     """With the election off every replica is a controller of its own: two
     would each lead alone. The render refuses them in each spelling of off
-    and says the two ways out; with the election on they render."""
+    and says the two ways out; with the election on they render. The
+    refusal reads the count as written, and judges it as a reader of the
+    manifest takes it: a number from a values file, a fraction above one,
+    and a text that reads there as a number above one."""
     for off in OFF:
         for replicas in (2, 3):
             refused = render_error(*ON, f"policyController.replicas={replicas}", *off)
@@ -940,18 +970,42 @@ def test_more_than_one_replica_needs_the_election():
             ) in refused, off
     pair = one(render(*ELECTED, "policyController.replicas=2"), "Deployment")["spec"]
     assert pair["replicas"] == 2
+    # A number from a values file, whole or a fraction above one: the
+    # refusal reads it as written.
+    values = tmp_path / "values.yaml"
+    for replicas, skip_schema in ((2, False), (2.5, True)):
+        values.write_text(yaml.safe_dump({"policyController": {"replicas": replicas}}))
+        refused = render_error(*ON, files=(values,), skip_schema=skip_schema)
+        assert (
+            f"policyController.replicas is {replicas} with policyController.election.enabled off"
+        ) in refused, replicas
+    # A text the manifest's reader takes as a number above one is refused as
+    # that number is. With the election on it is written as asked, for the
+    # API to judge.
+    for count in ("2e0", " 2"):
+        asked = f"policyController.replicas={count}"
+        refused = render_error(*ON, asked, skip_schema=True)
+        assert (
+            f"policyController.replicas is {count} with policyController.election.enabled off"
+        ) in refused, count
+        written = one(render(*ELECTED, asked, skip_schema=True), "Deployment")["spec"]["replicas"]
+        assert written == yaml.safe_load(f"count: {count}")["count"], count
 
 
 @needs_helm
-def test_a_replica_count_the_schema_refuses_is_written_as_asked():
+def test_a_replica_count_the_schema_refuses_is_written_as_asked(tmp_path):
     """With the schema's check skipped the helper compares the count and
     writes the value as the values hold it. A null stays the API's default
-    of one replica and a fraction stays for the API to refuse: neither is
-    written as zero."""
+    of one replica and a fraction, as text or as a number, stays for the API
+    to refuse: neither is written as zero or as its whole part."""
     unset = render(*ON, "policyController.replicas=null", skip_schema=True)
     assert one(unset, "Deployment")["spec"]["replicas"] is None
     fraction = render(*ON, "policyController.replicas=1.5", skip_schema=True)
     assert one(fraction, "Deployment")["spec"]["replicas"] == 1.5
+    values = tmp_path / "values.yaml"
+    values.write_text(yaml.safe_dump({"policyController": {"replicas": 1.5}}))
+    number = render(*ON, files=(values,), skip_schema=True)
+    assert one(number, "Deployment")["spec"]["replicas"] == 1.5
 
 
 @pytest.fixture
