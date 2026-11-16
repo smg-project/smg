@@ -360,7 +360,7 @@ fn a_removed_worker_leaves_no_load_row_and_a_late_record_or_report_writes_none()
     let loads: &dyn LoadSink = &store;
     let t0 = Instant::now();
     loads.record(id, 0, row(0), t0, LoadSource::Stream);
-    loads.report(id, &[(1, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(id, 1, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(id), 2);
     assert_eq!(store.load_entries(), 1);
 
@@ -372,7 +372,11 @@ fn a_removed_worker_leaves_no_load_row_and_a_late_record_or_report_writes_none()
     let later = t0 + Duration::from_secs(1);
     loads.record(id, 0, row(0), later, LoadSource::Stream);
     loads.record(id, 0, row(0), later, LoadSource::Relay(GatewayId(4)));
-    loads.report(id, &[(0, row(0)), (1, row(0))], later, LoadSource::Poll);
+    loads.report(
+        &[(id, 0, Some(row(0))), (id, 1, Some(row(0)))],
+        later,
+        LoadSource::Poll,
+    );
     assert_eq!(loads.ranks(id), 0, "a late write re-creates nothing");
     assert!(loads.load(id, 0).is_none());
     assert_eq!(store.load_entries(), 0);
@@ -420,7 +424,7 @@ fn a_load_write_for_an_id_that_never_registered_is_dropped() {
     let stranger = WorkerId(77);
     let t0 = Instant::now();
     loads.record(stranger, 0, row(0), t0, LoadSource::Scrape);
-    loads.report(stranger, &[(0, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(stranger, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(stranger), 0);
     assert_eq!(store.load_entries(), 0);
 }
@@ -438,7 +442,7 @@ fn a_writer_racing_the_removal_finds_no_row_after_it_returns() {
             scope.spawn(|| {
                 for _ in 0..50 {
                     store.record(id, 0, row(0), t0, LoadSource::Stream);
-                    store.report(id, &[(1, row(0))], t0, LoadSource::Poll);
+                    store.report(&[(id, 1, Some(row(0)))], t0, LoadSource::Poll);
                 }
             });
             scope.spawn(|| {
@@ -464,7 +468,7 @@ fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
         PollMode::Poll,
         "its receipts went too"
     );
-    loads.report(id, &[(0, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(id), 1, "a member's next report is written");
 }
 
@@ -492,7 +496,11 @@ fn fallback_polling_stays_while_a_silent_rank_stays_silent() {
         PollMode::Fallback,
         "rank 1 fell silent"
     );
-    sink.report(id, &[(0, row), (1, row)], later, LoadSource::Poll);
+    sink.report(
+        &[(id, 0, Some(row)), (id, 1, Some(row))],
+        later,
+        LoadSource::Poll,
+    );
     assert_eq!(
         sink.poll_mode(id, later, interval),
         PollMode::Fallback,
@@ -561,8 +569,11 @@ fn a_record_replaces_its_rank_alone_and_a_poll_fills_only_the_ranks_that_stayed_
     let mut polled = row(0);
     polled.running = 2;
     loads.report(
-        id,
-        &[(0, polled), (1, polled), (2, polled)],
+        &[
+            (id, 0, Some(polled)),
+            (id, 1, Some(polled)),
+            (id, 2, Some(polled)),
+        ],
         polled_at,
         LoadSource::Poll,
     );
@@ -601,7 +612,7 @@ fn the_poll_mode_reads_the_receipts_of_the_pushing_ranks_alone() {
     let interval = Duration::from_secs(10);
     let t0 = Instant::now();
     assert_eq!(loads.poll_mode(id, t0, interval), PollMode::Poll);
-    loads.report(id, &[(0, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(
         loads.poll_mode(id, t0, interval),
         PollMode::Poll,
