@@ -5936,7 +5936,8 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
 }
 
 /// Holds the scanner of each of `patterns` against the pattern's program:
-/// the same match ranges on every fixture text and on the fuzz inputs.
+/// the same match ranges on every fixture text, on the fuzz inputs and on
+/// two all-ASCII forms of each fuzz input.
 fn scanner_differential(patterns: &[&str]) {
     let fixtures = fixture_texts();
     let rounds = fuzz_rounds();
@@ -5954,10 +5955,19 @@ fn scanner_differential(patterns: &[&str]) {
             );
             for words in [false, true] {
                 let mut each = Vec::new();
-                parsed.for_each_match(text, words, |start, end| each.push((start, end)));
+                parsed
+                    .for_each_match::<false, _>(text, words, |start, end| each.push((start, end)));
                 assert_eq!(
                     each, expected,
                     "for_each_match words={words}: pattern {pattern:?} text {text:?}"
+                );
+            }
+            if text.is_ascii() {
+                let mut each = Vec::new();
+                parsed.for_each_match::<true, _>(text, false, |start, end| each.push((start, end)));
+                assert_eq!(
+                    each, expected,
+                    "for_each_match of an all-ASCII text: pattern {pattern:?} text {text:?}"
                 );
             }
         };
@@ -5965,7 +5975,20 @@ fn scanner_differential(patterns: &[&str]) {
             check(text);
         }
         for _ in 0..rounds {
-            check(&fuzz_text(&mut state, &fixtures));
+            let text = fuzz_text(&mut state, &fixtures);
+            check(&text);
+            // Nearly every fuzz text holds a character beyond ASCII, so the
+            // all-ASCII walk gets texts of its own: the text's ASCII
+            // characters, and those with each one repeated up to twelve
+            // times, which makes letter runs and space runs longer than the
+            // eight bytes the lean scan tests in line.
+            let ascii: String = text.chars().filter(char::is_ascii).collect();
+            check(&ascii);
+            let runs: String = ascii
+                .chars()
+                .flat_map(|c| std::iter::repeat_n(c, 1 + pseudo_random(&mut state) as usize % 12))
+                .collect();
+            check(&runs);
         }
     }
 }
