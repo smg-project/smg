@@ -677,10 +677,9 @@ pub(super) async fn handle_simple_streaming_passthrough(
     worker.record_outcome(status.as_u16());
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|err| format!("Failed to read upstream error body: {err}"));
+        let error_body = response.text().await.unwrap_or_else(|err| {
+            format!("Failed to read upstream error body: {}", err.without_url())
+        });
         let error_body = error::sanitize_error_body(&error_body);
         return (status, error_body).into_response();
     }
@@ -1615,9 +1614,46 @@ mod tests {
     /// request URL.
     #[tokio::test]
     async fn a_failed_streamed_forward_answers_without_the_workers_address() {
+        use axum::http::StatusCode;
+
+        use crate::test_support::{text_of, RefusedAddress};
+
+        let refused = RefusedAddress::reserve();
+
+        let response = streamed_answer_from(&format!("http://{}", refused.addr())).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = text_of(response).await;
+        assert!(!body.contains(&refused.addr().to_string()), "{body}");
+    }
+
+    /// A refusal whose body is lost mid-answer: the caller's answer says so
+    /// without the worker's address. The HTTP client's text of a failed body
+    /// read ends with the request URL.
+    #[tokio::test]
+    async fn an_unread_refusal_is_answered_without_the_workers_address() {
+        use axum::http::StatusCode;
+
+        use crate::test_support::{answering, text_of};
+
+        let addr = answering(500, "short", true).await;
+
+        let response = streamed_answer_from(&format!("http://{addr}")).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = text_of(response).await;
+        assert!(
+            body.contains("Failed to read upstream error body"),
+            "{body}"
+        );
+        assert!(!body.contains(&addr.to_string()), "{body}");
+    }
+
+    /// The plain streaming path's answer to a streamed request for the worker
+    /// at `worker_url`, over empty stores.
+    async fn streamed_answer_from(worker_url: &str) -> Response {
         use std::sync::Arc;
 
-        use axum::http::StatusCode;
         use openai_protocol::responses::ResponsesRequest;
         use serde_json::json;
         use smg_data_connector::{
@@ -1626,11 +1662,9 @@ mod tests {
 
         use crate::{
             openai::context::StorageHandles,
-            test_support::{http_client, text_of, RefusedAddress, StubWorker},
+            test_support::{http_client, StubWorker},
         };
 
-        let refused = RefusedAddress::reserve();
-        let worker_url = format!("http://{}", refused.addr());
         let request: ResponsesRequest =
             serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
                 .expect("a request");
@@ -1649,17 +1683,8 @@ mod tests {
             },
         };
 
-        let response = handle_simple_streaming_passthrough(
-            &http_client(),
-            &StubWorker::at(&worker_url),
-            None,
-            req,
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body = text_of(response).await;
-        assert!(!body.contains(&refused.addr().to_string()), "{body}");
+        handle_simple_streaming_passthrough(&http_client(), &StubWorker::at(worker_url), None, req)
+            .await
     }
 
     /// A header the upstream sent more than once reaches the client of a

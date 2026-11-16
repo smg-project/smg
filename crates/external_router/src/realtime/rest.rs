@@ -159,7 +159,7 @@ pub async fn proxy_response(resp: reqwest::Response, model: &str) -> Response {
     match resp.bytes().await {
         Ok(body) => (status, [(http::header::CONTENT_TYPE, content_type)], body).into_response(),
         Err(e) => {
-            error!(error = %e, "Failed to read upstream response body");
+            error!(model, error = %e.without_url(), "Failed to read upstream response body");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -170,7 +170,9 @@ mod tests {
     use axum::http::header::CONTENT_TYPE;
 
     use super::*;
-    use crate::test_support::{text_of, upstream, RefusedAddress, StubWorker};
+    use crate::test_support::{
+        answering, http_client, text_of, upstream, RefusedAddress, StubWorker,
+    };
 
     /// The provider's error envelope as its realtime REST endpoints answer
     /// it: the message names the operator's organization and project.
@@ -241,6 +243,27 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert!(logs_contain("Failed to forward realtime REST request"));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// A realtime answer lost mid-body: the failure line names the model and
+    /// says why without the request URL. The HTTP client's text of a failed
+    /// body read ends with it, its query kept.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_realtime_body_cut_short_goes_without_the_clients_url_in_its_line() {
+        let addr = answering(200, "short", true).await;
+        let resp = http_client()
+            .get(format!("http://{addr}/v1/realtime/sessions?key=s3cret"))
+            .send()
+            .await
+            .expect("the answer's head");
+
+        let response = proxy_response(resp, "realtime-model").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(logs_contain("Failed to read upstream response body"));
+        assert!(logs_contain("realtime-model"));
         assert!(!logs_contain("s3cret"));
     }
 }
