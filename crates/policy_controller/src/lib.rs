@@ -79,8 +79,9 @@
 //!   later PRs.
 //! - Behind the `client` feature, the reference client of the controller's
 //!   protocol (`client`): one gateway's side of it (the dial, `Leader`,
-//!   and the session's `Hello` answered by a `Welcome`), with a blocking
-//!   form. No shipped binary builds it.
+//!   the session's `Hello` answered by a `Welcome`, and a request's
+//!   lifecycle reports on that session), with a blocking form. No shipped
+//!   binary builds it.
 //!
 //! What this step does not hold: the gRPC plugin service, the operator calls,
 //! the other ingestion drivers and the gRPC API; they arrive in later
