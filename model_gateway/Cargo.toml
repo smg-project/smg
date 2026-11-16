@@ -17,6 +17,8 @@ categories = ["web-programming", "network-programming"]
 
 [features]
 default = ["grpc-client", "jemalloc-stats", "providers"]
+# Experimental transport; disabled in normal builds pending API/security review.
+experimental-responses-websocket = []
 tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
 grpc-client = []
 jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
@@ -159,6 +161,7 @@ chrono = { workspace = true, features = ["clock"] }
 toml = "1.1"
 
 [dev-dependencies]
+tokio-tungstenite = "0.29.0"
 # Self dev-dependency: turns on `test-util` for this crate's own test targets,
 # and only that. Without `default-features = false` the default set (including
 # the provider routers) would leak into every test target whatever features the

@@ -7863,6 +7863,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml",
  "tonic",

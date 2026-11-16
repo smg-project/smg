@@ -52,6 +52,9 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
+#[cfg(feature = "experimental-responses-websocket")]
+mod responses_ws;
+
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod health;
@@ -337,8 +340,15 @@ async fn v1_responses(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
+    #[cfg(feature = "experimental-responses-websocket")] prewarm: Option<
+        Extension<responses_ws::Prewarm>,
+    >,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
+    #[cfg(feature = "experimental-responses-websocket")]
+    if prewarm.is_some() {
+        return responses_ws::prewarm_response(body);
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -1322,6 +1332,15 @@ pub fn build_apps(
     // the bound on the buffered body read (inside admission, so a stalled
     // upload releases its permit, and inside the stream-vs-buffer decision,
     // since the streamed relay has its own watchdog).
+    let typed_protection = tower::ServiceBuilder::new()
+        .layer(middleware::MessagesErrorEnvelopeLayer)
+        .layer(InertLayer(wasm_layer.clone()))
+        .layer(InertLayer(serving_auth_layer.clone()))
+        .layer(tenant_resolution_state.clone().layer());
+    #[cfg(feature = "experimental-responses-websocket")]
+    let typed_protection = typed_protection.layer(axum::middleware::from_fn(
+        responses_ws::tenant_binding_guard,
+    ));
     let typed_routes = Router::new()
         .route("/v1/responses", post(v1_responses))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
@@ -1366,11 +1385,7 @@ pub fn build_apps(
         .route("/v1/decisions", post(v1_decisions))
         .route("/v1/systemone", post(v1_systemone))
         .route_layer(
-            tower::ServiceBuilder::new()
-                .layer(middleware::MessagesErrorEnvelopeLayer)
-                .layer(InertLayer(wasm_layer.clone()))
-                .layer(InertLayer(serving_auth_layer.clone()))
-                .layer(tenant_resolution_state.clone().layer())
+            typed_protection
                 .layer(InertLayer(priority_admission.clone()))
                 .layer(InertLayer(legacy_limit.clone()))
                 .layer(
@@ -1415,7 +1430,30 @@ pub fn build_apps(
     // WebSocket and WebRTC routes: auth + admission but no WASM middleware.
     // The hooks filter HTTP requests and responses; a realtime session is
     // upgraded away from HTTP and its frames are not run through modules.
-    let realtime_routes = Router::new()
+    let realtime_routes = Router::new();
+    #[cfg(feature = "experimental-responses-websocket")]
+    let realtime_routes = realtime_routes.route(
+        "/v1/responses",
+        get(responses_ws::upgrade).layer(Extension(responses_ws::Dispatch(
+            protected_routes
+                .clone()
+                .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
+                .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
+                .with_state(app_state.clone()),
+            Arc::new({
+                let tracker = app_state.context.inflight_tracker.clone();
+                move || {
+                    let guard = tracker.track();
+                    if tracker.is_draining() {
+                        return Err(serde_json::json!({"type":"error","status":503,"error":{"type":"server_error","code":"gateway_draining","message":"Gateway is draining; reconnect to continue."}}));
+                    }
+                    Ok(Box::new(guard) as Box<dyn Send>)
+                }
+            }),
+            max_payload_size,
+        ))),
+    );
+    let realtime_routes = realtime_routes
         .route("/v1/realtime", get(v1_realtime_ws))
         .route("/v1/realtime/calls", post(v1_realtime_webrtc))
         .route_layer(
@@ -1425,6 +1463,10 @@ pub fn build_apps(
                 .layer(InertLayer(priority_admission.clone()))
                 .layer(InertLayer(legacy_limit.clone())),
         );
+
+    #[cfg(feature = "experimental-responses-websocket")]
+    let realtime_routes =
+        realtime_routes.layer(axum::middleware::from_fn(responses_ws::capture_credential));
 
     // Multipart upload routes: auth + admission but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject

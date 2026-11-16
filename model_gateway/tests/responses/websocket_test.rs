@@ -1,0 +1,179 @@
+//! The experimental transport must reuse production Responses routing.
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+use futures::{SinkExt, StreamExt};
+use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use serde_json::{json, Value};
+use smg::{
+    config::{RouterConfig, RoutingMode},
+    routers::RouterFactory,
+    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+};
+use smg_test_harness::{
+    grpc_harness::grpc_test_context_with_tokenizer, scripted_tokenizer::ScriptedTokenizer,
+    scripted_worker::ScriptedWorker, test_app::create_test_app_with_context,
+};
+use tokio::{net::TcpListener, task::AbortHandle, time::timeout};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Error as WsError, Message},
+};
+
+struct Servers(Vec<AbortHandle>);
+impl Drop for Servers {
+    fn drop(&mut self) {
+        for server in &self.0 {
+            server.abort();
+        }
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synthetic CPU fixture: failed startup or protocol assertions must fail the test"
+)]
+#[tokio::test]
+async fn native_responses_websocket_uses_auth_validation_and_grpc_tool_pipeline() {
+    const MODEL: &str = "responses-websocket-fixture";
+    let worker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_address = worker_listener.local_addr().unwrap();
+    let worker = ScriptedWorker {
+        output_tokens: 2,
+        finish_reasons: vec!["tool_calls"],
+        generation: Default::default(),
+        requests: Default::default(),
+    };
+    let requests = worker.requests.clone();
+    let worker_server = tokio::spawn(worker.serve(worker_listener));
+    let mut servers = Servers(vec![worker_server.abort_handle()]);
+    let mut config = RouterConfig::builder()
+        .mode(RoutingMode::Regular {
+            worker_urls: vec![],
+        })
+        .grpc_connection()
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(1024 * 1024)
+        .build_unchecked();
+    config.health_check.disable_health_check = true;
+    config.tool_call_parser = Some("qwen".into());
+    config.api_key = Some("fixture-key".into());
+    config.max_concurrent_requests = 1;
+    let tokenizer = Arc::new(ScriptedTokenizer::new(
+        r#"<tool_call>{"name":"echo","arguments":{"message":"fixture"}}</tool_call>"#,
+    ));
+    let context = grpc_test_context_with_tokenizer(config, MODEL, tokenizer).await;
+    context
+        .worker_registry
+        .register(Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://{worker_address}"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .model(ModelCard::new(MODEL))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        ))
+        .unwrap();
+    let router = RouterFactory::create_router(&context).await.unwrap();
+    let app = create_test_app_with_context(router.into(), context);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    servers.0.push(server.abort_handle());
+    let url = format!("ws://{address}/v1/responses");
+    let denied = connect_async(&url).await.unwrap_err();
+    assert!(matches!(denied, WsError::Http(response) if response.status() == 401));
+    let mut upgrade = url.into_client_request().unwrap();
+    upgrade
+        .headers_mut()
+        .insert("authorization", "Bearer fixture-key".parse().unwrap());
+    let (mut socket, _) = connect_async(upgrade).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"response.create","model":MODEL,"store":null,"input":"fixture input"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let rejected = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let rejected: Value = serde_json::from_str(&rejected).unwrap();
+    assert_eq!(rejected["error"]["code"], "invalid_type");
+    assert_eq!(rejected["error"]["param"], "store");
+    assert!(requests.lock().unwrap().is_empty());
+    let tools = json!([{"type":"function","name":"echo","parameters":{"type":"object","properties":{"message":{"type":"string"}}}}]);
+    let mut parent = Value::Null;
+    let mut call_id = Value::Null;
+    for turn in 0..3 {
+        let input = if turn == 2 {
+            json!([{"type":"function_call_output","call_id":call_id,"output":"fixture result"}])
+        } else {
+            json!("fixture input")
+        };
+        let mut request = json!({"type":"response.create","model":MODEL,"store":false,"generate":turn != 0,"input":input,"tools":tools,"max_output_tokens":16});
+        if !parent.is_null() {
+            request["previous_response_id"] = parent.clone();
+        }
+        socket
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        let terminal = timeout(Duration::from_secs(20), async {
+            loop {
+                let event = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                let event: Value = serde_json::from_str(&event).unwrap();
+                assert_ne!(event["type"], "error", "{event}");
+                if matches!(
+                    event["type"].as_str(),
+                    Some("response.completed" | "response.incomplete" | "response.failed")
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal["type"], "response.completed", "{terminal}");
+        parent = terminal["response"]["id"].clone();
+        if turn == 0 {
+            assert!(terminal["response"]["output"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "prewarming must not dispatch inference"
+            );
+        } else {
+            let output = &terminal["response"]["output"][0];
+            assert_eq!(output["type"], "function_call");
+            assert_eq!(output["name"], "echo");
+            assert_eq!(
+                serde_json::from_str::<Value>(output["arguments"].as_str().unwrap()).unwrap(),
+                json!({"message":"fixture"})
+            );
+            assert_ne!(output["call_id"], call_id);
+            call_id = output["call_id"].clone();
+        }
+    }
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    socket.close(None).await.unwrap();
+}

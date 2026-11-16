@@ -9,3 +9,6 @@ mod responses_history_test;
 mod stored_response_persist_test;
 mod stored_stream_client_departure_test;
 mod unsupported_input_parts_test;
+
+#[cfg(feature = "experimental-responses-websocket")]
+mod websocket_test;
