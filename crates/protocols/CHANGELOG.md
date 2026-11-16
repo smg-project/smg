@@ -190,6 +190,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
   read the same way; a usage the gateway writes is unchanged.
+- A Messages document's content source takes its content as a string, and the request's
+  `container` takes the id of a container as a string, as the public API takes both beside their
+  other forms. Each string was refused with the whole request. On the gRPC router a string
+  content source renders as the document's text, as a text source does. Breaking:
+  `DocumentSource::Content` holds the new `DocumentContent`, and `CreateMessageRequest.container`
+  is the new `MessagesContainer`.
 - `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
   (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
   request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public
