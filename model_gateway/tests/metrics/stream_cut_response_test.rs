@@ -149,10 +149,27 @@ impl MockEngine {
             .no_proxy()
             .build()
             .expect("test client");
+        let name = format!("grpc:{port}");
+        // The engine joins the process fleet when its serve task starts,
+        // which can be after the spawn above returns: until then the admin
+        // API has no engine under the name and a fault call answers 404.
+        let known = format!("http://127.0.0.1:{admin_port}/admin/fault/{name}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !client
+                .get(&known)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the mock engine joins the fleet");
         Self {
             port,
             admin_port,
-            name: format!("grpc:{port}"),
+            name,
             client,
             stop: Some((stop, stop_admin)),
             served: Some((served, admin)),
