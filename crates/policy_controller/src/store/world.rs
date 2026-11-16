@@ -237,9 +237,10 @@ const WALKED_RUNS: usize = 160;
 /// `gateway`'s run among a pool's runs, sorted by gateway. While the runs
 /// are at most [`WALKED_RUNS`] the two ends are asked first, which is the
 /// whole answer where one gateway alone holds a veto, and a gateway
-/// between them is walked to from the nearer end: from the front to the
-/// first gateway not under it, or from the back to the first not above
-/// it. Above that count the run is found by one search.
+/// between them is walked to from the nearer end, over the runs between
+/// the two ends alone: from the front to the first gateway not under it,
+/// or from the back to the first not above it. Above that count the run
+/// is found by one search.
 fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
     if runs.len() > WALKED_RUNS {
         let at = runs
@@ -247,19 +248,20 @@ fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
             .ok()?;
         return runs.get(at);
     }
-    let (first, last) = (runs.first()?, runs.last()?);
+    let (first, rest) = runs.split_first()?;
     if gateway <= first.gateway {
         return (gateway == first.gateway).then_some(first);
     }
+    let (last, between) = rest.split_last()?;
     if gateway >= last.gateway {
         return (gateway == last.gateway).then_some(last);
     }
     // The middle run says which half holds the gateway's.
-    let middle = runs.get(runs.len() / 2)?;
+    let middle = between.get(between.len() / 2)?;
     let run = if gateway < middle.gateway {
-        runs.iter().find(|run| run.gateway >= gateway)
+        between.iter().find(|run| run.gateway >= gateway)
     } else {
-        runs.iter().rev().find(|run| run.gateway <= gateway)
+        between.iter().rev().find(|run| run.gateway <= gateway)
     };
     run.filter(|run| run.gateway == gateway)
 }
@@ -737,6 +739,11 @@ pub(super) struct Writer {
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
     spec: Arc<AppliedSpec>,
+    /// The generation before the standing one, kept one apply longer: a
+    /// decider that lets go of the last world published under it frees no
+    /// engine, the next apply does. Its whole engine stays resident that
+    /// long, its session table included, as it stood when it was replaced.
+    retired: Option<Arc<AppliedSpec>>,
     /// The last publication the window counts from: a window's end, or a
     /// load write that published by itself.
     last_window: Option<Instant>,
@@ -763,6 +770,7 @@ impl Writer {
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
             spec: Arc::new(AppliedSpec::unbound()),
+            retired: None,
             last_window: None,
             waiting: false,
         }
@@ -786,7 +794,16 @@ impl Writer {
     /// generation. A number at or under the standing one is refused by
     /// naming the standing one, and nothing is published: the number only
     /// rises, so no reader sees a generation and then a lower one.
-    pub(super) fn apply(&mut self, spec: Arc<AppliedSpec>) -> Result<Arc<World>, StaleGeneration> {
+    ///
+    /// The generation this one replaces is kept until the next apply, and
+    /// the one kept until now is handed back for the caller to let go
+    /// outside the store's lock: an engine is freed by the thread that
+    /// applies, never by a decider dropping the last world of an old
+    /// generation, unless a decider holds a world across two applies.
+    pub(super) fn apply(
+        &mut self,
+        spec: Arc<AppliedSpec>,
+    ) -> Result<(Arc<World>, Option<Arc<AppliedSpec>>), StaleGeneration> {
         let standing = self.spec.generation();
         if spec.generation() <= standing {
             return Err(StaleGeneration {
@@ -794,8 +811,8 @@ impl Writer {
                 offered: spec.generation(),
             });
         }
-        self.spec = spec;
-        Ok(self.publish())
+        let before = self.retired.replace(mem::replace(&mut self.spec, spec));
+        Ok((self.publish(), before))
     }
 
     /// Derive the pools of the membership `members` at the store's `epoch`,

@@ -3,7 +3,8 @@
 //! health service, one instance a listener, holding that listener's scopes.
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
-//! with a principal or with none. Every other call is refused:
+//! with a principal or with none. `Session` is served to a gateway
+//! ([`session`](super::session)). Every other call is refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
@@ -21,8 +22,9 @@ use tonic::{service::Routes, Request, Response, Status, Streaming};
 use super::{
     config::Scope,
     election::{split_identity, Standing},
+    gateways::Gateways,
     principal::{self, Layer, Principal},
-    PROTOCOL_VERSION,
+    session, PROTOCOL_VERSION,
 };
 use crate::{
     elector::{Elector, Fence},
@@ -50,6 +52,21 @@ pub(crate) struct Shared {
     /// The controller's store: what the calls feed and read, and the run
     /// loop's drivers with them.
     pub(crate) store: Arc<MemoryStore>,
+    /// Who is present: the gateways a `Session` welcomed, over this fence
+    /// and this store.
+    pub(crate) gateways: Arc<Gateways>,
+}
+
+/// Who leads, as this replica knows it at one read of its fence.
+pub(crate) struct Leader {
+    /// The leader's id; empty when nobody is named.
+    pub(crate) controller_id: String,
+    /// Its dialable address; empty when nobody is named or it has none.
+    pub(crate) address: String,
+    /// The highest term this replica knows.
+    pub(crate) term: u64,
+    /// Whether the leader is this replica.
+    pub(crate) is_leader: bool,
 }
 
 impl Shared {
@@ -65,6 +82,12 @@ impl Shared {
         standing: watch::Receiver<Standing>,
         store: Arc<MemoryStore>,
     ) -> Self {
+        let gateways = Arc::new(Gateways::new(
+            session::GRACE_PERIOD,
+            session::PRESENT_MAX,
+            elector.fence(),
+            Arc::clone(&store),
+        ));
         Self {
             controller_id,
             address,
@@ -72,6 +95,43 @@ impl Shared {
             fence: elector.fence(),
             standing,
             store,
+            gateways,
+        }
+    }
+
+    /// Who leads, given `leading`, one read of the fence: the term this
+    /// replica leads under, or `None`. A replica whose fence is open names
+    /// itself under the fence's term. Any other names the holder its last
+    /// look at the lease saw, or nobody (an empty address: no leader known)
+    /// when the lease is free, when that look failed, when it read a term
+    /// under the highest this replica saw, when the record still names this
+    /// replica behind a closed fence, and when this replica's own take is
+    /// newer than that look: a holder is named under a term one write of
+    /// the lease stored for it. The term is the highest this replica knows
+    /// either way, so no answer of its falls in term.
+    pub(crate) fn leader(&self, leading: Option<u64>) -> Leader {
+        let (controller_id, address, term, is_leader) = match leading {
+            Some(term) => (self.controller_id.clone(), self.address.clone(), term, true),
+            None => {
+                let standing = self.standing.borrow();
+                let fenced = self.fence.term();
+                let term = standing.term.max(fenced);
+                if standing.holder.is_empty()
+                    || standing.holder == self.identity
+                    || fenced > standing.term
+                {
+                    (String::new(), String::new(), term, false)
+                } else {
+                    let (id, address) = split_identity(&standing.holder);
+                    (id.to_owned(), address.to_owned(), term, false)
+                }
+            }
+        };
+        Leader {
+            controller_id,
+            address,
+            term,
+            is_leader,
         }
     }
 }
@@ -226,39 +286,16 @@ impl Service {
         )))
     }
 
-    /// The `Leader` call's answer at `now`. A replica whose fence is open
-    /// names itself under the fence's term. Any other names the holder its
-    /// last look at the lease saw, or nobody (an empty address: no leader
-    /// known) when the lease is free, when that look failed, when it read a
-    /// term under the highest this replica saw, when the record still names
-    /// this replica behind a closed fence, and when this replica's own take
-    /// is newer than that look: a holder is named under a term one write of
-    /// the lease stored for it. The term is the highest this replica knows
-    /// either way, so no answer of its falls in term.
+    /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read
+    /// of the fence.
     fn leader_info(&self, now: Instant) -> proto::LeaderInfo {
         let shared = &self.shared;
-        let (controller_id, address, term, is_leader) = match shared.fence.leader_term(now) {
-            Some(term) => (
-                shared.controller_id.clone(),
-                shared.address.clone(),
-                term,
-                true,
-            ),
-            None => {
-                let standing = shared.standing.borrow();
-                let fenced = shared.fence.term();
-                let term = standing.term.max(fenced);
-                if standing.holder.is_empty()
-                    || standing.holder == shared.identity
-                    || fenced > standing.term
-                {
-                    (String::new(), String::new(), term, false)
-                } else {
-                    let (id, address) = split_identity(&standing.holder);
-                    (id.to_owned(), address.to_owned(), term, false)
-                }
-            }
-        };
+        let Leader {
+            controller_id,
+            address,
+            term,
+            is_leader,
+        } = shared.leader(shared.fence.leader_term(now));
         proto::LeaderInfo {
             controller_id,
             address,
@@ -277,7 +314,7 @@ impl Service {
 
 #[tonic::async_trait]
 impl PolicyController for Service {
-    type SessionStream = Unserved<proto::ControllerFrame>;
+    type SessionStream = session::Frames;
     type DecideStream = Unserved<proto::DecideAnswer>;
     type WatchWorkersStream = Unserved<proto::WorkerEvent>;
     type WatchRegimeStream = Unserved<proto::Regime>;
@@ -287,7 +324,9 @@ impl PolicyController for Service {
         &self,
         request: Request<Streaming<proto::GatewayFrame>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        self.unserved(Call::Session, &request)
+        let principal = self.admit(Call::Session, &request)?.clone();
+        let frames = session::serve(Arc::clone(&self.shared), principal, request.into_inner());
+        Ok(Response::new(frames))
     }
 
     async fn decide(
@@ -731,10 +770,11 @@ mod tests {
     /// listener with no layer, a name stated to one that takes identities
     /// as told, and no name stated to that one. `Leader` is served every
     /// way; any other answers in its own name: denied off the listener's
-    /// scopes, and on them unimplemented to the caller the layer placed
-    /// and unauthenticated to any other. The names are read from the
-    /// contract, so a method added there joins the case, and fails it until
-    /// the table holds its call.
+    /// scopes, and on them unauthenticated to a caller the layer did not
+    /// place. To the caller it placed, a call no step serves is
+    /// unimplemented, and `Session` is reached: the empty message is no
+    /// `Hello`. The names are read from the contract, so a method added
+    /// there joins the case, and fails it until the table holds its call.
     #[tokio::test]
     async fn every_method_of_the_contract_answers_by_its_calls_scopes_and_its_callers_principal() {
         let methods = methods();
@@ -804,6 +844,12 @@ mod tests {
                     (
                         Code::PermissionDenied,
                         format!("{method} is not a call of this listener's scopes"),
+                    )
+                } else if layer == Layer::AsTold && stated && *method == "Session" {
+                    (
+                        Code::FailedPrecondition,
+                        "no session stands on this stream: Hello is the first frame, a frame of no kind came first"
+                            .to_owned(),
                     )
                 } else if layer == Layer::AsTold && stated {
                     (

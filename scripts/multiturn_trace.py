@@ -38,6 +38,8 @@ SESSION_BASE = 1_000_000
 SESSION_SPAN = 10_000
 # What a later turn waits beyond its think time: the previous answer's latency.
 ANSWER_LATENCY_S = 3.0
+# The largest output length replay reads: its rows hold `output_length` as a u32.
+OUTPUT_MAX = 2**32 - 1
 
 
 def block_range(raw: str) -> tuple[int, int]:
@@ -109,8 +111,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if not 0 <= args.sys_blocks <= TENANT_SPAN:
         parser.error(f"--sys-blocks must be 0 to {TENANT_SPAN}: a tenant's hash ids span that many")
-    if args.answer_blocks < 0 or args.output < 0:
-        parser.error("--answer-blocks and --output must be at least 0")
+    if args.answer_blocks < 0:
+        parser.error("--answer-blocks must be at least 0")
+    if not 0 <= args.output <= OUTPUT_MAX:
+        parser.error(f"--output must be 0 to {OUTPUT_MAX}: replay reads it as a u32")
     shortest = args.sys_blocks + args.first_blocks[0]
     if shortest == 0:
         parser.error("--sys-blocks or --first-blocks must give a first turn a block")
@@ -140,16 +144,18 @@ def generate(args: argparse.Namespace) -> tuple[list[dict], int]:
         tenant = rng.choices(range(args.tenants), weights)[0]
         ids = [tenant * TENANT_SPAN + i for i in range(args.sys_blocks)]
         own = itertools.count(SESSION_BASE + session * SESSION_SPAN)
-        ids.extend(itertools.islice(own, rng.randint(*args.first_blocks)))
+        # A turn's length is counted before its blocks are taken, so a turn the
+        # cap ends takes none, however many its draws come to.
+        length = args.sys_blocks + rng.randint(*args.first_blocks)
         turns = 1 + int(rng.expovariate(1.0 / max(args.mean_turns - 1, 1e-9)))
         at = start
         for turn in range(turns):
             if turn:
-                ids.extend(itertools.islice(own, args.answer_blocks))
-                ids.extend(itertools.islice(own, rng.randint(*args.turn_blocks)))
+                length += args.answer_blocks + rng.randint(*args.turn_blocks)
                 at += rng.expovariate(1.0 / args.think_s) + ANSWER_LATENCY_S
-            if len(ids) > args.max_blocks or at > args.duration_s:
+            if length > args.max_blocks or at > args.duration_s:
                 break
+            ids.extend(itertools.islice(own, length - len(ids)))
             rows.append(
                 {
                     "timestamp": int(at * 1000),

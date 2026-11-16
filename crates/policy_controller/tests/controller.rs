@@ -26,15 +26,23 @@ use smg_policy_controller::{
         TlsError, SERVICE_NAME,
     },
     elector::{ElectionSettings, FileLease, LeaseBackend},
+    lease::{Lease, LeaseId},
     proto::{
-        policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, LeaderRequest,
-        WatchWorkersRequest,
+        controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
+        GatewayFrame, GetPolicySpecRequest, Hello, LeaderRequest, WatchWorkersRequest,
     },
-    store::{LoadSink, LoadSource, WorkerFacts, WorkersStore},
-    view::{LoadRow, Role},
+    store::{
+        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, WorkerFacts,
+        WorkersStore,
+    },
+    view::{fingerprint, LoadRow, Role, WorkerId},
 };
-use tokio::{net::TcpStream, sync::oneshot};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
 use tonic::{
+    codegen::tokio_stream::wrappers::ReceiverStream,
     metadata::AsciiMetadataValue,
     transport::{Certificate, Channel, ClientTlsConfig, Identity},
     Code, Request,
@@ -271,6 +279,112 @@ async fn a_listener_named_as_told_takes_the_stated_name_and_the_others_take_none
                 .into_inner();
             assert!(info.is_leader, "{info:?}");
         }
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}
+
+/// A gateway's session through the bound controller. It is welcomed under
+/// the leader's term, and the run loop's sweep lets it go a grace period
+/// after its stream's end: the lease it held is released then, not before.
+#[tokio::test]
+async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
+    const GATEWAY: &str = "gateway-a";
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    controller
+        .identity_as_told("gateway")
+        .expect("a listener of the configuration");
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+    let store = controller.store();
+    // The store keys a gateway by its subject's fingerprint.
+    let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let addr = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let mut client = PolicyControllerClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the listener accepts");
+        let (frames, sent) = mpsc::channel(4);
+        let mut answers = client
+            .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        let hello = Hello {
+            gateway_id: GATEWAY.to_owned(),
+            protocol_min: 1,
+            protocol_max: 1,
+            ..Hello::default()
+        };
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(hello)),
+            })
+            .await
+            .expect("the stream takes the Hello");
+        let answer = answers
+            .message()
+            .await
+            .expect("a frame, not a status")
+            .expect("a frame, not the stream's end");
+        assert_eq!(answer.term, 1, "the first take's term: {answer:?}");
+        let grace = match answer.frame {
+            Some(controller_frame::Frame::Welcome(welcome)) => {
+                Duration::from_millis(u64::from(welcome.grace_period_ms))
+            }
+            other => panic!("a Welcome answers a Hello: {other:?}"),
+        };
+
+        // A lease the gateway holds, as a decision records it.
+        let now = Instant::now();
+        store
+            .issue(LeaseRecord {
+                lease: Lease {
+                    id: LeaseId(1),
+                    ..Lease::default()
+                },
+                gateway,
+                request: 1,
+                target: WorkerId(7),
+                decode: None,
+                term: 1,
+                issued_at: now,
+                dispatch_deadline: now + Duration::from_secs(600),
+                state: LeaseState::Issued,
+            })
+            .expect("a lease under the leader's term");
+        assert_eq!(store.live(gateway), 1);
+
+        // The stream ends. The gateway stays present for the grace period,
+        // then the sweep releases what it held.
+        drop(frames);
+        drop(answers);
+        let ended = Instant::now();
+        while store.live(gateway) > 0 {
+            assert!(
+                ended.elapsed() < grace + Duration::from_secs(20),
+                "the lease stands {:?} after the stream's end",
+                ended.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            ended.elapsed() >= grace,
+            "let go {:?} after the stream's end, inside the grace period of {grace:?}",
+            ended.elapsed()
+        );
 
         stop.send(()).expect("the serve is listening for the stop");
     };

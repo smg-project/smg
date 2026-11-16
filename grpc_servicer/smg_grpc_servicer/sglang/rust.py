@@ -457,6 +457,11 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+# The engine's switch under which a decode side asks the bootstrap server for
+# a request's prefill rank instead of deriving it from the room.
+FORCE_QUERY_PREFILL_DP_RANK_ENV = "SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK"
+
+
 def refuse_epd_disaggregation(server_args: Any) -> None:
     """The EPD roles this process cannot serve are a configuration error
     before the server binds. ``encoder_only`` is not a servicer role on either
@@ -472,15 +477,16 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
     fields; :func:`start_bootstrap_server`) on a side of any number of
     scheduler ranks: the Rust servicer places a prefill side's request on the
     rank of its room (``bootstrap_room % dp_size``, where the decode side looks
-    for the KV) and a decode side's on its pinned rank. One prefill shape is
-    refused whatever its load-balance method and environment: several plain
-    data-parallel replicas (``--dp-size N`` without attention DP), where every
-    replica reports attention-DP rank 0 to the engine's KV sender; following
-    the room, the sender fails each request whose room's residue is not 0, and
-    under any other method or the engine's force-query switch it registers
-    rank 0, so the decode side bootstraps against replica 0 for every request
-    that ran elsewhere; attention DP (``--tp-size N --attn-dp-size N``) is the
-    multi-rank prefill shape."""
+    for the KV) and a decode side's on its pinned rank. Plain data-parallel
+    replicas (``--dp-size N`` without attention DP) are such a prefill side
+    only when they follow the room (``auto`` is that on a prefill side): each
+    request then names its replica to the engine's KV sender (to which every
+    replica is attention-DP rank 0) and the decode side derives the replica
+    from the room. Under any other load-balance method the decode side waits
+    for a rank the sender never registers for a named request, so that launch
+    is refused. So is one with the engine's force-query switch on: the value
+    that breaks the shape is the decode side's, which this process cannot
+    see, and its own, read as the engine reads it, stands in for it."""
     args = EngineConfigView(server_args).server_args
     if args.encoder_only:
         raise ServicerConfigError(
@@ -505,13 +511,20 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
         args.disaggregation_mode == "prefill"
         and args.scheduler_count > 1
         and args.attention_dp_width == 1
+        and (
+            args.load_balance_method not in ("auto", "follow_bootstrap_room")
+            or os.environ.get(FORCE_QUERY_PREFILL_DP_RANK_ENV, "").strip().lower()
+            in ("true", "1", "yes", "y")
+        )
     ):
         raise ServicerConfigError(
-            f"a prefill side of {args.scheduler_count} plain data-parallel replicas is not served: "
-            "each replica reports attention-DP rank 0 to the engine's KV sender, which fails every "
-            "request whose bootstrap_room % dp_size is not 0 when it follows the room, and "
-            "registers rank 0 for the decode side's bootstrap under any other load-balance "
-            "method; run attention DP (--tp-size N --attn-dp-size N) or one rank per side"
+            f"a prefill side of {args.scheduler_count} plain data-parallel replicas is served only "
+            "when it follows the room (load_balance_method 'auto' or 'follow_bootstrap_room', here "
+            f"{args.load_balance_method!r}) with {FORCE_QUERY_PREFILL_DP_RANK_ENV} off (read here "
+            "in place of the decode side's, which is the one that matters): otherwise the decode "
+            "side waits for a prefill rank the engine's KV sender never registers for a request "
+            "that names its rank; run attention DP (--tp-size N --attn-dp-size N) or one rank "
+            "per side"
         )
 
 

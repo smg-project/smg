@@ -1415,11 +1415,18 @@ fn the_pair_door_racing_the_publications_builds_both_sides_from_one_load() {
     // The case ends at an event, the door read across `SEEN` publications,
     // and holds the door's rule at every read: one load of the world feeds
     // both sides, so a publication between the two builds shows in neither.
+    // A store that stopped publishing fails the case at this bound: without
+    // it the door would be read for ever.
+    let bound = Instant::now() + Duration::from_secs(60);
     let (mut seen, mut last) = (0, None);
     while seen < SEEN {
         assert!(
             !writer.is_finished(),
             "the writer ended before the door was read across {SEEN} publications"
+        );
+        assert!(
+            Instant::now() < bound,
+            "the door was read across {seen} publications of {SEEN} in a minute"
         );
         let (prefills, decodes) = sides();
         assert_eq!(
@@ -2045,6 +2052,34 @@ fn a_generation_is_applied_above_the_standing_one_and_no_other() {
     assert!(Arc::ptr_eq(&standing, &store.world()));
     store.apply(generation(4)).expect("above the standing one");
     assert_eq!(view(&store, &ask(t0)).2.generation, 4);
+}
+
+#[test]
+fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
+    let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
+    let first = Arc::new(generation(1));
+    let held = Arc::downgrade(&first);
+    let (world, before) = writer.apply(first).expect("above the unbound start");
+    assert!(before.is_none(), "nothing was kept before the first apply");
+    // A reader still holds a world of generation 1 when the next is
+    // applied; the unbound start, kept since the first apply, is handed
+    // back.
+    let (_, before) = writer
+        .apply(Arc::new(generation(2)))
+        .expect("above the standing one");
+    assert_eq!(before.map(|spec| spec.generation()), Some(0));
+    // The reader lets its world go: the writer keeps the generation, so
+    // the reader frees no engine.
+    drop(world);
+    assert_eq!(held.strong_count(), 1, "kept by the writer alone");
+    // The next apply hands it back, and the caller's drop is its end.
+    let (_, before) = writer
+        .apply(Arc::new(generation(3)))
+        .expect("above the standing one");
+    let before = before.expect("the generation before the last");
+    assert_eq!((before.generation(), held.strong_count()), (1, 1));
+    drop(before);
+    assert_eq!(held.strong_count(), 0);
 }
 
 #[test]
