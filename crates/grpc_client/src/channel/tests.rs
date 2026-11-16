@@ -1853,7 +1853,9 @@ async fn a_keep_alive_timeout_under_a_call_is_unavailable() {
 
 /// A subscriber that keeps the message of every event this crate logs, for
 /// the tests that read what the channel says. The connection's task runs
-/// on the test's current-thread runtime, so a thread-local default sees it.
+/// on the test's current-thread runtime, so a thread-local default sees it
+/// while a second dispatcher is alive beside it. Installed alone, it misses
+/// a callsite that another test's thread reaches first.
 struct Capture(Arc<Mutex<Vec<String>>>);
 
 impl tracing::Subscriber for Capture {
