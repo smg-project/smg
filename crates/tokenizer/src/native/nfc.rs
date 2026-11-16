@@ -9,16 +9,23 @@
 //! eight bytes at a time. Nearly every character is Yes with combining class
 //! 0, so the third bitmap holds those and the walk reads that one bit per
 //! such character (the two bitmaps and a character decode per character
-//! were a third of a short Cyrillic encode: measured). The bit is found
-//! from the character's bytes as they stand, the bitmap's word from the
-//! first two and the bit from the last, with no code point put together
-//! (a decode and the bit read were twenty to thirty instructions a
-//! character, and the walk a sixth of a warm encode of a text whose bytes
-//! are half beyond ASCII: counted). Characters of one length come in runs (a
-//! word of Cyrillic or Arabic letters, a line of ideographs or syllables),
-//! so each length has its own loop with a fixed step. A step whose length
-//! is looked up for each character chains two reads into every step: a
-//! table by lead byte took fewer instructions and more time (measured).
+//! were a third of a short Cyrillic encode: measured). Characters beyond
+//! ASCII come in runs (a word of Cyrillic or Arabic letters, a line of
+//! ideographs or syllables), and in a run the bit is found from the
+//! character's bytes as they stand, the bitmap's word from the first two
+//! and the bit from the last, with no code point put together (a decode
+//! and the bit read were twenty to thirty instructions a character, and
+//! the walk a sixth of a warm encode of a text whose bytes are half beyond
+//! ASCII: counted). The run is one loop, and its step is a constant of the
+//! character's length: a step whose length is looked up for each character
+//! chains two reads into every step (a table by lead byte took fewer
+//! instructions and more time: measured). A character that stands alone
+//! between ASCII ones (an accented letter, a quotation mark, a dash) is
+//! decoded and takes the same bit by its code point: a run's set-up and
+//! end cost such a character more than the decode, and natural
+//! Latin-script texts read more instructions when every character started
+//! a run (counted). So the first character after an ASCII one is decoded,
+//! and a run starts at a character that follows another beyond ASCII.
 //! The answers are the library's own,
 //! read from its functions once when the tables are built, and what the
 //! tables cannot settle (a Maybe, a character outside the plane) is handed
@@ -152,43 +159,67 @@ impl NfcQuick {
                 }
                 cut = at - 1;
                 last = 0;
-                continue;
-            }
-            // `at` is on the lead byte of a character (a continuation byte
-            // follows a lead byte only, and the steps here are whole
-            // characters). A character that is Yes with combining class 0,
-            // nearly every one, is one bit read from its bytes as they
-            // stand. Characters of one length come in runs, so each length
-            // has its own loop with a fixed step: the next character never
-            // waits for a length that had to be looked up. The others are
-            // decoded and take both tables and the class.
-            let mut rest = &bytes[at..];
-            if bytes[at] < 0xE0 {
-                while let [lead @ 0xC2..=0xDF, second, tail @ ..] = rest {
-                    if !self.plain_bit(usize::from(lead & 0x1F), *second) {
-                        break;
-                    }
-                    rest = tail;
+                if at == bytes.len() {
+                    break;
                 }
+                // The character after the ASCII ones is decoded below, in
+                // this pass. In Latin-script text it stands alone between
+                // ASCII characters (an accented letter, a quotation mark, a
+                // dash), and a run's set-up and end cost such a character
+                // more than its decode: natural texts read more
+                // instructions when every character started a run
+                // (counted). Taking it here adds no test: where the walk
+                // stands in its own control flow says what came before.
             } else {
-                while let [lead @ 0xE0..=0xEF, second, third, tail @ ..] = rest {
-                    let word = (usize::from(lead & 0x0F) << 6) | usize::from(second & 0x3F);
-                    if !self.plain_bit(word, *third) {
-                        break;
+                // `at` is on the lead byte of a character right after
+                // another character beyond ASCII, or at the start of the
+                // text (a continuation byte follows a lead byte only, and
+                // the steps here are whole characters): a run. A character
+                // that is Yes with combining class 0, nearly every one, is
+                // one bit read from its bytes as they stand, and the step
+                // to the next is a constant of its arm: no length is looked
+                // up, so no character waits for a read before it. The
+                // three-byte arm is first, the long runs being ideographs
+                // and syllables; a character of the other length does not
+                // end the run, so a text that mixes the two stays in the
+                // loop.
+                let mut rest = &bytes[at..];
+                loop {
+                    match rest {
+                        [lead @ 0xE0..=0xEF, second, third, tail @ ..] => {
+                            let word = (usize::from(lead & 0x0F) << 6) | usize::from(second & 0x3F);
+                            if !self.plain_bit(word, *third) {
+                                break;
+                            }
+                            rest = tail;
+                        }
+                        [lead @ 0xC2..=0xDF, second, tail @ ..] => {
+                            if !self.plain_bit(usize::from(lead & 0x1F), *second) {
+                                break;
+                            }
+                            rest = tail;
+                        }
+                        _ => break,
                     }
-                    rest = tail;
+                }
+                let run = bytes.len() - rest.len();
+                if run != at {
+                    at = run;
+                    last = 0;
+                    continue;
                 }
             }
-            let run = bytes.len() - rest.len();
-            if run != at {
-                at = run;
-                last = 0;
-                continue;
-            }
+            // One character by its code point: the first after an ASCII
+            // character, and one a run did not take. A plain one is one bit
+            // of the same table; the others take both tables and the class.
             let lead = bytes[at];
             let (code, len) = char_beyond_ascii(bytes, at, lead);
             at += len;
             let code = code as usize;
+            if code < PLANE && Self::bit(&self.plain, code) {
+                last = 0;
+                continue;
+            }
             let ch = char::from_u32(code as u32).ok_or(Unplaced { cut, at: at - len })?;
             let (yes, marked) = if code < PLANE {
                 (Self::bit(&self.yes, code), Self::bit(&self.marked, code))
@@ -292,12 +323,19 @@ mod tests {
                 alone,
                 "U+{code:04X}"
             );
-            // Alone, after a letter, before one and twice over.
+            // Alone, after a letter, before one, twice over, and twice over
+            // between letters (the first is decoded, the second starts a
+            // run); then inside a run that mixes the two lengths, after a
+            // two-byte letter and after a three-byte one.
             for text in [
                 format!("{ch}"),
                 format!("a{ch}"),
                 format!("{ch}a"),
                 format!("{ch}{ch}"),
+                format!("a{ch}{ch}a"),
+                format!("a\u{436}{ch}\u{3042}"),
+                format!("a\u{3042}{ch}\u{436}"),
+                format!("\u{436}\u{3042}{ch}\u{436}\u{3042}a"),
             ] {
                 assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
             }
@@ -420,6 +458,15 @@ mod tests {
             ("ก\u{E48}\u{E38}", Ok(false)),
             ("1234567ก\u{E48}\u{E38}", Ok(false)),
             ("漢字ก\u{E48}\u{E38}", Ok(false)),
+            // Single characters between ASCII ones, each decoded: an
+            // accented letter, a dash.
+            ("caf\u{E9} \u{2014} na\u{EF}ve", Ok(true)),
+            // A run that mixes two-byte and three-byte letters is one run;
+            // marks out of order after it are the library's No, and a mark
+            // after an ASCII letter behind it is reported from that letter.
+            ("\u{436}\u{3042}\u{436}\u{3042}", Ok(true)),
+            ("\u{436}\u{3042}\u{E48}\u{E38}", Ok(false)),
+            ("a\u{436}\u{3042}x\u{301}", Err(Unplaced { cut: 6, at: 7 })),
         ] {
             assert_eq!(quick.check(text), expected, "{text:?}");
             assert_eq!(quick.is_nfc(text), library_is_nfc(text), "{text:?}");
