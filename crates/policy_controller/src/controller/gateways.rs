@@ -1,0 +1,835 @@
+//! Who is present (design 4.3, the stream rule): a gateway is present from
+//! its `Welcome` until its grace period ends with no new `Hello`, and what
+//! the controller holds for it lives exactly that long.
+//!
+//! Presence is read from the clock at the instant of the question, as the
+//! fence is: a gateway is present while a session of it stands and for the
+//! grace period after the last one ended. No task tells a reader who is
+//! present. The sweep only lets go what a gateway that ended held, so a
+//! late sweep changes no answer.
+//!
+//! Two rules come from the fence (design 5.3). A replica whose fence is
+//! closed lets nothing go: a fenced leader releases nothing. And at a take
+//! every gone gateway's period starts again: no `Hello` could be welcomed
+//! here while this replica did not lead, so that time is not the gateway's
+//! silence.
+//!
+//! A `Welcome` and the letting-go of one gateway are ordered by the table's
+//! lock, held across the store's release: a gateway is welcomed with what
+//! it held, or let go and welcomed with nothing, never welcomed and then
+//! let go. The table's lock is taken before any lock of the store.
+//!
+//! The table holds two bounds of its own. A ceiling of rows: a `Hello` that
+//! would make a new row past it is refused, so the names a listener lets in
+//! never grow the table without end; a present gateway's `Hello` makes no
+//! row and is always taken. And one subject a key: the store keys a gateway
+//! by a fingerprint of its subject, so a `Hello` of another subject under a
+//! present gateway's key is refused, never merged into that gateway's row.
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
+use tokio::{
+    sync::{watch, Notify},
+    time::MissedTickBehavior,
+};
+use tracing::{info, warn};
+
+use crate::{
+    elector::Fence,
+    store::{GatewayId, LeasesStore, MemoryStore},
+};
+
+/// Why a `Hello` takes no seat. A refused `Hello` changes nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Refused {
+    /// A gateway of another subject is present under the same key.
+    AnotherSubject,
+    /// The table holds its ceiling of rows and this `Hello` would make a
+    /// new one.
+    Full { ceiling: usize },
+}
+
+/// The presence table.
+pub(crate) struct Gateways {
+    /// How long a gateway stays present after its last session ended.
+    grace: Duration,
+    /// How many rows the table holds at most: the gateways with a standing
+    /// session or inside their grace period.
+    ceiling: usize,
+    fence: Arc<Fence>,
+    store: Arc<MemoryStore>,
+    table: Mutex<Table>,
+}
+
+#[derive(Default)]
+struct Table {
+    rows: FxHashMap<GatewayId, Row>,
+    /// The highest term the table was read under since this replica last
+    /// led; `None` when the last read found the fence closed, and before
+    /// the first.
+    led: Option<u64>,
+    /// Numbers every session the table welcomed and never restarts: a
+    /// session's number is its alone, whatever became of its gateway's row.
+    sessions: u64,
+}
+
+struct Row {
+    /// The verified subject, for the log.
+    subject: String,
+    /// The number of the gateway's latest session, `0` before the first: a
+    /// stream's end is the row's only while the number is that stream's own.
+    session: u64,
+    /// When the last session ended; `None` while one stands.
+    gone: Option<Instant>,
+    /// Wakes the standing session when a newer one takes its place.
+    superseded: Arc<Notify>,
+    /// Held for as long as this presence lasts: a [`Presence`] waits for
+    /// its drop.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a decide stream subscribes to it; the Decide call is the step's next PR"
+        )
+    )]
+    ended: watch::Sender<()>,
+}
+
+/// A standing session's place in the table. Its drop is the session's end.
+pub(crate) struct Seat {
+    gateways: Arc<Gateways>,
+    gateway: GatewayId,
+    session: u64,
+    superseded: Arc<Notify>,
+}
+
+impl Seat {
+    /// Resolves when a newer session of the gateway took this one's place.
+    pub(crate) async fn superseded(&self) {
+        self.superseded.notified().await;
+    }
+
+    /// The session ended at `now`, where a case names the instant.
+    #[cfg(test)]
+    pub(crate) fn end(self, now: Instant) {
+        self.gateways.gone(self.gateway, self.session, now);
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        // A no-op after `end`: the row's period started there.
+        self.gateways
+            .gone(self.gateway, self.session, Instant::now());
+    }
+}
+
+/// A gateway's presence as a decide stream holds it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Decide call holds one a decide stream; that call is the step's next PR"
+    )
+)]
+#[derive(Clone)]
+pub(crate) struct Presence(watch::Receiver<()>);
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Decide call ends a decide stream on it; that call is the step's next PR"
+    )
+)]
+impl Presence {
+    /// Resolves when the presence ended.
+    pub(crate) async fn ended(&mut self) {
+        // No value is ever sent: the row holds the sender and goes with
+        // the presence.
+        while self.0.changed().await.is_ok() {}
+    }
+}
+
+impl Gateways {
+    pub(crate) fn new(
+        grace: Duration,
+        ceiling: usize,
+        fence: Arc<Fence>,
+        store: Arc<MemoryStore>,
+    ) -> Self {
+        Self {
+            grace,
+            ceiling,
+            fence,
+            store,
+            table: Mutex::new(Table::default()),
+        }
+    }
+
+    /// The ceiling of rows.
+    #[cfg(test)]
+    pub(crate) fn ceiling(&self) -> usize {
+        self.ceiling
+    }
+
+    /// The grace period, as a `Welcome` tells it.
+    pub(crate) fn grace(&self) -> Duration {
+        self.grace
+    }
+
+    /// A `Welcome` at `now` under `term`, the session's one read of the
+    /// fence: the gateway is present, and the session takes its seat. A
+    /// session of the gateway that still stands is superseded. A gateway
+    /// whose period had ended before this `Hello`, the sweep not yet
+    /// passed, is let go first: the new presence starts with nothing of the
+    /// earlier one. The letting-go is the table's own read of the fence,
+    /// under its lock as the sweep's is: a fence that no longer shows
+    /// `term` lets nothing go.
+    ///
+    /// # Errors
+    ///
+    /// A gateway of another subject is present under the key, or the row
+    /// would be a new one past the table's ceiling. A row whose period is
+    /// over counts until the sweep's next pass, a tenth of the period at
+    /// most.
+    pub(crate) fn welcome(
+        self: &Arc<Self>,
+        gateway: GatewayId,
+        subject: &str,
+        term: u64,
+        now: Instant,
+    ) -> Result<Seat, Refused> {
+        let mut table = self.table.lock();
+        let shown = self.fence.leader_term(now);
+        Self::observe(&mut table, shown, now);
+        if shown == Some(term)
+            && table
+                .rows
+                .get(&gateway)
+                .is_some_and(|row| self.over(row, now))
+        {
+            if let Some(row) = table.rows.remove(&gateway) {
+                self.end(gateway, row);
+            }
+        }
+        match table.rows.get(&gateway) {
+            // One key, one subject: two names of one fingerprint are never
+            // one gateway. Nothing of the present gateway is touched.
+            Some(row) if row.subject != subject => {
+                warn!(
+                    present = %row.subject,
+                    refused = %subject,
+                    "a Hello's subject shares its key with a present gateway of another subject: refused"
+                );
+                return Err(Refused::AnotherSubject);
+            }
+            // A new row past the ceiling: the table's bound that is not time.
+            // The table has no gauge yet: this line and the refusal are its
+            // signal.
+            None if table.rows.len() >= self.ceiling => {
+                warn!(
+                    refused = %subject,
+                    ceiling = self.ceiling,
+                    "a Hello would make a new row past the table's ceiling of present gateways: refused"
+                );
+                return Err(Refused::Full {
+                    ceiling: self.ceiling,
+                });
+            }
+            _ => {}
+        }
+        table.sessions += 1;
+        let session = table.sessions;
+        let row = table.rows.entry(gateway).or_insert_with(|| Row {
+            subject: subject.to_owned(),
+            session: 0,
+            gone: None,
+            superseded: Arc::new(Notify::new()),
+            ended: watch::channel(()).0,
+        });
+        if row.session > 0 && row.gone.is_none() {
+            row.superseded.notify_one();
+        }
+        row.session = session;
+        row.gone = None;
+        row.superseded = Arc::new(Notify::new());
+        Ok(Seat {
+            gateways: Arc::clone(self),
+            gateway,
+            session,
+            superseded: Arc::clone(&row.superseded),
+        })
+    }
+
+    /// The gateway's presence at `now` for a decide stream's open: `None`
+    /// when it is not present. No decision asks: a stream's open and end do.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Decide call asks it at a decide stream's open; that call is the step's next PR"
+        )
+    )]
+    pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
+        let mut table = self.table.lock();
+        Self::observe(&mut table, self.fence.leader_term(now), now);
+        let row = table.rows.get(&gateway)?;
+        (!self.over(row, now)).then(|| Presence(row.ended.subscribe()))
+    }
+
+    /// One pass of the sweep at `now`: every gateway whose period is over
+    /// is let go. Returns how many. A replica that does not lead at `now`
+    /// lets nothing go.
+    pub(crate) fn sweep(&self, now: Instant) -> usize {
+        let mut table = self.table.lock();
+        if !Self::observe(&mut table, self.fence.leader_term(now), now) {
+            return 0;
+        }
+        let over: Vec<GatewayId> = table
+            .rows
+            .iter()
+            .filter(|(_, row)| self.over(row, now))
+            .map(|(gateway, _)| *gateway)
+            .collect();
+        for gateway in &over {
+            if let Some(row) = table.rows.remove(gateway) {
+                self.end(*gateway, row);
+            }
+        }
+        over.len()
+    }
+
+    /// The sweep's task: a pass every tenth of the grace period until
+    /// `stop`, on no stream's path.
+    pub(crate) async fn run(&self, mut stop: watch::Receiver<bool>) {
+        let mut tick = tokio::time::interval((self.grace / 10).max(Duration::from_millis(1)));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    self.sweep(Instant::now());
+                }
+                _ = stop.wait_for(|stop| *stop) => break,
+            }
+        }
+    }
+
+    /// Whether `term`, a read of the fence at `now`, shows a leader, with
+    /// the take's rule applied to the table: at the first read under a term
+    /// above the one the table was last read under, or after a read that
+    /// found the fence closed, every gone gateway's period starts again at
+    /// `now`.
+    fn observe(table: &mut Table, term: Option<u64>, now: Instant) -> bool {
+        match (term, table.led) {
+            // The term the table was last read under, or a read that lost
+            // its race to a later one: nothing moved.
+            (Some(term), Some(led)) if term <= led => {}
+            (Some(_), _) => {
+                for row in table.rows.values_mut() {
+                    if row.gone.is_some() {
+                        row.gone = Some(now);
+                    }
+                }
+                table.led = term;
+            }
+            (None, _) => table.led = None,
+        }
+        term.is_some()
+    }
+
+    /// Whether the row's grace period is over at `now`.
+    fn over(&self, row: &Row, now: Instant) -> bool {
+        row.gone
+            .is_some_and(|gone| now.saturating_duration_since(gone) >= self.grace)
+    }
+
+    /// The end of a presence, under the table's lock: what the store holds
+    /// for the gateway is released, then the row goes and its decide
+    /// streams are told.
+    fn end(&self, gateway: GatewayId, row: Row) {
+        let leases = self.store.drop_gateway(gateway);
+        info!(
+            gateway = %row.subject,
+            leases,
+            "a gateway's grace period ended with no new Hello: its leases are released"
+        );
+        drop(row);
+    }
+
+    /// The session `session` of `gateway` ended at `now`: its grace period
+    /// starts, unless a newer session stands or the period already runs.
+    fn gone(&self, gateway: GatewayId, session: u64, now: Instant) {
+        let mut table = self.table.lock();
+        if let Some(row) = table.rows.get_mut(&gateway) {
+            if row.session == session && row.gone.is_none() {
+                row.gone = Some(now);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use tokio::{sync::watch, task::JoinSet, time::timeout};
+
+    use super::{Gateways, Refused, Seat};
+    use crate::{
+        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        lease::{Lease, LeaseId},
+        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
+        view::WorkerId,
+    };
+
+    pub(crate) const GRACE: Duration = Duration::from_secs(10);
+    const A: GatewayId = GatewayId(11);
+    const B: GatewayId = GatewayId(12);
+    const C: GatewayId = GatewayId(13);
+    const D: GatewayId = GatewayId(14);
+    const MS: Duration = Duration::from_millis(1);
+    /// The term of the first take.
+    const TERM: u64 = 1;
+
+    /// Under these a fence taken once stays open for half an hour of a
+    /// case's clock: the case's instants decide what is over, not the
+    /// election's.
+    pub(crate) const PATIENT: ElectionSettings = ElectionSettings {
+        duration: Duration::from_secs(3600),
+        renew_period: Duration::from_secs(1),
+        renew_deadline: Duration::from_secs(1800),
+    };
+
+    /// A candidate that took its own lease at the returned instant, a store,
+    /// and the table over that candidate's fence and that store.
+    pub(crate) fn leading(grace: Duration) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
+        ceiled(grace, 1_024)
+    }
+
+    /// The same, with a table that holds `ceiling` rows.
+    fn ceiled(
+        grace: Duration,
+        ceiling: usize,
+    ) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
+        let mut elector = Elector::new(
+            Box::new(MemoryLease::new()),
+            "controller-0@10.0.0.7:30100",
+            PATIENT,
+        )
+        .expect("the settings are in order");
+        let taken = Instant::now();
+        assert_eq!(
+            elector.tick(taken).expect("the take"),
+            Tick::Acquired { term: 1 }
+        );
+        let store = Arc::new(MemoryStore::new());
+        let gateways = Arc::new(Gateways::new(
+            grace,
+            ceiling,
+            elector.fence(),
+            Arc::clone(&store),
+        ));
+        (elector, store, gateways, taken)
+    }
+
+    /// A `Hello` the table takes.
+    fn welcomed(
+        gateways: &Arc<Gateways>,
+        gateway: GatewayId,
+        subject: &str,
+        term: u64,
+        now: Instant,
+    ) -> Seat {
+        gateways
+            .welcome(gateway, subject, term, now)
+            .expect("the table takes the Hello")
+    }
+
+    /// One lease of `gateway` as a decision records it.
+    pub(crate) fn lease(gateway: GatewayId, id: u64, now: Instant) -> LeaseRecord {
+        LeaseRecord {
+            lease: Lease {
+                id: LeaseId(id),
+                ..Lease::default()
+            },
+            gateway,
+            request: id,
+            target: WorkerId(7),
+            decode: None,
+            term: 0,
+            issued_at: now,
+            dispatch_deadline: now + Duration::from_secs(5),
+            state: LeaseState::Issued,
+        }
+    }
+
+    #[test]
+    fn a_gateway_is_present_from_its_welcome_until_its_grace_period_ends() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        assert!(gateways.presence(A, t0).is_none(), "never welcomed");
+
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        assert!(gateways.presence(A, t0).is_some());
+        // A session that stands is present however long it stands.
+        assert!(gateways.presence(A, t0 + 100 * GRACE).is_some());
+        assert!(gateways.presence(B, t0).is_none(), "another gateway");
+
+        // Its end starts the period; the clock alone ends the presence, at
+        // the period's last instant, with no sweep passed.
+        let ended = t0 + Duration::from_secs(60);
+        seat.end(ended);
+        assert!(gateways.presence(A, ended + GRACE - MS).is_some());
+        assert!(gateways.presence(A, ended + GRACE).is_none());
+    }
+
+    #[test]
+    fn a_hello_inside_the_grace_period_changes_nothing() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+
+        // The session comes back a millisecond before the period's end.
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE - MS);
+        assert_eq!(gateways.sweep(t0 + GRACE), 0);
+        assert_eq!(gateways.sweep(t0 + 100 * GRACE), 0);
+        assert_eq!(store.live(A), 1, "the gap's lease stands");
+        assert!(gateways.presence(A, t0 + 100 * GRACE).is_some());
+        drop(seat);
+    }
+
+    #[tokio::test]
+    async fn past_the_grace_period_the_sweep_lets_the_gateway_go_and_no_other() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        store.issue(lease(A, 2, t0)).expect("a lease");
+        store.issue(lease(B, 1, t0)).expect("a lease");
+        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
+        let mut of_a = gateways.presence(A, t0).expect("present");
+        let mut of_b = gateways.presence(B, t0).expect("present");
+        gone.end(t0);
+
+        assert_eq!(gateways.sweep(t0 + GRACE - MS), 0);
+        assert_eq!(store.live(A), 2, "inside the period nothing is let go");
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        assert_eq!(store.live(A), 0, "the gateway's leases are released");
+        assert_eq!(store.live(B), 1, "another gateway's stand");
+        assert_eq!(gateways.sweep(t0 + GRACE), 0, "let go once");
+
+        // The handle a decide stream holds resolves at the end, and only
+        // the ended gateway's.
+        timeout(Duration::from_secs(20), of_a.ended())
+            .await
+            .expect("the ended presence resolves its handle");
+        assert!(
+            timeout(Duration::from_millis(50), of_b.ended())
+                .await
+                .is_err(),
+            "a presence that stands resolves no handle"
+        );
+    }
+
+    /// A welcome and a letting-go of one gateway at one instant are
+    /// ordered: welcomed with what it held, or let go and welcomed with
+    /// nothing. Never welcomed and then let go.
+    #[tokio::test]
+    async fn a_hello_at_the_periods_end_meets_the_letting_go_in_one_order() {
+        // The Hello first: the period was over, so the gateway is let go
+        // before it is welcomed, and a sweep of that instant lets nothing
+        // of the new presence go.
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        let mut earlier = gateways.presence(A, t0).expect("present");
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
+        assert_eq!(store.live(A), 0, "the earlier presence's lease is released");
+        timeout(Duration::from_secs(20), earlier.ended())
+            .await
+            .expect("the earlier presence ended");
+        store.issue(lease(A, 2, t0 + GRACE)).expect("a lease");
+        assert_eq!(gateways.sweep(t0 + GRACE), 0);
+        assert_eq!(gateways.sweep(t0 + 100 * GRACE), 0);
+        assert_eq!(store.live(A), 1, "the new presence keeps what it holds");
+        drop(seat);
+
+        // The sweep first: the gateway is let go, then welcomed with nothing.
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
+        assert_eq!(store.live(A), 0);
+        assert_eq!(gateways.sweep(t0 + GRACE), 0);
+        assert!(gateways.presence(A, t0 + GRACE).is_some());
+        drop(seat);
+    }
+
+    #[test]
+    fn a_closed_fence_lets_nothing_go_and_a_take_starts_every_period_again() {
+        let (mut elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+
+        // The lease is given up: nobody leads here, and the period's end
+        // lets nothing go.
+        assert!(elector.release().expect("the release"));
+        assert_eq!(gateways.sweep(t0 + GRACE), 0);
+        assert_eq!(gateways.sweep(t0 + 3 * GRACE), 0);
+        assert_eq!(store.live(A), 1, "a fenced replica releases nothing");
+
+        // The take, three periods later: the gateway could say no Hello
+        // here meanwhile, so its period starts at the take.
+        let retaken = t0 + 3 * GRACE;
+        assert_eq!(
+            elector.tick(retaken).expect("the take"),
+            Tick::Acquired { term: 2 }
+        );
+        assert_eq!(gateways.sweep(retaken), 0);
+        assert!(gateways.presence(A, retaken + GRACE - MS).is_some());
+        assert_eq!(gateways.sweep(retaken + GRACE - MS), 0);
+        assert_eq!(store.live(A), 1);
+        assert_eq!(gateways.sweep(retaken + GRACE), 1);
+        assert_eq!(store.live(A), 0);
+    }
+
+    /// A renewal that lands late opens the fence again under the same term.
+    /// No `Hello` could be welcomed here while it was closed, so the first
+    /// read after it starts every gone gateway's period again, as a take
+    /// does.
+    #[test]
+    fn a_late_renewal_under_the_same_term_starts_every_gone_gateways_period_again() {
+        let (mut elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+
+        // Past the renew deadline the fence is closed and the lease is
+        // still this candidate's: a read finds nobody leading here.
+        let closed = t0 + PATIENT.renew_deadline + MS;
+        assert_eq!(gateways.sweep(closed), 0);
+        assert_eq!(store.live(A), 1, "a fenced replica releases nothing");
+
+        // The renewal lands late, under the same term: the gateway's
+        // period starts at the first read after it.
+        let landed = closed + GRACE;
+        assert_eq!(
+            elector.tick(landed).expect("the renewal"),
+            Tick::Renewed { term: TERM }
+        );
+        assert_eq!(gateways.sweep(landed), 0);
+        assert!(gateways.presence(A, landed + GRACE - MS).is_some());
+        assert_eq!(gateways.sweep(landed + GRACE - MS), 0);
+        assert_eq!(store.live(A), 1);
+        assert_eq!(gateways.sweep(landed + GRACE), 1);
+        assert_eq!(store.live(A), 0);
+    }
+
+    /// The take's rule holds at a Hello too: a Hello that is the first read
+    /// after a take finds the period started again, and lets nothing go.
+    #[test]
+    fn a_hello_right_after_a_take_keeps_what_the_gateway_held() {
+        let (mut elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        assert!(elector.release().expect("the release"));
+        assert_eq!(gateways.sweep(t0 + GRACE), 0);
+
+        let retaken = t0 + 3 * GRACE;
+        assert_eq!(
+            elector.tick(retaken).expect("the take"),
+            Tick::Acquired { term: 2 }
+        );
+        let seat = welcomed(&gateways, A, "gateway-a", 2, retaken);
+        assert_eq!(store.live(A), 1, "its lease stands through the gap");
+        drop(seat);
+    }
+
+    #[tokio::test]
+    async fn a_second_session_supersedes_the_first_whose_end_starts_no_period() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        assert!(
+            timeout(Duration::from_millis(50), first.superseded())
+                .await
+                .is_err(),
+            "a lone session is not superseded"
+        );
+        let second = welcomed(&gateways, A, "gateway-a", TERM, t0 + MS);
+        timeout(Duration::from_secs(20), first.superseded())
+            .await
+            .expect("the first session is told");
+        assert!(
+            timeout(Duration::from_millis(50), second.superseded())
+                .await
+                .is_err(),
+            "the newer session stands"
+        );
+
+        // The superseded stream's end is not the gateway's.
+        first.end(t0 + 2 * MS);
+        assert!(gateways.presence(A, t0 + 100 * GRACE).is_some());
+        assert_eq!(gateways.sweep(t0 + 100 * GRACE), 0);
+        // The standing one's is.
+        second.end(t0 + 3 * MS);
+        assert!(gateways.presence(A, t0 + 3 * MS + GRACE).is_none());
+    }
+
+    #[test]
+    fn a_seats_drop_is_its_sessions_end() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        drop(welcomed(&gateways, A, "gateway-a", TERM, t0));
+        let dropped = Instant::now();
+        assert!(gateways.presence(A, dropped).is_some());
+        assert!(gateways.presence(A, dropped + GRACE).is_none());
+    }
+
+    /// A session's number is its alone for the table's life: the late end
+    /// of a session that an earlier presence replaced is no end of the
+    /// session that stands now.
+    #[test]
+    fn a_replaced_sessions_late_end_is_no_end_of_a_later_presences_session() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let second = welcomed(&gateways, A, "gateway-a", TERM, t0 + MS);
+        second.end(t0 + 2 * MS);
+        assert_eq!(gateways.sweep(t0 + 2 * MS + GRACE), 1);
+
+        // A new presence, and only then the end of the replaced session.
+        let third = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE + 3 * MS);
+        first.end(t0 + GRACE + 4 * MS);
+        let later = t0 + 3 * GRACE;
+        assert!(gateways.presence(A, later).is_some(), "its session stands");
+        assert_eq!(gateways.sweep(later), 0);
+        drop(third);
+    }
+
+    /// The letting-go at a `Welcome` is the table's own read of the fence:
+    /// a replica that stopped leading after the session's read releases
+    /// nothing.
+    #[test]
+    fn a_welcome_whose_fence_closed_since_the_sessions_read_lets_nothing_go() {
+        let (mut elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+
+        // The period is over with no sweep passed, and the lease is given
+        // up between a session's read and the table's lock.
+        assert!(elector.release().expect("the release"));
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
+        assert_eq!(store.live(A), 1, "a fenced replica releases nothing");
+        drop(seat);
+    }
+
+    /// The table's bound that is not time: a `Hello` that would make a row
+    /// past the ceiling is refused at the door, and a present gateway's is
+    /// always taken.
+    #[test]
+    fn a_hello_past_the_ceiling_is_refused_and_a_present_gateways_is_taken() {
+        let (_elector, _store, gateways, t0) = ceiled(GRACE, 3);
+        let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let second = welcomed(&gateways, B, "gateway-b", TERM, t0);
+        let third = welcomed(&gateways, C, "gateway-c", TERM, t0);
+        // The fourth would be a new row: refused, and no row is made.
+        assert_eq!(
+            gateways.welcome(D, "gateway-d", TERM, t0).err(),
+            Some(Refused::Full { ceiling: 3 })
+        );
+        assert!(gateways.presence(D, t0).is_none());
+        // A present gateway says Hello again: no new row, so it is taken.
+        let again = welcomed(&gateways, A, "gateway-a", TERM, t0);
+
+        // Inside its grace period a gateway's row still counts.
+        third.end(t0);
+        assert_eq!(
+            gateways
+                .welcome(D, "gateway-d", TERM, t0 + GRACE - MS)
+                .err(),
+            Some(Refused::Full { ceiling: 3 })
+        );
+        // Once the sweep let one go, the fourth is welcomed.
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        let fourth = welcomed(&gateways, D, "gateway-d", TERM, t0 + GRACE);
+        drop((first, second, again, fourth));
+    }
+
+    /// One key, one subject: a `Hello` of another subject under a present
+    /// gateway's key is refused, and nothing of that gateway is touched.
+    /// The table is handed the key and the subject apart, so the case names
+    /// one key under two subjects.
+    #[tokio::test]
+    async fn a_hello_of_another_subject_under_a_present_gateways_key_is_refused() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        let stands = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        assert_eq!(
+            gateways.welcome(A, "gateway-b", TERM, t0).err(),
+            Some(Refused::AnotherSubject)
+        );
+        // The standing session is not replaced, and what it held stands.
+        assert!(
+            timeout(Duration::from_millis(50), stands.superseded())
+                .await
+                .is_err(),
+            "the present gateway's session stands"
+        );
+        assert_eq!(store.live(A), 1);
+
+        // Inside the grace period the key is still the first subject's.
+        stands.end(t0);
+        assert_eq!(
+            gateways
+                .welcome(A, "gateway-b", TERM, t0 + GRACE - MS)
+                .err(),
+            Some(Refused::AnotherSubject)
+        );
+        // Once the first is let go the key is free, and the other subject
+        // starts with nothing of it.
+        let other = welcomed(&gateways, A, "gateway-b", TERM, t0 + GRACE);
+        assert_eq!(store.live(A), 0, "the first gateway's lease went with it");
+        drop(other);
+    }
+
+    /// The task over the real clock: a gone gateway is let go a grace
+    /// period after its session's end, and the task ends at its signal.
+    #[tokio::test]
+    async fn the_sweeps_task_lets_a_gone_gateway_go_and_ends_at_its_stop() {
+        let grace = Duration::from_millis(60);
+        let (_elector, store, gateways, t0) = leading(grace);
+        store.issue(lease(A, 1, t0)).expect("a lease");
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        let sweeper = Arc::clone(&gateways);
+        task.spawn(async move { sweeper.run(stopped).await });
+
+        let ended = Instant::now();
+        drop(welcomed(&gateways, A, "gateway-a", TERM, ended));
+        let started = Instant::now();
+        while store.live(A) > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the sweep let nothing go in 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            ended.elapsed() >= grace,
+            "let go {:?} after the end, inside the period of {grace:?}",
+            ended.elapsed()
+        );
+
+        stop.send_replace(true);
+        timeout(Duration::from_secs(20), task.join_next())
+            .await
+            .expect("the task ends within 20 s of its stop")
+            .expect("one task")
+            .expect("it ended by itself");
+    }
+}
