@@ -123,15 +123,21 @@ impl<'de> Visitor<'de> for BodyVisitor {
     fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
         let mut fields = serde_json::Map::new();
         while let Some(key) = entries.next_key::<String>()? {
-            if fields.contains_key(&key) {
-                return Err(serde::de::Error::custom(format!("duplicate field `{key}`")));
-            }
-            let value = if key == "metadata" {
+            let slot = match fields.entry(key) {
+                serde_json::map::Entry::Occupied(slot) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate field `{}`",
+                        slot.key()
+                    )));
+                }
+                serde_json::map::Entry::Vacant(slot) => slot,
+            };
+            let value = if slot.key() == "metadata" {
                 entries.next_value()?
             } else {
                 entries.next_value_seed(StrictValue)?
             };
-            fields.insert(key, value);
+            slot.insert(value);
         }
         Ok(Value::Object(fields))
     }
