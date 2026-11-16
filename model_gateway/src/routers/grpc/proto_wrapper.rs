@@ -396,32 +396,12 @@ macro_rules! wire_field {
 
 /// The accessors every engine-response wrapper answers with the same five-arm
 /// match, written once and invoked inside each wrapper's `impl` (as the engine
-/// clients invoke `impl_engine_client_basics`): the engine predicates, the chunk
-/// semantics of the response shape, the index, the four token counters and the
-/// reported weight version. What differs per wrapper (the typed accessors, the
-/// token ids, the logprobs, the finish reason) stays in its own `impl`.
+/// clients invoke `impl_engine_client_basics`): the chunk semantics of the
+/// response shape, the index, the four token counters and the reported weight
+/// version. What differs per wrapper (the token ids, the logprobs, the finish
+/// reason) stays in its own `impl`.
 macro_rules! engine_response_basics {
     () => {
-        /// Check if this is SGLang
-        pub fn is_sglang(&self) -> bool {
-            matches!(self, Self::Sglang(_))
-        }
-
-        /// Check if this is TensorRT-LLM
-        pub fn is_trtllm(&self) -> bool {
-            matches!(self, Self::Trtllm(_))
-        }
-
-        /// Check if this is MLX
-        pub fn is_mlx(&self) -> bool {
-            matches!(self, Self::Mlx(_))
-        }
-
-        /// Check if this is TokenSpeed
-        pub fn is_tokenspeed(&self) -> bool {
-            matches!(self, Self::TokenSpeed(_))
-        }
-
         /// How this response's payloads relate to the preceding ones of its
         /// stream — see [`ChunkSemantics`]: a `Delta` stream's counts are
         /// accumulated chunk by chunk, a `Cumulative` stream's `Complete` reports
@@ -498,42 +478,6 @@ pub enum ProtoGenerateStreamChunk {
 impl ProtoGenerateStreamChunk {
     engine_response_basics!();
 
-    /// Get SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang(&self) -> &sglang::GenerateStreamChunk {
-        match self {
-            Self::Sglang(chunk) => chunk,
-            _ => panic!("Expected SGLang GenerateStreamChunk"),
-        }
-    }
-
-    /// Get vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &vllm::GenerateStreamChunk {
-        match self {
-            Self::Vllm(chunk) => chunk,
-            _ => panic!("Expected vLLM GenerateStreamChunk"),
-        }
-    }
-
-    /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &trtllm::GenerateStreamChunk {
-        match self {
-            Self::Trtllm(chunk) => chunk,
-            _ => panic!("Expected TensorRT-LLM GenerateStreamChunk"),
-        }
-    }
-
     /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -558,22 +502,6 @@ impl ProtoGenerateStreamChunk {
                 .output_logprobs
                 .as_ref()
                 .map(ProtoOutputLogProbs::TokenSpeed),
-        }
-    }
-
-    /// Get input logprobs (SGLang and vLLM only - streaming chunks don't have prompt logprobs)
-    pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
-        match self {
-            Self::Sglang(c) => c
-                .input_logprobs
-                .as_ref()
-                .map(|lp| convert_input_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .input_logprobs
-                .as_ref()
-                .map(|lp| convert_input_logprobs!(lp)),
-            // TRT-LLM, MLX, and TokenSpeed streaming chunks don't have input_logprobs
-            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
 }
@@ -605,59 +533,12 @@ impl ProtoGenerateComplete {
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
+        reason = "typed accessor: the caller guarantees the variant"
     )]
     pub fn as_sglang(&self) -> &sglang::GenerateComplete {
         match self {
             Self::Sglang(complete) => complete,
             _ => panic!("Expected SGLang GenerateComplete"),
-        }
-    }
-
-    /// Get mutable SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut sglang::GenerateComplete {
-        match self {
-            Self::Sglang(complete) => complete,
-            _ => panic!("Expected SGLang GenerateComplete"),
-        }
-    }
-
-    /// Get vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &vllm::GenerateComplete {
-        match self {
-            Self::Vllm(complete) => complete,
-            _ => panic!("Expected vLLM GenerateComplete"),
-        }
-    }
-
-    /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &trtllm::GenerateComplete {
-        match self {
-            Self::Trtllm(complete) => complete,
-            _ => panic!("Expected TensorRT-LLM GenerateComplete"),
-        }
-    }
-
-    /// Get token IDs from either backend (output_ids in proto)
-    pub fn token_ids(&self) -> &[u32] {
-        match self {
-            Self::Sglang(c) => &c.output_ids,
-            Self::Vllm(c) => &c.output_ids,
-            Self::Trtllm(c) => &c.output_token_ids,
-            Self::Mlx(c) => &c.output_ids,
-            Self::TokenSpeed(c) => &c.output_ids,
         }
     }
 
@@ -788,18 +669,6 @@ impl ProtoGenerateComplete {
                 .output_logprobs
                 .as_ref()
                 .map(ProtoOutputLogProbs::TokenSpeed),
-        }
-    }
-
-    /// Get KV transfer parameters from prefill response (vLLM Mooncake PD only).
-    /// Returns (remote_host, remote_port) if present.
-    pub fn kv_transfer_params(&self) -> Option<(String, u32)> {
-        match self {
-            Self::Vllm(c) => c
-                .kv_transfer_params
-                .as_ref()
-                .map(|params| (params.remote_host.clone(), params.remote_port)),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
 
@@ -2154,12 +2023,11 @@ impl ProtoStream {
                 .map(|result| result.map(ProtoGenerateResponse::TokenSpeed)),
             // Every ZMQ engine (including TokenSpeed) emits vllm-shaped
             // responses: the adapter translates wire output into
-            // `vllm::GenerateResponse`, so variant checks like
-            // `is_tokenspeed()` on a response are unreliable for ZMQ-backed
-            // streams. Key response-side engine logic on the worker's
-            // `runtime_type()`, never on the response variant; key
-            // accumulation on `chunk_semantics()`, which the vLLM shape
-            // (delta chunks, cumulative `Complete`) defines for this lane.
+            // `vllm::GenerateResponse`, so a response's variant does not name
+            // the engine behind a ZMQ-backed stream. Key response-side engine
+            // logic on the worker's `runtime_type()`, never on the response
+            // variant; key accumulation on `chunk_semantics()`, which the vLLM
+            // shape (delta chunks, cumulative `Complete`) defines for this lane.
             Self::Zmq(stream) => stream
                 .next()
                 .await

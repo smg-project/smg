@@ -192,19 +192,6 @@ impl BackendClient {
         }
     }
 
-    /// Mutable SGLang client accessor. Only valid for a gRPC-SGLang backend;
-    /// callers guard with a runtime/sglang check.
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees an SGLang gRPC backend"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut SglangSchedulerClient {
-        match self {
-            Self::Grpc(client) => client.as_sglang_mut(),
-            Self::Zmq(_) => panic!("Expected SGLang client, got ZMQ backend"),
-        }
-    }
-
     pub async fn health_check(&self) -> Result<HealthCheckResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.health_check().await,
