@@ -206,7 +206,7 @@ pub(crate) async fn prepare_chat_like(
             "ChatPreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
-        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.prompt_thought = Some(prompt_thought);
         ctx.state.reading = reading;
 
         let skip_special_tokens = skips_special_tokens(

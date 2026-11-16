@@ -181,7 +181,7 @@ impl MessagePreparationStage {
             "MessagePreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
-        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.prompt_thought = Some(prompt_thought);
         ctx.state.reading = reading;
 
         // Derive skip_special_tokens from parser and constraint type:

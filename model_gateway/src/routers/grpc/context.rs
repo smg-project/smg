@@ -278,9 +278,8 @@ pub(crate) struct ProcessingState {
     pub provider: Option<ProviderProfile>,
     /// The table's replay of the rendered prompt, as preparation read it for the forced call's
     /// tag (`reading::prepare`): request building's reasoning decision takes it in place of a
-    /// second replay of the same prompt (`reading::reasoning_decision`). `None` when preparation
-    /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
-    /// preparation reads no prompt); a decision then replays itself.
+    /// second replay of the same prompt (`reading::reasoning_decision`). `None` where the
+    /// endpoint's preparation reads no prompt; a decision then replays itself.
     pub prompt_thought: Option<PromptReplay>,
     /// The table decision for the request's model under its parser (`regular::symphony::reading`:
     /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
