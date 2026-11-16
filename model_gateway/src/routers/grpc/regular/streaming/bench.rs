@@ -24,7 +24,6 @@ use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, profile::ProviderProfile,
 };
 use prost::Message as ProstMessage;
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
 use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
@@ -41,25 +40,48 @@ use tonic::{
     service::Routes,
     transport::{server::TcpIncoming, Server},
 };
-use tool_parser::ParserFactory as ToolParserFactory;
 
 use super::{character_tokenizer::CharacterTokenizer, GenerateStreamContext, StreamingProcessor};
-use crate::{
-    routers::{
-        common::sse::{sse_channel, SseReceiver},
-        grpc::{
-            context::DispatchMetadata,
-            proto_wrapper::ProtoStream,
-            regular::symphony::{assign_for, Asks, Assignment, Reading},
-            spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
-            utils::ParserResolver,
-        },
+use crate::routers::{
+    common::sse::{sse_channel, SseReceiver},
+    grpc::{
+        context::DispatchMetadata,
+        proto_wrapper::ProtoStream,
+        regular::symphony::{assign_for, Asks, Assignment, Reading},
+        spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
     },
-    worker::WorkerRegistry,
 };
 
 /// The model the requests name.
 const MODEL: &str = "bench-model";
+
+/// Symphony's assignment of the Qwen3 table (JSON calls in the tag) after a prompt that opens no
+/// thought: what request building assigns the chat and Messages streams read here.
+fn qwen3_assignment() -> Assignment {
+    Assignment {
+        format: Arc::new(qwen3(CallSyntax::Json)),
+        prompt: "<|im_start|>assistant\n".to_string(),
+        forbids_calls: false,
+        past_the_end: false,
+        forcing: None,
+        opener: None,
+        forced_ids: None,
+        json_answer: false,
+        span: tracing::Span::none(),
+        marked: Arc::default(),
+    }
+}
+
+/// Symphony's assignment of the plain table (every byte of the output is content), the reading
+/// of a model whose template has no marker for a thought or a call.
+fn plain_assignment() -> Assignment {
+    Assignment {
+        format: Table::Plain.shared(),
+        prompt: String::new(),
+        ..qwen3_assignment()
+    }
+}
+
 /// The completion request's prompt (echoed by no scenario here).
 const COMPLETION_PROMPT: &str = "Say hello";
 
@@ -176,7 +198,7 @@ fn trailers_frame() -> Frame<Bytes> {
 }
 
 /// A chat request whose `tool_choice` forces a call, read as the gateway reads
-/// it under the JSON schema the older registry writes for such a call: the
+/// it under the JSON schema the gateway writes for such a call: the
 /// request, its model's table and the prompt's tail, and the response's spec
 /// with the reader the gateway assigns (`assign_for`, the regular router's).
 pub struct ForcedChat {
@@ -224,7 +246,7 @@ impl ForcedChat {
             }}]
         }))
         .expect("a chat request");
-        // The schema's text as the older registry writes it: the named function's parameters,
+        // The schema's text as the gateway writes it: the named function's parameters,
         // or the root of a required call's list.
         let schema = if named {
             r#"{"type":"object","properties":{"q":{"type":"string"}}}"#
@@ -238,19 +260,22 @@ impl ForcedChat {
             prompt,
             schema: ("json_schema".to_string(), schema.to_string()),
         };
-        forced.spec.symphony = forced.assignment();
+        forced.spec.symphony = Some(forced.assignment());
         forced
     }
 
     /// The gateway's assignment of the response's reader, which request
-    /// building asks once per request: whether a table reads the response.
-    pub fn assign(&self) -> bool {
-        self.assignment().is_some()
+    /// building asks once per request.
+    pub fn assign(&self) {
+        std::hint::black_box(self.assignment());
     }
 
-    fn assignment(&self) -> Option<Assignment> {
+    fn assignment(&self) -> Assignment {
         assign_for(
-            Reading::Table(self.table.shared(), false),
+            Reading {
+                format: self.table.shared(),
+                compiled: false,
+            },
             Asks::Chat(&self.request),
             Some(&self.schema),
             self.prompt,
@@ -260,11 +285,11 @@ impl ForcedChat {
     }
 }
 
-/// The stream drivers, ready to run a script: one streaming processor over
-/// the legacy parser factories (the tool parser `json`, the reasoning parser
-/// `qwen3`), the character tokenizer, the chat request's spec under the
-/// legacy parsers and under Symphony's Qwen3 table, the completion's and the
-/// Messages' specs, and the loopback peer the engine streams are owned
+/// The stream drivers, ready to run a script: one streaming processor, the
+/// character tokenizer, the chat request's spec under Symphony's Qwen3
+/// table, the logprobs request's under the plain table and under Qwen3's,
+/// the completion's and the Messages' specs, and the loopback peer
+/// the engine streams are owned
 /// against (never dispatched to: the abort on drop is disarmed).
 pub struct StreamBench {
     processor: StreamingProcessor,
@@ -272,9 +297,8 @@ pub struct StreamBench {
     client: VllmEngineClient,
     peer: JoinHandle<()>,
     chat: ChatResponseSpec,
-    chat_symphony: ChatResponseSpec,
     chat_logprobs: ChatResponseSpec,
-    chat_symphony_logprobs: ChatResponseSpec,
+    chat_qwen3_logprobs: ChatResponseSpec,
     completion: CompletionResponseSpec,
     messages: MessagesResponseSpec,
 }
@@ -296,24 +320,12 @@ impl StreamBench {
             }}]
         }))
         .expect("a chat request");
-        let chat = ChatResponseSpec::from(&request);
-        let qwen3_assignment = || Assignment {
-            format: Arc::new(qwen3(CallSyntax::Json)),
-            prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: false,
-            past_the_end: false,
-            forcing: None,
-            opener: None,
-            forced_ids: None,
-            json_answer: false,
-            span: tracing::Span::none(),
-            marked: Arc::default(),
-        };
-        let mut chat_symphony = chat.clone();
-        chat_symphony.symphony = Some(qwen3_assignment());
+        let mut chat = ChatResponseSpec::from(&request);
+        chat.symphony = Some(qwen3_assignment());
         // The plain chat stream asking for the tokens' logprobs with five
         // candidates each: no tools and no reasoning split, so every token
-        // goes out as a bare text delta carrying them.
+        // goes out as a bare text delta carrying them. The plain table
+        // reads it.
         let logprobs_request: ChatCompletionRequest = serde_json::from_value(json!({
             "model": MODEL,
             "messages": [{"role": "user", "content": "Hello"}],
@@ -322,37 +334,24 @@ impl StreamBench {
             "top_logprobs": 5
         }))
         .expect("a chat request with logprobs");
-        let chat_logprobs = ChatResponseSpec::from(&logprobs_request);
-        // The same stream under Symphony's Qwen3 table: every token goes out
-        // as a text event of the step, which carries its logprobs.
-        let mut chat_symphony_logprobs = chat_logprobs.clone();
-        chat_symphony_logprobs.symphony = Some(qwen3_assignment());
+        let mut chat_logprobs = ChatResponseSpec::from(&logprobs_request);
+        chat_logprobs.symphony = Some(plain_assignment());
+        // The same stream under the Qwen3 table.
+        let mut chat_qwen3_logprobs = chat_logprobs.clone();
+        chat_qwen3_logprobs.symphony = Some(qwen3_assignment());
         let completion_request: CompletionRequest = serde_json::from_value(json!({
             "model": MODEL, "prompt": COMPLETION_PROMPT, "stream": true
         }))
         .expect("a completion request");
-        // The resolver of a configured gateway: the parser names checked
-        // against the factories' registries, as `--tool-call-parser` and
-        // `--reasoning-parser` are.
-        let tool_parsers = ToolParserFactory::new();
-        let reasoning_parsers = ReasoningParserFactory::new();
-        let resolver = ParserResolver::new(
-            Arc::new(WorkerRegistry::new()),
-            Some("json".to_string()),
-            Some("qwen3".to_string()),
-            &tool_parsers,
-            &reasoning_parsers,
-        );
-        let processor = StreamingProcessor::new(tool_parsers, reasoning_parsers, resolver, "vllm");
+        let processor = StreamingProcessor::new("vllm");
         Self {
             processor,
             tokenizer: Arc::new(CharacterTokenizer::default()),
             client,
             peer,
             chat,
-            chat_symphony,
             chat_logprobs,
-            chat_symphony_logprobs,
+            chat_qwen3_logprobs,
             completion: CompletionResponseSpec::new(&completion_request, Vec::new()),
             messages: MessagesResponseSpec {
                 thinking_requested: true,
@@ -361,26 +360,19 @@ impl StreamBench {
                 prompt_tokens: 8,
                 max_tokens: 4096,
                 context_window: None,
-                tool_choice: None,
                 has_tools: false,
-                history_tool_calls_count: 0,
                 chat_tools: Vec::new().into(),
                 stop_sequences: None,
-                symphony: None,
+                symphony: Some(qwen3_assignment()),
                 first_tool_call_only: false,
                 parser_names: None,
             },
         }
     }
 
-    /// A chat stream under the legacy parsers: the bytes written.
+    /// A chat stream under the Qwen3 table: the bytes written.
     pub async fn chat(&self, script: &EngineScript) -> usize {
         self.chat_under(&self.chat, script).await
-    }
-
-    /// A chat stream under Symphony's Qwen3 table: the bytes written.
-    pub async fn chat_symphony(&self, script: &EngineScript) -> usize {
-        self.chat_under(&self.chat_symphony, script).await
     }
 
     /// The response stream of a chat request that forces a call, under the
@@ -390,16 +382,15 @@ impl StreamBench {
     }
 
     /// A plain chat stream asking for the tokens' logprobs with five
-    /// candidates each (a script of [`EngineScript::single_tokens_with_logprobs`]):
-    /// the bytes written.
+    /// candidates each (a script of [`EngineScript::single_tokens_with_logprobs`]),
+    /// read by the plain table: the bytes written.
     pub async fn chat_logprobs(&self, script: &EngineScript) -> usize {
         self.chat_under(&self.chat_logprobs, script).await
     }
 
-    /// [`Self::chat_logprobs`] under Symphony's Qwen3 table (the step writer's
-    /// path): the bytes written.
-    pub async fn chat_symphony_logprobs(&self, script: &EngineScript) -> usize {
-        self.chat_under(&self.chat_symphony_logprobs, script).await
+    /// [`Self::chat_logprobs`] under the Qwen3 table: the bytes written.
+    pub async fn chat_qwen3_logprobs(&self, script: &EngineScript) -> usize {
+        self.chat_under(&self.chat_qwen3_logprobs, script).await
     }
 
     /// The tokenizer the streams decode with (a character is a token).

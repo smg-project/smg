@@ -1,13 +1,13 @@
 //! What a chat stream's text delta carrying logprobs allocates, pinned on the
-//! scripted engine seam against the plain delta, on the plain chat stream and
-//! under Symphony's table (the step writer's path): the logprobs add the engine
-//! message's own lists (prost grows them as it decodes) and one decode per
-//! token text, and the frame writer adds nothing of its own (the entries are
-//! written from the message's view), so the next change that builds an
-//! object per chunk, copies a byte list or collects the candidates into a
-//! list fails here rather than moving the mock bed's allocation count inside
-//! its noise. A separate executable, so it can declare the counting
-//! allocator the pin needs.
+//! scripted engine seam against the plain delta, on the plain chat stream
+//! (read by the plain table) and under the Qwen3 table, both written by the
+//! step writer: the logprobs add the engine message's own lists (prost grows
+//! them as it decodes) and one decode per token text, and the frame writer
+//! adds nothing of its own (the entries are written from the message's
+//! view), so the next change that builds an object per chunk, copies a byte
+//! list or collects the candidates into a list fails here rather than moving
+//! the mock bed's allocation count inside its noise. A separate executable,
+//! so it can declare the counting allocator the pin needs.
 
 #![expect(
     clippy::print_stderr,
@@ -101,10 +101,10 @@ fn chunk_bytes(id: u32, logprobs: bool) -> Vec<u8> {
 /// slope between a 32-token and a 64-token run of the same stream (the
 /// stream's fixed costs cancel); each length is run once warm before the
 /// counted run. Both runs go through the chat stream that asks for logprobs
-/// (no tools, no reasoning split; under Symphony's table when `symphony`, the
-/// step writer's path), the plain one with chunks carrying none, so the
-/// difference is the logprobs' own cost.
-async fn per_token(bench: &StreamBench, logprobs: bool, symphony: bool) -> usize {
+/// (no tools, no reasoning split; under the Qwen3 table when `qwen3`, under
+/// the plain table otherwise), the plain one with chunks carrying none, so
+/// the difference is the logprobs' own cost.
+async fn per_token(bench: &StreamBench, logprobs: bool, qwen3: bool) -> usize {
     let mut counts = [0usize; 2];
     for (slot, tokens) in [32usize, 64].into_iter().enumerate() {
         let script = if logprobs {
@@ -113,8 +113,8 @@ async fn per_token(bench: &StreamBench, logprobs: bool, symphony: bool) -> usize
             EngineScript::single_tokens(&text(tokens))
         };
         let run = || async {
-            if symphony {
-                bench.chat_symphony_logprobs(&script).await
+            if qwen3 {
+                bench.chat_qwen3_logprobs(&script).await
             } else {
                 bench.chat_logprobs(&script).await
             }
@@ -135,17 +135,17 @@ async fn per_token(bench: &StreamBench, logprobs: bool, symphony: bool) -> usize
 /// message's lists (decoded by prost) and one decode per token text (the
 /// token and its candidates); the one-pass writer adds none of its own: no
 /// object per chunk, no byte-list copy, no candidates or entries list. The
-/// margin of one covers the larger frames' flush boundaries. Under `symphony`
-/// the stream runs under Symphony's table, the step writer's path.
-async fn a_logprobs_delta_adds_only_the_lists_and_the_decodes(symphony: bool) {
-    let path = if symphony {
-        "the chat stream under Symphony's table"
+/// margin of one covers the larger frames' flush boundaries. Under `qwen3`
+/// the stream is read by the Qwen3 table, by the plain table otherwise.
+async fn a_logprobs_delta_adds_only_the_lists_and_the_decodes(qwen3: bool) {
+    let path = if qwen3 {
+        "the chat stream under the Qwen3 table"
     } else {
         "the plain chat stream"
     };
     let bench = StreamBench::start().await;
-    let plain = per_token(&bench, false, symphony).await;
-    let with_logprobs = per_token(&bench, true, symphony).await;
+    let plain = per_token(&bench, false, qwen3).await;
+    let with_logprobs = per_token(&bench, true, qwen3).await;
     let extra = with_logprobs.saturating_sub(plain);
 
     let id = u32::from('a');
@@ -182,14 +182,14 @@ async fn a_logprobs_delta_adds_only_the_lists_and_the_decodes(symphony: bool) {
     );
 }
 
-/// The plain chat stream (no parser): the delta goes through the emission's
-/// content path.
+/// The plain chat stream, read by the plain table: every token is a text
+/// event of the step, which carries its logprobs from the view.
 #[tokio::test]
 async fn a_logprobs_delta_adds_the_message_lists_and_one_decode_per_text_and_nothing_of_its_own() {
     a_logprobs_delta_adds_only_the_lists_and_the_decodes(false).await;
 }
 
-/// The same stream under Symphony's table: the delta goes through the step
+/// The same stream under the Qwen3 table: the delta goes through the step
 /// writer, whose first text event carries the logprobs from the view.
 #[tokio::test]
 async fn under_the_symphony_table_a_logprobs_delta_adds_the_same_and_nothing_of_its_own() {

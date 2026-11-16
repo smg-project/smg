@@ -188,7 +188,7 @@ impl Bed {
             RuntimeType::Vllm,
             &[],
         );
-        let deps = PipelineDeps::pair(
+        let deps = PipelineDeps::new(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,

@@ -14,20 +14,35 @@ use openai_protocol::{
     chat::ChatCompletionRequest, common::StringOrArray, completion::CompletionRequest,
 };
 use smg_grpc_client::vllm_engine::proto;
+use symphony::{
+    formats::{kimi_k2, qwen3},
+    CallSyntax, Format,
+};
 use tokio::sync::oneshot;
 
 use super::{
     super::*,
     eof::{
-        chunk, chunk_with_logprobs, complete, complete_with_prompt, processor, scripted_stream,
-        staged_stream, CharacterTokenizer,
+        chunk, chunk_with_logprobs, complete, complete_with_prompt, processor, read_by,
+        scripted_stream, staged_stream, CharacterTokenizer, ASSISTANT_PROMPT,
     },
 };
 use crate::routers::common::sse::SseReceiver;
 
+/// The rendered prompt's tail of a Kimi K2 turn.
+pub(super) const KIMI_K2_PROMPT: &str = "<|im_assistant|>assistant<|im_middle|>";
+
+/// One call of the `lookup` tool in the Kimi K2 syntax, which carries the call's id: the table
+/// reads it from the output, so a pinned stream names the same id on every run.
+pub(super) const KIMI_K2_CALL: &str = "<|tool_calls_section_begin|><|tool_call_begin|>\
+                                        functions.lookup:0<|tool_call_argument_begin|>\
+                                        {\"q\": \"x\"}<|tool_call_end|><|tool_calls_section_end|>";
+
 struct Scenario {
     name: &'static str,
-    with_tools: bool,
+    /// The table that reads the stream, and the rendered prompt's tail it replays.
+    format: fn() -> Format,
+    prompt: &'static str,
     request: Value,
     weight_version: Option<&'static str>,
     stop: Option<&'static str>,
@@ -56,7 +71,8 @@ fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
             name: "content",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request("fixture-model", json!({})),
             weight_version: None,
             stop: None,
@@ -65,7 +81,8 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "reasoning",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request("fixture-model", json!({"separate_reasoning": true})),
             weight_version: None,
             stop: None,
@@ -78,7 +95,8 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "two_choices_with_logprobs",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request("fixture-model", json!({"n": 2, "logprobs": true})),
             weight_version: None,
             stop: None,
@@ -94,7 +112,8 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "usage_chunk",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request(
                 "fixture-model",
                 json!({"stream_options": {"include_usage": true}}),
@@ -106,7 +125,8 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "continuous_usage",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request(
                 "fixture-model",
                 json!({"stream_options": {"include_usage": true, "continuous_usage_stats": true}}),
@@ -122,7 +142,8 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "deepseek_usage_placeholder",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request(
                 "deepseek-flash",
                 json!({"stream_options": {"include_usage": true}}),
@@ -134,7 +155,8 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "system_fingerprint",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request("fixture-model", json!({})),
             weight_version: Some("v7"),
             stop: None,
@@ -143,7 +165,8 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "stop_sequence",
-            with_tools: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             request: request("fixture-model", json!({})),
             weight_version: None,
             stop: Some("END"),
@@ -152,20 +175,22 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "tool_calls",
-            with_tools: true,
+            format: kimi_k2,
+            prompt: KIMI_K2_PROMPT,
             request: request("kimi-fixture", json!({"tools": tools()})),
             weight_version: None,
             stop: None,
             frames: vec![
-                chunk(0, r#"{"name": "lookup", "#),
-                chunk(0, r#""parameters": {"q": "x"}}"#),
+                chunk(0, &KIMI_K2_CALL[..40]),
+                chunk(0, &KIMI_K2_CALL[40..]),
                 complete(0, "stop"),
             ],
             must_contain: r#""tool_calls""#,
         },
         Scenario {
             name: "specific_function",
-            with_tools: true,
+            format: kimi_k2,
+            prompt: KIMI_K2_PROMPT,
             request: request(
                 "kimi-fixture",
                 json!({
@@ -175,9 +200,10 @@ fn scenarios() -> Vec<Scenario> {
             ),
             weight_version: None,
             stop: None,
+            // The forced call in the table's own syntax: the table's tag constrains it so.
             frames: vec![
-                chunk(0, r#"{"q": "#),
-                chunk(0, r#""x"}"#),
+                chunk(0, &KIMI_K2_CALL[..40]),
+                chunk(0, &KIMI_K2_CALL[40..]),
                 complete(0, "stop"),
             ],
             must_contain: r#""name":"lookup""#,
@@ -199,13 +225,17 @@ async fn stream_bytes(scenario: &Scenario) -> Vec<u8> {
     let stop = scenario
         .stop
         .map(|sequence| StringOrArray::String(sequence.to_string()));
-    let result = processor(scenario.with_tools)
+    let result = processor()
         .process_streaming_chunks(
             stream,
             dispatch,
             Arc::new(CharacterTokenizer::default()),
             (stop, None, false, false, false),
-            ChatResponseSpec::from(&request),
+            read_by(
+                ChatResponseSpec::from(&request),
+                (scenario.format)(),
+                scenario.prompt,
+            ),
             &tx,
             None,
         )
@@ -318,7 +348,7 @@ async fn completion_stream_bytes(scenario: &CompletionScenario) -> Vec<u8> {
     let stop = scenario
         .stop
         .map(|sequence| StringOrArray::String(sequence.to_string()));
-    let result = processor(false)
+    let result = processor()
         .process_completion_streaming_chunks(
             stream,
             dispatch,
@@ -403,7 +433,7 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token() {
         created: 1_700_000_000,
         weight_version: None,
     };
-    let processor = processor(false);
+    let processor = processor();
     let reading = async {
         let result = processor
             .process_streaming_chunks(
@@ -411,7 +441,11 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token() {
                 dispatch,
                 Arc::new(CharacterTokenizer::default()),
                 (None, None, false, false, false),
-                ChatResponseSpec::from(&request),
+                read_by(
+                    ChatResponseSpec::from(&request),
+                    qwen3(CallSyntax::Json),
+                    ASSISTANT_PROMPT,
+                ),
                 &tx,
                 None,
             )
@@ -479,7 +513,7 @@ async fn ready_engine_chunks_share_a_frame_after_the_first_token_on_the_completi
         created: 1,
         weight_version: None,
     };
-    let processor = processor(false);
+    let processor = processor();
     let reading = async {
         let result = processor
             .process_completion_streaming_chunks(
@@ -595,7 +629,7 @@ async fn a_burst_past_the_flush_bound_leaves_in_bounded_frames_on_the_chat_strea
         created: 1_700_000_000,
         weight_version: None,
     };
-    let processor = processor(false);
+    let processor = processor();
     let reading = async {
         let result = processor
             .process_streaming_chunks(
@@ -603,7 +637,11 @@ async fn a_burst_past_the_flush_bound_leaves_in_bounded_frames_on_the_chat_strea
                 dispatch,
                 Arc::new(CharacterTokenizer::default()),
                 (None, None, false, false, false),
-                ChatResponseSpec::from(&request),
+                read_by(
+                    ChatResponseSpec::from(&request),
+                    qwen3(CallSyntax::Json),
+                    ASSISTANT_PROMPT,
+                ),
                 &tx,
                 None,
             )

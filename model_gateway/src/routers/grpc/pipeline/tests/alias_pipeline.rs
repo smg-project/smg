@@ -50,7 +50,7 @@ async fn pd_generate_alias_is_canonical_before_preparation() {
         .unwrap();
 
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         policy_registry,
         None,
@@ -62,13 +62,10 @@ async fn pd_generate_alias_is_canonical_before_preparation() {
         templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         tokenizer_registry,
         worker_registry,
-        tool_parser_factory: ToolParserFactory::default(),
-        reasoning_parser_factory: ReasoningParserFactory::default(),
         parser_resolver: utils::ParserResolver::disabled(),
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: ParserChoice::Legacy,
     });
     let request: GenerateRequest = serde_json::from_value(json!({
         "model": MODEL_ALIAS,

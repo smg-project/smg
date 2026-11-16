@@ -2302,7 +2302,6 @@ mod tests {
         let context = app_context_for_tests(
             RouterConfig::default(),
             Arc::new(crate::worker::WorkerRegistry::new()),
-            None,
         );
         let queue = JobQueue::new(
             JobQueueConfig {
@@ -2418,7 +2417,6 @@ mod tests {
         let context = app_context_for_tests(
             RouterConfig::builder().build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         );
         let queue = JobQueue::new(
             JobQueueConfig {
@@ -3119,7 +3117,7 @@ mod tests {
     async fn a_registrations_cleanup_removal_is_queued_once_per_url() {
         use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
         let registry = Arc::new(WorkerRegistry::new());
-        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry));
         // A queue that accepts jobs and never runs one: no slot to run one in.
         let queue = JobQueue::new(
             JobQueueConfig {
@@ -3174,7 +3172,7 @@ mod tests {
     async fn a_cleanup_behind_a_removal_of_other_workers_keeps_its_own_pins() {
         use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
         let registry = Arc::new(WorkerRegistry::new());
-        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry));
         let queue = JobQueue::new(
             JobQueueConfig {
                 max_concurrent_jobs: 0,
@@ -3500,7 +3498,7 @@ mod tests {
         .await;
         let router_config = RouterConfig::default();
         let registry = Arc::new(WorkerRegistry::new());
-        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry));
         assert!(
             context
                 .workflow_engines
@@ -3614,7 +3612,7 @@ mod tests {
         };
         let router_config = RouterConfig::default();
         let registry = Arc::new(WorkerRegistry::new());
-        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+        let context = app_context_for_tests(router_config.clone(), Arc::clone(&registry));
         assert!(
             context
                 .workflow_engines

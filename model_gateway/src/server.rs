@@ -72,7 +72,7 @@ use crate::{
     config::{
         available_cpus, bind_socket_addr, dp_minimum_tokens_scheduler_scope_warning, redacted,
         runtime_worker_threads_oversubscription, unused_credentials_warnings,
-        validate_mesh_listener_port, ParserChoice, RouterConfig,
+        validate_mesh_listener_port, RouterConfig,
     },
     endpoints::{
         conversations, messages::MessagesHeaders, models, parse, responses as response_handlers,
@@ -92,11 +92,8 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams,
-        error as route_error,
-        gateway::Gateway,
-        grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
-        http::router::StreamBodyState,
+        common::realtime::ws::RealtimeQueryParams, error as route_error, gateway::Gateway,
+        grpc::common::responses::spawn_unstored_sweeper, http::router::StreamBodyState,
         RouterTrait,
     },
     secrets::{reload_logged, start_auto_reload, BadFile, KeySets, SecretFiles, SecretReloader},
@@ -137,18 +134,12 @@ pub struct AppState {
     pub secrets: Option<Arc<SecretReloader>>,
 }
 
-async fn parse_function_call(
-    State(state): State<Arc<AppState>>,
-    AdminJson(req): AdminJson<ParseFunctionCallRequest>,
-) -> Response {
-    parse::parse_function_call(&state.context, &req).await
+async fn parse_function_call(AdminJson(req): AdminJson<ParseFunctionCallRequest>) -> Response {
+    parse::parse_function_call(&req)
 }
 
-async fn parse_reasoning(
-    State(state): State<Arc<AppState>>,
-    AdminJson(req): AdminJson<SeparateReasoningRequest>,
-) -> Response {
-    parse::parse_reasoning(&state.context, &req).await
+async fn parse_reasoning(AdminJson(req): AdminJson<SeparateReasoningRequest>) -> Response {
+    parse::parse_reasoning(&req)
 }
 
 /// An unknown URL: a JSON envelope, never an empty body.
@@ -2337,11 +2328,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
         metrics::init_startup_series();
-        // Under Symphony the series of a request no table reads exist at zero
-        // from the start; a table's own follow its model's first registration.
-        if config.router_config.parser == ParserChoice::Symphony {
-            telemetry::init_startup_series();
-        }
         handle
     });
 

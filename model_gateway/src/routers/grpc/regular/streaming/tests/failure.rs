@@ -22,7 +22,7 @@ use crate::{
     },
     worker::{
         test_support::{no_health_check, RefusedAddress},
-        BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
+        BasicWorkerBuilder, Worker, WorkerType,
     },
 };
 
@@ -34,12 +34,7 @@ const DECODE_URL: &str = "grpc://decode-1:30000";
 const LOOPBACK_PREFILL_URL: &str = "grpc://127.0.0.1:30000";
 
 fn processor() -> StreamingProcessor {
-    StreamingProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(Arc::new(WorkerRegistry::new()), None, None),
-        metrics_labels::BACKEND_PD,
-    )
+    StreamingProcessor::new(metrics_labels::BACKEND_PD)
 }
 
 fn dispatch() -> context::DispatchMetadata {

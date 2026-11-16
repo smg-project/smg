@@ -245,7 +245,6 @@ mod tests {
                 .round_robin_policy()
                 .build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         )
     }
 
@@ -468,7 +467,6 @@ mod tests {
                 .disable_tokenizer_autoload(true)
                 .build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         );
         let only = worker(&app_context, "http://w1:8000", "m", "/tok/m");
         worker_tokenizer(&app_context, "m", "/tok/m").await;
@@ -521,7 +519,6 @@ mod tests {
                 .model_path("/models/m")
                 .build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         );
         tokenizer(&app_context, "/models/m", "/models/m").await;
         let only = bare_http_worker(&app_context, "http://w1:8000", "/models/m");

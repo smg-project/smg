@@ -23,19 +23,14 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::{
-        ContentPart, FunctionCallResponse, ResponseFormat, StringOrArray, Tool, ToolCall,
-        ToolChoice, ToolChoiceValue,
-    },
+    common::{ContentPart, ResponseFormat, StringOrArray, Tool, ToolChoice},
     generate::GenerateFinishReason,
     profile::ProviderProfile,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::{sync::Semaphore, task::yield_now};
-use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
-use uuid::Uuid;
 
 use super::prepared_tools::prepare_tools;
 use crate::{
@@ -1169,9 +1164,9 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// template as a kwarg, `build_chat_template_kwargs`): the model answers the
 /// same prompt whichever way the choice is set, so a session that toggles the
 /// choice between turns keeps its prefix. A call the model writes anyway is
-/// not delivered where Symphony reads the response (the reader's forbidden
-/// calls, `regular::symphony`); the legacy parsers run no tool parser under
-/// `none`, as they never did, so there such markup stays in the content. The
+/// not delivered where the gateway reads the response (the reader's forbidden
+/// calls, `regular::symphony`); an HTTP worker's engine reads its own output,
+/// so there such markup stays in the content. The
 /// Responses API keeps withholding the request's function tools under `none`
 /// (`regular::responses::conversions::chat_tools`, for its replayed tool-loop
 /// histories), so the same request renders a different prompt through it: a
@@ -1447,113 +1442,9 @@ pub fn create_stop_decoder(
     )
 }
 
-/// With parallel tool calls turned off (`parallel_tool_calls: false`, or
-/// Messages `disable_parallel_tool_use: true`) a response returns only its
-/// first tool call; the calls a model writes after it are dropped.
-pub(crate) fn keep_first_tool_call(calls: &mut Option<Vec<ToolCall>>) {
-    if let Some(calls) = calls.as_mut().filter(|calls| calls.len() > 1) {
-        debug!(
-            dropped = calls.len() - 1,
-            "parallel tool calls are off: returning the first call"
-        );
-        calls.truncate(1);
-    }
-}
-
-/// The streamed form of [`keep_first_tool_call`].
-pub(crate) fn keep_first_tool_call_items(items: &mut Vec<ToolCallItem>) {
-    items.retain(|item| item.tool_index == 0);
-}
-
-/// Parse tool calls from JSON schema constrained response
-pub(crate) fn parse_json_schema_response(
-    processed_text: &str,
-    tool_choice: Option<&ToolChoice>,
-    model: &str,
-    history_tool_calls_count: usize,
-) -> (Option<Vec<ToolCall>>, String) {
-    match tool_choice {
-        Some(ToolChoice::Function { function, .. }) => {
-            // Specific function: Parse parameters directly
-            match serde_json::from_str::<Value>(processed_text) {
-                Ok(params) => {
-                    let tool_call = ToolCall {
-                        id: generate_tool_call_id(
-                            model,
-                            &function.name,
-                            0,
-                            history_tool_calls_count,
-                        ),
-                        tool_type: "function".to_string(),
-                        function: FunctionCallResponse {
-                            name: function.name.clone(),
-                            arguments: Some(
-                                serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
-                            ),
-                        },
-                    };
-                    (Some(vec![tool_call]), String::new())
-                }
-                Err(e) => {
-                    error!("Failed to parse specific function parameters: {}", e);
-                    (None, processed_text.to_string())
-                }
-            }
-        }
-        Some(ToolChoice::Value(ToolChoiceValue::Required))
-        | Some(ToolChoice::AllowedTools { .. }) => {
-            // Required mode: Parse array of tool calls
-            match serde_json::from_str::<Vec<Value>>(processed_text) {
-                Ok(parsed_array) => {
-                    let spec_tool_calls: Vec<ToolCall> = parsed_array
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(i, item)| {
-                            let obj = item.as_object()?;
-                            let name = obj.get("name")?.as_str()?.to_string();
-                            let parameters = obj.get("parameters")?;
-
-                            Some(ToolCall {
-                                id: generate_tool_call_id(
-                                    model,
-                                    &name,
-                                    i,
-                                    history_tool_calls_count,
-                                ),
-                                tool_type: "function".to_string(),
-                                function: FunctionCallResponse {
-                                    name,
-                                    arguments: Some(
-                                        serde_json::to_string(parameters)
-                                            .unwrap_or_else(|_| "{}".to_string()),
-                                    ),
-                                },
-                            })
-                        })
-                        .collect();
-                    (Some(spec_tool_calls), String::new())
-                }
-                Err(e) => {
-                    error!("Failed to parse required tool call array: {}", e);
-                    (None, processed_text.to_string())
-                }
-            }
-        }
-        _ => (None, processed_text.to_string()),
-    }
-}
-
-/// Generate a tool call ID based on model format
-///
-/// # Arguments
-/// * `model` - Model name to determine ID format
-/// * `tool_name` - Name of the tool being called
-/// * `tool_index` - Index of this tool call within the current message
-/// * `history_count` - Number of tool calls in previous messages
-///
-/// # Returns
-/// A unique ID string:
-/// - Kimi-K3 (XTML): `{name}_{history_count + tool_index}` — an opaque ordinal
+/// A model family whose call ids are numbered by the call's place in the
+/// conversation; every other model's ids are the table's.
+/// - Kimi-K3 (XTML): `{name}_{history_count + tool_index}`, an opaque ordinal
 ///   that keeps counting across turns, so a second turn's three calls are
 ///   `3,4,5` rather than restarting at `0`. The `_` separator matches the
 ///   reference K3 server's id shape (`Bash_0`); K2's `:` is protocol-visible
@@ -1562,23 +1453,6 @@ pub(crate) fn parse_json_schema_response(
 ///   The history offset keeps ids unique over a conversation (OpenAI treats
 ///   `tool_call_id` as globally unique, and clients correlate by it).
 /// - Kimi-K2: `functions.{name}:{history_count + tool_index}` (globally unique).
-/// - others: `call_{24-char-uuid}`.
-pub(crate) fn generate_tool_call_id(
-    model: &str,
-    tool_name: &str,
-    tool_index: usize,
-    history_count: usize,
-) -> String {
-    match CallIdFamily::of(model) {
-        Some(family) => family.id(tool_name, tool_index, history_count),
-        // Standard OpenAI format: call_{24-char-uuid}
-        None => format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]),
-    }
-}
-
-/// A model family whose call ids are numbered by the call's place in the
-/// conversation ([`generate_tool_call_id`] has the forms); every other
-/// model's ids are minted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallIdFamily {
     KimiK2,

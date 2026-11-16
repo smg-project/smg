@@ -7,7 +7,7 @@ use crate::common::Tool;
 pub struct ParseFunctionCallRequest {
     /// The text to parse for function calls.
     pub text: String,
-    /// The parser type/name to use for parsing (e.g., "json", "pythonic").
+    /// The parser type/name to use for parsing (e.g., "json", "qwen").
     pub tool_call_parser: String,
     /// The list of available tools that the model can call.
     pub tools: Vec<Tool>,
@@ -29,7 +29,7 @@ pub struct ParseFunctionCallResponse {
 pub struct SeparateReasoningRequest {
     /// The text to parse for reasoning content.
     pub text: String,
-    /// The parser type/name to use for reasoning detection (e.g., "step3", "deepseek_r1").
+    /// The parser type/name to use for reasoning detection (e.g., "qwen3", "deepseek_r1").
     pub reasoning_parser: String,
 }
 

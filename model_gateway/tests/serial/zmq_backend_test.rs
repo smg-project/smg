@@ -22,7 +22,7 @@ use openai_protocol::{generate::GenerateRequest, model_card::ModelCard};
 use portpicker::pick_unused_port;
 use serial_test::serial;
 use smg::{
-    config::{GroupedDpSticky, ParserChoice},
+    config::GroupedDpSticky,
     middleware::{RouteRequestMeta, TenantKey},
     routers::{grpc::backend_client::BackendClient, RouterTrait},
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
@@ -559,14 +559,15 @@ async fn a_silent_zmq_engine_ends_the_request_at_the_request_timeout() {
 
 /// What a chat request's grammar tells the engine over the gateway's own
 /// ZMQ link, read off the wire by a mock engine that takes the requests as a
-/// real one would. A forced call whose tag the gateway led with the model's
-/// thought for a worker that starts the grammar at the first token reaches
-/// the engine with the gate behind its reasoning parser taken as passed
-/// (`reasoning_ended = true`), streamed or not; a forced call the gateway
-/// did not lead (a tool parser without a reasoning prefix, on a model
-/// without a table), a response schema it did not shape (the same model),
-/// and a request without a grammar say nothing of it, and the engine starts
-/// the grammar where it does.
+/// real one would. A tag the table shaped for a worker that starts the
+/// grammar at the first token reaches the engine with the gate behind the
+/// thought taken as passed (`reasoning_ended = true`), streamed or not: a
+/// forced call's tag on every table (wrapped behind the thought where the
+/// table has a thought channel, from the first token where it has none), a
+/// JSON answer's where the table has a thought channel to wrap it behind. A
+/// JSON answer on a table without one is the request's own schema, and a
+/// request without a grammar has none: neither says anything of it, and the
+/// engine starts the grammar where it does.
 #[tokio::test]
 #[serial]
 async fn a_grammar_led_for_the_first_token_tells_the_engine_so_over_zmq() {
@@ -575,14 +576,15 @@ async fn a_grammar_led_for_the_first_token_tells_the_engine_so_over_zmq() {
 }
 
 /// [`a_grammar_led_for_the_first_token_tells_the_engine_so_over_zmq`] with the
-/// legacy tool parser `parser`, whose forced call's tag the gateway leads with
-/// the thought block for a first-token worker (`led`) or sends as built.
+/// tool-call parser name `parser` (the table that answers to it reads the
+/// model), whose tags the gateway shapes for a first-token worker; `thought`
+/// says whether the table has a thought channel to wrap a JSON answer behind.
 #[expect(
     clippy::expect_used,
     clippy::panic,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn grammar_over_zmq(parser: &str, led: bool) {
+async fn grammar_over_zmq(parser: &str, thought: bool) {
     use std::collections::{BTreeSet, HashMap};
 
     use engine_zmq_client::{
@@ -596,15 +598,11 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
 
     let fixture = zmq_fixture();
     // A prompt that leaves the model inside its thought, and a worker that
-    // says its grammar starts at the first token: a legacy tool parser with a
-    // reasoning prefix leads the forced call's tag with the thought block.
-    // The legacy path's wire semantics: pinned to `--parser legacy`, since under
-    // the default parser a legacy name a table answers to (`glm47_moe`) reads
-    // with that table and the gateway shapes the response schema itself.
+    // says its grammar starts at the first token: a table with a thought
+    // channel leads the forced call's tag with the thought block.
     let config = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
-        .parser(ParserChoice::Legacy)
         .tool_call_parser(parser)
         .worker_startup_timeout_secs(5)
         .worker_startup_check_interval_secs(1)
@@ -677,10 +675,11 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Grammar {
-        /// A forced call on the older registry's parser: led with the thought for the
-        /// worker's start where the parser has a reasoning prefix, sent as built otherwise.
+        /// A forced call: the table's tag, shaped for the worker's start (the thought
+        /// wrapped in where the table has a thought channel).
         LedCall,
-        /// A response schema on a model without a table: sent as it is.
+        /// A response schema: the table's tag for a JSON answer where the table has a
+        /// thought channel to wrap it behind, the schema itself where it has none.
         BareSchema,
         /// No grammar at all.
         None,
@@ -763,8 +762,9 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
         );
         assert_eq!(
             sent.reasoning_ended,
-            (led && grammar == Grammar::LedCall).then_some(true),
-            "stream {stream}, {grammar:?} ({parser}): only a grammar the gateway led for the first token says the gate is passed"
+            (grammar == Grammar::LedCall || (thought && grammar == Grammar::BareSchema))
+                .then_some(true),
+            "stream {stream}, {grammar:?} ({parser}): a tag the table shaped for the first token says the gate is passed, nothing else does"
         );
         // The engine answers, and the request completes as any other.
         output

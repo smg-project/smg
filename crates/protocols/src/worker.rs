@@ -693,6 +693,85 @@ impl TagVocabulary {
     }
 }
 
+/// Where a worker's engine starts a request's grammar on a prompt that ends
+/// inside the model's thinking block, from its `constrained_decoding_start`
+/// label (the servicers advertise it off the engine's config). An engine's
+/// own server picks the grammar's shape from this: it sends the
+/// reasoning-aware tags (the thought, its close, then the calls) when it runs
+/// no reasoning parser and the bare calls when it does, because its grammar
+/// backend then waits for the thought's end; an engine with a reasoning
+/// parser set (and `enable_in_reasoning` off) waits the same way. The gateway
+/// reads the same fact from the worker and shapes the calls' prefix
+/// accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrammarStart {
+    /// The worker does not say (an older servicer, an engine without the
+    /// label): free text with nothing owed at its end precedes the calls,
+    /// which fits an engine of either kind.
+    #[default]
+    Unknown,
+    /// The engine applies the grammar only once its reasoning parser has
+    /// seen the model's own `</think>`: nothing precedes the calls, so the
+    /// call is forced right at that gate, as the engine's own server does.
+    AfterReasoning,
+    /// The engine applies the grammar from the first generated token: the
+    /// thought, its close and then the calls, so the call is not forced into
+    /// the thought.
+    FirstToken,
+}
+
+impl GrammarStart {
+    /// The worker label that carries it.
+    pub const LABEL: &'static str = "constrained_decoding_start";
+    /// The label's value for [`Self::AfterReasoning`].
+    pub const AFTER_REASONING: &'static str = "after_reasoning";
+    /// The label's value for [`Self::FirstToken`].
+    pub const FIRST_TOKEN: &'static str = "first_token";
+
+    /// The start a worker's `constrained_decoding_start` label names; anything
+    /// else, the label's absence included, is [`Self::Unknown`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value {
+            Some(Self::AFTER_REASONING) => Self::AfterReasoning,
+            Some(Self::FIRST_TOKEN) => Self::FirstToken,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The constraint the gateway hands a worker's engine for a request's calls or
+/// its JSON answer, as the gRPC request carries it: a kind and its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolConstraint {
+    /// A JSON schema: the output is the JSON alone from its first token, with
+    /// no framing of the model's own (a forced call's arguments, a required
+    /// call's list, a JSON answer).
+    JsonSchema(String),
+    /// A structural tag: the output keeps the model's own framing around the
+    /// calls, which the model's table reads.
+    StructuralTag(String),
+}
+
+impl ToolConstraint {
+    /// The kind the gRPC request names for [`Self::JsonSchema`].
+    pub const JSON_SCHEMA: &'static str = "json_schema";
+    /// The kind the gRPC request names for [`Self::StructuralTag`].
+    pub const STRUCTURAL_TAG: &'static str = "structural_tag";
+
+    /// The pair the gRPC request carries: the kind and its text.
+    pub fn to_tuple(&self) -> (String, String) {
+        match self {
+            Self::JsonSchema(schema) => (Self::JSON_SCHEMA.to_string(), schema.clone()),
+            Self::StructuralTag(tag) => (Self::STRUCTURAL_TAG.to_string(), tag.clone()),
+        }
+    }
+
+    /// Whether the constraint is a JSON schema.
+    pub fn is_json_schema(&self) -> bool {
+        matches!(self, Self::JsonSchema(_))
+    }
+}
+
 // ── Core identity ────────────────────────────────────────────────────
 
 /// Core worker identity and configuration.

@@ -9,24 +9,20 @@ use openai_protocol::{
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
     profile::ProviderProfile,
-    worker::ConstrainedDecoding,
+    worker::{ConstrainedDecoding, GrammarStart as WorkerGrammarStart, ToolConstraint},
 };
 use serde_json::{json, Value};
 use symphony::{
     grammar::{GrammarStart, Options},
     Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
 };
-use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
-#[cfg(test)]
-use super::names::reading;
 use super::{
-    names::{reads, table_reading, Reading},
+    names::{reading, reads, Reading},
     template::Templates,
     SymphonyError,
 };
 use crate::{
-    config::ParserChoice,
     routers::grpc::{
         common::stages::helpers::TagForStart,
         spec::{scans_for_tool_calls_for, ChatResponseSpec},
@@ -93,11 +89,11 @@ fn unspelled_tag(
 /// The constraint `grammar` gives, written straight from the tree as the request carries it, in
 /// the `vocabulary` the worker's grammar compiler takes ([`structural_tag`]), for the response
 /// template's table too (`compiled`, [`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)): a registry
-/// table with no tag leaves the older registry to decide, as before; the template's table refuses
-/// instead, since its output has no other syntax the older path could constrain and the table
-/// still read, and so does a prompt that `continues` the assistant's message, since the tag
-/// writes a turn from its start. A tag the worker's grammar backend has no spelling of counts
-/// as no tag ([`unspelled_tag`]).
+/// table with no tag leaves the output to the gateway's JSON schema, which the table reads with
+/// its forced call; the template's table refuses instead, since its output has no other syntax
+/// the schema could constrain and the table still read, and so does a prompt that `continues` the
+/// assistant's message, since the tag writes a turn from its start. A tag the worker's grammar
+/// backend has no spelling of counts as no tag ([`unspelled_tag`]).
 pub(super) fn tagged(
     grammar: Option<Grammar>,
     vocabulary: TagVocabulary,
@@ -367,8 +363,8 @@ impl<'a> Asks<'a> {
     /// worker no tag for the schema, which a registry table leaves to the engine): a Messages
     /// request's, unless its choice forces a call to one of `tools` ([`Self::forced_call`]): a
     /// turn forced into a call has no text answer to format, whether or not the call has a
-    /// constraint of its own (a legacy parser may give a forced call none and let the model
-    /// write its native call). A chat request's reaches the engine through its request builder
+    /// constraint of its own (a table without a tag for it leaves the model to write its native
+    /// call). A chat request's reaches the engine through its request builder
     /// (`response_format_constraint`), so none is named here.
     pub(crate) fn untabled_answer_schema(self, tools: &[Tool]) -> Option<Cow<'a, Value>> {
         match self {
@@ -480,10 +476,10 @@ impl<'a> Asks<'a> {
         }
     }
 
-    /// The table reads no calls from the output: the legacy path would run no tool parser for the
-    /// request (a chat response it would not scan for calls, no tools declared anywhere, for a
-    /// provider that reads calls only with them: [`scans_for_tool_calls_for`]; a Messages request
-    /// that declares no tools, an empty list being a declaration). A `tool_choice` of `none` is
+    /// The table reads no calls from the output: the response is not scanned for calls (a chat
+    /// request with no tools declared anywhere, for a provider that reads calls only with them:
+    /// [`scans_for_tool_calls_for`]; a Messages request that declares no tools, an empty list
+    /// being a declaration). A `tool_choice` of `none` is
     /// not this: the table keeps its calls and the reader delivers none of them
     /// ([`Asks::forbids_calls_for`]). `provider` is the chat model's profile as the request's
     /// preparation derived it once.
@@ -515,8 +511,8 @@ impl<'a> Asks<'a> {
     }
 
     /// The table reads no thought from the output: a chat request that keeps the reasoning in the
-    /// content (`separate_reasoning: false`), as the legacy path runs no reasoning parser then; a
-    /// Messages request's thinking blocks are always its own.
+    /// content (`separate_reasoning: false`); a Messages request's thinking blocks are always its
+    /// own.
     pub(crate) fn no_reasoning(self) -> bool {
         match self {
             Self::Chat(request) => !request.separate_reasoning,
@@ -540,8 +536,8 @@ impl<'a> Asks<'a> {
     }
 
     /// The request holds the answer to JSON: a chat request's `json_object` or `json_schema`
-    /// response format (the response spec's `json_mode`, the one rule both paths read through
-    /// [`ChatResponseSpec::json_mode_of`]; a structural tag is free text around its tags), a
+    /// response format (the one rule, [`ChatResponseSpec::json_mode_of`]; a structural tag is
+    /// free text around its tags), a
     /// Messages request's `output_config.format`. The table's engine then reads the answer's
     /// quote state and keeps a marker the model spells inside one of the answer's strings as
     /// the answer's text, as the family's own parsers do under their JSON mode
@@ -574,7 +570,6 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
     reason = "the table, the request's ask, where the prompt and the engines leave the model"
 )]
 pub(crate) fn constraint(
-    parser: ParserChoice,
     names: &ModelNames<'_>,
     asks: Asks<'_>,
     tools: &[Tool],
@@ -585,7 +580,7 @@ pub(crate) fn constraint(
     templates: &Templates,
 ) -> PreparedConstraint {
     constraint_for(
-        &reading(parser, names, asks.model(), templates)?,
+        &reading(names, asks.model(), templates)?,
         asks,
         tools,
         reasoning_open,
@@ -604,8 +599,9 @@ pub(crate) fn constraint(
 /// `vocabulary` they take together ([`vocabulary_of`]); the answer's as it derives for the selected
 /// worker's own start and vocabulary ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose
 /// workers start the grammar at different places has no one answer tag that fits them all.
-/// [`Prepared::None`] when no table reads the response ([`reads`]), the request asks neither, or
-/// the table has no tag for the call; the older registry then decides as before. An error refuses
+/// [`Prepared::None`] when the request asks neither, or the table has no tag for the call; the
+/// gateway's JSON schema then constrains the output, which the table reads with its forced call
+/// ([`assign_for`](super::reader::assign_for)). An error refuses
 /// the request: the response template's table cannot constrain the call it is asked (the answer's
 /// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
 /// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
@@ -620,10 +616,7 @@ pub(crate) fn constraint_for(
     start: GrammarStart,
     vocabulary: TagVocabulary,
 ) -> PreparedConstraint {
-    let Reading::Table(format, compiled) = read else {
-        return Ok(Prepared::None);
-    };
-    let (format, compiled) = (Arc::clone(format), *compiled);
+    let (format, compiled) = (Arc::clone(&read.format), read.compiled);
     if compiled && asks.constrains_outside_the_format() {
         return Err(SymphonyError::Constraint(format!(
             "model '{}' writes its output in the format its response template declares, and a \
@@ -671,16 +664,15 @@ pub(crate) fn constraint_for(
 /// a grammar on every turn ([`ConstrainedDecoding::Always`]): the table's grammar for the request's
 /// callable `tools` with no call required, at most one when parallel calls are off, and
 /// `reasoning_open` when the prompt leaves the model inside its thought. The request asked for
-/// nothing, so nothing is refused: `Ok(None)` when no table reads the response ([`reads`]), the
-/// request takes no tag for its calls ([`Asks::auto_calls`]), the table has none for them, or
-/// the worker's grammar backend has no spelling of it ([`auto_tag`]). A thought and an answer
-/// alone are not constrained today. `thought_closed` as for [`constraint_for`].
+/// nothing, so nothing is refused: `Ok(None)` when the request takes no tag for its calls
+/// ([`Asks::auto_calls`]), the table ([`reads`]) has none for them, or the worker's grammar
+/// backend has no spelling of it ([`auto_tag`]). A thought and an answer alone are not
+/// constrained today. `thought_closed` as for [`constraint_for`].
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model"
 )]
 pub(crate) fn auto_constraint(
-    parser: ParserChoice,
     names: &ModelNames<'_>,
     asks: Asks<'_>,
     tools: &[Tool],
@@ -690,9 +682,7 @@ pub(crate) fn auto_constraint(
     vocabulary: TagVocabulary,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
-    let Some(format) = reads(parser, names, asks.model(), templates)? else {
-        return Ok(None);
-    };
+    let format = reads(names, asks.model(), templates)?;
     Ok(asks.auto_calls(tools).and_then(|one_call| {
         auto_tag(
             &format,
@@ -734,25 +724,24 @@ pub(super) fn auto_tag(
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known
-/// ([`constraint_for`]): a forced call's tag, the table's or the older registry's; a JSON answer's
-/// tag as it derives for a worker's start; or why the table cannot constrain the request. Request
+/// ([`constraint_for`]): a forced call's tag; a JSON answer's tag as it derives for a worker's
+/// start; or why the table cannot constrain the request. Request
 /// building decides on the selected worker ([`worker_constraint`]).
 pub(crate) type PreparedConstraint = Result<Prepared, SymphonyError>;
 
 /// What preparation found for a request's constraint, before its worker is known.
 #[derive(Debug)]
 pub(crate) enum Prepared {
-    /// Nothing: the request asks for no constraint the table or the older registry gives.
+    /// Nothing: the request asks for no constraint the table gives.
     None,
-    /// A constraint every worker takes as it is: a forced call's tag, the table's built for the
-    /// start the model's workers name together ([`grammar_start_of`]) or the older registry's,
-    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`).
+    /// A constraint every worker takes as it is: a forced call's tag, built for the start the
+    /// model's workers name together ([`grammar_start_of`]), or the JSON schema a Messages
+    /// request's answer takes where no tag constrains it.
     Constraint {
         constraint: ToolConstraint,
         /// The table built it for an engine that starts the grammar at the first token (the
-        /// thought, closed, ahead of the calls), the start the model's workers name together.
-        /// The older registry's is shaped for the worker at request building, which says then
-        /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
+        /// thought, closed, ahead of the calls), the start the model's workers name together
+        /// ([`WorkerConstraint::first_token`]).
         first_token: bool,
         /// The table built it (its tag for the forced call, `calls_tag`), so the table reads
         /// the response with its own markers whatever the constraint's kind; `false` for the
@@ -928,7 +917,6 @@ pub(crate) struct WorkerConstraint {
 /// one is not covered (no registry table gives one of two starts a retry may cross between the tag
 /// and the other none; the whole turn keeps the first token apart).
 pub(crate) struct AutoTag {
-    pub parser: ParserChoice,
     /// The model's parser names, both sources owned ([`ModelNames`] borrows the flags from the
     /// resolver, which the stamp outlives).
     pub labels: Names,
@@ -984,7 +972,6 @@ impl AutoTag {
             ),
         };
         auto_constraint(
-            self.parser,
             &ModelNames {
                 labels: self.labels.clone(),
                 flags: &self.flags,
@@ -1029,8 +1016,7 @@ impl TagForStart for AutoTag {
 impl fmt::Debug for AutoTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut tag = f.debug_struct("AutoTag");
-        tag.field("parser", &self.parser)
-            .field("model", &self.model())
+        tag.field("model", &self.model())
             .field("reasoning_open", &self.reasoning_open)
             .field("thought_closed", &self.thought_closed);
         if let AutoRequest::Messages {
@@ -1082,8 +1068,7 @@ pub(crate) fn worker_constraint(
     let start = grammar_start_from(decoding.start);
     let vocabulary = decoding.vocabulary;
     // A tag derived here is shaped for the selected worker's start; a prepared constraint says
-    // for itself whether the table built it for the first token, and the older registry's is
-    // shaped and spoken for at request building (`utils::tool_constraints_for_worker`).
+    // for itself whether the table built it for the first token.
     let derived_for_first_token =
         |tag: &Option<ToolConstraint>| tag.is_some() && start == GrammarStart::FirstToken;
     let (constraint, by_policy, table_tag, first_token, table) = match prepared? {
@@ -1131,7 +1116,6 @@ pub(crate) fn worker_constraint(
 /// other table, and where the turn's grammar does not start; an error refuses what it cannot
 /// hold.
 pub(crate) fn turn_constraint(
-    parser: ParserChoice,
     names: &ModelNames<'_>,
     asks: Asks<'_>,
     declared: &[Tool],
@@ -1139,9 +1123,11 @@ pub(crate) fn turn_constraint(
     vocabulary: TagVocabulary,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
-    match table_reading(parser, names, asks.model(), templates)? {
-        Some((format, true)) => turn_of(&format, asks, declared, prompt, vocabulary),
-        _ => Ok(None),
+    let read = reading(names, asks.model(), templates)?;
+    if read.compiled {
+        turn_of(&read.format, asks, declared, prompt, vocabulary)
+    } else {
+        Ok(None)
     }
 }
 
@@ -1208,7 +1194,7 @@ pub(super) fn whole_turn(
 
 #[cfg(test)]
 mod tests {
-    use tool_parser::GrammarStart;
+    use openai_protocol::worker::GrammarStart;
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
@@ -1311,7 +1297,6 @@ mod tests {
         .expect("a Messages request");
         let answer_of = |asks| {
             let prepared = super::constraint(
-                ParserChoice::Symphony,
                 &deepseek,
                 asks,
                 &[],
@@ -1360,7 +1345,6 @@ mod tests {
         // The pool names either kind (a first-token worker beside another): the answer's tag is
         // not built for it, but for the worker each attempt selects.
         let prepared = super::constraint(
-            ParserChoice::Symphony,
             &deepseek,
             Asks::Chat(&asked),
             &[],
@@ -1411,7 +1395,6 @@ mod tests {
                 first_token,
                 ..
             }) = super::constraint(
-                ParserChoice::Symphony,
                 &deepseek,
                 Asks::Chat(&forced),
                 &tools(),
@@ -1468,7 +1451,6 @@ mod tests {
                 first_token,
                 ..
             }) = super::constraint(
-                ParserChoice::Symphony,
                 &kimi,
                 Asks::Chat(asked),
                 &tools(),
@@ -1509,29 +1491,21 @@ mod tests {
             assert_eq!(format["tags"][0]["end"], "<|tool_calls_section_end|>");
             // The constraint is a structural tag, so the table is assigned to the response.
             let structural = ("structural_tag".to_string(), tag);
-            let assigned = assign(
-                ParserChoice::Symphony,
-                &kimi,
-                asked,
-                Some(&structural),
-                prompt,
-            )
-            .expect("assigned");
+            let assigned = assign(&kimi, asked, Some(&structural), prompt);
             assert_eq!(assigned.format.name(), "kimi_k2");
         }
-        // The older registry's forced call (a JSON schema) is the table's to read too, with its
-        // forced call: the thought as the table reads one, then the arguments alone.
+        // A forced call under the gateway's JSON schema (a table without a tag for it) is the
+        // table's to read too, with its forced call: the thought as the table reads one, then the
+        // arguments alone.
         let schema = ("json_schema".to_string(), "{}".to_string());
-        let forced = assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt)
-            .expect("the table reads the forced call");
+        let forced = assign(&kimi, &named, Some(&schema), prompt);
         assert_eq!(forced.format.name(), "kimi_k2");
         assert_eq!(forced.forcing.as_deref(), Some("lookup"));
     }
 
     /// A forced or required call on a table whose calls are named arguments inside a block takes
-    /// the table's tag and the table reads the answer: the request is not handed to the older
-    /// path. Under the older registry's JSON-schema constraint the table reads the answer too,
-    /// with its forced call.
+    /// the table's tag and the table reads the answer; a forced call under the gateway's JSON
+    /// schema (a table without a tag for it) is the table's too, with its forced call.
     #[test]
     fn a_forced_call_on_the_deepseek_v3_1_table_takes_its_tag_and_the_table_reads_the_answer() {
         let deepseek = names(Some("deepseek31"), Some("deepseek_v31"));
@@ -1550,7 +1524,6 @@ mod tests {
                 first_token,
                 ..
             }) = super::constraint(
-                ParserChoice::Symphony,
                 &deepseek,
                 Asks::Chat(asked),
                 &tools(),
@@ -1592,27 +1565,13 @@ mod tests {
             assert_eq!(format["tags"][0]["end"], "<｜tool▁calls▁end｜>");
             // The constraint is a structural tag, so the table is assigned to the response.
             let structural = ("structural_tag".to_string(), tag);
-            let assigned = assign(
-                ParserChoice::Symphony,
-                &deepseek,
-                asked,
-                Some(&structural),
-                prompt,
-            )
-            .expect("assigned");
+            let assigned = assign(&deepseek, asked, Some(&structural), prompt);
             assert_eq!(assigned.format.name(), "deepseek_v3.1");
         }
-        // The older registry's forced call (a JSON schema) is the table's to read too, with its
+        // A forced call under the gateway's JSON schema is the table's to read too, with its
         // forced call: the thought as the table reads one, then the arguments alone.
         let schema = ("json_schema".to_string(), "{}".to_string());
-        let forced = assign(
-            ParserChoice::Symphony,
-            &deepseek,
-            &named,
-            Some(&schema),
-            prompt,
-        )
-        .expect("the table reads the forced call");
+        let forced = assign(&deepseek, &named, Some(&schema), prompt);
         assert_eq!(forced.format.name(), "deepseek_v3.1");
         assert_eq!(forced.forcing.as_deref(), Some("lookup"));
     }
@@ -1732,7 +1691,7 @@ mod tests {
     /// engine starts the grammar at the first token, and is the engine's own schema where it does
     /// not say or starts after its reasoning parser's gate, as on a prompt that opened the
     /// thought. A prompt that opened and closed the thought (thinking off) leaves the model in
-    /// the content, and the legacy choice asks the table nothing.
+    /// the content.
     #[test]
     fn a_turn_the_prompt_leaves_unopened_is_inside_the_thought_for_the_grammar_too() {
         let model = "deepseek-ai/DeepSeek-V4-Flash";
@@ -1742,14 +1701,11 @@ mod tests {
         );
         let thinking = "<\u{ff5c}User\u{ff5c}>q<\u{ff5c}Assistant\u{ff5c}><think>";
         let closed = "<\u{ff5c}User\u{ff5c}>q<\u{ff5c}Assistant\u{ff5c}></think>";
-        let open = |parser, prompt| {
-            reasoning_open(parser, &names(None, None), model, &templates(), prompt)
-        };
-        let is_open = |parser, prompt| open(parser, prompt).map(|thought| thought.open);
-        assert_eq!(is_open(ParserChoice::Symphony, unopened), Some(true));
-        assert_eq!(is_open(ParserChoice::Symphony, thinking), Some(true));
-        assert_eq!(is_open(ParserChoice::Symphony, closed), Some(false));
-        assert_eq!(is_open(ParserChoice::Legacy, unopened), None);
+        let open = |prompt| reasoning_open(&names(None, None), model, &templates(), prompt);
+        let is_open = |prompt| open(prompt).map(|thought| thought.open);
+        assert_eq!(is_open(unopened), Some(true));
+        assert_eq!(is_open(thinking), Some(true));
+        assert_eq!(is_open(closed), Some(false));
         // The JSON answer's tag on the unopened prompt is the thinking prompt's: the closed
         // thought first where the engine starts at the first token, and otherwise the schema
         // alone, the engine's own constraint and no tag; with the thought closed the schema alone
@@ -1759,11 +1715,10 @@ mod tests {
         }));
         let answer = |prompt, start| {
             super::constraint(
-                ParserChoice::Symphony,
                 &names(None, None),
                 Asks::Chat(&request),
                 &[],
-                is_open(ParserChoice::Symphony, prompt) == Some(true),
+                is_open(prompt) == Some(true),
                 false,
                 symphony::GrammarStart::Unknown,
                 TagVocabulary::Current,
@@ -1792,58 +1747,19 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_choice_assigns_nothing_and_asks_for_no_constraint() {
-        assert!(assign(
-            ParserChoice::Legacy,
-            &ModelNames::default(),
-            &request(json!({})),
-            None,
-            PROMPT
-        )
-        .is_none());
-        let required = request(json!({"tool_choice": "required"}));
-        assert!(constraint(
-            ParserChoice::Legacy,
-            &ModelNames::default(),
-            &required,
-            &tools(),
-            false
-        )
-        .is_none());
-    }
-
-    #[test]
     fn a_forced_call_takes_the_tables_structural_tag_and_auto_takes_none() {
         let required = request(json!({"tool_choice": "required"}));
-        let Some(ToolConstraint::StructuralTag(tag)) = constraint(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &required,
-            &tools(),
-            false,
-        ) else {
+        let Some(ToolConstraint::StructuralTag(tag)) =
+            constraint(&ModelNames::default(), &required, &tools(), false)
+        else {
             panic!("a structural tag");
         };
         let tag: Value = serde_json::from_str(&tag).expect("JSON");
         assert!(tag["format"].is_object(), "{tag}");
         let auto = request(json!({"tool_choice": "auto"}));
-        assert!(constraint(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &auto,
-            &tools(),
-            false
-        )
-        .is_none());
+        assert!(constraint(&ModelNames::default(), &auto, &tools(), false).is_none());
         let unknown = request(json!({"model": "unknown", "tool_choice": "required"}));
-        assert!(constraint(
-            ParserChoice::Symphony,
-            &ModelNames::default(),
-            &unknown,
-            &tools(),
-            false
-        )
-        .is_none());
+        assert!(constraint(&ModelNames::default(), &unknown, &tools(), false).is_none());
     }
 
     /// A JSON `response_format` takes the table's answer tag whatever names select the table,
@@ -1873,7 +1789,6 @@ mod tests {
         let any_object = json!({"model": "muse-spark", "response_format": {"type": "json_object"}});
         let answer = |names: &ModelNames<'_>, extra: Value, reasoning_open: bool| {
             super::constraint(
-                ParserChoice::Symphony,
                 names,
                 Asks::Chat(&request(extra)),
                 &[],
@@ -2034,7 +1949,6 @@ mod tests {
     fn an_always_worker_takes_the_tables_tag_for_the_calls_auto_allows() {
         let auto = request(json!({"tool_choice": "auto"}));
         let tag = auto_constraint(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             Asks::Chat(&auto),
             &tools(),
@@ -2051,7 +1965,6 @@ mod tests {
         let tag: Value = serde_json::from_str(&tag).expect("JSON");
         assert!(tag["format"].is_object(), "{tag}");
         let Some(ToolConstraint::StructuralTag(forced)) = constraint(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             &request(json!({"tool_choice": "required"})),
             &tools(),
@@ -2062,7 +1975,6 @@ mod tests {
         let forced: Value = serde_json::from_str(&forced).expect("JSON");
         assert_ne!(tag, forced, "the auto tag requires no call");
         assert!(auto_constraint(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             Asks::Chat(&auto),
             &[],
@@ -2075,20 +1987,6 @@ mod tests {
         .expect("no hf")
         .is_none());
         assert!(auto_constraint(
-            ParserChoice::Legacy,
-            &ModelNames::default(),
-            Asks::Chat(&auto),
-            &tools(),
-            false,
-            false,
-            symphony::GrammarStart::Unknown,
-            TagVocabulary::Current,
-            &templates()
-        )
-        .expect("legacy")
-        .is_none());
-        assert!(auto_constraint(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             Asks::Chat(&request(json!({"tool_choice": "none"}))),
             &tools(),
@@ -2114,7 +2012,6 @@ mod tests {
         ] {
             assert!(
                 auto_constraint(
-                    ParserChoice::Symphony,
                     &ModelNames::default(),
                     Asks::Chat(&request(own.clone())),
                     &tools(),
@@ -2139,7 +2036,6 @@ mod tests {
         .unwrap();
         assert!(matches!(
             auto_constraint(
-                ParserChoice::Symphony,
                 &ModelNames::default(),
                 Asks::for_messages(&messages_auto, false),
                 &tools,
@@ -2153,7 +2049,6 @@ mod tests {
             Some(ToolConstraint::StructuralTag(_))
         ));
         assert!(auto_constraint(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             Asks::for_messages(&messages_auto, true),
             &tools,
@@ -2170,7 +2065,6 @@ mod tests {
             "tool_choice": {"type": "any"}
         }));
         assert!(auto_constraint(
-            ParserChoice::Symphony,
             &ModelNames::default(),
             Asks::for_messages(&messages_any, false),
             &tools,
@@ -2196,7 +2090,6 @@ mod tests {
         let hf = names(Some("hf"), Some("hf"));
         let constrain = |templates: &Templates, extra: Value| {
             super::constraint(
-                ParserChoice::Symphony,
                 &hf,
                 Asks::Chat(&request(extra)),
                 &tools(),
@@ -2248,7 +2141,6 @@ mod tests {
         let plain = names(None, None);
         assert!(
             super::constraint(
-                ParserChoice::Symphony,
                 &plain,
                 Asks::Chat(&request(json!({"response_format": {"type": "json_object"}}))),
                 &tools(),
@@ -2297,21 +2189,12 @@ mod tests {
 
     #[tokio::test]
     async fn messages_are_read_by_the_same_tables_and_their_tool_choice_forces_calls() {
-        let symphony = ParserChoice::Symphony;
         let plain = ModelNames::default();
-        let read = reads(symphony, &plain, "Qwen/Qwen3-8B", &templates())
-            .expect("read")
-            .expect("the registry's table");
+        let read = reads(&plain, "Qwen/Qwen3-8B", &templates()).expect("read");
         assert_eq!(read.name(), "qwen3");
-        assert!(
-            reads(ParserChoice::Legacy, &plain, "Qwen/Qwen3-8B", &templates())
-                .expect("read")
-                .is_none()
-        );
         // A tool_choice of none over no tools takes the table without its calls, as every
         // request without tools does; over declared tools it keeps them, for the reader to drop.
         let no_calls = super::super::assign(
-            symphony,
             &plain,
             Asks::for_messages(
                 &message_request(json!({"tool_choice": {"type": "none"}})),
@@ -2321,13 +2204,11 @@ mod tests {
             PROMPT,
             &templates(),
         )
-        .expect("read")
-        .expect("assigned");
+        .expect("read");
         assert_eq!(no_calls.format.name(), "qwen3");
         assert_eq!(no_calls.format.call_syntax(), None);
         assert!(!no_calls.forbids_calls);
         let forbidden = super::super::assign(
-            symphony,
             &plain,
             Asks::for_messages(&message_request(json!({
                     "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
@@ -2337,8 +2218,7 @@ mod tests {
             PROMPT,
             &templates(),
         )
-        .expect("read")
-        .expect("assigned");
+        .expect("read");
         assert_eq!(forbidden.format.name(), "qwen3");
         assert!(
             forbidden.format.call_syntax().is_some(),
@@ -2348,7 +2228,6 @@ mod tests {
         // Past the route the request's own `tools` reads `None` (the route took them out while it
         // owned the request): the declaration the spec recorded is what the table reads.
         let taken = super::super::assign(
-            symphony,
             &plain,
             Asks::Messages {
                 request: &message_request(json!({"tool_choice": {"type": "none"}})),
@@ -2359,8 +2238,7 @@ mod tests {
             PROMPT,
             &templates(),
         )
-        .expect("read")
-        .expect("assigned");
+        .expect("read");
         assert!(
             taken.format.call_syntax().is_some(),
             "the declaration is read from the ask, not from the request's emptied field"
@@ -2368,7 +2246,6 @@ mod tests {
         assert!(taken.forbids_calls);
         let constrain = |extra: Value| {
             super::constraint(
-                symphony,
                 &plain,
                 Asks::for_messages(&message_request(extra), false),
                 &tools(),
@@ -2396,15 +2273,13 @@ mod tests {
             .is_none());
         assert!(constrain(json!({})).expect("read").is_none());
         let assigned = super::super::assign(
-            symphony,
             &plain,
             Asks::for_messages(&message_request(json!({})), false),
             None,
             PROMPT,
             &templates(),
         )
-        .expect("read")
-        .expect("assigned");
+        .expect("read");
         assert_eq!(assigned.format.name(), "qwen3");
         assert_eq!(assigned.prompt, "<|im_start|>assistant\n<think>\n");
         // The template's table reads messages too, and refuses what it cannot tag.
@@ -2415,7 +2290,6 @@ mod tests {
         )
         .await;
         let why = super::constraint(
-            symphony,
             &hf,
             Asks::for_messages(
                 &message_request(json!({"tool_choice": {"type": "any"}})),
@@ -2445,7 +2319,6 @@ mod tests {
 
         let templates = Arc::new(templates());
         let auto_tag = || AutoTag {
-            parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
@@ -2526,7 +2399,6 @@ mod tests {
         // the tag takes a shape for each start.
         let templates = Arc::new(templates());
         let auto_tag = || AutoTag {
-            parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
@@ -2696,7 +2568,6 @@ mod tests {
             Ok(Prepared::None),
             || Ok(None),
             || AutoTag {
-                parser: ParserChoice::Symphony,
                 labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
                 flags: Names::default(),
                 request: AutoRequest::Chat(Arc::new(request(json!({})))),
@@ -2739,7 +2610,6 @@ mod tests {
             "type": "json_schema", "json_schema": {"name": "city", "schema": schema},
         }}));
         let prepared = super::constraint(
-            ParserChoice::Symphony,
             &deepseek,
             Asks::Chat(&asked),
             &[],
@@ -2829,7 +2699,6 @@ mod tests {
             first_token,
             ..
         }) = super::constraint(
-            ParserChoice::Symphony,
             &deepseek,
             Asks::Chat(&forced),
             &tools(),
@@ -2866,7 +2735,6 @@ mod tests {
         }));
         let tags = [
             AutoTag {
-                parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
                 request: AutoRequest::Chat(Arc::new(chat.clone())),
@@ -2875,7 +2743,6 @@ mod tests {
                 templates: Arc::clone(&templates),
             },
             AutoTag {
-                parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
                 request: AutoRequest::Messages {
@@ -2893,7 +2760,6 @@ mod tests {
             let built = |start| {
                 let constraint = match &auto_tag.request {
                     AutoRequest::Chat(_) => auto_constraint(
-                        ParserChoice::Symphony,
                         &names,
                         Asks::Chat(&chat),
                         &chat.callable_tools(),
@@ -2904,7 +2770,6 @@ mod tests {
                         &templates,
                     ),
                     AutoRequest::Messages { .. } => auto_constraint(
-                        ParserChoice::Symphony,
                         &names,
                         Asks::for_messages(&messages, false),
                         &tools(),
@@ -2940,7 +2805,6 @@ mod tests {
         }
         // A tag the table gives no engine (no tool to call) derives as none for every start.
         let none = AutoTag {
-            parser: ParserChoice::Symphony,
             labels: names.labels,
             flags: Names::default(),
             request: AutoRequest::Chat(Arc::new(request(json!({})))),
@@ -3147,17 +3011,11 @@ mod tests {
 
     #[test]
     fn only_the_response_templates_table_spells_a_whole_turn() {
-        // Any other name, and the legacy parsers, leave the turn to the table's tags without
-        // looking for a template.
+        // Any other name leaves the turn to the table's tags without looking for a template.
         let request = request(json!({"tools": weather(), "tool_choice": "required"}));
-        for (parser, names) in [
-            (ParserChoice::Symphony, names(Some("qwen"), None)),
-            (ParserChoice::Symphony, names(None, None)),
-            (ParserChoice::Legacy, names(Some("hf"), None)),
-        ] {
+        for names in [names(Some("qwen"), None), names(None, None)] {
             assert!(matches!(
                 turn_constraint(
-                    parser,
                     &names,
                     Asks::Chat(&request),
                     &request.effective_tool_list(),
@@ -3171,7 +3029,6 @@ mod tests {
         // The template's names ask for the model's own template, and a model without one is
         // refused, as the table's tags refuse it.
         let why = turn_constraint(
-            ParserChoice::Symphony,
             &names(Some("hf"), None),
             Asks::Chat(&request),
             &request.effective_tool_list(),
@@ -3272,7 +3129,6 @@ mod tests {
                             ("first token", symphony::GrammarStart::FirstToken),
                         ] {
                             let calls = super::constraint(
-                                ParserChoice::Symphony,
                                 names,
                                 Asks::Chat(request),
                                 &tools(),
@@ -3293,7 +3149,6 @@ mod tests {
                     }
                 }
                 let allowed = auto_constraint(
-                    ParserChoice::Symphony,
                     names,
                     Asks::Chat(&auto),
                     &tools(),

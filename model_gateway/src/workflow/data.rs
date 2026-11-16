@@ -155,7 +155,7 @@ pub struct WorkerWorkflowData {
     /// Under Symphony, the table whose failure classes the registration step
     /// publishes at zero once the worker is in the registry (transient; the
     /// create step resolves it from the model card and the names; none for
-    /// an HTTP worker, the legacy parsers or a model no table reads).
+    /// an HTTP worker, whose engine reads its own output).
     #[serde(skip, default)]
     pub symphony_table: Option<&'static str>,
     // -- External-only fields --

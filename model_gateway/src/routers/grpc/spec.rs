@@ -89,14 +89,10 @@ pub(crate) struct ChatResponseSpec {
     /// The wire the answer leaves in, selected by the profile of the model
     /// the client asked for ([`Wire::of`]): the stream's shape follows it.
     pub wire: Wire,
-    pub separate_reasoning: bool,
-    /// Preserve JSON string data when a typed reasoning parser removes framing.
-    pub json_mode: bool,
     pub tool_choice: Option<ToolChoice>,
     /// The tools the response is read against, shared with the readers that
     /// type its calls (one per choice) rather than copied into each.
     pub tools: Option<Arc<[Tool]>>,
-    pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
     /// `parallel_tool_calls: false`: only the first tool call is returned.
     pub first_tool_call_only: bool,
@@ -122,8 +118,9 @@ pub(crate) struct ChatResponseSpec {
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
-    /// Set by request building when Symphony reads the response (`regular::symphony`):
-    /// the table, and the part of the rendered prompt the engine replays.
+    /// Set by request building (`regular::stages::reading::decide`): the table that reads the
+    /// response and the part of the rendered prompt the engine replays (`regular::symphony`).
+    /// `None` until then; a reader given a spec without it answers an internal error.
     pub symphony: Option<Assignment>,
     /// The parser names the request's preparation resolved once from the model's
     /// cards (`ProcessingState::parser_names`), handed on by request building for
@@ -156,10 +153,9 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
 }
 
 impl ChatResponseSpec {
-    /// The spec's `json_mode` of `request`: a `json_object` or `json_schema`
-    /// response format holds the answer to JSON; a structural tag is free text
-    /// around its tags. The one rule the legacy chat path and the Symphony
-    /// path read (its `Asks::json_answer`).
+    /// Whether `request` holds the answer to JSON: a `json_object` or
+    /// `json_schema` response format does; a structural tag is free text
+    /// around its tags. The rule the reader's `Asks::json_answer` reads.
     pub(crate) fn json_mode_of(request: &ChatCompletionRequest) -> bool {
         matches!(
             request.response_format,
@@ -173,8 +169,6 @@ impl ChatResponseSpec {
     pub(crate) fn for_request(request: &ChatCompletionRequest, provider: ProviderProfile) -> Self {
         Self {
             wire: Wire::of(provider),
-            separate_reasoning: request.separate_reasoning,
-            json_mode: Self::json_mode_of(request),
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included: the request's own list shared, not copied (a new list
@@ -185,7 +179,6 @@ impl ChatResponseSpec {
             // them (`scans_for_tool_calls_for`).
             tools: scans_for_tool_calls_for(request, provider)
                 .then(|| request.shared_tool_list_for(provider)),
-            history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
             expected_choices: request.choices(),
@@ -249,16 +242,18 @@ pub(crate) struct MessagesResponseSpec {
     /// by request building and again when a retry selects another worker;
     /// `None` when the worker advertises none.
     pub context_window: Option<u32>,
-    pub tool_choice: Option<messages::ToolChoice>,
+    /// The request declares tools, which the table's asks carry
+    /// (`regular::symphony::Asks::Messages`).
     pub has_tools: bool,
-    pub history_tool_calls_count: usize,
     /// The custom tools as chat tools, converted once: the template renders
     /// them (narrowed by `tool_choice`), the constraints and the parsers
     /// read them; shared with the reader that types the calls.
     pub chat_tools: Arc<[Tool]>,
     /// The stop sequences as the decoders match them.
     pub stop_sequences: Option<StringOrArray>,
-    /// Symphony's assignment when a table reads the message (see `regular::symphony`).
+    /// Set by request building (`regular::stages::reading::decide`): the table that reads the
+    /// message and the part of the rendered prompt the engine replays (`regular::symphony`).
+    /// `None` until then; a reader given a spec without it answers an internal error.
     pub symphony: Option<Assignment>,
     /// `disable_parallel_tool_use: true`: only the first tool call is
     /// returned.
@@ -328,9 +323,7 @@ impl MessagesResponseSpec {
             prompt_tokens: 0,
             max_tokens: request.max_tokens,
             context_window: None,
-            tool_choice: request.tool_choice.clone(),
             has_tools: tools.declared,
-            history_tool_calls_count: request.history_tool_calls_count(),
             chat_tools: tools.chat_tools,
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
@@ -639,7 +632,7 @@ mod tests {
             let request = chat_request(json!({
                 "model": "test", "messages": [], "response_format": format
             }));
-            assert_eq!(ChatResponseSpec::from(&request).json_mode, expected);
+            assert_eq!(ChatResponseSpec::json_mode_of(&request), expected);
         }
     }
 }

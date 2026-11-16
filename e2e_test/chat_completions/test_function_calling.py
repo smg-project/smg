@@ -17,7 +17,7 @@ import httpx
 import openai
 import pytest
 import smg_client
-from infra.constants import effective_parser, get_runtime
+from infra.constants import get_runtime
 from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
@@ -40,66 +40,6 @@ LLAMA_SYSTEM_MESSAGE = (
     'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}. '
     "Do not use variables.\n\n"
 )
-
-# Tools for pythonic function calling tests
-PYTHONIC_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the current weather for a given location.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "The name of the city or location.",
-                    }
-                },
-                "required": ["location"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_tourist_attractions",
-            "description": "Get a list of top tourist attractions for a given city.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "The name of the city to find attractions for.",
-                    }
-                },
-                "required": ["city"],
-            },
-        },
-    },
-]
-
-PYTHONIC_MESSAGES = [
-    {
-        "role": "system",
-        "content": (
-            "You are a travel assistant. "
-            "When asked to call functions, ALWAYS respond ONLY with a python list of function calls, "
-            "using this format: [func_name1(param1=value1, param2=value2), func_name2(param=value)]. "
-            "Do NOT use JSON, do NOT use variables, do NOT use any other format. "
-            "Here is an example:\n"
-            '[get_weather(location="Paris"), get_tourist_attractions(city="Paris")]'
-        ),
-    },
-    {
-        "role": "user",
-        "content": (
-            "I'm planning a trip to Tokyo next week. What's the weather like and what are some "
-            "top tourist attractions? Propose parallel tool calls at once, using the python list "
-            "of function calls format as shown above."
-        ),
-    },
-]
 
 
 # =============================================================================
@@ -475,15 +415,9 @@ class TestOpenAIServerFunctionCalling:
         - When tool_choice is a specific ToolChoice, the model should return one or more tool_calls.
         """
         # Under a named choice the gateway constrains the engine to the call it
-        # names: Symphony's json table, this model's under the default, gives
-        # the forced call its own structural tag, the list holding that one
-        # call, which the table reads; the legacy path constrains the engine to
-        # the function's parameters object and names the call itself.
-        mock_answers.enqueue(
-            '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
-            if effective_parser() == "symphony"
-            else '{"city": "Paris"}'
-        )
+        # names: the json table, this model's, gives the forced call its own
+        # structural tag, the list holding that one call, which the table reads.
+        mock_answers.enqueue('[{"name": "get_weather", "parameters": {"city": "Paris"}}]')
         tools = [
             {
                 "type": "function",
@@ -740,83 +674,6 @@ class TestOpenAIServerFunctionCalling:
 
 
 # =============================================================================
-# Pythonic Function Calling Tests (Llama 8B with pythonic parser)
-# =============================================================================
-
-
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
-@pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
-@pytest.mark.gateway(
-    reuse=True, extra_args=["--tool-call-parser", "pythonic", "--history-backend", "memory"]
-)
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
-@pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
-@pytest.mark.skipif(
-    effective_parser() == "symphony",
-    reason="the registry reads this model with the json table under Symphony, the default; "
-    "the pythonic list is the legacy parsers' reading",
-)
-class TestOpenAIPythonicFunctionCalling:
-    """Tests for pythonic function calling format.
-
-    Under Symphony (the default) the registry reads this model with its own table (``json``)
-    whatever ``--tool-call-parser`` names, so the gateway-wide ``pythonic`` name this class
-    relies on does not apply there: the class runs where the legacy parsers read (the
-    ``--parser legacy`` lane), and skips under Symphony at collection, before any fixture
-    starts a worker or a gateway.
-    """
-
-    def test_pythonic_tool_call_prompt(self, model, api_client):
-        """Test: Explicit prompt for pythonic tool call format without chat template."""
-
-        response = api_client.chat.completions.create(
-            model=model,
-            messages=PYTHONIC_MESSAGES,
-            tools=PYTHONIC_TOOLS,
-            temperature=0.1,
-            stream=False,
-        )
-        tool_calls = response.choices[0].message.tool_calls
-        assert isinstance(tool_calls, list), "No tool_calls found"
-        assert len(tool_calls) >= 1
-        names = [tc.function.name for tc in tool_calls]
-        assert "get_weather" in names or "get_tourist_attractions" in names, (
-            f"Function name '{names}' should contain either 'get_weather' or 'get_tourist_attractions'"
-        )
-
-    def test_pythonic_tool_call_streaming(self, model, api_client):
-        """Test: Streaming pythonic tool call format; assert tool_call index is present."""
-
-        response_stream = api_client.chat.completions.create(
-            model=model,
-            messages=PYTHONIC_MESSAGES,
-            tools=PYTHONIC_TOOLS,
-            temperature=0.1,
-            stream=True,
-        )
-        found_tool_calls = False
-        found_index = False
-        found_names = set()
-        for chunk in response_stream:
-            choice = chunk.choices[0]
-            if getattr(choice.delta, "tool_calls", None):
-                found_tool_calls = True
-                tool_call = choice.delta.tool_calls[0]
-                if hasattr(tool_call, "index") or (
-                    isinstance(tool_call, dict) and "index" in tool_call
-                ):
-                    found_index = True
-                found_names.add(str(tool_call.function.name))
-
-        assert found_tool_calls, "No tool_calls found in streaming response"
-        assert found_index, "No index field found in any streamed tool_call"
-        assert "get_weather" in found_names or "get_tourist_attractions" in found_names, (
-            f"Function name '{found_names}' should contain either 'get_weather' or 'get_tourist_attractions'"
-        )
-
-
-# =============================================================================
 # Tool Choice Tests - Base Class (Llama 1B with llama parser)
 # =============================================================================
 
@@ -1007,8 +864,8 @@ def get_travel_messages():
 
 
 # Two tools whose `$defs` give one name, DataType, two definitions. The pair is valid, since each
-# tool's parameters is its own schema document. The legacy path merges every tool into one schema
-# and refuses the pair with a 400; a structural-tag path serves it with each tool's own definition.
+# tool's parameters is its own schema document. A forced call whose schema merges every tool into
+# one document refuses the pair with a 400; a structural tag serves it with each tool's own definition.
 CONFLICTING_DEFS_TOOLS = [
     {
         "type": "function",
@@ -1126,13 +983,10 @@ class _TestToolChoiceBase:
     def _answer_calls(self, mock_answers, calls, *, forced=False):
         """State the mock engine's next answer: ``calls`` in the class's syntax.
 
-        The forced syntaxes are the shapes Symphony's tables constrain the engine to;
-        the legacy path constrains it to others, which the mock classes do not state.
+        The forced syntaxes are the shapes the tables constrain the engine to.
         """
         if not mock_answers.active:
             return
-        if forced and effective_parser() != "symphony":
-            pytest.skip("the forced answers are stated in the shapes Symphony constrains")
         write = self._forced_calls_text if forced else self._calls_text
         assert write is not None, "a class on the mock engine states its model's tool-call syntax"
         mock_answers.enqueue(write(calls))
@@ -1741,8 +1595,8 @@ class _TestToolChoiceBase:
     def _assert_conflicting_defs_served(self, model, api_client, mock_answers):
         """Under a table whose forced call carries each tool's own `$defs`, the pair is served
         and the call's arguments follow the called tool's definition (a string for tool1, a
-        number for tool2). The subclasses whose parser name Symphony answers to call this under
-        --parser symphony; the base test keeps the legacy path's refusal."""
+        number for tool2). The subclasses whose parser name a table answers to call this; the
+        base test keeps the refusal of a forced call whose list schema merges the definitions."""
         self._answer_calls(mock_answers, [("tool1", {"data": {"value": "one"}})], forced=True)
         response = api_client.chat.completions.create(
             model=model,
@@ -1797,12 +1651,8 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
     }
 
     def test_conflicting_defs_required_tool_choice(self, model, api_client, mock_answers):
-        """Under --parser symphony the pair is served: the `llama` name reads the json table,
-        whose forced call carries each tool's own `$defs`. On the legacy path the merged schema
-        refuses the pair, as the base test expects."""
-        if effective_parser() != "symphony":
-            super().test_conflicting_defs_required_tool_choice(model, api_client)
-            return
+        """The pair is served: the `llama` name reads the json table, whose forced call carries
+        each tool's own `$defs`."""
         self._assert_conflicting_defs_served(model, api_client, mock_answers)
 
 
@@ -1832,12 +1682,8 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
     _forced_calls_text = staticmethod(_qwen_calls_text)
 
     def test_conflicting_defs_required_tool_choice(self, model, api_client, mock_answers):
-        """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
-        structural tag that carries each tool's own `$defs`. On the legacy path the merged schema
-        refuses the pair, as the base test expects."""
-        if effective_parser() != "symphony":
-            super().test_conflicting_defs_required_tool_choice(model, api_client)
-            return
+        """The pair is served: the Qwen3 table gives the forced call a structural tag that
+        carries each tool's own `$defs`."""
         self._assert_conflicting_defs_served(model, api_client, mock_answers)
 
 
@@ -2038,9 +1884,7 @@ class TestMultiTurnToolCall:
 @pytest.mark.engine("tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
-@pytest.mark.gateway(
-    extra_args=["--parser", "symphony", "--tool-call-parser", "qwen", "--history-backend", "memory"]
-)
+@pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai"], indirect=True)
 class TestConstrainedDecodingAlways:

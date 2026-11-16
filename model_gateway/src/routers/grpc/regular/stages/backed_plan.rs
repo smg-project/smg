@@ -1,16 +1,13 @@
 //! The backend `GenerateRequest` the chat and Messages stages build alike
 //! once the worker is known, and the stamp a retry re-mints it from. The
 //! sequence is one ([`build`]): the request id stamped for the attempt
-//! (`helpers::resolve_request_id_stamp`), the forced call's grammar shaped
-//! for the worker (the bare calls behind a reasoning parser's gate, the
-//! thought and then the calls from the first token: the worker's
-//! `constrained_decoding_start` label, `utils::tool_constraints_for_worker`),
-//! the request built by the client for the stage's request type, the
-//! sampling defaults, the stops and the PD metadata
+//! (`helpers::resolve_request_id_stamp`), the request built by the client for
+//! the stage's request type with the constraint the table shaped for the
+//! worker's start, the sampling defaults, the stops and the PD metadata
 //! (`helpers::finish_generate_request`), and the attempt stamp, which carries
-//! the unshaped constraint, or what derives the table's tag for a start (the
-//! `auto` tag, a JSON answer's), so a retry gives the worker it selects the
-//! same shaping (`helpers::ToolConstraintStamp`). Each stage keeps what
+//! what derives the table's tag for a start (the `auto` tag, a JSON answer's),
+//! so a retry gives the worker it selects the same shaping
+//! (`helpers::ToolConstraintStamp`). Each stage keeps what
 //! differs ([`Inputs`]): the request its client builds from, the sampling
 //! mask, the id prefix, and where its media is assembled and its reasoning
 //! decision taken.
@@ -19,7 +16,7 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use llm_tokenizer::chat_template::ThinkingKeyName;
-use openai_protocol::{common::ResponseFormat, profile::ProviderProfile};
+use openai_protocol::profile::ProviderProfile;
 use smg_grpc_client::FormatSetAside;
 use tracing::error;
 
@@ -34,7 +31,6 @@ use crate::routers::{
             RequestContext, RequestType,
         },
         proto_wrapper::{MultimodalData, ProtoGenerateRequest},
-        utils,
     },
 };
 
@@ -118,29 +114,6 @@ pub(crate) fn build(
         disaggregated,
     );
 
-    // Now that the worker is known, a forced call's grammar takes the shape
-    // its engine needs: the bare calls behind a reasoning parser's gate, the
-    // thought and then the calls from the first token (the worker's
-    // `constrained_decoding_start` label; see `utils::tool_constraints_for_worker`).
-    // The unshaped constraint stays on the attempt stamp, or what derives the
-    // table's tag for a start (the `auto` tag, a JSON answer's): a retry gives
-    // the worker it selects the same shaping (`helpers::ToolConstraintStamp`).
-    let tool_parser = ctx
-        .components
-        .parser_resolver
-        .tool_parser_for(ctx.state.parser_names.as_ref(), model);
-    let unshaped_tool_constraints = tool_constraints.clone();
-    let (tool_constraints, led_for_first_token) = utils::tool_constraints_for_worker(
-        &ctx.components.tool_parser_factory,
-        tool_parser.as_deref(),
-        tool_constraints,
-        ctx.state.workers.as_ref(),
-    )
-    .map_err(|e| {
-        error!(function = function, error = %e, "Failed to shape the tool constraint for the worker");
-        error::internal_error("invalid_tool_constraint", format!("Invalid tool constraint: {e}"))
-    })?;
-
     // The ids are the prompt; the text rides along only when the request
     // carries media (see `helpers::wire_prompt_text`).
     let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
@@ -154,7 +127,7 @@ pub(crate) fn build(
             tool_constraints,
             format_set_aside,
             require_reasoning,
-            first_token_grammar: first_token_tag || led_for_first_token,
+            first_token_grammar: first_token_tag,
         },
     )
     .map_err(|e| {
@@ -192,16 +165,8 @@ pub(crate) fn build(
         function,
     )?;
 
-    let tool_constraint = match table_tag {
-        Some(table_tag) => helpers::ToolConstraintStamp::capture_table(table_tag, &proto_request),
-        None => helpers::ToolConstraintStamp::capture(
-            unshaped_tool_constraints,
-            tool_parser.as_deref(),
-            first_token_tag,
-            &proto_request,
-            own_format(&ctx.input.request_type, format_set_aside),
-        ),
-    };
+    let tool_constraint =
+        table_tag.and_then(|tag| helpers::ToolConstraintStamp::capture_table(tag, &proto_request));
     Ok((
         ExecutionPlan::generate(settings.plan_kind, proto_request),
         AttemptStamp {
@@ -212,15 +177,6 @@ pub(crate) fn build(
             tool_constraint,
         },
     ))
-}
-
-/// The body's own `response_format` as the builder read it: a chat body's,
-/// unless the constraint set it aside (`FormatSetAside::response_format`).
-fn own_format(request: &RequestType, set_aside: FormatSetAside) -> Option<&ResponseFormat> {
-    match request {
-        RequestType::Chat(chat) if !set_aside.response_format => chat.response_format.as_ref(),
-        _ => None,
-    }
 }
 
 /// Match the template's tri-state switch, including explicit kwargs precedence.

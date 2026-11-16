@@ -75,8 +75,8 @@ impl Panicked {
         }
     }
 
-    /// The same failure, read by the Symphony `table` (its label) when one
-    /// read the response: the outcome is counted under it.
+    /// The same failure, read by the Symphony `table` (its label): the outcome is counted under
+    /// it.
     pub(crate) fn read_by(mut self, table: Option<&'static str>) -> Self {
         self.table = table;
         self
@@ -98,7 +98,7 @@ impl Panicked {
         if let Some(table) = self.table {
             telemetry::record_panicked(table);
         }
-        telemetry::mark_panicked(&Span::current(), self.table);
+        telemetry::mark_panicked(&Span::current(), self.table.unwrap_or("none"));
         error!(
             request_id,
             model,

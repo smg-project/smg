@@ -684,7 +684,7 @@ fn hint_response_template(app_context: &AppContext, model: &str, tokenizer_id: &
         info!(
             model,
             "the tokenizer ships a response_template; --tool-call-parser {TEMPLATE_PARSER} and \
-             --reasoning-parser {TEMPLATE_PARSER} read with it under --parser symphony"
+             --reasoning-parser {TEMPLATE_PARSER} read with it"
         );
     }
 }
@@ -1083,7 +1083,6 @@ mod tests {
                 .round_robin_policy()
                 .build_unchecked(),
             Arc::new(workers),
-            None,
         )
     }
 

@@ -5,13 +5,13 @@
 //! the decode side's number saw a full hit on every request.
 use std::time::Instant;
 
-use openai_protocol::chat::ChatCompletionRequest;
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 
 use super::{
     super::*,
     eof::{
-        chunk, collect_events, complete_with_prompt, processor, scripted_stream, CharacterTokenizer,
+        chat_spec_of, chunk, collect_events, complete_with_prompt, processor, scripted_stream,
+        CharacterTokenizer,
     },
 };
 use crate::routers::grpc::{
@@ -68,9 +68,7 @@ fn spec(continuous_usage: bool) -> ChatResponseSpec {
         "model": "pd-usage-test", "messages": [], "stream": true,
         "stream_options": {"include_usage": true, "continuous_usage_stats": continuous_usage}
     });
-    ChatResponseSpec::from(
-        &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
-    )
+    chat_spec_of(request)
 }
 
 /// Stream a disaggregated chat answer from the two sides and return its SSE
@@ -81,7 +79,7 @@ async fn stream_pd(
     continuous_usage: bool,
 ) -> Vec<Value> {
     let (tx, rx) = sse_channel();
-    let result = processor(false)
+    let result = processor()
         .process_prefill_decode_streaming_chunks(
             prefill,
             decode,
@@ -212,7 +210,7 @@ async fn a_single_engines_answer_keeps_its_own_cache_hit() {
     )
     .await;
     let (tx, rx) = sse_channel();
-    let result = processor(false)
+    let result = processor()
         .process_streaming_chunks(
             stream,
             dispatch(),

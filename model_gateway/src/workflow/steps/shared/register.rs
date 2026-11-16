@@ -270,8 +270,8 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // workers' model exist at zero from here, once every worker of the
         // batch is in the registry: a registration refused above leaves no
         // series behind. The table was resolved where the model card and the
-        // names are (none for an HTTP worker, the legacy parsers or a model
-        // no table reads).
+        // names are (none for an HTTP worker, whose engine reads its own
+        // output).
         if let Some(table) = context.data.symphony_table() {
             telemetry::init_table_series(table);
         }
@@ -384,7 +384,7 @@ mod tests {
         let mut data = create_worker_workflow_data(
             WorkerSpec::new(url),
             WorkerRegistrationMode::CreateOnly,
-            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None),
+            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry)),
         );
         data.actual_workers = Some(vec![Arc::clone(&worker)]);
         let state = WorkflowState::new(
@@ -422,11 +422,7 @@ mod tests {
         let data = create_worker_workflow_data(
             WorkerSpec::new("http://worker:8080"),
             WorkerRegistrationMode::CreateOnly,
-            app_context_for_tests(
-                RouterConfig::default(),
-                Arc::new(WorkerRegistry::new()),
-                None,
-            ),
+            app_context_for_tests(RouterConfig::default(), Arc::new(WorkerRegistry::new())),
         );
         let mut state = WorkflowState::new(
             WorkflowInstanceId::new(),

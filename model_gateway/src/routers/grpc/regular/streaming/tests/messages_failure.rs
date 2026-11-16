@@ -66,7 +66,7 @@ async fn a_chunk_that_fails_to_decode_after_the_first_token_flushes_the_events_w
     )
     .await;
     let (tx, mut rx) = sse_channel();
-    let processor = processor(false);
+    let processor = processor();
     let reading = async {
         let result = processor
             .process_messages_streaming_chunks(

@@ -28,7 +28,6 @@ fn app_context() -> Arc<AppContext> {
             .round_robin_policy()
             .build_unchecked(),
         Arc::new(WorkerRegistry::new()),
-        None,
     )
 }
 

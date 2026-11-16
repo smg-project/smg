@@ -71,12 +71,6 @@ workspace = true
 [dependencies.rand]
 workspace = true
 
-[dependencies.tool-parser]
-workspace = true
-
-[dependencies.reasoning-parser]
-workspace = true
-
 [dev-dependencies]
 tempfile = "3.27"
 

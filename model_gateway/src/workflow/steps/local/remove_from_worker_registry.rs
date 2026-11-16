@@ -207,7 +207,7 @@ mod tests {
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
             .build_unchecked();
-        app_context_for_tests(router_config, registry, None)
+        app_context_for_tests(router_config, registry)
     }
 
     /// The data the selection leaves for the step: the workers found under

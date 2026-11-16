@@ -102,7 +102,7 @@ async fn two_prompt_reading(
     tokenizer: Arc<dyn Tokenizer>,
     tx: SseSender,
 ) -> ReadingEnd {
-    let processor = processor(false);
+    let processor = processor();
     let spec = completion_spec();
     let body_first_frame = AtomicBool::new(false);
     let outcomes = try_join_all([
@@ -193,7 +193,7 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
     )
     .await;
     let (tx, rx) = driven_channel();
-    let processor = processor(false);
+    let processor = processor();
     let spec = completion_spec();
     let reading = async move {
         let result = processor
@@ -277,7 +277,7 @@ async fn a_chunk_that_fails_to_decode_after_the_first_frame_flushes_the_chunks_w
     .await;
     let spec = completion_spec();
     let (tx, mut rx) = sse_channel();
-    let processor = processor(false);
+    let processor = processor();
     let reading = async {
         let result = processor
             .process_completion_streaming_chunks(
@@ -436,7 +436,7 @@ async fn a_failed_finish_of_a_later_choice_flushes_the_earlier_choice_s_tail_wri
     .expect("a two-choice completion request");
     let spec = CompletionResponseSpec::new(&request, Vec::new());
     let (tx, mut rx) = sse_channel();
-    let processor = processor(false);
+    let processor = processor();
     let reading = async {
         let result = processor
             .process_completion_streaming_chunks(

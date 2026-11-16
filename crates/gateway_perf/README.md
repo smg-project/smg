@@ -120,7 +120,7 @@ The long path's cells are long at the Makefile's default `PERF_REQUESTS` (10,000
 16/s is 625 s per cell, twice that at `--rate-scale 0.5`): pass a smaller count when naming it,
 for example `PERF_REQUESTS=3000`; its rate stays a whole number at `--rate-scale 0.5`.
 
-The gateway runs with `--parser symphony --tool-call-parser json` (`--gw-args` changes it),
+The gateway runs with `--tool-call-parser json` (`--gw-args` changes it),
 `cache_aware` routing (`GW_POLICY` in the environment names another), 8 runtime threads and
 log level `warn`, as `grpc_stress/bed.sh` sets it up; 4 mock engines (`--workers`).
 

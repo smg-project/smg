@@ -478,7 +478,6 @@ mod tests {
                 .round_robin_policy()
                 .build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         );
         for url in ["http://w1:8000", "http://w2:8000"] {
             let worker: Arc<dyn Worker> = Arc::new(
@@ -624,7 +623,6 @@ mod tests {
                 .round_robin_policy()
                 .build_unchecked(),
             Arc::new(WorkerRegistry::new()),
-            None,
         );
         for url in ["http://w1:8000", "http://w2:8000"] {
             let worker: Arc<dyn Worker> = Arc::new(

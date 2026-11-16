@@ -15,7 +15,7 @@ use smg::{
 use tower::ServiceExt;
 
 use crate::common::{
-    create_test_context_with_parsers,
+    create_test_context,
     mock_worker::{MockWorker, MockWorkerConfig},
     test_app::create_test_app_with_context,
 };
@@ -87,8 +87,7 @@ impl ParserTestContext {
             .build()
             .unwrap();
 
-        // Create app context with parser factories initialized
-        let app_context = create_test_context_with_parsers(config.clone()).await;
+        let app_context = create_test_context(config.clone()).await;
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
@@ -172,6 +171,35 @@ mod parse_function_call_tests {
         assert_eq!(body_json["success"], true);
         assert!(body_json["tool_calls"].is_array());
 
+        ctx.shutdown().await;
+    }
+
+    /// The call parse keeps a thought in the remaining text: with no calls in the text, every
+    /// byte comes back as written, the thought's markers included.
+    #[tokio::test]
+    async fn test_parse_function_call_keeps_the_thought_in_the_remaining_text() {
+        let ctx = ParserTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+        let payload = json!({
+            "text": "<think>plan</think>Hello",
+            "tool_call_parser": "qwen",
+            "tools": []
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/parse/function_call")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["success"], true);
+        assert_eq!(body_json["tool_calls"], json!([]));
+        assert_eq!(body_json["remaining_text"], "<think>plan</think>Hello");
         ctx.shutdown().await;
     }
 
@@ -297,7 +325,7 @@ mod separate_reasoning_tests {
 
         let payload = json!({
             "text": "<think>Let me think about this problem. The user is asking for help.</think>Sure, I can help you with that.",
-            "reasoning_parser": "step3"
+            "reasoning_parser": "qwen3"
         });
 
         let req = Request::builder()
@@ -374,7 +402,7 @@ mod separate_reasoning_tests {
 
         // Missing 'text' field
         let payload = json!({
-            "reasoning_parser": "step3"
+            "reasoning_parser": "qwen3"
         });
 
         let req = Request::builder()
@@ -413,7 +441,7 @@ mod separate_reasoning_tests {
 
         let payload = json!({
             "text": "",
-            "reasoning_parser": "step3"
+            "reasoning_parser": "qwen3"
         });
 
         let req = Request::builder()
@@ -443,7 +471,7 @@ mod separate_reasoning_tests {
 
         let payload = json!({
             "text": "Just a normal text without any reasoning tags",
-            "reasoning_parser": "step3"
+            "reasoning_parser": "qwen3"
         });
 
         let req = Request::builder()
@@ -469,8 +497,7 @@ mod separate_reasoning_tests {
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(body_json["success"], true);
-        // When there are no reasoning tags, parser returns empty normal_text and empty reasoning_text
-        // since the detect_and_parse_reasoning method only extracts if it finds reasoning markers
+        // Without reasoning markers the table reads the whole text as content.
         assert!(body_json.get("normal_text").is_some());
         assert!(body_json.get("reasoning_text").is_some());
 
@@ -485,7 +512,7 @@ mod separate_reasoning_tests {
         // Some parsers may handle multiple reasoning blocks
         let payload = json!({
             "text": "<think>First thought</think>Text 1<think>Second thought</think>Text 2",
-            "reasoning_parser": "step3"
+            "reasoning_parser": "qwen3"
         });
 
         let req = Request::builder()
@@ -539,7 +566,7 @@ mod api_routing_tests {
 
         let payload = json!({
             "text": "test",
-            "reasoning_parser": "step3"
+            "reasoning_parser": "qwen3"
         });
 
         let req = Request::builder()

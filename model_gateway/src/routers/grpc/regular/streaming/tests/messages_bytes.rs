@@ -1,39 +1,41 @@
 //! The exact SSE bytes of Messages streams, pinned per scenario: text, text
-//! under Symphony (the answer over several chunks: the first delta opens the
-//! block through the content-block machine, the following ones go straight
-//! from the borrowed text to the frame), thinking then text, a tool call and a
-//! length stop, driven over scripted
-//! engine frames and compared byte for byte with
-//! `fixtures/messages_<scenario>.sse`. The fixtures hold the bytes the
-//! per-event copies produced, so any change to the wire format of a Messages
-//! event, intended or not, fails here. Set `SMG_RECORD_SSE_FIXTURES=1` to
-//! rewrite them from the current code.
+//! over several chunks (the first delta opens the block through the
+//! content-block machine, the following ones go straight from the borrowed
+//! text to the frame), thinking then text, a tool call in the Kimi K2 syntax
+//! (the table reads the call's id from the output, so the bytes are the
+//! same on every run) and a length stop, driven over scripted engine frames
+//! and compared byte for byte with `fixtures/messages_<scenario>.sse`. The
+//! fixtures hold the bytes the per-event copies produced, so any change to
+//! the wire format of a Messages event, intended or not, fails here. Set
+//! `SMG_RECORD_SSE_FIXTURES=1` to rewrite them from the current code.
 
 use std::sync::Arc;
 
 use futures::StreamExt as _;
 use smg_grpc_client::vllm_engine::proto;
-use symphony::{formats::qwen3, CallSyntax};
+use symphony::{
+    formats::{kimi_k2, qwen3},
+    CallSyntax, Format,
+};
 use tokio::sync::oneshot;
 
 use super::{
     super::*,
     eof::{
-        chat_spec, chunk, complete, complete_with_prompt, dispatch, messages_spec, processor, pull,
-        scripted_stream, staged_stream, CharacterTokenizer,
+        assignment_of, chat_spec, chunk, complete, complete_with_prompt, dispatch, messages_spec,
+        processor, pull, scripted_stream, staged_stream, CharacterTokenizer, ASSISTANT_PROMPT,
     },
-    sse_bytes::assert_recorded_bytes,
+    sse_bytes::{assert_recorded_bytes, KIMI_K2_CALL, KIMI_K2_PROMPT},
 };
-use crate::routers::grpc::regular::symphony::Assignment;
 
 struct MessagesScenario {
     name: &'static str,
     with_tools: bool,
     thinking: bool,
-    /// Symphony's Qwen3 table reads the message (the content-block machine writes the events)
-    /// instead of the reasoning and tool parsers.
-    symphony: bool,
-    /// The served model; a Kimi name gives the tool call its deterministic id.
+    /// The table that reads the message, and the rendered prompt's tail it replays.
+    format: fn() -> Format,
+    prompt: &'static str,
+    /// The served model.
     model: &'static str,
     frames: Vec<proto::GenerateResponse>,
     /// A substring the scenario's bytes must carry, so the scenario keeps
@@ -47,7 +49,8 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_text",
             with_tools: false,
             thinking: false,
-            symphony: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             model: "fixture-model",
             frames: vec![
                 chunk(0, "Hello"),
@@ -60,7 +63,8 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_symphony_text",
             with_tools: false,
             thinking: false,
-            symphony: true,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             model: "fixture-model",
             frames: vec![
                 chunk(0, "Hello"),
@@ -77,7 +81,8 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_thinking_then_text",
             with_tools: false,
             thinking: true,
-            symphony: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             model: "fixture-model",
             frames: vec![
                 chunk(0, "<think>because"),
@@ -90,11 +95,12 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_tool_use",
             with_tools: true,
             thinking: false,
-            symphony: false,
+            format: kimi_k2,
+            prompt: KIMI_K2_PROMPT,
             model: "kimi-fixture",
             frames: vec![
-                chunk(0, r#"{"name": "lookup", "#),
-                chunk(0, r#""parameters": {"q": "x"}}"#),
+                chunk(0, &KIMI_K2_CALL[..40]),
+                chunk(0, &KIMI_K2_CALL[40..]),
                 complete(0, "stop"),
             ],
             must_contain: r#""type":"tool_use""#,
@@ -103,7 +109,8 @@ fn scenarios() -> Vec<MessagesScenario> {
             name: "messages_length",
             with_tools: false,
             thinking: false,
-            symphony: false,
+            format: || qwen3(CallSyntax::Json),
+            prompt: ASSISTANT_PROMPT,
             model: "fixture-model",
             frames: vec![chunk(0, "a"), complete(0, "length")],
             must_contain: r#""stop_reason":"max_tokens""#,
@@ -129,32 +136,19 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
         thinking_requested: scenario.thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
-        tool_choice: None,
         has_tools: scenario.with_tools,
-        history_tool_calls_count: 0,
         chat_tools: if scenario.with_tools {
             chat_spec(true).tools.unwrap()
         } else {
             Vec::new().into()
         },
         stop_sequences: None,
-        symphony: scenario.symphony.then(|| Assignment {
-            format: Arc::new(qwen3(CallSyntax::Json)),
-            prompt: "<|im_start|>assistant\n".to_string(),
-            forbids_calls: false,
-            past_the_end: false,
-            forcing: None,
-            opener: None,
-            forced_ids: None,
-            json_answer: false,
-            span: Span::none(),
-            marked: Arc::default(),
-        }),
+        symphony: Some(assignment_of((scenario.format)(), scenario.prompt)),
         first_tool_call_only: false,
         parser_names: None,
     };
     let (tx, mut rx) = sse_channel();
-    let result = processor(scenario.with_tools)
+    let result = processor()
         .process_messages_streaming_chunks(
             stream,
             dispatch,
@@ -189,8 +183,9 @@ async fn messages_stream_bytes_match_the_recorded_fixtures() {
 /// is processed, and after it the events the engine has ready at one poll
 /// leave as one frame: the second delta, ready with the first, leaves alone
 /// once the first frame is out (the loop does not wait for more); the two
-/// after the gate share a frame; the stream's tail (the block's stop,
-/// `message_delta`, `message_stop`), written after the read, is one frame.
+/// after the gate share a frame with the block's stop, which the engine's
+/// terminal frame in the same read closes; the stream's tail
+/// (`message_delta`, `message_stop`), written after the read, is one frame.
 #[tokio::test]
 async fn ready_engine_messages_share_a_frame_after_the_first_token_on_the_messages_stream() {
     let (gate, gated) = oneshot::channel();
@@ -212,7 +207,7 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token_on_the_messag
         created: 1,
         weight_version: None,
     };
-    let processor = processor(false);
+    let processor = processor();
     let reading = async {
         let result = processor
             .process_messages_streaming_chunks(
@@ -254,8 +249,8 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token_on_the_messag
     let shape: Vec<usize> = events.iter().map(|(count, _)| *count).collect();
     assert_eq!(
         shape,
-        [1, 2, 1, 2, 3],
-        "message_start alone, the block's start with the first token, the second token alone, the two after the gate together, the tail: {events:?}"
+        [1, 2, 1, 3, 2],
+        "message_start alone, the block's start with the first token, the second token alone, the two after the gate with the block's stop, the tail: {events:?}"
     );
     assert!(
         events[0].1.starts_with("event: message_start\n"),
@@ -268,11 +263,13 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token_on_the_messag
     );
     assert!(events[2].1.contains(r#""text":"b""#), "{events:?}");
     assert!(
-        events[3].1.contains(r#""text":"c""#) && events[3].1.contains(r#""text":"d""#),
+        events[3].1.contains(r#""text":"c""#)
+            && events[3].1.contains(r#""text":"d""#)
+            && events[3].1.ends_with("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"),
         "{events:?}"
     );
     assert!(
-        events[4].1.starts_with("event: content_block_stop\n")
+        events[4].1.starts_with("event: message_delta\n")
             && events[4]
                 .1
                 .ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
@@ -302,7 +299,7 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
     )
     .await;
     let (tx, rx) = driven_channel();
-    let processor = processor(false);
+    let processor = processor();
     let spec = messages_spec(false);
     let reading = async move {
         let result = processor
@@ -374,15 +371,17 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
 /// keeps the empty object it started with and no `input_json_delta` is
 /// written, as the buffered answer's `input` is an empty object too, so a
 /// client that replays the streamed answer replays an object. A call whose
-/// arguments open an object streams them as written. Both tool routes:
-/// Symphony's Qwen3 table and the model's own tool parser.
+/// arguments open an object streams them as written. Two tables: Qwen3's
+/// call, a JSON object between its tags, and Kimi K2's, the arguments behind
+/// the call's own marker.
 #[tokio::test]
 async fn a_tool_call_whose_arguments_are_not_an_object_streams_an_empty_input() {
-    let array_under_symphony = MessagesScenario {
-        name: "array_arguments_symphony",
+    let array_under_qwen3 = MessagesScenario {
+        name: "array_arguments_qwen3",
         with_tools: true,
         thinking: false,
-        symphony: true,
+        format: || qwen3(CallSyntax::Json),
+        prompt: ASSISTANT_PROMPT,
         model: "fixture-model",
         frames: vec![
             chunk(0, "<tool_call>\n{\"name\": \"lookup\", \"arguments\": [1, "),
@@ -391,20 +390,25 @@ async fn a_tool_call_whose_arguments_are_not_an_object_streams_an_empty_input() 
         ],
         must_contain: "",
     };
-    let array_under_the_parser = MessagesScenario {
-        name: "array_arguments_parser",
+    let array_under_kimi_k2 = MessagesScenario {
+        name: "array_arguments_kimi_k2",
         with_tools: true,
         thinking: false,
-        symphony: false,
+        format: kimi_k2,
+        prompt: KIMI_K2_PROMPT,
         model: "kimi-fixture",
         frames: vec![
-            chunk(0, r#"{"name": "lookup", "#),
-            chunk(0, r#""parameters": [1, 2]}"#),
+            chunk(
+                0,
+                "<|tool_calls_section_begin|><|tool_call_begin|>functions.lookup:0\
+                 <|tool_call_argument_begin|>[1, ",
+            ),
+            chunk(0, "2]<|tool_call_end|><|tool_calls_section_end|>"),
             complete(0, "stop"),
         ],
         must_contain: "",
     };
-    for scenario in [array_under_symphony, array_under_the_parser] {
+    for scenario in [array_under_qwen3, array_under_kimi_k2] {
         let bytes = stream_bytes(&scenario).await;
         let text = String::from_utf8_lossy(&bytes);
         assert!(
@@ -420,11 +424,12 @@ async fn a_tool_call_whose_arguments_are_not_an_object_streams_an_empty_input() 
         );
     }
 
-    let object_under_symphony = MessagesScenario {
-        name: "object_arguments_symphony",
+    let object_under_qwen3 = MessagesScenario {
+        name: "object_arguments_qwen3",
         with_tools: true,
         thinking: false,
-        symphony: true,
+        format: || qwen3(CallSyntax::Json),
+        prompt: ASSISTANT_PROMPT,
         model: "fixture-model",
         frames: vec![
             chunk(
@@ -436,7 +441,7 @@ async fn a_tool_call_whose_arguments_are_not_an_object_streams_an_empty_input() 
         ],
         must_contain: "",
     };
-    let bytes = stream_bytes(&object_under_symphony).await;
+    let bytes = stream_bytes(&object_under_qwen3).await;
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("input_json_delta"), "{text}");
     assert!(text.contains(r#""partial_json":"#), "{text}");

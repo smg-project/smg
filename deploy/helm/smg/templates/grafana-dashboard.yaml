@@ -1020,14 +1020,10 @@ data:
           }
         },
         {
-          "title": "Fallbacks, refusals and suppressed calls",
+          "title": "Refusals and suppressed calls",
           "type": "timeseries",
           "datasource": "Prometheus",
           "targets": [
-            {
-              "expr": "sum by (reason) (rate(smg_symphony_fallback_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
-              "legendFormat": "fallback {{ "{{" }}reason{{ "}}" }}"
-            },
             {
               "expr": "sum(rate(smg_symphony_refused_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
               "legendFormat": "refused"

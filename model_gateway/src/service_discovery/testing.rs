@@ -22,7 +22,7 @@ pub(crate) fn create_test_app_context() -> Arc<AppContext> {
 
     // Note: Using uninitialized queue for tests to avoid spawning background workers
     // Jobs submitted during tests will queue but not be processed
-    app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
+    app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()))
 }
 
 /// An `AppContext` whose jobs run: a live job queue and workflow engines, so

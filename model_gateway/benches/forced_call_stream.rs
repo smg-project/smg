@@ -164,8 +164,7 @@ fn bench_forced_calls(c: &mut Criterion) {
         let written = run();
         let after = allocated();
         println!(
-            "{name}: a table reads: {}, {written} bytes written, {} allocations of {} bytes per stream",
-            forced.assign(),
+            "{name}: {written} bytes written, {} allocations of {} bytes per stream",
             after.0 - before.0,
             after.1 - before.1,
         );
@@ -177,14 +176,14 @@ fn bench_forced_calls(c: &mut Criterion) {
     for (name, thought) in [("thought_table", true), ("plain_table", false)] {
         let forced = request(thought, true);
         let before = allocated();
-        let assigned = forced.assign();
+        forced.assign();
         let after = allocated();
         println!(
-            "{name}: a table reads: {assigned}, {} allocations of {} bytes per assignment",
+            "{name}: {} allocations of {} bytes per assignment",
             after.0 - before.0,
             after.1 - before.1,
         );
-        assignments.bench_function(name, |b| b.iter(|| black_box(forced.assign())));
+        assignments.bench_function(name, |b| b.iter(|| forced.assign()));
     }
     assignments.finish();
 }

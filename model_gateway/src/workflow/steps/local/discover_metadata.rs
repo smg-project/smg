@@ -3,9 +3,9 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
+use openai_protocol::worker::GrammarStart;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 

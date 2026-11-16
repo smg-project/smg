@@ -207,7 +207,6 @@ impl ChatRequestBuildingStage {
             },
         )?;
         let format_set_aside = set_aside_for(
-            assignment.is_some(),
             chat_request.response_format.is_some(),
             tool_constraints.as_ref(),
             whole_turn,
@@ -236,7 +235,7 @@ impl ChatRequestBuildingStage {
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.image_tokens = image_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
-        spec.symphony = assignment;
+        spec.symphony = Some(assignment);
         spec.parser_names.clone_from(&ctx.state.parser_names);
 
         Ok(BuildOutput {
@@ -259,19 +258,17 @@ impl ChatRequestBuildingStage {
 /// builders answers, so that they read those as absent and the engine's
 /// request is built from the client's request as sent, with no two competing
 /// constraints in it: the `response_format` when the table's structural tag
-/// stands in for the JSON answer (Symphony reads the response, the request
-/// names a format and the constraint is a tag; see
-/// `regular::symphony::constraint`) or when the whole turn's grammar is the
-/// constraint, which stands in for a `regex` or an `ebnf` too.
+/// stands in for the JSON answer (the request names a format and the
+/// constraint is a tag; see `regular::symphony::constraint`) or when the
+/// whole turn's grammar is the constraint, which stands in for a `regex` or
+/// an `ebnf` too.
 fn set_aside_for(
-    symphony_reads: bool,
     names_a_format: bool,
     tool_constraints: Option<&(String, String)>,
     whole_turn: bool,
 ) -> FormatSetAside {
-    let answered = symphony_reads
-        && names_a_format
-        && tool_constraints.is_some_and(|(kind, _)| kind == "structural_tag");
+    let answered =
+        names_a_format && tool_constraints.is_some_and(|(kind, _)| kind == "structural_tag");
     FormatSetAside {
         response_format: answered || whole_turn,
         grammar: whole_turn,
@@ -464,10 +461,9 @@ mod tests {
     }
 
     /// What the stage sets aside follows what the constraint answers: the
-    /// `response_format` when Symphony's tag stands in for a JSON answer, both
-    /// kinds of field for the whole turn's grammar, and nothing when the
-    /// legacy parsers read the response, when the request names no format, or
-    /// when the constraint is not a tag.
+    /// `response_format` when the table's tag stands in for a JSON answer,
+    /// both kinds of field for the whole turn's grammar, and nothing when the
+    /// request names no format or when the constraint is not a tag.
     #[test]
     fn the_set_aside_follows_what_the_constraint_answers() {
         let tag = ("structural_tag".to_string(), FORCED_CALL_TAG.to_string());
@@ -476,27 +472,14 @@ mod tests {
             response_format,
             grammar,
         };
+        assert_eq!(set_aside_for(true, Some(&tag), false), aside(true, false));
+        assert_eq!(set_aside_for(true, Some(&tag), true), aside(true, true));
+        assert_eq!(set_aside_for(false, None, true), aside(true, true));
+        assert_eq!(set_aside_for(false, Some(&tag), false), aside(false, false));
         assert_eq!(
-            set_aside_for(true, true, Some(&tag), false),
-            aside(true, false)
-        );
-        assert_eq!(
-            set_aside_for(true, true, Some(&tag), true),
-            aside(true, true)
-        );
-        assert_eq!(set_aside_for(false, false, None, true), aside(true, true));
-        assert_eq!(
-            set_aside_for(false, true, Some(&tag), false),
+            set_aside_for(true, Some(&schema), false),
             aside(false, false)
         );
-        assert_eq!(
-            set_aside_for(true, false, Some(&tag), false),
-            aside(false, false)
-        );
-        assert_eq!(
-            set_aside_for(true, true, Some(&schema), false),
-            aside(false, false)
-        );
-        assert_eq!(set_aside_for(true, true, None, false), aside(false, false));
+        assert_eq!(set_aside_for(true, None, false), aside(false, false));
     }
 }

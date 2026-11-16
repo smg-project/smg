@@ -233,11 +233,7 @@ mod tests {
             .load("tokenizer-id", "m", "test", || async move { Ok(loaded) })
             .await
             .unwrap();
-        let components = components_over(
-            tokenizer_registry,
-            Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
-        );
+        let components = components_over(tokenizer_registry, Arc::new(WorkerRegistry::new()));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m", "messages": [{"role": "user", "content": "Hello world"}]
         }))

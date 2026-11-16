@@ -27,7 +27,7 @@ fn the_pipeline_counts_an_unserved_model_under_other() {
         })
         .build();
     worker_registry.register(Arc::new(worker)).unwrap();
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry,
         Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
         None,

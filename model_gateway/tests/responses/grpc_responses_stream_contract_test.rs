@@ -4,10 +4,7 @@
 
 use std::{error::Error, sync::Arc, time::Duration};
 
-use axum::{
-    body::to_bytes,
-    http::{HeaderMap, HeaderValue, StatusCode},
-};
+use axum::{body::to_bytes, http::StatusCode};
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
@@ -52,7 +49,6 @@ async fn responses_result_with_final_answer(
         stream,
         final_answer_after.map(|limit| (limit, "Final answer after tools")),
         vec!["stop"],
-        false,
     )
     .await
 }
@@ -63,10 +59,6 @@ async fn responses_result_with_final_answer(
     clippy::disallowed_methods,
     reason = "test helper: failures should panic; the in-process worker is aborted after the request"
 )]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one case: its script, its request and its reader"
-)]
 async fn responses_result_with_finishes(
     tools: Value,
     output: Option<&str>,
@@ -75,7 +67,6 @@ async fn responses_result_with_finishes(
     stream: bool,
     final_answer_after: Option<(usize, &str)>,
     finish_reasons: Vec<&'static str>,
-    legacy_reader: bool,
 ) -> (Value, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -159,20 +150,12 @@ async fn responses_result_with_finishes(
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,
     }))
     .unwrap();
-    let headers = legacy_reader.then(|| {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-parser", HeaderValue::from_static("legacy"));
-        headers
-    });
-    let (status, content_type, parser, bytes) = timeout(Duration::from_secs(30), async {
-        let response = router
-            .route_responses(headers.as_ref(), &tenant, request, MODEL)
-            .await;
+    let (status, content_type, bytes) = timeout(Duration::from_secs(30), async {
+        let response = router.route_responses(None, &tenant, request, MODEL).await;
         let status = response.status();
         let content_type = response.headers().get("content-type").cloned();
-        let parser = response.headers().get("x-smg-parser").cloned();
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        (status, content_type, parser, bytes)
+        (status, content_type, bytes)
     })
     .await
     .expect("Responses stream should terminate");
@@ -188,28 +171,6 @@ async fn responses_result_with_finishes(
         StatusCode::OK,
         "{}",
         String::from_utf8_lossy(&bytes)
-    );
-    // Every answer names the parser that read it, as the chat route does: the
-    // JSON answer and the SSE answer, with and without MCP tools (the MCP
-    // stream's header comes from the startup barrier, the non-stream tool
-    // loop's from its last completion). Which reader it is follows the
-    // parser rule the route test pins, and this helper's own setup decides
-    // it: the `qwen` tool parser is configured exactly when an output is
-    // scripted, and under a configured tool parser the Symphony reader is
-    // chosen, so every scripted-output case names `symphony` (the scripted
-    // plain answer included) and the two unscripted cases `legacy`, as does
-    // a case whose request asks for the legacy reader.
-    let parser = parser.as_ref().and_then(|value| value.to_str().ok());
-    let expected = if output.is_some() && !legacy_reader {
-        "symphony"
-    } else {
-        "legacy"
-    };
-    assert_eq!(
-        parser,
-        Some(expected),
-        "x-smg-parser on the {} answer",
-        if stream { "SSE" } else { "JSON" }
     );
     if !stream {
         let response: Value = serde_json::from_slice(&bytes).unwrap();
@@ -679,43 +640,6 @@ fn message_text_holds_call_markup(response: &Value) -> bool {
         })
 }
 
-/// The same under the legacy reader, whose streaming parsers read a call only
-/// to a tool of the list the response is read against: the final turn is read
-/// against the server tools as every turn is, so the repeated call is a call
-/// there too, in both forms.
-#[tokio::test]
-async fn mcp_final_turn_hides_a_repeated_server_call_under_the_legacy_reader() {
-    for stream in [false, true] {
-        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
-            .await
-            .unwrap();
-        let (response, events) = responses_result_with_finishes(
-            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
-            Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"query-0\"}}\n</tool_call>\n"),
-            Some(1),
-            "completed",
-            stream,
-            None,
-            vec!["stop"],
-            true,
-        )
-        .await;
-        mcp.stop().await;
-        assert!(response["error"].is_null(), "stream={stream}: {response}");
-        assert_executed_mcp_queries(&response, &["query-0"]);
-        assert!(
-            !events
-                .iter()
-                .any(|event| event["item"]["type"] == "function_call"),
-            "no server call reaches the client as a function: {events:?}"
-        );
-        assert!(
-            !message_text_holds_call_markup(&response),
-            "the final turn's repeated call is hidden, not text, stream={stream}: {response}"
-        );
-    }
-}
-
 #[tokio::test]
 async fn mcp_unfinished_generation_never_dispatches_tools() {
     for finish in ["length", "failed"] {
@@ -727,7 +651,7 @@ async fn mcp_unfinished_generation_never_dispatches_tools() {
                 json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
                 Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>"),
                 Some(1), if finish == "length" { "incomplete" } else { "failed" },
-                stream, None, vec![finish], false,
+                stream, None, vec![finish],
             ).await;
             mcp.stop().await;
             assert_eq!(
@@ -863,7 +787,6 @@ async fn bare_generation_failure_includes_error_details() {
                 stream,
                 None,
                 vec!["failed"],
-                false,
             )
             .await;
             mcp.stop().await;
@@ -890,7 +813,7 @@ async fn mcp_unfinished_later_generation_preserves_executed_results() {
                 Some(r#"<tool_call>
 {"name":"brave_web_search","arguments":{"query":"first"}}
 </tool_call>"#),
-                Some(2), if finish == "length" { "incomplete" } else { "failed" }, stream, None, vec!["stop", finish], false,
+                Some(2), if finish == "length" { "incomplete" } else { "failed" }, stream, None, vec!["stop", finish],
             ).await;
             mcp.stop().await;
             assert_eq!(mcp.call_count(), 1, "{response}");
@@ -916,7 +839,7 @@ async fn mcp_client_handoff_preserves_previous_server_results() {
             None, "completed", stream,
             Some((1, r#"<tool_call>
 {"name":"user_tool","arguments":{}}
-</tool_call>"#)), vec!["stop"], false,
+</tool_call>"#)), vec!["stop"],
         ).await;
         mcp.stop().await;
         assert_eq!(mcp.call_count(), 1);
@@ -947,7 +870,7 @@ async fn mcp_filter_preserves_namespaced_client_function_with_same_member_name()
                     ]}
                 ]),
                 Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"first\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"client.brave_web_search\",\"arguments\":{}}\n</tool_call>"),
-                None, if finish == "length" { "incomplete" } else { "completed" }, stream, None, vec![finish], false,
+                None, if finish == "length" { "incomplete" } else { "completed" }, stream, None, vec![finish],
             ).await;
             mcp.stop().await;
             assert_executed_mcp_queries(
@@ -976,7 +899,7 @@ async fn engine_error_never_dispatches_mcp_calls() {
         responses_result_with_finishes(
             json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
             Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{}}\n</tool_call>"),
-            Some(1), if stream { "failed" } else { "http_error" }, stream, None, vec!["error"], false,
+            Some(1), if stream { "failed" } else { "http_error" }, stream, None, vec!["error"],
         ).await;
         mcp.stop().await;
         assert_eq!(mcp.call_count(), 0);

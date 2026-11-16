@@ -293,7 +293,6 @@ mod tests {
         let mut context = AppContext::clone(&app_context_for_tests(
             config,
             Arc::new(WorkerRegistry::new()),
-            None,
         ));
         let monitor = Arc::new(KvEventMonitor::new());
         context

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
-    routers::grpc::regular::processor::ResponseProcessor, worker::WorkerRegistry,
+    routers::grpc::regular::processor::ResponseProcessor,
 };
 
 const MODEL: &str = "generate-tokens-test";
@@ -133,24 +133,20 @@ fn a_collected_generate_answer_counts_its_prompt_and_cache_hit_once_per_request(
                 created: 1,
                 weight_version: None,
             };
-            let responses = ResponseProcessor::new(
-                ToolParserFactory::new(),
-                ReasoningParserFactory::new(),
-                utils::ParserResolver::with_flags(Arc::new(WorkerRegistry::new()), None, None),
-            )
-            .process_non_streaming_generate_response(
-                context::ExecutionResult::Single {
-                    stream,
-                    dispatch_start: Instant::now(),
-                },
-                dispatch,
-                &mut decoder,
-                false,
-                Instant::now(),
-                metrics_labels::ENDPOINT_GENERATE,
-            )
-            .await
-            .unwrap_or_else(|response| panic!("{}", response.status()));
+            let responses = ResponseProcessor::new()
+                .process_non_streaming_generate_response(
+                    context::ExecutionResult::Single {
+                        stream,
+                        dispatch_start: Instant::now(),
+                    },
+                    dispatch,
+                    &mut decoder,
+                    false,
+                    Instant::now(),
+                    metrics_labels::ENDPOINT_GENERATE,
+                )
+                .await
+                .unwrap_or_else(|response| panic!("{}", response.status()));
             server.abort();
             // The figures the scrape counts are the ones every choice's
             // `meta_info` reports to the client.

@@ -15,7 +15,7 @@ async fn pipeline_over(
     let port = spawn_stub(scheduler.clone()).await;
     let worker_registry = Arc::new(WorkerRegistry::new());
     register_worker(&worker_registry, port, WorkerType::Regular);
-    let deps = PipelineDeps::pair(
+    let deps = PipelineDeps::new(
         worker_registry.clone(),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,

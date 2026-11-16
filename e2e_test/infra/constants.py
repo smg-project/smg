@@ -260,27 +260,19 @@ VLLM_MM_PROCESSORS = ("inprocess", "smg")
 
 
 def get_parser() -> str | None:
-    """The parser a lane starts the gateway with, its ``--parser`` flag.
-
-    Set ``E2E_PARSER=legacy`` to read every chat completion with the per-model
-    parsers; ``symphony`` pins Symphony for the models its registry knows.
-    Unset or blank leaves the gateway on its default, symphony.
+    """The parser a lane starts the gateway with, its ``--parser`` flag, which keeps its one
+    value for one release: set ``E2E_PARSER=symphony`` to pass the flag explicitly; unset or
+    blank leaves the command line without it. The flag is removed in 1.17, and this variable
+    with it.
     """
     value = os.environ.get(ENV_PARSER, "").strip().lower()
     if not value:
         return None
-    if value not in ("legacy", "symphony"):
-        raise ValueError(f"{ENV_PARSER}={value!r} is not a parser; use legacy or symphony")
+    if value != "symphony":
+        raise ValueError(
+            f"{ENV_PARSER}={value!r} is not a parser; the gateway reads with symphony alone"
+        )
     return value
-
-
-def effective_parser() -> str:
-    """The parser the gateway reads with in this lane: ``get_parser()`` when ``E2E_PARSER``
-    is set, else the gateway's own default, ``symphony``. A test that branches on the parser
-    reads this, so it need not know the default; the command line still omits ``--parser``
-    when the variable is blank (``Gateway._build_base_cmd``).
-    """
-    return get_parser() or "symphony"
 
 
 def get_vllm_mm_processor() -> str:

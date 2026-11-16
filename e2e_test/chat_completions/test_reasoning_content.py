@@ -22,13 +22,12 @@ logger = logging.getLogger(__name__)
 @pytest.mark.engine("sglang", "vllm", "trtllm", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.model("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
-@pytest.mark.gateway(
-    extra_args=["--reasoning-parser", "deepseek_r1", "--history-backend", "memory"]
-)
+@pytest.mark.gateway(extra_args=["--reasoning-parser", "deepseek", "--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestReasoningContentAPI:
-    """Tests for reasoning content API with DeepSeek R1 reasoning parser.
+    """Tests for the reasoning content API with the DeepSeek V3 table, which `deepseek` names
+    and which reads the R1 line's thought.
 
     On the mock engine each test states the model's answer first (``mock_answers``, a
     no-op on a real engine): the template opens the thought in the prompt, so the

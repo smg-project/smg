@@ -169,14 +169,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     .any(|field| matches!(*field, "tool_parser" | "reasoning_parser"))
                 {
                     for card in models.iter() {
-                        validate_parser_overrides(
-                            card,
-                            worker.url(),
-                            app_context.router_config.parser,
-                            app_context.tool_parser_factory.as_ref(),
-                            app_context.reasoning_parser_factory.as_ref(),
-                        )
-                        .map_err(|message| WorkflowError::StepFailed {
+                        validate_parser_overrides(card, worker.url()).map_err(|message| WorkflowError::StepFailed {
                             step_id: StepId::new("update_worker_properties"),
                             message,
                         })?;

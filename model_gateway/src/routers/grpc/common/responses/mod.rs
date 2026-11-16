@@ -19,7 +19,7 @@ pub(crate) use driven::{
 pub(crate) use history::{load_history, ReplayInto};
 pub(crate) use streaming::{
     await_stream_startup, body_guards, build_sse_response, build_sse_response_from_stream,
-    naming_parser, signal_stream_startup, stream_startup_channel, StreamStartupSender,
+    signal_stream_startup, stream_startup_channel, StreamStartupSender,
 };
 pub(crate) use utils::{
     ensure_mcp_connection, persist_response_if_needed, previous_response_chain, stored_foreground,

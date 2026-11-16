@@ -7,10 +7,13 @@
 use axum::{body::Body, http::StatusCode};
 use http_body_util::BodyExt;
 use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
+use symphony::{formats::qwen3, CallSyntax};
 
 use super::{
     super::*,
-    eof::{chunk, complete, processor, scripted_stream, CharacterTokenizer},
+    eof::{
+        chunk, complete, processor, read_by, scripted_stream, CharacterTokenizer, ASSISTANT_PROMPT,
+    },
 };
 
 /// The spec of a streamed chat request for `model` with `fields` on top, as
@@ -23,7 +26,11 @@ fn spec_for(model: &str, fields: Value) -> ChatResponseSpec {
         .extend(fields.as_object().cloned().unwrap_or_default());
     let mut request: ChatCompletionRequest = serde_json::from_value(request).expect("chat request");
     request.normalize();
-    ChatResponseSpec::from(&request)
+    read_by(
+        ChatResponseSpec::from(&request),
+        qwen3(CallSyntax::Json),
+        ASSISTANT_PROMPT,
+    )
 }
 
 /// The `data:` payloads of one streamed chat completion for `spec`, in order
@@ -37,7 +44,7 @@ async fn streamed_payloads(spec: ChatResponseSpec) -> Vec<String> {
         weight_version: None,
     };
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
-    let response = Arc::new(processor(false))
+    let response = Arc::new(processor())
         .process_streaming_response(
             context::ExecutionResult::Single {
                 stream,

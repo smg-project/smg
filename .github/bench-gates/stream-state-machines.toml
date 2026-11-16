@@ -1,9 +1,10 @@
 # Regression gate for `cargo bench -p smg --bench stream_state_machines`, run by
 # .github/workflows/benchmark-stream-state-machines.yml on pull requests through scripts/bench_gate.py.
 #
-# The five rows each drive one stream of 300 single-token chunks and a completion through a stream state
-# machine (a chat under the legacy parsers, the same chat under a Symphony table, a completion, a generate
-# and a Messages stream) over a scripted engine stream decoded by the client's own codec, no socket under it;
+# The four rows each drive one stream of 300 single-token chunks and a completion through a stream state
+# machine (a chat under a Symphony table, a completion, a generate and a Messages stream; the chat under the
+# older parsers was a fifth row until those parsers went) over a scripted engine stream decoded by the
+# client's own codec, no socket under it;
 # criterion's warmed-up sample medians, in nanoseconds per chunk.
 #
 # Threshold. tokenizer.toml describes the method: the smallest multiple of 5 % that is at least twice the

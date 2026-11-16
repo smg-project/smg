@@ -143,11 +143,7 @@ mod tests {
     }
 
     fn test_app_context() -> Arc<AppContext> {
-        app_context_for_tests(
-            RouterConfig::default(),
-            Arc::new(WorkerRegistry::new()),
-            None,
-        )
+        app_context_for_tests(RouterConfig::default(), Arc::new(WorkerRegistry::new()))
     }
 
     /// The activation is a registry transition, published as a
