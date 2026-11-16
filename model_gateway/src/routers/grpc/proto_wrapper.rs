@@ -773,8 +773,8 @@ impl WatchedStream {
 /// A disaggregated request's decode side. Its engine loads the prompt's KV
 /// from the prefill side and reports what it loaded as cached, so every chunk
 /// and complete it yields is restamped with the prefill side's prefix-cache
-/// hit before the gateway reads it. Decode sides are not tracked today; if one
-/// ever is, the tracking must sit inside this wrapper, so that a
+/// hit before the gateway reads it. A decode side's tracking sits inside this
+/// wrapper (every route puts the wrapper on last), so that a
 /// [`PrefillTicket`] reads the engine's own `cached_tokens`, not the
 /// restamped value.
 pub struct DecodeStream {
@@ -813,11 +813,12 @@ impl PrefillCachedTokens {
     /// entry, or the one entry of a prefill that completed once for the
     /// whole request.
     pub fn for_index(&self, index: u32) -> Option<u32> {
-        match self.by_index.get(&index) {
-            Some(cached) => Some(*cached),
-            None if self.by_index.len() == 1 => self.by_index.values().next().copied(),
-            None => None,
+        // One entry answers every index, as the sample's own or as the whole
+        // request's: no hash of the index on a decode side's every message.
+        if self.by_index.len() == 1 {
+            return self.by_index.values().next().copied();
         }
+        self.by_index.get(&index).copied()
     }
 
     fn restamp(&self, index: u32, cached: &mut u32) {
@@ -1558,6 +1559,57 @@ mod tracked_tests {
         );
     }
 
+    /// A decode side restamps every response the stream it wraps hands on,
+    /// a held first item as the ones read after it, and once: a wrapper
+    /// inside a wrapper answers with the outer side's figure.
+    #[tokio::test]
+    async fn a_decode_side_restamps_every_response_of_the_stream_it_wraps() {
+        type Item = Result<ProtoGenerateResponse, tonic::Status>;
+        let chunk = |cached_tokens| -> Item {
+            let chunk = vllm::GenerateStreamChunk {
+                cached_tokens,
+                ..Default::default()
+            };
+            let response = Some(vllm::generate_response::Response::Chunk(chunk));
+            Ok(ProtoGenerateResponse::Vllm(Box::new(
+                vllm::GenerateResponse { response },
+            )))
+        };
+        let which = |item: Option<&Item>| Some(item?.as_ref().ok()?.cached_tokens());
+        let prefill = |cached_tokens| {
+            let mut prefill = super::PrefillCachedTokens::default();
+            prefill.note(&super::ProtoGenerateComplete::Vllm(Box::new(
+                vllm::GenerateComplete {
+                    cached_tokens,
+                    ..Default::default()
+                },
+            )));
+            prefill
+        };
+        // Two tracked layers, each holding one chunk for its reader: the
+        // stream yields the chunks 1 and 2 and ends.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let two_chunks = || {
+            let empty = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+            [2, 1].into_iter().fold(empty, |inner, id| {
+                let mut layer = inner.tracked(Arc::clone(&engine), 0, false);
+                if let ProtoStream::Tracked(tracked) = &mut layer {
+                    tracked.replay = Some(Some(chunk(id)));
+                }
+                layer
+            })
+        };
+        let mut stream = two_chunks().decode_side(prefill(7));
+        assert!(matches!(stream, ProtoStream::DecodeSide(_)), "wrapped");
+        assert_eq!(which(stream.next().await.as_ref()), Some(7), "the held");
+        assert_eq!(which(stream.next().await.as_ref()), Some(7), "the next");
+        assert!(stream.next().await.is_none(), "to the stream's end");
+        let mut stream = two_chunks().decode_side(prefill(7)).decode_side(prefill(9));
+        assert_eq!(which(stream.next().await.as_ref()), Some(9), "the outer");
+        assert_eq!(which(stream.next().await.as_ref()), Some(9), "the outer");
+        assert!(stream.next().await.is_none(), "to the stream's end");
+    }
+
     /// A decode side's first item is its prefill worker's handoff only when
     /// it is output: a chunk, or a complete that ended neither in an abort
     /// (an aborted choice, as the Rust servicers end one) nor in an error.
@@ -1883,10 +1935,34 @@ impl ProtoStream {
         }
     }
 
+    /// `item` as this stream hands it on: under a decode-side wrapper a
+    /// response carries the prefill side's prefix-cache hit instead of its
+    /// own, stamped where the item lies. The inner stream did its own
+    /// bookkeeping and engine-error mapping; only the prompt-side usage
+    /// changes here. The wrapper is looked at when the item is in hand:
+    /// nothing of it is carried across a wait, and a stream with no wrapper
+    /// pays one test a message.
+    #[inline]
+    fn restamp(&self, item: &mut Option<Result<ProtoGenerateResponse, tonic::Status>>) {
+        if let (Self::DecodeSide(side), Some(Ok(response))) = (self, item) {
+            response.restamp_cached_tokens(&side.prefill);
+        }
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        let Self::Watched(watched) = self else {
-            return self.next_unwatched().await;
+        // A decode side is read through the layers it wraps, in place, and
+        // restamped on the way out: read through this function a second
+        // time, its messages paid a boxed future and each layer's dispatch
+        // twice.
+        let stream = match &mut *self {
+            Self::DecodeSide(side) => &mut side.inner,
+            stream => stream,
+        };
+        let Self::Watched(watched) = stream else {
+            let mut item = stream.next_unwatched().await;
+            self.restamp(&mut item);
+            return item;
         };
         let WatchedStream {
             inner,
@@ -1919,7 +1995,10 @@ impl ProtoStream {
             .await
         };
         match item {
-            Some(item) => item,
+            Some(mut item) => {
+                self.restamp(&mut item);
+                item
+            }
             None => {
                 watched.client_left();
                 None
@@ -1935,9 +2014,10 @@ impl ProtoStream {
             return Box::pin(self.next()).await;
         }
         if let Self::DecodeSide(side) = self {
-            // A decode side's messages are polled in place as a tracked
-            // stream's are, without a boxed future per message; a wrapper
-            // inside the wrapper recurses. The inner stream did its own
+            // Reached with a watch over the wrapper, or with one wrapper
+            // inside another: [`Self::next`] reads a decode side in place. A
+            // tracked stream or a wrapper under this one is read through
+            // `next`, behind a boxed future. The inner stream did its own
             // bookkeeping and engine-error mapping; only the prompt-side usage
             // changes here.
             let item = if matches!(side.inner, Self::Tracked(_) | Self::DecodeSide(_)) {
@@ -2034,8 +2114,8 @@ impl ProtoStream {
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
             Self::Tracked(_) | Self::Watched(_) => return Box::pin(self.next()).await,
-            // Reached only with one wrapper inside another: [`Self::next`]
-            // polls a decode side in place.
+            // Reached with a tracked layer over the wrapper, which no route
+            // builds: [`Self::next`] reads a decode side in place.
             Self::DecodeSide(_) => return Box::pin(self.next()).await,
             // The held item, mapped when it was read, and the layer goes.
             Self::Ahead(ahead) => {
@@ -3366,6 +3446,43 @@ mod watched_tests {
             stream.client_left(),
             "the end was the client's leaving, seen through the wrapper"
         );
+    }
+
+    /// A decode side restamps a watched stream's responses whichever layer
+    /// is outside: the wrapper over the watch, as dual dispatch builds it,
+    /// and the watch over the wrapper.
+    #[tokio::test]
+    async fn a_decode_side_restamps_over_a_watch_and_under_one() {
+        let prefill = || {
+            let mut prefill = PrefillCachedTokens::default();
+            prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+                vllm::GenerateComplete {
+                    prompt_tokens: 4,
+                    cached_tokens: 2,
+                    ..Default::default()
+                },
+            )));
+            prefill
+        };
+        let (stream, gate, _rx) = watched(vec![chunk(0, "a")], vec![complete(0, "stop")]).await;
+        let mut over = stream.decode_side(prefill());
+        let (under_gate, gate_rx) = oneshot::channel();
+        let (stream, _server) =
+            gated_stream(vec![chunk(0, "a")], gate_rx, vec![complete(0, "stop")], "0").await;
+        let (client, _under_rx) = sse_channel();
+        let mut under = stream
+            .decode_side(prefill())
+            .until_client_gone(&client, "req-watched");
+        gate.send(()).expect("the stream holds its gate");
+        under_gate.send(()).expect("the stream holds its gate");
+        for stream in [&mut over, &mut under] {
+            for _ in 0..2 {
+                let response = stream.next().await.expect("a response");
+                let response = response.expect("no error");
+                assert_eq!(response.cached_tokens(), 2, "the prefill's hit");
+            }
+            assert!(stream.next().await.is_none(), "the engine's end");
+        }
     }
 
     /// The wait for the client's leaving is one for the stream's whole life,
