@@ -6,6 +6,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A `CompletionRequest` whose `best_of` equals `n` validates: the public API gives both fields
+  the default 1, so a request that states both defaults is the plain one and is no longer refused
+  under `best_of_less_than_n`. A `best_of` under `n` is still refused with that code (its sentence
+  now reads `best_of must be greater than or equal to n`), and on a stream only a `best_of` above
+  `n` is refused under `best_of_not_supported_with_stream`, whose sentence now reads
+  `best_of greater than n is not supported when stream is enabled`.
+
 - `EmbeddingObject.embedding` is an `Embedding`: the float array, or the base64 string of the
   vector's little-endian f32 bytes when the request asked for `encoding_format: "base64"`; the
   type is untagged, so an answer reads either shape. The gateway's gRPC embeddings path answered
@@ -41,11 +48,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   Messages route answered before. That route reads both through a typed header extractor, and the
   external router's beta reading shares the grammar.
 - `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
-  transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
-  handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
-  one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
-  `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
-  read it.
+  newtype over `serde_json::Value` with nothing to validate or normalize before the handler sees
+  it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or one under
+  another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
+  `invalid_json` or `json_parse_error`) as the typed routes do. A repeated key is refused as a
+  typed body's is (`json_parse_error`, serde's `duplicate field` words, the place as `param`), at
+  the body's own keys and at any depth below them; the keys of `metadata` keep the last value, as
+  that map's do in a typed body. The gateway's Conversations routes read it.
 - `Usage::with_image_tokens`: the prompt's image token count reported as
   `prompt_tokens_details.image_tokens`, kept within `prompt_tokens`; `None` leaves the details as
   they are. The gateway's chat route reports the tokens its own multimodal expansion wrote into
@@ -190,6 +199,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   writes it, parses, with no completion tokens. The crate refused the whole answer with
   ``missing field `completion_tokens` ``. The rerank and classify answers share `UsageInfo` and
   read the same way; a usage the gateway writes is unchanged.
+- A Messages document's content source takes its content as a string, and the request's
+  `container` takes the id of a container as a string, as the public API takes both beside their
+  other forms. Each string was refused with the whole request. On the gRPC router a string
+  content source renders as the document's text, as a text source does. Breaking:
+  `DocumentSource::Content` holds the new `DocumentContent`, and `CreateMessageRequest.container`
+  is the new `MessagesContainer`.
 - `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
   (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
   request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public
@@ -324,6 +339,17 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   copy a chat template renders, and `FunctionTool::allows_direct_calls` and
   `CustomTool::allows_direct_calls` say whether the model may call a tool itself. Breaking:
   `CustomTool` gains `r#async: Option<bool>` and `allowed_callers: Option<Vec<String>>`.
+- An Interactions request keeps the fields the gateway does not model (`continuation_token`,
+  `safety_settings`, `service_tier`, `webhook_config`, `environment`, `labels`, `cached_content`,
+  and any the API adds), forwarded to the upstream as written, as the Messages request's `other`
+  keeps its. The Gemini router rebuilds the upstream body from the typed request, which dropped
+  them: the safety settings were lost, and a `store: false` client's continuation hop reached the
+  upstream without its token, so each hop started the answer over. A modeled field also reads its
+  camelCase spelling (`previousInteractionId`, `systemInstruction`, `generationConfig`, ...) into
+  the typed field, where the gateway's checks see it, and a body with both spellings is refused.
+  So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
+  `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
+  Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
 - `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
   `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
   gateway's `/generate` reads its body through the validated extractor and answers a negative
@@ -333,10 +359,6 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
   `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
   `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
-- A `/v1/tokenize` answer carries `max_model_len`, as SGLang's `/tokenize` writes it: the smallest
-  context window any of the model's workers reports, or -1, SGLang's value when there is none.
-  SGLang's own `TokenizeResponse` refused the gateway's answer without it. Breaking:
-  `TokenizeResponse` gains `max_model_len`.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a

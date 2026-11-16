@@ -1,18 +1,55 @@
-//! Integration tests for tokenizers using real tokenizer data
+//! Integration tests of the tokenizer wrapper on a tokenizer file
 //!
-//! These tests download the TinyLlama tokenizer from HuggingFace to verify our tokenizer
-//! implementation works correctly with real-world tokenizer files.
+//! The cases build a small BPE in the Llama family's style in code (the word mark, byte
+//! fallback, the strip decoder; `common::word_mark_bpe`), save it as a `tokenizer.json` and
+//! read it through the wrapper. Real vocabularies are pinned by the fixtures run
+//! (`bellwether_fixtures`); the last cases of this file test the hub download itself.
 
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use llm_tokenizer::{
     factory, huggingface::HuggingFaceTokenizer, sequence::Sequence, stop::*, stream::DecodeStream,
     traits::*,
 };
 
-use crate::common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
+use crate::common::{word_mark_bpe, EXPECTED_HASHES, TEST_PROMPTS, WORD_MARK_MERGES};
 
-const LONG_TEST_PROMPTS: [(&str, &str); 6] = [
+/// The ids [`word_mark_bpe`] gives [`TEST_PROMPTS`].
+const EXPECTED_IDS: [&[u32]; 4] = [
+    &[288, 275, 293, 277, 273, 290, 295],
+    &[259, 71, 287, 275, 293, 277, 273, 290, 295],
+    &[
+        259, 267, 260, 278, 297, 284, 274, 273, 264, 259, 278, 287, 273, 259, 273, 264, 272, 274,
+        291, 260, 279, 264, 271, 284,
+    ],
+    &[
+        297, 274, 279, 267, 264, 277, 259, 275, 277, 274, 272, 275, 279,
+    ],
+];
+
+/// Writes the cases' tokenizer, [`word_mark_bpe`], as `tokenizer.json` in `dir`.
+#[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
+fn write_tokenizer_file(dir: &Path) -> PathBuf {
+    let path = dir.join("tokenizer.json");
+    word_mark_bpe(&WORD_MARK_MERGES)
+        .save(&path, false)
+        .expect("Failed to write the tokenizer file");
+    path
+}
+
+/// The cases' tokenizer file in a directory of its own, which the caller keeps for as
+/// long as it reads the file.
+#[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
+fn tokenizer_file() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let path = write_tokenizer_file(dir.path());
+    (dir, path)
+}
+
+const LONG_TEST_PROMPTS: [(&str, &str); 7] = [
     ("Tell me about the following text.", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."),
     ("Tell me about the following text.", "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."),
     ("Tell me about the following text.", "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt."),
@@ -25,7 +62,10 @@ const LONG_TEST_PROMPTS: [(&str, &str); 6] = [
     Each battle is played under enchanted floodlights, the lines patrolled by spectral line judges whose calls are final. The crowd's roar swells with every break point, and the Silver-Wristed Knight's racket glows brightest when the match teeters at deuce. There are moments when doubt grips him — when his serve falters or his touch deserts him — but each challenge teaches a new stroke, culminating in the legendary Forehand of Dawn.
     When the last relic is claimed, he stands not as a conqueror but as a custodian of the game, knowing that rivalries forge the very magic he protects. The balance is restored — until the next season begins."),
     // Emoji stress test
-    ("Tell me about the following text.", "😀😃😄😁😆🥹😅😂🤣🥲☺️😊😇🙂🙃😉🤩😎 🤪🥳🤓🙄🤪😵👻")
+    ("Tell me about the following text.", "😀😃😄😁😆🥹😅😂🤣🥲☺️😊😇🙂🙃😉🤩😎 🤪🥳🤓🙄🤪😵👻"),
+    // Accented words: a character of more than one byte right after a letter token, whose
+    // first byte the stream holds back
+    ("Tell me about the following text.", "A naïve café, déjà vu."),
 ];
 
 #[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
@@ -44,22 +84,33 @@ fn compute_hashes_for_tokenizer<E: Encoder>(tokenizer: &E, prompts: &[&str]) -> 
 #[test]
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 fn test_huggingface_tokenizer_hashes() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load HuggingFace tokenizer");
 
+    let prompt_ids: Vec<Vec<u32>> = TEST_PROMPTS
+        .iter()
+        .map(|prompt| {
+            tokenizer
+                .encode(prompt, false)
+                .expect("Failed to encode prompt")
+                .token_ids()
+                .to_vec()
+        })
+        .collect();
     let prompt_hashes = compute_hashes_for_tokenizer(&tokenizer, &TEST_PROMPTS);
 
     println!(
-        "HF Tokenizer: {tokenizer_path:?}\nComputed Hashes: {prompt_hashes:?}\nExpected Hashes: {EXPECTED_HASHES:?}"
+        "HF Tokenizer: {tokenizer_path:?}\nComputed Ids: {prompt_ids:?}\nComputed Hashes: {prompt_hashes:?}\nExpected Hashes: {EXPECTED_HASHES:?}"
     );
 
+    assert_eq!(prompt_ids, EXPECTED_IDS);
     assert_eq!(prompt_hashes, EXPECTED_HASHES);
 }
 
 #[test]
 fn test_tokenizer_encode_decode_lifecycle() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load HuggingFace tokenizer");
 
@@ -78,7 +129,7 @@ fn test_tokenizer_encode_decode_lifecycle() {
 
 #[test]
 fn test_sequence_operations() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
@@ -118,7 +169,7 @@ fn test_sequence_operations() {
 
 #[test]
 fn test_decode_stream() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
@@ -144,7 +195,7 @@ fn test_decode_stream() {
 
 #[test]
 fn test_long_sequence_incremental_decode_with_prefill() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
@@ -175,7 +226,7 @@ fn test_long_sequence_incremental_decode_with_prefill() {
 #[test]
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 fn test_stop_sequence_decoder() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
@@ -189,6 +240,8 @@ fn test_stop_sequence_decoder() {
         ),
         ("Testing stop sequences.", ".", "Testing stop sequences"),
         ("No stop sequence here", "xyz", "No stop sequence here"),
+        // The stop word arrives in one token with the space before it
+        ("deep learning is here", "is", "deep learning "),
     ];
 
     for (input, stop_seq, expected) in test_cases {
@@ -227,18 +280,19 @@ fn test_stop_sequence_decoder() {
             "Input: '{input}', Stop: '{stop_seq}', Output: '{output}', Expected: '{expected}'"
         );
 
-        // The test should check if output starts with expected
-        // since stop sequences might not be perfectly aligned with token boundaries
-        assert!(
-            output.starts_with(expected) || output == input,
-            "Stop sequence test failed"
+        // Each row is exact: the text before the stop word, and whether the decoder stopped
+        assert_eq!(output, expected, "Stop sequence test failed for {input:?}");
+        assert_eq!(
+            stopped,
+            input.contains(stop_seq),
+            "stop state for {input:?}"
         );
     }
 }
 
 #[test]
 fn test_factory_creation() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = factory::create_tokenizer(tokenizer_path.to_str().unwrap())
         .expect("Failed to create tokenizer via factory");
 
@@ -255,7 +309,7 @@ fn test_factory_creation() {
 
 #[test]
 fn test_batch_encoding() {
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load tokenizer");
 
@@ -278,15 +332,30 @@ fn test_batch_encoding() {
 fn test_special_tokens() {
     use llm_tokenizer::traits::Tokenizer as TokenizerTrait;
 
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Failed to load tokenizer");
 
     let special_tokens = tokenizer.get_special_tokens();
 
-    // TinyLlama should have at least BOS and EOS tokens
+    // The file names a start and an end token
     assert!(special_tokens.bos_token.is_some());
     assert!(special_tokens.eos_token.is_some());
+
+    // An encoding that asks for special tokens starts with the start token
+    let start = special_tokens
+        .bos_token
+        .as_deref()
+        .and_then(|token| tokenizer.token_to_id(token));
+    let encoding = tokenizer
+        .encode(TEST_PROMPTS[0], true)
+        .expect("Failed to encode with special tokens");
+    let (first, rest) = encoding
+        .token_ids()
+        .split_first()
+        .expect("an encoding with special tokens is not empty");
+    assert_eq!(Some(*first), start);
+    assert_eq!(rest, EXPECTED_IDS[0]);
 
     println!("Special tokens: {special_tokens:?}");
 }
@@ -295,7 +364,7 @@ fn test_special_tokens() {
 fn test_thread_safety() {
     use std::thread;
 
-    let tokenizer_path = ensure_tokenizer_cached();
+    let (_dir, tokenizer_path) = tokenizer_file();
     let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
@@ -332,11 +401,8 @@ fn test_chat_template_discovery() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let dir_path = temp_dir.path();
 
-    // Copy a real tokenizer.json file for testing
-    // We'll use the TinyLlama tokenizer that's already cached
-    let cached_tokenizer = ensure_tokenizer_cached();
-    let tokenizer_path = dir_path.join("tokenizer.json");
-    fs::copy(&cached_tokenizer, &tokenizer_path).expect("Failed to copy tokenizer file");
+    // The cases' tokenizer file, written into the directory
+    let tokenizer_path = write_tokenizer_file(dir_path);
 
     // Test 1: With chat_template.jinja file
     let jinja_path = dir_path.join("chat_template.jinja");
@@ -381,10 +447,8 @@ fn test_load_chat_template_from_local_file() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let dir_path = temp_dir.path();
 
-    // Copy a real tokenizer for testing
-    let cached_tokenizer = ensure_tokenizer_cached();
-    let tokenizer_path = dir_path.join("tokenizer.json");
-    fs::copy(&cached_tokenizer, &tokenizer_path).expect("Failed to copy tokenizer");
+    // The cases' tokenizer file, written into the directory
+    let tokenizer_path = write_tokenizer_file(dir_path);
 
     // Create a chat template file
     let template_path = dir_path.join("my_template.jinja");

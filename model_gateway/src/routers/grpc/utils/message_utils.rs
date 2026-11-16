@@ -19,6 +19,7 @@ use openai_protocol::{
         InputMessage, SystemContent, ToolResultContent,
     },
     profile::ProviderProfile,
+    worker::MmProcessingMode,
 };
 use serde_json::{json, Value};
 use tracing::error;
@@ -410,7 +411,16 @@ pub(crate) async fn resolve_media(
     // such a request and never schedules it), and no modality to a pool whose engines take none of
     // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
     // on the declared parts, before any byte of media is fetched, decoded or sent.
-    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
+    let router_processes = components
+        .multimodal
+        .as_ref()
+        .is_some_and(|mm_components| mm_components.processing == MmProcessingMode::Router);
+    multimodal::ensure_model_accepts_media(
+        &components.worker_registry,
+        model_id,
+        &plan,
+        router_processes,
+    )?;
     if plan.is_empty() {
         // A request without media renders the same under either order (its text parts in
         // their own order): the registries are not asked for a model with nothing to place.
@@ -749,13 +759,19 @@ fn convert_user_message(
 /// A document block as prompt text, so that any template reads it: the
 /// title and context the request gave, then the document's text, in the
 /// tagged layout the public API documents for documents in a prompt. Only
-/// text renders: a text source, or a content source made of text blocks. A
-/// PDF or URL source needs a document reader this gateway has no path for
-/// and is refused naming the block (`at`), not handed to the template.
+/// text renders: a text source, or a content source given as a string or
+/// made of text blocks. A PDF or URL source needs a document reader this
+/// gateway has no path for and is refused naming the block (`at`), not
+/// handed to the template.
 fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<String, String> {
     let text = match &document.source {
-        messages::DocumentSource::Text { data } => data.as_str(),
-        messages::DocumentSource::Content { content } => {
+        messages::DocumentSource::Text { data }
+        | messages::DocumentSource::Content {
+            content: messages::DocumentContent::String(data),
+        } => data.as_str(),
+        messages::DocumentSource::Content {
+            content: messages::DocumentContent::Blocks(content),
+        } => {
             let mut texts = Vec::with_capacity(content.len());
             for block in content {
                 match block {
@@ -1696,6 +1712,30 @@ mod tests {
         );
     }
 
+    /// A content source given as a string renders as the document's text, as
+    /// a text source does.
+    #[test]
+    fn a_content_document_given_as_a_string_renders_its_text() {
+        let messages = document(
+            messages::DocumentSource::Content {
+                content: messages::DocumentContent::String("The whole text.".to_string()),
+            },
+            None,
+            None,
+        );
+        let parts = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+        assert_eq!(
+            parts[0]["content"][0]["text"],
+            "<document>\n<document_content>\nThe whole text.\n</document_content>\n</document>"
+        );
+    }
+
     /// A content-source document joins its text blocks; one holding anything
     /// else is refused naming the block.
     #[test]
@@ -1709,7 +1749,10 @@ mod tests {
         };
         let messages = document(
             messages::DocumentSource::Content {
-                content: vec![text("First paragraph."), text("Second paragraph.")],
+                content: messages::DocumentContent::Blocks(vec![
+                    text("First paragraph."),
+                    text("Second paragraph."),
+                ]),
             },
             None,
             None,
@@ -1728,13 +1771,15 @@ mod tests {
 
         let messages = document(
             messages::DocumentSource::Content {
-                content: vec![InputContentBlock::Image(messages::ImageBlock {
-                    source: messages::ImageSource::Base64 {
-                        media_type: "image/png".to_string(),
-                        data: "AAAA".to_string().into(),
+                content: messages::DocumentContent::Blocks(vec![InputContentBlock::Image(
+                    messages::ImageBlock {
+                        source: messages::ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: "AAAA".to_string().into(),
+                        },
+                        cache_control: None,
                     },
-                    cache_control: None,
-                })],
+                )]),
             },
             None,
             None,

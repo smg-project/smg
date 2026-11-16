@@ -22,13 +22,15 @@ pub type Result<T> = std::result::Result<T, TransformError>;
 
 /// Extract RGB pixel data from a DynamicImage, avoiding a copy when already RGB8.
 /// Returns (width, height, raw_bytes) where raw_bytes is interleaved R,G,B,R,G,B,...
+/// and exactly `3 * width * height` long: an RGB8 image's container may be
+/// longer than its pixels (`ImageBuffer::from_raw` takes any that is long
+/// enough), and the bytes behind them are not the image.
 pub fn rgb_bytes(image: &DynamicImage) -> (usize, usize, std::borrow::Cow<'_, [u8]>) {
     match image {
-        DynamicImage::ImageRgb8(rgb) => (
-            rgb.width() as usize,
-            rgb.height() as usize,
-            std::borrow::Cow::Borrowed(rgb.as_raw()),
-        ),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+            (w, h, std::borrow::Cow::Borrowed(&rgb.as_raw()[..3 * w * h]))
+        }
         _ => {
             let rgb = image.to_rgb8();
             let w = rgb.width() as usize;

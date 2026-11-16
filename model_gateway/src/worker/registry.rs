@@ -50,7 +50,9 @@ use crate::{
 };
 
 pub mod event;
-pub mod service;
+// The admin API's service over this registry lives with the control plane
+// (`crate::admin::worker_service`); the path it had here is kept.
+pub use crate::admin::worker_service as service;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
