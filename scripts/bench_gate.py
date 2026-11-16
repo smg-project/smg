@@ -58,11 +58,17 @@ instruction count in every batch both ran after the first is the same work. The 
 placement, reported with the count and the two places and not failed, when two more facts
 hold: the function the harness spent the most in starts at another address in the pull
 request's executable, and the change is within twice the id's threshold. The same count with
-that function where it was, or with a change beyond twice the threshold, leaves the failure,
-with the count in its line. Two counts that differ are each taken once more, and
+that function where it was leaves the failure, with the count in its line. An id whose change
+is beyond twice its threshold is not counted: no count makes it a placement, and its line
+says so. Two counts that differ are each taken once more, and
 the failure stands either way: the count moved, or it differs from itself on one executable
 (an id whose work follows the clock, a seed or the allocator's state) and tells nothing. A
 count that was not read (no valgrind on the host, one batch alone) leaves the failure too. The
+count ends by the run's budget: `run_budget`, the seconds from the run's start that a gate
+file asking the count must name, below its gate step's bound by the report's room. No count
+starts with less than 30 s of it left, and one that starts is capped by what is left. The ids
+are counted in name order: the id whose turn the budget cut and the ids behind it keep the
+time's verdict, their lines saying so, and the report is written. The
 count cannot see a change that runs the same instructions slower, a load that misses or a
 branch that stops predicting: where the function moved too, such a row reads as a placement
 up to twice its threshold, by name, in the summary. A placement is still a row to read.
@@ -121,6 +127,13 @@ class Gate:
         return re.search(self.pattern, bench_id) is not None
 
 
+# No count starts with less than this left of the run's budget (`run_budget` in the gate file,
+# seconds from the run's start): a count is the harness's one-second warm-up under an emulator,
+# and one the budget cuts short only fails. A step's bound that ends the script takes the
+# report with it, so a gate file sets its budget below that bound by the report's room.
+COUNT_FLOOR_S = 30.0
+
+
 @dataclass
 class Gates:
     repeats: int = 3
@@ -129,6 +142,8 @@ class Gates:
     sources: list[str] = field(default_factory=list)
     # An id that fails by time is counted on both executables before the verdict.
     count: bool = False
+    # Seconds from the run's start by which the count ends; a gate file that counts names it.
+    run_budget: float | None = None
     gates: list[Gate] = field(default_factory=list)
 
     def threshold_for(self, bench_id: str) -> Gate | None:
@@ -139,7 +154,7 @@ class Gates:
         return None
 
 
-GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "sources", "count", "gate"}
+GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "sources", "count", "run_budget", "gate"}
 GATE_ENTRY_KEYS = {"pattern", "threshold", "note"}
 
 
@@ -172,12 +187,28 @@ def load_gates(path: Path) -> Gates:
     count = raw.get("count", False)
     if not isinstance(count, bool):
         raise ValueError(f"{path}: count must be true or false, got {count!r}")
+    run_budget = raw.get("run_budget")
+    if run_budget is not None:
+        if isinstance(run_budget, bool) or not isinstance(run_budget, (int, float)):
+            raise ValueError(f"{path}: run_budget must be a number of seconds, got {run_budget!r}")
+        try:
+            seconds = float(run_budget)
+        except OverflowError:  # an integer past a float's range
+            seconds = math.inf
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError(f"{path}: run_budget must be finite and above zero: {run_budget!r}")
+    elif count:
+        raise ValueError(
+            f"{path}: count = true needs run_budget, the seconds from the run's start by which "
+            "the count ends (below the gate step's bound)"
+        )
     gates = Gates(
         repeats=repeats,
         filter=filter_,
         bench_args=[str(arg) for arg in bench_args],
         sources=sources,
         count=count,
+        run_budget=None if run_budget is None else float(run_budget),
     )
     if gates.filter is not None:
         try:
@@ -462,6 +493,7 @@ class BusyHost(RuntimeError):
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    run_started = time.monotonic()
     gates = load_gates(Path(args.gates))
     repeats = args.repeats or gates.repeats
     # Absolute: the bench binaries run under --cwd and get this path through the environment.
@@ -554,15 +586,23 @@ def cmd_run(args: argparse.Namespace) -> int:
                     for side in round_sides(i):
                         run(i, side, exact, f"recheck {extra}/{args.recheck}")
             # An id that still fails is counted on both executables: on the same instruction
-            # count its time can be a placement in the bench executable, not work.
-            failing = sorted(
-                row.bench_id for row in compare(results, gates) if row.verdict == "regression"
-            )
-            if failing and gates.count:
+            # count its time can be a placement in the bench executable, not work. A change
+            # beyond twice the threshold is no placement whatever its count reads: not counted.
+            still = [row for row in compare(results, gates) if row.verdict == "regression"]
+            if still and gates.count:
                 # The timed rounds are written first: a count that hangs, or a job cancelled
                 # in it, still leaves them in the output directory.
                 save()
-                results["count"] = count_ids(failing, copies, out, cwd, gates, extra_args, args.cpu)
+                within = sorted(row.bench_id for row in still if row.within_ceiling)
+                results["count"] = {
+                    row.bench_id: {"skipped": "no_base" if row.change is None else "beyond"}
+                    for row in still
+                    if not row.within_ceiling
+                }
+                deadline = run_started + (gates.run_budget or math.inf)
+                results["count"].update(
+                    count_ids(within, copies, out, cwd, gates, extra_args, args.cpu, deadline)
+                )
         except BusyHost as busy:
             save()
             print(f"run: not judged, {busy}", file=sys.stderr)
@@ -678,12 +718,13 @@ def count_once(
     extra_args: list[str],
     bench_id: str,
     cpu: int | None,
+    bound: float,
 ) -> dict:
     """The instruction counts of one id on one executable: the bench in the harness's profile
     mode under callgrind, which writes one profile after each batch of iterations (the mode
     is the harness's warm-up: one second of batches of 1, 2, 4, ... iterations, whatever the
-    bench configures). Returns the batches' counts in order and the last batch's unit; a
-    `RuntimeError` says why nothing was read."""
+    bench configures), ended after `bound` seconds. Returns the batches' counts in order and
+    the last batch's unit; a `RuntimeError` says why nothing was read."""
     valgrind = shutil.which("valgrind")
     if valgrind is None:
         raise RuntimeError("valgrind is not on this host")
@@ -718,12 +759,10 @@ def count_once(
                     env=env,
                     stdout=log,
                     stderr=subprocess.STDOUT,
-                    timeout=COUNT_TIMEOUT_S,
+                    timeout=bound,
                 )
             except subprocess.TimeoutExpired:
-                raise RuntimeError(
-                    f"the count ran over {COUNT_TIMEOUT_S:g} s; see {log_path}"
-                ) from None
+                raise RuntimeError(f"the count ran over {bound:g} s; see {log_path}") from None
         if proc.returncode != 0:
             raise RuntimeError(f"the count exited with {proc.returncode}; see {log_path}")
         # callgrind names a profile by its process and numbers the one it writes after each
@@ -765,20 +804,33 @@ def count_ids(
     gates: Gates,
     extra_args: list[str],
     cpu: int | None,
+    deadline: float,
 ) -> dict[str, dict]:
-    """Every id on both executables; a side that was not read carries the reason. Two counts
-    that differ are each taken once more (`again`): a count that differs from itself is the
-    id's own (a seed the process draws, the allocator's state) and says nothing of the change."""
+    """The ids on both executables, in their order, until the run's budget ends (`deadline`,
+    on the monotonic clock); a side that was not read carries the reason. Two counts that
+    differ are each taken once more (`again`): a count that differs from itself is the id's
+    own (a seed the process draws, the allocator's state) and says nothing of the change. No
+    count starts with less than `COUNT_FLOOR_S` left, and one that starts is capped by what
+    is left: the id whose turn the budget cut and the ids behind it are not counted."""
     counts: dict[str, dict] = {}
     for n, bench_id in enumerate(ids, start=1):
 
-        def count(side: str, turn: int) -> dict:
+        def count(side: str, turn: int) -> dict | None:
+            """One count; None when the run's budget left no room for it or ended it."""
+            left = deadline - time.monotonic()
+            if left < COUNT_FLOOR_S:
+                return None
+            bound = min(COUNT_TIMEOUT_S, left)
             started = time.monotonic()
             try:
                 work = out / SIDE_DIRS[side] / f"count-{n}-{turn}"
-                read = count_once(binaries[side], work, cwd, gates, extra_args, bench_id, cpu)
+                read = count_once(
+                    binaries[side], work, cwd, gates, extra_args, bench_id, cpu, bound
+                )
                 said = f"{len(read['batches'])} batches"
             except (RuntimeError, OSError) as err:
+                if bound < COUNT_TIMEOUT_S and time.monotonic() - started >= bound:
+                    return None
                 read = {"error": str(err)}
                 said = f"not read, {err}"
             seconds = time.monotonic() - started
@@ -786,17 +838,40 @@ def count_ids(
             print(f"[{label}] {side}: {bench_id}: {said} in {seconds:.0f} s", flush=True)
             return read
 
-        # The two counts of a side run from directories of one length: the length of a path
-        # the process holds moves what it allocates after, and a count can follow that.
-        sides = counts[bench_id] = {side: count(side, 1) for side in SIDES}
-        if any("batches" not in read for read in sides.values()):
-            continue
-        if differs_at(sides["base"]["batches"], sides["pr"]["batches"]) is None:
-            continue
-        for side in SIDES:
-            again = count(side, 2)
-            if "batches" in again:
-                sides[side]["again"] = again["batches"]
+        def counted() -> dict | None:
+            """The id's two to four counts; None when the run's budget cut its turn."""
+            # The two counts of a side run from directories of one length: the length of a
+            # path the process holds moves what it allocates after, and a count can follow that.
+            sides: dict[str, dict] = {}
+            for side in SIDES:
+                read = count(side, 1)
+                if read is None:
+                    return None
+                sides[side] = read
+            if any("batches" not in read for read in sides.values()):
+                return sides
+            if differs_at(sides["base"]["batches"], sides["pr"]["batches"]) is None:
+                return sides
+            for side in SIDES:
+                again = count(side, 2)
+                if again is None:
+                    return None
+                if "batches" in again:
+                    sides[side]["again"] = again["batches"]
+            return sides
+
+        sides = counted()
+        if sides is None:
+            # This id and the ids behind it keep the time's verdict, and the report is written.
+            left_ids = ids[n - 1 :]
+            print(
+                f"[count] the run's budget of {gates.run_budget:g} s leaves no room: "
+                f"{len(left_ids)} of {len(ids)} ids not counted",
+                flush=True,
+            )
+            counts.update({left_id: {"skipped": "budget"} for left_id in left_ids})
+            break
+        counts[bench_id] = sides
     return counts
 
 
@@ -957,13 +1032,16 @@ class Row:
         return places[0] != places[1]
 
     @property
+    def within_ceiling(self) -> bool:
+        """Whether the change is one a placement can excuse: within twice the threshold."""
+        change, threshold = self.change, self.gate.threshold if self.gate else 0.0
+        return change is not None and change <= PLACEMENT_CEILING * threshold
+
+    @property
     def placed(self) -> bool:
         """Whether where the code sits can carry the time: the same count, a measured
         function that starts elsewhere, and a change within twice the threshold."""
-        if not (self.same_count and self.moved):
-            return False
-        change, threshold = self.change, self.gate.threshold if self.gate else 0.0
-        return change is not None and change <= PLACEMENT_CEILING * threshold
+        return bool(self.same_count and self.moved) and self.within_ceiling
 
 
 def judge(row: Row) -> str:
@@ -1101,10 +1179,23 @@ def fmt_place(address: int) -> str:
     return f"0x{address % 4096:03x}"
 
 
+# Why an id that failed by time was not counted, as its line and the report say it.
+NOT_COUNTED = {
+    "beyond": (
+        f"a change beyond {PLACEMENT_CEILING:g} times the threshold, which no placement excuses"
+    ),
+    "no_base": "a base median of zero, which leaves no change for a placement to excuse",
+    "budget": "the run's budget left no room for its count, and the time alone decides",
+}
+
+
 def fmt_count(row: Row) -> str:
     """What the count of a row read, as sentences for its line; "" for a row never counted."""
     if not row.counts:
         return ""
+    skipped = NOT_COUNTED.get(row.counts.get("skipped"))
+    if skipped:
+        return f" Not counted: {skipped}."
     sides = [row.counts.get(side) or {} for side in SIDES]
     counted = row.counted
     if counted is None:
@@ -1253,16 +1344,23 @@ def markdown(results: dict, rows: list[Row]) -> str:
             f"interleaved order: {', '.join(f'`{bench_id}`' for bench_id in sorted(rechecked))}.",
             "",
         ]
-    if results.get("count"):
+    reads = results.get("count") or {}
+    counted = sorted(bench_id for bench_id, read in reads.items() if "skipped" not in read)
+    if counted:
         lines += [
             "Counted before the verdict, on both executables under callgrind: "
-            f"{', '.join(f'`{bench_id}`' for bench_id in sorted(results['count']))}. An id that "
+            f"{', '.join(f'`{bench_id}`' for bench_id in counted)}. An id that "
             "fails by time is a placement (where its code sits in the bench executable) when "
             "it runs the same instruction count on both, its measured function starts at "
             "another address and the change is within twice its threshold: reported, not "
             "failed, and still a row to read.",
             "",
         ]
+    for why, said in NOT_COUNTED.items():
+        left = sorted(bench_id for bench_id, read in reads.items() if read.get("skipped") == why)
+        if left:
+            names = ", ".join(f"`{bench_id}`" for bench_id in left)
+            lines += [f"Not counted, {names}: {said}.", ""]
     if any(results.get(side, {}).get("load") for side in SIDES):
         shown = ", ".join(
             f"{side} {[round(v, 1) for v in results[side]['load'] if v is not None]}"
