@@ -14,8 +14,8 @@ use smg_policy_controller::{
 /// Fills a worker before it opens the next: the worker with the most
 /// requests running, by its engine's own load report, scores highest, so a
 /// fleet under light traffic keeps whole workers idle. A worker with no
-/// report yet counts as idle. The profile's filters still drop a worker
-/// that is unhealthy or overloaded.
+/// report yet counts as idle. The profile's filter still drops a worker the
+/// prober takes out of rotation.
 #[derive(Debug)]
 struct Pack;
 
@@ -88,8 +88,8 @@ mod tests {
     use smg_policy_controller::{
         controller::{Config, Controller, Election, Listener, Scope},
         store::{
-            Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
-            WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+            Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers,
+            WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
         },
         Constraints, Engine, LoadRow, PolicySpec, RequestFacts, Role, Scorer, Scratch, SpecError,
         WorkerId,
@@ -211,6 +211,14 @@ mod tests {
             self.publish();
         }
 
+        /// Sets or clears a gateway's standing veto on a worker, as the
+        /// gateway's breaker does.
+        fn veto(&mut self, gateway: GatewayId, id: WorkerId, standing: bool) {
+            let until = standing.then(|| self.window + Duration::from_secs(3600));
+            self.store.gateway_veto(gateway, id, until);
+            self.publish();
+        }
+
         /// What one decision asks of the store, a second into its window.
         fn ask(&self) -> Ask {
             Ask {
@@ -305,6 +313,23 @@ mod tests {
         for worker in [fleet.busy, fleet.idle, unreported] {
             assert!(picks.contains(&Some(worker)), "{worker:?} took no pick");
         }
+    }
+
+    #[test]
+    fn a_gateways_veto_takes_its_worker_out_for_that_gateway_alone() {
+        let mut fleet = Fleet::new();
+        let engine = engine(POLICY);
+        // Another gateway's veto is its own: this gateway still picks the
+        // busy worker.
+        fleet.veto(GatewayId(7), fleet.busy, true);
+        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
+        // This gateway's veto stalls the worker for it, and the profile's
+        // health filter drops a stalled worker.
+        fleet.veto(GatewayId::LOCAL, fleet.busy, true);
+        assert_eq!(fleet.pick(&engine), Some(fleet.idle));
+        // The veto cleared, the busy worker fills again.
+        fleet.veto(GatewayId::LOCAL, fleet.busy, false);
+        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
     }
 
     #[test]

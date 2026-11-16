@@ -3,6 +3,6 @@
 apiVersion: smg.policy/v1
 profiles:
   default:
-    filter: [healthy, not-overloaded]
+    filter: [healthy]
     score: [pack]
     pick: best
