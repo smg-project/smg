@@ -4,9 +4,8 @@
 //! hand-written reader that buffers a value before its typed read hides the
 //! repeat the typed read would refuse. Such a reader buffers through this one.
 //! It refuses every repeat, also where the typed read would keep the last value
-//! (a map, a free-form value) or pass over the key (one it does not know). A
-//! reader with one member whose repeats it must keep names that key to
-//! [`strict_entries`]: the member's value is read by [`Value`]'s own reader.
+//! (a map, a free-form value) or pass over the key (one it does not know): a
+//! reader that must keep those reads them itself.
 //! The refusal is in serde's words for a duplicate field; its place is the
 //! deserializer's to name, as it is for the derived readers.
 
@@ -15,15 +14,26 @@ use std::fmt;
 use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
 
-/// The entries of an object, each value read by [`StrictValue`] but the value
-/// of the key `plain` names, which [`Value`]'s own reader reads. A repeated
-/// key is refused when it is met, before its value is read. One map slot per
-/// key, taken before the value is read and filled after: the read costs what
-/// the plain value read costs.
+/// The entries of an object, each value read by [`StrictValue`]: the read
+/// costs what the plain value read costs.
 pub(crate) fn strict_entries<'de, A: MapAccess<'de>>(
     entries: &mut A,
-    plain: Option<&str>,
 ) -> Result<Map<String, Value>, A::Error> {
+    entries_with(entries, |_, entries| entries.next_value_seed(StrictValue))
+}
+
+/// The entries of an object, each value read by `read`, which is given the
+/// value's key. A repeated key is refused when it is met, before its value is
+/// read. One map slot per key, taken before the value is read and filled
+/// after.
+pub(crate) fn entries_with<'de, A, F>(
+    entries: &mut A,
+    mut read: F,
+) -> Result<Map<String, Value>, A::Error>
+where
+    A: MapAccess<'de>,
+    F: FnMut(&str, &mut A) -> Result<Value, A::Error>,
+{
     let mut fields = Map::new();
     while let Some(key) = entries.next_key::<String>()? {
         let slot = match fields.entry(key) {
@@ -32,11 +42,7 @@ pub(crate) fn strict_entries<'de, A: MapAccess<'de>>(
             }
             Entry::Vacant(slot) => slot,
         };
-        let value = if plain == Some(slot.key().as_str()) {
-            entries.next_value()?
-        } else {
-            entries.next_value_seed(StrictValue)?
-        };
+        let value = read(slot.key().as_str(), entries)?;
         slot.insert(value);
     }
     Ok(fields)
@@ -106,7 +112,7 @@ impl<'de> Visitor<'de> for StrictValue {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
-        strict_entries(&mut entries, None).map(Value::Object)
+        strict_entries(&mut entries).map(Value::Object)
     }
 }
 

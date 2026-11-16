@@ -2307,7 +2307,7 @@ impl<'de> Deserialize<'de> for ItemFields {
                 self,
                 mut entries: A,
             ) -> Result<Self::Value, A::Error> {
-                crate::strict_value::strict_entries(&mut entries, None).map(ItemFields)
+                crate::strict_value::strict_entries(&mut entries).map(ItemFields)
             }
         }
 

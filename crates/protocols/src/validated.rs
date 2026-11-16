@@ -42,7 +42,7 @@ use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKin
 #[cfg(feature = "axum")]
 use crate::{
     common::FIELD_PARAM,
-    strict_value::{strict_entries, StrictValue},
+    strict_value::{entries_with, StrictValue},
 };
 
 /// A JSON extractor that automatically validates and normalizes the request body
@@ -124,7 +124,14 @@ impl<'de> Visitor<'de> for BodyVisitor {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
-        strict_entries(&mut entries, Some("metadata")).map(Value::Object)
+        entries_with(&mut entries, |key, entries| {
+            if key == "metadata" {
+                entries.next_value()
+            } else {
+                entries.next_value_seed(StrictValue)
+            }
+        })
+        .map(Value::Object)
     }
 }
 
