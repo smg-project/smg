@@ -126,10 +126,11 @@ pub(super) fn tagged(
 /// The tag of a forced call to one of `tools`, at most one when `one_call`, with
 /// `reasoning_open` when the prompt leaves the model inside its thought and `thought_closed` when
 /// it closed the thought itself and wrote the template's text after it, in the `vocabulary` the
-/// worker's grammar compiler takes ([`tagged`]). No tag for a registry table whose tag would
-/// open with free text, the prefix an open thought takes on workers that name no one start for
-/// the grammar ([`opens_with_free_text`]): text that owes nothing at its end does not hold the
-/// model to the call, and the older registry's schema does, wherever the engine starts.
+/// worker's grammar compiler takes ([`tagged`]). A registry table's tag that opens with free
+/// text, the prefix an open thought takes on workers that name no one start for the grammar
+/// ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): text that owes
+/// nothing at its end does not hold the model to the call, so preparation gives the older
+/// registry's schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model, \
@@ -146,28 +147,41 @@ fn calls_tag(
     start: GrammarStart,
     vocabulary: TagVocabulary,
     continues: bool,
-) -> Result<Option<ToolConstraint>, SymphonyError> {
-    let grammar = format
-        .grammar_for(
-            tools,
-            Options {
-                at_least_one: true,
-                reasoning_open,
-                thought_closed,
-                one_call,
-                start,
-            },
-        )
-        // The response template's table keeps its tag: it refuses a call it has no tag for.
-        .filter(|grammar| compiled || !opens_with_free_text(grammar));
-    tagged(
+) -> PreparedConstraint {
+    let grammar = format.grammar_for(
+        tools,
+        Options {
+            at_least_one: true,
+            reasoning_open,
+            thought_closed,
+            one_call,
+            start,
+        },
+    );
+    // The response template's table keeps its tag unmarked: it has no other syntax the older
+    // registry could constrain and the table still read ([`tagged`]).
+    let free = !compiled && grammar.as_ref().is_some_and(opens_with_free_text);
+    let first_token = start == GrammarStart::FirstToken;
+    let tag = tagged(
         grammar,
         vocabulary,
         compiled,
         model,
         "a forced tool choice",
         continues,
-    )
+    )?;
+    Ok(match tag {
+        Some(constraint) if free => Prepared::OpensWithFreeText {
+            constraint,
+            first_token,
+        },
+        Some(constraint) => Prepared::Constraint {
+            constraint,
+            first_token,
+            table: true,
+        },
+        None => Prepared::None,
+    })
 }
 
 /// Whether `grammar` opens with free text, which owes nothing at its end: a tag that begins so
@@ -622,8 +636,8 @@ pub(crate) fn constraint(
 /// worker's own start and vocabulary ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose
 /// workers start the grammar at different places has no one answer tag that fits them all.
 /// [`Prepared::None`] when no table reads the response ([`reads`]), the request asks neither, or
-/// the table has no tag for the call, or only one that would open with free text
-/// ([`calls_tag`]); the older registry then decides as before. An error refuses
+/// the table has no tag for the call; the older registry then decides as before. A call's tag
+/// that opens with free text comes marked ([`Prepared::OpensWithFreeText`]). An error refuses
 /// the request: the response template's table cannot constrain the call it is asked (the answer's
 /// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
 /// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
@@ -662,15 +676,7 @@ pub(crate) fn constraint_for(
             start,
             vocabulary,
             continues,
-        )
-        .map(|tag| match tag {
-            Some(constraint) => Prepared::Constraint {
-                constraint,
-                first_token: start == GrammarStart::FirstToken,
-                table: true,
-            },
-            None => Prepared::None,
-        });
+        );
     }
     Ok(match asks.answer_schema() {
         Some(schema) => Prepared::Answer(Arc::new(AnswerTag {
@@ -778,6 +784,15 @@ pub(crate) enum Prepared {
         /// request's own schema where no table reads ([`WorkerConstraint::table`]).
         table: bool,
     },
+    /// A forced call's tag a registry table built that opens with free text ([`calls_tag`]),
+    /// which does not hold the model to the call. Preparation gives the older registry's schema
+    /// in its place, or keeps the tag as the table's own where that schema cannot be built
+    /// ([`Self::held_by`]).
+    OpensWithFreeText {
+        constraint: ToolConstraint,
+        /// As [`Self::Constraint`]'s.
+        first_token: bool,
+    },
     /// A JSON answer's tag, which derives for the selected worker's own start as the `auto` tag
     /// does ([`AnswerTag`]): the schema alone behind a reasoning parser's gate or where the engine
     /// does not say, the closed thought then the schema from the first token. A pool whose
@@ -788,10 +803,32 @@ pub(crate) enum Prepared {
 }
 
 impl Prepared {
+    /// What holds a forced call where the table's tag opens with free text
+    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the older registry's JSON
+    /// schema, which holds the model to the call wherever the engine starts the grammar; or the
+    /// table's own tag where `schema` gives none, so that a request that schema cannot spell is
+    /// served, not refused. Anything else stays as found, and `schema` is not asked.
+    pub(crate) fn held_by(self, schema: impl FnOnce() -> Option<ToolConstraint>) -> Self {
+        match self {
+            Self::OpensWithFreeText {
+                constraint,
+                first_token,
+            } => match schema() {
+                Some(schema) => Self::from(Some(schema)),
+                None => Self::Constraint {
+                    constraint,
+                    first_token,
+                    table: true,
+                },
+            },
+            found => found,
+        }
+    }
+
     /// The constraint a worker whose engine starts the grammar at `start` and whose compiler
     /// takes `vocabulary` takes: a JSON answer's tag derived for it, what was found as it is
-    /// otherwise. The tests read what preparation found through it; the decision
-    /// ([`worker_constraint`]) reads each variant itself.
+    /// otherwise, a marked tag too. The tests read what preparation found through it; the
+    /// decision ([`worker_constraint`]) reads each variant itself.
     #[cfg(test)]
     pub(crate) fn for_start(
         self,
@@ -800,7 +837,9 @@ impl Prepared {
     ) -> Result<Option<ToolConstraint>, SymphonyError> {
         match self {
             Self::None => Ok(None),
-            Self::Constraint { constraint, .. } => Ok(Some(constraint)),
+            Self::Constraint { constraint, .. } | Self::OpensWithFreeText { constraint, .. } => {
+                Ok(Some(constraint))
+            }
             Self::Answer(answer) => answer.for_start(start, vocabulary),
         }
     }
@@ -1130,6 +1169,12 @@ pub(crate) fn worker_constraint(
             first_token,
             table,
         } => (Some(constraint), false, None, first_token, table),
+        // Preparation resolves a marked tag ([`Prepared::held_by`]); one nothing resolved is
+        // the table's tag as it was built.
+        Prepared::OpensWithFreeText {
+            constraint,
+            first_token,
+        } => (Some(constraint), false, None, first_token, true),
         Prepared::None => (None, false, None, false, false),
     };
     Ok(WorkerConstraint {
@@ -1365,10 +1410,10 @@ mod tests {
     /// calls when the prompt leaves the thought open: nothing after the reasoning parser's gate
     /// (a JSON answer then needs no tag; the request's own schema goes to the engine as it is),
     /// the thought closed first from the first token, the schema alone (the request's own, no
-    /// tag) when the worker does not say, and for the calls no tag when the model's workers
-    /// name different starts or none: the table's prefix there is free text, which owes the
-    /// call nothing, and the older registry's schema forces it. The answer's tag derives for
-    /// the selected worker, whatever start the pool names.
+    /// tag) when the worker does not say, and for the calls the free-text prefix, marked as
+    /// such, when the model's workers name different starts or none: free text owes the call
+    /// nothing, so preparation gives the older registry's schema in the tag's place. The
+    /// answer's tag derives for the selected worker, whatever start the pool names.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
         let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
@@ -1454,7 +1499,10 @@ mod tests {
             symphony::GrammarStart::Unknown,
             symphony::GrammarStart::Either,
         ] {
-            let prepared = super::constraint(
+            let Ok(Prepared::OpensWithFreeText {
+                constraint: ToolConstraint::StructuralTag(tag),
+                first_token,
+            }) = super::constraint(
                 ParserChoice::Symphony,
                 &deepseek,
                 Asks::Chat(&forced),
@@ -1464,11 +1512,16 @@ mod tests {
                 start,
                 TagVocabulary::Current,
                 &templates(),
+            )
+            else {
+                panic!("{start:?}: a tag marked as opening with free text");
+            };
+            let tag: Value = serde_json::from_str(&tag).expect("JSON");
+            assert_eq!(
+                tag["format"]["elements"][0]["type"], "any_text",
+                "{start:?}: {tag}"
             );
-            assert!(
-                matches!(prepared, Ok(Prepared::None)),
-                "{start:?}: no tag that opens with free text, not {prepared:?}"
-            );
+            assert!(!first_token, "{start:?}: not built for the first token");
         }
         let bare = call_of(symphony::GrammarStart::AfterReasoning);
         assert_eq!(
@@ -1480,14 +1533,15 @@ mod tests {
         assert_eq!(first["format"]["elements"][1], bare["format"]);
     }
 
-    /// No forced call of a registry table is left to free text. Over every table, wherever the
-    /// workers start a grammar, the thought never opened, closed by the prompt or open, one call
-    /// and many: the table's tag opens with free text only from an open thought on workers that
-    /// name no one start, the tag is withheld exactly there, and every other tag stands.
+    /// No tag of a registry table that opens with free text goes unmarked. Over every table,
+    /// wherever the workers start a grammar, the thought never opened, closed by the prompt or
+    /// open, one call and many: the table's tag opens with free text only from an open thought
+    /// on workers that name no one start, the tag is marked exactly there, and every other tag
+    /// stands unmarked.
     #[test]
-    fn a_forced_calls_tag_is_withheld_only_where_it_would_open_with_free_text() {
+    fn a_forced_calls_tag_is_marked_only_where_it_opens_with_free_text() {
         let tools = tools();
-        let mut withheld = 0;
+        let mut marked = 0;
         for table in symphony::formats::Table::ALL {
             let format = table.format();
             for (reasoning_open, thought_closed) in [(false, false), (false, true), (true, false)] {
@@ -1514,7 +1568,7 @@ mod tests {
                             },
                         );
                         let free = built.as_ref().is_some_and(opens_with_free_text);
-                        let tag = calls_tag(
+                        let found = calls_tag(
                             &format,
                             false,
                             "m",
@@ -1538,22 +1592,26 @@ mod tests {
                                 "{cell}: free text only from an open thought on workers that \
                                  name no one start"
                             );
-                            assert!(tag.is_none(), "{cell}: the tag is withheld");
-                            withheld += 1;
-                        } else {
-                            assert_eq!(
-                                tag.is_some(),
-                                built.is_some(),
-                                "{cell}: every other tag stands"
+                            assert!(
+                                matches!(found, Prepared::OpensWithFreeText { .. }),
+                                "{cell}: the tag is marked, not {found:?}"
                             );
+                            marked += 1;
+                        } else {
+                            let stands = match &found {
+                                Prepared::Constraint { table: true, .. } => true,
+                                Prepared::None => false,
+                                other => panic!("{cell}: {other:?}"),
+                            };
+                            assert_eq!(stands, built.is_some(), "{cell}: every other tag stands");
                         }
                     }
                 }
             }
         }
         assert!(
-            withheld > 0,
-            "the sweep meets tables whose tag would open with free text"
+            marked > 0,
+            "the sweep meets tables whose tag opens with free text"
         );
     }
 
@@ -2934,11 +2992,13 @@ mod tests {
             Some(text.as_str())
         );
         assert_eq!(stamp.schema(), Some(&schema));
-        // The forced call keeps the pool's start too: workers of either kind leave a thought
-        // the prompt left open no one place to end, the table's tag would open with free
-        // text, and so no tag is given: the older registry's schema forces the call.
+        // The forced call's tag keeps the pool's start: the prefix that fits either kind, which
+        // is free text, so the tag comes marked.
         let forced = request(json!({"tool_choice": "required"}));
-        let prepared = super::constraint(
+        let Ok(Prepared::OpensWithFreeText {
+            constraint: ToolConstraint::StructuralTag(call),
+            first_token,
+        }) = super::constraint(
             ParserChoice::Symphony,
             &deepseek,
             Asks::Chat(&forced),
@@ -2948,10 +3008,15 @@ mod tests {
             grammar_start_of(&pool),
             vocabulary_of(&pool),
             &templates(),
-        );
+        )
+        else {
+            panic!("a forced tag, marked");
+        };
+        let call: Value = serde_json::from_str(&call).expect("JSON");
+        assert_eq!(call["format"]["elements"][0]["type"], "any_text", "{call}");
         assert!(
-            matches!(prepared, Ok(Prepared::None)),
-            "the pool's start is either: no tag that opens with free text, not {prepared:?}"
+            !first_token,
+            "the pool's start is either: not built for the first token"
         );
     }
 
@@ -3376,11 +3441,6 @@ mod tests {
                             ("unknown", symphony::GrammarStart::Unknown),
                             ("first token", symphony::GrammarStart::FirstToken),
                         ] {
-                            // An open thought on workers that name no start has no
-                            // forced tag: the older registry's schema goes out there.
-                            if reasoning_open && start == symphony::GrammarStart::Unknown {
-                                continue;
-                            }
                             let calls = super::constraint(
                                 ParserChoice::Symphony,
                                 names,

@@ -77,7 +77,10 @@ pub(crate) struct Prepared {
 /// reader is assigned by; the answer's tag derives for the selected worker at
 /// request building); the older registry decides for every other request
 /// (`generate_tool_constraint`, over `tools`, the ones the request's choice
-/// lets the model call, and the legacy tool parser's name). On a thinking
+/// lets the model call, and the legacy tool parser's name). A table's tag
+/// for a forced call that opens with free text gives way to that registry's
+/// JSON schema, asked with no parser named, and stands where the schema
+/// cannot be built (`regular::symphony::Prepared::held_by`). On a thinking
 /// prompt a parser with a reasoning prefix gets its tag wrapped so a forced
 /// call follows the reasoning instead of preempting it: `switch` is the API's
 /// tokenizer-driven answer, and where a table reads the response its replay
@@ -147,6 +150,21 @@ pub(crate) fn prepare(
         )
     });
     let choice = asks.choice();
+    // A table's tag that opens with free text does not hold the model to the
+    // call, so the older registry's JSON schema goes out in its place. No
+    // parser is named for it: a parser's own tag opens the same way and is
+    // not spelled for the workers' vocabulary. A request that schema cannot
+    // spell keeps the table's tag.
+    let from_the_table = from_the_table.map(|found| {
+        found.held_by(|| {
+            ctx.components
+                .tool_parser_factory
+                .registry()
+                .generate_tool_constraint(None, tools, choice.as_deref()?, reasoning)
+                .ok()
+                .flatten()
+        })
+    });
     let constraint = match (from_the_table, choice.as_deref()) {
         (Ok(symphony::Prepared::None), Some(tool_choice)) if !tools.is_empty() => {
             let constraint = ctx
@@ -888,12 +906,21 @@ mod tests {
     /// tool-call parser. With no tool-call name the older registry has no tag of its own for a
     /// forced call, so the call takes its JSON schema where the table has no tag either.
     fn pool(table: &str, start: Option<&str>) -> Arc<SharedComponents> {
+        let start = start.map(|start| (tool_parser::GrammarStart::LABEL, start));
+        pool_of(
+            ModelCard::new(SERVED).with_reasoning_parser(table),
+            start.as_slice(),
+        )
+    }
+
+    /// The gateway's components over one worker that serves `card` and carries `labels`.
+    fn pool_of(card: ModelCard, labels: &[(&str, &str)]) -> Arc<SharedComponents> {
         let registry = Arc::new(WorkerRegistry::new());
         let mut worker = BasicWorkerBuilder::new("grpc://engine:50051")
-            .model(ModelCard::new(SERVED).with_reasoning_parser(table))
+            .model(card)
             .worker_type(WorkerType::Regular);
-        if let Some(start) = start {
-            worker = worker.label(tool_parser::GrammarStart::LABEL, start);
+        for (label, value) in labels {
+            worker = worker.label(*label, *value);
         }
         registry.register(Arc::new(worker.build()));
         let mut components = components_over(
@@ -962,6 +989,126 @@ mod tests {
                 prepared.json_schema, schema,
                 "workers that start at {start:?}: {:?}",
                 prepared.constraint
+            );
+        }
+    }
+
+    /// A forced call from an open thought on workers that name no start takes the JSON schema
+    /// whatever tool-call parser the card names. Each name here is one a table answers to and
+    /// one the older registry builds a tag of its own for. No parser is named for the schema,
+    /// so that tag does not go out in the table's place: it may open with free text as the
+    /// table's does, and it is not spelled for workers that take the older tag vocabulary.
+    #[test]
+    fn a_forced_call_takes_the_schema_whatever_tool_call_parser_the_card_names() {
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        let older = [(utils::TagVocabulary::LABEL, utils::TagVocabulary::OLDER)];
+        for parser in ["glm47_moe", "minimax_m3", "hy_v4", "deepseek_v41"] {
+            for (vocabulary, labels) in [
+                (utils::TagVocabulary::Current, &[][..]),
+                (utils::TagVocabulary::Older, &older[..]),
+            ] {
+                let cell = format!("{parser}, the {vocabulary:?} tag vocabulary");
+                let chat = forced(true);
+                let mut ctx = RequestContext::for_chat(
+                    Arc::clone(&chat),
+                    None,
+                    SERVED.into(),
+                    pool_of(ModelCard::new(SERVED).with_tool_parser(parser), labels),
+                );
+                ctx.state.parser = Some(ParserChoice::Symphony);
+                assert!(
+                    ctx.components
+                        .tool_parser_factory
+                        .registry()
+                        .has_structural_tag(parser),
+                    "{cell}: the older registry builds a tag of its own"
+                );
+                let workers = ctx
+                    .components
+                    .worker_registry
+                    .get_by_model(&ctx.input.model_id);
+                assert_eq!(symphony::vocabulary_of(&workers), vocabulary, "{cell}");
+                let tools = chat.tools.clone().unwrap_or_default();
+                let prepared = prepare(
+                    &ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    PROMPT,
+                    true,
+                    &tokenizer,
+                    "test",
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused");
+                assert!(
+                    matches!(prepared.reading, Some(Reading::Table(..))),
+                    "{cell}: a table reads the response"
+                );
+                assert!(
+                    prepared.json_schema,
+                    "{cell}: the schema, not a tag: {:?}",
+                    prepared.constraint
+                );
+            }
+        }
+    }
+
+    /// Two tools whose schemas define one name differently, under `required` from an open
+    /// thought on workers that name no start: the older registry's one schema for the whole
+    /// list cannot hold both definitions, so the request keeps the table's tag, which reads
+    /// each tool's definitions apart, and is served. With one definition under the name the
+    /// schema goes out.
+    #[test]
+    fn a_required_call_the_schema_cannot_spell_keeps_the_tables_tag() {
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        let tool = |name: &str, place: &str| {
+            json!({"type": "function", "function": {"name": name, "parameters": {
+                "type": "object",
+                "properties": {"place": {"$ref": "#/$defs/place"}},
+                "$defs": {"place": {"type": place}},
+            }}})
+        };
+        for (place, schema) in [("string", true), ("integer", false)] {
+            let chat: Arc<ChatCompletionRequest> = Arc::new(
+                serde_json::from_value(json!({
+                    "model": SERVED, "messages": [{"role": "user", "content": "hi"}],
+                    "tool_choice": "required",
+                    "tools": [tool("lookup", "string"), tool("route", place)],
+                }))
+                .expect("chat request"),
+            );
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", None),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let tools = chat.tools.clone().unwrap_or_default();
+            let prepared = prepare(
+                &ctx,
+                Asks::Chat(&chat),
+                &tools,
+                PROMPT,
+                true,
+                &tokenizer,
+                "test",
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused");
+            assert_eq!(
+                prepared.json_schema, schema,
+                "the second tool's place is {place}: {:?}",
+                prepared.constraint
+            );
+            assert_eq!(
+                matches!(
+                    prepared.constraint,
+                    Ok(symphony::Prepared::Constraint { table: true, .. })
+                ),
+                !schema,
+                "the second tool's place is {place}: the table's own tag where the schema \
+                 cannot be spelled"
             );
         }
     }
