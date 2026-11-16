@@ -15,8 +15,9 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{btree_map, BTreeMap, BTreeSet},
     fmt, io,
+    marker::PhantomData,
     sync::LazyLock,
 };
 
@@ -787,6 +788,46 @@ fn single_key<'de, A: MapAccess<'de>>(mut map: A, entry: ScoreSpec) -> Result<Sc
     Ok(entry)
 }
 
+/// One of the document's maps, each key once: a key written twice is refused
+/// by name, in whatever form the document came. The map of the standard
+/// library keeps the last value and says nothing, so a JSON document that
+/// wrote one profile's name twice ran the second.
+fn keyed_once<'de, D, V>(deserializer: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct Once<V>(PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for Once<V> {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut read = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                match read.entry(key) {
+                    btree_map::Entry::Vacant(place) => {
+                        place.insert(map.next_value()?);
+                    }
+                    btree_map::Entry::Occupied(first) => {
+                        return Err(de::Error::custom(format_args!(
+                            "the key `{}` is written twice",
+                            first.key()
+                        )));
+                    }
+                }
+            }
+            Ok(read)
+        }
+    }
+
+    deserializer.deserialize_map(Once(PhantomData))
+}
+
 /// What a document wrote under a scorer's name that is no built-in's, kept
 /// as read for the validator. A key written twice is refused here, in the
 /// words a built-in's parameters refuse it: the map of `serde_json` keeps
@@ -1332,7 +1373,11 @@ pub struct BindingSpec {
     pub plan: Option<PlanName>,
     /// The profiles per side: `single`, or every side of the plan
     /// (`prefill` and `decode`; `encode` too under `epd`), each named.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "keyed_once",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub profiles: BTreeMap<String, String>,
     /// The overload veto's defaults for the binding's workers.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1383,9 +1428,14 @@ pub struct PolicySpec {
     /// model the most specific wins: an exact id, then the longer of a
     /// `prefix*` and a `*suffix`, then `*`; a `prefix*` and a `*suffix` of
     /// one length are refused as a pair.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "keyed_once",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub index: BTreeMap<String, IndexSpec>,
     /// The profiles by name.
+    #[serde(deserialize_with = "keyed_once")]
     pub profiles: BTreeMap<String, ProfileSpec>,
     /// The plans' rules.
     #[serde(default, skip_serializing_if = "is_default")]
@@ -3297,6 +3347,41 @@ mod tests {
           "bindings": [ { "profile": "p", "sessions": { "ttl": 600 } } ] }"#,
         );
         assert!(err.contains("unknown field `ttl`"), "{err}");
+    }
+
+    /// A key written twice in one of the document's maps is refused by name
+    /// where it is read: the profiles, the index and a binding's profiles.
+    /// A JSON document ran the last of the two before.
+    #[test]
+    fn a_map_key_written_twice_is_refused_by_name() {
+        let documents = [
+            (
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random"},"p":{"pick":"round-robin"}}}"#,
+                "p",
+            ),
+            (
+                r#"{"apiVersion":"smg.policy/v1","index":{"a*":{},"a*":{"ttl_s":1}},"profiles":{"p":{"pick":"random"}}}"#,
+                "a*",
+            ),
+            (
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random"}},"bindings":[{"match":{"model":"*"},"profiles":{"single":"p","single":"p"}}]}"#,
+                "single",
+            ),
+        ];
+        for (document, key) in documents {
+            let refused = parse_error(document);
+            assert!(
+                refused.contains(&format!("the key `{key}` is written twice")),
+                "{refused}"
+            );
+        }
+        // Each key once reads as before.
+        let read = doc(
+            r#"{"apiVersion":"smg.policy/v1","index":{"a*":{}},"profiles":{"p":{"pick":"random"},"q":{"pick":"round-robin"}},"bindings":[{"match":{"model":"*"},"profiles":{"single":"p"}}]}"#,
+        );
+        assert_eq!(read.profiles.len(), 2);
+        assert_eq!(read.index.len(), 1);
+        assert_eq!(read.bindings[0].profiles["single"], "p");
     }
 
     #[test]
