@@ -4331,7 +4331,7 @@ fn a_thread_whose_wide_table_outgrew_its_share_gives_it_back_at_its_next_encode(
     native.threads.store(300, Ordering::Relaxed);
     let share = native.piece_cache_share();
     assert!(
-        share < 16_000 && grown <= ShortPieceTable::slots_for(share),
+        share < 16_000 && grown <= WidePieceTable::slots_for(share),
         "{share}"
     );
     assert_eq!(
@@ -4346,7 +4346,7 @@ fn a_thread_whose_wide_table_outgrew_its_share_gives_it_back_at_its_next_encode(
     // the table's back.
     native.threads.store(1_024, Ordering::Relaxed);
     let share = native.piece_cache_share();
-    assert!(grown > ShortPieceTable::slots_for(share), "{share}");
+    assert!(grown > WidePieceTable::slots_for(share), "{share}");
     assert_eq!(
         native
             .encode_with(Some(model), text, false, false)
@@ -4367,8 +4367,9 @@ fn a_wide_table_grows_within_the_share_and_keeps_the_threads_pieces() {
     let tokenizer = tokenizer_of(shape, &mut state);
     let mut native = seeded(&tokenizer);
     let model = tokenizer.get_model();
-    // 4,096 threads counted: a share of 1,024 pieces, whose slots are 2,048.
-    native.threads.store(4_096, Ordering::Relaxed);
+    // 4,095 threads counted before this one, whose first encode makes them
+    // 4,096: a share of 1,024 pieces, whose slots are 2,048.
+    native.threads.store(4_095, Ordering::Relaxed);
     let share = native.piece_cache_share();
     assert_eq!((share, WidePieceTable::slots_for(share)), (1_024, 2_048));
     let text = " a b c";
