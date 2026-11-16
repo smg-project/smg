@@ -431,8 +431,8 @@ async fn judge(
     frame: &proto::GatewayFrame,
     answers: &mut Answers,
 ) -> Option<Status> {
-    // A session that was replaced applies no frame: its gateway may be let
-    // go under it, and a write under a gone gateway's key would outlive it.
+    // A session that was replaced applies no frame: the gateway's frames
+    // are the newer session's from the instant this one is told.
     if seat.replaced() {
         return Some(replaced());
     }
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     /// A session that was replaced applies no frame, whichever arm the
-    /// loop's turn took: its gateway may be let go under it.
+    /// loop's turn took.
     #[tokio::test]
     async fn a_replaced_sessions_frame_is_not_applied() {
         let mut bed = bed(PATIENT).await;

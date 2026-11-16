@@ -333,20 +333,6 @@ impl MemoryStore {
         self.health.lock().ok_at.remove(&gateway);
     }
 
-    /// The presence table's word at a sweep: the health tables keep what
-    /// they hold under a gateway `present` names and let the rest go. A
-    /// gateway's end lets its table go once; this reclaims what a frame of
-    /// a replaced session wrote under the gone key after it. It lets go
-    /// every key `present` does not name: a writer of completions that is
-    /// no session of a present gateway loses its own at each pass.
-    #[cfg(feature = "controller")]
-    pub(crate) fn keep_gateways(&self, mut present: impl FnMut(GatewayId) -> bool) {
-        self.health
-            .lock()
-            .ok_at
-            .retain(|gateway, _| present(*gateway));
-    }
-
     /// How many times a publication allocated a pool's rows since the store
     /// was made. A publication writes a pool's rows over rows no world
     /// lists any more: the ones the pool published before its last, else

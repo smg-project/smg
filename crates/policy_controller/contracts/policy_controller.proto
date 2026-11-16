@@ -241,7 +241,9 @@ message Welcome {
   // Initial credit per Decide stream; a new Decide stream starts here again.
   uint32 decide_window = 7;
   uint32 max_decide_streams = 8;
-  // The stream rule's grace period and the default dispatch TTL.
+  // The stream rule's grace period and the default dispatch TTL. A gateway
+  // is let go one grace period after its last session ended, and one period
+  // more at most while a session that a newer one replaced still runs.
   uint32 grace_period_ms = 9;
   uint32 dispatch_ttl_ms = 10;
   // How often the gateway polls Leader for its term floor.
