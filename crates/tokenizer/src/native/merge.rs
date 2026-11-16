@@ -80,16 +80,23 @@ const SHORT_PIECE_SMALL: usize = 32;
 /// The smallest arrays of a short merge: a word.
 const SHORT_PIECE_TINY: usize = 16;
 /// Bits of a position in a short merge's key, `rank << SHORT_KEY_BITS |
-/// position`: an unsigned minimum over the keys is the least rank and,
-/// among its repeats, the leftmost position.
+/// position`: a minimum over the keys is the least rank and, among its
+/// repeats, the leftmost position. A key is a signed word that is never
+/// negative ([`MAX_RANKS`] leaves the sign bit clear): the baseline vector
+/// instructions compare signed words and have no minimum of unsigned ones,
+/// so unsigned keys paid two sign flips more for every eight keys.
 const SHORT_KEY_BITS: u32 = SHORT_PIECE_SYMBOLS.trailing_zeros();
 /// The position bits of a short merge's key.
 const SHORT_KEY_MASK: u32 = (1 << SHORT_KEY_BITS) - 1;
 /// The key of a live symbol whose pair is no merge, past every packed key.
-const NO_KEY: u32 = u32::MAX;
-/// Ranks a short merge's key carries; a model with more merges declines
-/// the table (a vocabulary has some hundred thousand).
-const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
+const NO_KEY: i32 = i32::MAX;
+/// Ranks a short merge's key carries with its sign bit clear; a model with
+/// more merges declines the table (a vocabulary has some hundred thousand).
+const MAX_RANKS: usize = 1 << (i32::BITS - 1 - SHORT_KEY_BITS);
+// The greatest key a table makes, its last rank at the last position, is
+// under `NO_KEY`.
+const _: () =
+    assert!(((MAX_RANKS as u64 - 2) << SHORT_KEY_BITS | SHORT_KEY_MASK as u64) < NO_KEY as u64);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
 /// The id of a byte the vocabulary has no token for. On the byte-level path
@@ -1062,7 +1069,7 @@ struct ShortMerge<const N: usize> {
     symbols: [u32; N],
     /// The id the pair each live symbol starts produces, when it is a merge.
     products: [u32; N],
-    keys: [u32; N],
+    keys: [i32; N],
     /// The live neighbours by position: `next` of the last symbol is `n`,
     /// `prev` of the first is 255, both past every position.
     next: [u8; N],
@@ -1110,7 +1117,7 @@ impl<const N: usize> ShortMerge<N> {
     fn settle(mut self, table: &MergeTable, pairs: usize, ids: &mut Vec<u32>) {
         let mut best = self.least(pairs);
         while best != NO_KEY {
-            best = self.merge_at(table, (best & SHORT_KEY_MASK) as usize);
+            best = self.merge_at(table, (best as u32 & SHORT_KEY_MASK) as usize);
         }
         let mut at = 0;
         while at < self.n {
@@ -1122,7 +1129,7 @@ impl<const N: usize> ShortMerge<N> {
     /// Merges the pair the symbol at `at` starts, and answers the least key
     /// after it.
     #[inline(always)]
-    fn merge_at(&mut self, table: &MergeTable, at: usize) -> u32 {
+    fn merge_at(&mut self, table: &MergeTable, at: usize) -> i32 {
         self.symbols[at] = self.products[at];
         let dead = self.next[at] as usize;
         let right = self.next[dead] as usize;
@@ -1157,12 +1164,12 @@ impl<const N: usize> ShortMerge<N> {
     /// Records the pair the symbol at `at` starts as `merge` (its key and
     /// its product; no key for [`Merge::NONE`]) and answers the key.
     #[inline(always)]
-    fn set_pair(&mut self, at: usize, merge: Merge) -> u32 {
+    fn set_pair(&mut self, at: usize, merge: Merge) -> i32 {
         let key = if merge == Merge::NONE {
             NO_KEY
         } else {
             self.products[at] = merge.product();
-            merge.rank() << SHORT_KEY_BITS | at as u32
+            (merge.rank() << SHORT_KEY_BITS | at as u32) as i32
         };
         self.keys[at] = key;
         key
@@ -1172,7 +1179,7 @@ impl<const N: usize> ShortMerge<N> {
     /// past the live pairs are [`NO_KEY`], so the lanes may run on to the
     /// next eight).
     #[inline(always)]
-    fn least(&self, len: usize) -> u32 {
+    fn least(&self, len: usize) -> i32 {
         let lim = (len + 7) & !7;
         let mut lanes = [NO_KEY; 8];
         for chunk in self.keys[..lim].as_chunks::<8>().0 {

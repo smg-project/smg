@@ -1547,6 +1547,43 @@ fn the_read_of_a_section_builds_the_table_the_model_builds() {
     );
 }
 
+/// A short merge's key is a rank over seven position bits in a signed word,
+/// so a table carries one merge less than `MAX_RANKS`: a model with more is
+/// declined and its own merge stays in place, where the key of its last
+/// rank would be negative and sort before every other.
+#[test]
+fn a_model_with_more_merges_than_the_keys_carry_is_declined() {
+    use crate::word_cache::ReadBpe;
+    let model = ModelWrapper::BPE(model_with(&[("a", "b")], false));
+    // The merges as the one-pass read hands them over, one more than the
+    // keys carry: zeroed memory, refused by its length before an entry is
+    // read.
+    let read = ReadBpe {
+        pairs: Some(vec![[0u32; 3]; super::MAX_RANKS].into_boxed_slice()),
+        max_id: None,
+        dense: false,
+        tokens: None,
+    };
+    assert_eq!(
+        MergeTable::from_model(&model, ByteTokens::Alphabet, Some(&read)).err(),
+        Some(super::Declined::from(
+            "more merges than a short merge's keys carry"
+        ))
+    );
+    // The keys at the bound, packed as `ShortMerge::set_pair` packs them.
+    let key = |rank: usize, at: u32| ((rank as u32) << super::SHORT_KEY_BITS | at) as i32;
+    let last = key(super::MAX_RANKS - 2, super::SHORT_KEY_MASK);
+    assert!(0 < last && last < super::NO_KEY, "{last}");
+    assert!(
+        key(super::MAX_RANKS - 3, super::SHORT_KEY_MASK) < key(super::MAX_RANKS - 2, 0),
+        "a lower rank sorts first whatever its position"
+    );
+    assert!(
+        key(super::MAX_RANKS, 0) < 0,
+        "one rank more would sort before every key"
+    );
+}
+
 /// The entries read by id are the vocabulary's entries when the ids are the
 /// range `0..n`; a vocabulary numbered elsewhere (a byte-fallback one at
 /// 2^31) or two tokens on one id take the vocabulary walk, as a model
