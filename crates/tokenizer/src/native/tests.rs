@@ -3725,6 +3725,59 @@ fn an_entry_the_merges_do_not_reach_is_seeded_as_the_model_tokenizes_it() {
 }
 
 #[test]
+fn a_seeded_entry_of_more_ids_than_an_entry_holds_goes_through_the_insert() {
+    // The vocabulary has "abcdef" and no merge reaches it: the model
+    // tokenizes its own entry as six ids, more than a table's entry holds
+    // inline, so the seed keeps them in its spill. A thread's table cannot
+    // take that entry as a copy (the spill is the seed's own): the ids go
+    // through the insert into the thread's spill, and the second encode
+    // reads them from there.
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let whole = vocab.len() as u32;
+    vocab.insert("abcdef".to_owned(), whole);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, Vec::<(String, String)>::new())
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let expected: Vec<u32> = "abcdef"
+        .chars()
+        .map(|c| model.token_to_id(&c.to_string()).expect("a byte's token"))
+        .collect();
+    let mut ids = Vec::new();
+    assert!(native
+        .seed
+        .ids_into(ShortPieceKey::of(b"abcdef").expect("key"), &mut ids));
+    assert_eq!(ids, expected, "the seed holds what the model gives");
+    assert_eq!(
+        native.encode(Some(model), "abcdef", false),
+        Ok(expected.clone()),
+        "the seed answered"
+    );
+    assert_eq!(
+        native.encode(Some(model), "abcdef", false),
+        Ok(expected),
+        "the thread's table answered, from its own spill"
+    );
+    let caches: Vec<(usize, usize)> = native
+        .piece_cache
+        .iter_mut()
+        .map(|cache| {
+            let cache = cache.get_mut();
+            (cache.packed.len(), cache.short.len())
+        })
+        .collect();
+    assert_eq!(caches, [(1, 0)]);
+}
+
+#[test]
 fn a_vocabulary_with_gaps_in_its_ids_keeps_the_whole_piece_lookup() {
     // The seed reads the ids `0..vocab_size`: with "xy" at 300 and "xyz" at
     // 301 in a vocabulary of 258 entries both lie beyond it, so the seed does

@@ -26,9 +26,12 @@ use openai_protocol::{
 use prost::Message as ProstMessage;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
-use smg_grpc_client::vllm_engine::{
-    proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
-    VllmEngineClient,
+use smg_grpc_client::{
+    codec::SizedProstCodec,
+    vllm_engine::{
+        proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
+        VllmEngineClient,
+    },
 };
 use symphony::{
     formats::{qwen3, Table},
@@ -516,10 +519,8 @@ impl StreamBench {
     /// codec from the pre-encoded frames, owned against the peer and never
     /// dispatched to it, so dropping it aborts nothing.
     fn engine_stream(&self, script: &EngineScript) -> ProtoStream {
-        let mut codec = tonic_prost::ProstCodec::<
-            proto::GenerateResponse,
-            Box<proto::GenerateResponse>,
-        >::default();
+        let mut codec =
+            SizedProstCodec::<proto::GenerateResponse, Box<proto::GenerateResponse>>::default();
         let decoded = tonic::Streaming::new_response(
             codec.decoder(),
             StreamBody::new(script.reading()),
