@@ -63,8 +63,14 @@ pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 /// not by doubling).
 pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
 
+/// The unsent bytes at which a chat burst's frame takes [`CHAT_BURST_ROOM`]
+/// (`ChatStream::read_engine`): an eighth of a frame, half the stream's first
+/// room, so a paced engine's frames, one event each, stay under it and keep
+/// the room they have.
+pub(super) const CHAT_BURST_MARK: usize = CHUNK_FLUSH_BYTES / 8;
+
 /// The room the chat loop's frame buffer takes once a burst's unsent bytes
-/// reach an eighth of a frame (`ChatStream::read_engine`): one frame and two
+/// reach [`CHAT_BURST_MARK`] (`ChatStream::read_engine`): one frame and two
 /// such marks. The frame leaves at the flush bound plus the event that
 /// crossed it, and what it leaves behind still holds the next burst up to
 /// its own mark, so each frame of a burst costs one reservation: taken back
@@ -73,7 +79,7 @@ pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
 /// the chat loop reserves at every frame's mark, before it knows the frame
 /// will fill, so a second frame's room would never be written, and a frame
 /// in flight pins its whole allocation.
-pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + CHUNK_FLUSH_BYTES / 4;
+pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + 2 * CHAT_BURST_MARK;
 
 /// The SSE frame of the per-token chat chunks of one stream.
 ///
