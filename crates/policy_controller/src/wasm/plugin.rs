@@ -393,10 +393,7 @@ impl Runtime {
     /// host's origin, the clock of [`RequestFacts::now_micros`].
     pub fn with_clock(clock: impl Fn() -> u64 + Send + Sync + 'static) -> Result<Self, LoadError> {
         let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-        config.cranelift_opt_level(OptLevel::Speed);
+        configure(&mut config);
         let engine = Engine::new(&config).map_err(|e| LoadError::Runtime(e.to_string()))?;
         let mut linker = Linker::<HostState>::new(&engine);
         record::smg::policy::host::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
@@ -444,6 +441,21 @@ impl Runtime {
     pub fn now_micros(&self) -> u64 {
         (self.clock)()
     }
+}
+
+/// What the host asks of the engine: the component model, fuel and epochs
+/// for a call's two bounds, and no state for concurrent calls. The host
+/// calls a plugin one call at a time and lends it no async import. The
+/// runtime reads that switch at each call, and it defaults to on wherever
+/// its async component support is compiled in, which any crate of a build
+/// can ask for. Said here, a call makes the same allocator calls in every
+/// build, and a component that needs that support is refused.
+fn configure(config: &mut Config) {
+    config.wasm_component_model(true);
+    config.concurrency_support(false);
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+    config.cranelift_opt_level(OptLevel::Speed);
 }
 
 /// Why a component is refused at load.
@@ -2646,6 +2658,42 @@ mod tests {
                 "{spent} and {granted} under {seed}"
             );
         }
+    }
+
+    /// The engine the host asks for keeps no state for concurrent calls and
+    /// admits no component that needs it, in every build. The runtime's
+    /// switch defaults to on wherever its async component support is
+    /// compiled in, which any crate of a build can ask for: there this case
+    /// is red without the switch's line. A build without that support passes
+    /// with or without the line.
+    #[test]
+    fn the_runtime_keeps_no_state_for_concurrent_calls() {
+        // An engine as the runtime builds its own: a config, then the
+        // host's settings.
+        let mut config = wasmtime::Config::new();
+        super::configure(&mut config);
+        let engine = wasmtime::Engine::new(&config).expect("an engine");
+        // The least component that needs the support: one export lifted the
+        // async way.
+        let needs_it = wat::parse_str(
+            r#"(component
+                (core module $m
+                    (func (export "run") (result i32) i32.const 0)
+                    (func (export "cb") (param i32 i32 i32) (result i32) i32.const 0))
+                (core instance $i (instantiate $m))
+                (type $run (func async))
+                (func (export "run") (type $run)
+                    (canon lift (core func $i "run") async (callback (core func $i "cb")))))"#,
+        )
+        .expect("the component assembles");
+        assert!(
+            wasmtime::component::Component::new(&engine, needs_it).is_err(),
+            "a component with an async export compiled"
+        );
+        assert!(
+            !engine.get_concurrency_support(),
+            "the runtime keeps state for concurrent calls"
+        );
     }
 
     #[test]
