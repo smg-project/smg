@@ -1785,6 +1785,21 @@ mod tests {
                 "{surface}: {json}"
             );
         }
+
+        // A namespace member whose parameters are no object, on Responses: the refusal is the
+        // `tools` field's, and its message says which member.
+        let body = r#"{"model":"m","input":"hi","tools":[{"type":"namespace","name":"ns","description":"d","tools":[{"type":"function","name":"f","parameters":[]}]}]}"#;
+        let (status, json) = rejected::<ResponsesRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "invalid_type", "{json}");
+        assert_eq!(json["error"]["param"], "tools", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "Invalid type for 'tools[0].tools[0].parameters': expected an object, but got an array instead."
+            ),
+            "{json}"
+        );
     }
 
     /// A refusal inside a Responses `input` item names the item, the part
