@@ -306,9 +306,61 @@ jobs:
           # instead of after the arms are up. Bump the pin deliberately.
           TAU2_BENCH_REF=5bfa7e37b36656b37dc6d022156be6563c1007f3
           git clone https://github.com/sierra-research/tau2-bench
-          (cd tau2-bench && git checkout --quiet "$TAU2_BENCH_REF" && uv sync \
-            && uv pip install --python .venv/bin/python websockets \
+          (cd tau2-bench && git checkout --quiet "$TAU2_BENCH_REF" && uv sync --frozen --python 3.12 \
+            && uv pip install --python .venv/bin/python websockets==15.0.1 pydub==0.25.1 httpx==0.28.1 \
             && .venv/bin/tau2 run --help >/dev/null)
+      # No policy means no paid run. Exact-job or explicit standing per-job approval only.
+      - name: Validate approved paid request policy
+        env:
+          POLICY_JSON: ${{ vars.TAU2_BUDGET_POLICY_JSON }}
+          CONTEXTS_JSON: ${{ vars.TAU2_PROVIDER_CONTEXTS_JSON }}
+          CONTEXTS_SHA: ${{ vars.TAU2_PROVIDER_CONTEXTS_SHA256 }}
+          JOB_RUN_ID: ${{ github.run_id }}
+          JOB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          JOB_MATRIX_NAME: ${{ matrix.name }}
+          JOB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          JOB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json, os, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts/tau2').absolute()))
+          from guarded_cli import resolve_approval
+          policy = resolve_approval(json.loads(os.environ['POLICY_JSON']), {
+              'run_id': os.environ['JOB_RUN_ID'], 'run_attempt': os.environ['JOB_RUN_ATTEMPT'],
+              'matrix_name': os.environ['JOB_MATRIX_NAME'], 'workflow_ref': os.environ['JOB_WORKFLOW_REF'],
+              'event_name': os.environ['JOB_EVENT_NAME'],
+          })
+          scope = policy['scope_id']
+          root = Path(os.environ['RUNNER_TEMP']) / ('tau2-paid-' + hashlib.sha256(scope.encode()).hexdigest())
+          root.mkdir(mode=0o700, exist_ok=False)
+          (root / 'policy.json').write_text(json.dumps(policy))
+          (root / 'contexts.json').write_text(os.environ['CONTEXTS_JSON'])
+          values = {
+              'TAU2_BUDGET_POLICY': root / 'policy.json',
+              'TAU2_BUDGET_CONTEXTS': root / 'contexts.json',
+              'TAU2_BUDGET_CONTEXTS_SHA256': os.environ['CONTEXTS_SHA'],
+              'TAU2_BUDGET_LEDGER': root / 'ledger.db',
+              'TAU2_BUDGET_SCOPE': scope,
+          }
+          subprocess.run([
+              str(Path('tau2-bench/.venv/bin/python').absolute()), '-I', 'scripts/tau2/guarded_cli.py',
+              '--policy', str(values['TAU2_BUDGET_POLICY']), '--contexts', str(values['TAU2_BUDGET_CONTEXTS']),
+              '--contexts-sha256', os.environ['CONTEXTS_SHA'], '--scope', scope,
+              '--ledger', str(values['TAU2_BUDGET_LEDGER']), '--initialize',
+          ], check=True)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              for key, value in values.items():
+                  env.write(f'{key}={value}\n')
+          PYCODE
+      # Exact task selection is resolved offline through the pinned tau2 loader,
+      # before serving or paid simulator calls. Cap=0 means all actual split tasks.
+      - name: Prepare expected task coverage
+        run: |
+          tau2-bench/.venv/bin/python scripts/tau2/run_ab.py \
+            --prepare-expected-tasks "$RUNNER_TEMP/tau2_expected_tasks.json" \
+            --data-dir tau2-bench/data --domains "$DOMAINS" \
+            --num-tasks "$NUM_TASKS" --num-trials "$NUM_TRIALS" --seed 300
       - name: Stage model weights
         # Skip if pre-staged locally at <cache>/<id> (e.g. blackwell NVMe); else
         # download just this leg's model (not the whole GPU tier).
@@ -340,11 +392,8 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
-          # Auto-register the served model at $0 cost so litellm's per-response cost
-          # lookup stops logging thousands of "This model isn't mapped yet" ERRORs
-          # (self-hosted models aren't in litellm's price map). sitecustomize runs at
-          # interpreter startup, inheriting into the tau2 subprocess's own venv.
-          export PYTHONPATH="$PWD/scripts/tau2/costmap_shim${PYTHONPATH:+:$PYTHONPATH}"
+          # The isolated guarded child registers only the local agent at $0,
+          # after installing its hard paid-request boundary. No sitecustomize bypass.
           # Serialize the launch->serve->teardown phase PER HOST. Blackwell runner
           # agents share one bare-metal machine (host network + the same 8 GPUs), so
           # two legs at once collide on ports and GPU memory. A host-wide flock runs
@@ -373,7 +422,8 @@ jobs:
           DATA_DIR="tau2-bench/data"
           COMMON=(
             --agent-model "$MODEL" --user-llm gpt-5.2
-            --tau2 "$TAU2_BIN" --data-dir "$DATA_DIR"
+            --expected-tasks "$RUNNER_TEMP/tau2_expected_tasks.json" --seed 300
+            --tau2 "$TAU2_BIN" --tau2-python "$PWD/tau2-bench/.venv/bin/python" --data-dir "$DATA_DIR"
             --domains "$DOMAINS" --num-trials "$NUM_TRIALS" --num-tasks "$NUM_TASKS"
             --max-concurrency "$MAX_CONCURRENCY"
             # Fail-fast bounds so one wedged simulation can't burn the whole 6h job
@@ -416,6 +466,7 @@ jobs:
               --diff-candidate "$RUNNER_TEMP/scores_smg.json" \
               --domains "$DOMAINS" \
               --num-trials "$NUM_TRIALS" --tolerance 0.02 \
+              --expected-tasks "$RUNNER_TEMP/tau2_expected_tasks.json" --seed 300 \
               --out "$RUNNER_TEMP/tau2_ab.md" --json-out "$RUNNER_TEMP/tau2_ab.json"
           else
             # Concurrent: arm A (pure vLLM) on the first GPU half, arm B (SMG ->
@@ -463,6 +514,10 @@ jobs:
           path: |
             ${{ runner.temp }}/tau2_ab.md
             ${{ runner.temp }}/tau2_ab.json
+            ${{ runner.temp }}/tau2_expected_tasks.json
+            ${{ env.TAU2_BUDGET_LEDGER }}
+            ${{ env.TAU2_BUDGET_POLICY }}
+            ${{ env.TAU2_BUDGET_CONTEXTS }}
             ${{ runner.temp }}/tau2_transcripts.tgz
           if-no-files-found: warn
           retention-days: 30
