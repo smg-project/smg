@@ -364,17 +364,36 @@ impl ToolInventory {
     /// dropped is not still offered under its alias. Prompts and resources
     /// stay.
     pub fn clear_server_tool_entries(&self, server_key: &str) {
-        if let Some((_, names)) = self.tools_by_server.remove(server_key) {
-            for qualified in names {
-                self.remove_entry(&qualified);
-            }
+        self.retain_server_tool_entries(server_key, &HashSet::new());
+    }
+
+    /// Keep the server's tools named in `listed` and drop its others, with
+    /// the aliases that target a dropped tool, index and entry alike. A
+    /// refresh installs its listing first and calls this after, so a reader
+    /// never finds the server without the tools both listings hold.
+    pub fn retain_server_tool_entries(&self, server_key: &str, listed: &HashSet<String>) {
+        let dropped: Vec<QualifiedToolName> = self
+            .tools_by_server
+            .get_mut(server_key)
+            .map(|mut names| {
+                names
+                    .extract_if(|name| !listed.contains(name.tool_name()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.tools_by_server
+            .remove_if(server_key, |_, names| names.is_empty());
+        for qualified in dropped {
+            self.remove_entry(&qualified);
         }
 
-        // Remove aliases that point to this server, index and entry alike
         let aliases: Vec<String> = self
             .aliases
             .iter()
-            .filter(|entry| entry.value().server_key() == server_key)
+            .filter(|entry| {
+                entry.value().server_key() == server_key
+                    && !listed.contains(entry.value().tool_name())
+            })
             .map(|entry| entry.key().clone())
             .collect();
         for alias in aliases {
@@ -1084,6 +1103,42 @@ mod tests {
         // prompts and resources are not the tool clear's business
         assert_eq!(inventory.counts().1, 1);
         assert_eq!(inventory.counts().2, 1);
+    }
+
+    #[test]
+    fn retaining_a_listing_drops_the_servers_other_tools_and_their_aliases() {
+        let inventory = ToolInventory::new();
+        for name in ["kept", "gone"] {
+            inventory.insert_entry(ToolEntry::new(
+                QualifiedToolName::new("s", name),
+                create_test_tool(name),
+            ));
+            let alias = format!("{name}_alias");
+            inventory.insert_entry(
+                ToolEntry::new(
+                    QualifiedToolName::new(ALIAS_SERVER_KEY, &alias),
+                    create_test_tool(name),
+                )
+                .with_alias(AliasTarget::new(QualifiedToolName::new("s", name))),
+            );
+            inventory.register_alias(alias, QualifiedToolName::new("s", name));
+        }
+        inventory.insert_entry(ToolEntry::new(
+            QualifiedToolName::new("other", "gone"),
+            create_test_tool("gone"),
+        ));
+
+        inventory.retain_server_tool_entries("s", &HashSet::from(["kept".to_string()]));
+
+        assert!(inventory.get_entry("s", "kept").is_some());
+        assert!(inventory.get_tool_or_alias("kept_alias").is_some());
+        assert!(inventory.get_entry("s", "gone").is_none());
+        assert!(inventory.resolve_alias("gone_alias").is_none());
+        assert!(inventory
+            .get_entry(ALIAS_SERVER_KEY, "gone_alias")
+            .is_none());
+        // another server's tool of the same name is not this server's to drop
+        assert_eq!(inventory.get_tool_servers("gone"), ["other"]);
     }
 
     #[test]

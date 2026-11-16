@@ -1178,6 +1178,76 @@ mod tests {
         );
     }
 
+    /// A refresh never shows a server with fewer tools than both listings
+    /// hold: the refreshed listing goes in before what is gone goes out. A
+    /// reader on its own thread lists in a loop through one whole refresh of
+    /// two thousand tools. The second refresh's listing reaches the server
+    /// only after the first's write-back, and ends the read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_keeps_the_tools_both_listings_hold() {
+        let names: &'static [&'static str] = (0..2000)
+            .map(|n| &*format!("tool-{n}").leak())
+            .collect::<Vec<_>>()
+            .leak();
+        let changed = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(names),
+            changed: Some(Arc::clone(&changed)),
+            arrived: Some(Arc::clone(&arrived)),
+            ..Default::default()
+        })
+        .await;
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&McpServerConfig {
+                name: "conf".to_string(),
+                transport: McpTransport::Streamable {
+                    url,
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: false,
+            })
+            .await
+            .expect("the server connects");
+        // The first load's listing.
+        arrived.notified().await;
+
+        let (spinning, spins) = oneshot::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = tokio::task::spawn_blocking({
+            let (orchestrator, stop) = (Arc::clone(&orchestrator), Arc::clone(&stop));
+            move || {
+                let conf = ["conf".to_string()];
+                let mut fewest = orchestrator.list_tools_for_servers(&conf).len();
+                let _ = spinning.send(());
+                while !stop.load(Ordering::SeqCst) {
+                    fewest = fewest.min(orchestrator.list_tools_for_servers(&conf).len());
+                }
+                fewest
+            }
+        });
+        spins.await.expect("the reader runs");
+        for _ in 0..2 {
+            changed.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                .await
+                .expect("a refresh's listing reaches the server");
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            reader.await.expect("the reader ends"),
+            names.len(),
+            "the fewest tools a reader found through a refresh"
+        );
+    }
+
     /// An orchestrator holding one configured server, `conf-static`, a
     /// local MCP server with one tool; and a registry.
     async fn orchestrator_holding_conf_static() -> (Arc<McpOrchestrator>, FormatRegistry) {
