@@ -18,7 +18,8 @@ echo "Building WASM test fixtures..."
 command -v cargo >/dev/null 2>&1 || { echo "Error: cargo not found"; exit 1; }
 if ! rustup target list --installed | grep -q "wasm32-wasip2"; then
     echo "Installing wasm32-wasip2 target..."
-    rustup target add wasm32-wasip2
+    # One failed download would end the step; a later attempt resumes it.
+    bash "$REPO_ROOT/scripts/ci_retry.sh" 3 10 rustup target add wasm32-wasip2
 fi
 
 build_guest() {

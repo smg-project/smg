@@ -9,8 +9,11 @@ bash "$(dirname "${BASH_SOURCE[0]}")/ci_install_build_deps.sh"
 # it from GITHUB_PATH, this script from PATH.
 export PATH="${CI_PROTOC_PREFIX:-${HOME}/.local}/bin:${PATH}"
 
-# Install rustup (Rust installer and version manager)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.100.0
+# Install rustup (Rust installer and version manager). One failed request to
+# the release host would end the job, so the install is retried; a later
+# attempt resumes the downloads the earlier one kept.
+bash "$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh" 3 10 bash -o pipefail -c \
+    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.100.0"
 
 
 # Follow the installation prompts, then reload your shell
