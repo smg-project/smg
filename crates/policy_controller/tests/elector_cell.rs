@@ -184,8 +184,8 @@ fn parse(log: &str) -> Vec<Line> {
 /// or after following or a loss, above the term read there. A renewal stays
 /// in its run and a loss ends it, both under the run's term. Following comes
 /// first of all, after a loss under a higher term, or after following under
-/// no lower one. A line that holds no lease holds no fence, and a fence that
-/// is open stays open at each later renewal of its run.
+/// no lower one. A line carries its fence exactly when it holds the lease: a
+/// take opens the fence and a renewal that landed keeps it open.
 fn walk(lines: &[Line], told: &str) {
     for (at, line) in lines.iter().enumerate() {
         let prior = at.checked_sub(1).and_then(|before| lines.get(before));
@@ -201,10 +201,9 @@ fn walk(lines: &[Line], told: &str) {
         };
         assert!(allowed, "line {at} is no step of an election: {told}");
         if line.holds() {
-            let open = prior.is_some_and(|prior| prior.holds() && prior.closes.is_some());
             assert!(
-                line.closes.is_some() || !open,
-                "line {at} lets an open fence go at a renewal: {told}"
+                line.closes.is_some(),
+                "line {at} holds the lease without its fence: {told}"
             );
         } else {
             assert!(
@@ -337,17 +336,30 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
             .all(|other| other.term() != held.term())),
         "one term held by both: {told}"
     );
-
-    // A take opens the fence and a renewal that lands keeps it open: every
-    // line that holds the lease carries its fence.
+    // A followed term is a term the other process took, and the takes of
+    // the two logs are one a term: 1, 2, 3 and on, each once.
+    for (own, other) in [(&holder, &taker), (&taker, &holder)] {
+        for followed in own.iter().filter(|l| l.kind() == "following") {
+            assert!(
+                other
+                    .iter()
+                    .any(|l| l.kind() == "acquired" && l.term() == followed.term()),
+                "a followed term the other process never took: {told}"
+            );
+        }
+    }
+    let mut takes: Vec<u64> = holder
+        .iter()
+        .chain(&taker)
+        .filter(|l| l.kind() == "acquired")
+        .map(Line::term)
+        .collect();
+    takes.sort_unstable();
     assert!(
-        holder
-            .iter()
-            .chain(&taker)
-            .filter(|l| l.holds())
-            .all(|l| l.closes.is_some()),
-        "a line that holds the lease carries its fence: {told}"
+        (1..).zip(&takes).all(|(term, took)| term == *took),
+        "one take a term: {told}"
     );
+
     // The fence's promise across processes: a fenced instant under a term
     // begins only when each fence under a lower term has closed.
     for (lower, higher) in [(&holder, &taker), (&taker, &holder)] {

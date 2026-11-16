@@ -486,6 +486,9 @@ fn client_configuration(kubeconfig: &Path, url: &str) {
 /// One leads and the other names it; the leader is stopped, releases the
 /// object and the other takes it under the next term. The stand-in's record
 /// of changes ends with that order: the leader, its release, the successor.
+/// A leader the host held back past the duration has lost the object by
+/// the time it reads its stop: the record then ends with the leader and the
+/// successor, and the successor is stopped alone and releases in its turn.
 /// The stand-in stores a release late and the replicas close their
 /// listeners at the signal, so the stopped leader's way out is shorter than
 /// its release: it leaves once the release is stored all the same.
@@ -494,75 +497,94 @@ fn client_configuration(kubeconfig: &Path, url: &str) {
 async fn two_binaries_elect_over_the_lease_object_and_hand_over_at_a_stop() {
     use replicas::{Lease as Place, Record, Replica, ROOM};
 
-    // A leader stalled past the duration before its signal has lost the
-    // object and none to release: its log says the lease moved, that run
-    // tests nothing, and the case is run again.
-    for run in 1..=3 {
-        let shared = Shared::default();
-        let url = format!("http://{}", serve(Arc::clone(&shared)));
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let kubeconfig = dir.path().join("kubeconfig");
-        client_configuration(&kubeconfig, &url);
-        let place = Place::Object {
-            name: NAME,
-            kubeconfig: &kubeconfig,
-        };
-        shared.lock().release_delay = settings().renew_deadline / 2;
-        let start =
-            |id: &str| Replica::start(id, place, settings(), 0).expect("the replica starts");
-        let mut replicas = vec![start("replica-a"), start("replica-b")];
-        let mut record = Record::default();
+    let shared = Shared::default();
+    let url = format!("http://{}", serve(Arc::clone(&shared)));
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let kubeconfig = dir.path().join("kubeconfig");
+    client_configuration(&kubeconfig, &url);
+    let place = Place::Object {
+        name: NAME,
+        kubeconfig: &kubeconfig,
+    };
+    shared.lock().release_delay = settings().renew_deadline / 2;
+    let start = |id: &str| Replica::start(id, place, settings(), 0).expect("the replica starts");
+    let mut replicas = vec![start("replica-a"), start("replica-b")];
+    let mut record = Record::default();
 
-        let (leader, term) = record
+    let (leader, term) = record
+        .agreed(&mut replicas)
+        .await
+        .expect("the replicas agree on a leader");
+    let first = replicas[leader].identity();
+    let holder = shared
+        .lock()
+        .object
+        .as_ref()
+        .and_then(|object| object.spec.as_ref())
+        .and_then(|spec| spec.holder_identity.clone());
+    assert_eq!(holder.as_deref(), Some(first.as_str()));
+
+    let mut stopped = replicas.remove(leader);
+    stopped.terminate().expect("SIGTERM");
+    let within = settings().duration + settings().renew_period + ROOM;
+    let successor = record
+        .promoted(&mut replicas, term, within)
+        .await
+        .expect("the other replica takes the lease");
+    assert!(stopped
+        .exited()
+        .expect("the stopped leader exits")
+        .success());
+    assert_eq!(successor.replica, replicas[0].id);
+    assert_eq!(successor.info.term, term + 1);
+
+    // The stop is read from the stand-in's record of changes: the leader,
+    // its release and the successor, in that order.
+    let second = replicas[0].identity();
+    let taken = format!("{second}@{}", term + 1);
+    let changes = shared.lock().changes.clone();
+    if changes.ends_with(&[format!("{first}@{term}"), format!("@{term}"), taken.clone()]) {
+        assert!(
+            stopped.logged("the lease is released"),
+            "a stored release the leader never logged:\n{}",
+            stopped.log()
+        );
+    } else {
+        // No release was stored: the other replica took the object by its
+        // duration. A leader held back past the duration across its signal
+        // has lost the object by the time it reads the stop: it writes
+        // nothing and logs nothing, and the record of changes cannot tell
+        // that stop from one that never releases. The replica left is
+        // stopped alone, where nothing but its own release moves the
+        // object.
+        assert!(
+            changes.ends_with(&[format!("{first}@{term}"), taken]),
+            "the object's changes: {changes:?}"
+        );
+        assert!(
+            !stopped.logged("the lease is released"),
+            "the leader logged a release the stand-in never stored:\n{}",
+            stopped.log()
+        );
+        let (alone, term) = record
             .agreed(&mut replicas)
             .await
-            .expect("the replicas agree on a leader");
-        let first = replicas[leader].identity();
-        let holder = shared
-            .lock()
-            .object
-            .as_ref()
-            .and_then(|object| object.spec.as_ref())
-            .and_then(|spec| spec.holder_identity.clone());
-        assert_eq!(holder.as_deref(), Some(first.as_str()));
-
-        let mut stopped = replicas.remove(leader);
+            .expect("the replica left leads");
+        let mut stopped = replicas.remove(alone);
         stopped.terminate().expect("SIGTERM");
-        let within = settings().duration + settings().renew_period + ROOM;
-        let successor = record
-            .promoted(&mut replicas, term, within)
-            .await
-            .expect("the other replica takes the lease");
         assert!(stopped
             .exited()
             .expect("the stopped leader exits")
             .success());
-        if !stopped.logged("the lease is released") {
-            assert!(
-                stopped.lost_its_lease() && run < 3,
-                "the stopped leader released the object:\n{}",
-                stopped.log()
-            );
-            continue;
-        }
-        assert_eq!(successor.replica, replicas[0].id);
-        assert_eq!(successor.info.term, term + 1);
-
-        // The stand-in stored the leader, its release and the successor,
-        // in that order.
-        let second = replicas[0].identity();
         let changes = shared.lock().changes.clone();
         assert!(
-            changes.ends_with(&[
-                format!("{first}@{term}"),
-                format!("@{term}"),
-                format!("{second}@{}", term + 1),
-            ]),
-            "the object's changes: {changes:?}"
+            stopped.logged("the lease is released")
+                && changes.ends_with(&[format!("{second}@{term}"), format!("@{term}")]),
+            "a leader stopped alone releases the object: {changes:?}\n{}",
+            stopped.log()
         );
-        record.check().expect("the election's promise holds");
-        break;
     }
+    record.check().expect("the election's promise holds");
 }
 
 /// A release the stand-in refuses once (design 5.3): the stopped leader
@@ -570,7 +592,10 @@ async fn two_binaries_elect_over_the_lease_object_and_hand_over_at_a_stop() {
 /// stand-in stores that one, and the other replica takes the object. The
 /// row of the Numbers table is printed: the signal to the stored release
 /// and to the take, at the cell's timings or the three of
-/// `SMG_REPLICAS_TIMINGS_MS`.
+/// `SMG_REPLICAS_TIMINGS_MS`. A leader the host held back past the duration
+/// has lost the object by its second release: the other replica took it
+/// unreleased, and the replica left is stopped alone and refused once in
+/// its turn.
 #[cfg(feature = "controller")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_release_is_written_again_a_renew_period_later() {
@@ -578,76 +603,70 @@ async fn a_refused_release_is_written_again_a_renew_period_later() {
 
     let mut out = std::io::stdout();
     let settings = replicas::timings(settings(), &mut out);
-    // A leader that lost the object before its signal is run again, as in
-    // the case above.
-    for run in 1..=3 {
-        let shared = Shared::default();
-        let url = format!("http://{}", serve(Arc::clone(&shared)));
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let kubeconfig = dir.path().join("kubeconfig");
-        client_configuration(&kubeconfig, &url);
-        let place = Place::Object {
-            name: NAME,
-            kubeconfig: &kubeconfig,
-        };
-        shared.lock().release_refusals = 1;
-        let start = |id: &str| Replica::start(id, place, settings, 0).expect("the replica starts");
-        let mut replicas = vec![start("replica-a"), start("replica-b")];
-        let mut record = Record::default();
-        let (leader, term) = record
-            .agreed(&mut replicas)
-            .await
-            .expect("the replicas agree on a leader");
-        let first = replicas[leader].identity();
-
-        let mut stopped = replicas.remove(leader);
-        // Taken before the signal: no release began sooner.
-        let signalled = Instant::now();
-        stopped.terminate().expect("SIGTERM");
-        let within = settings.duration + settings.renew_period + ROOM;
-        record
-            .promoted(&mut replicas, term, within)
-            .await
-            .expect("the other replica takes the lease");
-        assert!(stopped
-            .exited()
-            .expect("the stopped leader exits")
-            .success());
-        if !stopped.logged("the lease is released") {
-            assert!(
-                stopped.lost_its_lease() && run < 3,
-                "the stopped leader released the object:\n{}",
-                stopped.log()
-            );
-            continue;
-        }
+    let shared = Shared::default();
+    let url = format!("http://{}", serve(Arc::clone(&shared)));
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let kubeconfig = dir.path().join("kubeconfig");
+    client_configuration(&kubeconfig, &url);
+    let place = Place::Object {
+        name: NAME,
+        kubeconfig: &kubeconfig,
+    };
+    shared.lock().release_refusals = 1;
+    let start = |id: &str| Replica::start(id, place, settings, 0).expect("the replica starts");
+    let mut replicas = vec![start("replica-a"), start("replica-b")];
+    let mut record = Record::default();
+    // What a stop the stand-in refused once leaves: the refusal in the
+    // stopped leader's log, and two releases at the stand-in after the
+    // `earlier` ones, the second no sooner than a renew period after the
+    // signal: the first began after the signal and the second a period
+    // after the first began. A hold of the host only makes the second
+    // later: the floor needs no room.
+    let refused_then_stored = |stopped: &Replica, earlier: usize, signalled: Instant| {
         assert!(
             stopped.logged("the release failed"),
             "the stand-in refused the first release:\n{}",
             stopped.log()
         );
-
-        // Two releases reached the stand-in, the second no sooner than a
-        // renew period after the signal: the first began after the signal
-        // and the second a period after the first began. A hold of the
-        // host only makes the second later: the floor needs no room.
-        let releases = shared.lock().releases.clone();
+        let releases = shared.lock().releases[earlier..].to_vec();
         assert_eq!(releases.len(), 2, "one refused, one stored");
         let again = releases[1].duration_since(signalled);
         assert!(
             again >= settings.renew_period,
             "the second release came {again:?} after the signal"
         );
-        let second = replicas[0].identity();
-        let changes = shared.lock().changes.clone();
+    };
+    let (leader, term) = record
+        .agreed(&mut replicas)
+        .await
+        .expect("the replicas agree on a leader");
+    let first = replicas[leader].identity();
+
+    let mut stopped = replicas.remove(leader);
+    // Taken before the signal: no release began sooner.
+    let signalled = Instant::now();
+    stopped.terminate().expect("SIGTERM");
+    let within = settings.duration + settings.renew_period + ROOM;
+    record
+        .promoted(&mut replicas, term, within)
+        .await
+        .expect("the other replica takes the lease");
+    assert!(stopped
+        .exited()
+        .expect("the stopped leader exits")
+        .success());
+    // The stop is read from the stand-in's record of changes: the leader,
+    // its release and the successor, in that order.
+    let second = replicas[0].identity();
+    let taken = format!("{second}@{}", term + 1);
+    let changes = shared.lock().changes.clone();
+    if changes.ends_with(&[format!("{first}@{term}"), format!("@{term}"), taken.clone()]) {
         assert!(
-            changes.ends_with(&[
-                format!("{first}@{term}"),
-                format!("@{term}"),
-                format!("{second}@{}", term + 1),
-            ]),
-            "the object's changes: {changes:?}"
+            stopped.logged("the lease is released"),
+            "a stored release the leader never logged:\n{}",
+            stopped.log()
         );
+        refused_then_stored(&stopped, 0, signalled);
 
         // The successor lives on: its take's line reaches the log a
         // moment after its answer turned.
@@ -671,9 +690,49 @@ async fn a_refused_release_is_written_again_a_renew_period_later() {
             stamp(&replicas[0], "leading").saturating_sub(signal) / 1000
         )
         .expect("stdout");
-        record.check().expect("the election's promise holds");
-        break;
+    } else {
+        // No release was stored: the other replica took the object by its
+        // duration. A leader held back past the duration, before its signal
+        // or between its two releases, has lost the object by the time it
+        // releases: it writes nothing and logs nothing, and the record of
+        // changes cannot tell that stop from one that never releases. The
+        // replica left is stopped alone, where nothing but its own release
+        // moves the object, and the stand-in refuses its first release.
+        assert!(
+            changes.ends_with(&[format!("{first}@{term}"), taken]),
+            "the object's changes: {changes:?}"
+        );
+        assert!(
+            !stopped.logged("the lease is released"),
+            "the leader logged a release the stand-in never stored:\n{}",
+            stopped.log()
+        );
+        let (alone, term) = record
+            .agreed(&mut replicas)
+            .await
+            .expect("the replica left leads");
+        let mut stopped = replicas.remove(alone);
+        let earlier = {
+            let mut store = shared.lock();
+            store.release_refusals = 1;
+            store.releases.len()
+        };
+        let signalled = Instant::now();
+        stopped.terminate().expect("SIGTERM");
+        assert!(stopped
+            .exited()
+            .expect("the stopped leader exits")
+            .success());
+        let changes = shared.lock().changes.clone();
+        assert!(
+            stopped.logged("the lease is released")
+                && changes.ends_with(&[format!("{second}@{term}"), format!("@{term}")]),
+            "a leader stopped alone releases the object: {changes:?}\n{}",
+            stopped.log()
+        );
+        refused_then_stored(&stopped, earlier, signalled);
     }
+    record.check().expect("the election's promise holds");
 }
 
 /// A settle window longer than the cell below waits for anything: a stop
