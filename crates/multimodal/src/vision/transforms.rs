@@ -521,7 +521,7 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     clippy::slow_vector_initialization,
     reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
 )]
-fn plain_buffer(len: usize) -> Vec<u8> {
+pub(crate) fn plain_buffer(len: usize) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(len);
     buffer.resize(len, 0);
     buffer
