@@ -21,10 +21,12 @@
 // and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
 // A listener its operator names takes a caller's identity as told: the
 // caller states its name in the `x-smg-principal` metadata entry of every
-// call, once (one token of printable ASCII, 1 to 253 bytes), nothing is
-// verified, and the principal reads METHOD_AS_TOLD. Such a listener has no
-// other credential rule. Leader needs no principal: it tells a caller where
-// to go before the caller holds a session.
+// call, once (one token of visible ASCII, 0x21 to 0x7E, with no comma, 1
+// to 253 bytes: entries a hop joined with a comma are two names), nothing
+// is verified, and the principal reads METHOD_AS_TOLD. Such a listener has
+// no other credential rule, and the stated name stands there wherever
+// this contract says the verified subject. Leader needs no principal: it
+// tells a caller where to go before the caller holds a session.
 // Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
 // leader's term, every GatewayFrame the gateway's term floor. A gateway
 // raises its floor from Leader and rejects frames below it; the controller
