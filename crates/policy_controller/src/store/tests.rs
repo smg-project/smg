@@ -1319,3 +1319,30 @@ fn the_identity_rule_reads_a_key_through_its_fingerprint() {
     );
     assert_ne!(identity_of(0, 0), WorkerId(0), "an id is never 0");
 }
+
+#[test]
+fn a_dropped_gateway_takes_its_vetoes_and_completed_dispatches_and_no_other_gateways() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let until = now + Duration::from_secs(60);
+    let (g1, g2) = (GatewayId(1), GatewayId(2));
+    let a = ready(&store, "http://a:8000");
+    let b = ready(&store, "http://b:8000");
+    for gateway in [g1, g2] {
+        store.gateway_veto(gateway, a, Some(until));
+        HealthSink::completed(&store, gateway, b, TransportClass::Ok, now);
+    }
+    store.gateway_veto(g1, b, Some(until));
+    assert_eq!(store.health_entries(), 5);
+
+    assert_eq!(store.drop_gateway(g1), 0, "it held no lease");
+    assert!(!store.vetoed(g1, a, now) && !store.vetoed(g1, b, now));
+    assert!(!store.completed_ok_since(g1, b, now));
+    // The other gateway's stand.
+    assert!(store.vetoed(g2, a, now));
+    assert!(store.completed_ok_since(g2, b, now));
+    assert_eq!(store.health_entries(), 2);
+    // A gateway that holds nothing is dropped as cleanly.
+    assert_eq!(store.drop_gateway(g1), 0);
+    assert_eq!(store.health_entries(), 2);
+}

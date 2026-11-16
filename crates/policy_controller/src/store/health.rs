@@ -42,8 +42,10 @@ pub trait HealthSink: Send + Sync {
     /// A gateway's standing veto on a worker until `until`; `None` clears
     /// it. The breaker's open window and the liveness veto travel this way,
     /// and a veto standing across a reconnect is re-asserted in the gateway's
-    /// `Hello` pages. A veto for a worker without a row (never registered,
-    /// or removed) writes nothing; the clear needs no such guard.
+    /// `Hello`. A veto for a worker without a row (never registered, or
+    /// removed) writes nothing; the clear needs no such guard. A gateway
+    /// gone past its grace period takes its vetoes with it
+    /// ([`LeasesStore::drop_gateway`](super::LeasesStore::drop_gateway)).
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>);
 
     /// Whether `gateway` vetoes the worker at `now`.

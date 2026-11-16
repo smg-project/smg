@@ -1,7 +1,8 @@
 //! The `Session` call (design 5.2 and 5.3): one stream a gateway. `Hello`
 //! comes first and `Welcome` answers it; from the `Welcome` the gateway is
 //! present ([`Gateways`](super::gateways::Gateways)) and stays so for the
-//! grace period after the stream's end.
+//! grace period after the stream's end, one period more at most while a
+//! session a newer one replaced still runs.
 //!
 //! A stream says `Hello` within [`HELLO_DEADLINE`] of its open or is ended,
 //! and while it waits it reads the election's steps: a replica that stops
@@ -24,10 +25,14 @@
 //! the `Welcome` and after it: only the gateway's own close ends a stream
 //! with none.
 //!
-//! One arm a kind of frame. `Hello` is served here, and the lifecycle's
-//! three frames in [`lifecycle`]. The other kinds are refused by name
-//! until the step that serves each adds its arm, as the service refuses an
-//! unserved call.
+//! One arm a kind of frame. `Hello` and `GatewayVeto` are served here, and
+//! the lifecycle's three frames in [`lifecycle`]. The other kinds are
+//! refused by name until the step that serves each adds its arm, as the
+//! service refuses an unserved call.
+//!
+//! A gateway's vetoes ride its `Hello`, whole, and are held before the
+//! `Welcome` leaves: a new leader masks for the gateway from its first
+//! decision. After it a `GatewayVeto` sets or lifts one kind's veto.
 //!
 //! The session's loop is polled with the stream it answers on, so no task
 //! outlives its stream: a gateway that stops reading its stream stops its
@@ -47,7 +52,7 @@ use tracing::{debug, info};
 
 use super::{
     decide,
-    gateways::{Refused, Seat},
+    gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX},
     lifecycle,
     principal::Principal,
     service::Shared,
@@ -56,10 +61,12 @@ use super::{
 use crate::{
     proto::{self, controller_frame, gateway_frame::Frame},
     store::GatewayId,
+    view::WorkerId,
 };
 
 /// The stream rule's grace period (design 4.3): how long a gateway stays
-/// present after its session ended with no new `Hello`.
+/// present after its session ended with no new `Hello`. A session a newer
+/// one replaced that still runs holds it one period more at most.
 pub(crate) const GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 /// How many gateways are present at most, each with a standing session or
@@ -75,6 +82,9 @@ pub(crate) const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The refusal of a `Hello` on a replica that does not lead.
 const NOT_LEADING: &str = "this controller does not lead: find the leader through Leader";
+
+/// How many vetoes a `Hello` lists at most.
+const LISTED_MAX: usize = 4_096;
 
 /// How often a gateway polls `Leader` for its term floor (design 5.3).
 const LEADER_POLL: Duration = Duration::from_secs(1);
@@ -307,6 +317,9 @@ async fn session(
             hello.protocol_min, hello.protocol_max
         )));
     }
+    if let Some(status) = listed(&hello) {
+        return Some(status);
+    }
     // One read: the verdict and the term the Welcome carries.
     let Some(term) = shared.fence.leader_term(now) else {
         return Some(not_leading(shared, answers).await);
@@ -326,6 +339,16 @@ async fn session(
         }
         Err(refused) => return Some(refusal(refused)),
     };
+    // The gateway's vetoes, whole, held before the Welcome leaves.
+    let vetoes: Vec<(WorkerId, i32, Instant)> = hello
+        .vetoes
+        .iter()
+        .map(|veto| {
+            let remaining = Duration::from_micros(veto.remaining_micros.into());
+            (WorkerId(veto.worker_id), veto.kind, now + remaining)
+        })
+        .collect();
+    let vetoes_restored = seat.restore(&vetoes, now);
     let (generation, needs, hashing) = applied();
     let welcome = proto::Welcome {
         protocol: PROTOCOL_VERSION,
@@ -347,9 +370,10 @@ async fn session(
         dispatch_ttl_ms: 0,
         grace_period_ms: millis(shared.gateways.grace()),
         leader_poll_ms: millis(LEADER_POLL),
-        // The design sends no page: nothing is restored from a Hello.
+        // The design sends no page: no lease and no pin is restored.
         leases_restored: 0,
         pins_restored: 0,
+        vetoes_restored: u32::try_from(vetoes_restored).unwrap_or(u32::MAX),
     };
     answers
         .frame(term, controller_frame::Frame::Welcome(welcome))
@@ -358,6 +382,8 @@ async fn session(
         gateway = %principal.subject,
         version = %release(&hello.version),
         term,
+        vetoes = hello.vetoes.len(),
+        vetoes_restored,
         "a gateway is welcomed"
     );
 
@@ -423,6 +449,73 @@ fn replaced() -> Status {
     Status::aborted("a newer session of this gateway took this one's place")
 }
 
+/// The form of a `Hello`'s veto list, judged before anything is applied and
+/// before a presence is made: its count is the list's length, it holds
+/// [`LISTED_MAX`] vetoes at most, no entry is a veto of no kind, and no
+/// worker holds more than [`KINDS_MAX`] kinds in it.
+fn listed(hello: &proto::Hello) -> Option<Status> {
+    if usize::try_from(hello.veto_count).ok() != Some(hello.vetoes.len()) {
+        return Some(Status::invalid_argument(format!(
+            "Hello counts {} vetoes and lists {}",
+            hello.veto_count,
+            hello.vetoes.len()
+        )));
+    }
+    if hello.vetoes.len() > LISTED_MAX {
+        return Some(Status::resource_exhausted(format!(
+            "Hello lists {} vetoes: a list holds {LISTED_MAX} at most",
+            hello.vetoes.len()
+        )));
+    }
+    if hello.vetoes.iter().any(|veto| veto.kind == 0) {
+        return Some(Status::invalid_argument(
+            "Hello lists a veto of no kind: KIND_UNSPECIFIED is not a veto",
+        ));
+    }
+    let kinds = hello
+        .vetoes
+        .iter()
+        .map(|veto| (WorkerId(veto.worker_id), veto.kind));
+    over_kinds(kinds).then(|| {
+        Status::resource_exhausted(format!(
+            "Hello lists more than {KINDS_MAX} kinds of veto on one worker"
+        ))
+    })
+}
+
+/// The `GatewayVeto` arm: one kind's veto set from the frame's instant, or
+/// lifted by `clear`. A duration of zero ends at that instant, which the
+/// table reads as no veto: it lifts as `clear` does. `Some` ends the
+/// session: a veto of no kind is neither kept nor dropped in silence.
+fn vetoed(seat: &Seat, veto: &proto::GatewayVeto, now: Instant) -> Option<Status> {
+    if veto.kind == 0 {
+        return Some(Status::invalid_argument(
+            "GatewayVeto names no kind: KIND_UNSPECIFIED is not a veto",
+        ));
+    }
+    let until = (!veto.clear).then(|| now + Duration::from_micros(veto.for_micros.into()));
+    match seat.veto(WorkerId(veto.worker_id), veto.kind, until, now) {
+        Vetoed::Shown => None,
+        // The table's lock asked the seat's question again and a newer
+        // session stands: the same end.
+        Vetoed::Replaced => Some(replaced()),
+        Vetoed::NoWorker => {
+            debug!(
+                worker = veto.worker_id,
+                kind = veto.kind,
+                "a veto on a worker with no row is dropped"
+            );
+            None
+        }
+        // A veto frame has no answer in the stream, and one dropped in
+        // silence would leave the gateway believing a veto stands that the
+        // store does not hold: the session ends by name.
+        Vetoed::Full => Some(Status::resource_exhausted(format!(
+            "GatewayVeto would stand one kind more than the {KINDS_MAX} a worker holds for one gateway"
+        ))),
+    }
+}
+
 /// One frame after the `Welcome`: the seat, the fence, the floor, then its
 /// kind's arm. `Some` ends the session; the frame is then not applied.
 async fn judge(
@@ -462,9 +555,10 @@ async fn judge(
         Some(Frame::Released(released)) => {
             lifecycle::released(&shared.store, gateway, released).err()
         }
-        Some(unserved @ (Frame::HelloPage(_) | Frame::Veto(_) | Frame::SpecAck(_))) => Some(
-            Status::unimplemented(format!("{} is not served by this build", kind(unserved))),
-        ),
+        Some(Frame::Veto(veto)) => vetoed(seat, veto, now),
+        Some(unserved @ (Frame::HelloPage(_) | Frame::SpecAck(_))) => Some(Status::unimplemented(
+            format!("{} is not served by this build", kind(unserved)),
+        )),
     }
 }
 
@@ -493,8 +587,8 @@ mod tests {
     use tonic_prost::ProstCodec;
 
     use super::{
-        judge, refusal, release, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL, OUT_QUEUE,
-        PRESENT_MAX, RELEASE_MAX,
+        judge, refusal, release, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL, LISTED_MAX,
+        OUT_QUEUE, PRESENT_MAX, RELEASE_MAX,
     };
     use crate::{
         controller::{
@@ -502,7 +596,7 @@ mod tests {
             election::{LeasePlace, Standing},
             gateways::{
                 tests::{lease, PATIENT},
-                Gateways, Refused,
+                Gateways, Refused, KINDS_MAX,
             },
             lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
@@ -517,6 +611,7 @@ mod tests {
             policy_controller_client::PolicyControllerClient,
         },
         store::{HealthSink, LeaseState, LeasesStore},
+        view::WorkerId,
     };
 
     const ID: &str = "controller-0";
@@ -803,6 +898,7 @@ mod tests {
                     leader_poll_ms: 1_000,
                     leases_restored: 0,
                     pins_restored: 0,
+                    vetoes_restored: 0,
                 })),
             }
         );
@@ -909,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_kind_but_hello_is_refused_by_its_name_until_its_step_serves_it() {
+    async fn a_kind_no_step_serves_yet_is_refused_by_its_name() {
         let mut bed = bed(PATIENT).await;
         bed.leads(1);
         let kinds = [
@@ -917,11 +1013,6 @@ mod tests {
                 Frame::HelloPage(proto::HelloPage::default()),
                 Code::Unimplemented,
                 "HelloPage is not served by this build",
-            ),
-            (
-                Frame::Veto(proto::GatewayVeto::default()),
-                Code::Unimplemented,
-                "GatewayVeto is not served by this build",
             ),
             (
                 Frame::SpecAck(proto::SpecAck::default()),
@@ -1479,5 +1570,234 @@ mod tests {
         ] {
             assert_eq!(release(unread), "(unreadable)", "{unread:?}");
         }
+    }
+
+    const NO_KIND: &str = "GatewayVeto names no kind: KIND_UNSPECIFIED is not a veto";
+    /// A minute, in the contract's microseconds.
+    const MINUTE: u32 = 60_000_000;
+
+    fn veto(worker: WorkerId, kind: i32, for_micros: u32, clear: bool) -> proto::GatewayFrame {
+        frame(
+            0,
+            Some(Frame::Veto(proto::GatewayVeto {
+                worker_id: worker.0,
+                kind,
+                for_micros,
+                clear,
+            })),
+        )
+    }
+
+    /// Whether the store shows the gateway's veto on `worker` now.
+    fn vetoed(bed: &Bed, worker: WorkerId) -> bool {
+        let gateway = told(GATEWAY).gateway();
+        bed.shared.store.vetoed(gateway, worker, Instant::now())
+    }
+
+    /// Waits, bounded, until the store shows the veto as `stands`.
+    async fn shows(bed: &Bed, worker: WorkerId, stands: bool) {
+        let started = Instant::now();
+        while vetoed(bed, worker) != stands {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the store shows the veto as {stands} within 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// The frame's arm: a duration sets its kind's veto, `clear` or a zero
+    /// duration lifts it, and a veto of no kind ends the session by name.
+    #[tokio::test]
+    async fn a_veto_frame_sets_its_kinds_veto_and_a_clear_or_a_zero_duration_lifts_it() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let w = worker(&bed.shared.store, "http://a:8000");
+        let mut session = open(bed.addr).await;
+        assert_eq!(session.welcomed(1).await.vetoes_restored, 0);
+
+        session.send(veto(w, 1, MINUTE, false)).await;
+        shows(&bed, w, true).await;
+        session.send(veto(w, 1, MINUTE, true)).await;
+        shows(&bed, w, false).await;
+        // A kind this build has no name for, lifted by a zero duration.
+        session.send(veto(w, 9, MINUTE, false)).await;
+        shows(&bed, w, true).await;
+        session.send(veto(w, 9, 0, false)).await;
+        shows(&bed, w, false).await;
+
+        session.send(veto(w, 0, MINUTE, false)).await;
+        assert_eq!(
+            session.status().await,
+            (Code::InvalidArgument, NO_KIND.to_owned())
+        );
+        assert!(!vetoed(&bed, w), "a veto of no kind is not kept");
+    }
+
+    /// A frame that meets a closed fence is not applied: the session ends
+    /// with its `NotLeader` and the store shows no veto.
+    #[tokio::test]
+    async fn a_veto_that_meets_a_closed_fence_is_not_applied() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let w = worker(&bed.shared.store, "http://a:8000");
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+
+        // The lease is given up and no step is published: the frame itself
+        // meets the fence.
+        assert!(bed.elector.release().expect("the release"));
+        session.send(veto(w, 1, MINUTE, false)).await;
+        assert_eq!(session.frame().await, not_leader(2, 1, ""));
+        assert_eq!(session.status().await, (Code::Aborted, ENDED.to_owned()));
+        assert!(!vetoed(&bed, w));
+    }
+
+    /// A gateway's vetoes ride its `Hello` and are held before the
+    /// `Welcome` leaves. A list that miscounts, or holds a veto of no kind,
+    /// refuses the `Hello` whole.
+    #[tokio::test]
+    async fn a_hellos_vetoes_are_held_before_the_welcome_and_a_malformed_list_refuses_it() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let w = worker(&bed.shared.store, "http://a:8000");
+        let assertion = |worker: WorkerId, kind: i32, remaining_micros: u32| proto::VetoAssertion {
+            worker_id: worker.0,
+            kind,
+            remaining_micros,
+        };
+        let listing = |veto_count: u32, vetoes: Vec<proto::VetoAssertion>| {
+            frame(
+                0,
+                Some(Frame::Hello(proto::Hello {
+                    gateway_id: GATEWAY.to_owned(),
+                    protocol_min: PROTOCOL_VERSION,
+                    protocol_max: PROTOCOL_VERSION,
+                    veto_count,
+                    vetoes,
+                    ..proto::Hello::default()
+                })),
+            )
+        };
+
+        // One veto more than a list holds, and one kind more than a worker
+        // holds: each is one more than a ceiling of the controller's.
+        let over = u32::try_from(LISTED_MAX + 1).expect("a small number");
+        let long = (0..u64::from(over))
+            .map(|n| assertion(WorkerId(1_000 + n), 1, MINUTE))
+            .collect();
+        let kinds = i32::try_from(KINDS_MAX + 1).expect("a small number");
+        let many = (1..=kinds).map(|kind| assertion(w, kind, MINUTE)).collect();
+        let refused = [
+            (
+                listing(2, vec![assertion(w, 1, MINUTE)]),
+                Code::InvalidArgument,
+                "Hello counts 2 vetoes and lists 1".to_owned(),
+            ),
+            (
+                listing(2, vec![assertion(w, 1, MINUTE), assertion(w, 0, MINUTE)]),
+                Code::InvalidArgument,
+                "Hello lists a veto of no kind: KIND_UNSPECIFIED is not a veto".to_owned(),
+            ),
+            (
+                listing(over, long),
+                Code::ResourceExhausted,
+                format!("Hello lists {over} vetoes: a list holds {LISTED_MAX} at most"),
+            ),
+            (
+                listing(u32::try_from(kinds).expect("a small number"), many),
+                Code::ResourceExhausted,
+                format!("Hello lists more than {KINDS_MAX} kinds of veto on one worker"),
+            ),
+        ];
+        for (hello, code, message) in refused {
+            let mut session = open(bed.addr).await;
+            session.send(hello).await;
+            assert_eq!(session.status().await, (code, message));
+            assert!(!vetoed(&bed, w), "nothing of a refused list is applied");
+            assert!(!bed.present(Instant::now()), "and no presence is made");
+        }
+
+        // One veto the controller holds, one on a worker it holds no row
+        // for, one with nothing remaining.
+        let mut session = open(bed.addr).await;
+        let list = vec![
+            assertion(w, 1, MINUTE),
+            assertion(WorkerId(77), 1, MINUTE),
+            assertion(w, 2, 0),
+        ];
+        session.send(listing(3, list)).await;
+        let welcome = match session.frame().await.frame {
+            Some(controller_frame::Frame::Welcome(welcome)) => welcome,
+            other => panic!("a Welcome answers a Hello: {other:?}"),
+        };
+        assert_eq!(welcome.vetoes_restored, 1);
+        // No wait: the veto was held before the Welcome left.
+        assert!(vetoed(&bed, w));
+    }
+
+    /// A worker holds a ceiling of kinds for one gateway: the frame that
+    /// would set one more ends the session by name, and what stands stays.
+    #[tokio::test]
+    async fn a_veto_of_one_kind_more_than_a_worker_holds_ends_the_session_by_name() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let w = worker(&bed.shared.store, "http://a:8000");
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
+        for kind in 1..=kinds {
+            session.send(veto(w, kind, MINUTE, false)).await;
+        }
+        session.send(veto(w, kinds + 1, MINUTE, false)).await;
+        assert_eq!(
+            session.status().await,
+            (
+                Code::ResourceExhausted,
+                format!(
+                    "GatewayVeto would stand one kind more than the {KINDS_MAX} a worker holds for one gateway"
+                )
+            )
+        );
+        assert!(vetoed(&bed, w), "the kinds that stood stand");
+    }
+
+    /// The table's lock asks the seat's question again: a veto frame of a
+    /// session replaced after `judge` asked ends it by the seat's own
+    /// status and writes nothing.
+    #[tokio::test]
+    async fn a_veto_frame_of_a_session_replaced_since_the_question_ends_it_the_same_way() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let gateway = told(GATEWAY).gateway();
+        let w = worker(&bed.shared.store, "http://a:8000");
+        let now = Instant::now();
+        let seat = bed
+            .shared
+            .gateways
+            .welcome(gateway, GATEWAY, 1, now)
+            .expect("a seat");
+        let _newer = bed
+            .shared
+            .gateways
+            .welcome(gateway, GATEWAY, 1, now)
+            .expect("a seat");
+        // Past the question `judge` asks: the arm itself, as for a frame
+        // asked about before the newer session's `Welcome`.
+        let frame = proto::GatewayVeto {
+            worker_id: w.0,
+            kind: 1,
+            for_micros: MINUTE,
+            clear: false,
+        };
+        let status = super::vetoed(&seat, &frame, now).expect("the replaced session ends");
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                Code::Aborted,
+                "a newer session of this gateway took this one's place"
+            )
+        );
+        assert!(!vetoed(&bed, w), "a replaced session writes no veto");
     }
 }

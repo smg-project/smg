@@ -18,9 +18,9 @@ use super::{
 use crate::{
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        pairing::Refusal, GatewayId, HealthSink, LoadSink, LoadSource, MembershipTail, MemoryStore,
-        Overload, PairingDescriptor, Reachability, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MembershipTail,
+        MemoryStore, Overload, PairingDescriptor, Reachability, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -4363,4 +4363,38 @@ fn a_lent_view_hands_its_own_gateways_standing_vetoes_in_the_rows_order() {
     // No other gateway's run is read.
     assert_eq!(masked(GatewayId(2), t0), [0]);
     assert!(masked(GatewayId(3), t0).is_empty());
+}
+
+#[test]
+fn a_dropped_gateways_vetoes_leave_in_one_publication_and_every_other_stands() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let one = member(&store, "http://a:8000");
+    let two = member(&store, "http://b:8000");
+    let other = GatewayId(2);
+    store.gateway_veto(ASKER, one, Some(until));
+    store.gateway_veto(ASKER, two, Some(until));
+    store.gateway_veto(other, two, Some(until));
+    let mut both = [one, two];
+    both.sort_unstable();
+    assert_eq!(stalled(&store, ASKER, t0), both);
+
+    let before = store.world();
+    store.drop_gateway(ASKER);
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(
+        stalled(&store, other, t0),
+        [two],
+        "another gateway's stands"
+    );
+    // Dropped again, and a gateway that never vetoed: no world is made.
+    let lifted = store.world();
+    assert!(
+        !Arc::ptr_eq(&before, &lifted),
+        "the lifting is a publication"
+    );
+    store.drop_gateway(ASKER);
+    store.drop_gateway(GatewayId(3));
+    assert!(Arc::ptr_eq(&lifted, &store.world()));
 }

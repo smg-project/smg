@@ -71,26 +71,29 @@
 // at the head of a refused registration's or patch's status message), a
 // Dispatched, Completed or Released whose side, class, reason or number
 // reads wrong, a Released that names neither a lease nor a ticket (the
-// field's name in the message), or a DecideRequest field out of its range
-// in this protocol version (the status message names the field, and the
-// stream closes); RESOURCE_EXHAUSTED a relay over its per-subscriber budget
-// or a standby over its backlog (a resync_required batch precedes it), a
-// complete snapshot above one message, a Hello past the controller's
-// ceiling of present gateways, a WatchWorkers past its principal's ceiling
-// of 4 open watches or past the replica's ceiling of watching principals, a
+// field's name in the message), a veto of no kind, a Hello whose veto_count
+// is not its list's length, or a DecideRequest field out of its range in
+// this protocol version (the status message names the field, and the stream
+// closes); RESOURCE_EXHAUSTED a relay over its per-subscriber budget or a
+// standby over its backlog (a resync_required batch precedes it), a complete
+// snapshot above one message, a WatchWorkers past its principal's ceiling of
+// 4 open watches or past the replica's ceiling of watching principals, a
 // Decide stream past its gateway's Welcome.max_decide_streams, a Session
-// frame over the transport's limit of 4 MiB a message, or a Decide frame
-// over 64 KiB as encoded; ALREADY_EXISTS a Hello whose id collides with
-// another present gateway's, refused while that one stands, or an add of a
-// registered URL; NOT_FOUND a replace of an absent URL, or no worker under
-// the id; DEADLINE_EXCEEDED a Session stream that said no Hello within 5 s
-// of its open; UNAVAILABLE a standby not yet synced, a read a standby cannot
-// serve yet (WatchWorkers until its replica follows the leader's log, a
-// NotLeader in the status details), a leader that does not write under its
-// term (the moment after its take: retry; and for as long as its log
-// followed a term at or above the one it took: no registration numbers a
-// life under it), or a Decide stream open when the controller closes its
-// listeners at its shutdown (its gateway opens the next one on the leader);
+// frame over the transport's limit of 4 MiB a message, a Decide frame over
+// 64 KiB as encoded, or a ceiling of the controller's: a Hello past 4,096
+// present gateways, a Hello that lists more than 4,096 vetoes or more than
+// eight kinds for one worker, a ninth kind of veto on one worker;
+// ALREADY_EXISTS a Hello whose id collides with another present gateway's,
+// refused while that one stands, or an add of a registered URL; NOT_FOUND a
+// replace of an absent URL, or no worker under the id; DEADLINE_EXCEEDED a
+// Session stream that said no Hello within 5 s of its open; UNAVAILABLE a
+// standby not yet synced, a read a standby cannot serve yet (WatchWorkers
+// until its replica follows the leader's log, a NotLeader in the status
+// details), a leader that does not write under its term (the moment after
+// its take: retry; and for as long as its log followed a term at or above
+// the one it took: no registration numbers a life under it), or a Decide
+// stream open when the controller closes its listeners at its shutdown (its
+// gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a
@@ -166,8 +169,9 @@ message GatewayFrame {
   }
 }
 
-// What the gateway holds; the leases, pins and vetoes follow in HelloPage
-// frames, the counts here size the restore.
+// What the gateway holds. Its standing vetoes ride this frame. No HelloPage
+// is sent (design 5.2): the page's case stays unsent in the oneof, and the
+// lease and pin counts size no restore.
 message Hello {
   // Must equal the principal's subject.
   string gateway_id = 1;
@@ -180,12 +184,20 @@ message Hello {
   uint64 generation = 7;
   uint32 lease_count = 8;
   uint32 pin_count = 9;
+  // The length of `vetoes`: a Hello that counts otherwise is refused.
   uint32 veto_count = 10;
   // A reconnect inside the grace period: restore exactly what the pages list
   // and release at once what they omit (the inverse rule, design 4.3).
   bool resume = 11;
   // The gateway's release string, for the audit log.
   string version = 16;
+  // The gateway's standing vetoes, whole, held before the Welcome leaves: a
+  // veto the list omits is lifted, whether or not the Hello says `resume`.
+  // An entry with nothing remaining is no veto; of two entries of one
+  // worker and kind the later end stands. A list holds at most 4,096
+  // vetoes and at most eight kinds for one worker: a Hello past either is
+  // refused RESOURCE_EXHAUSTED and makes no session.
+  repeated VetoAssertion vetoes = 17;
   // Never assigned; kept out of use so a later field takes a fresh number.
   reserved 12 to 15;
 }
@@ -233,15 +245,27 @@ message VetoAssertion {
   uint32 remaining_micros = 3;
 }
 
+// A gateway's veto on a worker, by kind: each kind stands and clears apart,
+// and the worker is vetoed for the gateway while one kind stands. A veto on
+// a worker the controller holds no row for is not kept: a veto leaves with
+// its worker's row, and the gateway states it again when it sees the worker.
 message GatewayVeto {
   fixed64 worker_id = 1;
+  // A veto is kept by its kind's number: a number this build has no name
+  // for stands and clears like the named ones. KIND_UNSPECIFIED is no kind:
+  // the session ends with INVALID_ARGUMENT, and a Hello that lists it is
+  // refused the same way. A worker holds at most eight kinds for one
+  // gateway: a frame that would set a ninth ends the session with
+  // RESOURCE_EXHAUSTED, and what stands stays. A clear, and a frame of a
+  // kind that stands, are always taken.
   enum Kind {
     KIND_UNSPECIFIED = 0;
     KIND_BREAKER = 1;
     KIND_LIVENESS = 2;
   }
   Kind kind = 2;
-  // How long the veto stands; 0 with `clear` lifts it.
+  // How long the veto stands from the frame's arrival. `clear`, or a
+  // duration of 0, lifts this kind's veto.
   uint32 for_micros = 3;
   bool clear = 4;
 }
@@ -288,6 +312,10 @@ message Welcome {
   uint32 leader_poll_ms = 11;
   uint32 leases_restored = 12;
   uint32 pins_restored = 13;
+  // How many of the Hello's vetoes the controller holds: fewer than listed
+  // when an entry had nothing remaining, repeated another, or named a worker
+  // the controller holds no row for.
+  uint32 vetoes_restored = 14;
 }
 
 // What the transport verified, or what the caller stated on a listener that

@@ -395,6 +395,14 @@ impl MemoryStore {
         self.show(&mut loads.writer, world);
     }
 
+    /// Publish the lifting of every veto of `gateway` at once. Called under
+    /// the health lock, as a veto's own write is.
+    fn show_gateway_gone(&self, gateway: GatewayId) {
+        let mut loads = self.loads.lock();
+        let world = loads.writer.drop_gateway(gateway);
+        self.show(&mut loads.writer, world);
+    }
+
     /// How many entries the health tables hold, over every gateway. A
     /// gateway's table that holds none counts as one: a table left behind
     /// shows.
@@ -476,15 +484,6 @@ impl MemoryStore {
         health.forget(id);
         let mut loads = self.loads.lock();
         loads.ranks.remove(&id);
-    }
-
-    /// A gateway is gone past its grace period: what the health tables
-    /// hold under its key leaves with it, here and nowhere else. Its
-    /// completions today; its vetoes join with the arm that writes them.
-    /// Called from [`LeasesStore::drop_gateway`]: one door tells the store
-    /// a gateway is gone.
-    fn forget_gateway(&self, gateway: GatewayId) {
-        self.health.lock().ok_at.remove(&gateway);
     }
 
     /// How many times a publication allocated a pool's rows since the store
@@ -926,6 +925,12 @@ impl HealthTables {
             workers.remove(&id);
             !workers.is_empty()
         });
+    }
+
+    /// Drop the gateway's entries on every worker.
+    fn forget_gateway(&mut self, gateway: GatewayId) {
+        self.vetoes.retain(|(owner, _), _| *owner != gateway);
+        self.ok_at.remove(&gateway);
     }
 }
 
@@ -1635,11 +1640,20 @@ impl LeasesStore for MemoryStore {
     }
 
     fn drop_gateway(&self, gateway: GatewayId) -> usize {
-        self.forget_gateway(gateway);
-        let mut leases = self.leases.lock();
-        let before = leases.records.len();
-        leases.records.retain(|(owner, _), _| *owner != gateway);
-        before - leases.records.len()
+        let released = {
+            let mut leases = self.leases.lock();
+            let before = leases.records.len();
+            leases.records.retain(|(owner, _), _| *owner != gateway);
+            before - leases.records.len()
+        };
+        // The leases lock nests with no other, so it is let go first. The
+        // gateway's vetoes and completed dispatches leave under the health
+        // lock and the published vetoes under the load lock inside it: the
+        // order a veto's own write takes.
+        let mut health = self.health.lock();
+        health.forget_gateway(gateway);
+        self.show_gateway_gone(gateway);
+        released
     }
 
     fn live(&self, gateway: GatewayId) -> usize {
