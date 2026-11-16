@@ -24,11 +24,12 @@
 use std::borrow::Cow;
 
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
-use ndarray::{s, Array3, Array4, IxDyn};
+use ndarray::{Array3, IxDyn};
 
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+    scratch,
     transforms::{self, TransformError},
 };
 
@@ -272,36 +273,6 @@ impl Phi3VisionProcessor {
         transforms::resize_bicubic_torch_f32(tensor, TILE_SIZE as usize, TILE_SIZE as usize)
     }
 
-    /// Reshape HD image into tiles.
-    ///
-    /// Transforms [3, H, W] -> [num_tiles, 3, 336, 336]
-    /// where H and W are multiples of 336.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
-    fn reshape_to_tiles(&self, tensor: &Array3<f32>) -> Vec<Array3<f32>> {
-        let (_c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
-        let grid_h = h / TILE_SIZE as usize;
-        let grid_w = w / TILE_SIZE as usize;
-
-        let mut tiles = Vec::with_capacity(grid_h * grid_w);
-
-        for gh in 0..grid_h {
-            for gw in 0..grid_w {
-                let y_start = gh * TILE_SIZE as usize;
-                let x_start = gw * TILE_SIZE as usize;
-                let y_end = y_start + TILE_SIZE as usize;
-                let x_end = x_start + TILE_SIZE as usize;
-
-                let tile_view = tensor.slice(s![.., y_start..y_end, x_start..x_end]);
-                tiles.push(tile_view.to_owned());
-            }
-        }
-
-        tiles
-    }
-
     /// Calculate number of image tokens for given HD size.
     ///
     /// Formula: `((h//336)*(w//336)+1)*144 + 1 + (h//336+1)*12`
@@ -317,8 +288,15 @@ impl Phi3VisionProcessor {
         (grid_h * grid_w + 1) * 144 + 1 + (grid_h + 1) * 12
     }
 
-    /// Process a single image through the full pipeline.
-    fn process_single_image(&self, image: &DynamicImage) -> (Array4<f32>, (usize, usize), usize) {
+    /// Process a single image through the full pipeline and append its
+    /// `[num_crops + 1, 3, 336, 336]` values to `values`: the global image,
+    /// the HD image's tiles in row-major order, zeros for the crops the image
+    /// does not fill.
+    fn process_single_image(
+        &self,
+        image: &DynamicImage,
+        values: &mut Vec<f32>,
+    ) -> ((usize, usize), usize) {
         // 1. Convert to RGB
         let image = match image {
             DynamicImage::ImageRgb8(_) => Cow::Borrowed(image),
@@ -333,34 +311,36 @@ impl Phi3VisionProcessor {
         //    reference composes `ToTensor` and `Normalize`: three roundings)
         let tensor = transforms::to_tensor_then_normalize(&hd_image, &self.mean, &self.std);
 
-        // 4. Create global image (336x336)
-        let global_image = self.create_global_image(&tensor);
+        // 4. The global image (336x336) comes first
+        let tile = TILE_SIZE as usize;
+        let end = values.len() + (self.num_crops + 1) * 3 * tile * tile;
+        values.extend(self.create_global_image(&tensor).iter());
 
-        // 5. Reshape HD image into tiles
-        let tiles = self.reshape_to_tiles(&tensor);
-
-        // 6. Concatenate global + tiles
-        let max_crops = self.num_crops + 1; // num_crops + 1 for global
-
-        // Create output tensor [max_crops, 3, 336, 336]
-        let mut output =
-            Array4::<f32>::zeros((max_crops, 3, TILE_SIZE as usize, TILE_SIZE as usize));
-
-        // Copy global image (first position)
-        output.slice_mut(s![0, .., .., ..]).assign(&global_image);
-
-        // Copy tiles (positions 1..num_actual_crops)
-        for (i, tile) in tiles.iter().enumerate() {
-            if i + 1 < max_crops {
-                output.slice_mut(s![i + 1, .., .., ..]).assign(tile);
+        // 5. The HD image's tiles, row-major, as far as the crops go
+        let (h, w) = (hd_h as usize, hd_w as usize);
+        let (planes, _) = tensor.into_raw_vec_and_offset();
+        'tiles: for grid_y in 0..h / tile {
+            for grid_x in 0..w / tile {
+                if values.len() + 3 * tile * tile > end {
+                    break 'tiles;
+                }
+                for plane in planes.chunks_exact(h * w) {
+                    for row in plane.chunks_exact(w).skip(grid_y * tile).take(tile) {
+                        values.extend_from_slice(&row[grid_x * tile..(grid_x + 1) * tile]);
+                    }
+                }
             }
         }
+        scratch::give_f32(planes);
+
+        // 6. Zeros for the crops the image does not fill
+        values.resize(end, 0.0);
 
         // Calculate token count
-        let num_tokens = self.calculate_num_tokens(hd_h as usize, hd_w as usize);
+        let num_tokens = self.calculate_num_tokens(h, w);
 
         // The returned size is the HD-transformed image size.
-        (output, (hd_h as usize, hd_w as usize), num_tokens)
+        ((h, w), num_tokens)
     }
 }
 
@@ -381,37 +361,27 @@ impl VisionPreProcessor for Phi3VisionProcessor {
             return Err(TransformError::EmptyBatch);
         }
 
-        let mut all_pixel_values = Vec::with_capacity(images.len());
+        for image in images {
+            let (width, height) = image.dimensions();
+            self.hd_target_or_refuse(width, height)?;
+        }
+
+        // The batch [B, num_crops+1, 3, 336, 336], written once per image.
+        // Pooled: it is the encoder input's storage, which returns to the
+        // pool when the input is written out.
+        let max_crops = self.num_crops + 1;
+        let batch_size = images.len();
+        let tile = TILE_SIZE as usize;
+        let shape = vec![batch_size, max_crops, 3, tile, tile];
+        let mut flat_data = scratch::take_f32_cap(shape.iter().product());
         let mut all_image_sizes = Vec::with_capacity(images.len());
         let mut all_num_tokens = Vec::with_capacity(images.len());
 
         for image in images {
-            let (width, height) = image.dimensions();
-            self.hd_target_or_refuse(width, height)?;
-            let (encoder_input, image_size, num_tokens) = self.process_single_image(image);
-            all_pixel_values.push(encoder_input);
+            let (image_size, num_tokens) = self.process_single_image(image, &mut flat_data);
             all_image_sizes.push((image_size.1 as u32, image_size.0 as u32)); // (width, height)
             all_num_tokens.push(num_tokens);
         }
-
-        // Stack into batch [B, num_crops+1, 3, 336, 336]
-        let max_crops = self.num_crops + 1;
-        let batch_size = images.len();
-        let mut batch_tensor = ndarray::Array5::<f32>::zeros((
-            batch_size,
-            max_crops,
-            3,
-            TILE_SIZE as usize,
-            TILE_SIZE as usize,
-        ));
-
-        for (i, pv) in all_pixel_values.iter().enumerate() {
-            batch_tensor.slice_mut(s![i, .., .., .., ..]).assign(pv);
-        }
-
-        // Convert to dynamic array for storage
-        let shape = batch_tensor.shape().to_vec();
-        let (flat_data, _offset) = batch_tensor.into_raw_vec_and_offset();
 
         // Store model-specific image_sizes data.
         let mut model_specific = std::collections::HashMap::new();
@@ -578,6 +548,43 @@ mod tests {
         assert_eq!(result.batch_size(), 2);
         assert_eq!(result.item_sizes.len(), 2);
         assert_eq!(result.feature_token_counts.len(), 2);
+    }
+
+    /// A batch is its images' own outputs in turn, and the crops an image
+    /// does not fill are zeros: an image's slot starts where the slot before
+    /// it ends, whatever that image filled.
+    #[test]
+    fn a_batch_is_its_images_in_turn_and_unfilled_crops_are_zero() {
+        use crate::test_support::lcg_rgb_image;
+
+        let processor = Phi3VisionProcessor::new();
+        let images = [
+            lcg_rgb_image(300, 200, 1),
+            lcg_rgb_image(90, 700, 2),
+            lcg_rgb_image(700, 400, 3),
+        ];
+        let crop = 3 * (TILE_SIZE * TILE_SIZE) as usize;
+        let mut joined = Vec::new();
+        let mut filled_crops = Vec::new();
+        for image in &images {
+            let single = processor.preprocess(&[image]).unwrap();
+            let (width, height) = single.item_sizes[0];
+            let filled = 1 + ((width / TILE_SIZE) * (height / TILE_SIZE)) as usize;
+            let values = single.encoder_input.as_f32();
+            let values = values.as_slice().unwrap();
+            assert!(values[filled * crop..]
+                .iter()
+                .all(|value| value.to_bits() == 0));
+            joined.extend_from_slice(values);
+            filled_crops.push(filled);
+        }
+        // Two of the three leave crops unfilled; the tall one fills them all.
+        assert_eq!(filled_crops, [13, 17, 16]);
+
+        let batch = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(batch.encoder_input.as_f32().as_slice().unwrap(), joined);
     }
 
     #[test]
