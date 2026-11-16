@@ -6,6 +6,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- A `CompletionRequest` whose `best_of` equals `n` validates: the public API gives both fields
+  the default 1, so a request that states both defaults is the plain one and is no longer refused
+  under `best_of_less_than_n`. A `best_of` under `n` is still refused with that code (its sentence
+  now reads `best_of must be greater than or equal to n`), and on a stream only a `best_of` above
+  `n` is refused under `best_of_not_supported_with_stream`, whose sentence now reads
+  `best_of greater than n is not supported when stream is enabled`.
+
 - `EmbeddingObject.embedding` is an `Embedding`: the float array, or the base64 string of the
   vector's little-endian f32 bytes when the request asked for `encoding_format: "base64"`; the
   type is untagged, so an answer reads either shape. The gateway's gRPC embeddings path answered
