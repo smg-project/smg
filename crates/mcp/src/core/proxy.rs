@@ -13,7 +13,8 @@ use crate::error::{McpError, McpResult};
 /// * `global_proxy` - Global proxy configuration from McpConfig
 ///
 /// # Returns
-/// The resolved proxy configuration, or None for direct connection
+/// The resolved proxy configuration, or None when none is configured (the
+/// client then falls back to reqwest's environment proxies, if any)
 pub(crate) fn resolve_proxy_config<'a>(
     server_config: &'a McpServerConfig,
     global_proxy: Option<&'a McpProxyConfig>,
