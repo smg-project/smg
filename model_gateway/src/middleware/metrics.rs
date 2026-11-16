@@ -338,10 +338,10 @@ impl ResponseOutcome {
     }
 
     /// The response head is out: the status a completed response counts as.
-    /// A body the JSON extractor refused gets its `X-SMG-Error-Code` header
-    /// here: the extractor's envelope is built in the protocols crate, which
-    /// names the code in the body and in an extension, and this layer reads
-    /// that extension for every response.
+    /// A request the extractors refused (its body, its query or its path)
+    /// gets its `X-SMG-Error-Code` header here: their one envelope is built
+    /// in the protocols crate, which names the code in the body and in an
+    /// extension, and this layer reads that extension for every response.
     pub(super) fn head(&mut self, response: &mut Response) {
         let code = error_code_label(response).to_owned();
         if !code.is_empty() && extract_error_code_from_response(response).is_empty() {
