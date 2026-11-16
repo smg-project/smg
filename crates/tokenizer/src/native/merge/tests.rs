@@ -1550,7 +1550,8 @@ fn the_read_of_a_section_builds_the_table_the_model_builds() {
 /// A short merge's key is a rank over seven position bits in a signed word,
 /// so a table carries one merge less than `MAX_RANKS`: a model with more is
 /// declined and its own merge stays in place, where the key of its last
-/// rank would be negative and sort before every other.
+/// rank at the last position would be `NO_KEY`, and one rank more would be
+/// negative and sort before every other.
 #[test]
 fn a_model_with_more_merges_than_the_keys_carry_is_declined() {
     use crate::word_cache::ReadBpe;
@@ -1574,6 +1575,11 @@ fn a_model_with_more_merges_than_the_keys_carry_is_declined() {
     let key = |rank: usize, at: u32| ((rank as u32) << super::SHORT_KEY_BITS | at) as i32;
     let last = key(super::MAX_RANKS - 2, super::SHORT_KEY_MASK);
     assert!(0 < last && last < super::NO_KEY, "{last}");
+    assert_eq!(
+        key(super::MAX_RANKS - 1, super::SHORT_KEY_MASK),
+        super::NO_KEY,
+        "the last rank of a declined model ties no merge at the last position"
+    );
     assert!(
         key(super::MAX_RANKS - 3, super::SHORT_KEY_MASK) < key(super::MAX_RANKS - 2, 0),
         "a lower rank sorts first whatever its position"

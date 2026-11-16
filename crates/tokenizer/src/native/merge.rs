@@ -83,8 +83,9 @@ const SHORT_PIECE_TINY: usize = 16;
 /// position`: a minimum over the keys is the least rank and, among its
 /// repeats, the leftmost position. A key is a signed word that is never
 /// negative ([`MAX_RANKS`] leaves the sign bit clear): the baseline vector
-/// instructions compare signed words and have no minimum of unsigned ones,
-/// so unsigned keys paid two sign flips more for every eight keys.
+/// instructions have no minimum of words and compare them signed only, so
+/// a signed minimum is a compare and a blend and an unsigned one paid two
+/// sign flips more for every eight keys.
 const SHORT_KEY_BITS: u32 = SHORT_PIECE_SYMBOLS.trailing_zeros();
 /// The position bits of a short merge's key.
 const SHORT_KEY_MASK: u32 = (1 << SHORT_KEY_BITS) - 1;
@@ -93,8 +94,10 @@ const NO_KEY: i32 = i32::MAX;
 /// Ranks a short merge's key carries with its sign bit clear; a model with
 /// more merges declines the table (a vocabulary has some hundred thousand).
 const MAX_RANKS: usize = 1 << (i32::BITS - 1 - SHORT_KEY_BITS);
-// The greatest key a table makes, its last rank at the last position, is
-// under `NO_KEY`.
+// The greatest key a table makes is under `NO_KEY`: a table's last rank is
+// `MAX_RANKS - 2` at the most (`from_model` declines a model of `MAX_RANKS`
+// merges, and the ranks of a byte-level table end under `MAX_RANKS`, by the
+// assertion in `from_ranks`), and that rank at the last position is under it.
 const _: () =
     assert!(((MAX_RANKS as u64 - 2) << SHORT_KEY_BITS | SHORT_KEY_MASK as u64) < NO_KEY as u64);
 /// The rank of a pair that is no merge.
@@ -461,9 +464,10 @@ impl MergeTable {
         }
         let ranks_end = ranks.values().max().map_or(0, |&rank| rank as usize + 1);
         // A rank is a merge's rank and its product at once; it is bounded as
-        // the decode table of such a file is, and that bound stays within
-        // what a short merge's key carries of a rank.
-        const _: () = assert!(MAX_BYTE_LEVEL_TABLE_IDS <= MAX_RANKS);
+        // the decode table of such a file is, and that bound stays under
+        // what a short merge's key carries of a rank: the last rank is
+        // `MAX_RANKS - 2` at the most, as for a model (see `MAX_RANKS`).
+        const _: () = assert!(MAX_BYTE_LEVEL_TABLE_IDS < MAX_RANKS);
         if ranks_end > MAX_BYTE_LEVEL_TABLE_IDS {
             return Err(Declined::from(format!(
                 "ranks up to {ranks_end} on a table bounded at {MAX_BYTE_LEVEL_TABLE_IDS}"
