@@ -580,6 +580,10 @@ fn report(
 /// expires by its duration.
 fn give_up(elector: &mut Elector) {
     let period = elector.settings().renew_period;
+    // A holder whose release finds the record moved lost the lease after
+    // its last step: it has none to release, and says what a step that
+    // read the loss says.
+    let held = elector.is_holder().then(|| elector.fence().term());
     for attempt in 1..=RELEASE_ATTEMPTS {
         let began = Instant::now();
         match elector.release() {
@@ -587,7 +591,15 @@ fn give_up(elector: &mut Elector) {
                 info!(identity = elector.identity(), "the lease is released");
                 return;
             }
-            Ok(false) => return,
+            Ok(false) => {
+                if let Some(term) = held {
+                    warn!(
+                        identity = elector.identity(),
+                        term, "the lease moved; the fence is closed"
+                    );
+                }
+                return;
+            }
             Err(error) => {
                 warn!(identity = elector.identity(), attempt, %error, "the release failed");
             }
@@ -1480,6 +1492,49 @@ mod tests {
             let count = text.lines().filter(|line| line.contains(words)).count();
             (count, text)
         }
+    }
+
+    /// A leader whose lease moved after its last step finds it at its
+    /// stop's release: it releases nothing and says the lease moved, as a
+    /// step that read the loss would. A replica that held nothing at its
+    /// stop says nothing.
+    #[test]
+    fn a_stop_that_finds_the_lease_moved_says_so_and_releases_nothing() {
+        const MOVED: &str = "the lease moved; the fence is closed";
+        // A renew period of twenty seconds: the stop's release is the
+        // first to read the lease after the take.
+        let settings = ElectionSettings {
+            duration: Duration::from_secs(60),
+            renew_period: Duration::from_secs(20),
+            renew_deadline: Duration::from_secs(40),
+        };
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let leading = looping(holder, standing);
+        until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
+        // Another candidate's record is stored over the holder's.
+        let theirs = LeaseRecord {
+            holder: "b@127.0.0.1:2".to_owned(),
+            term: 2,
+            duration_ms: 60_000,
+            ..LeaseRecord::default()
+        };
+        store.put(&theirs);
+        let (moved, text) = leading.stopped_with(MOVED);
+        assert_eq!(moved, 1, "{text}");
+        assert!(!text.contains("the lease is released"), "{text}");
+        let mut lease = store.clone();
+        assert_eq!(lease.read().expect("a read"), Some(theirs));
+
+        let follower = Elector::new(Box::new(store.clone()), "c@127.0.0.1:3", settings)
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let following = looping(follower, standing);
+        until("the first look", || stood.borrow().looked);
+        let (moved, text) = following.stopped_with(MOVED);
+        assert_eq!(moved, 0, "{text}");
     }
 
     #[test]
