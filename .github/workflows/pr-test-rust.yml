@@ -364,8 +364,8 @@ jobs:
         if: matrix.fmt
         run: |
           source "$HOME/.cargo/env"
-          rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
-          rustup toolchain install nightly --profile minimal
+          bash scripts/ci_retry.sh 3 10 rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+          bash scripts/ci_retry.sh 3 10 rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
           # The Symphony fuzz crate is a workspace of its own; the root's fmt does not reach it.
           cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
@@ -441,7 +441,7 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           bash examples/wasm/wasm-guest-policy/build.sh
           cd examples/wasm/wasm-guest-policy
-          rustup toolchain install nightly --profile minimal --component rustfmt
+          bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 3 10 rustup toolchain install nightly --profile minimal --component rustfmt
           cargo +nightly fmt -- --check
           cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings
 
