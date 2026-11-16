@@ -52,12 +52,15 @@ fn shown(url: &str) -> String {
 /// Result type for worker operations
 pub type WorkerResult<T> = Result<T, WorkerError>;
 
-/// Convert from reqwest errors to worker errors
+/// A client error as a worker error. The client's text would repeat the
+/// request URL as the client holds it, so the URL moves to `url` (kept
+/// raw; the message writes it redacted) and the text goes without it.
 impl From<reqwest::Error> for WorkerError {
     fn from(err: reqwest::Error) -> Self {
+        let url = err.url().map(|u| u.to_string()).unwrap_or_default();
         WorkerError::NetworkError {
-            url: err.url().map(|u| u.to_string()).unwrap_or_default(),
-            error: err.to_string(),
+            url,
+            error: err.without_url().to_string(),
         }
     }
 }
@@ -67,6 +70,27 @@ mod tests {
     use std::error::Error;
 
     use super::*;
+    use crate::worker::{connection::http_client::LazyHttpClient, test_support::RefusedAddress};
+
+    #[tokio::test]
+    async fn a_client_error_converts_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}/health?token=s3cret", refused.http_url());
+        let error: WorkerError = LazyHttpClient::deferred()
+            .client()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("nothing listens at the address")
+            .into();
+        let text = error.to_string();
+        assert!(!text.contains("s3cret"), "{text}");
+        assert_eq!(
+            text.matches(&refused.addr().to_string()).count(),
+            1,
+            "{text}"
+        );
+    }
 
     #[test]
     fn test_health_check_failed_display() {
