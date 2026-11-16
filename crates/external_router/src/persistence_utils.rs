@@ -655,8 +655,8 @@ async fn persist_conversation_items_inner(
         openai_bridge::compact_image_generation_outputs_json(outputs);
     }
 
-    // Extract response ID and clone out the (already-compacted) output array
-    // before handing the rest of `response_json` to `build_stored_response`,
+    // Extract the response ID and read the (already-compacted) output array
+    // in place before handing `response_json` to `build_stored_response`,
     // which moves the value into `raw_response` without re-cloning the full
     // response tree.
     let response_id_str = response_json
@@ -670,12 +670,9 @@ async fn persist_conversation_items_inner(
     let input_items = extract_input_items(&original_body.input)
         .map_err(|e| PersistError::new(PersistStep::Input, false, e))?;
 
-    // Cloning the array here is shallow against compacted items — base64
-    // image payloads have already been stripped above.
     let output_items = response_json
         .get("output")
         .and_then(|v| v.as_array())
-        .cloned()
         .ok_or_else(|| {
             PersistError::new(PersistStep::Input, false, "No output array in response")
         })?;
@@ -685,12 +682,20 @@ async fn persist_conversation_items_inner(
         .get("status")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let written_output_ids = output_item_ids(&output_items);
+    let written_output_ids = output_item_ids(output_items);
+    let (input_count, output_count) = (input_items.len(), output_items.len());
+    // Only a request that names a conversation links its items, so only that
+    // one copies the two lists; the copy is shallow against compacted items
+    // (the base64 image payloads were stripped above).
+    let to_link = original_body
+        .conversation
+        .is_some()
+        .then(|| (input_items.clone(), output_items.clone()));
 
     // Build and store response (consumes `response_json`).
     let mut stored_response = build_stored_response(response_json, original_body);
     stored_response.id = response_id.clone();
-    stored_response.input = Value::Array(input_items.clone());
+    stored_response.input = Value::Array(input_items);
     stored_response.tenant = tenant.map(str::to_string);
 
     let store_error = |e: ResponseStorageError| {
@@ -775,8 +780,7 @@ async fn persist_conversation_items_inner(
     };
 
     // If conversation exists, link items to it (the items move into their records)
-    let (input_count, output_count) = (input_items.len(), output_items.len());
-    if let Some(conv_id) = conv_id_opt {
+    if let (Some(conv_id), Some((input_items, output_items))) = (conv_id_opt, to_link) {
         link_items_to_conversation(
             &item_storage,
             &conv_id,
