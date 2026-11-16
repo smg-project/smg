@@ -286,7 +286,9 @@ pub(crate) async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> 
 
 /// One connect to the socket file at `path`, closed at once: `Ok` when a
 /// listener answers, `ConnectionRefused` when none is behind the file. The
-/// connect never waits: a listener whose backlog is full fails it instead.
+/// connect never waits: on Linux a listener whose backlog is full fails it
+/// with `WouldBlock`; macOS and the BSDs refuse it, so there a live listener
+/// whose backlog is full reads as gone.
 #[cfg(unix)]
 pub async fn knock_ipc_socket(path: &Path) -> std::io::Result<()> {
     tokio::net::UnixStream::connect(path).await.map(drop)
