@@ -40,7 +40,7 @@ use std::{
 use net::http_get;
 use replicas::{Lease, Record, Replica, ROOM};
 use smg_policy_controller::{
-    elector::{ElectionSettings, FileLease, LeaseBackend, LeaseRecord},
+    elector::{ElectionSettings, FileLease, LeaseBackend, LeaseRecord, Written},
     proto::{
         policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, SnapshotRequest,
     },
@@ -553,6 +553,21 @@ impl Stretch {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "a measurement for the Numbers table, run by name"]
 async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
+    lost_under_a_live_leader("REMOVED").await;
+}
+
+/// The same rounds with the record's holder cleared in place, the term, the
+/// stamps and the duration kept, as a hand's patch of the holder leaves it:
+/// a write through the store, so no renewal in flight puts the holder back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_holder_cleared_in_place_under_a_live_leader_with_a_standby_looking() {
+    lost_under_a_live_leader("CLEARED").await;
+}
+
+/// The rounds of the two cells above; `label` names the loss and the
+/// printed lines.
+async fn lost_under_a_live_leader(label: &str) {
     let mut out = std::io::stdout();
     let settings = replicas::timings(ElectionSettings::default(), &mut out);
     let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
@@ -567,15 +582,33 @@ async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
         let mut record = Record::default();
         let started = Instant::now();
         let mut replicas = vec![start(&format!("replica-{round}-a"), &lease, settings)];
-        let (_, term) = agreed(&mut record, &mut replicas).await;
+        agreed(&mut record, &mut replicas).await;
         let first_ms = millis(started.elapsed());
         tokio::time::sleep(spread(round, 333, period)).await;
         replicas.push(start(&format!("replica-{round}-b"), &lease, settings));
-        agreed(&mut record, &mut replicas).await;
+        // The term the loss is read against: the one both replicas agree on
+        // right before it.
+        let (_, term) = agreed(&mut record, &mut replicas).await;
         tokio::time::sleep(spread(round, 0, period)).await;
-        // The removal under the store's own lock, as a writer of the store
-        // moves the file: no renewal in flight puts the record back.
-        {
+        if label == "CLEARED" {
+            // A compare and swap through the store: a renewal that lands
+            // first moves the record, and the clearing is tried again.
+            let mut store = FileLease::new(&lease);
+            loop {
+                let held = store.read().expect("the lease file reads");
+                let held = held.expect("the lease file holds a record");
+                let cleared = LeaseRecord {
+                    holder: String::new(),
+                    ..held.clone()
+                };
+                if store.write(Some(&held), &cleared).expect("the clearing") == Written::Done {
+                    break;
+                }
+            }
+        } else {
+            // The removal under the store's own lock, as a writer of the
+            // store moves the file: no renewal in flight puts the record
+            // back.
             let lock = std::fs::File::create(dir.path().join("lease.lock")).expect("the lock");
             lock.lock().expect("the store's lock");
             std::fs::remove_file(&lease).expect("the removal");
@@ -605,7 +638,7 @@ async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
             }
         }
         let Some((at, next)) = taken else {
-            writeln!(out, "REMOVED round={round} void: no take in {within:?}").expect("stdout");
+            writeln!(out, "{label} round={round} void: no take in {within:?}").expect("stdout");
             continue;
         };
         let promise = if record.check().is_ok() {
@@ -622,7 +655,7 @@ async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
         );
         writeln!(
             out,
-            "REMOVED round={round} term={term}->{next} first_start_ms={first_ms} samples={samples} both={both} both_ms={both_ms} nobody_ms={none_ms} to_take_ms={to_take_ms} promise={promise}"
+            "{label} round={round} term={term}->{next} first_start_ms={first_ms} samples={samples} both={both} both_ms={both_ms} nobody_ms={none_ms} to_take_ms={to_take_ms} promise={promise}"
         )
         .expect("stdout");
         first.push(first_ms);
@@ -631,18 +664,20 @@ async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
         take_ms.push(to_take_ms);
     }
     let counted = take_ms.len();
+    let names =
+        ["TWO_LEADERS_MS", "NOBODY_LEADS_MS", "TO_TAKE_MS"].map(|name| format!("{label}_{name}"));
     summaries(
         &mut out,
         [
             ("FIRST_START_TO_LEADER_ANSWER_MS", &mut first),
-            ("REMOVED_TWO_LEADERS_MS", &mut two_ms),
-            ("REMOVED_NOBODY_LEADS_MS", &mut nobody_ms),
-            ("REMOVED_TO_TAKE_MS", &mut take_ms),
+            (names[0].as_str(), &mut two_ms),
+            (names[1].as_str(), &mut nobody_ms),
+            (names[2].as_str(), &mut take_ms),
         ],
     );
     writeln!(
         out,
-        "REMOVED_ROUNDS n={counted} with_two_leaders={with_two} promise_broken={broken}"
+        "{label}_ROUNDS n={counted} with_two_leaders={with_two} promise_broken={broken}"
     )
     .expect("stdout");
 }

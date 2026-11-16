@@ -27,7 +27,11 @@
 //!   holder's release, and its holder may still lead: the candidate waits
 //!   the duration of the record it saw held last, from its own first sight
 //!   of the change, as for a record that stands still, and follows nobody
-//!   meanwhile ([`Tick::Gone`]). A take writes the next term (terms
+//!   meanwhile ([`Tick::Gone`]). A record with no holder that still says a
+//!   duration is no holder's release either, since a release writes none: a
+//!   hand cleared the holder in place, and every candidate waits the
+//!   duration the record says, from its first sight of it. A take writes
+//!   the next term (terms
 //!   only grow, one per change of holder, and a candidate counts from the
 //!   highest term it saw, so a record that vanished under it is taken at the
 //!   term after the one it held); a resume of its own identity's record
@@ -246,7 +250,8 @@ pub enum Tick {
     /// released under a lower term, a shape no holder's release leaves. Its
     /// holder may still lead, so nobody is followed, and the lease is taken
     /// once that record's duration has passed since this candidate first saw
-    /// the change.
+    /// the change. Also the answer at a record under `term` with no holder
+    /// and a duration, which a hand's clearing leaves and no release does.
     Gone { term: u64 },
     /// The lease looked free, but another candidate wrote first; the next
     /// tick reads what it wrote.
@@ -443,6 +448,8 @@ impl Elector {
             return Ok(false);
         };
         self.fence.set(mine.term, None);
+        // No duration: it tells a holder's release, taken at once, from a
+        // holder that another hand cleared in place.
         let released = LeaseRecord {
             holder: String::new(),
             duration_ms: 0,
@@ -639,9 +646,18 @@ impl Elector {
         let (term, acquired_at_micros) = match &current {
             // Never seen held, or waited out.
             None => (next_term, 0),
-            // A holder's release, a record this run never saw held, or a
-            // release under a lower term waited out.
-            Some(record) if record.is_released() => (next_term, 0),
+            // A record with no holder is waited out for the duration it
+            // says, from this run's first sight of it. A holder's release
+            // says none and is taken at once. A record whose holder another
+            // hand cleared in place keeps its duration, and that holder may
+            // lead until its own next step reads the lease.
+            Some(record) if record.is_released() => {
+                let since = self.observed.as_ref().map_or(now, |o| o.since);
+                if now.saturating_duration_since(since) < record.duration() {
+                    return Ok(Tick::Gone { term: record.term });
+                }
+                (next_term, 0)
+            }
             // The write this run attempted landed after all: its own lease.
             Some(record) if self.attempted.as_ref() == Some(record) => {
                 (record.term, record.acquired_at_micros)
@@ -1874,6 +1890,92 @@ mod tests {
             b.tick(b_saw + 3 * S).expect("take"),
             Tick::Acquired { term: 2 }
         );
+    }
+
+    /// The record of `holder` with its holder cleared in place, as a hand's
+    /// patch leaves it: the term, the stamps and the duration kept.
+    fn cleared(lease: &MemoryLease, holder: &Elector) {
+        let held = holder.observed().expect("the holder's record").clone();
+        let cleared = LeaseRecord {
+            holder: String::new(),
+            ..held.clone()
+        };
+        let mut hand = lease.clone();
+        assert_eq!(
+            hand.write(Some(&held), &cleared).expect("a write"),
+            Written::Done
+        );
+    }
+
+    #[test]
+    fn a_record_cleared_in_place_under_a_live_holder_is_waited_out() {
+        // A holder's release says no duration. A record whose holder another
+        // hand cleared keeps its term and its duration, and that holder
+        // leads until its next step reads the lease: the record is waited
+        // out for the duration it says, from the first sight of it.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        let mut b = candidate(&lease, "b@host:2");
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        cleared(&lease, &a);
+        let saw = t0 + S / 2;
+        assert_eq!(b.tick(saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(a.fence().leader_term(saw), Some(1));
+        assert_eq!(b.fence().leader_term(saw), None);
+        // The holder reads its loss at its next step and waits as every
+        // candidate does.
+        assert_eq!(
+            a.tick(t0 + S).expect("the renewal"),
+            Tick::Lost {
+                term: 1,
+                holder: String::new()
+            }
+        );
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+        assert_eq!(a.tick(t0 + 2 * S).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(
+            b.tick(saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(
+            b.tick(saw + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_never_saw_the_lease_held_waits_out_a_record_cleared_in_place() {
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        cleared(&lease, &a);
+        // A replica that starts now never saw the lease held, and the holder
+        // stalls with its fence open. The record still says its duration:
+        // it is waited out from this first sight, and the holder's fence has
+        // closed by itself before the take.
+        let mut c = candidate(&lease, "c@host:3");
+        let saw = t0 + S / 2;
+        assert_eq!(c.tick(saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(a.fence().leader_term(saw), Some(1));
+        assert_eq!(c.fence().leader_term(saw), None);
+        assert_eq!(
+            c.tick(saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(
+            c.tick(saw + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+        assert_eq!(a.fence().leader_term(saw + 3 * S), None);
+        assert_eq!(c.fence().leader_term(saw + 3 * S), Some(2));
     }
 
     #[test]
