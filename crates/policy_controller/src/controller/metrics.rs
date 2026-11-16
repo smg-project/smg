@@ -252,45 +252,59 @@ mod tests {
         use std::{
             sync::{
                 atomic::{AtomicBool, Ordering},
-                mpsc,
+                mpsc, Arc,
             },
             thread,
+            time::Instant,
         };
 
-        let metrics = Metrics::new();
-        let stats = Stats::default();
-        let inside = AtomicBool::new(false);
+        let metrics = Arc::new(Metrics::new());
+        let stats = Arc::new(Stats::default());
+        let inside = Arc::new(AtomicBool::new(false));
         let (sampling, sampled) = mpsc::channel();
         // The first scrape stays inside its sample while the second begins,
-        // and the role changes between the two.
-        let (first, second, overlapped) = thread::scope(|scope| {
-            let first = scope.spawn({
-                let (metrics, stats, inside) = (&metrics, &stats, &inside);
-                move || {
-                    metrics.render(
-                        || {
-                            inside.store(true, Ordering::SeqCst);
-                            sampling.send(()).expect("the case listens");
-                            thread::sleep(Duration::from_millis(100));
-                            inside.store(false, Ordering::SeqCst);
-                            State::Leader
-                        },
-                        stats,
-                    )
-                }
-            });
-            sampled.recv().expect("the first scrape samples");
-            let mut overlapped = false;
-            let second = metrics.render(
-                || {
-                    overlapped = inside.load(Ordering::SeqCst);
-                    State::Follower
-                },
-                &stats,
+        // and the role changes between the two. It runs on a thread the
+        // case does not wait for without a bound.
+        let first = thread::spawn({
+            let (metrics, stats, inside) = (
+                Arc::clone(&metrics),
+                Arc::clone(&stats),
+                Arc::clone(&inside),
             );
-            let first = first.join().expect("the first scrape ends");
-            (first, second, overlapped)
+            move || {
+                metrics.render(
+                    || {
+                        inside.store(true, Ordering::SeqCst);
+                        sampling.send(()).expect("the case listens");
+                        thread::sleep(Duration::from_millis(100));
+                        inside.store(false, Ordering::SeqCst);
+                        State::Leader
+                    },
+                    &stats,
+                )
+            }
         });
+        // A scrape that blocks before its sample fails the case by name.
+        sampled
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the first scrape samples within 20 s");
+        let mut overlapped = false;
+        let second = metrics.render(
+            || {
+                overlapped = inside.load(Ordering::SeqCst);
+                State::Follower
+            },
+            &stats,
+        );
+        let waited = Instant::now();
+        while !first.is_finished() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(20),
+                "the first scrape did not end in 20 s"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let first = first.join().expect("the first scrape ends");
         assert!(!overlapped, "the second scrape sampled inside the first");
         for (rendered, own) in [(&first, State::Leader), (&second, State::Follower)] {
             for state in State::ALL {

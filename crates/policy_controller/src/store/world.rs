@@ -25,6 +25,16 @@
 //! copies one run of memory nobody is writing and sees each row as one
 //! publication left it, through no lock.
 //!
+//! **Published rows are written again only when nothing can read them.**
+//! A pool's copy goes over the rows the pool published before its last,
+//! once the writer holds the last reference to them ([`Arc::get_mut`]): a
+//! world lists each pool's rows by a counted pointer and every reader holds
+//! a world, so that count is the proof, never a clock or a number of
+//! windows. Rows a world still lists are left as they are: the pool
+//! takes other rows the writer holds alone, or the publication allocates,
+//! which the store counts
+//! ([`MemoryStore::publication_allocations`](crate::store::MemoryStore::publication_allocations)).
+//!
 //! **The store publishes at its own rate, never at its writers'.** Every
 //! deciding thread fetches every publication, so there is one world a
 //! window for the whole store: the load records folded into any pool are
@@ -55,6 +65,7 @@
 //! step, so no publication shows the row without it.
 
 use std::{
+    mem,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -696,7 +707,24 @@ pub(super) struct Writer {
     derived: Arc<Derived>,
     /// Each pool's rows as the last publication left them.
     published: Vec<Arc<[Candidate]>>,
+    /// Each pool's spare: the rows it published before its last, kept for
+    /// its next publication to write over; none before the pool's first
+    /// publication after a membership write. Beside the working copies,
+    /// not in them: a load write's step from pool to pool is as it was.
+    spares: Vec<Option<Arc<[Candidate]>>>,
     working: Vec<Working>,
+    /// Rows that left their pool and that a world may still list: a spare a
+    /// publication found listed by a world some reader holds, and the
+    /// spares and the published rows of the pools a membership write
+    /// retired. The writer never lets go of rows a world lists, so a
+    /// decision that drops the last world listing them frees no rows.
+    held: Vec<Arc<[Candidate]>>,
+    /// The held rows a publication found no world listing any more, for
+    /// that publication alone: a pool of their length with no spare to
+    /// write over takes them, and the publication frees the rest.
+    unlisted: Vec<Arc<[Candidate]>>,
+    /// How many times a publication allocated a pool's rows.
+    allocations: u64,
     /// Every member's rows, sorted by worker id: a worker serving several
     /// models has a row in each model's pool.
     places: Vec<Place>,
@@ -726,7 +754,11 @@ impl Writer {
             epoch: 0,
             derived: Arc::default(),
             published: Vec::new(),
+            spares: Vec::new(),
             working: Vec::new(),
+            held: Vec::new(),
+            unlisted: Vec::new(),
+            allocations: 0,
             places: Vec::new(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
@@ -819,8 +851,13 @@ impl Writer {
                 }
             }
         }
+        // The outgoing pools' rows wait with the held ones, the spares and
+        // the published: the publication that finds no world listing them
+        // gives them to a pool of their length or frees them, this write's
+        // own at the earliest for the spares, the next for the published.
+        self.held.extend(self.spares.drain(..).flatten());
+        self.held.append(&mut self.published);
         self.working.clear();
-        self.published.clear();
         self.places.clear();
         let mut by_model = FxHashMap::default();
         let mut pools = Vec::new();
@@ -848,6 +885,7 @@ impl Writer {
                         .collect(),
                 });
                 self.published.push(Arc::from(rows.as_slice()));
+                self.spares.push(None);
                 self.working.push(Working { rows, dirty: false });
                 indexes[side] = Some(index);
             }
@@ -1087,15 +1125,61 @@ impl Writer {
     /// The one door every publication goes through: each pool folded since
     /// the last publication takes new rows, whole, and one world holds
     /// every pool. What waited for the window rides along.
+    ///
+    /// A pool's new rows are its working copy written over rows the writer
+    /// holds the last reference to ([`written_over`]): the pool's spare,
+    /// else held rows of its length that no world lists any more. That is
+    /// exact: every world listing such rows left the store's cell by the
+    /// publication that replaced them, the cell's swap pays each reader's
+    /// borrow of the outgoing world into that world's count before it
+    /// returns, and a world counts on the rows it lists for as long as it
+    /// lives. Rows some world still lists are left whole to that world's
+    /// reader, and a pool with none to write over takes a new copy, which
+    /// is counted: a publication never waits for a reader. Two buffers a
+    /// pool carry every window, and one more for each publication a reader
+    /// still holds. A publication asks each held row's count once, and each
+    /// pool with no spare to write over reads each unlisted row's length.
     fn publish(&mut self) -> Arc<World> {
-        for (pool, published) in self.working.iter_mut().zip(&mut self.published) {
-            if pool.dirty {
-                *published = Arc::from(pool.rows.as_slice());
-                pool.dirty = false;
+        let unlisted = |rows: &mut Arc<[Candidate]>| Arc::get_mut(rows).is_some();
+        self.unlisted.extend(self.held.extract_if(.., unlisted));
+        let pools = self.working.iter_mut().zip(&mut self.published);
+        for ((pool, published), spare) in pools.zip(&mut self.spares) {
+            if !pool.dirty {
+                continue;
             }
+            let mut next = spare.take();
+            // A spare some world still lists stays the writer's to free.
+            let listed = next.take_if(|over| !written_over(over, &pool.rows));
+            self.held.extend(listed);
+            if next.is_none() {
+                let fits = |over: &mut Arc<[Candidate]>| written_over(over, &pool.rows);
+                let found = self.unlisted.iter_mut().position(fits);
+                next = found.map(|at| self.unlisted.swap_remove(at));
+            }
+            let next = next.unwrap_or_else(|| {
+                self.allocations += 1;
+                Arc::from(pool.rows.as_slice())
+            });
+            *spare = Some(mem::replace(published, next));
+            pool.dirty = false;
         }
+        // Rows no world lists and no pool took are freed here, by a write.
+        self.unlisted.clear();
         self.waiting = false;
         self.world()
+    }
+
+    /// How many times a publication allocated a pool's rows: it found
+    /// neither the pool's spare nor held rows of the pool's length free of
+    /// every world. A membership write's own rows are not counted.
+    pub(super) fn allocations(&self) -> u64 {
+        self.allocations
+    }
+
+    /// How many rows that left their pool the writer still keeps.
+    #[cfg(test)]
+    pub(super) fn held_rows(&self) -> usize {
+        self.held.len() + self.unlisted.len()
     }
 
     fn publish_window(&mut self, at: Instant) -> Arc<World> {
@@ -1109,6 +1193,20 @@ impl Writer {
         }
         self.publish()
     }
+}
+
+/// Writes `rows` over `over` when `over` is of `rows`' length and the
+/// writer holds the last reference to it: no world lists it, so nothing
+/// can read it. Whether it did.
+fn written_over(over: &mut Arc<[Candidate]>, rows: &[Candidate]) -> bool {
+    if over.len() != rows.len() {
+        return false;
+    }
+    let Some(over) = Arc::get_mut(over) else {
+        return false;
+    };
+    over.copy_from_slice(rows);
+    true
 }
 
 /// The first index at or after `from` whose worker id is not under `id`,

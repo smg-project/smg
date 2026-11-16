@@ -48,7 +48,10 @@
 # passes without a run. Every job that runs both sides uploads bench-gate/results.json with the raw per-run
 # medians; a gated row whose spread on the hosted runner reads above 5 % takes 15 % by the rule above.
 
+# Count: `count = true`, as policy-engine.toml records it. Read on this file's 6 ids, the same work with cold
+# code ahead of the decision (never committed): all 6 count the same in every batch after the first.
 repeats = 3
+count = true
 filter = "^policy_affinity/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the pull

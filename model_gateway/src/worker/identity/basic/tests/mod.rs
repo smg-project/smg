@@ -11,7 +11,7 @@ use super::*;
 use crate::worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::metadata::DecodingLabels,
-    test_support::no_health_check,
+    test_support::{no_health_check, RefusedAddress},
     BasicWorkerBuilder, OverloadThresholds,
 };
 
@@ -2170,4 +2170,22 @@ fn a_stall_written_through_a_retired_worker_is_read() {
         "the replacement's read published the stall"
     );
     assert!(replacement.routing_state().stalled);
+}
+
+#[tokio::test]
+async fn a_failed_http_admin_call_names_the_worker_once_without_the_clients_url() {
+    let refused = RefusedAddress::reserve();
+    let url = format!("{}/?token=s3cret", refused.http_url());
+    let text = BasicWorkerBuilder::new(&url)
+        .build()
+        .flush_cache()
+        .await
+        .expect_err("nothing listens at the address")
+        .to_string();
+    assert!(!text.contains("s3cret"), "{text}");
+    assert_eq!(
+        text.matches(&refused.addr().to_string()).count(),
+        1,
+        "{text}"
+    );
 }

@@ -381,14 +381,39 @@ impl Replica {
         }
     }
 
-    /// The exit status, waited for, with the log read to its end: every
-    /// line the process wrote on its way out is in the log from here.
+    /// The exit status, waited for under the kit's own bound, with the log
+    /// read to its end: every line the process wrote on its way out is in
+    /// the log from here. A replica that has not exited inside [`ROOM`] is
+    /// killed and named, and so is a log that does not end: a process that
+    /// hangs at its exit fails its case instead of holding the job.
     pub fn exited(&mut self) -> Result<ExitStatus, String> {
-        let status = self
-            .child
-            .wait()
-            .map_err(|error| format!("wait {}: {error}", self.id))?;
+        let waited = Instant::now();
+        let status = loop {
+            let exited = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("wait {}: {error}", self.id))?;
+            if let Some(status) = exited {
+                break status;
+            }
+            if waited.elapsed() >= ROOM {
+                // Best effort: the case fails by the name below either way.
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(format!("{} did not exit in {ROOM:?}", self.id));
+            }
+            thread::sleep(PACE);
+        };
         if let Some(reader) = self.reader.take() {
+            while !reader.is_finished() {
+                if waited.elapsed() >= ROOM {
+                    return Err(format!(
+                        "{}: its log did not end in {ROOM:?} of its exit's wait",
+                        self.id
+                    ));
+                }
+                thread::sleep(PACE);
+            }
             reader
                 .join()
                 .map_err(|_| format!("{}: the log reader panicked", self.id))?;

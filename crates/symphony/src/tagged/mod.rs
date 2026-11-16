@@ -115,14 +115,18 @@ pub(super) trait TaggedAssembler {
     }
 }
 
-/// The one event of a string value that one of a call's two own ends closed: the stream's stop
+/// The one event of a value the model left open, which the assembler closes for it. Mostly a
+/// string value that one of a call's two own ends closed: the stream's stop
 /// (`why` = [`MalformedReason::OpenAtTheStop`], [`open_at_the_stop`]) or the call's closing
 /// marker (`why` = [`MalformedReason::OpenAtTheMarker`]: the model ended the call, its own
 /// closing marker, the next call's opener or the block's close came, with the string's closing
 /// tag never written). Either way the model wrote nothing more of the value, so the assembler
 /// closes the string; the event carries no bytes and stands before the closing quote. The four
 /// assemblers of this module push it from their `close_open_string`; a value held whole for its
-/// close keeps the ending's own path, reported or refused, nothing made up for it.
+/// close keeps the ending's own path, reported or refused, nothing made up for it. The XML
+/// assembler pushes it once more (`why` = [`MalformedReason::TagCutShort`]): for an element
+/// declared a list or an object that the closing tag of the element around it cut short, before
+/// the fragment that writes the element empty.
 pub(crate) fn left_open(why: MalformedReason, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(String::new()),

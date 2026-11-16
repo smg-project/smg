@@ -305,7 +305,11 @@ async fn refresh_worker_models(
             false
         }
         Err(e) => {
-            tracing::warn!("Failed to fetch models from backend: {}", e);
+            tracing::warn!(
+                "Failed to fetch models from backend {}: {}",
+                Endpoint::redacted_str(&url),
+                e.without_url()
+            );
             false
         }
     }

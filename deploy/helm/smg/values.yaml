@@ -7,7 +7,7 @@ global:
   image:
     registry: docker.io
     repository: lightseekorg/smg
-    tag: ""  # defaults to Chart.appVersion
+    tag: ""  # defaults to Chart.appVersion; text: quote a tag of digits alone ("1.16")
     pullPolicy: IfNotPresent
   imagePullSecrets: []
 
@@ -446,6 +446,9 @@ policyController:
   #    and turning the election off deletes the Lease. Turning it on beside
   #    a running controller starts an elected pod while the lone one still
   #    leads: scale the controller to zero first.
+  #    A changed leaseName on a running release is such a change as well: a
+  #    pod elected over the new Lease may lead while the old Lease's leader
+  #    still leads, until its renew deadline, and the term starts again.
   election:
     enabled: false
     leaseName: ""

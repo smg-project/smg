@@ -34,6 +34,11 @@
 //! on each of eight members, none of them the asking one's: what a build
 //! pays to pass over a veto that is not its own.
 //!
+//! `policy_store_held/publish/<n>` is the publication beside a reader that
+//! holds the world listing the rows it would write over: the publication
+//! leaves those rows whole and writes over rows the reader let go. Outside
+//! the gate.
+//!
 //! The pair door's cells are a bench target of their own (`store_pair`):
 //! this binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
@@ -452,40 +457,56 @@ fn load_write(c: &mut Criterion, fixtures: &mut [Fixture]) {
     group.finish();
 }
 
+/// One window's publication of the pool: `policy_store/publish/<n>` with no
+/// reader holding a world, and `policy_store_held/publish/<n>` beside a
+/// reader that keeps the worlds of the last two publications. The older of
+/// the two lists the rows the publication would write over, so every
+/// publication of the held cell leaves them and takes other rows.
 fn publish(c: &mut Criterion, fixtures: &mut [Fixture]) {
-    let mut group = c.benchmark_group("policy_store/publish");
-    for fixture in fixtures.iter_mut() {
-        let n = fixture.n;
-        let mut turn = 0u64;
-        group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter_batched(
-                || {
-                    // One record folded inside the window: the pool has
-                    // something to publish at the window's end.
-                    turn += 1;
-                    let index = (turn as usize).wrapping_mul(67) % n;
-                    let opened = fixture.window.get();
-                    fixture.store.record(
-                        fixture.ids[index],
-                        0,
-                        record_of(index, turn),
-                        opened + Duration::from_millis(1),
-                        LoadSource::Stream,
-                    );
-                    let due = opened + PUBLISH_WINDOW;
-                    fixture.window.set(due);
-                    due
-                },
-                |due| fixture.store.publish(black_box(due)),
-                BatchSize::PerIteration,
-            );
-        });
-        // A cell the filter left out published nothing: the write cell's
-        // records may still wait.
-        assert!(turn == 0 || fixture.store.publish_due().is_none());
+    for (group, reader) in [
+        ("policy_store/publish", false),
+        ("policy_store_held/publish", true),
+    ] {
+        let mut group = c.benchmark_group(group);
+        for fixture in fixtures.iter_mut() {
+            let n = fixture.n;
+            let mut turn = 0u64;
+            let mut kept = [None, None];
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+                b.iter_batched(
+                    || {
+                        // One record folded inside the window: the pool has
+                        // something to publish at the window's end.
+                        turn += 1;
+                        let index = (turn as usize).wrapping_mul(67) % n;
+                        let opened = fixture.window.get();
+                        fixture.store.record(
+                            fixture.ids[index],
+                            0,
+                            record_of(index, turn),
+                            opened + Duration::from_millis(1),
+                            LoadSource::Stream,
+                        );
+                        if reader {
+                            // The last publication's world takes the place
+                            // of the one three publications back.
+                            kept[(turn % 2) as usize] = Some(fixture.store.world());
+                        }
+                        let due = opened + PUBLISH_WINDOW;
+                        fixture.window.set(due);
+                        due
+                    },
+                    |due| fixture.store.publish(black_box(due)),
+                    BatchSize::PerIteration,
+                );
+            });
+            // A cell the filter left out published nothing: the write
+            // cell's records may still wait.
+            assert!(turn == 0 || fixture.store.publish_due().is_none());
+        }
+        group.finish();
     }
-    group.finish();
 }
 
 /// What the bench thread asks of the writer's thread.

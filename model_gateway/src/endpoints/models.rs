@@ -452,7 +452,7 @@ async fn fetch_models_from(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            debug!("Failed to reach upstream {shown}: {e}");
+            debug!("Failed to reach upstream {shown}: {}", e.without_url());
             return None;
         }
     };

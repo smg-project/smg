@@ -185,6 +185,10 @@ name = "elector_k8s_cell"
 required-features = ["kubernetes"]
 
 [[test]]
+name = "fleet"
+required-features = ["controller"]
+
+[[test]]
 name = "ingest"
 required-features = ["controller"]
 

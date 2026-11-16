@@ -15,7 +15,7 @@
 
 use tonic::{Request, Status};
 
-use crate::proto::principal::Method;
+use crate::{proto::principal::Method, store::GatewayId, view};
 
 /// The metadata entry a caller states its name in, on a listener that takes
 /// identities as told.
@@ -41,6 +41,14 @@ pub(crate) struct Principal {
     pub(crate) subject: String,
     /// How the listener came by it: a verification, or as told.
     pub(crate) method: Method,
+}
+
+impl Principal {
+    /// The subject as the store keys a gateway's leases, vetoes and reports:
+    /// its fingerprint, never `0`, which is the embedded mode's own gateway.
+    pub(crate) fn gateway(&self) -> GatewayId {
+        GatewayId(view::fingerprint(self.subject.as_bytes()))
+    }
 }
 
 /// The layer of a listener that takes identities as told: the name the call
@@ -86,7 +94,7 @@ pub(crate) mod tests {
     use tonic::{Code, Request};
 
     use super::{as_told, principal, Principal, ENTRY, NAME_MAX};
-    use crate::proto::principal::Method;
+    use crate::{proto::principal::Method, store::GatewayId};
 
     /// The refusal of a call with no principal, word for word.
     pub(crate) const NO_PRINCIPAL: &str = "the call has no principal: this listener takes none as told, or the call states none in x-smg-principal";
@@ -155,6 +163,15 @@ pub(crate) mod tests {
                 .expect("an opaque value"),
         );
         assert!(principal(&as_told(request)).is_err());
+    }
+
+    #[test]
+    fn a_gateways_id_is_its_subjects_fingerprint_and_never_the_embedded_one() {
+        let a = told("gateway-a").gateway();
+        let b = told("gateway-b").gateway();
+        assert_ne!(a, b);
+        assert_ne!(a, GatewayId::LOCAL);
+        assert_eq!(a, told("gateway-a").gateway());
     }
 
     /// Two names are no name: neither the first nor the last is taken, so a
