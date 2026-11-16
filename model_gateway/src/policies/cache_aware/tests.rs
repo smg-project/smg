@@ -5405,6 +5405,127 @@ fn a_large_pool_miss_spreads_over_the_pool() {
     );
 }
 
+/// `count` workers of one model behind a policy whose model has no event
+/// index: the token tree places, and it holds `tokens` for the worker at
+/// `holder`.
+fn large_pool_on_the_tree(
+    count: usize,
+    holder: usize,
+    tokens: &[u32],
+) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let workers = make_workers(&refs);
+    let policy = CacheAwarePolicy::with_config(test_config());
+    seed_token_tenants(&policy, &workers, tokens, &[refs[holder]]);
+    policy.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
+    (policy, workers)
+}
+
+/// A pool of one model above the sample's reach decides what the scan
+/// decides, at 33 workers and at 200. With an event index the sampled
+/// decision places the holder the index names; without one the scan decides
+/// (the tree's holder), and the sampled decision hands the request over
+/// before it draws a worker.
+#[test]
+fn a_large_pool_of_one_model_decides_as_the_scan_with_and_without_an_event_index() {
+    let prompt: Vec<u32> = (1..=8).collect();
+    for count in [2 * FLEET_SAMPLE + 1, 200] {
+        let holder = count - 3;
+        let (policy, workers) = large_pool(
+            count,
+            holder,
+            &[&[1, 2, 3, 4], &[5, 6, 7, 8]],
+            test_config(),
+        );
+        for _ in 0..8 {
+            let info = tokens_info(&prompt);
+            assert!(
+                matches!(
+                    policy.select_worker_sampled(&workers, &info),
+                    Sampled::Decided(Some(idx)) if idx == holder
+                ),
+                "{count} workers with an index: the sample decides"
+            );
+            assert_eq!(policy.select_worker(&workers, &info), Some(holder));
+            assert_eq!(policy.select_worker_scanned(&workers, &info), Some(holder));
+        }
+
+        let (policy, workers) = large_pool_on_the_tree(count, holder, &prompt);
+        for _ in 0..8 {
+            let info = tokens_info(&prompt);
+            assert!(
+                matches!(policy.select_worker_sampled(&workers, &info), Sampled::Scan),
+                "{count} workers without an index: the scan decides"
+            );
+            assert_eq!(policy.select_worker(&workers, &info), Some(holder));
+            assert_eq!(policy.select_worker_scanned(&workers, &info), Some(holder));
+        }
+    }
+}
+
+/// A pool whose workers name different models is the scan's when its first
+/// worker's model has no event index, whatever index the other workers'
+/// model has and whichever workers a sample would draw: no sample is drawn
+/// for it.
+#[test]
+fn a_mixed_pool_whose_first_worker_has_no_event_index_is_the_scans() {
+    use openai_protocol::model_card::ModelCard;
+
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+
+    let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+    workers[0] = Arc::new(
+        BasicWorkerBuilder::new("http://plain:8000")
+            .model(ModelCard::new("plain"))
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    policy.init_workers(&workers);
+    let prompt: Vec<u32> = (1..=8).collect();
+    for _ in 0..8 {
+        assert!(matches!(
+            policy.select_worker_sampled(&workers, &tokens_info(&prompt)),
+            Sampled::Scan
+        ));
+    }
+}
+
+/// The lookup after the draw still decides one pool: its first worker names
+/// a model with an event index and is never drawn, and every worker a sample
+/// can draw names a model without one. The sample's first worker names the
+/// index the decision reads, there is none, and the scan decides.
+#[test]
+fn a_mixed_pool_whose_sampled_workers_have_no_event_index_is_the_scans() {
+    use openai_protocol::model_card::ModelCard;
+
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+
+    let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+    workers[0].set_status(WorkerStatus::NotReady);
+    for (i, worker) in workers.iter_mut().enumerate().skip(1) {
+        *worker = Arc::new(
+            BasicWorkerBuilder::new(format!("http://plain{i}:8000").as_str())
+                .model(ModelCard::new("plain"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+    }
+    policy.init_workers(&workers);
+    let prompt: Vec<u32> = (1..=8).collect();
+    let info = tokens_info(&prompt);
+    assert!(!info.admits(workers[0].routing_state()));
+    assert!(info.admits(workers[1].routing_state()));
+    for _ in 0..8 {
+        assert!(matches!(
+            policy.select_worker_sampled(&workers, &info),
+            Sampled::Scan
+        ));
+    }
+}
+
 #[test]
 fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
