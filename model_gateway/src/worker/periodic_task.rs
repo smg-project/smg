@@ -132,6 +132,8 @@ mod tests {
     #[test]
     fn test_periodic_task_responds_to_shutdown() {
         let task = PeriodicTask::spawn(24 * 60 * 60, "test", || {});
+        // Let the task thread reach its timed wait, so the drop has to wake it.
+        thread::sleep(Duration::from_millis(100));
         assert_the_drop_returns(task);
     }
 
