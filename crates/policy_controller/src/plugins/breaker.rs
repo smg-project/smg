@@ -128,24 +128,11 @@ impl Breaker {
 /// a p99 past it is slow. The p99 of a window is its second-slowest sample,
 /// so one outlier does not open the breaker, and a window that read slow is
 /// forgotten, so it does not open it twice.
-///
-/// The ring also says whether its thread reads its CPU clock at the start
-/// and the end of the plugin's calls ([`Latency::arm`]): the sample of a
-/// late call no reading covers is the time the call took, which a hold of
-/// the host makes slow, so the ring that is about to take one is armed until
-/// that sample has left it, and at most one of them is ever in a window. A
-/// call that runs out under a decision's remainder arms it too where the
-/// two ends of the time nothing read part: by the time the plugin's unread
-/// calls took the run-out is its own, by their fuel it is not. So does a
-/// sample slow at its high end alone ([`Latency::uncovered`]), late call or
-/// none: a window never holds two slow samples no reading covered.
 #[derive(Debug)]
 pub(crate) struct Latency {
     ring: [u32; Self::SAMPLES],
     next: usize,
     filled: usize,
-    /// The samples the ring still takes armed.
-    armed: usize,
 }
 
 impl Latency {
@@ -159,61 +146,37 @@ impl Latency {
             ring: [0; Self::SAMPLES],
             next: 0,
             filled: 0,
-            armed: 0,
         }
     }
 
-    /// Arms the ring's thread for the ring's length in samples: the sample
-    /// of the decision in flight and the [`Latency::SAMPLES`] - 1 after it.
-    /// The sample that follows those overwrites this decision's.
-    pub(crate) fn arm(&mut self) {
-        self.armed = Self::SAMPLES;
-    }
-
-    /// Whether the thread reads its CPU clock at the start and the end of a
-    /// call.
-    pub(crate) fn armed(&self) -> bool {
-        self.armed != 0
-    }
-
-    /// A charge of `micros` as a share of a frame of `frame_micros`, in the
-    /// ring's unit. The frame is not zero.
-    fn share(micros: u32, frame_micros: u32) -> u32 {
+    /// What a sample is: a charge of `micros` as a share of a frame of
+    /// `frame_micros`, in the ring's unit. A call without a frame is none.
+    /// Whoever asks whether a call is a sample asks here.
+    pub(crate) fn share(micros: u32, frame_micros: u32) -> Option<u32> {
+        if frame_micros == 0 {
+            return None;
+        }
         let share = u64::from(micros) * u64::from(Self::FRAME) / u64::from(frame_micros);
-        u32::try_from(share).unwrap_or(u32::MAX)
+        Some(u32::try_from(share).unwrap_or(u32::MAX))
     }
 
     /// How many of the two marks a read holds a window to a sample of
     /// `share` is past: half the frame, where the median reads slow, and
     /// the frame, where the tail does.
-    fn marks(share: u32) -> u8 {
+    pub(crate) fn marks(share: u32) -> u8 {
         u8::from(share > Self::FRAME / 2) + u8::from(share > Self::FRAME)
     }
 
-    /// Whether a sample of `micros` is past a mark that `low_micros` is
-    /// short of, both under a frame of `frame_micros`. The second is the
-    /// same decision at the low end of the time nothing read, so such a
-    /// sample is slow by that time alone: no reading covers it. A sample
-    /// slow by both ends is not one, nor is one without a frame.
-    pub(crate) fn uncovered(micros: u32, low_micros: u32, frame_micros: u32) -> bool {
-        frame_micros != 0
-            && Self::marks(Self::share(micros, frame_micros))
-                != Self::marks(Self::share(low_micros, frame_micros))
-    }
-
-    /// Records one call of `micros` under a frame of `frame_micros` (a call
-    /// without a frame is not a sample); `true` when this call completed a
-    /// window and the window reads slow, which forgets the window.
+    /// Records one call of `micros` under a frame of `frame_micros`, when
+    /// it is a sample ([`Latency::share`]); `true` when this call completed
+    /// a window and the window reads slow, which forgets the window.
     pub(crate) fn record(&mut self, micros: u32, frame_micros: u32) -> bool {
-        if frame_micros == 0 {
+        let Some(share) = Self::share(micros, frame_micros) else {
             return false;
-        }
-        self.ring[self.next] = Self::share(micros, frame_micros);
+        };
+        self.ring[self.next] = share;
         self.next = (self.next + 1) % Self::SAMPLES;
         self.filled = (self.filled + 1).min(Self::SAMPLES);
-        // The arm falls by one where a sample is written, so it is counted
-        // in the ring's own unit.
-        self.armed = self.armed.saturating_sub(1);
         if !self.next.is_multiple_of(Self::EVERY) || self.filled < 2 {
             return false;
         }
@@ -246,46 +209,6 @@ mod tests {
             failures: 3,
             window_micros: 1_000,
             cooldown_micros: 5_000,
-        }
-    }
-
-    /// A sample is uncovered where it is past a mark of the ring that its
-    /// low end is short of: each mark at its edge, in the ring's own unit.
-    #[test]
-    fn a_sample_past_a_mark_its_low_end_is_short_of_is_uncovered() {
-        // A sample, its low end and the frame, and whether no reading
-        // covers the sample.
-        let table = [
-            // At half the frame the high end is past no mark.
-            (500, 0, 1_000, false),
-            // Past half the frame by the high end alone.
-            (501, 0, 1_000, true),
-            (501, 500, 1_000, true),
-            // Past half the frame by both ends, and short of the frame by
-            // both.
-            (501, 501, 1_000, false),
-            (1_000, 501, 1_000, false),
-            // Past the frame by the high end alone, whatever half says.
-            (1_001, 0, 1_000, true),
-            (1_001, 501, 1_000, true),
-            (1_001, 1_000, 1_000, true),
-            // Past the frame by both ends.
-            (1_001, 1_001, 1_000, false),
-            (9_000, 1_001, 1_000, false),
-            // The share is the ring's: a frame that is no thousand.
-            (700, 5, 400, true),
-            (200, 5, 400, false),
-            (201, 5, 400, true),
-            (2, 1, 3, true),
-            // No frame, no sample.
-            (700, 5, 0, false),
-        ];
-        for (micros, low_micros, frame_micros, uncovered) in table {
-            assert_eq!(
-                Latency::uncovered(micros, low_micros, frame_micros),
-                uncovered,
-                "{micros} over {low_micros} under a frame of {frame_micros}"
-            );
         }
     }
 
@@ -607,52 +530,5 @@ mod tests {
 
         let mut unbudgeted = Latency::new();
         assert!(!(0..Latency::SAMPLES).any(|_| unbudgeted.record(1_000, 0)));
-    }
-
-    /// An armed ring stays armed for its own length in samples and no
-    /// longer: through the sample of the decision that armed it and the 127
-    /// after it, so the next sample a late call can leave unread overwrites
-    /// the first one's. A decision that records nothing does not count.
-    #[test]
-    fn an_armed_ring_stays_armed_for_its_length_in_samples() {
-        let mut ring = Latency::new();
-        assert!(!ring.armed(), "a new ring is not armed");
-        ring.arm();
-        for sample in 0..Latency::SAMPLES - 1 {
-            assert!(ring.armed(), "armed before sample {sample}");
-            assert!(!ring.record(10, 0), "no frame: not a sample");
-            assert!(
-                ring.armed(),
-                "a decision that records nothing does not count"
-            );
-            ring.record(10, 100);
-        }
-        assert!(
-            ring.armed(),
-            "the call 127 samples after the first is still read"
-        );
-        ring.record(10, 100);
-        assert!(!ring.armed(), "the arm fell with the ring's length");
-    }
-
-    /// One slow sample a window is never its p99. A ring armed by each late
-    /// call no reading covers takes such a sample once a length at most, so
-    /// those samples alone never read slow.
-    #[test]
-    fn one_unread_sample_a_ring_length_never_reads_slow() {
-        let mut ring = Latency::new();
-        let mut tripped = false;
-        for round in 0..4 {
-            assert!(!ring.armed(), "round {round}: the last arm has fallen");
-            // The unread call's decision: its sample is the time the call
-            // took, five hundred times its budget. It arms the ring.
-            ring.arm();
-            tripped |= ring.record(50_000, 100);
-            // Armed, a late call is read: its sample is the plugin's own.
-            for _ in 1..Latency::SAMPLES {
-                tripped |= ring.record(10, 100);
-            }
-        }
-        assert!(!tripped, "one slow sample in every window of the ring");
     }
 }
