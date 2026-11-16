@@ -12,6 +12,7 @@ use crate::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
+        rgb_runs::RgbSplitter,
         transforms::{
             pil_to_filter, resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes,
             round_half_to_even, TransformError,
@@ -45,10 +46,9 @@ struct Geometry {
     content: (usize, usize),
 }
 
-/// The image's own bytes in the patch layout, with the normalization a
-/// float destination applies.
+/// What [`encode`] appended: the normalization a float destination applies
+/// to the bytes, and their grid.
 struct Patches {
-    values: Vec<u8>,
     norm: PixelNorm,
     grid: (usize, usize, usize),
     count: usize,
@@ -394,12 +394,14 @@ fn prepare<'a, F: RgbSource>(
     Ok(Cow::Owned(canvas))
 }
 
-/// Pack resized RGB frames into merged patch rows with temporal padding.
+/// Append resized RGB frames to `values` as merged patch rows with temporal
+/// padding. After an error `values` holds a partial append.
 fn encode<F: RgbSource>(
     frames: &[F],
     budget_frames: usize,
     params: Params,
     pixels: &Pixels,
+    values: &mut Vec<u8>,
 ) -> Result<Patches, TransformError> {
     let first = frames.first().ok_or(TransformError::EmptyBatch)?;
     let source_size = first.dimensions();
@@ -422,17 +424,20 @@ fn encode<F: RgbSource>(
         "GLM features",
     )?;
     let expected = product(&[count, features], "GLM patch output size")?;
-    let mut values = Vec::new();
     values
         .try_reserve_exact(expected)
         .map_err(|error| shape(format!("cannot reserve GLM patch output: {error}")))?;
     // Write bounded row slices rather than growing the Vec for each pixel.
-    // This also lets the gather loop check the RGB row's bounds once.
-    values.resize(expected, 0);
-    let mut remaining = values.as_mut_slice();
+    let written = values.len();
+    values.resize(written + expected, 0);
+    let mut remaining = &mut values[written..];
     let norm = pixels.norm;
     let filter = pixels.filter;
     let merged_patch = params.merge * params.patch;
+    let splitter = RgbSplitter::detect();
+    // One channel of a patch holds its plane once per frame of the temporal patch.
+    let plane = params.patch * params.patch;
+    let channel = params.temporal * plane;
 
     for temporal_index in 0..grid_t {
         let start = temporal_index * params.temporal;
@@ -441,28 +446,39 @@ fn encode<F: RgbSource>(
             .iter()
             .map(|frame| prepare(frame, geometry, filter, do_resize))
             .collect::<Result<Vec<_>, _>>()?;
-        let last = prepared.last().ok_or(TransformError::EmptyBatch)?;
+        if prepared.is_empty() {
+            return Err(TransformError::EmptyBatch);
+        }
         for patch_row in 0..grid_h / params.merge {
             for patch_col in 0..grid_w / params.merge {
                 let (y0, x0) = (patch_row * merged_patch, patch_col * merged_patch);
                 for merge_h in 0..params.merge {
                     for merge_w in 0..params.merge {
-                        for channel in 0..3 {
-                            for temporal in 0..params.temporal {
-                                let raw = prepared.get(temporal).unwrap_or(last).as_ref();
-                                for patch_y in 0..params.patch {
-                                    let row = (y0 + merge_h * params.patch + patch_y) * width
-                                        + x0
-                                        + merge_w * params.patch;
-                                    let rgb = &raw[row * 3..(row + params.patch) * 3];
-                                    let (output, rest) = remaining.split_at_mut(params.patch);
-                                    remaining = rest;
-                                    for (output, pixel) in
-                                        output.iter_mut().zip(rgb.as_chunks::<3>().0)
-                                    {
-                                        *output = pixel[channel];
-                                    }
-                                }
+                        let (patch, rest) = remaining.split_at_mut(3 * channel);
+                        remaining = rest;
+                        let (red, rest) = patch.split_at_mut(channel);
+                        let (green, blue) = rest.split_at_mut(channel);
+                        for (temporal, raw) in prepared.iter().enumerate() {
+                            for patch_y in 0..params.patch {
+                                let row = (y0 + merge_h * params.patch + patch_y) * width
+                                    + x0
+                                    + merge_w * params.patch;
+                                let at = temporal * plane + patch_y * params.patch;
+                                splitter.split(
+                                    &raw[row * 3..(row + params.patch) * 3],
+                                    &mut red[at..at + params.patch],
+                                    &mut green[at..at + params.patch],
+                                    &mut blue[at..at + params.patch],
+                                );
+                            }
+                        }
+                        // A frame past the clip's end repeats the last one.
+                        for temporal in prepared.len()..params.temporal {
+                            for copies in [&mut *red, &mut *green, &mut *blue] {
+                                copies.copy_within(
+                                    (temporal - 1) * plane..temporal * plane,
+                                    temporal * plane,
+                                );
                             }
                         }
                     }
@@ -472,7 +488,6 @@ fn encode<F: RgbSource>(
     }
     debug_assert!(remaining.is_empty());
     Ok(Patches {
-        values,
         norm,
         grid: (grid_t, grid_h, grid_w),
         count,
@@ -490,14 +505,15 @@ fn preprocess_video_frames<F: RgbSource>(
         .first()
         .ok_or(TransformError::EmptyBatch)?
         .dimensions();
-    let patches = encode(frames, frames.len(), params, pixels)?;
+    let mut values = Vec::new();
+    let patches = encode(frames, frames.len(), params, pixels, &mut values)?;
     let fps = clip.sample_fps;
     if !fps.is_finite() || fps <= 0.0 {
         return Err(shape(format!("GLM video fps must be positive, got {fps}")));
     }
     let (grid_t, grid_h, grid_w) = patches.grid;
     let features = 3 * params.temporal * params.patch * params.patch;
-    let tensor = Array2::from_shape_vec((patches.count, features), patches.values)
+    let tensor = Array2::from_shape_vec((patches.count, features), values)
         .map_err(|error| shape(format!("failed to build GLM video patches: {error}")))?;
     Ok(PreprocessedEncoderInputs::new(
         EncoderInput::bytes(tensor, patches.norm),
@@ -692,6 +708,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
                 params.temporal,
                 params,
                 &self.pixels,
+                &mut values,
             )?;
             grids.extend([
                 patches.grid.0 as i64,
@@ -700,7 +717,6 @@ impl VisionPreProcessor for Glm53FlashProcessor {
             ]);
             counts.push(patches.count as i64);
             tokens.push(patches.tokens);
-            values.extend(patches.values);
         }
         let features = 3 * params.temporal * params.patch * params.patch;
         let total = values.len() / features;
@@ -1087,6 +1103,66 @@ mod tests {
         let patch = &flat[..1176];
         for (offset, value) in [10.0, 40.0, 20.0, 50.0, 30.0, 60.0].into_iter().enumerate() {
             assert!((patch[offset * 196] - value / 255.0).abs() < 1e-6);
+        }
+    }
+
+    /// `encode` writes what the plain per-byte gather writes: the merged
+    /// blocks in row-major order, each sub-patch channel by channel, each
+    /// channel once per frame of the temporal patch, a frame past the clip's
+    /// end repeating the last one; and it appends to what the buffer holds.
+    #[test]
+    fn encode_writes_gradient_frames_as_the_per_byte_gather_does() {
+        let (width, height) = (56_usize, 84_usize);
+        let frames: Vec<Vec<u8>> = (0..4)
+            .map(|seed| lcg_bytes(width * height * 3, seed))
+            .collect();
+        // Clips that end inside a temporal patch, by one frame and by two,
+        // and a single frame.
+        for (temporal_patch, count) in [(2, 3), (3, 4), (2, 1)] {
+            let mut config = config(MAX_VIDEO_TOKENS);
+            config.do_resize = Some(false);
+            config.temporal_patch_size = Some(temporal_patch);
+            let params = Params::from_config(&config, true).unwrap();
+            let pixels = Pixels::from_config(&config, params).unwrap();
+            let clip: Vec<RgbFrameRef<'_>> = frames[..count]
+                .iter()
+                .map(|data| RgbFrameRef {
+                    width: width as u32,
+                    height: height as u32,
+                    data,
+                })
+                .collect();
+            let mut values = vec![0xAA];
+            encode(&clip, count, params, &pixels, &mut values).unwrap();
+
+            let (patch, merged) = (params.patch, params.merge * params.patch);
+            let mut expected = vec![0xAA];
+            for group in clip.chunks(params.temporal) {
+                for block_row in 0..height / merged {
+                    for block_col in 0..width / merged {
+                        for merge_h in 0..params.merge {
+                            for merge_w in 0..params.merge {
+                                let top = block_row * merged + merge_h * patch;
+                                let left = block_col * merged + merge_w * patch;
+                                for channel in 0..3 {
+                                    for temporal in 0..params.temporal {
+                                        let frame = group[temporal.min(group.len() - 1)].data;
+                                        for y in top..top + patch {
+                                            for x in left..left + patch {
+                                                expected.push(frame[(y * width + x) * 3 + channel]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                values, expected,
+                "temporal patch {temporal_patch}, {count} frames"
+            );
         }
     }
 
