@@ -838,15 +838,16 @@ mod tests {
         assert_eq!(table.slots(), ShortPieceTable::slots_for(100));
     }
 
-    /// A run that wrapped around the old slots' end is placed again whole,
-    /// for homes that stay behind that end and for homes at the grown
-    /// table's end, where the run wraps again.
+    /// A run that wrapped around the old slots' end is placed again whole:
+    /// for homes that stay behind that end, for homes at the grown table's
+    /// end, where the run wraps again, and for a run that mixes the two,
+    /// the one a walk from the first slot loses entries of.
     #[test]
     fn a_run_wrapped_around_the_old_end_reads_back_after_growth() {
         let grown = ShortPieceTable::for_entries(100);
         assert_eq!(grown.slots(), 256);
         let slot_of = |i: u32| grown.first_slot(key(&i.to_le_bytes())).0;
-        for homes in [62..=63, 254..=255] {
+        for homes in [&[62, 63][..], &[254, 255], &[62, 63, 254, 255]] {
             let wrapped: Vec<u32> = (0..4000)
                 .filter(|&i| homes.contains(&slot_of(i)))
                 .take(6)
