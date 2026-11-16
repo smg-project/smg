@@ -2063,7 +2063,7 @@ async fn port_answers(endpoint: &Endpoint) -> bool {
                 .is_ok_and(|connected| connected.is_ok())
         }
         #[cfg(unix)]
-        Endpoint::Ipc(Some(path)) => tokio::net::UnixStream::connect(path).await.is_ok(),
+        Endpoint::Ipc(Some(path)) => engine_zmq_adapter::knock_ipc_socket(path).await.is_ok(),
         // Nothing to knock on (the enum is non-exhaustive): the ZMQ connect
         // below says what is wrong.
         _ => true,

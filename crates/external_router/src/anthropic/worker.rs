@@ -156,7 +156,7 @@ pub(crate) async fn parse_response(
             Ok(message)
         }
         Err(e) => {
-            error!(model = %model_id, error = %e, "Failed to parse response");
+            error!(model = %model_id, error = %e.without_url(), "Failed to parse response");
             record_failure_metrics(
                 model_id,
                 start_time,
@@ -191,6 +191,9 @@ pub(crate) async fn relay_response(
     let body = match response.bytes().await {
         Ok(body) => body,
         Err(e) => {
+            // The client's text ends with the request URL; the answers name
+            // no address.
+            let e = e.without_url();
             warn!(model = %model_id, error = %e, "Reading the response body failed");
             if e.is_timeout() {
                 record_failure_metrics(
@@ -441,7 +444,8 @@ mod tests {
 
     use super::{probe::counted_failure, *};
     use crate::test_support::{
-        text_of, upstream, RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
+        answering, text_of, upstream, RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL,
+        MASKED_WORKER_URL,
     };
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
@@ -752,6 +756,49 @@ mod tests {
         assert!(!body.contains("s3cret"), "{body}");
         assert!(!body.contains(&refused.addr().to_string()), "{body}");
         assert!(logs_contain("Request to worker failed"));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// An answer that is no JSON: the failure line says why without the
+    /// request URL. The HTTP client's text of a failed body read ends with
+    /// it, its query kept.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn an_answer_that_is_no_json_goes_without_the_clients_url_in_its_line() {
+        let addr = answering(200, "not json", false).await;
+        let response = client_with_timeout(Duration::from_secs(5))
+            .get(format!("http://{addr}/v1/messages?key=s3cret"))
+            .send()
+            .await
+            .expect("the answer's head");
+
+        let Err(answer) = parse_response(response, "m", Instant::now()).await else {
+            panic!("an answer that is no JSON");
+        };
+
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
+        assert!(logs_contain("Failed to parse response"));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// A body lost mid-answer: the caller's 502 and the failure line say why
+    /// without the request URL.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_body_cut_short_goes_without_the_clients_url() {
+        let addr = answering(200, "short", true).await;
+        let response = client_with_timeout(Duration::from_secs(5))
+            .get(format!("http://{addr}/v1/messages?key=s3cret"))
+            .send()
+            .await
+            .expect("the answer's head");
+
+        let answer = relay_response(response, "m", Instant::now()).await;
+
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
+        let body = text_of(answer).await;
+        assert!(!body.contains("s3cret"), "{body}");
+        assert!(logs_contain("Reading the response body failed"));
         assert!(!logs_contain("s3cret"));
     }
 

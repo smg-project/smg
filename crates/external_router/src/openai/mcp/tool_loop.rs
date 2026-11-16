@@ -1211,7 +1211,7 @@ async fn upstream_round(
     let response_json = response
         .json::<Value>()
         .await
-        .map_err(|e| format!("parse response: {e}"))?;
+        .map_err(|e| format!("parse response: {}", e.without_url()))?;
 
     let function_calls = extract_function_calls(&response_json);
     if function_calls.is_empty() {
@@ -1651,7 +1651,7 @@ mod tests {
         header_utils::ApiProvider,
         openai::mcp::test_support,
         openai_bridge::{FormatRegistry, ResponseFormat},
-        test_support::{counting_alloc, http_client, RefusedAddress},
+        test_support::{answering, counting_alloc, http_client, RefusedAddress},
     };
 
     fn test_tool(name: &str) -> Tool {
@@ -3009,5 +3009,29 @@ mod tests {
 
         assert!(!text.contains("s3cret"), "{text}");
         assert!(!text.contains(&refused.addr().to_string()), "{text}");
+    }
+
+    /// A round answered with no JSON fails without the request URL in its
+    /// text. The HTTP client's text of a failed body read ends with it, its
+    /// query kept.
+    #[tokio::test]
+    async fn a_round_answered_with_no_json_goes_without_the_clients_url() {
+        let addr = answering(200, "not json", false).await;
+        let url = format!("http://{addr}/v1/responses?key=s3cret");
+
+        let Err(text) = upstream_round(
+            &http_client(),
+            &url,
+            &ApiProvider::Generic,
+            None,
+            &json!({}),
+        )
+        .await
+        else {
+            panic!("an answer that is no JSON");
+        };
+
+        assert!(text.starts_with("parse response"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 }
