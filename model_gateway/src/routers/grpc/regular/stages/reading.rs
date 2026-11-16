@@ -1094,7 +1094,9 @@ mod tests {
                 .worker_registry
                 .model_routing_snapshot(SERVED)
                 .expect("a served model")
-                .labels(SERVED, |_| panic!("preparation kept its answers"))
+                .labels(SERVED, |_| {
+                    panic!("preparation kept nothing on the snapshot")
+                })
                 .cloned()
                 .expect("kept under the request's spelling")
         };
