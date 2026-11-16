@@ -194,39 +194,24 @@ async fn forward_upstream_to_client(
             msg = upstream_stream.next() => {
                 match msg {
                     Some(Ok(tungstenite_msg)) => {
-                        match tungstenite_msg {
+                        let axum_msg = match tungstenite_msg {
                             TungsteniteMessage::Text(text) => {
                                 let text = relayed_text(&session_id, &text);
-                                if let Err(e) = client_sink.send(AxumMessage::Text(text.into_owned().into())).await {
-                                    warn!(session_id, error = %e, "Failed to send to client");
-                                    return;
-                                }
+                                AxumMessage::Text(text.into_owned().into())
                             }
-                            TungsteniteMessage::Binary(data) => {
-                                if let Err(e) = client_sink.send(AxumMessage::Binary(data)).await {
-                                    warn!(session_id, error = %e, "Failed to send binary to client");
-                                    return;
-                                }
-                            }
-                            TungsteniteMessage::Ping(data) => {
-                                if let Err(e) = client_sink.send(AxumMessage::Ping(data)).await {
-                                    warn!(session_id, error = %e, "Failed to send ping to client");
-                                    return;
-                                }
-                            }
-                            TungsteniteMessage::Pong(data) => {
-                                if let Err(e) = client_sink.send(AxumMessage::Pong(data)).await {
-                                    warn!(session_id, error = %e, "Failed to send pong to client");
-                                    return;
-                                }
-                            }
+                            TungsteniteMessage::Binary(data) => AxumMessage::Binary(data),
+                            TungsteniteMessage::Ping(data) => AxumMessage::Ping(data),
+                            TungsteniteMessage::Pong(data) => AxumMessage::Pong(data),
                             TungsteniteMessage::Close(_) => {
                                 let _ = client_sink.close().await;
                                 return;
                             }
-                            TungsteniteMessage::Frame(_) => {
-                                // Raw frames — ignore
-                            }
+                            // Raw frames — ignore
+                            TungsteniteMessage::Frame(_) => continue,
+                        };
+                        if let Err(e) = client_sink.send(axum_msg).await {
+                            warn!(session_id, error = %e, "Failed to send to client");
+                            return;
                         }
                     }
                     Some(Err(e)) => {

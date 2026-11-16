@@ -67,13 +67,14 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_ADMIN_LISTEN, help_heading = "Listeners")]
     admin_listen: SocketAddr,
 
-    /// The listeners, by name (gateway, ingestion, control, replication),
-    /// that take a caller's identity as told: the caller states its name in
-    /// the x-smg-principal metadata entry and nothing is verified, so
-    /// whoever reaches such a listener acts as any principal of its scopes.
-    /// For a loopback, or a mesh that verifies in front of the process; a
-    /// listener with a client CA takes none. A listener that is not named
-    /// refuses the calls that need a principal
+    /// The listeners, by name (gateway, control, replication, and ingestion
+    /// where --ingestion-listen makes it a listener), that take a caller's
+    /// identity as told: the caller states its name in the x-smg-principal
+    /// metadata entry and nothing is verified, so whoever reaches such a
+    /// listener acts as any principal of its scopes. For a loopback, or a
+    /// mesh that verifies in front of the process; a listener with a client
+    /// CA takes none. A listener that is not named refuses the calls that
+    /// need a principal
     #[arg(
         long,
         value_name = "LISTENER",

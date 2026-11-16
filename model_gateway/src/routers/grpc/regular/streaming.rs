@@ -85,7 +85,8 @@ use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
         assistant_choice, forces_tool_call, opening_choice, push_json, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
+        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHAT_BURST_MARK, CHAT_BURST_ROOM,
+        CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 #[cfg(test)]
@@ -3702,7 +3703,21 @@ impl<'a> ChatStream<'a> {
                         })
                         .await?;
                         match polled {
-                            Some(item) => item,
+                            Some(item) => {
+                                // A message ready with this much unsent
+                                // (`CHAT_BURST_MARK`) is a burst's, and its
+                                // frame is on the way to the flush bound: the
+                                // buffer takes that frame's room in one step
+                                // (`CHAT_BURST_ROOM`). Doubled up from the
+                                // stream's first room, it was copied at every
+                                // step.
+                                let unsent = self.sse_buffer.len();
+                                if unsent >= CHAT_BURST_MARK {
+                                    self.sse_buffer
+                                        .reserve(CHAT_BURST_ROOM.saturating_sub(unsent));
+                                }
+                                item
+                            }
                             None => {
                                 if let Some(frame) = waiting {
                                     self.tx

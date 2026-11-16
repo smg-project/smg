@@ -2284,12 +2284,21 @@ struct HalfOpen<'a> {
 impl Drop for HalfOpen<'_> {
     fn drop(&mut self) {
         if !self.returned {
-            // The open is unwinding, and a second panic let out here would
-            // end the process. So the walk runs under a catch: if it panics
-            // too (the host's clock again, a destructor's host call), it
-            // stops there and the open's panic is the one the host sees.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.bound.close()));
+            self.undo();
         }
+    }
+}
+
+impl HalfOpen<'_> {
+    /// The open is unwinding, and a second panic let out here would end the
+    /// process. So the walk runs contained: if it panics too (the host's
+    /// clock again, a destructor's host call), it stops there and the open's
+    /// panic is the one the host sees. Out of line: an open that returned
+    /// pays the guard's one test.
+    #[cold]
+    #[inline(never)]
+    fn undo(&self) {
+        framework::contained(|| self.bound.close());
     }
 }
 
