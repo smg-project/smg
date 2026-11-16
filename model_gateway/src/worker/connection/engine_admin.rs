@@ -74,7 +74,8 @@ fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
 }
 
 /// The worker's backend client for an admin op, refused when the backend
-/// answers none ([`zmq_admin_unsupported`]).
+/// answers none ([`zmq_admin_unsupported`]). `url` is how the refusal names
+/// the worker: the worker's own masked address.
 pub(in crate::worker) fn admin_backend_client(
     url: &str,
     operation: &str,
@@ -88,7 +89,8 @@ pub(in crate::worker) fn admin_backend_client(
 }
 
 /// Map a gRPC admin-op outcome (`success` flag plus message) to a
-/// [`WorkerResult`].
+/// [`WorkerResult`]. `url` is how a failure names the worker: the worker's
+/// own masked address.
 pub(in crate::worker) fn admin_grpc_result(
     url: &str,
     operation: &str,

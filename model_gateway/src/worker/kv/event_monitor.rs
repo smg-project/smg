@@ -41,8 +41,8 @@ use crate::{
     observability::metrics::Metrics,
     policies::utils::PeriodicTask,
     worker::{
-        identity::endpoint::Endpoint, load::monitor::WorkerMonitor, registry::WorkerRegistry,
-        ConnectionMode, Worker, UNKNOWN_MODEL_ID,
+        load::monitor::WorkerMonitor, registry::WorkerRegistry, ConnectionMode, Worker,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -158,6 +158,10 @@ struct WorkerSubscription {
     /// the object under the URL, and the records on the stream reach the
     /// one the task holds, so an add with another object restarts it.
     started_for: Weak<dyn Worker>,
+    /// The masked address of the worker the stream was started for, read
+    /// off the worker at the start: the lines of the stream's stop name the
+    /// worker by it, since they hold its address and no worker.
+    shown: String,
     /// Signals the subscription task to shut down gracefully. The task owns
     /// the worker's index state and takes its blocks out of the index on exit.
     shutdown_tx: oneshot::Sender<()>,
@@ -308,7 +312,7 @@ impl KvEventMonitor {
         // EngineCore returns `unimplemented` for SubscribeKvEvents — subscribing
         // there would just be a wasted handshake + round-trip per registration.
         if *worker.connection_mode() != ConnectionMode::Grpc {
-            debug!(worker_url = %Endpoint::redacted_str(&url), mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
+            debug!(worker_url = %worker.redacted_url(), mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
             return;
         }
 
@@ -318,7 +322,7 @@ impl KvEventMonitor {
             // longer holds gets no stream, and a stream another object has
             // under the URL is not stopped for it.
             if !self.still_held(worker) {
-                debug!(worker_url = %Endpoint::redacted_str(&url), "no KV event stream for a worker the registry no longer holds");
+                debug!(worker_url = %worker.redacted_url(), "no KV event stream for a worker the registry no longer holds");
                 return;
             }
             // A stream started for another object under this URL, which the
@@ -332,7 +336,7 @@ impl KvEventMonitor {
             if matches!(handles.get(&url), Some(Slot::Active(sub)) if !sub.streams_for(worker)) {
                 let stale = Self::begin_removal(&mut handles, &url);
                 drop(handles);
-                info!(worker_url = %Endpoint::redacted_str(&url), "Restarting KV event subscription for a re-registered worker");
+                info!(worker_url = %worker.redacted_url(), "Restarting KV event subscription for a re-registered worker");
                 if let Some(sub) = stale {
                     self.finish_removal(&url, sub).await;
                 }
@@ -340,7 +344,7 @@ impl KvEventMonitor {
             }
             let mut done = match handles.get(&url) {
                 Some(Slot::Active(_)) => {
-                    debug!(worker_url = %Endpoint::redacted_str(&url), "KV event subscription already active, skipping");
+                    debug!(worker_url = %worker.redacted_url(), "KV event subscription already active, skipping");
                     return;
                 }
                 Some(Slot::Removing(reservation)) => reservation.done.clone(),
@@ -406,17 +410,18 @@ impl KvEventMonitor {
                 // gauge by the seed.
                 Metrics::set_kv_block_size(&model_id, known.tokens);
             } else {
-                warn!(worker_url = %Endpoint::redacted_str(&url), "Worker reports kv_block_size=0, ignoring");
+                warn!(worker_url = %worker.redacted_url(), "Worker reports kv_block_size=0, ignoring");
             }
         }
 
         let started_for = Arc::downgrade(worker);
+        let shown = worker.redacted_url().to_string();
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
         let block_sizes = Arc::clone(&self.block_sizes);
 
         info!(
-            worker_url = %Endpoint::redacted_str(&url),
+            worker_url = %worker.redacted_url(),
             model_id = %model_id,
             ?kind,
             "Starting KV event subscription"
@@ -467,7 +472,7 @@ impl KvEventMonitor {
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "(non-string panic)".into());
                 error!(
-                    worker_url = %Endpoint::redacted_str(writer.url()),
+                    worker_url = %writer.redacted_url(),
                     panic.message = %msg,
                     ?kind,
                     "KV event subscription task panicked; this worker's stream \
@@ -499,6 +504,7 @@ impl KvEventMonitor {
                 model_id,
                 kind,
                 started_for,
+                shown,
                 shutdown_tx,
                 done,
             }),
@@ -580,7 +586,7 @@ impl KvEventMonitor {
                     .held_under(worker_url)
                     .is_some_and(|held| sub.streams_for(&held))
                 {
-                    debug!(worker_url = %Endpoint::redacted_str(worker_url), "KV event stream left to the worker the registry holds under the URL");
+                    debug!(worker_url = %sub.shown, "KV event stream left to the worker the registry holds under the URL");
                     return;
                 }
             }
@@ -608,7 +614,7 @@ impl KvEventMonitor {
         let stale = {
             let mut handles = self.worker_handles.lock().await;
             if !self.still_held(worker) {
-                debug!(worker_url = %Endpoint::redacted_str(url), "no KV event stream to end for a worker the registry no longer holds");
+                debug!(worker_url = %worker.redacted_url(), "no KV event stream to end for a worker the registry no longer holds");
                 return;
             }
             if !matches!(handles.get(url), Some(Slot::Active(sub)) if !sub.streams_for(worker)) {
@@ -617,7 +623,7 @@ impl KvEventMonitor {
             Self::begin_removal(&mut handles, url)
         };
         if let Some(sub) = stale {
-            info!(worker_url = %Endpoint::redacted_str(url), "Ending the KV event subscription of a replaced worker: its successor streams nothing");
+            info!(worker_url = %worker.redacted_url(), "Ending the KV event subscription of a replaced worker: its successor streams nothing");
             self.finish_removal(url, sub).await;
         }
     }
@@ -652,7 +658,7 @@ impl KvEventMonitor {
     /// Outside the lock: the taken subscription told to stop and awaited to
     /// its end; the gauge lowered while the slot still holds its reservation.
     async fn finish_removal(&self, worker_url: &str, sub: WorkerSubscription) {
-        info!(worker_url = %Endpoint::redacted_str(worker_url), "Stopping KV event subscription");
+        info!(worker_url = %sub.shown, "Stopping KV event subscription");
         // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
         let _ = sub.shutdown_tx.send(());
         // The task lifts the reservation and drops the model's last index on
@@ -664,7 +670,7 @@ impl KvEventMonitor {
         let id = sub.id;
         if let Err(e) = sub.handle.await {
             error!(
-                worker_url = %Endpoint::redacted_str(worker_url),
+                worker_url = %sub.shown,
                 error = %e,
                 "KV event subscription task failed"
             );
@@ -707,11 +713,11 @@ impl KvEventMonitor {
                 "Stopping all KV event subscriptions"
             );
             for (url, sub) in subscriptions {
-                debug!(worker_url = %Endpoint::redacted_str(&url), "Stopping KV event subscription");
+                debug!(worker_url = %sub.shown, "Stopping KV event subscription");
                 let _ = sub.shutdown_tx.send(());
                 if let Err(e) = sub.handle.await {
                     error!(
-                        worker_url = %Endpoint::redacted_str(&url),
+                        worker_url = %sub.shown,
                         error = %e,
                         "KV event subscription task failed"
                     );
@@ -1378,6 +1384,66 @@ mod tests {
             "KV event stream left to the worker the registry holds under the URL"
         ));
         monitor.stop().await;
+    }
+
+    /// The lines of a stream's stop name the worker the stream was started
+    /// for by its own masked address, read off the worker at the start: a
+    /// token before a host of digits is a userinfo there, where the address
+    /// string alone reads as a host and its rank. A stream left to the
+    /// worker the registry holds, a removal's stop and the monitor's own.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streams_stop_names_the_worker_by_its_own_masked_address() {
+        let monitor = Arc::new(KvEventMonitor::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        monitor.set_worker_registry(&registry);
+        let removed = refusing_grpc_worker_at("grpc://s3cret-token@2130706433");
+        let kept = refusing_grpc_worker_at("grpc://s3cret-token@2130706434");
+        let id = registry
+            .register(Arc::clone(&removed))
+            .expect("the first registration");
+        registry
+            .register(Arc::clone(&kept))
+            .expect("the second registration");
+        for worker in [&removed, &kept] {
+            monitor
+                .on_worker_added(worker, SubscriptionKind::Loads)
+                .await;
+        }
+
+        // The registry still holds the worker: its stream is left.
+        monitor.on_worker_removed(removed.url()).await;
+        // The worker left the registry: its stream is stopped.
+        assert!(registry.remove(&id).is_some());
+        monitor.on_worker_removed(removed.url()).await;
+        // The monitor stops the other's stream.
+        monitor.stop().await;
+
+        logs_assert(|lines: &[&str]| {
+            for (message, named) in [
+                (
+                    "KV event stream left to the worker the registry holds under the URL",
+                    "worker_url=grpc://***@2130706433",
+                ),
+                (
+                    "Stopping KV event subscription",
+                    "worker_url=grpc://***@2130706433",
+                ),
+                (
+                    "Stopping KV event subscription",
+                    "worker_url=grpc://***@2130706434",
+                ),
+            ] {
+                let mut said = lines.iter().filter(|line| line.contains(message));
+                if !said.clone().any(|line| line.contains(named)) {
+                    return Err(format!("no line says '{message}' with {named}"));
+                }
+                if let Some(line) = said.find(|line| line.contains("s3cret")) {
+                    return Err(format!("a line carries the token: {line}"));
+                }
+            }
+            Ok(())
+        });
     }
 
     /// The registry holds a new object whose add has not run yet: the

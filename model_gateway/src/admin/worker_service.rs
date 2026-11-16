@@ -595,7 +595,7 @@ impl WorkerService {
                 the gateway's key ends at its auth middleware, so requests reach this worker \
                 with no credential. If the worker requires a key (the gateway's or its own), \
                 register it with that key explicitly.",
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
         }
 

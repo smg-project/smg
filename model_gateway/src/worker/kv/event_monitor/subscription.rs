@@ -22,7 +22,6 @@ use crate::{
     routers::grpc::backend_client::BackendClient,
     worker::{
         health::liveness,
-        identity::endpoint::Endpoint,
         kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
         load::monitor::WorkerMonitor,
         Worker,
@@ -397,7 +396,7 @@ impl KvEventMonitor {
                 Ok(worker_id) => Some((indexer, worker_id)),
                 Err(e) => {
                     error!(
-                        worker_url = %Endpoint::redacted_str(&worker_url),
+                        worker_url = %worker.redacted_url(),
                         error = %e,
                         "Failed to intern worker; KV events from this worker will \
                          not feed cache-aware routing"
@@ -479,7 +478,7 @@ impl KvEventMonitor {
                 // be unreachable. Retry defensively rather than exiting and
                 // leaving a stale entry in worker_handles.
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %sub.worker.redacted_url(),
                     delay_ms = backoff.delay_ms(),
                     "Worker has no backend client yet, retrying"
                 );
@@ -487,7 +486,7 @@ impl KvEventMonitor {
             }
             Err(e) => {
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %sub.worker.redacted_url(),
                     error = %e,
                     delay_ms = backoff.delay_ms(),
                     "Failed to get backend client, retrying"
@@ -509,7 +508,7 @@ impl KvEventMonitor {
         let stream = match subscribed {
             Subscribed::Stream(stream) => {
                 info!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %sub.worker.redacted_url(),
                     start_seq,
                     "KV event stream connected"
                 );
@@ -538,7 +537,7 @@ impl KvEventMonitor {
                         // publishes; only when none does is it routed on the
                         // approximate prefix tree.
                         Role::Index { .. } => warn!(
-                            worker_url = %Endpoint::redacted_str(worker_url),
+                            worker_url = %sub.worker.redacted_url(),
                             model_id = sub.model_id,
                             reason = e.message(),
                             "Backend does not implement SubscribeKvEvents, \
@@ -549,7 +548,7 @@ impl KvEventMonitor {
                              events"
                         ),
                         Role::Loads => info!(
-                            worker_url = %Endpoint::redacted_str(worker_url),
+                            worker_url = %sub.worker.redacted_url(),
                             "Backend does not implement SubscribeKvEvents, \
                              disabling the load stream for this worker; its load \
                              stays polled"
@@ -559,7 +558,7 @@ impl KvEventMonitor {
                 }
                 if e.code() == tonic::Code::OutOfRange {
                     warn!(
-                        worker_url = %Endpoint::redacted_str(worker_url),
+                        worker_url = %sub.worker.redacted_url(),
                         start_seq,
                         "KV event replay cursor expired; clearing worker state and requesting a current snapshot"
                     );
@@ -582,7 +581,7 @@ impl KvEventMonitor {
                     liveness::on_contact_failed(sub.worker, "kv subscribe");
                 }
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %sub.worker.redacted_url(),
                     error = %e,
                     delay_ms = backoff.delay_ms(),
                     "Failed to subscribe to KV events, retrying"
@@ -601,7 +600,7 @@ impl KvEventMonitor {
         }
         if state.abandon_snapshot() {
             warn!(
-                worker_url = %Endpoint::redacted_str(worker_url),
+                worker_url = %sub.worker.redacted_url(),
                 "KV event stream ended during a relay snapshot; the next subscription \
                  starts over from zero"
             );
@@ -609,7 +608,7 @@ impl KvEventMonitor {
         match result {
             StreamResult::Ended => {
                 info!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %sub.worker.redacted_url(),
                     resume_from = state.resume_sequence(),
                     delay_ms = backoff.delay_ms(),
                     "KV event stream ended, reconnecting"
@@ -622,7 +621,7 @@ impl KvEventMonitor {
                 Metrics::record_kv_event_stream_error(worker_url, error_class(e.code()));
                 if e.code() == tonic::Code::DataLoss {
                     warn!(
-                        worker_url = %Endpoint::redacted_str(worker_url),
+                        worker_url = %sub.worker.redacted_url(),
                         error = %e,
                         resume_from = state.resume_sequence(),
                         "KV event subscriber fell behind; clearing worker state and requesting a current snapshot"
@@ -646,7 +645,7 @@ impl KvEventMonitor {
                     liveness::on_contact_failed(sub.worker, "kv stream");
                 }
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %sub.worker.redacted_url(),
                     error = %e,
                     resume_from = state.resume_sequence(),
                     delay_ms = backoff.delay_ms(),
@@ -656,7 +655,7 @@ impl KvEventMonitor {
             }
             StreamResult::GapDetected { expected, received } => {
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %sub.worker.redacted_url(),
                     expected,
                     received,
                     "Sequence gap detected, reconnecting for replay from seq {expected}"
@@ -714,7 +713,7 @@ impl KvEventMonitor {
                 };
                 tokio::select! {
                     result = Self::process_stream(
-                        stream, sub.worker_url, worker_id, indexer, state, on_batch, on_load,
+                        stream, sub.worker.as_ref(), worker_id, indexer, state, on_batch, on_load,
                     ) => result,
                     _ = &mut *shutdown_rx => return Drained::Shutdown,
                 }
@@ -765,7 +764,7 @@ impl KvEventMonitor {
     /// Process batches from a single stream connection.
     async fn process_stream(
         mut stream: tonic::Streaming<KvEventBatch>,
-        worker_url: &str,
+        worker: &dyn Worker,
         worker_id: u32,
         indexer: &KvIndex,
         state: &mut WorkerStreamState,
@@ -774,6 +773,7 @@ impl KvEventMonitor {
     ) -> StreamResult {
         use tokio_stream::StreamExt;
 
+        let worker_url = worker.url();
         while let Some(result) = stream.next().await {
             let batch = match result {
                 Ok(batch) => batch,
@@ -787,7 +787,7 @@ impl KvEventMonitor {
                 }
             }
             if let BatchOutcome::Gap { expected, received } =
-                Self::admit_batch(&batch, worker_url, worker_id, indexer, state, &mut on_batch)
+                Self::admit_batch(&batch, worker, worker_id, indexer, state, &mut on_batch)
             {
                 return StreamResult::GapDetected { expected, received };
             }
@@ -1846,6 +1846,38 @@ mod tests {
             gaps.iter().zip(&delays).any(|(gap, delay)| gap < delay),
             "no connect came before its scheduled delay: gaps {gaps:?}, delays {delays:?}"
         );
+    }
+
+    /// A line of a worker's subscription names the worker by its own masked
+    /// address: a token before a host of digits is a userinfo there, where
+    /// the address string alone reads as a host and its rank.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_subscription_line_names_the_worker_by_its_own_masked_address() {
+        // An HTTP worker has no backend client, so the round ends at its
+        // first line.
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://s3cret-token@2130706433").build());
+        let sub = WorkerSubscription {
+            worker: &worker,
+            worker_url: worker.url(),
+            role: Role::Loads,
+            model_id: "m",
+            load_sink: None,
+            wake: None,
+        };
+        let mut state = WorkerStreamState::default();
+        let mut backoff = Backoff::new();
+        let (_shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+        let round =
+            KvEventMonitor::subscription_round(&sub, &mut state, &mut backoff, &mut shutdown_rx)
+                .await;
+
+        assert!(matches!(round, Round::Backoff));
+        assert!(logs_contain("Worker has no backend client yet, retrying"));
+        assert!(logs_contain("worker_url=http://***@2130706433"));
+        assert!(!logs_contain("s3cret"));
     }
 
     /// A backend that serves no KV events (an engine whose publisher is off)

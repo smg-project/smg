@@ -196,8 +196,16 @@ impl Endpoint {
     /// stays put — it is split off as userinfo further down, not treated as a
     /// rank marker.
     pub fn parse_with_rank(input: &str) -> Result<(Self, Option<usize>), EndpointError> {
-        let trimmed = input.trim();
-        let (body, rank) = split_rank(trimmed);
+        let (body, rank) = split_rank(input.trim());
+        Ok((Self::parse_unranked(body)?, rank))
+    }
+
+    /// Parse a string as one address and read no rank out of it: a trailing
+    /// `@<digits>` is the authority's or the path's own text, as a client
+    /// that dials the string reads it. An address a worker registered
+    /// without the workflow expanding it into ranks is read this way, and so
+    /// is a rank-expanded worker's base.
+    pub(crate) fn parse_unranked(body: &str) -> Result<Self, EndpointError> {
         let (scheme, rest) = match Scheme::split_from(body) {
             Some((scheme, rest)) => (Some(scheme), rest),
             None => (None, body),
@@ -207,16 +215,13 @@ impl Endpoint {
         }
 
         if scheme.is_some_and(Scheme::is_ipc) {
-            return Ok((
-                Endpoint {
-                    scheme,
-                    userinfo: None,
-                    host: Host::IpcPath(rest.to_string()),
-                    port: None,
-                    path: None,
-                },
-                rank,
-            ));
+            return Ok(Endpoint {
+                scheme,
+                userinfo: None,
+                host: Host::IpcPath(rest.to_string()),
+                port: None,
+                path: None,
+            });
         }
 
         let (authority, path) = split_path(rest);
@@ -231,16 +236,13 @@ impl Endpoint {
             return Err(EndpointError::Empty);
         }
         let (host, port) = split_host_port(hostport)?;
-        Ok((
-            Endpoint {
-                scheme,
-                userinfo,
-                host,
-                port,
-                path,
-            },
-            rank,
-        ))
+        Ok(Endpoint {
+            scheme,
+            userinfo,
+            host,
+            port,
+            path,
+        })
     }
 
     pub fn scheme(&self) -> Option<Scheme> {
@@ -339,31 +341,45 @@ impl Endpoint {
         .render()
     }
 
-    /// `redacted` for an address string, as a log line writes a worker's
-    /// address: parsed with the workflow's `@rank` suffix a DP-aware worker's
-    /// address carries and masked, the rank written back after the masked
-    /// address; one the parser refuses (no registered address is) is written
-    /// as a marker, never raw. The one rendering every log line, refusal
-    /// message and start-up line of the gateway writes a worker's address
-    /// through.
+    /// `redacted` for an address string, as a line that holds only the
+    /// string writes a worker's address: parsed with the workflow's `@rank`
+    /// suffix a DP-aware worker's address carries and masked, the rank
+    /// written back after the masked address; one the parser refuses (no
+    /// registered address is) is written as a marker, never raw. A line that
+    /// holds the worker writes the worker's own masked address
+    /// ([`Self::redacted_worker_url`]), and this form's one wrong reading is
+    /// why: `http://token@8080` is a userinfo and a host of digits to a
+    /// client, and reads here as the host `token` and its rank, written
+    /// whole. The worker URL door refuses such an address at registration.
+    ///
+    /// A string alone cannot say whether digits behind its last `@` are a
+    /// rank or the end of a token, so none are written back from behind a
+    /// query or a fragment: `http://w:8000?token=abc@42` reads
+    /// `http://w:8000`. The rank of a rank-expanded worker whose base
+    /// carries a query is shown by the worker's own masked address
+    /// ([`Self::redacted_worker_url`]), which reads the worker's rank field.
     pub fn redacted_str(input: &str) -> String {
         match Self::parse_with_rank(input) {
-            Ok((endpoint, Some(rank))) => format!("{}@{rank}", endpoint.redacted()),
-            Ok((endpoint, None)) => endpoint.redacted(),
+            Ok((endpoint, Some(rank))) if !endpoint.has_query_or_fragment() => {
+                format!("{}@{rank}", endpoint.redacted())
+            }
+            Ok((endpoint, _)) => endpoint.redacted(),
             Err(_) => "<unparsable address>".to_string(),
         }
     }
 
-    /// The address as a request's success path shows it: the routed-worker
-    /// response header, the cache-trace header and the request-sent event.
-    /// An address without userinfo, query or fragment is the registered
-    /// string, byte for byte, so the header a client matches against the
-    /// address it registered does not change; one with userinfo is
-    /// [`Self::redacted_str`]'s form (the userinfo masked whole, a DP rank
-    /// kept), one with a query or fragment is cut at its path like it (they
-    /// may carry a token), and so is one the parser refuses. A worker
-    /// computes it once at registration (`WorkerMetadata::redacted_url`);
-    /// nothing on a request path parses.
+    /// The success-path form of an address that is a string and nothing
+    /// more. An address without userinfo, query or fragment is the string,
+    /// byte for byte; one with userinfo is [`Self::redacted_str`]'s form
+    /// (the userinfo masked whole, a DP rank kept); one with a query or a
+    /// fragment is cut at its path like it (they may carry a token) and
+    /// keeps no rank from behind them; so is one the parser refuses.
+    ///
+    /// No worker's own address is made here: a worker makes its own once at
+    /// registration from its fields ([`Self::redacted_worker_url`], kept as
+    /// `WorkerMetadata::redacted_url`), and the routed-worker response
+    /// header, the cache-trace header and the request-sent event show that.
+    /// Nothing on a request path parses.
     pub fn redacted_url(input: &str) -> String {
         match Self::parse_with_rank(input) {
             Ok((endpoint, _)) if endpoint.userinfo.is_none() && !input.contains(['?', '#']) => {
@@ -371,6 +387,48 @@ impl Endpoint {
             }
             _ => Self::redacted_str(input),
         }
+    }
+
+    /// A worker's address in [`Self::redacted_url`]'s form, made from the
+    /// worker's own fields and never read back out of its string: the base
+    /// masked with no rank read, then the rank the registration assigned.
+    ///
+    /// The registration writes a rank-expanded worker's address as
+    /// `{base}@{rank}` after the whole base, query included, and keeps the
+    /// base and the rank beside it. A worker it did not expand has neither,
+    /// and digits at the end of its address are its own text: a host of
+    /// digits behind a userinfo (`http://token@8080` reads `http://***@8080`)
+    /// or the end of a query, which is cut with it.
+    pub fn redacted_worker_url(
+        url: &str,
+        dp_base_url: Option<&str>,
+        dp_rank: Option<usize>,
+    ) -> String {
+        match (dp_base_url, dp_rank) {
+            (Some(base), Some(rank)) => format!("{}@{rank}", Self::redacted_base_url(base)),
+            _ => Self::redacted_base_url(url),
+        }
+    }
+
+    /// [`Self::redacted_url`] for a worker's base, the address its routes join
+    /// to, or for any address that carries no rank. None is read out of it,
+    /// so digits behind its last `@` are its own text. A line that names a
+    /// worker by its base masks it here.
+    pub fn redacted_base_url(base: &str) -> String {
+        match Self::parse_unranked(base.trim()) {
+            Ok(endpoint) if endpoint.userinfo.is_none() && !base.contains(['?', '#']) => {
+                base.to_string()
+            }
+            Ok(endpoint) => endpoint.redacted(),
+            Err(_) => "<unparsable address>".to_string(),
+        }
+    }
+
+    /// Whether a query or a fragment follows the authority.
+    fn has_query_or_fragment(&self) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|path| path.contains(['?', '#']))
     }
 
     /// Whether the address carries userinfo: a username, a password or a
@@ -1055,5 +1113,79 @@ mod tests {
             Endpoint::redacted_url("not an address"),
             "<unparsable address>"
         );
+    }
+
+    /// Digits behind the last `@` of a query or a fragment are a token's own
+    /// text: both string forms cut them with the query or the fragment and
+    /// write no rank back. Behind an authority or a path they are still the
+    /// workflow's rank, and the identity key reads as it did.
+    #[test]
+    fn no_rank_is_written_back_from_behind_a_query_or_a_fragment() {
+        for (spelling, masked) in [
+            ("http://w:8000?token=@123456", "http://w:8000"),
+            ("http://w:8000?token=abc@42", "http://w:8000"),
+            ("http://w:8000/v1?key=s3cr3t@99", "http://w:8000/v1"),
+            ("http://w:8000#frag@7", "http://w:8000"),
+            ("http://user:pw@w:8000?token=abc@42", "http://***@w:8000"),
+            ("grpc://w:8000?token=abc@42", "grpc://w:8000"),
+            ("w:8000?token=abc@42", "w:8000"),
+        ] {
+            assert_eq!(Endpoint::redacted_str(spelling), masked, "{spelling}");
+            assert_eq!(Endpoint::redacted_url(spelling), masked, "{spelling}");
+        }
+        for (spelling, masked) in [
+            ("grpc://w:8000@3", "grpc://w:8000@3"),
+            ("http://w:8000/v1@3", "http://w:8000/v1@3"),
+            ("http://user:pw@w:8000@3", "http://***@w:8000@3"),
+            ("ipc:///tmp/engine.sock@1", "ipc:///tmp/engine.sock@1"),
+        ] {
+            assert_eq!(Endpoint::redacted_str(spelling), masked, "{spelling}");
+            assert_eq!(Endpoint::redacted_url(spelling), masked, "{spelling}");
+        }
+        // A rank-expanded worker is found under its base's key, query and all.
+        assert_eq!(
+            endpoint_key("http://w:8000?token=abc@0").unwrap(),
+            endpoint_key("http://w:8000?token=abc").unwrap()
+        );
+    }
+
+    /// A worker's masked address is made from the worker's own fields: the
+    /// base masked with no rank read, then the rank the registration
+    /// assigned. A worker it did not expand has no rank, whatever its
+    /// address ends in.
+    #[test]
+    fn a_workers_masked_address_is_made_from_its_own_fields() {
+        for (base, rank, masked) in [
+            ("http://w:8000", 2, "http://w:8000@2"),
+            ("http://Worker:8000/", 2, "http://Worker:8000/@2"),
+            ("http://w:8000?token=abc", 0, "http://w:8000@0"),
+            ("http://w:8000?token=abc", 1, "http://w:8000@1"),
+            ("http://w:8000?token=@123456", 3, "http://w:8000@3"),
+            ("http://user:pw@w:8000", 3, "http://***@w:8000@3"),
+            ("ipc:///tmp/engine.sock", 1, "ipc:///tmp/engine.sock@1"),
+        ] {
+            let url = format!("{base}@{rank}");
+            assert_eq!(
+                Endpoint::redacted_worker_url(&url, Some(base), Some(rank)),
+                masked,
+                "{url}"
+            );
+        }
+        for (url, masked) in [
+            ("http://w:8000", "http://w:8000"),
+            ("http://Worker:8000/", "http://Worker:8000/"),
+            ("http://w:8000?token=abc@42", "http://w:8000"),
+            ("http://w:8000?token=@123456", "http://w:8000"),
+            ("http://w:8000#frag@7", "http://w:8000"),
+            ("http://token@8080", "http://***@8080"),
+            ("http://user:8080@2130706433", "http://***@2130706433"),
+            ("not an address", "<unparsable address>"),
+        ] {
+            assert_eq!(
+                Endpoint::redacted_worker_url(url, None, None),
+                masked,
+                "{url}"
+            );
+        }
     }
 }

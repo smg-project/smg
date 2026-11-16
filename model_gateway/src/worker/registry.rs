@@ -2902,7 +2902,7 @@ impl WorkerRegistry {
         // this guard also covers peers running older builds.
         if ConnectionMode::from_url(&state.url) == Some(ConnectionMode::Zmq) {
             tracing::debug!(
-                url = %Endpoint::redacted_str(&state.url),
+                url = %Self::shown_state(state),
                 "Ignoring mesh state for host-local ZMQ worker"
             );
             return;
@@ -2924,7 +2924,7 @@ impl WorkerRegistry {
             // local health state machine is the single writer.
             if self.origin_of(&existing_id) == Some(WorkerOrigin::Local) {
                 tracing::debug!(
-                    url = %Endpoint::redacted_str(&state.url),
+                    url = %self.shown_held(&existing_id, state),
                     "Ignoring mesh state for locally-owned worker"
                 );
                 return;
@@ -2950,6 +2950,7 @@ impl WorkerRegistry {
                     PublishedSpec::Spec(spec) => {
                         let replacement: Arc<dyn Worker> =
                             Arc::new(Self::import_from(state, Some(*spec)));
+                        let shown = replacement.redacted_url().to_string();
                         let record = ImportRecord {
                             version: state.version,
                             from_spec: true,
@@ -2957,7 +2958,7 @@ impl WorkerRegistry {
                         if self.replace_inner(&existing_id, replacement, None, None, Some(record)) {
                             tracing::info!(
                                 worker_id = %existing_id.as_str(),
-                                url = %Endpoint::redacted_str(&state.url),
+                                url = %shown,
                                 model = %state.model_id,
                                 version = state.version,
                                 "Rebuilt mesh-synced worker from its owner's replacement"
@@ -2979,7 +2980,7 @@ impl WorkerRegistry {
                     PublishedSpec::Undecodable(err) => {
                         tracing::warn!(
                             worker_id = %existing_id.as_str(),
-                            url = %Endpoint::redacted_str(&state.url),
+                            url = %self.shown_held(&existing_id, state),
                             version = state.version,
                             %err,
                             "the owner's replacement of a mesh-synced worker carries a spec this node cannot decode"
@@ -3002,7 +3003,7 @@ impl WorkerRegistry {
             let health = state.health;
             let outcome = self.transition_under_lock(&existing_id, None, |existing| {
                 if self.origin_of(&existing_id) == Some(WorkerOrigin::Local) {
-                    return ((), None);
+                    return (Arc::clone(existing), None);
                 }
                 let target = match (health, existing.status()) {
                     (true, WorkerStatus::Pending | WorkerStatus::NotReady) => {
@@ -3011,11 +3012,11 @@ impl WorkerRegistry {
                     (false, WorkerStatus::Ready) => Some(WorkerStatus::NotReady),
                     _ => None,
                 };
-                ((), target)
+                (Arc::clone(existing), target)
             });
-            if outcome.is_some() {
+            if let Some((existing, _)) = outcome {
                 tracing::debug!(
-                    url = %Endpoint::redacted_str(&state.url),
+                    url = %existing.redacted_url(),
                     healthy = state.health,
                     "Updated health for existing mesh-synced worker"
                 );
@@ -3033,8 +3034,10 @@ impl WorkerRegistry {
             PublishedSpec::Spec(spec) => Some(*spec),
             PublishedSpec::Absent => None,
             PublishedSpec::Undecodable(err) => {
+                // The minimal import built below carries this masked
+                // address: one address, no rank read out of it.
                 tracing::warn!(
-                    url = %Endpoint::redacted_str(&state.url),
+                    url = %Endpoint::redacted_base_url(&state.url),
                     %err,
                     "undecodable WorkerSpec in mesh state; importing minimal worker"
                 );
@@ -3059,6 +3062,9 @@ impl WorkerRegistry {
         // otherwise fall back to the minimal builder.
         let spec_applied = spec.is_some();
         let worker: Arc<dyn Worker> = Arc::new(Self::import_from(state, spec));
+        // The lines below name the import by its own masked address, read
+        // here before the registry takes the worker.
+        let shown = worker.redacted_url().to_string();
 
         // A `Mesh` origin keeps the outbound sync from re-publishing the
         // imported state (which would version-bump the CRDT in a loop),
@@ -3074,7 +3080,7 @@ impl WorkerRegistry {
             self.import_records.insert(id.clone(), record);
             tracing::info!(
                 worker_id = %id.as_str(),
-                url = %Endpoint::redacted_str(&state.url),
+                url = %shown,
                 model = %state.model_id,
                 healthy = state.health,
                 spec_applied,
@@ -3106,6 +3112,7 @@ impl WorkerRegistry {
     /// (`import_rebuild_wanted` keeps an import built from a spec instead).
     fn rebuild_minimal_import(&self, import_id: &WorkerId, state: &smg_mesh::WorkerState) {
         let replacement: Arc<dyn Worker> = Arc::new(Self::import_from(state, None));
+        let shown = replacement.redacted_url().to_string();
         let record = ImportRecord {
             version: state.version,
             from_spec: false,
@@ -3113,7 +3120,7 @@ impl WorkerRegistry {
         if self.replace_inner(import_id, replacement, None, None, Some(record)) {
             tracing::info!(
                 worker_id = %import_id.as_str(),
-                url = %Endpoint::redacted_str(&state.url),
+                url = %shown,
                 model = %state.model_id,
                 version = state.version,
                 "Rebuilt the minimal mesh-synced worker from its owner's replacement"
@@ -3198,6 +3205,31 @@ impl WorkerRegistry {
             });
     }
 
+    /// The masked address a line names a peer's `state` by where no worker
+    /// stands for it: the one the state's import carries. A state whose spec
+    /// decodes is masked from the spec's own fields, a rank keeping its rank;
+    /// any other is masked as one address with no rank read, as the minimal
+    /// import is. The address string alone would read a token before a host
+    /// of digits as a host and its rank.
+    pub(crate) fn shown_state(state: &smg_mesh::WorkerState) -> String {
+        match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
+            Ok(spec) => {
+                Endpoint::redacted_worker_url(&spec.url, spec.dp_base_url.as_deref(), spec.dp_rank)
+            }
+            Err(_) => Endpoint::redacted_base_url(&state.url),
+        }
+    }
+
+    /// How a line names the worker held under `id` for a peer's `state`: by
+    /// the worker's own masked address, and by the state's when the worker
+    /// has left the registry.
+    fn shown_held(&self, id: &WorkerId, state: &smg_mesh::WorkerState) -> String {
+        self.get(id).map_or_else(
+            || Self::shown_state(state),
+            |worker| worker.redacted_url().to_string(),
+        )
+    }
+
     /// The `WorkerSpec` a published state carries, decoded, under the
     /// transport gate it declares. The caller says what it does without one:
     /// the import path builds the minimal worker, the rebuild keeps an
@@ -3212,7 +3244,11 @@ impl WorkerRegistry {
                 // the URL scheme — not routable from this node.
                 if spec.connection_mode == ConnectionMode::Zmq {
                     tracing::debug!(
-                        url = %Endpoint::redacted_str(&state.url),
+                        url = %Endpoint::redacted_worker_url(
+                            &spec.url,
+                            spec.dp_base_url.as_deref(),
+                            spec.dp_rank,
+                        ),
                         "Ignoring mesh state for host-local ZMQ worker"
                     );
                     return PublishedSpec::HostLocal;

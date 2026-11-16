@@ -32,7 +32,7 @@ pub async fn get_dp_info(
     let dp_size = routing_dp_size(info.dp_size, info.attn_dp_size).map_err(|error| {
         format!(
             "Invalid DP metadata from {}: {error}",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_base_url(url)
         )
     })?;
 
@@ -133,14 +133,14 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
         if !app_context.router_config.dp_aware {
             debug!(
                 "Worker {} is not DP-aware, skipping DP discovery",
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
             return Ok(StepResult::Success);
         }
 
         debug!(
             "Discovering DP info for {} (DP-aware)",
-            Endpoint::redacted_str(&config.url)
+            Endpoint::redacted_base_url(&config.url)
         );
 
         let dp_info = match context.data.connection_mode {
@@ -155,7 +155,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                         warn!(
                             "No DP info for {} ({e}); registering as a single \
                          non-DP worker",
-                            Endpoint::redacted_str(&config.url)
+                            Endpoint::redacted_base_url(&config.url)
                         );
                         return Ok(StepResult::Success);
                     }
@@ -174,7 +174,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                     warn!(
                         "DP discovery is not supported for {} HTTP workers ({}), skipping",
                         runtime.unwrap_or("unknown"),
-                        Endpoint::redacted_str(&config.url)
+                        Endpoint::redacted_base_url(&config.url)
                     );
                     return Ok(StepResult::Success);
                 }
@@ -191,7 +191,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
         debug!(
             "Discovered DP size {} for {} (model: {})",
             dp_info.dp_size,
-            Endpoint::redacted_str(&config.url),
+            Endpoint::redacted_base_url(&config.url),
             dp_info.model_id
         );
 

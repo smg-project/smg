@@ -88,6 +88,18 @@ pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<A
         .collect()
 }
 
+/// How a line names the address a request gave once the registry has found
+/// its workers. One worker found is named by its own masked address, which
+/// reads no rank out of a string; several are the registrations the address
+/// selects as a string, and none is no worker at all: the address is masked
+/// as a string there.
+fn shown_found(url: &str, found: &[Arc<dyn Worker>]) -> String {
+    match found {
+        [one] => one.redacted_url().to_string(),
+        _ => Endpoint::redacted_str(url),
+    }
+}
+
 /// Create a worker removal workflow definition.
 ///
 /// DAG structure:
@@ -445,6 +457,32 @@ mod dp_removal_tests {
             vec!["ipc:///tmp/worker@socket"]
         );
     }
+
+    /// A line names the one worker an address found by that worker's own
+    /// masked address: a token before a host of digits is a userinfo there,
+    /// where the address string alone reads as a host and its rank. A group
+    /// of ranks, and an address that found nothing, are named by the address
+    /// masked as a string.
+    #[test]
+    fn a_found_worker_is_named_by_its_own_masked_address() {
+        let registry = WorkerRegistry::new();
+        let token = "http://s3cret-token@2130706433";
+        register(&registry, token, None);
+        let found = find_workers_by_url(&registry, token);
+        assert_eq!(found.len(), 1);
+        assert_eq!(shown_found(token, &found), "http://***@2130706433");
+
+        let base = "http://user:pass@worker:3000";
+        register(&registry, base, Some(0));
+        register(&registry, base, Some(1));
+        let group = find_workers_by_url(&registry, base);
+        assert_eq!(group.len(), 2);
+        assert_eq!(shown_found(base, &group), "http://***@worker:3000");
+        assert_eq!(
+            shown_found("http://user:pass@gone:3000", &[]),
+            "http://***@gone:3000"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +570,68 @@ mod tests {
                 "the model's tokenizer after removing {url}"
             );
         }
+    }
+
+    /// The find steps' lines name the worker found by its own masked
+    /// address, and no step of the removal writes its address otherwise: a
+    /// token before a host of digits is a userinfo there, where the address
+    /// string alone reads as a host and its rank. The update's find step,
+    /// then the removal workflow as a whole, its steps run in the
+    /// definition's order.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn the_steps_name_the_worker_found_by_its_own_masked_address() {
+        let token = "http://s3cret-token@2130706433";
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(token)
+                .model(ModelCard::new("m"))
+                .build(),
+        );
+        app_context.worker_registry.register(worker).unwrap();
+
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(serde_json::json!({"labels": {"tier": "a"}}))
+                .expect("an update");
+        let mut found = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_worker_update_workflow_data(token.to_string(), update, Arc::clone(&app_context)),
+        );
+        FindWorkerToUpdateStep.execute(&mut found).await.unwrap();
+
+        let workflow = create_worker_removal_workflow();
+        let mut removal = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_worker_removal_workflow_data(token.to_string(), None, Arc::clone(&app_context)),
+        );
+        for step in &workflow.steps {
+            step.executor.execute(&mut removal).await.unwrap();
+        }
+
+        assert!(
+            app_context.worker_registry.get_by_url(token).is_none(),
+            "the removal ran"
+        );
+        logs_assert(|lines: &[&str]| {
+            for wanted in [
+                "Found 1 worker(s) to update for http://***@2130706433",
+                "Found 1 worker(s) to remove for http://***@2130706433",
+            ] {
+                if !lines.iter().any(|line| line.contains(wanted)) {
+                    return Err(format!("no line reads: {wanted}"));
+                }
+            }
+            match lines.iter().find(|line| line.contains("s3cret")) {
+                Some(line) => Err(format!("a line carries the token: {line}")),
+                None => Ok(()),
+            }
+        });
     }
 
     #[test]

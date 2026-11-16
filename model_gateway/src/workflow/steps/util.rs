@@ -67,11 +67,11 @@ fn http_health_url(url: &str) -> Result<String, String> {
         // carries.
         Some("grpc") | Some("grpcs") => Err(format!(
             "HTTP health check does not accept gRPC URL scheme: {}",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_base_url(url)
         )),
         Some(scheme) => Err(format!(
             "HTTP health check does not accept URL scheme '{scheme}': {}",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_base_url(url)
         )),
         None => Ok(format!("http://{}/health", url.trim_end_matches('/'))),
     }
@@ -82,11 +82,11 @@ fn grpc_reachable_url(url: &str) -> Result<String, String> {
         Some("grpc") | Some("grpcs") => Ok(url.trim_end_matches('/').to_string()),
         Some("http") | Some("https") => Err(format!(
             "gRPC health check does not accept HTTP URL scheme: {}",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_base_url(url)
         )),
         Some(scheme) => Err(format!(
             "gRPC health check does not accept URL scheme '{scheme}': {}",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_base_url(url)
         )),
         None => Ok(format!("grpc://{}", url.trim_end_matches('/'))),
     }
@@ -400,6 +400,16 @@ mod tests {
         let unknown = grpc_reachable_url("ftp://user:secret@worker:3000").unwrap_err();
         assert!(!unknown.contains("secret"), "{unknown}");
         assert!(unknown.contains("'ftp'"), "{unknown}");
+        // The address is a registration's, as given: it carries no rank, so
+        // a token before a host of digits is a userinfo, never a host with
+        // a rank written whole.
+        for refusal in [
+            grpc_reachable_url("http://s3cret-token@2130706433").unwrap_err(),
+            http_health_url("grpc://s3cret-token@2130706433").unwrap_err(),
+        ] {
+            assert!(!refusal.contains("s3cret"), "{refusal}");
+            assert!(refusal.contains("://***@2130706433"), "{refusal}");
+        }
     }
 
     /// A scheme is read at the start of an address alone. An address with

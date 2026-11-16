@@ -1456,11 +1456,11 @@ impl CliArgs {
 
     /// The banner's lines that name the worker nodes of the two
     /// disaggregated modes. Each address is written through
-    /// [`Endpoint::redacted_url`]: one with no userinfo, query or fragment
-    /// reads as it was given, byte for byte, a userinfo is masked whole and a
-    /// query or fragment is cut, and one the address parser refuses reads as
-    /// its marker. An address on the command line may carry a credential;
-    /// what every start prints may not.
+    /// [`Endpoint::redacted_base_url`], which reads no rank out of it: one
+    /// with no userinfo, query or fragment reads as it was given, byte for
+    /// byte, a userinfo is masked whole and a query or fragment is cut, and
+    /// one the address parser refuses reads as its marker. An address on the
+    /// command line may carry a credential; what every start prints may not.
     pub(crate) fn node_lines(
         &self,
         prefill_urls: &[(String, Option<u16>)],
@@ -1469,14 +1469,14 @@ impl CliArgs {
         let shown = |nodes: &[(String, Option<u16>)]| -> Vec<(String, Option<u16>)> {
             nodes
                 .iter()
-                .map(|(url, port)| (Endpoint::redacted_url(url), *port))
+                .map(|(url, port)| (Endpoint::redacted_base_url(url), *port))
                 .collect()
         };
         let decode: Vec<String> = self
             .workers
             .decode
             .iter()
-            .map(|url| Endpoint::redacted_url(url))
+            .map(|url| Endpoint::redacted_base_url(url))
             .collect();
         let mut lines = Vec::new();
         if self.workers.pd_disaggregation && !prefill_urls.is_empty() {

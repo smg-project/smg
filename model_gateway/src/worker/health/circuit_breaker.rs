@@ -116,6 +116,10 @@ pub struct CircuitBreaker {
     last_state_change_ms: AtomicU64,
     config: CircuitBreakerConfig,
     metric_label: String,
+    /// What a line of this breaker names its worker by: the worker's own
+    /// masked address when the worker's builder made the breaker, else the
+    /// label masked as a bare string.
+    shown: String,
     /// Serializes the state gauge writes (see `publish_state_gauge`).
     gauge_lock: Mutex<()>,
 }
@@ -128,6 +132,14 @@ impl CircuitBreaker {
 
     /// Create a new circuit breaker with custom configuration and metric label
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
+        let shown = Endpoint::redacted_str(&metric_label);
+        Self::for_worker(config, metric_label, shown)
+    }
+
+    /// A worker's breaker. `metric_label` is the worker's address as its
+    /// metrics carry it; `shown` is the worker's own masked address, which
+    /// the breaker's lines name it by.
+    pub fn for_worker(config: CircuitBreakerConfig, metric_label: String, shown: String) -> Self {
         let init_state = CircuitState::Closed;
         Metrics::set_worker_cb_state(&metric_label, init_state.as_int());
         // Every transition this state machine can make, at zero, so the
@@ -152,6 +164,7 @@ impl CircuitBreaker {
             last_state_change_ms: AtomicU64::new(now_ms()),
             config,
             metric_label,
+            shown,
             gauge_lock: Mutex::new(()),
         }
     }
@@ -244,7 +257,7 @@ impl CircuitBreaker {
             CircuitState::Closed => {}
             CircuitState::Open => {
                 tracing::warn!(
-                    worker_url = %Endpoint::redacted_str(&self.metric_label),
+                    worker_url = %self.shown,
                     "Success recorded while circuit is open"
                 );
             }
@@ -306,7 +319,7 @@ impl CircuitBreaker {
         let (from, to) = (from.as_str(), to.as_str());
         // An absent `cause` records no field: the line reads as before.
         info!(
-            worker_url = %Endpoint::redacted_str(&self.metric_label),
+            worker_url = %self.shown,
             from,
             to,
             cause,
@@ -469,6 +482,7 @@ impl Clone for CircuitBreaker {
             last_state_change_ms: AtomicU64::new(self.last_state_change_ms.load(Ordering::Acquire)),
             config: self.config.clone(),
             metric_label: self.metric_label.clone(),
+            shown: self.shown.clone(),
             gauge_lock: Mutex::new(()),
         }
     }

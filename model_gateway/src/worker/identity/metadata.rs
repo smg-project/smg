@@ -32,8 +32,9 @@ pub struct WorkerMetadata {
     /// The URL as a request's success path shows it: the routed-worker
     /// response header, the cache-trace header and the request-sent event.
     /// The registered URL byte for byte when it has no userinfo, query or
-    /// fragment; otherwise `endpoint::Endpoint::redacted_str`'s form (see
-    /// `Endpoint::redacted_url`). Computed once at construction (the worker
+    /// fragment; otherwise its masked form. Made from the worker's own base
+    /// and rank, never read back out of the string (see
+    /// `Endpoint::redacted_worker_url`), once at construction (the worker
     /// builder, the Go binding's worker); nothing on a request path parses
     /// the URL.
     pub redacted_url: String,

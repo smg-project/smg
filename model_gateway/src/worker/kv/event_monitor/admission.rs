@@ -16,11 +16,11 @@ use super::{
 use crate::{
     observability::metrics::Metrics,
     worker::{
-        identity::endpoint::Endpoint,
         kv::{
             event_monitor::recovery::{Admission, RankState, ResyncReason},
             index_backend::KvIndex,
         },
+        Worker,
     },
 };
 
@@ -142,7 +142,7 @@ impl KvEventMonitor {
     /// worker's index state.
     pub(super) fn admit_batch(
         batch: &KvEventBatch,
-        worker_url: &str,
+        worker: &dyn Worker,
         worker_id: u32,
         indexer: &KvIndex,
         state: &mut WorkerStreamState,
@@ -150,9 +150,10 @@ impl KvEventMonitor {
     ) -> BatchOutcome {
         if let Some(chunk) = &batch.snapshot {
             return Self::admit_snapshot_chunk(
-                batch, chunk, worker_url, worker_id, indexer, state, on_batch,
+                batch, chunk, worker, worker_id, indexer, state, on_batch,
             );
         }
+        let worker_url = worker.url();
         let rank = batch.dp_rank.unwrap_or(0);
         // The first batch that names no rank puts rank 0's cursor into a
         // pinned worker's degraded count: a change of the gauge in its own
@@ -178,13 +179,13 @@ impl KvEventMonitor {
         match admission {
             Admission::Apply => {}
             Admission::Stale => {
-                debug!(worker_url = %Endpoint::redacted_str(worker_url), rank, received = seq, "Skipping stale KV event batch");
+                debug!(worker_url = %worker.redacted_url(), rank, received = seq, "Skipping stale KV event batch");
                 Metrics::record_kv_event_batch(worker_url, "stale");
                 return BatchOutcome::Skipped;
             }
             Admission::Restart if indexed => {
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %worker.redacted_url(),
                     rank,
                     received = seq,
                     "KV event publisher restarted; clearing the worker's index state"
@@ -209,7 +210,7 @@ impl KvEventMonitor {
                 // once, through its own rank's restart). A replay pending on
                 // that rank went with its old publisher.
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %worker.redacted_url(),
                     rank,
                     received = seq,
                     "KV event publisher of another rank restarted; this worker's index is kept"
@@ -232,7 +233,7 @@ impl KvEventMonitor {
             }
             Admission::Unrecovered { missed, cleared } => {
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %worker.redacted_url(),
                     rank,
                     missed,
                     cleared,
@@ -293,12 +294,13 @@ impl KvEventMonitor {
     fn admit_snapshot_chunk(
         batch: &KvEventBatch,
         chunk: &KvSnapshotChunk,
-        worker_url: &str,
+        worker: &dyn Worker,
         worker_id: u32,
         indexer: &KvIndex,
         state: &mut WorkerStreamState,
         on_batch: &mut impl FnMut(&KvEventBatch),
     ) -> BatchOutcome {
+        let worker_url = worker.url();
         let rank = batch.dp_rank.unwrap_or(0);
         if batch.dp_rank.is_none() {
             state.saw_unranked = true;
@@ -306,14 +308,14 @@ impl KvEventMonitor {
         if chunk.index == 0 || state.snapshot.is_none() {
             if chunk.index != 0 {
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %worker.redacted_url(),
                     rank,
                     index = chunk.index,
                     "KV event relay snapshot arrived without its first chunk; taking it as a resync"
                 );
             }
             info!(
-                worker_url = %Endpoint::redacted_str(worker_url),
+                worker_url = %worker.redacted_url(),
                 rank,
                 chunks = chunk.count,
                 blocks = chunk.blocks,
@@ -323,7 +325,7 @@ impl KvEventMonitor {
             );
             if chunk.unknown_before > 0 {
                 warn!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %worker.redacted_url(),
                     rank,
                     unknown_before = chunk.unknown_before,
                     "KV event relay snapshot starts late: the engine's blocks from before the \
@@ -363,7 +365,7 @@ impl KvEventMonitor {
             progress.applied += 1;
             if progress.applied >= progress.count {
                 info!(
-                    worker_url = %Endpoint::redacted_str(worker_url),
+                    worker_url = %worker.redacted_url(),
                     chunks = progress.count,
                     blocks = progress.blocks,
                     through = batch.sequence_number,
@@ -519,8 +521,10 @@ mod tests {
 
     use super::{super::apply::convert_kv_block, *};
     use crate::worker::{
+        identity::basic::BasicWorker,
         kv::event_monitor::recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW},
         test_support::kv_cache_cleared,
+        BasicWorkerBuilder,
     };
 
     /// Token ids for engine block `id`: distinct content per id.
@@ -731,6 +735,8 @@ mod tests {
     /// sees the stream the subscriber *should* have applied.
     struct Sim {
         indexer: KvIndex,
+        /// The worker the stream is admitted for.
+        named: BasicWorker,
         worker: u32,
         state: WorkerStreamState,
         reference: ReferenceIndexer,
@@ -744,6 +750,7 @@ mod tests {
             let worker = indexer.intern_worker("grpc://w1:9000").unwrap();
             Self {
                 indexer,
+                named: BasicWorkerBuilder::new("grpc://w1:9000").build(),
                 worker,
                 state: WorkerStreamState::default(),
                 reference: ReferenceIndexer::new(),
@@ -755,7 +762,7 @@ mod tests {
         fn feed(&mut self, b: &KvEventBatch) -> BatchOutcome {
             KvEventMonitor::admit_batch(
                 b,
-                "grpc://w1:9000",
+                &self.named,
                 self.worker,
                 &self.indexer,
                 &mut self.state,
@@ -1336,6 +1343,42 @@ mod tests {
         assert_eq!(sim.feed(&b3), BatchOutcome::Skipped);
         sim.deliver(&b4);
         sim.assert_matches_reference();
+    }
+
+    /// The admission's lines name the worker the stream is admitted for by
+    /// its own masked address: a token before a host of digits is a userinfo
+    /// there, where its address string alone reads as a host and its rank. A
+    /// stale batch's line, then a restarted publisher's.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_admissions_lines_name_the_worker_by_its_own_masked_address() {
+        let mut sim = Sim::new();
+        sim.named = BasicWorkerBuilder::new("http://s3cret-token@2130706433").build();
+        let b1 = batch(1, None, vec![stored(None, &[1, 2])]);
+        let b2 = batch(2, None, vec![stored(Some(2), &[3])]);
+        sim.deliver(&b1);
+        sim.deliver(&b2);
+        assert_eq!(sim.feed(&b2), BatchOutcome::Skipped);
+        sim.feed(&b1);
+
+        logs_assert(|lines: &[&str]| {
+            for message in [
+                "Skipping stale KV event batch",
+                "KV event publisher restarted; clearing the worker's index state",
+            ] {
+                let line = lines
+                    .iter()
+                    .find(|line| line.contains(message))
+                    .ok_or_else(|| format!("no line says: {message}"))?;
+                if !line.contains("worker_url=http://***@2130706433") {
+                    return Err(format!("the line names the worker otherwise: {line}"));
+                }
+            }
+            match lines.iter().find(|line| line.contains("s3cret")) {
+                Some(line) => Err(format!("a line carries the token: {line}")),
+                None => Ok(()),
+            }
+        });
     }
 
     #[test]

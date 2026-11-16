@@ -109,7 +109,6 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         health::manager::{WorkerManager, WorkerManagerConfig},
-        identity::endpoint::Endpoint,
         ConnectionMode,
     },
     workflow::{
@@ -2572,9 +2571,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!(
         "Router ready | workers: {:?}",
-        WorkerManager::get_worker_urls(&app_state.context.worker_registry)
+        app_state
+            .context
+            .worker_registry
+            .get_all()
             .iter()
-            .map(|url| Endpoint::redacted_str(url))
+            .map(|worker| worker.redacted_url())
             .collect::<Vec<_>>()
     );
 

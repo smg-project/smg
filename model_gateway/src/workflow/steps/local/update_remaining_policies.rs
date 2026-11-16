@@ -58,18 +58,23 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
             .policy_registry
             .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
 
-        // Log final result at info level
-        if worker_urls.len() == 1 {
-            info!("Removed worker {}", Endpoint::redacted_str(&worker_urls[0]));
+        // The final result at info level. The workers found are named by
+        // their own masked addresses; a workflow restored without them names
+        // their address strings.
+        let removed: Vec<String> = match &context.data.actual_workers_to_remove {
+            Some(workers) => workers
+                .iter()
+                .map(|worker| worker.redacted_url().to_string())
+                .collect(),
+            None => worker_urls
+                .iter()
+                .map(|url| Endpoint::redacted_str(url))
+                .collect(),
+        };
+        if let [one] = removed.as_slice() {
+            info!("Removed worker {one}");
         } else {
-            info!(
-                "Removed {} DP-aware workers: {:?}",
-                worker_urls.len(),
-                worker_urls
-                    .iter()
-                    .map(|url| Endpoint::redacted_str(url))
-                    .collect::<Vec<_>>()
-            );
+            info!("Removed {} DP-aware workers: {:?}", removed.len(), removed);
         }
 
         Ok(StepResult::Success)
@@ -155,5 +160,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(tree(&app_context), ["http://w1:8000"]);
+    }
+
+    /// The step's final line names the workers the find step found by their
+    /// own masked addresses: a token before a host of digits is a userinfo
+    /// there, where the address string alone reads as a host and its rank.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_final_line_names_a_removed_worker_by_its_own_masked_address() {
+        let token = "http://s3cret-token@2130706433";
+        let app_context = context_with_cache_aware_model();
+        let mut data =
+            create_worker_removal_workflow_data(token.to_string(), None, Arc::clone(&app_context));
+        data.worker_urls = vec![token.to_string()];
+        data.actual_workers_to_remove = Some(vec![ready_worker(token, MODEL)]);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        UpdateRemainingPoliciesStep
+            .execute(&mut context)
+            .await
+            .unwrap();
+
+        assert!(logs_contain("Removed worker http://***@2130706433"));
+        assert!(!logs_contain("s3cret"));
     }
 }

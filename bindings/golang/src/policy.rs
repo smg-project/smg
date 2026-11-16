@@ -75,7 +75,7 @@ impl GrpcWorker {
 
         let metadata = WorkerMetadata {
             pd_pairing: PdPairing::derive(&spec),
-            redacted_url: Endpoint::redacted_url(&endpoint),
+            redacted_url: Endpoint::redacted_worker_url(&endpoint, None, None),
             decoding: DecodingLabels::of(&spec),
             spec: Arc::new(spec),
             discovered_labels: Arc::default(),
@@ -751,6 +751,23 @@ mod tests {
         assert_eq!(worker.load(), 1);
         assert!(Arc::ptr_eq(&other.release(), &worker));
         assert_eq!(worker.load(), 0);
+        listener.close();
+    }
+
+    /// The binding's worker has no rank field, so its masked address reads
+    /// no rank out of its endpoint: the end of a query is cut with the
+    /// query, and a userinfo before a host of digits is masked.
+    #[test]
+    fn a_workers_masked_address_reads_no_rank_out_of_its_endpoint() {
+        let listener = SilentListener::bind();
+        let client = connect(&listener.endpoint);
+        for (endpoint, masked) in [
+            ("grpc://w:8000?token=abc@42", "grpc://w:8000"),
+            ("grpc://token@8080", "grpc://***@8080"),
+        ] {
+            let worker = GrpcWorker::new(Arc::clone(&client), endpoint.to_string());
+            assert_eq!(worker.redacted_url(), masked, "{endpoint}");
+        }
         listener.close();
     }
 

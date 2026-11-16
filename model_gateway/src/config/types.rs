@@ -1031,11 +1031,13 @@ impl RoutingMode {
     /// what the start-up lines and the configuration view show.
     pub fn redacted(&self) -> Self {
         fn masked(urls: &[String]) -> Vec<String> {
-            urls.iter().map(|url| Endpoint::redacted_str(url)).collect()
+            urls.iter()
+                .map(|url| Endpoint::redacted_base_url(url))
+                .collect()
         }
         fn masked_with_ports(urls: &[(String, Option<u16>)]) -> Vec<(String, Option<u16>)> {
             urls.iter()
-                .map(|(url, port)| (Endpoint::redacted_str(url), *port))
+                .map(|(url, port)| (Endpoint::redacted_base_url(url), *port))
                 .collect()
         }
         match self {

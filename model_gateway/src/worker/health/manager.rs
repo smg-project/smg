@@ -137,8 +137,8 @@ impl IntoResponse for EngineMetricsResult {
 /// events to keep its internal schedule in sync with registrations,
 /// removals, and replacements.
 ///
-/// The static helpers (`get_worker_urls`, `flush_cache_all`,
-/// `get_engine_metrics`, `fleet_loads`) are operational commands that
+/// The static helpers (`flush_cache_all`, `get_engine_metrics`,
+/// `fleet_loads`) are operational commands that
 /// don't depend on lifecycle state and remain associated functions.
 pub struct WorkerManager {
     handle: Option<JoinHandle<()>>,
@@ -931,15 +931,15 @@ fn apply_connect_signal(
     // A Failed worker under removal is on its way out: the contact that
     // signalled it was a last poll, not a return.
     if slot == ProbeSlot::Removal {
-        debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a worker being removed; ignoring");
+        debug!(worker_url = %worker.redacted_url(), "Connect signal for a worker being removed; ignoring");
         return None;
     }
     if matches!(slot, ProbeSlot::Probe(_)) && *worker.connection_mode() != ConnectionMode::Zmq {
         if worker.revision() != revision {
-            debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a replaced worker; ignoring");
+            debug!(worker_url = %worker.redacted_url(), "Connect signal for a replaced worker; ignoring");
             return None;
         }
-        debug!(worker_url = %Endpoint::redacted_str(&url), "Contact from a demoted worker: its health probe runs now");
+        debug!(worker_url = %worker.redacted_url(), "Contact from a demoted worker: its health probe runs now");
         schedule_at(
             next_check,
             worker_id,
@@ -951,7 +951,7 @@ fn apply_connect_signal(
     }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
-            debug!(worker_url = %Endpoint::redacted_str(&url), ?old, ?new, "Promoted worker on connect signal");
+            debug!(worker_url = %worker.redacted_url(), ?old, ?new, "Promoted worker on connect signal");
             // A promoted worker serves traffic, so it is on the schedule from
             // here whatever its slot was (a Failed worker's may have gone):
             // otherwise a later engine death would leave it Ready with a dead
@@ -970,7 +970,7 @@ fn apply_connect_signal(
         None => {
             // No transition: already Ready (idempotent), or a stale revision
             // after a same-URL replacement. Polling covers either case.
-            debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal applied no transition");
+            debug!(worker_url = %worker.redacted_url(), "Connect signal applied no transition");
             None
         }
     }
@@ -1097,21 +1097,22 @@ fn labels_follow_the_engine(
 /// the ZMQ wire this refresh is what gives it its window. A failed
 /// submission is logged; the next transition retries.
 async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue>) {
-    let url = worker.url().to_string();
     match job_queue
-        .submit_or_defer(Job::RefreshWorkerLabels { url: url.clone() })
+        .submit_or_defer(Job::RefreshWorkerLabels {
+            url: worker.url().to_string(),
+        })
         .await
     {
         Ok(true) => debug!(
-            worker_url = %Endpoint::redacted_str(&url),
+            worker_url = %worker.redacted_url(),
             "Submitted a label refresh for a worker that came into service"
         ),
         Ok(false) => debug!(
-            worker_url = %Endpoint::redacted_str(&url),
+            worker_url = %worker.redacted_url(),
             "A job for the worker is in flight; its label refresh runs when that job ends"
         ),
         Err(error) => warn!(
-            worker_url = %Endpoint::redacted_str(&url),
+            worker_url = %worker.redacted_url(),
             %error,
             "Could not submit a label refresh for a worker that came into service"
         ),
@@ -1272,7 +1273,7 @@ async fn submit_removal_job(
     let url = worker_url.to_string();
     warn!(
         worker_id = %worker_id.as_str(),
-        worker_url = %Endpoint::redacted_str(&url),
+        worker_url = %Endpoint::redacted_base_url(&url),
         expected_revision,
         "Removing failed worker from registry"
     );
@@ -1289,7 +1290,7 @@ async fn submit_removal_job(
         .await
     {
         error!(
-            worker_url = %Endpoint::redacted_str(&url),
+            worker_url = %Endpoint::redacted_base_url(&url),
             error = %e,
             "Failed to submit worker removal job"
         );
@@ -1297,14 +1298,6 @@ async fn submit_removal_job(
 }
 
 impl WorkerManager {
-    pub fn get_worker_urls(registry: &Arc<WorkerRegistry>) -> Vec<String> {
-        registry
-            .get_all()
-            .iter()
-            .map(|w| w.url().to_string())
-            .collect()
-    }
-
     /// Fan an admin operation out to workers in parallel, collecting
     /// successful worker URLs and per-worker failure messages.
     ///
@@ -1608,7 +1601,8 @@ impl WorkerManager {
 
         // One scrape target per base URL (the DP ranks share one), grouped
         // by the masked address the `worker_addr` label carries; a worker
-        // on another transport is named once per address.
+        // on another transport is named once per address. A base carries no
+        // rank, so none is read out of its text.
         let mut seen = HashSet::new();
         let mut named = HashSet::new();
         let mut not_scraped = String::new();
@@ -1618,7 +1612,7 @@ impl WorkerManager {
             if !seen.insert(base_url.clone()) {
                 continue;
             }
-            let address = Endpoint::redacted_url(&base_url);
+            let address = Endpoint::redacted_base_url(&base_url);
             if *worker.connection_mode() == ConnectionMode::Http {
                 registrations.entry(address).or_default().push(worker);
             } else if named.insert(address.clone()) {
@@ -1655,7 +1649,7 @@ impl WorkerManager {
                 break;
             }
             for resp in fan_out(&targets, "metrics", reqwest::Method::GET).await {
-                let address = Endpoint::redacted_url(&resp.url);
+                let address = Endpoint::redacted_base_url(&resp.url);
                 let registration = round + 1;
                 let of = registrations.get(&address).map_or(1, Vec::len);
                 match resp.result {

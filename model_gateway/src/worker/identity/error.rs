@@ -10,8 +10,10 @@ use super::endpoint::Endpoint;
 /// or fragment dropped, a plain address byte for byte, an unparsable one
 /// replaced by a marker): the message follows a redacted field into log
 /// lines, step failures and response bodies, and must not repeat the
-/// address raw. The `url` field keeps the registered address for the code
-/// that matches on it.
+/// address raw. The `url` field keeps the address its maker gave. A
+/// worker that makes an error about itself gives its own masked address,
+/// which reads no rank out of the address string, and the message's mask
+/// leaves a masked address as it is.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     #[error("Health check failed for worker {}: {reason}", shown(.url))]
@@ -90,6 +92,28 @@ mod tests {
             1,
             "{text}"
         );
+    }
+
+    /// A worker gives an error its own masked address, and the message's
+    /// mask leaves a masked address as it is.
+    #[test]
+    fn a_masked_address_is_written_as_given() {
+        for masked in [
+            "http://***@2130706433",
+            "http://***@w:8000@1",
+            "http://w:8000@0",
+            "http://w:8000",
+            "<unparsable address>",
+        ] {
+            let error = WorkerError::WorkerNotFound {
+                url: masked.to_string(),
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("Worker not found: {masked}"),
+                "{masked}"
+            );
+        }
     }
 
     #[test]

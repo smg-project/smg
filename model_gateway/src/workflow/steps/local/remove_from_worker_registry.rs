@@ -7,8 +7,9 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::shown_found;
 use crate::{
-    worker::{identity::endpoint::Endpoint, Worker},
+    worker::Worker,
     workflow::{
         data::WorkerRemovalWorkflowData,
         steps::shared::{pool_group, refresh_worker_pool_sizes, PoolGroups},
@@ -83,7 +84,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
                         None => {
                             debug!(
                                 "Worker {} was registered under the URL after the removal's selection, left alone",
-                                Endpoint::redacted_str(worker_url)
+                                shown_found(worker_url, registry.get(&worker_id).as_slice())
                             );
                             standing.push(worker_url);
                             None
@@ -107,13 +108,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
                                 worker.revision() == pinned
                                     || worker.status() == WorkerStatus::Draining
                             });
-                            if removed.is_none() && registry.get(&worker_id).is_some() {
-                                debug!(
-                                    worker_url = %Endpoint::redacted_str(worker_url),
-                                    pinned_revision = pinned,
-                                    "Worker was replaced after the removal's selection and stands on its own, left alone"
-                                );
-                                standing.push(worker_url);
+                            if removed.is_none() {
+                                if let Some(replacement) = registry.get(&worker_id) {
+                                    debug!(
+                                        worker_url = %replacement.redacted_url(),
+                                        pinned_revision = pinned,
+                                        "Worker was replaced after the removal's selection and stands on its own, left alone"
+                                    );
+                                    standing.push(worker_url);
+                                }
                             }
                             removed
                         }
@@ -518,5 +521,88 @@ mod tests {
             Arc::ptr_eq(&ctx.data.removed_workers[0], &fresh),
             "the worker removed is the one under the URL"
         );
+    }
+
+    /// A registration under the URL since the selection is named by its own
+    /// fields: read as a bare string, a token before a host of digits is a
+    /// host with a rank and is written whole.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_registration_since_the_selection_is_named_by_its_own_masked_address() {
+        let url = "http://s3cret-token@2130706433";
+        let registry = Arc::new(WorkerRegistry::new());
+        let found = build_worker(url);
+        let found_id = registry
+            .register(Arc::clone(&found))
+            .expect("the worker registers");
+        let pins = HashMap::from([(found_id.as_str().to_string(), Some(found.revision()))]);
+        let mut ctx = make_context(
+            make_app_context(Arc::clone(&registry)),
+            url,
+            vec![Arc::clone(&found)],
+            Some(pins),
+        );
+        assert!(
+            registry.remove(&found_id).is_some(),
+            "the worker found leaves"
+        );
+        registry
+            .register(build_worker(url))
+            .expect("the fresh registration lands");
+
+        let result = RemoveFromWorkerRegistryStep
+            .execute(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(result, StepResult::Success);
+        assert!(logs_contain(
+            "Worker http://***@2130706433 was registered under the URL after the removal's \
+             selection, left alone"
+        ));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// A replacement left standing under a pinned id is named by its own
+    /// fields too.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_replacement_left_standing_is_named_by_its_own_masked_address() {
+        let url = "http://s3cret-token@2130706433";
+        let registry = Arc::new(WorkerRegistry::new());
+        let found = build_worker(url);
+        let found_id = registry
+            .register(Arc::clone(&found))
+            .expect("the worker registers");
+        let pinned = found.revision();
+        let mut ctx = make_context(
+            make_app_context(Arc::clone(&registry)),
+            url,
+            vec![Arc::clone(&found)],
+            Some(HashMap::from([(
+                found_id.as_str().to_string(),
+                Some(pinned),
+            )])),
+        );
+        // Never drained and replaced since: the replacement stands on its own.
+        found.set_status(WorkerStatus::NotReady);
+        let replacement = build_worker(url);
+        assert!(
+            registry.replace(&found_id, Arc::clone(&replacement)),
+            "the replacement lands"
+        );
+        replacement.set_status(WorkerStatus::NotReady);
+
+        let result = RemoveFromWorkerRegistryStep
+            .execute(&mut ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(result, StepResult::Success);
+        assert!(logs_contain(&format!(
+            "Worker was replaced after the removal's selection and stands on its own, left \
+             alone worker_url=http://***@2130706433 pinned_revision={pinned}"
+        )));
+        assert!(!logs_contain("s3cret"));
     }
 }

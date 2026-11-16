@@ -19,7 +19,10 @@ use openai_protocol::worker::{
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowStatus};
+use wfaas::{
+    StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowInstanceId,
+    WorkflowState, WorkflowStatus,
+};
 
 use crate::{
     app_context::AppContext,
@@ -29,10 +32,11 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
-        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode,
+        create_worker_workflow_data, engines::WorkerRegistrationEngine,
+        note_tokenizer_load_outcome, note_tokenizer_removed, registered_entries, registered_in,
+        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode,
+        WorkerWorkflowData,
     },
 };
 
@@ -109,7 +113,9 @@ impl Job {
     /// (the start-up marker, an MCP server, a WASM module, a tokenizer id) as
     /// they are, since the address parser would respell or refuse them;
     /// anything else is a worker's address, written with a userinfo in it
-    /// masked, so a worker job added later cannot write its address raw.
+    /// masked, so a worker job added later cannot write its address raw. A
+    /// registration's address carries no rank, so an `AddWorker` job masks
+    /// it with none read: digits behind its last `@` are its own text.
     pub fn shown_worker(job_type: &str, worker_url: &str) -> String {
         match job_type {
             "InitializeWorkersFromConfig"
@@ -119,19 +125,39 @@ impl Job {
             | "RemoveWasmModule"
             | "AddTokenizer"
             | "RemoveTokenizer" => worker_url.to_string(),
+            "AddWorker" => Endpoint::redacted_base_url(worker_url),
             _ => Endpoint::redacted_str(worker_url),
         }
     }
 
-    /// The name a worker job's workflow goes by: the worker's address with a
-    /// userinfo in it masked, as the job's own lines write it. The engine
-    /// writes the name into the text a wait ends with (completed, cancelled,
-    /// timed out), and that text is the job's result: its log line and its
-    /// status. Nothing finds a workflow by its name, so two workers whose
-    /// addresses differ in the userinfo alone go by one, each tracked under
-    /// its own address.
-    fn workflow_label(worker_url: &str) -> String {
-        Endpoint::redacted_str(worker_url)
+    /// [`Self::shown_worker`] read with the registry, for the queue's own
+    /// lines. An update, a label refresh and a removal carry a registered
+    /// worker's address as a string, which alone cannot say whether digits
+    /// behind its last `@` are a rank: while the registry holds a worker
+    /// under that address, the job is named by the worker's own masked
+    /// address. Any other job, and an address no worker is registered under
+    /// (a base that stands for its ranks, a worker already gone), is named
+    /// as [`Self::shown_worker`] names it.
+    ///
+    /// The name is also what a worker job's workflow goes by. The engine
+    /// writes it into the text a wait ends with (completed, cancelled, timed
+    /// out), and that text is the job's result: its log line and its status.
+    /// Nothing finds a workflow by its name.
+    fn shown_worker_in(
+        registry: &crate::worker::WorkerRegistry,
+        job_type: &str,
+        worker_url: &str,
+    ) -> String {
+        let registered = match job_type {
+            "UpdateWorker" | "RefreshWorkerLabels" | "RemoveWorker" => {
+                registry.get_by_url(worker_url)
+            }
+            _ => None,
+        };
+        registered.map_or_else(
+            || Self::shown_worker(job_type, worker_url),
+            |worker| worker.redacted_url().to_string(),
+        )
     }
 
     /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
@@ -657,10 +683,11 @@ impl JobQueue {
                 }
                 continue;
             }
+            // What the job's lines name its worker by, read before it runs.
+            let shown = Job::shown_worker_in(&context.worker_registry, job_type, worker_url);
             debug!(
                 "Running the {} job kept for worker={} while another job held the URL",
-                job_type,
-                Job::shown_worker(job_type, worker_url)
+                job_type, shown
             );
             Self::record_own_status(
                 status_map,
@@ -687,7 +714,14 @@ impl JobQueue {
             {
                 context.worker_registry.release_reservation(worker_url);
             }
-            Self::record_job_completion(job_type, worker_url, start.elapsed(), &result, status_map);
+            Self::record_job_completion(
+                job_type,
+                worker_url,
+                &shown,
+                start.elapsed(),
+                &result,
+                status_map,
+            );
             if let Some(id) = own_id {
                 cancelled_before_start.remove(&id);
             }
@@ -789,15 +823,15 @@ impl JobQueue {
         if let Some(model) = &tokenizer_load {
             context.tokenizer_load_failures.load_started(model);
         }
+        // The job's name is read before the hand-over: a removal that runs at
+        // once takes its worker out of the registry.
+        let shown = Job::shown_worker_in(&context.worker_registry, job_type, &worker_url);
         permit.send(Queued { job, waiter });
 
         let (queue_depth, available_permits) = self.get_load_info();
         debug!(
             "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
-            job_type,
-            Job::shown_worker(job_type, &worker_url),
-            queue_depth,
-            available_permits
+            job_type, shown, queue_depth, available_permits
         );
         Ok(())
     }
@@ -818,7 +852,10 @@ impl JobQueue {
         // not handed the first caller's outcome (and the first its loss).
         match self.outcomes.entry(key.clone()) {
             Entry::Occupied(_) => {
-                let shown = Job::shown_worker(job.job_type(), &key);
+                let shown = self.context.upgrade().map_or_else(
+                    || Job::shown_worker(job.job_type(), &key),
+                    |context| Job::shown_worker_in(&context.worker_registry, job.job_type(), &key),
+                );
                 return Err(JobOutcomeError::InFlight(shown));
             }
             Entry::Vacant(entry) => {
@@ -1006,6 +1043,12 @@ impl JobQueue {
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
         let start = std::time::Instant::now();
+        // What this job's lines name its worker by, read once here: a removal
+        // takes the worker out of the registry before its last line.
+        let shown = context.upgrade().map_or_else(
+            || Job::shown_worker(job_type, &worker_url),
+            |ctx| Job::shown_worker_in(&ctx.worker_registry, job_type, &worker_url),
+        );
 
         // Update to processing: this job's entry only (a job of another type
         // submitted for the URL since this one was queued keeps its status).
@@ -1016,11 +1059,7 @@ impl JobQueue {
             Some(JobStatus::processing(job_type, &worker_url)),
         );
 
-        debug!(
-            "Processing job: type={}, worker={}",
-            job_type,
-            Job::shown_worker(job_type, &worker_url)
-        );
+        debug!("Processing job: type={}, worker={}", job_type, shown);
 
         // Release concurrency slot immediately. The semaphore bounds how many
         // jobs can be dequeued concurrently (preventing thundering herd), but
@@ -1053,7 +1092,14 @@ impl JobQueue {
                 {
                     ctx.worker_registry.release_reservation(&worker_url);
                 }
-                Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
+                Self::record_job_completion(
+                    job_type,
+                    &worker_url,
+                    &shown,
+                    duration,
+                    &result,
+                    &status_map,
+                );
                 // A mark set for this job after its reads is over with it.
                 if let Some(id) = own_id {
                     cancelled_before_start.remove(&id);
@@ -1077,8 +1123,7 @@ impl JobQueue {
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, Err(error_msg));
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
-                    job_type,
-                    Job::shown_worker(job_type, &worker_url)
+                    job_type, shown
                 );
             }
         }
@@ -1170,6 +1215,23 @@ impl JobQueue {
             .await
     }
 
+    /// A registration's end: its terminal state and the outcome that state
+    /// reads as. One label names the worker in both texts, the wait's
+    /// timeout and the outcome, and the address as given is in reach of
+    /// neither.
+    async fn registration_end(
+        engine: &WorkerRegistrationEngine,
+        instance_id: WorkflowInstanceId,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<(WorkflowState<WorkerWorkflowData>, Result<String, String>), String> {
+        let state = engine
+            .wait_for_terminal_state(instance_id, label, timeout)
+            .await?;
+        let outcome = wfaas::completion_outcome(&state, label);
+        Ok((state, outcome))
+    }
+
     /// Execute a specific job
     async fn execute_job(
         job: &Job,
@@ -1224,16 +1286,18 @@ impl JobQueue {
 
                 debug!(
                     "Started worker registration workflow for {} (instance: {})",
-                    Endpoint::redacted_str(&config.url),
+                    Endpoint::redacted_base_url(&config.url),
                     instance_id
                 );
 
-                let label = Job::workflow_label(&config.url);
-                let state = engines
-                    .worker_registration
-                    .wait_for_terminal_state(instance_id, &label, timeout_duration)
-                    .await?;
-                let outcome = wfaas::completion_outcome(&state, &label);
+                let label = Job::shown_worker("AddWorker", &config.url);
+                let (state, outcome) = Self::registration_end(
+                    &engines.worker_registration,
+                    instance_id,
+                    &label,
+                    timeout_duration,
+                )
+                .await?;
                 // A POST's registration that put its worker in the registry
                 // and did not finish (a DELETE's cancel landing after the
                 // registry step, a later step's failure) leaves no worker
@@ -1279,6 +1343,7 @@ impl JobQueue {
                 }
             }
             Job::UpdateWorker { url, update } => {
+                let shown = Job::shown_worker_in(&context.worker_registry, "UpdateWorker", url);
                 let engines = context
                     .workflow_engines
                     .get()
@@ -1294,13 +1359,15 @@ impl JobQueue {
                     &engines.worker_update,
                     "worker_update",
                     "worker update",
-                    &Job::workflow_label(url),
+                    &shown,
                     workflow_data,
                     Duration::from_secs(30),
                 )
                 .await
             }
             Job::RefreshWorkerLabels { url } => {
+                let shown =
+                    Job::shown_worker_in(&context.worker_registry, "RefreshWorkerLabels", url);
                 let engines = context
                     .workflow_engines
                     .get()
@@ -1323,7 +1390,7 @@ impl JobQueue {
                     &engines.worker_update,
                     "worker_update",
                     "worker label refresh",
-                    &Job::workflow_label(url),
+                    &shown,
                     workflow_data,
                     Duration::from_secs(30),
                 )
@@ -1333,6 +1400,8 @@ impl JobQueue {
                 url,
                 expected_revisions,
             } => {
+                // Read before the workflow starts: it takes the worker out.
+                let shown = Job::shown_worker_in(&context.worker_registry, "RemoveWorker", url);
                 let engines = context
                     .workflow_engines
                     .get()
@@ -1352,8 +1421,7 @@ impl JobQueue {
 
                 debug!(
                     "Started worker removal workflow for {} (instance: {})",
-                    Endpoint::redacted_str(url),
-                    instance_id
+                    shown, instance_id
                 );
 
                 // Caller wait must cover the worst-case `DrainWorkersStep`
@@ -1373,7 +1441,7 @@ impl JobQueue {
 
                 let result = engines
                     .worker_removal
-                    .wait_for_completion(instance_id, &Job::workflow_label(url), timeout_duration)
+                    .wait_for_completion(instance_id, &shown, timeout_duration)
                     .await;
 
                 // Clean up job status when removing worker
@@ -1509,7 +1577,7 @@ impl JobQueue {
                         queue.submit(job).await.map_err(|e| {
                             format!(
                                 "Failed to submit AddWorker job for {worker_type} worker {}: {e}",
-                                Endpoint::redacted_str(&url_for_error)
+                                Endpoint::redacted_base_url(&url_for_error)
                             )
                         })?;
                         worker_count += 1;
@@ -1643,6 +1711,7 @@ impl JobQueue {
     fn record_job_completion(
         job_type: &'static str,
         worker_url: &str,
+        shown: &str,
         _duration: Duration,
         result: &Result<String, String>,
         status_map: &Arc<DashMap<String, JobStatus>>,
@@ -1652,9 +1721,7 @@ impl JobQueue {
                 Self::record_own_status(status_map, worker_url, job_type, None);
                 debug!(
                     "Completed job: type={}, worker={}, result={}",
-                    job_type,
-                    Job::shown_worker(job_type, worker_url),
-                    message
+                    job_type, shown, message
                 );
             }
             Err(error) => {
@@ -1666,9 +1733,7 @@ impl JobQueue {
                 );
                 warn!(
                     "Failed job: type={}, worker={}, error={}",
-                    job_type,
-                    Job::shown_worker(job_type, worker_url),
-                    error
+                    job_type, shown, error
                 );
             }
         }
@@ -1815,7 +1880,7 @@ async fn submit_external_worker_jobs(
             queue.submit(job).await.map_err(|e| {
                 format!(
                     "Failed to submit AddWorker job for {provider_name} endpoint {}: {e}",
-                    Endpoint::redacted_str(&url_for_error)
+                    Endpoint::redacted_base_url(&url_for_error)
                 )
             })?;
             submitted_count += 1;
@@ -1886,6 +1951,51 @@ mod tests {
         ] {
             assert_eq!(Job::shown_worker(job_type, name), name, "{job_type}");
         }
+        // A registration's address as given carries no rank: a token before
+        // a host of digits is a userinfo in an AddWorker job's lines. The
+        // other worker jobs hold a string that may be a rank's own address
+        // and keep its rank.
+        assert_eq!(
+            Job::shown_worker("AddWorker", "http://s3cret-token@2130706433"),
+            "http://***@2130706433"
+        );
+        for job_type in ["UpdateWorker", "RefreshWorkerLabels", "RemoveWorker"] {
+            assert_eq!(
+                Job::shown_worker(job_type, "http://w:8000@1"),
+                "http://w:8000@1",
+                "{job_type}"
+            );
+        }
+        // Read with the registry, a job of a registered worker is named by
+        // the worker's own masked address, where the string alone reads a
+        // rank. An address no worker is registered under is named as before.
+        let registry = crate::worker::WorkerRegistry::new();
+        let token = "http://s3cret-token@2130706433";
+        registry
+            .register(Arc::new(
+                crate::worker::BasicWorkerBuilder::new(token).build(),
+            ))
+            .unwrap();
+        for job_type in ["UpdateWorker", "RefreshWorkerLabels", "RemoveWorker"] {
+            assert_eq!(
+                Job::shown_worker_in(&registry, job_type, token),
+                "http://***@2130706433",
+                "{job_type}"
+            );
+            assert_eq!(
+                Job::shown_worker_in(&registry, job_type, "http://w:8000@1"),
+                "http://w:8000@1",
+                "{job_type}"
+            );
+        }
+        assert_eq!(
+            Job::shown_worker_in(&registry, "AddWorker", token),
+            "http://***@2130706433"
+        );
+        assert_eq!(
+            Job::shown_worker_in(&registry, "AddTokenizer", "org/tokenizer"),
+            "org/tokenizer"
+        );
     }
 
     /// A start-up registration the queue refuses names its worker with the
@@ -1916,6 +2026,7 @@ mod tests {
             JobQueue::record_job_completion(
                 job.job_type(),
                 job.worker_url(),
+                &Job::shown_worker(job.job_type(), job.worker_url()),
                 Duration::ZERO,
                 &result,
                 &statuses,
@@ -2015,6 +2126,7 @@ mod tests {
             JobQueue::record_job_completion(
                 job.job_type(),
                 job.worker_url(),
+                &Job::shown_worker(job.job_type(), job.worker_url()),
                 Duration::ZERO,
                 &result,
                 &statuses,
@@ -2048,6 +2160,237 @@ mod tests {
                 "{completed} completed-job lines, {masked} with the masked result, wanted five \
                  of five; the lines with a credential: {credentialed:#?}"
             ))
+        });
+    }
+
+    /// The lines of a registered worker's job name it by the worker's own
+    /// masked address, from the submission to the job's result: a token
+    /// before a host of digits is a userinfo there, where the job's address
+    /// string alone reads as a host and its rank. The name is read once,
+    /// before the job runs: the removal's last line is written with the
+    /// worker gone from the registry.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_registered_workers_job_lines_name_it_by_its_own_masked_address() {
+        use crate::service_discovery::testing::live_app_context;
+        let token = "http://s3cret-token@2130706433";
+        let context = live_app_context();
+        context
+            .worker_registry
+            .register(Arc::new(
+                crate::worker::BasicWorkerBuilder::new(token).build(),
+            ))
+            .unwrap();
+        let removal = || Job::RemoveWorker {
+            url: token.to_string(),
+            expected_revisions: None,
+        };
+        // The submission's line, on a queue whose one slot the test holds:
+        // the job is queued and does not run.
+        let parked = JobQueue::new(
+            JobQueueConfig {
+                queue_capacity: 1,
+                max_concurrent_jobs: 1,
+            },
+            Arc::downgrade(&context),
+        );
+        let _held = Arc::clone(&parked.concurrency_limit)
+            .acquire_owned()
+            .await
+            .expect("the dispatcher's permit");
+        parked.submit(removal()).await.expect("the job is queued");
+
+        // The job itself, run as the dispatcher runs it.
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let permit = Arc::clone(&queue.concurrency_limit)
+            .acquire_owned()
+            .await
+            .expect("a permit");
+        JobQueue::process_job(
+            Queued {
+                job: removal(),
+                waiter: None,
+            },
+            Arc::downgrade(&context),
+            Arc::clone(&queue.status_map),
+            Arc::clone(&queue.outcomes),
+            Arc::clone(&queue.kept),
+            Arc::clone(&queue.cancelled_before_start),
+            permit,
+        )
+        .await;
+
+        assert!(
+            context.worker_registry.get_by_url(token).is_none(),
+            "the removal ran"
+        );
+        logs_assert(|lines: &[&str]| {
+            for wanted in [
+                "Job submitted: type=RemoveWorker, worker=http://***@2130706433,",
+                "Processing job: type=RemoveWorker, worker=http://***@2130706433",
+                "Started worker removal workflow for http://***@2130706433 (instance:",
+                "Completed job: type=RemoveWorker, worker=http://***@2130706433, \
+                 result=http://***@2130706433 completed successfully via workflow",
+            ] {
+                if !lines.iter().any(|line| line.contains(wanted)) {
+                    return Err(format!("no line reads: {wanted}"));
+                }
+            }
+            match lines.iter().find(|line| line.contains("s3cret")) {
+                Some(line) => Err(format!("a line carries the token: {line}")),
+                None => Ok(()),
+            }
+        });
+    }
+
+    /// A context whose registry holds one worker at `url`. The cases below
+    /// take an address the string mask reads wrong: a token before a host of
+    /// digits is a userinfo to the worker, where the string alone reads a
+    /// host and its rank and writes the token whole.
+    fn a_context_with_a_worker_at(url: &str, mode: ConnectionMode) -> Arc<AppContext> {
+        use crate::service_discovery::testing::live_app_context;
+        let context = live_app_context();
+        context
+            .worker_registry
+            .register(Arc::new(
+                crate::worker::BasicWorkerBuilder::new(url)
+                    .connection_mode(mode)
+                    .build(),
+            ))
+            .unwrap();
+        context
+    }
+
+    /// The refusal of a second job for a registered worker names it by the
+    /// worker's own masked address: the queue reads the registry for the
+    /// name, where the key's string alone would write the token.
+    #[tokio::test]
+    async fn a_second_jobs_refusal_names_a_registered_worker_by_its_own_masked_address() {
+        let key = "http://s3cret-token@2130706433".to_string();
+        let context = a_context_with_a_worker_at(&key, ConnectionMode::Http);
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let (first, _first_rx) = oneshot::channel();
+        queue.outcomes.insert(
+            key.clone(),
+            Waiter {
+                id: 1,
+                sender: first,
+            },
+        );
+        let second = queue
+            .submit_and_wait(
+                Job::RefreshWorkerLabels { url: key.clone() },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(
+            second,
+            Err(JobOutcomeError::InFlight(
+                "http://***@2130706433".to_string()
+            ))
+        );
+    }
+
+    /// A job kept behind another names a registered worker by the worker's
+    /// own masked address: in the line that says it runs and in its
+    /// completion record, which a removal writes with the worker gone from
+    /// the registry.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_kept_jobs_lines_name_a_registered_worker_by_its_own_masked_address() {
+        let token = "http://s3cret-token@2130706433";
+        let context = a_context_with_a_worker_at(token, ConnectionMode::Http);
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        JobQueue::put_back(
+            &queue.kept,
+            token,
+            Job::RemoveWorker {
+                url: token.to_string(),
+                expected_revisions: None,
+            },
+        );
+        JobQueue::run_kept(
+            token,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+
+        assert!(
+            context.worker_registry.get_by_url(token).is_none(),
+            "the kept removal ran"
+        );
+        logs_assert(|lines: &[&str]| {
+            for wanted in [
+                "Running the RemoveWorker job kept for worker=http://***@2130706433 while",
+                "Completed job: type=RemoveWorker, worker=http://***@2130706433, \
+                 result=http://***@2130706433 completed successfully via workflow",
+            ] {
+                if !lines.iter().any(|line| line.contains(wanted)) {
+                    return Err(format!("no line reads: {wanted}"));
+                }
+            }
+            match lines.iter().find(|line| line.contains("s3cret")) {
+                Some(line) => Err(format!("a line carries the token: {line}")),
+                None => Ok(()),
+            }
+        });
+    }
+
+    /// An update's wait goes by the registered worker's own masked address:
+    /// its start line and the text the wait ends with, the job's result.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn an_updates_wait_names_a_registered_worker_by_its_own_masked_address() {
+        let token = "http://s3cret-token@2130706433";
+        let context = a_context_with_a_worker_at(token, ConnectionMode::Http);
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(serde_json::json!({"labels": {"tier": "a"}}))
+                .expect("an update");
+        let job = Job::UpdateWorker {
+            url: token.to_string(),
+            update: Box::new(update),
+        };
+        let result = JobQueue::execute_job(&job, &context, &DashSet::new(), None).await;
+        assert_eq!(
+            result.as_deref(),
+            Ok("http://***@2130706433 completed successfully via workflow")
+        );
+        assert!(logs_contain(
+            "Started worker update workflow for http://***@2130706433 (instance:"
+        ));
+    }
+
+    /// A label refresh's wait goes by it too. The worker is a ZMQ one whose
+    /// link is not up: the refresh dials nothing and re-reads nothing, and
+    /// how such a job ends is not this case's. Its start line names the
+    /// worker, and no text of the job carries the token.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_label_refreshs_wait_names_a_registered_worker_by_its_own_masked_address() {
+        let token = "tcp://s3cret-token@2130706433";
+        let context = a_context_with_a_worker_at(token, ConnectionMode::Zmq);
+        let job = Job::RefreshWorkerLabels {
+            url: token.to_string(),
+        };
+        let (Ok(text) | Err(text)) =
+            JobQueue::execute_job(&job, &context, &DashSet::new(), None).await;
+        assert!(
+            !text.contains("s3cret"),
+            "the job's result carries the token: {text}"
+        );
+        logs_assert(|lines: &[&str]| {
+            let wanted =
+                "Started worker label refresh workflow for tcp://***@2130706433 (instance:";
+            if !lines.iter().any(|line| line.contains(wanted)) {
+                return Err(format!("no line reads: {wanted}"));
+            }
+            match lines.iter().find(|line| line.contains("s3cret")) {
+                Some(line) => Err(format!("a line carries the token: {line}")),
+                None => Ok(()),
+            }
         });
     }
 
@@ -2132,6 +2475,7 @@ mod tests {
             JobQueue::record_job_completion(
                 job.job_type(),
                 job.worker_url(),
+                &Job::shown_worker(job.job_type(), job.worker_url()),
                 Duration::ZERO,
                 result,
                 &statuses,
@@ -2706,6 +3050,7 @@ mod tests {
         JobQueue::record_job_completion(
             "AddWorker",
             url,
+            url,
             Duration::ZERO,
             &Ok("done".to_string()),
             &queue.status_map,
@@ -2805,6 +3150,7 @@ mod tests {
         JobQueue::record_job_completion(
             "AddWorker",
             url,
+            url,
             Duration::ZERO,
             &Ok("done".to_string()),
             &queue.status_map,
@@ -2866,6 +3212,7 @@ mod tests {
 
         JobQueue::record_job_completion(
             "AddWorker",
+            url,
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
@@ -2932,6 +3279,7 @@ mod tests {
 
         JobQueue::record_job_completion(
             "UpdateWorker",
+            url,
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
@@ -3297,6 +3645,7 @@ mod tests {
         JobQueue::record_job_completion(
             "AddWorker",
             url,
+            url,
             Duration::ZERO,
             &Ok("done".to_string()),
             &queue.status_map,
@@ -3317,6 +3666,7 @@ mod tests {
         );
         JobQueue::record_job_completion(
             "UpdateWorker",
+            url,
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
@@ -3634,6 +3984,7 @@ mod tests {
         JobQueue::record_job_completion(
             "RemoveWorker",
             url,
+            url,
             Duration::ZERO,
             &Ok("done".to_string()),
             &queue.status_map,
@@ -3693,6 +4044,7 @@ mod tests {
         );
         JobQueue::record_job_completion(
             "UpdateWorker",
+            url,
             url,
             Duration::ZERO,
             &Ok("done".to_string()),
@@ -3760,6 +4112,7 @@ mod tests {
         );
         JobQueue::record_job_completion(
             "RemoveWorker",
+            url,
             url,
             Duration::ZERO,
             &Ok("done".to_string()),

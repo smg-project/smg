@@ -11,7 +11,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use super::create_worker::labels_for_rank;
 use super::create_worker::{
     kv_transfer_value, model_card_for_labels, report_for_rank, validate_parser_overrides,
-    warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
+    warn_on_conflicting_parser_overrides, Named, DP_WIDTH_LABELS,
 };
 use crate::{
     service_discovery::DISCOVERY_PROVIDER_LABEL,
@@ -106,7 +106,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // the reason and the worker keeps the labels it had.
                     super::create_worker::validate_constrained_decoding_label(
                         &labels,
-                        worker.url(),
+                        Named::Registered(worker.as_ref()),
                         "update_worker_properties",
                     )?;
                     labels
@@ -140,7 +140,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // otherwise read as `requested` from here on.
                     super::create_worker::validate_constrained_decoding_label(
                         &updated_labels,
-                        worker.url(),
+                        Named::Registered(worker.as_ref()),
                         "update_worker_properties",
                     )?;
                     if updated_labels.len() > existing.len()
@@ -171,7 +171,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     for card in models.iter() {
                         validate_parser_overrides(
                             card,
-                            worker.url(),
+                            Named::Registered(worker.as_ref()),
                             app_context.router_config.parser,
                             app_context.tool_parser_factory.as_ref(),
                             app_context.reasoning_parser_factory.as_ref(),

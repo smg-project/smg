@@ -148,7 +148,7 @@ impl LoadBalancingPolicy for BucketPolicy {
                     let url = workers[healthy_indices[idx]].url();
                     warn!(
                         "No URL found, randomly selecting: {}",
-                        Endpoint::redacted_str(url)
+                        workers[healthy_indices[idx]].redacted_url()
                     );
                     url.to_string()
                 })
@@ -161,7 +161,7 @@ impl LoadBalancingPolicy for BucketPolicy {
                         let selected_url = workers[healthy_indices[idx]].url();
                         warn!(
                             "The bucket lists none of the offered workers for a size of {}, randomly selecting: {}",
-                            char_count, Endpoint::redacted_str(selected_url)
+                            char_count, workers[healthy_indices[idx]].redacted_url()
                         );
                         selected_url.to_string()
                     }
@@ -1331,6 +1331,20 @@ mod tests {
         }
         // A normal drain is not worth a warning per request.
         assert!(!logs_contain("randomly selecting"));
+    }
+
+    /// The warning for an offered worker the bucket does not list names it
+    /// by its own masked address: read as a bare string, a token before a
+    /// host of digits is a host with a rank and is written whole.
+    #[test]
+    #[traced_test]
+    fn the_random_pick_warning_names_the_worker_by_its_own_masked_address() {
+        let policy = boundary_only_policy();
+        policy.init_prefill_worker_urls(&prefill_workers(&["http://w1:8000"]));
+        let unlisted = prefill_workers(&["http://s3cret-token@2130706433"]);
+        assert_eq!(select(&policy, &unlisted, 100), Some(0));
+        assert!(logs_contain("randomly selecting: http://***@2130706433"));
+        assert!(!logs_contain("s3cret"));
     }
 
     /// The adjustment walks the size histogram and every bound it writes is
