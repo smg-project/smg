@@ -94,9 +94,10 @@ serde_yaml = { workspace = true, optional = true }
 # clock's first read looks for the kernel's fast path through the process's
 # auxiliary vector, and the library's own read of it faults where a tool
 # hides that page from the process (a run under valgrind); libc's read is the
-# one such tools serve.
+# one such tools serve. `fs`: the controller opens its spec file without
+# waiting, where an open of a pipe waits for a writer.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { version = "1", default-features = false, features = ["process", "std", "time", "use-libc-auxv"], optional = true }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "time", "use-libc-auxv"], optional = true }
 
 # The binary's allocator, the one the gateway's binary registers, on the
 # targets the gateway registers it: a burst of registrations builds the
