@@ -555,10 +555,12 @@ impl Assembler {
     /// One element with no child yet is closed by the tag, not fed it as text: an element the
     /// tool declares an array or an object, holding nothing but whitespace, when the tag names
     /// the element directly around it. A closing tag is no value of a list or an object, so the
-    /// model left the element's own close out: the element is written empty, as its own close
-    /// writes it ([`Self::close_element`]), behind one `Malformed { TagCutShort }` event of no
-    /// bytes, and the tag closes the element it names. Nothing is refused, so the call stays
-    /// whole. Where the empty container would nest past [`DEEPEST`], the tag stays text.
+    /// model left the element's own close out: the element is written empty (`[]` or `{}`)
+    /// through [`Self::close_element`], behind one `Malformed { TagCutShort }` event of no
+    /// bytes, and the tag closes the element it names. Whitespace the element held is dropped
+    /// here; its own close would have written it as the element's text. Nothing is refused, so
+    /// the call stays whole. Where the empty container would nest past [`DEEPEST`], the tag
+    /// stays text.
     fn close_tag(&mut self, name: &str, bytes: String, declared: &Declared, out: &mut Events) {
         match self.open.last() {
             Some(element) if element.key == name => self.close_element(&bytes, declared, out),
@@ -573,10 +575,7 @@ impl Assembler {
                     .is_some_and(|around| around.key == name)
                 && matches!(self.kind_here(declared), Some(Kind::Array | Kind::Object)) =>
             {
-                out.push(Event::Malformed {
-                    text: Text::uncounted(String::new()),
-                    why: MalformedReason::TagCutShort,
-                });
+                super::left_open(MalformedReason::TagCutShort, out);
                 // Whitespace held is no value here: its bytes leave as the fragment's source.
                 self.value.clear();
                 self.close_element("", declared, out);
