@@ -3747,7 +3747,8 @@ fn a_refusal_for_a_drained_pool_is_counted_as_unavailable_not_as_a_backend_error
 /// The gateway's request timeout on a gRPC worker, in the shapes the
 /// issue's reproduction had: a streamed completion whose engine takes
 /// the request and says nothing ends at the deadline with the HTTP
-/// path's `stream_error` event under the timeout's message and `[DONE]`,
+/// path's `stream_error` event under the timeout's code and message and
+/// `[DONE]`,
 /// the engine receives the abort for that request before the client
 /// reads the event, and the worker's load goes with the body.
 #[tokio::test]
@@ -3781,6 +3782,10 @@ async fn a_streamed_request_to_a_silent_worker_ends_at_the_request_timeout_and_i
         "ended after {elapsed:?}: {body}"
     );
     assert!(body.contains("\"type\":\"stream_error\""), "{body}");
+    assert!(
+        body.contains("\"code\":\"call_upstream_timeout\""),
+        "the event names the timeout as the 504 does: {body}"
+    );
     assert!(body.contains("request timed out after 300ms"), "{body}");
     assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
     assert_aborted_and_released(&scheduler, &worker).await;
