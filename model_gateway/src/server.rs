@@ -1434,13 +1434,13 @@ pub fn build_apps(
     #[cfg(feature = "experimental-responses-websocket")]
     let realtime_routes = realtime_routes.route(
         "/v1/responses",
-        get(responses_ws::upgrade).layer(Extension(responses_ws::Dispatch(
-            protected_routes
+        get(responses_ws::upgrade).layer(Extension(responses_ws::Dispatch {
+            service: protected_routes
                 .clone()
                 .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
                 .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
                 .with_state(app_state.clone()),
-            Arc::new({
+            track_response: Arc::new({
                 let tracker = app_state.context.inflight_tracker.clone();
                 move || {
                     let guard = tracker.track();
@@ -1450,8 +1450,8 @@ pub fn build_apps(
                     Ok(Box::new(guard) as Box<dyn Send>)
                 }
             }),
-            max_payload_size,
-        ))),
+            max_payload_bytes: max_payload_size,
+        })),
     );
     let realtime_routes = realtime_routes
         .route("/v1/realtime", get(v1_realtime_ws))
