@@ -26,10 +26,7 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
-        health::{
-            circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
-            resilience::resolve_resilience,
-        },
+        health::{circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience},
         identity::{
             basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
             endpoint::Endpoint,
@@ -257,7 +254,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let http_client = context.data.http_client("create_worker")?;
         let http2 = context.data.http2.unwrap_or(false);
 
-        let overload_defaults = OverloadThresholds::from_gateway_config(&app_context.router_config);
+        let overload_defaults = app_context.router_config.worker_overload_thresholds();
 
         let health_base = app_context.router_config.health_check.to_protocol_config();
         let health_config =

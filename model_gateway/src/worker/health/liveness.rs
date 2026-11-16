@@ -143,7 +143,6 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
 use crate::{
-    config::RouterConfig,
     observability::metrics::Metrics,
     worker::{
         identity::basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
@@ -641,24 +640,20 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
     let _ = THRESHOLDS.set((stall, wedge, stale));
 }
 
-/// Apply every liveness budget the configuration carries: the stall, wedge
-/// and stale thresholds and the warm-up slice. The one place the budgets
-/// are read from a configuration, for the server's start-up and, as
+/// Apply every liveness budget the host hands in: the stall, wedge and
+/// stale thresholds and the warm-up slice. The one place the budgets are
+/// set from outside, for the server's start-up and, as
 /// `worker::configure_liveness`, for a host that builds the context without
 /// the builder (the test harness today); the first call in a process wins,
 /// as for the thresholds' own setter.
-pub fn configure_from(config: &RouterConfig) {
-    configure(
-        Duration::from_secs(config.worker_stall_secs),
-        Duration::from_secs(config.worker_wedge_secs),
-        Duration::from_secs(config.worker_stale_secs),
-    );
+pub fn configure_from(budgets: Budgets) {
+    configure(budgets.stall, budgets.wedge, budgets.stale);
     configure_warmup(Warmup {
-        secs: Duration::from_secs(config.worker_warmup_secs),
-        share: config.worker_warmup_share,
-        blocks: config.worker_warmup_blocks,
-        thin_ratio: config.worker_warmup_thin_ratio,
-        divert_every: config.worker_warmup_divert_every,
+        secs: budgets.warmup_secs,
+        share: budgets.warmup_share,
+        blocks: budgets.warmup_blocks,
+        thin_ratio: budgets.warmup_thin_ratio,
+        divert_every: budgets.warmup_divert_every,
     });
 }
 
