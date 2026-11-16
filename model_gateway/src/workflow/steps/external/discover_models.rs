@@ -14,7 +14,10 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     routers::provider_support,
     server::http_client_builder,
-    worker::identity::endpoint::Endpoint,
+    worker::{
+        identity::endpoint::Endpoint,
+        registry::service::{control_character_refusal, logged_strings},
+    },
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -263,6 +266,10 @@ async fn fetch_models(
     );
 
     let model_cards = group_models_into_cards(models_response.data);
+    // The ids are the provider's own report, which no door checked.
+    if let Some(refusal) = control_character_refusal(model_cards.iter().flat_map(logged_strings)) {
+        return Err(refusal);
+    }
 
     debug!(
         "Grouped into {} model cards with aliases",
@@ -375,7 +382,25 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
 #[cfg(test)]
 mod tests {
     use super::fetch_models;
-    use crate::worker::test_support::RefusedAddress;
+    use crate::{
+        worker::test_support::RefusedAddress,
+        workflow::steps::local::test_support::serve_json_routes,
+    };
+
+    /// A model id the provider lists is refused like one a request carries:
+    /// the discovery fails with the door's sentence, which does not repeat
+    /// the id.
+    #[tokio::test]
+    async fn a_listed_model_id_with_a_control_character_fails_the_discovery() {
+        let listed = serde_json::json!({ "data": [{ "id": "m\nINJECTED" }] });
+        let url = serve_json_routes(vec![("/v1/models", http::StatusCode::OK, listed)]).await;
+
+        let err = fetch_models(&url, None, None)
+            .await
+            .expect_err("the listed id is refused");
+
+        assert_eq!(err, "models[].id must not contain control characters");
+    }
 
     /// An address registered with a query, at a port nobody listens on: the
     /// failure does not repeat the query. The HTTP client's own error text

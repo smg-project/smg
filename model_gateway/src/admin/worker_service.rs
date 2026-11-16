@@ -73,6 +73,31 @@ fn bad_request(message: String) -> WorkerServiceError {
     WorkerServiceError::BadRequest { message }
 }
 
+/// The strings of a model card that log lines and a failed job's text write
+/// as they came, each under its field's name in a registration body.
+pub(crate) fn logged_strings(
+    card: &openai_protocol::model_card::ModelCard,
+) -> [(&'static str, Option<&str>); 3] {
+    [
+        ("models[].id", Some(card.id.as_str())),
+        (
+            "models[].reasoning_parser",
+            card.reasoning_parser.as_deref(),
+        ),
+        ("models[].tool_parser", card.tool_parser.as_deref()),
+    ]
+}
+
+/// The refusal for the first of `strings` that carries a control character.
+pub(crate) fn control_character_refusal<'a>(
+    strings: impl IntoIterator<Item = (&'static str, Option<&'a str>)>,
+) -> Option<String> {
+    strings
+        .into_iter()
+        .find(|(_, text)| text.is_some_and(has_control_character))
+        .map(|(field, _)| format!("{field} must not contain control characters"))
+}
+
 /// The bounds a registration body must satisfy before any job is queued:
 /// the URL's length, and no control character in it, in a model's id or in
 /// a parser's name; the labels' count, charset and size, the shape of the
@@ -90,22 +115,10 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     }
     // Log lines and a failed job's text write these as they came, so a line
     // break in one would start a line of the caller's choosing.
-    let of_models = spec.models.iter().flat_map(|card| {
-        [
-            ("models[].id", Some(card.id.as_str())),
-            (
-                "models[].reasoning_parser",
-                card.reasoning_parser.as_deref(),
-            ),
-            ("models[].tool_parser", card.tool_parser.as_deref()),
-        ]
-    });
-    for (field, text) in std::iter::once(("url", Some(spec.url.as_str()))).chain(of_models) {
-        if text.is_some_and(has_control_character) {
-            return Err(bad_request(format!(
-                "{field} must not contain control characters"
-            )));
-        }
+    let of_models = spec.models.iter().flat_map(logged_strings);
+    let strings = std::iter::once(("url", Some(spec.url.as_str()))).chain(of_models);
+    if let Some(refusal) = control_character_refusal(strings) {
+        return Err(bad_request(refusal));
     }
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;
