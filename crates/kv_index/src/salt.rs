@@ -28,8 +28,8 @@ pub fn namespace_seed(lora_name: Option<&str>, cache_salt: Option<&str>) -> u64 
 /// one shot over a stack buffer for blocks up to 256 tokens. The streaming
 /// hasher derives a seeded secret per instance before it sees a byte, which
 /// outweighs hashing a 16-token block. Same digest either way (the tests pin
-/// that). The plain hash keeps its own copy of this body: under a seed it
-/// cannot fold as a constant it costs more.
+/// that). The plain hash keeps its own copy of this body: routed through
+/// here, its seed can no longer fold as a constant, and it costs more.
 pub fn content_hash_with_seed(token_ids: &[u32], seed: u64) -> ContentHash {
     const STACK_BYTES: usize = 1024;
     let len = token_ids.len() * 4;
