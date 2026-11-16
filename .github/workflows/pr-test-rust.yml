@@ -364,8 +364,8 @@ jobs:
         if: matrix.fmt
         run: |
           source "$HOME/.cargo/env"
-          bash scripts/ci_retry.sh 3 10 rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
-          bash scripts/ci_retry.sh 3 10 rustup toolchain install nightly --profile minimal
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
           # The Symphony fuzz crate is a workspace of its own; the root's fmt does not reach it.
           cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
@@ -373,7 +373,7 @@ jobs:
       - name: Lint
         run: |
           source "$HOME/.cargo/env"
-          rustup component add clippy
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup component add clippy
           bash scripts/ci_rust_tests.sh lint ${{ matrix.leg }}
 
       # The shard table is a partition of the workspace: every package, every
@@ -441,10 +441,10 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           # build.sh adds a missing target by one attempt; added here first,
           # behind the retry helper, it is not missing.
-          bash scripts/ci_retry.sh 3 10 rustup target add wasm32-unknown-unknown
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup target add wasm32-unknown-unknown
           bash examples/wasm/wasm-guest-policy/build.sh
           cd examples/wasm/wasm-guest-policy
-          bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 3 10 rustup toolchain install nightly --profile minimal --component rustfmt
+          bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 5 10 timeout 180 rustup toolchain install nightly --profile minimal --component rustfmt
           cargo +nightly fmt -- --check
           cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings
 
@@ -602,7 +602,7 @@ jobs:
       - name: Lint the crates with AArch64-only code
         run: |
           source "$HOME/.cargo/env"
-          rustup component add clippy
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup component add clippy
           cargo clippy -p llm-multimodal -p kv-index --all-targets -- -D warnings
 
       # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
