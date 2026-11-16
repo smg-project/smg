@@ -4108,3 +4108,258 @@ fn remove_if_removes_the_worker_only_while_its_condition_holds() {
         "a worker gone reads None"
     );
 }
+
+/// The series a build writes for `url`, as lines of the store's scrape.
+fn series_lines_of(url: &str) -> usize {
+    let mut rendered = String::new();
+    worker_metrics::installed_or_default().render_into(&mut rendered);
+    let label = format!("worker=\"{url}\"");
+    rendered
+        .lines()
+        .filter(|line| line.contains(&label))
+        .count()
+}
+
+/// A worker of one model at `url` with no health check, built and not
+/// registered.
+fn built_at(url: &str) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .health_config(no_health_check())
+            .build(),
+    )
+}
+
+/// A worker that a registration built and did not register leaves no series
+/// of its address: the builder wrote them, and the registry retires them on
+/// the registration's word. An address the registry never heard of gets no
+/// index entry; a reserved one keeps its reservation, which is the job's to
+/// release, and no lock of the reserved id is left behind. The address
+/// records again once a worker registers at it.
+#[test]
+fn a_built_worker_that_never_registered_is_retired_from_the_series_store() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+
+        let unknown = "http://never-registered-seam:8080";
+        let built = built_at(unknown);
+        assert!(series_lines_of(unknown) > 0, "the builder wrote its series");
+        registry.retire_unregistered(&built);
+        assert_eq!(series_lines_of(unknown), 0);
+        assert!(series.is_retired(unknown));
+        assert!(!registry.url_to_id.contains_key(unknown));
+
+        let reserved = "http://reserved-seam:8080";
+        let id = registry.reserve_id_for_url(reserved);
+        let built = built_at(reserved);
+        assert!(
+            series_lines_of(reserved) > 0,
+            "the builder wrote its series"
+        );
+        registry.retire_unregistered(&built);
+        assert_eq!(series_lines_of(reserved), 0);
+        assert_eq!(registry.reserve_id_for_url(reserved), id);
+        assert!(!registry.worker_mutation_locks.contains_key(&id));
+
+        assert_eq!(registry.register(built_at(reserved)), Some(id));
+        assert!(!series.is_retired(reserved));
+        assert!(
+            series_lines_of(reserved) > 0,
+            "a registered address records again"
+        );
+    });
+}
+
+/// An address that holds a registered worker keeps its series when a
+/// registration builds another worker for it and is refused: the series are
+/// the registered worker's, and so is the lock of its id.
+#[test]
+fn a_refused_build_at_a_registered_address_leaves_the_registered_workers_series() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        let url = "http://held-seam:8080";
+        let id = registry.register(built_at(url)).unwrap();
+        let before = series_lines_of(url);
+        assert!(before > 0, "a registered address has its series");
+
+        let refused = built_at(url);
+        registry.retire_unregistered(&refused);
+
+        assert!(!series.is_retired(url));
+        assert_eq!(series_lines_of(url), before);
+        assert!(registry.worker_mutation_locks.contains_key(&id));
+    });
+}
+
+/// Waits until the retirement's handle of `lock` shows beside the map's and
+/// the case's own. The retirement has read the address's id by then, and
+/// waits on the lock from there, however late its thread started.
+fn until_the_retirement_holds(lock: &Arc<parking_lot::Mutex<()>>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Arc::strong_count(lock) < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retirement never reached the address's mutation lock"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// The retirement waits for the address's mutation lock, the one a
+/// registration holds from before its worker is visible until its series are
+/// written, so it never runs inside that stretch. An address whose id
+/// changed while it waited is another registration's and is left alone. A
+/// lock that is held elsewhere, as by a waiting registration, stays in the map.
+#[test]
+fn the_retirement_of_an_unregistered_build_waits_for_the_addresss_mutation_lock() {
+    let series = worker_metrics::installed_or_default();
+    let registry = Arc::new(WorkerRegistry::new());
+    let lock_of = |id: &WorkerId| {
+        registry
+            .worker_mutation_locks
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    };
+    let retiring = |built: &Arc<dyn Worker>| {
+        let (registry, built) = (Arc::clone(&registry), Arc::clone(built));
+        std::thread::spawn(move || registry.retire_unregistered(&built))
+    };
+
+    // The lock is held, as by a registration: the retirement waits, then runs.
+    let url = "http://locked-seam:8080";
+    let id = registry.reserve_id_for_url(url);
+    let lock = lock_of(&id);
+    let held = lock.lock();
+    let built = built_at(url);
+    let waiting = retiring(&built);
+    until_the_retirement_holds(&lock);
+    // A retirement that did not wait would be done well within this pause.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !series.is_retired(url),
+        "the retirement ran under a held mutation lock"
+    );
+    drop(held);
+    waiting.join().unwrap();
+    assert!(series.is_retired(url));
+    assert!(
+        registry
+            .worker_mutation_locks
+            .get(&id)
+            .is_some_and(|kept| Arc::ptr_eq(kept.value(), &lock)),
+        "a lock that is still held elsewhere was swept from the map"
+    );
+
+    // While it waits the reservation is released and the address reserved
+    // again, under another id: the address is left alone.
+    let url = "http://rereserved-seam:8080";
+    let first = registry.reserve_id_for_url(url);
+    let lock = lock_of(&first);
+    let held = lock.lock();
+    let built = built_at(url);
+    let waiting = retiring(&built);
+    until_the_retirement_holds(&lock);
+    registry.release_reservation(url);
+    assert_ne!(registry.reserve_id_for_url(url), first);
+    drop(held);
+    waiting.join().unwrap();
+    assert!(
+        !series.is_retired(url),
+        "an address reserved again under another id was retired"
+    );
+}
+
+/// The retirement runs under the id's lock as the map holds it. A removal
+/// drops that lock from the map under its guard, and a registration under
+/// the same id, as a mesh import's is, makes another and holds it: a
+/// retirement that waited on the first takes the second before it reads the
+/// address. Here the second lock is held while the first is let go.
+#[test]
+fn the_retirement_takes_a_lock_made_again_under_the_id_before_it_reads_the_address() {
+    let series = worker_metrics::installed_or_default();
+    let registry = Arc::new(WorkerRegistry::new());
+    let url = "http://remade-lock-seam:8080";
+    let id = registry.reserve_id_for_url(url);
+    let first = registry
+        .worker_mutation_locks
+        .entry(id.clone())
+        .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+        .clone();
+    let held = first.lock();
+    // The case keeps the built worker: its address reads retired while it lives.
+    let built = built_at(url);
+    let waiting = {
+        let (registry, built) = (Arc::clone(&registry), Arc::clone(&built));
+        std::thread::spawn(move || registry.retire_unregistered(&built))
+    };
+    until_the_retirement_holds(&first);
+
+    registry.worker_mutation_locks.remove(&id);
+    let again = Arc::new(parking_lot::Mutex::new(()));
+    registry
+        .worker_mutation_locks
+        .insert(id.clone(), Arc::clone(&again));
+    let held_again = again.lock();
+    drop(held);
+    // The retirement now waits on the second lock, or it ran under the first.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Arc::strong_count(&again) < 3 && !series.is_retired(url) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retirement neither reached the second lock nor retired the address"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        !series.is_retired(url),
+        "the retirement ran under a lock the map no longer holds"
+    );
+    drop(held_again);
+    waiting.join().unwrap();
+    assert!(series.is_retired(url));
+    assert!(
+        registry
+            .worker_mutation_locks
+            .get(&id)
+            .is_some_and(|kept| Arc::ptr_eq(kept.value(), &again)),
+        "the lock made again was swept with the case's handle on it"
+    );
+}
+
+/// The sweep takes the caller's lock out of the map and no other. A lock the
+/// map holds under the id that the caller did not take stays, though the
+/// map's handle and the case's are the two the sweep counts for its own.
+#[test]
+fn the_sweep_leaves_a_lock_the_caller_did_not_take() {
+    let registry = WorkerRegistry::new();
+    let id = registry.reserve_id_for_url("http://swept-lock-seam:8080");
+    let callers = Arc::new(parking_lot::Mutex::new(()));
+    let maps = Arc::new(parking_lot::Mutex::new(()));
+    registry
+        .worker_mutation_locks
+        .insert(id.clone(), Arc::clone(&maps));
+    registry.sweep_mutation_lock(&id, &callers);
+    assert!(
+        registry
+            .worker_mutation_locks
+            .get(&id)
+            .is_some_and(|kept| Arc::ptr_eq(kept.value(), &maps)),
+        "a lock the caller did not take was swept"
+    );
+
+    // The lock the caller did take, with no other holder, goes.
+    registry.sweep_mutation_lock(&id, &maps);
+    assert!(!registry.worker_mutation_locks.contains_key(&id));
+}

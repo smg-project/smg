@@ -1234,6 +1234,16 @@ impl JobQueue {
                     .wait_for_terminal_state(instance_id, &label, timeout_duration)
                     .await?;
                 let outcome = wfaas::completion_outcome(&state, &label);
+                // A registration that built its workers and did not register
+                // them leaves no series of their addresses: the builder wrote
+                // each address's health, HTTP/2 and breaker series, and no
+                // removal follows a registration that did not happen. A
+                // worker that did register is skipped: its series are its own.
+                if outcome.is_err() {
+                    for worker in state.context.data.actual_workers.iter().flatten() {
+                        context.worker_registry.retire_unregistered(worker);
+                    }
+                }
                 // A POST's registration that put its worker in the registry
                 // and did not finish (a DELETE's cancel landing after the
                 // registry step, a later step's failure) leaves no worker
@@ -3563,6 +3573,105 @@ mod tests {
         );
     }
 
+    /// A registration that fails after its workers are built leaves no
+    /// series of their address in the scrape. The build writes the address's
+    /// health and HTTP/2 gauges and its breaker's state, and a worker that
+    /// never reached the registry has no removal to retire them: here a
+    /// replacement whose worker id is gone, refused at the registry step.
+    #[test]
+    fn a_registration_that_fails_after_its_build_leaves_no_series_of_its_address() {
+        use http::StatusCode;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            observability::worker_metrics::{self, WorkerSeriesRecorder},
+            worker::WorkerRegistry,
+            workflow::{steps::local::test_support::serve_json_routes, WorkflowEngines},
+        };
+
+        let series = worker_metrics::installed_or_default();
+        let recorder = WorkerSeriesRecorder::new(
+            PrometheusBuilder::new().build_recorder(),
+            Arc::clone(series),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The queue's tasks and the workflow's run on this thread, under the
+        // local recorder.
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let url = serve_json_routes(vec![
+                    ("/health", StatusCode::OK, serde_json::json!({})),
+                    (
+                        "/get_server_info",
+                        StatusCode::OK,
+                        serde_json::json!({"model_path": "org/model"}),
+                    ),
+                    (
+                        "/v1/models",
+                        StatusCode::OK,
+                        serde_json::json!({"data": [{"id": "served"}]}),
+                    ),
+                ])
+                .await;
+                let router_config = RouterConfig::default();
+                let registry = Arc::new(WorkerRegistry::new());
+                let context =
+                    app_context_for_tests(router_config.clone(), Arc::clone(&registry), None);
+                assert!(
+                    context
+                        .workflow_engines
+                        .set(WorkflowEngines::new(&router_config))
+                        .is_ok(),
+                    "the engines are set once"
+                );
+                let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+                assert!(
+                    context.worker_job_queue.set(Arc::clone(&queue)).is_ok(),
+                    "the queue is set once"
+                );
+
+                let mut spec = WorkerSpec::new(url.as_str());
+                spec.runtime_type = RuntimeType::Sglang;
+                let outcome = queue
+                    .submit_and_wait(
+                        Job::AddWorker {
+                            config: Box::new(spec),
+                            registration_mode: WorkerRegistrationMode::ReplaceById {
+                                worker_id: "a-worker-id-that-is-gone".to_string(),
+                                expected_revision: 0,
+                            },
+                        },
+                        Duration::from_secs(60),
+                    )
+                    .await;
+                let failure = match outcome {
+                    Err(JobOutcomeError::Failed(reason)) => reason,
+                    other => panic!("the refused replacement's job ended otherwise: {other:?}"),
+                };
+                assert!(
+                    registry.get_by_url(&url).is_none(),
+                    "the refused replacement is registered: {failure}"
+                );
+
+                let mut rendered = String::new();
+                series.render_into(&mut rendered);
+                let label = format!("worker=\"{url}\"");
+                let left: Vec<&str> = rendered
+                    .lines()
+                    .filter(|line| line.contains(&label))
+                    .collect();
+                assert!(
+                    left.is_empty(),
+                    "the scrape holds the series of a worker that never registered \
+                     (the job's failure: {failure}): {left:?}"
+                );
+            });
+        });
+    }
     /// What `a_delete_setting` builds: the context, its queue and registry,
     /// the worker under the URL and that worker's id.
     type DeleteSetting = (
