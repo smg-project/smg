@@ -1112,11 +1112,15 @@ impl ConfigValidator {
 
     fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
         match mode {
-            RoutingMode::Regular { worker_urls } => {
+            // Allow empty URLs to support dynamic worker addition
+            // URLs will be validated if provided
+            RoutingMode::Regular { worker_urls }
+            | RoutingMode::OpenAI { worker_urls }
+            | RoutingMode::Anthropic { worker_urls }
+            | RoutingMode::Gemini { worker_urls } => {
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;
                 }
-                // Allow empty URLs without service discovery to match legacy behavior
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
@@ -1126,26 +1130,11 @@ impl ConfigValidator {
             } => {
                 // Allow empty URLs even without service discovery to support dynamic worker addition
                 // URLs will be validated if provided
-                if !prefill_urls.is_empty() {
-                    let prefill_url_strings: Vec<String> =
-                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
-                    Self::validate_urls(&prefill_url_strings)?;
-                }
+                Self::validate_url_port_urls(prefill_urls)?;
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
                 }
-
-                for (_url, port) in prefill_urls {
-                    if let Some(port) = port {
-                        if *port == 0 {
-                            return Err(ConfigError::invalid_value(
-                                "bootstrap_port",
-                                port,
-                                "Port must be between 1 and 65535",
-                            ));
-                        }
-                    }
-                }
+                Self::validate_bootstrap_ports(prefill_urls)?;
 
                 if let Some(p_policy) = prefill_policy {
                     Self::validate_policy(p_policy)?;
@@ -1163,22 +1152,8 @@ impl ConfigValidator {
                 decode_policy,
             } => {
                 for urls in [encode_urls, prefill_urls] {
-                    if !urls.is_empty() {
-                        let url_strings: Vec<String> =
-                            urls.iter().map(|(url, _)| url.clone()).collect();
-                        Self::validate_urls(&url_strings)?;
-                    }
-                    for (_url, port) in urls {
-                        if let Some(port) = port {
-                            if *port == 0 {
-                                return Err(ConfigError::invalid_value(
-                                    "bootstrap_port",
-                                    port,
-                                    "Port must be between 1 and 65535",
-                                ));
-                            }
-                        }
-                    }
+                    Self::validate_url_port_urls(urls)?;
+                    Self::validate_bootstrap_ports(urls)?;
                 }
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
@@ -1194,24 +1169,24 @@ impl ConfigValidator {
                     Self::validate_policy(policy)?;
                 }
             }
-            RoutingMode::OpenAI { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Anthropic { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Gemini { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
+        }
+        Ok(())
+    }
+
+    fn validate_url_port_urls(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        urls.iter()
+            .try_for_each(|(url, _)| validate_worker_url(url))
+    }
+
+    fn validate_bootstrap_ports(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        for (_url, port) in urls {
+            if let Some(port) = port {
+                if *port == 0 {
+                    return Err(ConfigError::invalid_value(
+                        "bootstrap_port",
+                        port,
+                        "Port must be between 1 and 65535",
+                    ));
                 }
             }
         }
