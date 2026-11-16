@@ -476,21 +476,28 @@ mod tests {
     #[test]
     fn the_tables_read_every_code_point_as_the_classes_do() {
         // Classes of every kind: a category, a negated set with a category,
-        // a range set, whitespace, a single character.
-        let pattern =
-            Pattern::parse(r"\p{L}|[^\r\n\p{L}\p{N}]|[一-龥぀-ゟ゠-ヿ]|\s|\p{N}|'").expect("parses");
+        // a range set, whitespace, a single character, a category with an
+        // exclusion.
+        let pattern = Pattern::parse(concat!(
+            r"\p{L}|[^\r\n\p{L}\p{N}]|[一-龥぀-ゟ゠-ヿ]|\s|\p{N}|'",
+            r"|[\p{L}&&[^\p{Lu}]]",
+        ))
+        .expect("parses");
         let classes: Vec<&Class> = pattern.classes().iter().collect();
         let roles = Roles::build(&classes);
         let mut text = String::new();
         // Above the plane the table is runs: both ends of every run are read
-        // beside the sample.
+        // beside the sample, and every code point of the block at U+10400,
+        // where only the exclusion cuts a run of the last class (capitals
+        // out, small letters in).
         let mut changes = vec![PLANE];
         for class in &classes {
             class.changes_from(PLANE, &mut changes);
         }
         let ends = changes.iter().flat_map(|&code| code - 1..=code);
+        let cuts = 0x1_0400..=0x1_044F;
         let sample = (0..0x11_0000u32).filter(|code| code % 7 == 0 || *code < 0x3000);
-        for code in sample.chain(ends) {
+        for code in sample.chain(ends).chain(cuts) {
             let Some(c) = char::from_u32(code) else {
                 continue;
             };
