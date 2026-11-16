@@ -124,7 +124,13 @@ the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
 `{` at the first byte as one call alone and every further object after it, behind a `;` or behind
 whitespace alone, as another call, and carries the family's call marker the output may open with
-(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does. The stages
+(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does; `Forced` (a
+required call's list under the request's JSON schema) reads as `ObjectOrList` with no marker and
+differs at the end of the stream alone, where the engine held the output to the list and no byte of
+an open one is prose: the separators held after a call, an object cut before its arguments began and
+what a started call's object held behind its arguments are refused (`tagged::refuse`: an event of no
+bytes counts each run and the bytes are `Dropped`), where every other framing returns them as
+`Malformed`. The stages
 (deciding at the first byte that is not whitespace, inside the marker, between objects, inside one,
 after the `]` or the lone object) and what they say of the bytes around the objects (the brackets,
 the commas, the `;` and the wrapping whitespace `Dropped`; text between objects `Malformed`, one run
@@ -426,7 +432,7 @@ What the syntax says, and what the assembler does with it:
   text spells) would nest past the bound, and an empty element the tool declares a container
   at the bound, are refused the same way, so the bound holds for the value the client reads,
   not only for the tags. Whitespace right after an opening tag is held
-  until the element's next byte says what it is: a leaf's text when text or the closing tag
+  until the element's next byte says what it is: a leaf's text when text or its own closing tag
   follows (a value that is one space is one space), the template's when a child tag follows.
 - **A value's type comes from the request's tools at every depth** (`Declared::kind_at`:
   below an object a key selects a property, below an array any element selects its items). A
@@ -436,6 +442,16 @@ What the syntax says, and what the assembler does with it:
   array or an object there, `null` when nothing is declared and it is a list's item, and `""`
   everywhere else: the template writes `None` inside a list as an empty element, skips a
   mapping's `None` member, and leaves a top-level argument that is `None` out altogether.
+  An element declared an array or an object that the model opens, leaves empty (whitespace at
+  most) and never closes, the closing tag of the element directly around it following, is
+  written `[]` or `{}` too: a closing tag is no value of a list or an object, so only the
+  element's own close is missing. Whitespace it held is dropped there, though under the
+  element's own closing tag it is the element's text. One `Malformed { TagCutShort }` event
+  of no bytes stands before its fragment, nothing is refused, and the call stays whole.
+  The tag stays the
+  element's text under a declared string or integer, under an element with no declaration,
+  under a declared container that holds text already or whose empty value would nest past the
+  bound, and when it names an element further out; the call's own end closes no element so.
   Nothing is taken from a value: the template writes it directly between the tags, with no
   escaping.
 - **A top-level null is never written.** The template leaves an argument whose value is `None`

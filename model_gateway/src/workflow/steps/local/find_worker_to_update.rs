@@ -6,7 +6,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::find_workers_by_url;
 use crate::{
-    worker::{endpoint::Endpoint, registry::WorkerId},
+    worker::{identity::endpoint::Endpoint, registry::WorkerId},
     workflow::data::WorkerUpdateWorkflowData,
 };
 

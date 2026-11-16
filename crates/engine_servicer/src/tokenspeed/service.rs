@@ -17,7 +17,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{admin, kv_events, rpc, servicer::RequestOrigin, BoxStream};
+use crate::{admin, rpc, servicer::RequestOrigin, BoxStream};
 
 #[derive(Clone)]
 pub(super) struct TokenSpeedService {
@@ -156,6 +156,6 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        rpc::subscribe_kv_events(&self.state, request, kv_events::TOKENSPEED_DISABLED_MESSAGE)
+        rpc::subscribe_kv_events(&self.state, request, &self.state.kv_events_disabled)
     }
 }

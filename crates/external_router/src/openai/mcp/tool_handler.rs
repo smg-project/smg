@@ -193,10 +193,6 @@ impl StreamingToolHandler {
             .or_else(|| self.accumulator.original_response_id())
     }
 
-    pub fn snapshot_final_response(&self) -> Option<Value> {
-        self.accumulator.snapshot_final_response()
-    }
-
     /// Process an SSE event given as its name and data payload: the payload
     /// is parsed here, once, and handed to [`Self::process_parsed`]. An
     /// unparsable payload reaches the accumulator (which logs it, as it
@@ -1117,7 +1113,8 @@ mod tests {
         assert!(matches!(action, StreamAction::Forward), "{action:?}");
         assert_eq!(handler.original_response_id(), Some("resp_lines"));
         let record = handler
-            .snapshot_final_response()
+            .accumulator
+            .into_final_response()
             .expect("the created event is on record");
         assert_eq!(record["id"], json!("resp_lines"));
     }
@@ -1175,7 +1172,10 @@ mod tests {
             "{completed_action:?}"
         );
         assert_eq!(
-            handler.snapshot_final_response().map(|r| r["id"].clone()),
+            handler
+                .accumulator
+                .into_final_response()
+                .map(|r| r["id"].clone()),
             Some(json!("resp_pinned"))
         );
         assert_eq!(

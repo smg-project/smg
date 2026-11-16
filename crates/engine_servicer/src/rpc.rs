@@ -42,7 +42,7 @@ pub(crate) async fn get_tokenizer<S: WireState>(
 pub(crate) fn subscribe_kv_events<S: WireState + RankLoads>(
     state: &Arc<S>,
     request: Request<common::SubscribeKvEventsRequest>,
-    disabled: &'static str,
+    disabled: &str,
 ) -> Result<Response<BoxStream<common::KvEventBatch>>, Status> {
     let request = request.into_inner();
     if request.loads_only {

@@ -992,6 +992,24 @@ ServiceMonitor.
 {{- end }}
 
 {{/*
+Policy controller election -- "true" when policyController.election.enabled
+is set; empty when it is not, and over values that hold no election block.
+*/}}
+{{- define "smg.policyControllerElection" -}}
+{{- if ((.Values.policyController).election).enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Policy controller Lease name -- policyController.election.leaseName, or the
+controller's full name when it is empty: two releases in one namespace never
+share a Lease. No revision is in it: a name that moved at an upgrade would
+elect a second leader beside the first.
+*/}}
+{{- define "smg.policyControllerLeaseName" -}}
+{{- default (include "smg.policyControllerName" .) ((.Values.policyController).election).leaseName -}}
+{{- end }}
+
+{{/*
 Policy controller selector labels -- the release's selector labels with the
 controller's own component, so no router or worker selector takes its pods.
 */}}
@@ -1001,16 +1019,39 @@ app.kubernetes.io/component: policy-controller
 {{- end }}
 
 {{/*
-Policy controller image -- policyController.image, its registry falling back
-to the global one. The repository and the tag have no default: no controller
-image is published yet.
+Policy controller image -- policyController.image, each part falling back to
+the router's image: the global registry, the global repository, and the
+router's tag with -policy-controller appended, the tag a release publishes
+the controller under. One version names both images: a release publishes one
+controller image, so the router's -slurm variant takes it too, its own
+suffix cut first. The default tag belongs to the router's repository and
+stands on the router's tag, so a repository of the operator's own is refused
+without its tag, and so is a router image named by a digest. No release
+older than the first that publishes a controller image has one, so a tag
+that names such a release is refused too. Only the three numbers a release
+tag starts with are compared, each of nine digits at most, a number the
+comparer can hold: any other tag takes the default.
 */}}
 {{- define "smg.policyControllerImage" -}}
 {{- $image := .Values.policyController.image -}}
-{{- if or (not $image.repository) (not $image.tag) -}}
-{{- fail "policyController.enabled needs policyController.image.repository and policyController.image.tag: no controller image is published yet, so neither has a default" -}}
+{{- $routerTag := .Values.global.image.tag | default .Chart.AppVersion -}}
+{{- if and $image.repository (not $image.tag) -}}
+{{- fail "policyController.image.repository needs policyController.image.tag: the default tag is the router's with -policy-controller appended, and it belongs to the router's repository" -}}
 {{- end -}}
-{{- printf "%s/%s:%s" ($image.registry | default .Values.global.image.registry) $image.repository $image.tag -}}
+{{- if and (not $image.tag) (contains "@" $routerTag) -}}
+{{- fail "policyController.image.tag is needed: global.image.tag names the router's image by a digest, and the controller's default tag is the router's tag with -policy-controller appended" -}}
+{{- end -}}
+{{- $firstRelease := "1.16.0" -}}
+{{- $release := regexFind "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}(-|$)" $routerTag | trimSuffix "-" -}}
+{{- if and (not $image.tag) $release -}}
+{{- if semverCompare (printf "<%s" $firstRelease) $release -}}
+{{- fail (printf "policyController.image.tag is needed: global.image.tag %s is older than %s, the first release that publishes a policy controller image" $routerTag $firstRelease) -}}
+{{- end -}}
+{{- end -}}
+{{- $registry := $image.registry | default .Values.global.image.registry -}}
+{{- $repository := $image.repository | default .Values.global.image.repository -}}
+{{- $tag := $image.tag | default (printf "%s-policy-controller" (trimSuffix "-slurm" $routerTag)) -}}
+{{- printf "%s/%s:%s" $registry $repository $tag -}}
 {{- end }}
 
 {{/*
@@ -1019,7 +1060,9 @@ smg-policy-controller, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
 start is refused at render: two listeners on one port, and a settle window
 over half the grace period (the controller's own default of 5 seconds when
-shutdownSettleSeconds is null).
+shutdownSettleSeconds is null). With the election on the Lease is named,
+and the pod's own address, which the kubelet writes in place of $(POD_IP):
+the holder of the Lease is named by an address the others can dial.
 */}}
 {{- define "smg.policyControllerArgs" -}}
 {{- $controller := .Values.policyController -}}
@@ -1036,6 +1079,7 @@ shutdownSettleSeconds is null).
 {{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) -}}
 {{- $settle = int $controller.shutdownSettleSeconds -}}
 {{- end -}}
+{{- $elected := include "smg.policyControllerElection" . -}}
 {{- if gt (mul $settle 2) $grace -}}
 {{- fail (printf "policyController: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
 {{- end -}}
@@ -1061,6 +1105,12 @@ shutdownSettleSeconds is null).
 - {{ $controller.logging.level | quote }}
 {{- if $controller.logging.json }}
 - "--log-json"
+{{- end }}
+{{- if $elected }}
+- "--lease-name"
+- {{ include "smg.policyControllerLeaseName" . | quote }}
+- "--advertise-address"
+- "$(POD_IP)"
 {{- end }}
 {{- range $controller.extraArgs }}
 - {{ . | quote }}

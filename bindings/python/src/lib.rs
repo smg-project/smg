@@ -588,6 +588,7 @@ struct Router {
     engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
+    grouped_dp_sticky: String,
     grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
     health_check_endpoint: String,
@@ -1036,6 +1037,18 @@ impl Router {
         })
     }
 
+    /// The grouped data-parallel pinning by its CLI spelling, read as the
+    /// CLI's value parser reads it; anything else is refused by name.
+    fn parse_grouped_dp_sticky(&self) -> Result<config::GroupedDpSticky, config::ConfigError> {
+        self.grouped_dp_sticky
+            .parse()
+            .map_err(|reason| config::ConfigError::InvalidValue {
+                field: "grouped_dp_sticky".to_string(),
+                value: self.grouped_dp_sticky.clone(),
+                reason,
+            })
+    }
+
     fn parse_assignment_mode(
         &self,
         default: config::ManualAssignmentMode,
@@ -1382,6 +1395,7 @@ impl Router {
             };
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+        let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -1517,6 +1531,7 @@ impl Router {
             .dp_aware(self.dp_aware)
             .engine_metrics(self.engine_metrics)
             .pd_pairing_mode(pd_pairing_mode)
+            .grouped_dp_sticky(grouped_dp_sticky)
             .runtime_worker_threads(self.runtime_worker_threads)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
@@ -1641,6 +1656,7 @@ impl Router {
         engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
+        grouped_dp_sticky = String::from("off"),
         grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
         health_check_endpoint = String::from("/health"),
@@ -1867,6 +1883,7 @@ impl Router {
         engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
+        grouped_dp_sticky: String,
         grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
         health_check_endpoint: String,
@@ -2144,6 +2161,7 @@ impl Router {
             engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
+            grouped_dp_sticky,
             grpc_request_timeout_secs,
             header_read_timeout_secs,
             health_check_endpoint,

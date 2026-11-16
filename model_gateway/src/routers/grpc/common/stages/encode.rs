@@ -762,6 +762,100 @@ mod tests {
         );
     }
 
+    /// An encode send that fails names its worker with the address masked:
+    /// its text is the line the dispatch's supervisor writes at error level.
+    /// Every worker here is registered with a password and a token in its
+    /// query. The encoder call meets a refused connection, a failed call and
+    /// a declined request; the frame's sender meets a worker out of reach,
+    /// one without a backend connection and one off the ZMQ lane.
+    #[tokio::test]
+    async fn a_failed_encode_send_names_its_worker_masked() {
+        use tokenspeed_encoder::token_speed_encoder_server::{
+            TokenSpeedEncoder, TokenSpeedEncoderServer,
+        };
+        use tonic::transport::Server;
+
+        use crate::routers::grpc::test_engine::serve_on_loopback;
+
+        /// An encoder that fails every call, or declines it.
+        struct Encoder {
+            fails: bool,
+        }
+
+        #[tonic::async_trait]
+        impl TokenSpeedEncoder for Encoder {
+            async fn encode(
+                &self,
+                _request: tonic::Request<tokenspeed_encoder::EncodeRequest>,
+            ) -> std::result::Result<
+                tonic::Response<tokenspeed_encoder::EncodeResponse>,
+                tonic::Status,
+            > {
+                if self.fails {
+                    return Err(tonic::Status::internal("the encoder failed"));
+                }
+                Ok(tonic::Response::new(tokenspeed_encoder::EncodeResponse {
+                    accepted: false,
+                }))
+            }
+        }
+
+        let serving = |fails| async move {
+            let service = TokenSpeedEncoderServer::new(Encoder { fails });
+            let (address, _server) =
+                serve_on_loopback(Server::builder().add_service(service)).await;
+            address.port()
+        };
+        let (failing, declining) = (serving(true).await, serving(false).await);
+        // Nothing listens on port 1: the connection is refused.
+        let refusing = 1;
+        let with_secrets = |port: u16| format!("http://user:s3cret@127.0.0.1:{port}/?token=s3cret");
+        let worker = |port, mode| {
+            BasicWorkerBuilder::new(with_secrets(port))
+                .connection_mode(mode)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .build()
+        };
+        let request = tokenspeed_encoder::EncodeRequest::default;
+        let rendezvous = EncodeRendezvous {
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+        };
+
+        let mut failures = Vec::new();
+        for (what, port) in [
+            ("a refused connection", refusing),
+            ("a failed call", failing),
+            ("a declined request", declining),
+        ] {
+            let sent = send_tokenspeed_encode_rpc(with_secrets(port), request()).await;
+            failures.push((what, port, sent.expect_err(what)));
+        }
+        for (what, port, mode) in [
+            ("a worker out of reach", refusing, ConnectionMode::Grpc),
+            (
+                "a worker without a backend connection",
+                refusing,
+                ConnectionMode::Http,
+            ),
+            ("a worker off the ZMQ lane", declining, ConnectionMode::Grpc),
+        ] {
+            let sent =
+                send_tokenspeed_encode_frame(&worker(port, mode), &rendezvous, request()).await;
+            failures.push((what, port, sent.expect_err(what)));
+        }
+        let unmasked: Vec<_> = failures
+            .iter()
+            .filter(|(_, port, text)| {
+                text.contains("s3cret") || !text.contains(&format!("http://***@127.0.0.1:{port}"))
+            })
+            .collect();
+        assert!(
+            unmasked.is_empty(),
+            "encode failures that do not name their worker masked: {unmasked:#?}"
+        );
+    }
+
     /// Real `/dev/shm` segments back the encode jobs, so these run only on
     /// Linux. They prove the encode jobs' SHM Drop guards move with the owning
     /// state: dropping it before dispatch reclaims the segment, while a
