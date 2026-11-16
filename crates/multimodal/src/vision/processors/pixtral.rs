@@ -167,10 +167,7 @@ impl PixtralProcessor {
         let mut planes = plain_buffer(3 * pixels);
         let (r_plane, rest) = planes.split_at_mut(pixels);
         let (g_plane, b_plane) = rest.split_at_mut(pixels);
-        // An image's container may be longer than its pixels
-        // (`ImageBuffer::from_raw` takes any that is long enough): the planes
-        // hold the image only.
-        RgbSplitter::detect().split(&resized[..3 * pixels], r_plane, g_plane, b_plane);
+        RgbSplitter::detect().split(&resized, r_plane, g_plane, b_plane);
         Ok((planes, (target_h as usize, target_w as usize)))
     }
 }
@@ -498,6 +495,22 @@ mod tests {
         let mut container = exact.to_rgb8().into_raw();
         container.extend_from_slice(&[0xAB; 7]);
         let longer = RgbImage::from_raw(64, 48, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processor.planes_of(&longer).unwrap(),
+            processor.planes_of(&exact).unwrap()
+        );
+    }
+
+    /// The same through the resize: 65x48 is not a target size.
+    #[test]
+    fn a_longer_container_resizes_as_its_image() {
+        let processor = PixtralProcessor::new();
+        let exact = lcg_rgb_image(65, 48, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(65, 48, container).unwrap();
         let longer = DynamicImage::ImageRgb8(longer);
 
         assert_eq!(
