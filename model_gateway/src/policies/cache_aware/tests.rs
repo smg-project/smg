@@ -333,7 +333,7 @@ fn update_expected_wait_loads(
             )
         })
         .collect();
-    TestFeed::attached_to(policy).publish(&loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&loads);
 }
 
 /// Like [`update_expected_wait_loads`], with each report counting the
@@ -357,7 +357,7 @@ fn update_expected_wait_loads_counting_held(
             (worker.url().to_string(), load)
         })
         .collect();
-    TestFeed::attached_to(policy).publish(&loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&loads);
 }
 
 /// One selection for `text` through the string path.
@@ -596,7 +596,7 @@ fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
     one_queued.loads[0].num_waiting_reqs = 1;
     let mut idle = expected_wait_load(0, 0.1, 100.0);
     idle.loads[0].num_running_reqs = 0;
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), one_queued),
         (workers[1].url().to_string(), idle),
     ]));
@@ -628,7 +628,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     running.loads[0].num_running_reqs = 3;
     let mut queued = expected_wait_load(3_100, 0.1, 100.0);
     queued.loads[0].num_running_reqs = 0;
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), running),
         (workers[1].url().to_string(), queued),
     ]));
@@ -640,7 +640,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     // the fixture's one running request (10.24 s each), so it cancels:
     // 40.96 s against `w2`'s 41.24 s.
     let (policy, workers) = initialised_pair();
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (
             workers[0].url().to_string(),
             expected_wait_load(0, 0.1, 100.0),
@@ -668,7 +668,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
 #[test]
 fn a_report_the_snapshot_dropped_is_no_longer_scored() {
     let (policy, workers) = initialised_pair();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&HashMap::from([
         (
             workers[0].url().to_string(),
@@ -703,7 +703,7 @@ fn a_report_the_snapshot_dropped_is_no_longer_scored() {
 #[test]
 fn the_shared_snapshot_is_the_score_source() {
     let (policy, workers) = initialised_pair();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&HashMap::from([
         (
             workers[0].url().to_string(),
@@ -782,7 +782,7 @@ fn cache_aware_worker_removal_prunes_expected_wait_state() {
             (worker.url().to_string(), load)
         })
         .collect();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&loads);
 
     let first = SelectWorkerInfo {
@@ -883,7 +883,7 @@ fn prefill_miss_ignores_generation_rate() {
             .map(|url| worker_of(url, WorkerType::Prefill))
             .collect();
         policy.init_workers(&workers);
-        let feed = TestFeed::attached_to(&policy.load_scorer);
+        let feed = TestFeed::attached_to(|rx| policy.load_scorer.set_load_receiver(rx));
         feed.publish(&HashMap::from([
             (
                 workers[0].url().to_string(),
@@ -3840,7 +3840,7 @@ fn event_decay_keeps_strict_affinity_ahead_of_expected_wait() {
             expected_wait_load(8, 0.0, 1_000.0),
         ),
     ]);
-    TestFeed::attached_to(&policy).publish(&overlap_loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&overlap_loads);
 
     let monitor = Arc::new(KvEventMonitor::new());
     monitor.indexers.insert("unknown".to_string(), indexer);
@@ -4130,7 +4130,7 @@ fn gated_pair(config: CacheAwareConfig) -> (CacheAwarePolicy, Vec<Arc<dyn Worker
     let policy = CacheAwarePolicy::with_config(gate_at_mean(config));
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&skewed_rate_loads(&workers));
     (policy, workers)
 }
 
@@ -4217,7 +4217,7 @@ fn idle_rate_residual_does_not_herd_misses() {
         }],
         ..Default::default()
     };
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), idle(0.36)),
         (workers[1].url().to_string(), idle(0.0)),
     ]));
@@ -6167,7 +6167,7 @@ fn prefill_miss_uses_input_capacity_without_generation_rate_bias() {
             let mut more_work = expected_wait_load(4_000, 0.0, 2_000.0);
             less_work.loads[0].prefill_throughput = less_rate;
             more_work.loads[0].prefill_throughput = more_rate;
-            let feed = TestFeed::attached_to(&policy.load_scorer);
+            let feed = TestFeed::attached_to(|rx| policy.load_scorer.set_load_receiver(rx));
             feed.publish(&HashMap::from([
                 (workers[0].url().to_string(), less_work),
                 (workers[1].url().to_string(), more_work),

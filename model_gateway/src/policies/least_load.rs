@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn prefill_fleet_rate_overflow_uses_configured_capacity() {
         let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = ["http://p1:1", "http://p2:2", "http://p3:3"]
             .into_iter()
             .map(|url| {
@@ -1319,7 +1319,7 @@ mod tests {
             (unmeasured, 3_024.0 / 40_000.0, 1),
         ] {
             let policy = LeastLoadPolicy::with_params(0.15, 1024, 1_000.0);
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = ["http://p1:1", "http://p2:2"]
                 .into_iter()
                 .map(|url| worker_of(url, WorkerType::Prefill))
@@ -1349,7 +1349,7 @@ mod tests {
     #[test]
     fn prefill_ignores_generation_rate() {
         let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = ["http://prefill:1", "http://missing:2"]
             .into_iter()
             .map(|url| worker_of(url, WorkerType::Prefill))
@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn generation_rate_still_prices_decode_and_regular() {
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         for role in [WorkerType::Decode, WorkerType::Regular] {
             let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
                 BasicWorkerBuilder::new("http://worker:1")
@@ -1497,7 +1497,7 @@ mod tests {
         // Four idle workers whose reports differ by a KV digit far below the
         // epsilon; an exact-equality tie handed everything to the first.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..4)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
             .collect();
@@ -1529,7 +1529,7 @@ mod tests {
         let mut seen = [false; 3];
         for _ in 0..150 {
             let policy = LeastLoadPolicy::new();
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| make_worker(u)).collect();
             let mut loads = HashMap::new();
             for url in urls {
@@ -1563,7 +1563,7 @@ mod tests {
         let mut seen = [0usize; 3];
         for _ in 0..150 {
             let policy = LeastLoadPolicy::new();
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| make_worker(u)).collect();
             let mut loads = HashMap::new();
             loads.insert(
@@ -1642,7 +1642,7 @@ mod tests {
         // `a` must read as 40 requests of work, not as an idle peer of `b`:
         // every pick goes to `b` until its own credit has grown to the same.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0).with_tie_break_seed(1);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         for _ in 0..40 {
@@ -1674,7 +1674,7 @@ mod tests {
         // running rather than queued, ties with `b` on the estimate, and a
         // third worker that holds nothing wins outright.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         let c = make_worker("http://c:8000");
@@ -1721,7 +1721,7 @@ mod tests {
         // and the six water-fill evenly: the floor steers off the hidden
         // backlogs, not onto a favourite.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..8)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
             .collect();
@@ -1753,7 +1753,7 @@ mod tests {
     #[test]
     fn a_report_releases_the_dispatches_made_up_to_its_sample_and_keeps_the_rest() {
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = vec![make_worker("http://a:8000")];
         let info = SelectWorkerInfo::default();
         let mut loads = HashMap::new();
@@ -1832,7 +1832,7 @@ mod tests {
         // rate of the CANDIDATES (b's 100 tok/s -> 20.48s > b's 10.04s), not
         // a fleet-wide mean that c's 100k tok/s would dominate (0.04s < b).
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         for _ in 0..2 {
             a.increment_load();
@@ -2074,7 +2074,7 @@ mod tests {
         // live in-flight. Scoring b on raw count (5) would wrongly beat a's 40s;
         // scoring it as drain time (5 * p̄ / nominal ≈ 51s) keeps the lighter a.
         let policy = LeastLoadPolicy::new(); // p̄ = 1024
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         for _ in 0..5 {
@@ -2591,7 +2591,7 @@ mod tests {
             3, 7, 4, 0, 0, 0, 0, 8, 2, 6, 8, 2, 6, 0, 2,
         ];
         let policy = LeastLoadPolicy::with_params(0.15, 1024, 2_000.0).with_tie_break_seed(11);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..WORKERS)
             .map(|i| {
                 let role = if i == PREFILL {
@@ -2665,7 +2665,7 @@ mod tests {
     #[test]
     fn a_decision_releases_what_its_reports_reflect_and_a_read_does_not() {
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = vec![make_worker("http://a:8000"), make_worker("http://b:8000")];
         let info = SelectWorkerInfo::default();
         let mut loads = HashMap::new();
@@ -2716,7 +2716,7 @@ mod tests {
 
     fn threads_land_their_credit(fleet: usize) {
         let policy = Arc::new(LeastLoadPolicy::new());
-        let feed = TestFeed::attached_to(policy.as_ref());
+        let feed = TestFeed::attached_to(|rx| policy.as_ref().set_load_receiver(rx));
         let workers: Arc<Vec<Arc<dyn Worker>>> = Arc::new(
             (0..fleet)
                 .map(|i| make_worker(&format!("http://w{i}:8000")))
@@ -2759,7 +2759,7 @@ mod tests {
         assert_eq!(HELD_GUARD_CANDIDATES, 7);
         let decide_twice = |candidates: usize| {
             let policy = LeastLoadPolicy::new();
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = (0..9)
                 .map(|i| make_worker(&format!("http://w{i}:8000")))
                 .collect();
