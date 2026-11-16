@@ -119,24 +119,44 @@ class Ledger:
 
     @contextmanager
     def _transaction(self):
-        db = sqlite3.connect(
-            self.path if self.create else self.path.as_uri() + "?mode=rw",
-            uri=not self.create,
-            timeout=5,
-            isolation_level=None,
-        )
+        db = None
+        failure = None
+        cleanup_failed = False
         try:
+            db = sqlite3.connect(
+                self.path if self.create else self.path.as_uri() + "?mode=rw",
+                uri=not self.create,
+                timeout=5,
+                isolation_level=None,
+            )
             db.execute("BEGIN IMMEDIATE")
             yield db
             db.commit()
-        except sqlite3.Error as error:
-            db.rollback()
-            raise BudgetError("Shared ledger unavailable or incompatible") from error
-        except BaseException:
-            db.rollback()
-            raise
+        except BaseException as error:
+            failure = error
+            if db is not None:
+                try:
+                    db.rollback()
+                except sqlite3.Error:
+                    cleanup_failed = True
         finally:
-            db.close()
+            if db is not None:
+                try:
+                    db.close()
+                except sqlite3.Error as error:
+                    cleanup_failed = True
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            # Preserve the primary paid-guard failure; a secondary rollback/close
+            # error must neither mask it nor turn it into a nonfatal CLI exit.
+            if isinstance(failure, BudgetError):
+                if cleanup_failed:
+                    failure.add_note("Shared ledger cleanup also failed")
+                raise failure
+            if isinstance(failure, sqlite3.Error) or cleanup_failed:
+                raise BudgetError("Shared ledger unavailable or incompatible") from failure
+            raise failure
 
     def _halted(self, db):
         config, halted = db.execute("SELECT config, halted FROM policy WHERE id=1").fetchone()

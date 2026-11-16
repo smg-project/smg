@@ -18,6 +18,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import random
 import subprocess
 import sys
 import uuid
@@ -61,22 +62,35 @@ class InfrastructureResults(ValueError):
         self.scored = scored
 
 
-def load_results(raw: dict) -> list[dict]:
-    """Read pinned tau2 5bfa7e37 results without inventing rewards or dropping trials.
+class InvalidResults(ValueError):
+    """Malformed rows remain invalid without erasing valid unscored obligations."""
 
-    Its SimulationRun permits reward_info=None for infrastructure-error
-    placeholders. Upstream excludes these from metrics; our full comparison
-    remains incomplete instead of shrinking its task/trial denominator.
-    """
+    def __init__(self, invalid_rows: list[dict], unscored: list[dict], scored: list[dict]):
+        super().__init__("Malformed simulation rows")
+        self.invalid_rows = invalid_rows
+        self.unscored = unscored
+        self.scored = scored
+
+
+def load_results(raw: dict) -> list[dict]:
+    """Keep every pinned SDK obligation; never normalize unknown errors to zero."""
     if not isinstance(raw, dict) or not isinstance(raw.get("simulations"), list):
         raise ValueError("results must contain a simulations list")
     out: list[dict] = []
     unscored: list[dict] = []
-    for s in raw["simulations"]:
+    invalid: list[dict] = []
+    for index, s in enumerate(raw["simulations"]):
+
+        def reject(kind):
+            # Only static categories and row offsets: no provider text or raw rows.
+            invalid.append({"row_index": index, "kind": kind})
+
         if not isinstance(s, dict) or "reward_info" not in s:
-            raise ValueError("simulation is missing its reward schema")
+            reject("missing_reward_schema")
+            continue
         if type(s.get("task_id")) not in (str, int) or not str(s["task_id"]):
-            raise ValueError("simulation is missing its task identity")
+            reject("missing_task_identity")
+            continue
         identity = {"task_id": str(s["task_id"]), "trial": s.get("trial")}
         if "seed" in s:
             identity["seed"] = s["seed"]
@@ -84,15 +98,14 @@ def load_results(raw: dict) -> list[dict]:
         if s.get("termination_reason") == "infrastructure_error":
             if (
                 info is not None
-                or not identity["task_id"]
                 or type(identity["trial"]) is not int
                 or identity["trial"] < 0
                 or type(s.get("seed")) is not int
             ):
-                raise ValueError("contradictory or unidentified infrastructure placeholder")
+                reject("contradictory_infrastructure_placeholder")
+                continue
             error_info = s.get("info")
             error_type = error_info.get("error_type") if isinstance(error_info, dict) else None
-            # Never copy provider messages/tracebacks (which may contain secrets).
             if (
                 not isinstance(error_type, str)
                 or not error_type.isidentifier()
@@ -100,24 +113,34 @@ def load_results(raw: dict) -> list[dict]:
             ):
                 error_type = "UnspecifiedError"
             unscored.append(
-                {
-                    **identity,
-                    "termination_reason": "infrastructure_error",
-                    "error_type": error_type,
-                }
+                {**identity, "termination_reason": "infrastructure_error", "error_type": error_type}
             )
             continue
         if not isinstance(info, dict) or type(info.get("reward")) not in (int, float):
-            raise ValueError("missing or malformed reward outside infrastructure placeholder")
-        reward = float(info["reward"])
+            reject("malformed_reward")
+            continue
+        try:
+            reward = float(info["reward"])
+        except OverflowError:
+            reject("nonfinite_reward")
+            continue
         if not isfinite(reward):
-            raise ValueError("reward must be finite")
+            reject("nonfinite_reward")
+            continue
         out.append({**identity, "reward": reward})
-    # Scan every row first: an unknown/contradictory row must not be masked by
-    # an earlier supported placeholder. No averages are computed for this domain.
+    # All rows are inspected regardless of ordering, including schema-error
+    # siblings. Their diagnostics cannot waive a valid infrastructure obligation.
+    if invalid:
+        raise InvalidResults(invalid, unscored, out)
     if unscored:
         raise InfrastructureResults(unscored, out)
     return out
+
+
+def trial_seeds(configured_seed: int, num_trials: int) -> list[int]:
+    """Pinned tau2 batch.py seeds once, then draws one randint per trial."""
+    rng = random.Random(configured_seed)
+    return [rng.randint(0, 1000000) for _ in range(num_trials)]
 
 
 def domain_scores(results: list[dict], k: int) -> dict[str, object]:
@@ -131,9 +154,13 @@ def domain_scores(results: list[dict], k: int) -> dict[str, object]:
         raise ValueError("no simulations were executed")
     by_task: dict[str, list[float]] = {}
     task_trials: dict[str, list[int | None]] = {}
+    task_trial_seeds: dict[str, list[dict]] = {}
     for r in results:
         by_task.setdefault(r["task_id"], []).append(r["reward"])
         task_trials.setdefault(r["task_id"], []).append(r.get("trial"))
+        task_trial_seeds.setdefault(r["task_id"], []).append(
+            {"trial": r.get("trial"), "seed": r.get("seed")}
+        )
     all_rewards = [x for xs in by_task.values() for x in xs]
     pass1 = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
     per_task = [passk(sum(1 for x in xs if x >= 1.0), len(xs), k) for xs in by_task.values()]
@@ -144,6 +171,7 @@ def domain_scores(results: list[dict], k: int) -> dict[str, object]:
         "n_tasks": len(by_task),
         "n_sims": len(all_rewards),
         "task_trials": task_trials,
+        "task_trial_seeds": task_trial_seeds,
     }
 
 
@@ -189,7 +217,9 @@ def read_expected_tasks(path: Path, domains: list[str], k: int, seed: int) -> di
     return selected
 
 
-def coverage_problem(scores: dict, expected: list[str] | None, k: int) -> str | None:
+def coverage_problem(
+    scores: dict, expected: list[str] | None, k: int, seed: int = 300
+) -> str | None:
     if not expected:
         return "missing expected task manifest"
     manifest = scores.get("task_trials")
@@ -206,6 +236,39 @@ def coverage_problem(scores: dict, expected: list[str] | None, k: int) -> str | 
             return f"missing, duplicate or unexpected trials for task {task}"
     if scores.get("n_tasks") != len(manifest) or scores.get("n_sims") != len(manifest) * k:
         return "sample counts disagree with task/trial identity manifest"
+    return seed_identity_problem(scores, expected, k, seed)
+
+
+def seed_identity_problem(
+    scores: dict, expected: list[str] | None, k: int, seed: int
+) -> str | None:
+    """Scored or saved rows must prove the pinned runner's exact trial seeds."""
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or any(not isinstance(task, str) or not task for task in expected)
+        or len(expected) != len(set(expected))
+    ):
+        return "missing or invalid expected task identity manifest"
+    identities = scores.get("task_trial_seeds")
+    if not isinstance(identities, dict) or set(identities) != set(expected):
+        return "missing task/trial/seed identity manifest"
+    seeds = trial_seeds(seed, k)
+    for task, rows in identities.items():
+        if (
+            not isinstance(rows, list)
+            or len(rows) != k
+            or any(
+                not isinstance(row, dict)
+                or type(row.get("trial")) is not int
+                or not 0 <= row["trial"] < k
+                or type(row.get("seed")) is not int
+                or row["seed"] != seeds[row["trial"]]
+                for row in rows
+            )
+            or sorted(row["trial"] for row in rows) != list(range(k))
+        ):
+            return f"missing, duplicate or unexpected trial seeds for task {task}"
     return None
 
 
@@ -292,6 +355,8 @@ def run_tau2(
         "invocation_id": invocation_id,
         "arm": arm.name,
         "domain": domain,
+        "configured_seed": seed,
+        "trial_seeds": trial_seeds(seed, num_trials),
         "results_path": str(results_json),
         "status": "running",
         "exit_code": None,
@@ -418,12 +483,23 @@ def run_tau2(
         body = results_json.read_bytes()
         invocation["results_sha256"] = hashlib.sha256(body).hexdigest()
         scores = domain_scores(load_results(json.loads(body)), k=num_trials)
-        if issue := coverage_problem(scores, expected_task_ids, num_trials):
+        if issue := coverage_problem(scores, expected_task_ids, num_trials, seed):
             fail("incomplete_results", "results")
             invocation["coverage_problem"] = issue
+            invocation["seed_identity_invalid"] = bool(
+                seed_identity_problem(scores, expected_task_ids, num_trials, seed)
+            )
             return
         arm.scores[domain] = scores
         invocation["status"] = "completed"
+    except InvalidResults as error:
+        invocation.update(
+            invalid_rows=error.invalid_rows,
+            n_infrastructure_errors=len(error.unscored),
+            unscored_cases=error.unscored,
+            scored_case_diagnostics=error.scored,
+        )
+        fail("invalid_results", "results", error)
     except InfrastructureResults as error:
         invocation.update(
             n_infrastructure_errors=len(error.unscored),
@@ -438,7 +514,7 @@ def run_tau2(
 
 
 def incompleteness(
-    arm: Arm, domains: list[str], expected_tasks: dict | None = None, k: int = 1
+    arm: Arm, domains: list[str], expected_tasks: dict | None = None, k: int = 1, seed: int = 300
 ) -> str | None:
     """Why this arm can't be compared (timed out / unscored domains), else None."""
     missing = [d for d in domains if d not in arm.scores]
@@ -457,7 +533,7 @@ def incompleteness(
         d: issue
         for d in domains
         if d in arm.scores
-        if (issue := coverage_problem(arm.scores[d], (expected_tasks or {}).get(d), k))
+        if (issue := coverage_problem(arm.scores[d], (expected_tasks or {}).get(d), k, seed))
     }
     invocation_failures = {}
     for domain in domains:
@@ -498,7 +574,12 @@ def incompleteness(
 
 
 def build_report(
-    baseline: Arm, candidate: Arm, domains: list[str], k: int, expected_tasks: dict | None = None
+    baseline: Arm,
+    candidate: Arm,
+    domains: list[str],
+    k: int,
+    expected_tasks: dict | None = None,
+    seed: int = 300,
 ):
     """Markdown + JSON; candidate − baseline; overall = unweighted mean."""
 
@@ -582,7 +663,7 @@ def build_report(
     )
     lines.append("")
     incomplete = {
-        a.name: incompleteness(a, domains, expected_tasks, k) for a in (baseline, candidate)
+        a.name: incompleteness(a, domains, expected_tasks, k, seed) for a in (baseline, candidate)
     }
     incomplete = {n: r for n, r in incomplete.items() if r}
     for name, reason in incomplete.items():
@@ -698,7 +779,12 @@ def write_report_and_gate(
 ) -> int:
     """Emit the markdown + JSON comparison and apply the completeness/regression gates."""
     report_md, payload = build_report(
-        baseline, candidate, domains, k, getattr(args, "expected_task_ids", None)
+        baseline,
+        candidate,
+        domains,
+        k,
+        getattr(args, "expected_task_ids", None),
+        getattr(args, "seed", 300),
     )
     budget_failed = False
     if getattr(args, "enforce_budget", False):
@@ -730,7 +816,10 @@ def write_report_and_gate(
     # Neither diagnostics nor a quality-tolerance flag can turn unscored
     # infrastructure obligations into a complete comparison (or waive paid gates).
     unscored_infrastructure = any(
-        invocation.get("failure_kind") == "infrastructure_error_results"
+        (
+            invocation.get("failure_kind") == "infrastructure_error_results"
+            or bool(invocation.get("unscored_cases"))
+        )
         for arm in (baseline, candidate)
         for invocation in arm.invocations.values()
         if isinstance(invocation, dict)
@@ -738,6 +827,23 @@ def write_report_and_gate(
     if (
         budget_failed
         or unscored_infrastructure
+        or any(
+            invocation.get("seed_identity_invalid") is True
+            for arm in (baseline, candidate)
+            for invocation in arm.invocations.values()
+            if isinstance(invocation, dict)
+        )
+        or any(
+            seed_identity_problem(
+                scores,
+                (getattr(args, "expected_task_ids", None) or {}).get(domain),
+                k,
+                getattr(args, "seed", 300),
+            )
+            for arm in (baseline, candidate)
+            for domain, scores in arm.scores.items()
+            if domain in domains
+        )
         or (payload["incomplete"] and not args.allow_incomplete)
     ):
         exit_code = EXIT_INCOMPLETE

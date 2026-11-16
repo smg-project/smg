@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import random
 import sys
 import types
 from pathlib import Path
@@ -334,8 +335,8 @@ def test_sequential_empty_saved_scores_are_incomplete(monkeypatch, tmp_path, cou
 def test_executed_zero_rewards_remain_a_valid_comparison(monkeypatch, tmp_path, allow_incomplete):
     scores = run_ab.domain_scores(
         [
-            {"task_id": "failed-task", "trial": 0, "reward": 0.0},
-            {"task_id": "failed-task", "trial": 1, "reward": 0.0},
+            {"task_id": "failed-task", "trial": 0, "seed": 626729, "reward": 0.0},
+            {"task_id": "failed-task", "trial": 1, "seed": 373753, "reward": 0.0},
         ],
         k=2,
     )
@@ -387,8 +388,21 @@ def _expected_manifest(tmp_path, ids):
     return path
 
 
+def _fixture_trial_seed(trial):
+    # Independent reproduction of pinned batch.py's seeded randint sequence.
+    # Invalid trial fixtures remain invalid; do not manufacture their identity.
+    if type(trial) is not int or trial < 0:
+        return None
+    rng = random.Random(300)
+    return [rng.randint(0, 1000000) for _ in range(trial + 1)][-1]
+
+
 def _rows(ids=("task",), trials=(0, 1), reward=0.0):
-    return [{"task_id": task, "trial": trial, "reward": reward} for task in ids for trial in trials]
+    return [
+        {"task_id": task, "trial": trial, "seed": _fixture_trial_seed(trial), "reward": reward}
+        for task in ids
+        for trial in trials
+    ]
 
 
 def _coverage_gate(tmp_path, baseline_rows, candidate_rows, expected):
@@ -503,7 +517,12 @@ def test_both_live_arms_bound_to_same_selected_ids_and_seed(monkeypatch, tmp_pat
             json.dumps(
                 {
                     "simulations": [
-                        {"task_id": "task", "trial": trial, "reward_info": {"reward": 0.0}}
+                        {
+                            "task_id": "task",
+                            "trial": trial,
+                            "seed": _fixture_trial_seed(trial),
+                            "reward_info": {"reward": 0.0},
+                        }
                         for trial in (0, 1)
                     ]
                 }
@@ -638,7 +657,12 @@ def test_missing_dataset_stops_manifest_preparation_before_paid_calls(monkeypatc
 def _raw_trials(trials=(0, 1), reward=0.0):
     return {
         "simulations": [
-            {"task_id": "task", "trial": trial, "reward_info": {"reward": reward}}
+            {
+                "task_id": "task",
+                "trial": trial,
+                "seed": _fixture_trial_seed(trial),
+                "reward_info": {"reward": reward},
+            }
             for trial in trials
         ]
     }
@@ -1139,7 +1163,7 @@ def test_unknown_or_contradictory_null_contract_is_not_normalized(row):
 
 def test_genuine_zero_reward_still_loads_without_infra_relabeling():
     assert run_ab.load_results(_raw_trials((0,), reward=0.0)) == [
-        {"task_id": "task", "trial": 0, "reward": 0.0}
+        {"task_id": "task", "trial": 0, "seed": 626729, "reward": 0.0}
     ]
 
 
@@ -1169,7 +1193,9 @@ def test_infra_results_report_identities_rawhash_and_force_incomplete(
     assert invocation["n_infrastructure_errors"] == 1
     assert invocation["unscored_cases"][0]["trial"] == 0
     assert invocation["unscored_cases"][0]["seed"] == 300
-    assert invocation["scored_case_diagnostics"] == [{"task_id": "task", "trial": 1, "reward": 0.0}]
+    assert invocation["scored_case_diagnostics"] == [
+        {"task_id": "task", "trial": 1, "seed": 373753, "reward": 0.0}
+    ]
     candidate = run_ab.Arm("smg", "", scores={"retail": run_ab.domain_scores(_rows(), 2)})
     args = types.SimpleNamespace(
         out=None,
@@ -1228,3 +1254,162 @@ def test_infra_placeholder_does_not_bypass_existing_paid_or_process_gate(
     assert "unscored_cases" not in invocation and "results_sha256" not in invocation
     assert not arm.scores
     assert len(calls) == (0 if gate == "halted" else 1)
+
+
+@pytest.mark.parametrize("infra_first", [True, False])
+def test_parent98_regression_mixed_invalid_never_waives_unscored(
+    monkeypatch, tmp_path, infra_first
+):
+    rows = [
+        _infra_placeholder(),
+        {"task_id": "bad", "trial": 1, "seed": 301, "reward_info": {"reward": True}},
+    ]
+    if not infra_first:
+        rows.reverse()
+    raw = {"simulations": rows}
+
+    def fake_run(command, **kwargs):
+        folder = tmp_path / "simulations" / command[command.index("--save-to") + 1]
+        folder.mkdir(parents=True)
+        (folder / "results.json").write_text(json.dumps(raw))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(run_ab.subprocess, "run", fake_run)
+    arm = run_ab.Arm("vllm", "http://unused.invalid")
+    _run_tau2(arm, tmp_path, domain="retail", num_trials=2, expected_task_ids=["task"])
+    args = types.SimpleNamespace(
+        out=None,
+        json_out=None,
+        tolerance=0.02,
+        allow_incomplete=True,
+        expected_task_ids={"retail": ["task"]},
+    )
+    assert run_ab.write_report_and_gate(arm, run_ab.Arm("smg", ""), ["retail"], 2, args) == 2
+    invocation = arm.invocations["retail"]
+    assert invocation["failure_kind"] == "invalid_results"
+    assert invocation["unscored_cases"][0]["task_id"] == "task"
+    assert invocation["invalid_rows"] == [
+        {"row_index": 1 if infra_first else 0, "kind": "malformed_reward"}
+    ]
+    assert not arm.scores
+
+
+def test_parent98_regression_saved_scores_reject_different_trial_seed(tmp_path):
+    import random
+
+    def rows(configured_seed):
+        rng = random.Random(configured_seed)
+        return [
+            {"task_id": "task", "trial": trial, "seed": rng.randint(0, 1000000), "reward": 0.0}
+            for trial in range(2)
+        ]
+
+    assert _coverage_gate(tmp_path, rows(300), rows(301), ["task"]) == 2
+    assert _coverage_gate(tmp_path, rows(300), rows(300), ["task"]) == 0
+
+
+@pytest.mark.parametrize("allow_incomplete", [False, True])
+@pytest.mark.parametrize("candidate_seed", [300, 301])
+def test_parent98_seed_identity_survives_saved_diff(
+    monkeypatch, tmp_path, candidate_seed, allow_incomplete
+):
+    files = []
+    for name, configured_seed in (("vllm", 300), ("smg", candidate_seed)):
+        rng = random.Random(configured_seed)
+        rows = [
+            {"task_id": "task", "trial": i, "seed": rng.randint(0, 1000000), "reward": 0.0}
+            for i in range(2)
+        ]
+        arm = run_ab.Arm(name, "", scores={"retail": run_ab.domain_scores(rows, 2)})
+        arm.budget = run_ab.prepare_budget()
+        path = tmp_path / f"{name}-seed-scores.json"
+        run_ab.save_scores(arm, path)
+        files.append(path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_ab.py",
+            *(["--allow-incomplete"] if allow_incomplete else []),
+            "--diff-baseline",
+            str(files[0]),
+            "--diff-candidate",
+            str(files[1]),
+            "--domains",
+            "retail",
+            "--expected-tasks",
+            str(_expected_manifest(tmp_path, ["task"])),
+            "--seed",
+            "300",
+        ],
+    )
+    assert run_ab.main() == (0 if candidate_seed == 300 else 2)
+
+
+def test_pinned_trial_seed_sequence_and_missing_saved_identity(tmp_path):
+    assert run_ab.trial_seeds(300, 2) == [626729, 373753]
+    assert run_ab.trial_seeds(301, 2) == [418104, 656453]
+    scores = run_ab.domain_scores(_rows(), 2)
+    del scores["task_trial_seeds"]
+    assert (
+        run_ab.coverage_problem(scores, ["task"], 2) == "missing task/trial/seed identity manifest"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        None,
+        {},
+        {"task_id": "bad", "reward_info": None},
+        {"task_id": "bad", "reward_info": {"reward": 10**400}},
+    ],
+)
+@pytest.mark.parametrize("infra_first", [False, True])
+def test_invalid_sibling_diagnostics_keep_every_infra_obligation(bad_row, infra_first):
+    rows = [_infra_placeholder(), bad_row]
+    if not infra_first:
+        rows.reverse()
+    with pytest.raises(run_ab.InvalidResults) as error:
+        run_ab.load_results({"simulations": rows})
+    assert len(error.value.unscored) == 1
+    assert len(error.value.invalid_rows) == 1
+    assert not error.value.scored
+    assert "10**400" not in str(error.value)
+
+
+@pytest.mark.parametrize("allow_incomplete", [False, True])
+def test_parent98_regression_missing_expected_manifest_is_fatal_cli(tmp_path, allow_incomplete):
+    # Exercise the real saved --diff CLI process, including its shell exit code.
+    # Both score files have otherwise valid complete task/trial/seed identities.
+    import os
+    import subprocess
+
+    files = []
+    for name in ("vllm", "smg"):
+        arm = run_ab.Arm(name, "", scores={"retail": run_ab.domain_scores(_rows(), 2)})
+        arm.budget = run_ab.prepare_budget()
+        path = tmp_path / f"{name}-without-manifest.json"
+        run_ab.save_scores(arm, path)
+        files.append(path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(run_ab.__file__).resolve()),
+            "--diff-baseline",
+            str(files[0]),
+            "--diff-candidate",
+            str(files[1]),
+            "--domains",
+            "retail",
+            *(["--allow-incomplete"] if allow_incomplete else []),
+        ],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == run_ab.EXIT_INCOMPLETE, result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    assert "missing expected task manifest" in result.stderr

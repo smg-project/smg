@@ -350,3 +350,23 @@ Public provider facts have been collected separately; execution still needs
 approved call/USD/output/scope bounds and paid/GPU authorization. No provider
 call, GPU test or quality score is authorized by this source feature. A source
 review, command fixture or passing CPU workflow is not sustained CI acceptance.
+
+
+The guarded CLI consumes the complete reviewed long-option command. Short
+aliases, abbreviated options, duplicate flags and unclaimed values cannot
+replace the approved domain or text workflow. SQLite connection, transaction and
+cleanup failures remain fatal paid-guard errors; secondary cleanup failures do
+not replace the original failure.
+
+If malformed rows accompany valid infrastructure placeholders, the invocation
+remains invalid, retains sanitized row-index diagnostics and all valid unscored
+identities, and still exits 2 even with `--allow-incomplete`. It cannot contribute
+a partial quality score. Pure malformed-result diagnostics retain the existing
+`--allow-incomplete` behavior; paid-ledger and process gates remain independent.
+
+Live and saved comparisons also retain each task/trial's actual seed. The pinned
+SDK seeds its RNG with the configured seed and draws one integer per trial; the
+configured seed itself is not the trial seed. Every task must match that exact
+trial mapping and the requested manifest seed. Missing or mismatched seed
+identities are fatal (exit 2), including sequential `--diff` with
+`--allow-incomplete`; legacy score files cannot invent missing seed provenance.

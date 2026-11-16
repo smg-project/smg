@@ -1049,3 +1049,49 @@ def test_isolated_guarded_entry_does_not_activate_legacy_startup_hook(configured
     assert legacy.returncode != 0
     assert "SMG_TAU2_BUDGET_GUARD must be 0 or 1" in legacy.stderr
     assert ledger.summary()["calls"] == 0
+
+
+@pytest.mark.parametrize(
+    "extra", [["-d", "telecom"], ["-h"], ["unclaimed"], ["--domain=telecom"], ["--seed", "1", "2"]]
+)
+def test_parent98_regression_entire_command_surface_is_consumed(extra):
+    base = [
+        "run",
+        "--domain",
+        "retail",
+        "--agent",
+        "llm_agent",
+        "--user-llm",
+        "gpt-5.2",
+        "--task-split-name",
+        "base",
+    ]
+    with pytest.raises(gc.BudgetError):
+        gc.validate_command(base + extra, "retail")
+
+
+def test_parent98_regression_legitimate_values_are_not_rewritten():
+    command = [
+        "run",
+        "--domain",
+        "retail",
+        "--agent",
+        "llm_agent",
+        "--user-llm",
+        "gpt-5.2",
+        "--task-split-name",
+        "base",
+        "--seed",
+        "-23",
+        "--task-ids",
+        "0",
+        "task-2",
+        "--agent-llm-args",
+        '{"temperature": -0.5, "extra_body": {"name": "--domain"}}',
+    ]
+    assert gc.validate_command(command, "retail") == command + [
+        "--max-retries",
+        "0",
+        "--hallucination-retries",
+        "0",
+    ]

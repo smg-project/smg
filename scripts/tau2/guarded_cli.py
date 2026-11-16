@@ -585,14 +585,29 @@ def validate_command(command, domain):
         "--num-tasks",
         "--max-concurrency",
     }
-    if any(arg.startswith("--") and arg not in allowed for arg in command[1:]):
-        raise BudgetError("Unqualified tau2 command surface")
+
+    # Match the pinned SDK's cardinalities, but expose only our reviewed long
+    # options. Consuming the complete argv also rejects positional/short-alias
+    # overrides that the SDK would otherwise parse after the reviewed options.
+    class ReviewedParser(argparse.ArgumentParser):
+        def error(self, message):
+            raise BudgetError("Unqualified tau2 command surface")
+
+    parser = ReviewedParser(add_help=False, allow_abbrev=False)
+    integer_options = {"--num-trials", "--num-tasks", "--max-concurrency", "--seed"}
+    for flag in allowed:
+        parser.add_argument(
+            flag,
+            **({"nargs": "+"} if flag == "--task-ids" else {}),
+            type=int if flag in integer_options else str,
+        )
     flags = [arg for arg in command[1:] if arg.startswith("--")]
-    if len(flags) != len(set(flags)):
-        raise BudgetError("Duplicate options cannot override the reviewed text scope")
+    if any(flag not in allowed for flag in flags) or len(flags) != len(set(flags)):
+        raise BudgetError("Unknown or duplicate options cannot override the reviewed text scope")
+    values = vars(parser.parse_args(command[1:]))
 
     def value(flag):
-        return command[command.index(flag) + 1] if flag in command else None
+        return values[flag[2:].replace("-", "_")]
 
     if (
         value("--domain") != domain
