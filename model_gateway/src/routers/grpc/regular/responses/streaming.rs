@@ -1325,6 +1325,7 @@ impl ChatResponseAccumulator {
 
 #[cfg(test)]
 mod tests {
+    use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -1437,6 +1438,31 @@ mod tests {
             "engine unavailable"
         );
         assert!(!events.iter().any(|e| e["type"] == "response.completed"));
+    }
+
+    /// The terminal of a Responses stream reports the code of the chat
+    /// stream's error event: the timeout's code for a stream the gateway's
+    /// request timeout cut, and the event's type for an event without a code.
+    #[tokio::test]
+    async fn a_stream_cut_by_the_request_timeout_fails_the_response_with_the_timeouts_code() {
+        for (error, code) in [
+            (
+                json!({"message": "the request timed out", "type": "stream_error", "code": REQUEST_TIMEOUT_CODE}),
+                REQUEST_TIMEOUT_CODE,
+            ),
+            (
+                json!({"message": "the worker went away", "type": "stream_error"}),
+                "stream_error",
+            ),
+        ] {
+            let cut = json!({"error": error});
+            let frames = vec![format!("data: {cut}\n\n"), "data: [DONE]\n\n".into()];
+            let mut rx = transformed_chat_stream(frames).await;
+            let events = drained_events(&mut rx).await;
+            let terminal = events.last().expect("a terminal event");
+            assert_eq!(terminal["type"], "response.failed", "{cut}");
+            assert_eq!(terminal["response"]["error"]["code"], code, "{cut}");
+        }
     }
 
     /// The `data:` payloads the client read, in order, once the transform has

@@ -20,6 +20,7 @@ use openai_protocol::{
 };
 use serde::Serialize;
 use serde_json::json;
+use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
 use smg_mcp::{self as mcp};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
@@ -106,14 +107,15 @@ struct ToolCallStreamItem {
 
 /// The bounded `reason` label for the stream-failure counter.
 ///
-/// The gateway emits two error codes on this path: `stream_error` when the
-/// backend stream could not be read, and `server_error` when the engine
-/// reported a failed generation (also the case when the finish reason alone
-/// says so and no error object was built). Anything else counts as `other`
-/// so a client-visible code can never widen the label set.
+/// The gateway emits three error codes on this path: `stream_error` when the
+/// backend stream could not be read, the request timeout's code when the
+/// timeout cut it, counted as the stream error it is, and `server_error`
+/// when the engine reported a failed generation (also the case when the
+/// finish reason alone says so and no error object was built). Anything else
+/// counts as `other` so a client-visible code can never widen the label set.
 fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
     match error.and_then(|e| e.get("code")).and_then(|c| c.as_str()) {
-        Some("stream_error") => "stream_error",
+        Some("stream_error" | REQUEST_TIMEOUT_CODE) => "stream_error",
         Some("server_error") | None => "server_error",
         Some("storage_unavailable") => "storage_unavailable",
         Some(_) => "other",
@@ -2100,6 +2102,25 @@ mod tests {
     use crate::routers::grpc::common::responses::utils::{
         assert_responses_api_usage, responses_api_test_usage,
     };
+
+    /// The terminal's error for a stream the request timeout cut counts under
+    /// `stream_error` in both shapes: with the event's type as its code (an
+    /// event without a code) and with the timeout's own code. The label set
+    /// does not grow with the code.
+    #[test]
+    fn a_stream_cut_by_the_request_timeout_counts_as_a_stream_error() {
+        let without_a_code = json!({"code": "stream_error"});
+        let with_the_timeouts_code = json!({"code": REQUEST_TIMEOUT_CODE});
+        assert_eq!(failure_reason(Some(&without_a_code)), "stream_error");
+        assert_eq!(
+            failure_reason(Some(&with_the_timeouts_code)),
+            "stream_error"
+        );
+        assert_eq!(
+            failure_reason(Some(&json!({"code": "a_code_it_does_not_know"}))),
+            "other"
+        );
+    }
 
     /// The events of one list-tools sequence for a server with no tools whose
     /// listing failed with `error` (or succeeded, `None`), read back from the
