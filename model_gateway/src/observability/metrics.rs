@@ -301,7 +301,7 @@ mod handles {
     /// own allocation, as the request counters' is, and a label the interner
     /// refused (its sentinel) keeps nothing (`None`).
     pub(super) fn engine_rank<'m>(
-        by_model: &'m mut HashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>,
+        by_model: &'m mut FxHashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>,
         model_id: &str,
         dp_rank: i32,
     ) -> Option<&'m mut EngineRankHandles> {
@@ -380,8 +380,10 @@ mod handles {
     pub(super) type WorkerGauges = ByWorker<Gauge>;
 
     /// The `smg_engine_*` set: by worker URL, then the model label as the
-    /// interner gave it, then the DP rank.
-    pub(super) type EngineLoads = ByWorker<HashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>>;
+    /// interner gave it, then the DP rank. The model is the one a worker
+    /// registered with, the gateway's own string, so its level hashes with
+    /// FxHash as the other two do.
+    pub(super) type EngineLoads = ByWorker<FxHashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>>;
 
     /// Uses the one handle of a series with no dynamic label: this thread's
     /// kept handle, built on first use, or a key built per call when handles
@@ -513,7 +515,7 @@ mod handles {
 
         #[test]
         fn engine_rank_handles_are_made_once_per_model_and_rank() {
-            let mut by_model = HashMap::new();
+            let mut by_model = FxHashMap::default();
             for (model, rank) in [("m", 0), ("m", 1), ("m", 0), ("m2", 0), ("m", 1)] {
                 assert!(engine_rank(&mut by_model, model, rank).is_some());
             }
