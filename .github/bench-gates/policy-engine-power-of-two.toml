@@ -1,0 +1,61 @@
+# Regression gate for `cargo bench -p smg-policy-controller --bench power_of_two`, the second row of the matrix
+# in .github/workflows/benchmark-policy-engine.yml, run on pull requests through scripts/bench_gate.py. The
+# first row gates the `decision` binary with policy-engine.toml, which records the placement every row is
+# built with (every function on a 64-byte boundary) and why.
+#
+# The gate runs the whole file: one decision under each form of the `power_of_two` preset at 8, 64 and 512
+# candidates (`policy_engine/power_of_two/<form>/<n>`): the expected wait of two drawn workers, the fewer in
+# flight of two drawn workers, the fewest in flight over every worker, the least resident work over every
+# worker, and that last form with a dispatch credit held per row. 15 single-threaded rows, a fresh seed per
+# iteration, about two and a half minutes a run, so three interleaved runs a side take about fifteen minutes.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of
+# the per-run criterion medians of one build, was read twice, and the threshold follows the lower reading:
+# the gate runs on the hosted runner, and the build host's wide rows sat inside single runs.
+#
+#   rows                           build host      hosted runner   threshold
+#   <form>/512 (1.6 - 10.9 us)     1.2 - 2.9 %     0.6 - 1.1 %     10 %
+#   <form>/64 (275 - 818 ns)       1.0 - 5.6 %     0.3 - 0.9 %     10 %
+#   <form>/8 (150 - 216 ns)        1.5 - 7.1 %     0.7 - 1.9 %     10 %
+#
+# The build host's reading: six pinned runs of one build, read through the gate script itself: one build as
+# both sides (the second side the same binary with one byte appended past its image), three interleaved runs
+# a side, each from a fresh copy of the binary with a fresh criterion home, on a reserved core of a shared
+# many-core build host. The script held each run until the host's one-minute load was at most 40
+# (`--busy-above 40`); the loads before the six runs were 39, 37, 29, 38, 36 and 33. The spread follows that
+# host: the same six runs with no hold on the load (27 to 85 before a run) read 1.9 - 7.2 %, 2.9 - 12.1 % and
+# 3.6 - 13.5 % for the three sizes.
+#
+# The hosted runner's reading: the first job that ran both sides, three interleaved runs a side. A side's
+# three runs are one build, and the table holds each row's wider side. The one-minute load before the runs
+# was 1.0 to 3.2. The two builds of that job differed in the measured crate, by a picker this binary does
+# not run: all 15 ids passed, the changes -0.2 to +2.9 %.
+#
+# The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never
+# under 10 %. The gate fails an id only when every pull-request run is slower than every base run, so one
+# slow run cannot fail the job. Read as three base and three head runs, the build host's null case passed at
+# 10 %: 0 failed, 0 suspect of 15 ids.
+#
+# A pull request that moves no file of this binary builds two binaries of the same bytes, which the gate
+# passes without a run. Every job that runs both sides uploads bench-gate/results.json with the raw per-run
+# medians; a row whose spread on the hosted runner reads above 5 % takes 15 % by the rule above.
+
+# Count: `count = true`, as policy-engine.toml records it. Read on this file's 15 ids, the same work with cold
+# code ahead of the decision (never committed): 13 count the same in every batch after the first, and two
+# 512-worker rows did not count steadily in that reading. They keep the time's verdict.
+repeats = 3
+count = true
+filter = "^policy_engine/power_of_two/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the pull
+# request has them (bench_gate.py build --sources-from), so the two binaries differ in the measured code alone.
+sources = [
+    "crates/policy_controller/benches/power_of_two.rs",
+    "crates/policy_controller/benches/common/mod.rs",
+]
+
+# The first gate whose pattern matches an id decides its threshold.
+[[gate]]
+pattern = "^policy_engine/power_of_two/"
+threshold = 0.10
+note = "identical build 0.3 - 1.9 % on the hosted runner, 1.0 - 7.1 % on the build host"

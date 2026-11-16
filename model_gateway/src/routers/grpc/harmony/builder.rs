@@ -456,8 +456,10 @@ impl HarmonyBuilder {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<HarmonyBuildOutput, String> {
-        utils::validate_chat_content_parts(&request.messages)?;
+        // Harmony takes media in no role: its own whole-request refusal speaks before
+        // the shared door names a role's rule.
         reject_chat_media(&request.messages)?;
+        utils::validate_chat_content_parts(&request.messages)?;
         let encoding = try_harmony_encoding()?;
 
         let mut all_messages = Vec::new();
@@ -1482,6 +1484,30 @@ mod tests {
         let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
         assert!(error.contains("vendor_media"));
         assert!(error.contains("gRPC"));
+    }
+
+    /// Harmony takes media in no role, so its own whole-request refusal
+    /// speaks before the shared door names a role's rule: a system image is
+    /// refused by name and pointed at the regular multimodal path, not told
+    /// to move to a user message.
+    #[test]
+    fn build_from_chat_refuses_a_system_image_in_harmonys_own_words() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "You see the attached image."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+                ]},
+                {"role": "user", "content": "Describe it."}
+            ]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert_eq!(
+            error,
+            "Harmony does not support image content parts; use the regular multimodal path"
+        );
     }
 
     /// A Responses message item's `input_image` or `input_file` part has no

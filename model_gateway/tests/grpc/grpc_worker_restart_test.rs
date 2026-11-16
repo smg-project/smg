@@ -32,8 +32,10 @@ use smg::{
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        manager::{WorkerManager, WorkerManagerConfig},
+        health::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            manager::{WorkerManager, WorkerManagerConfig},
+        },
         test_support::RefusedAddress,
         BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
     },
@@ -368,7 +370,10 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
         );
         let ready = worker.status() == WorkerStatus::Ready;
         let from = restarted.elapsed();
-        let age = worker.contact_age();
+        let age = worker
+            .runtime_state()
+            .expect("a gateway worker keeps its state")
+            .contact_age();
         if restarted.elapsed() - from > PROBE_TIMEOUT / 10 {
             return false;
         }

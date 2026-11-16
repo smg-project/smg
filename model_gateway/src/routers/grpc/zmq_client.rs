@@ -19,7 +19,7 @@ use crate::{
         client::{ModelInfo, ServerInfo},
         proto_wrapper::ProtoGenerateRequest,
     },
-    worker::basic::CONTEXT_WINDOW_LABELS,
+    worker::identity::basic::CONTEXT_WINDOW_LABELS,
 };
 
 /// Submit the wrapper's request to the engine it was built for.

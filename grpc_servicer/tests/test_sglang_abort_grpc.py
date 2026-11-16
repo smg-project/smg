@@ -42,6 +42,7 @@ def token_timing_stand_in(manager):  # noqa: F811
 @pytest.mark.parametrize("stream", [True, False])
 @pytest.mark.parametrize("send_fails", [False, True])
 def test_running_abort_closes_real_grpc_generate(manager, servicer, stream, send_fails):  # noqa: F811
+    """A local abort closes the RPC once and ignores late scheduler token rows."""
     from smg_grpc_proto import sglang_scheduler_pb2 as pb
     from smg_grpc_proto import sglang_scheduler_pb2_grpc as rpc
 
@@ -88,7 +89,11 @@ def test_running_abort_closes_real_grpc_generate(manager, servicer, stream, send
             assert state.event.is_set()
             assert not manager.rid_to_state
             # An eventual terminal scheduler batch cannot reopen the RPC.
-            await manager._handle_batch_output(SimpleNamespace(rids=["tcp"]))
+            await manager._handle_batch_output(
+                SimpleNamespace(
+                    rids=["tcp"], output_ids=[[1]], prompt_tokens=[1], cached_tokens=[0]
+                )
+            )
         finally:
             if call is not None:
                 call.cancel()
