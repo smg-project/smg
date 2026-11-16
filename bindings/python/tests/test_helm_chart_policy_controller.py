@@ -1301,7 +1301,7 @@ def test_the_image_job_starts_on_what_these_cases_read():
         REPO / "rust-toolchain.toml",
         crate / "Cargo.toml",
         crate / "build.rs",
-        crate / "src" / "main.rs",
+        crate / "src" / "bin" / "smg-policy-controller.rs",
         crate / "contracts" / "smg-policy.wit",
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.

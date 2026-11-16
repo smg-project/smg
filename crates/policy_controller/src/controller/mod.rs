@@ -271,6 +271,15 @@ impl Controller {
     pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
+        // The stages a policy document may name in this build, the host's
+        // own among them.
+        info!(
+            controller_id = %config.controller_id,
+            filters = ?catalog.filters().collect::<Vec<_>>(),
+            scorers = ?catalog.scorers().collect::<Vec<_>>(),
+            pickers = ?catalog.pickers().collect::<Vec<_>>(),
+            "stages held"
+        );
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();

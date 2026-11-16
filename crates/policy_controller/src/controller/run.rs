@@ -457,6 +457,18 @@ async fn bind(config: Config, catalog: Catalog, as_told: &[String]) -> Result<Co
 /// start-up sequence: parse, log, configure, then the runtime, built only
 /// now so a refusal costs no threads; bind and serve on it. A policy
 /// document names the stages `catalog` holds.
+///
+/// The command line is the process's own and this crate's: a flag it does
+/// not know is refused, so a host's settings come from its environment or a
+/// file. At `--help`, `--version` and a refused flag the parser ends the
+/// process itself and the call does not return.
+///
+/// # Panics
+///
+/// When a global log subscriber is already set: `run` installs its own, so
+/// the `main` that calls it installs none. When called inside an async
+/// runtime: `run` builds its own and blocks on it, so that `main` is a
+/// plain `fn main`.
 pub fn run(catalog: Catalog) -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli.log_level, cli.log_json);

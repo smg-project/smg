@@ -25,21 +25,26 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
 - The tests: a store fed as the controller's ingestion feeds one
   (registration, the prober's status, the engines' load reports) gives the
   rows, and the decision picks the busy worker, then the idle one once the
-  prober takes the busy one out. A controller bound with these stages takes
-  the document, and the stock one refuses it by the scorer's name.
+  prober takes the busy one out. A worker with no report yet counts as idle,
+  and an idle fleet ties. A controller bound with these stages takes the
+  document, and the stock one refuses it by the scorer's name. The built
+  binary's start-up line names `pack` among its scorers.
 - `Cargo.toml`: one dependency, the crate with its `controller` feature.
 
 ## Write, register, run
 
 1. Write the stage. Implement `Scorer`, `Filter` or `Picker` for a type of
    yours. A scorer writes one score for each row it is handed, from 0 to 1
-   with higher better, and allocates nothing. A stage that keeps no state
+   with higher better, and allocates nothing. A stage declares what it reads
+   in `needs`: `Pack` declares the load reports. A stage that keeps no state
    takes every default of `Lifecycle`.
 2. Register it. Start from `Catalog::builtin()` and add the stage under a new
    name with `scorer`, `filter` or `picker`. The name must be free among the
    built-ins and across the three kinds, and it must be the name the stage
    answers.
-3. Run. Hand the catalog to `controller::run` and return its exit code.
+3. Run. From a plain `fn main`, hand the catalog to `controller::run` and
+   return its exit code. `run` builds the async runtime itself and panics
+   inside another.
 
 ```rust
 fn main() -> Result<ExitCode, CatalogError> {
@@ -49,9 +54,12 @@ fn main() -> Result<ExitCode, CatalogError> {
 }
 ```
 
-The closure is a factory. The controller calls it once for each policy
-document it validates, so every generation of the policy gets a stage of its
-own. State that must outlive a generation rides the closure.
+The closure is a factory. The catalog calls it once at registration, to read
+the stage's name, and drops that stage. The controller calls it again each
+time it validates a policy document, once for each place the document names
+the stage, so every generation of the policy gets stages of its own. Keep the
+factory cheap: its first call runs in `main`, before the command line is
+read. State that must outlive a generation rides the closure.
 
 ## What a stage is handed
 
@@ -61,16 +69,16 @@ from its store, so a stage of yours starts with every fact a built-in has.
 | A stage reads | Where it comes from |
 |---|---|
 | `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the last load report's overload verdict. |
-| `Candidate::load` (`LoadRow`) | The engine's own load report: requests running and queued, KV-cache usage, the drain rate, the report's age. |
+| `Candidate::load` (`LoadRow`) | The engine's own load report: requests running and queued, KV-cache usage, the drain rate, the report's age. A stage that reads it declares `Needs::loads`. |
 | `Candidate::in_flight` | The requests the deciding host holds on the worker right now. |
 | `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. |
-| `RequestFacts::affinity` (`AffinityFacts`) | The cache index: the prefix blocks of the request the worker holds. Filled for a profile whose stages declare it. |
+| `RequestFacts::affinity_at(index)` (`AffinityFacts`) | The cache index: the prefix blocks of the request the worker at `index` holds. An empty column reads as nothing held. Filled for a profile with a stage that declares `Needs::affinity`. |
 | `Candidate::role`, `zone`, `labels`, `wire_modes` | The worker's registration. |
 | `RequestFacts` | The request: the model, the tenant, the session key, the prompt's size and block hashes, the allow-listed headers. |
-| `PoolFacts` | The pool the model resolves to: its size, the policy's generation, the overload regime. |
+| `PoolFacts`, at `DecisionScope::open` | The pool the model resolves to: its size, the policy's generation, the overload regime. A stage that holds a decision scope reads it when the scope opens. |
 
-`Pack` reads `Candidate::load`. The example's test feeds a store through the
-same doors and reads the decision.
+`Pack` reads `Candidate::load` and says so in `needs`. The example's test
+feeds a store through the same doors and reads the decision.
 
 ## The policy document
 
@@ -85,7 +93,9 @@ profiles:
 
 A scorer in code takes a weight from the document and nothing else:
 `- pack: { weight: 2 }`. A bare name weighs one. Settings of your own are
-your binary's: read them in `main` and move them into the factory.
+your binary's: read them in `main`, from the environment or a file, and move
+them into the factory. The command line is the crate's, and it refuses a flag
+it does not know.
 
 The stock controller refuses this document by the scorer's name. The
 published schema (`crates/policy_controller/policyspec.schema.json`) lists
@@ -101,7 +111,9 @@ target/release/policy-controller-example --controller-id controller-0
 
 The flags are the stock controller's, and `--help` lists them. `--log-level`
 sets the level of the crate's own log lines. Lines your own crate writes show
-at `warn` and above unless `RUST_LOG` says otherwise.
+at `warn` and above unless `RUST_LOG` says otherwise. `controller::run`
+installs the process's log subscriber and panics when one is already set, so
+`main` installs none.
 
 ## In a repository of your own
 

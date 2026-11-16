@@ -1,5 +1,6 @@
 //! The example controller started as a user starts it: the built binary
-//! binds its listeners, elects itself and reads ready on its admin listener.
+//! names the stages it holds, binds its listeners, elects itself and reads
+//! ready on its admin listener.
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -21,6 +22,8 @@ struct Started {
     child: Child,
     /// Where its admin listener is bound.
     admin: String,
+    /// The line of its log that names the stages it holds.
+    stages: String,
 }
 
 impl Drop for Started {
@@ -52,6 +55,7 @@ fn start() -> Result<Started, String> {
     let mut started = Started {
         child,
         admin: String::new(),
+        stages: String::new(),
     };
     let log = log.ok_or("the binary's log is not piped")?;
     let (lines, read) = mpsc::channel();
@@ -66,7 +70,9 @@ fn start() -> Result<Started, String> {
         let line = read
             .recv_timeout(left)
             .map_err(|_| "no admin listener line within the bound")?;
-        if line.contains("admin listener bound") {
+        if line.contains("stages held") {
+            started.stages = line;
+        } else if line.contains("admin listener bound") {
             break line
                 .split_whitespace()
                 .find_map(|field| field.strip_prefix("addr="))
@@ -126,4 +132,11 @@ fn the_built_binary_binds_leads_and_reads_ready() {
         version.contains(r#""protocol":"smg.policy.v1""#),
         "{version}"
     );
+}
+
+#[test]
+fn the_built_binary_holds_the_stages_of_this_build() {
+    let started = start().expect("the example controller starts");
+    // The stock build's line names no `pack`.
+    assert!(started.stages.contains(r#""pack""#), "{}", started.stages);
 }
