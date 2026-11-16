@@ -1197,12 +1197,15 @@ impl RequestContext {
     /// Fails loudly when worker selection's outputs (routing snapshot, wire)
     /// are absent: a retry context with defaulted routing inputs could
     /// re-select a worker the retained plan cannot be dispatched to.
-    pub fn into_dispatch(self) -> Result<DispatchContext, axum::response::Response> {
-        let RequestContext {
-            input,
-            components,
-            state,
-        } = self;
+    ///
+    /// Both contexts are a few KiB wide, so both travel boxed: this one
+    /// comes in its box, and the dispatch context leaves in the box the run
+    /// keeps it in.
+    pub fn into_dispatch(
+        self: Box<Self>,
+    ) -> Result<Box<DispatchContext>, axum::response::Response> {
+        // Fields leave the box one at a time: a local that bound `state`
+        // whole would copy all of it to the stack first.
         let RequestInput {
             request_type,
             headers,
@@ -1210,7 +1213,7 @@ impl RequestContext {
             streaming,
             tenant_request_meta,
             rate_limit_cell,
-        } = input;
+        } = self.input;
         // The model the response reports. `RequestContext::new` already
         // canonicalized both the request's `model` field and `model_id`, so a
         // request that arrived under an alias is answered under the canonical
@@ -1230,9 +1233,9 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
-        let parser = state.parser;
-        drop(components);
-        let routing = state.routing_snapshot.ok_or_else(|| {
+        let parser = self.state.parser;
+        drop(self.components);
+        let routing = self.state.routing_snapshot.ok_or_else(|| {
             error!(
                 function = "RequestContext::into_dispatch",
                 "Routing snapshot not captured by worker selection"
@@ -1243,10 +1246,10 @@ impl RequestContext {
             )
         })?;
         let wire = WireConstraint::of(
-            stage_output(state.workers.as_ref(), "RequestContext::into_dispatch")?,
-            state.media_refs_forwarded,
-            if state.media_refs_forwarded {
-                state.media_refs_pipeline
+            stage_output(self.state.workers.as_ref(), "RequestContext::into_dispatch")?,
+            self.state.media_refs_forwarded,
+            if self.state.media_refs_forwarded {
+                self.state.media_refs_pipeline
             } else {
                 PipelinePin::Any
             },
@@ -1256,7 +1259,7 @@ impl RequestContext {
                 .map(str::to_owned);
         let (created, _) =
             super::common::stages::helpers::request_wall_clock(tenant_request_meta.as_ref());
-        Ok(DispatchContext {
+        Ok(Box::new(DispatchContext {
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
             } else {
@@ -1276,19 +1279,19 @@ impl RequestContext {
             rate_limit_cell,
             routing,
             wire,
-            constraint_decided_on: state.constraint_decided_on,
-            tokenizer: state.tokenizer,
-            workers: state.workers,
-            sticky_key: state.sticky_key,
-            clients: state.clients,
-            encode_outputs: state.encode_outputs,
+            constraint_decided_on: self.state.constraint_decided_on,
+            tokenizer: self.state.tokenizer,
+            workers: self.state.workers,
+            sticky_key: self.state.sticky_key,
+            clients: self.state.clients,
+            encode_outputs: self.state.encode_outputs,
             encode_watch: None,
-            multimodal_inflight: state.multimodal_inflight,
+            multimodal_inflight: self.state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
-            pd_prefill_guard: state.pd_prefill_guard,
-            response: state.response,
-        })
+            pd_prefill_guard: self.state.pd_prefill_guard,
+            response: self.state.response,
+        }))
     }
 
     /// Create context for chat completion request
