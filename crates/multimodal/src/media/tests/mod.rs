@@ -345,6 +345,40 @@ fn a_base64_source_decodes_as_its_data_url() {
     assert!(matches!(from_base64.source, super::ImageSource::DataUrl));
 }
 
+/// A data URL header may carry parameters before the marker: the fetch
+/// decodes the frame of the plain header from it. The marker before a
+/// parameter is not a base64 header.
+#[test]
+fn a_data_url_with_parameters_before_the_marker_decodes_the_same() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let data = STANDARD.encode(TINY_PNG);
+    let plain = MediaConnector::fetch_data_url(
+        &format!("data:image/png;base64,{data}"),
+        ImageFetchConfig::default(),
+    )
+    .expect("the plain header decodes");
+    for header in [
+        "data:image/png;charset=x;base64,",
+        "data:image/png;charset=x;name=a.png;base64,",
+    ] {
+        let frame =
+            MediaConnector::fetch_data_url(&format!("{header}{data}"), ImageFetchConfig::default())
+                .expect(header);
+        assert_eq!(frame.raw_bytes, plain.raw_bytes, "{header}");
+        assert_eq!(frame.hash, plain.hash, "{header}");
+    }
+    let Err(error) = MediaConnector::fetch_data_url(
+        &format!("data:image/png;base64;charset=x,{data}"),
+        ImageFetchConfig::default(),
+    ) else {
+        panic!("the marker before a parameter is refused");
+    };
+    assert_eq!(
+        error.to_string(),
+        "data URL parse error: only base64 encoded data URLs are supported"
+    );
+}
+
 #[test]
 fn splits_concatenated_png_stream() {
     let mut stream = Vec::new();
