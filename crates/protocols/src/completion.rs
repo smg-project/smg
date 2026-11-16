@@ -248,7 +248,7 @@ fn validate_completion_cross_parameters(
     if req.stream && req.best_of.is_some_and(|best_of| best_of > req.choices()) {
         return Err(invalid(
             "best_of_not_supported_with_stream",
-            "best_of is not supported when stream is enabled",
+            "best_of greater than n is not supported when stream is enabled",
         ));
     }
 
@@ -603,7 +603,9 @@ mod tests {
     }
 
     /// A `best_of` equal to `n` asks for no candidate beyond the choices
-    /// returned, so the request is the plain one, streamed or not.
+    /// returned, so the request is the plain one, streamed or not. Without
+    /// `n` the cross rule has nothing to compare, so a `best_of` of 0 is
+    /// served on a stream as it is off one.
     #[test]
     fn best_of_equal_to_n_is_the_plain_request() {
         for body in [
@@ -612,6 +614,8 @@ mod tests {
             serde_json::json!({"n": 2, "best_of": 3}),
             serde_json::json!({"best_of": 1, "stream": true}),
             serde_json::json!({"n": 2, "best_of": 2, "stream": true}),
+            serde_json::json!({"best_of": 0}),
+            serde_json::json!({"best_of": 0, "stream": true}),
         ] {
             assert!(req(body.clone()).validate().is_ok(), "{body}");
         }
