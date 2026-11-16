@@ -827,10 +827,12 @@ impl Config {
     }
 
     /// Refuse the shared KV tier's flags where the tier would not take: on a
-    /// canned engine, with prefix caching off (a restore continues a prefix
-    /// hit), on an engine whose cache groups are not one main-attention group
-    /// (the tier holds whole blocks of one group), and a restore price with no
-    /// tier or one that is not a finite number of at least 0.
+    /// canned engine, on prefill or encode workers (neither runs its engine's
+    /// passes, which write and restore the tier), with prefix caching off (a
+    /// restore continues a prefix hit), on an engine whose cache groups are
+    /// not one main-attention group (the tier holds whole blocks of one
+    /// group), and a restore price with no tier or one that is not a finite
+    /// number of at least 0.
     fn check_global_l3(&self) -> Result<(), String> {
         let (blocks, ms) = (
             self.engine.global_l3_blocks,
@@ -841,6 +843,13 @@ impl Config {
                 "--global-l3-blocks is a realistic engine's tier: it needs --engine realistic"
                     .to_string(),
             );
+        }
+        if let Some(role) = self.role.filter(|role| blocks > 0 && *role != Role::Decode) {
+            return Err(format!(
+                "--global-l3-blocks is a tier the engines' passes write and restore from, but \
+                 --worker-type {} workers answer without running their engine's passes",
+                role.as_str()
+            ));
         }
         if blocks > 0 && !self.engine.prefix_cache {
             return Err(
@@ -1086,8 +1095,9 @@ pub fn usage() -> String {
        --worker-pass-time-scale <worker=f,..>  the named workers' passes take f times the\n\
                                 timing model's duration (0.001 to 1000; above 1 a slower engine)\n\
        --global-l3-blocks <n>   process-wide shared KV tier every engine writes to and restores\n\
-                                prefixes from, in blocks (default 0: off; realistic engine,\n\
-                                --prefix-cache true and one main-attention cache group only)\n\
+                                prefixes from, in blocks (default 0: off; a generating worker's\n\
+                                realistic engine, --prefix-cache true and one main-attention\n\
+                                cache group only)\n\
        --global-l3-ms-per-token <f>  pass time per token restored from the shared tier (default 0;\n\
                                 needs --global-l3-blocks)\n\
        --request-overhead-ms <f>  fixed per-request latency added to every event of a stream (default 0)\n\
@@ -1457,9 +1467,10 @@ mod tests {
     }
 
     /// The shared tier's flags set the engines' tier and are refused where
-    /// it would not take: a canned engine, prefix caching off, a hybrid
-    /// engine's several cache groups, a restore price with no tier, a price
-    /// that is not a finite number of at least 0.
+    /// it would not take: a canned engine, a prefill or encode worker (a
+    /// decode worker takes it), prefix caching off, a hybrid engine's several
+    /// cache groups, a restore price with no tier, a price that is not a
+    /// finite number of at least 0.
     #[test]
     fn the_shared_tier_flags_set_the_tier_and_are_refused_where_it_would_not_take() {
         let realistic = [
@@ -1489,6 +1500,14 @@ mod tests {
             &["--global-l3-blocks", "4096", "--prefix-cache", "false"],
             "needs --prefix-cache true",
         );
+        for role in ["prefill", "encode"] {
+            refused(
+                &["--global-l3-blocks", "4096", "--worker-type", role],
+                "workers answer without running their engine's passes",
+            );
+        }
+        with(&["--global-l3-blocks", "4096", "--worker-type", "decode"])
+            .expect("a decode worker runs its engine's passes");
         for groups in ["full_attention,sliding_window:128", "sliding_window:128"] {
             refused(
                 &["--global-l3-blocks", "4096", "--kv-cache-groups", groups],

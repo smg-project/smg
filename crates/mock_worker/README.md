@@ -182,8 +182,10 @@ experiments against it transfer to engines:
   `cached_tokens`, and add `--global-l3-ms-per-token` per restored token to
   the pass (a synchronous load). The tier is per process (a fleet split over
   several processes has one tier each), and a reset (`POST /admin/reset`)
-  leaves it as it is: a restarted engine does not empty a shared store. It
-  needs `--prefix-cache true` and one main-attention KV cache group
+  leaves it as it is: a restarted engine does not empty a shared store. A
+  queued request's `num_waiting_uncached_tokens` leaves out what the tier
+  would restore. The tier needs generating workers (a prefill or encode worker
+  runs no passes), `--prefix-cache true` and one main-attention KV cache group
   (`full_attention`, `mla_attention` or `sink_full_attention`): the tier holds
   whole blocks of one group.
 - **repeatable output** — `--output-seed prompt` derives synthetic output from

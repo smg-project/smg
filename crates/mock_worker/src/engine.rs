@@ -982,6 +982,30 @@ fn publish_to_global_l3(p: &EngineParams, inserted: &[(u64, u8)], restored_token
     l3.insert(&keys, p.global_l3_blocks);
 }
 
+/// Blocks the shared tier would restore for a prompt of `prompt_len` tokens
+/// whose first `cached_blocks` of `keys` the engine holds: the run the tier
+/// holds next, one fewer when the two cover the prompt whole (its last block
+/// is computed, as at admission). 0 while the tier is off.
+fn restorable_blocks(
+    keys: &[u64],
+    cached_blocks: usize,
+    prompt_len: u32,
+    p: &EngineParams,
+) -> usize {
+    if !(p.prefix_cache && p.global_l3_blocks > 0) {
+        return 0;
+    }
+    let held = global_l3()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .match_prefix(&keys[cached_blocks..]);
+    if held > 0 && (cached_blocks + held) as u32 * p.block_size.max(1) >= prompt_len {
+        held - 1
+    } else {
+        held
+    }
+}
+
 /// All engines registered in this process.
 pub(crate) fn fleet_engines() -> Vec<Engine> {
     fleet().lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -1804,7 +1828,8 @@ struct WaitingReq {
     rolling_hash: u64,
     /// Prompt tokens as reported on the stream (the original prompt).
     prompt_tokens: u32,
-    /// Uncached prompt tokens at enqueue time (the queued token-work it adds).
+    /// Prompt tokens at enqueue time neither cached nor restorable from the
+    /// shared tier (the queued token-work it adds).
     uncached_tokens: u32,
     /// Best cached prefix any fleet worker held at arrival (ground truth).
     oracle_tokens: u32,
@@ -2159,7 +2184,9 @@ impl SchedulerState {
         } else {
             0
         };
-        let cached = (cached_blocks as u32 * p.block_size).min(prompt_tokens);
+        // What the shared tier would restore is loaded, not computed.
+        let restored_blocks = restorable_blocks(&keys, cached_blocks, prompt_tokens, p);
+        let cached = ((cached_blocks + restored_blocks) as u32 * p.block_size).min(prompt_tokens);
         self.waiting.push_back(WaitingReq {
             req,
             keys,
@@ -2661,11 +2688,13 @@ impl SchedulerState {
         seq.extend_from_slice(&r.output_ids[r.resumed_output as usize..]);
         let (keys, rolling_hash, _) = prompt_blocks(&seq, p.block_size.max(1) as usize);
         let len = seq.len() as u32;
-        let cached = if p.prefix_cache {
-            (self.pool.match_prefix(&keys, p) as u32 * p.block_size).min(len)
+        let cached_blocks = if p.prefix_cache {
+            self.pool.match_prefix(&keys, p)
         } else {
             0
         };
+        let restored_blocks = restorable_blocks(&keys, cached_blocks, len, p);
+        let cached = ((cached_blocks + restored_blocks) as u32 * p.block_size).min(len);
         self.waiting.push_front(WaitingReq {
             req: NewRequest {
                 request_id: r.request_id,
@@ -3573,6 +3602,70 @@ mod tests {
         let pass_ms = step.duration.as_secs_f64() * 1000.0;
         let expected = tight.timing.prefill_pass_ms(6, 6);
         assert!((pass_ms - expected).abs() < 1e-3, "{pass_ms} vs {expected}");
+    }
+
+    /// A queued request's work leaves out what the shared tier would restore,
+    /// last block computed as at admission: a 16-token prompt the tier holds
+    /// whole queues 4 tokens of work, and 16 with the tier off.
+    #[test]
+    fn a_queued_request_counts_no_work_for_what_the_tier_would_restore() {
+        let params = EngineParams {
+            block_size: 4,
+            global_l3_blocks: 1024,
+            ..Default::default()
+        };
+        // Tokens no other test uses: the tier is process-wide.
+        let prompt: Vec<u32> = (95_001..95_017).collect();
+        let mut source = SchedulerState::new();
+        let (r, _rx_source) = req("queued-source", prompt.clone(), 8);
+        source.enqueue(r, &params);
+        let computing = source.step(&params);
+        publish_to_global_l3(&params, &computing.inserted, computing.restored_tokens);
+        let queued = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, _rx) = req("queued", prompt.clone(), 8);
+            st.enqueue(r, p);
+            st.snapshot(p).num_waiting_uncached_tokens
+        };
+        assert_eq!(queued(&params), 4, "the last of the four blocks is work");
+        let off = EngineParams {
+            global_l3_blocks: 0,
+            ..params.clone()
+        };
+        assert_eq!(queued(&off), 16);
+    }
+
+    /// A request preempted mid-prefill comes back counting no work for what
+    /// the tier holds past its own computed blocks: it computed one block of
+    /// a 40-token prompt, the tier holds the nine blocks after it, and the
+    /// requeued request queues only the last block.
+    #[test]
+    fn a_requeued_request_counts_no_work_for_what_the_tier_would_restore() {
+        let params = EngineParams {
+            block_size: 4,
+            global_l3_blocks: 1024,
+            max_batched_tokens: 6,
+            ..Default::default()
+        };
+        let prompt: Vec<u32> = (96_001..96_041).collect();
+        let mut st = SchedulerState::new();
+        let (r, _rx) = req("requeued", prompt.clone(), 8);
+        st.enqueue(r, &params);
+        st.step(&params);
+        assert_eq!(st.running[0].computed, 6, "one block and part of the next");
+        // The tier holds only the blocks after the engine's own, so the
+        // requeue has to join its local hit and the tier's run.
+        let keys = prompt_blocks(&prompt, 4).0;
+        global_l3()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(&keys[1..], params.global_l3_blocks);
+        st.preempt_last(&params);
+        assert_eq!(
+            st.snapshot(&params).num_waiting_uncached_tokens,
+            4,
+            "one block its own, eight restorable, the last one work"
+        );
     }
 
     /// The tier evicts the least recently written blocks down to its
