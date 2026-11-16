@@ -30,7 +30,8 @@ use crate::{
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
         breaker::{Breaker, Latency},
-        intern, BoundPlugin, Counters, Fallback, OpenDecision, OpenDecisions, Part,
+        intern, own_bound, BoundPlugin, Counters, Fallback, HalfOpen, OpenDecision, OpenDecisions,
+        Part,
     },
     spec::Needs,
     view::{Candidate, Phase, PoolFacts, RequestFacts},
@@ -324,15 +325,6 @@ fn judge(
         Verdict::Own
     };
     (OwnTime::read(fuel_micros, had, charged), verdict)
-}
-
-/// Whether a plugin alone consumed its decision's budget: its own time in
-/// the decision before a call, `spent_micros`, and the call's grant in
-/// full, `granted_micros`, reach the budget as seeded. Exact: a microsecond
-/// short, some other draw took part of the budget, and a call that runs out
-/// there is the decision's budget spent.
-fn reaches_the_budget(spent_micros: u64, granted_micros: u64, seed_micros: u64) -> bool {
-    spent_micros.saturating_add(granted_micros) >= seed_micros
 }
 
 /// Tables one store may hold: a component built from one module has the
@@ -1263,15 +1255,15 @@ impl Plugin {
                 // not charged for the hold before it. A host with no thread
                 // clock has no low end: there the spend is the time they took.
                 let granted = grant.div_ceil(fuel_per_micro);
-                let reaches = |spent: u64| reaches_the_budget(spent, granted, frame.seed_micros);
-                let own_bound = grant == frame.cap || reaches(before.spend);
-                if frame_ran_out && frame.decision != 0 && !own_bound {
+                let whole = grant == frame.cap;
+                let under_its_own = own_bound(whole, before.spend, granted, frame.seed_micros);
+                if frame_ran_out && frame.decision != 0 && !under_its_own {
                     tracing::debug!(
                         plugin = self.name,
                         "a call ran out under the decision's remainder"
                     );
                     bump(&self.tally.budget_spent);
-                    if reaches(before.sample) {
+                    if own_bound(whole, before.sample, granted, frame.seed_micros) {
                         // The two ends part: the time the plugin's unread
                         // calls took reaches the budget, their fuel does
                         // not, and nothing says whether a hold or their own
@@ -2307,44 +2299,14 @@ impl BoundPlugin for Bound {
     }
 }
 
-/// An open of a [`Bound`] that has not returned yet. The engine closes a
-/// scope only after its open returned, and this open marks its phase open
-/// and counts the decision before its instance's steps. So an open that
-/// stops half-way takes both back itself, by the walk the close does.
-struct HalfOpen<'a> {
-    bound: &'a Bound,
-    returned: bool,
-}
-
-impl Drop for HalfOpen<'_> {
-    fn drop(&mut self) {
-        if !self.returned {
-            self.undo();
-        }
-    }
-}
-
-impl HalfOpen<'_> {
-    /// The open is unwinding, and a second panic let out here would end the
-    /// process. So the walk runs contained: if it panics too (the host's
-    /// clock again, a destructor's host call), it stops there and the open's
-    /// panic is the one the host sees. Out of line: an open that returned
-    /// pays the guard's one test.
-    #[cold]
-    #[inline(never)]
-    fn undo(&self) {
-        framework::contained(|| self.bound.close());
-    }
-}
-
+/// This open marks its phase open and counts the decision before its
+/// instance's steps, so it runs under the guard that undoes an open that
+/// stops half-way.
 impl DecisionScope for Bound {
     fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>) {
-        let mut half_open = HalfOpen {
-            bound: self,
-            returned: false,
-        };
+        let mut half_open = HalfOpen::new(self);
         Bound::open(self, facts, candidates, pool);
-        half_open.returned = true;
+        half_open.returned();
     }
 
     fn close(&self) {
@@ -2364,8 +2326,8 @@ mod tests {
     use wasmtime::{Trap, UpdateDeadline};
 
     use super::{
-        bit, deadline_ticks, first_deadline, import_version, judge, reaches_the_budget,
-        thread_cpu_micros, tick, End, Latency, ThreadRing, Verdict, Watch, EPOCH_TICK_MICROS,
+        bit, deadline_ticks, first_deadline, import_version, judge, thread_cpu_micros, tick, End,
+        Latency, ThreadRing, Verdict, Watch, EPOCH_TICK_MICROS,
     };
 
     /// Whether a tick ended the call; a tick that lets it run asks for the
@@ -2757,33 +2719,6 @@ mod tests {
                 (own.sample, own.spend, verdict, reads.get()),
                 wanted,
                 "{case}"
-            );
-        }
-    }
-
-    /// The run-out's rule is exact: a plugin's own time and the grant in
-    /// full reach the budget or they do not, to the microsecond.
-    #[test]
-    fn a_spend_and_a_grant_reach_the_budget_to_the_microsecond() {
-        // A plugin's time before the call, the grant, the budget as seeded,
-        // and whether the plugin alone consumed it.
-        let table = [
-            (400, 599, 1_000, false),
-            (400, 600, 1_000, true),
-            (400, 601, 1_000, true),
-            (0, 999, 1_000, false),
-            (0, 1_000, 1_000, true),
-            (999, 0, 1_000, false),
-            (1_000, 0, 1_000, true),
-            // The sum saturates, and reaches.
-            (u64::MAX, 1, u64::MAX, true),
-            (u64::MAX - 1, 0, u64::MAX, false),
-        ];
-        for (spent, granted, seed, reached) in table {
-            assert_eq!(
-                reaches_the_budget(spent, granted, seed),
-                reached,
-                "{spent} and {granted} under {seed}"
             );
         }
     }

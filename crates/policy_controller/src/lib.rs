@@ -90,10 +90,12 @@ pub mod controller;
 pub mod decision;
 pub mod elector;
 pub mod framework;
+#[cfg(feature = "controller")]
+pub mod grpc;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
-#[cfg(feature = "wasm")]
+#[cfg(any(feature = "wasm", feature = "controller"))]
 pub mod plugins;
 #[cfg(feature = "controller")]
 pub mod proto;
