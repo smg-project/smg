@@ -145,31 +145,38 @@ impl<'a> McpToolSession<'a> {
                 }
             });
         }
-        let builtin_tool_bindings = Self::builtin_tool_bindings(orchestrator);
-        let (exposed_name_map, exposed_name_by_qualified) =
-            Self::build_exposed_function_tools(&mcp_tools, &mcp_servers, &builtin_tool_bindings);
-        let configured_internal_servers = orchestrator.internal_server_names();
-        let configured_builtin_servers = orchestrator.builtin_server_names();
+        // The orchestrator is asked about the bound servers by name: a walk of
+        // its server map takes one lock round and one allocation per shard,
+        // and the shards grow with the host's cores.
         let internal_server_keys: HashSet<String> = mcp_servers
             .iter()
-            .filter_map(|binding| {
-                if configured_internal_servers.contains(&binding.server_key) {
-                    Some(binding.server_key.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|binding| orchestrator.is_internal_server(&binding.server_key))
+            .map(|binding| binding.server_key.clone())
             .collect();
         let builtin_server_keys: HashSet<String> = mcp_servers
             .iter()
-            .filter_map(|binding| {
-                if configured_builtin_servers.contains(&binding.server_key) {
-                    Some(binding.server_key.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|binding| orchestrator.is_builtin_server(&binding.server_key))
+            .map(|binding| binding.server_key.clone())
             .collect();
+        // A builtin binding names a tool of a builtin server, and a tool of
+        // this session is a tool of a bound server, an alias by its target:
+        // only an alias whose target's server is not bound can match without
+        // a builtin server among the bindings.
+        let may_route_builtin = !builtin_server_keys.is_empty()
+            || mcp_tools.iter().any(|entry| {
+                entry.alias_target.as_ref().is_some_and(|alias| {
+                    !server_keys
+                        .iter()
+                        .any(|key| key == alias.target.server_key())
+                })
+            });
+        let builtin_tool_bindings = if may_route_builtin {
+            Self::builtin_tool_bindings(orchestrator)
+        } else {
+            HashSet::new()
+        };
+        let (exposed_name_map, exposed_name_by_qualified) =
+            Self::build_exposed_function_tools(&mcp_tools, &mcp_servers, &builtin_tool_bindings);
         let internal_non_builtin_server_labels: HashSet<String> = mcp_servers
             .iter()
             .filter(|binding| {
@@ -181,7 +188,7 @@ impl<'a> McpToolSession<'a> {
         // Filter out servers configured with builtin_type from the visible list.
         let visible_mcp_servers: Vec<McpServerBinding> = mcp_servers
             .iter()
-            .filter(|b| !configured_builtin_servers.contains(&b.server_key))
+            .filter(|b| !builtin_server_keys.contains(&b.server_key))
             .cloned()
             .collect();
 
@@ -1533,5 +1540,30 @@ mod tests {
             request_ctx.forwarded_headers.get("opc-request-id"),
             Some(&"req-123".to_string())
         );
+    }
+
+    /// An alias listed through the alias index's own key, its target's server
+    /// not among the bindings, is still told from the builtin bindings: the
+    /// session looks them up for it.
+    #[test]
+    fn an_alias_listed_without_its_targets_server_keeps_its_builtin_routing() {
+        let orchestrator = create_builtin_orchestrator();
+        insert_test_tool(&orchestrator, "brave-builtin", "brave_web_search");
+        orchestrator
+            .register_alias("search", "brave-builtin", "brave_web_search", None)
+            .expect("alias registration should succeed");
+
+        let session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "aliases".to_string(),
+                server_key: crate::inventory::ALIAS_SERVER_KEY.to_string(),
+                allowed_tools: None,
+                list_error: None,
+            }],
+            "test-request",
+        );
+
+        assert!(session.is_builtin_tool("search"));
     }
 }
