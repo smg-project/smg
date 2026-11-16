@@ -536,7 +536,7 @@ impl RetainedInput {
     /// Reserve atomically, rejecting both budget exhaustion and integer overflow.
     fn reserve(total: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self> {
         total
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|next| *next <= limit)
             })
             .map_err(|retained_bytes| Error::EngineInputBytesFull {

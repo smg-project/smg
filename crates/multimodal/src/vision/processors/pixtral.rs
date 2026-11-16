@@ -28,8 +28,9 @@ use crate::{
         preprocessor_config::PreProcessorConfig,
         processor::VisionPreProcessor,
         processors::qwen_vl_base::pixel_norm,
+        rgb_runs::RgbSplitter,
         scratch,
-        transforms::{resize_bicubic_torch_aa_rgb, rgb_bytes, TransformError},
+        transforms::{plain_buffer, resize_bicubic_torch_aa_rgb, rgb_bytes, TransformError},
     },
 };
 
@@ -163,21 +164,10 @@ impl PixtralProcessor {
             )
         };
         let pixels = target_h as usize * target_w as usize;
-        let mut planes = vec![0u8; 3 * pixels];
+        let mut planes = plain_buffer(3 * pixels);
         let (r_plane, rest) = planes.split_at_mut(pixels);
         let (g_plane, b_plane) = rest.split_at_mut(pixels);
-        for (((rgb, r), g), b) in resized
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(r_plane.iter_mut())
-            .zip(g_plane.iter_mut())
-            .zip(b_plane.iter_mut())
-        {
-            *r = rgb[0];
-            *g = rgb[1];
-            *b = rgb[2];
-        }
+        RgbSplitter::detect().split(&resized, r_plane, g_plane, b_plane);
         Ok((planes, (target_h as usize, target_w as usize)))
     }
 }
@@ -494,6 +484,39 @@ mod tests {
                 planes
             );
         }
+    }
+
+    /// A container may be longer than its image: `ImageBuffer::from_raw` takes
+    /// any that is long enough.
+    #[test]
+    fn a_longer_container_gives_the_planes_of_its_image() {
+        let processor = PixtralProcessor::new();
+        let exact = lcg_rgb_image(64, 48, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(64, 48, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processor.planes_of(&longer).unwrap(),
+            processor.planes_of(&exact).unwrap()
+        );
+    }
+
+    /// The same through the resize: 65x48 is not a target size.
+    #[test]
+    fn a_longer_container_resizes_as_its_image() {
+        let processor = PixtralProcessor::new();
+        let exact = lcg_rgb_image(65, 48, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(65, 48, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processor.planes_of(&longer).unwrap(),
+            processor.planes_of(&exact).unwrap()
+        );
     }
 
     /// The reference's rule on a mixed-size batch of solid images, written

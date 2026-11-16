@@ -12,6 +12,7 @@ use openai_protocol::{
         ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
     },
     common::{ChatLogProbs, FunctionCallDelta, ToolCall, ToolCallDelta},
+    event_types::{FunctionCallEvent, McpEvent},
     responses::{
         InputTokensDetails, OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse,
         ResponsesUsage,
@@ -566,6 +567,10 @@ impl HarmonyStreamingProcessor {
     ///
     /// When no MCP context is provided, all tool calls are treated as function calls.
     ///
+    /// `server_call_allowance` is the number of server calls the turn may still open items
+    /// for (the calls the request may run under its cap; none on the final turn after it), or
+    /// `None` where no session serves the turn.
+    ///
     /// Answers the iteration's result with the engine's counts the terminal
     /// frame brought, for the settlement of the iteration's reservation;
     /// `None` when the stream ended before that frame (a clean EOF): the
@@ -578,6 +583,7 @@ impl HarmonyStreamingProcessor {
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
         router_stop_strings: &[String],
+        server_call_allowance: Option<usize>,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         match execution_result {
             context::ExecutionResult::Single { stream, .. } => {
@@ -590,6 +596,7 @@ impl HarmonyStreamingProcessor {
                     format_registry,
                     router_stop_strings,
                     None,
+                    server_call_allowance,
                 )
                 .await
             }
@@ -611,6 +618,7 @@ impl HarmonyStreamingProcessor {
                     router_stop_strings,
                     pd_timing,
                     prefill_guards,
+                    server_call_allowance,
                 )
                 .await
             }
@@ -635,6 +643,7 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: &[String],
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
+        server_call_allowance: Option<usize>,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         // Phase 1: Drain prefill stream, for the client (see `next_response`):
         // a client that leaves during the prefill ends both sides at once. The
@@ -672,6 +681,7 @@ impl HarmonyStreamingProcessor {
             format_registry,
             router_stop_strings,
             Some(pd_timing),
+            server_call_allowance,
         )
         .await;
 
@@ -682,6 +692,7 @@ impl HarmonyStreamingProcessor {
     /// Process decode stream for tool call events. `pd_timing` is `Some` only
     /// in PD mode and yields honest PD TTFT (prefill start to first decode
     /// frame).
+    #[expect(clippy::too_many_arguments)]
     async fn process_decode_stream(
         mut decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
@@ -690,8 +701,10 @@ impl HarmonyStreamingProcessor {
         format_registry: Option<&FormatRegistry>,
         router_stop_strings: &[String],
         pd_timing: Option<context::PdTiming>,
+        server_call_allowance: Option<usize>,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
-        let mut decode = ResponsesDecode::new(pd_timing, router_stop_strings)?;
+        let mut decode =
+            ResponsesDecode::new(pd_timing, router_stop_strings, server_call_allowance)?;
         // A fresh iteration: no finish until its terminal frame names one, so the finish of an
         // earlier turn of the request never reads for this one.
         emitter.set_finish_reason(None);
@@ -781,6 +794,9 @@ struct ResponsesDecode {
     content_part_added: bool,
     /// Each call's output index, item id and response format, by the parser's call index.
     calls: HashMap<usize, (usize, String, Option<ResponseFormat>)>,
+    /// The server calls the turn may open items for, its first ones (`None` where no session
+    /// serves the turn, so no call is a server's): a server call past them opens no item.
+    server_call_allowance: Option<usize>,
     finalized_analysis: Option<String>,
     // The terminal frame's counters (a disaggregated request's decode side carries the prefill
     // side's cache hit, see `ProtoStream::decode_side`); completion tokens are counted per chunk on
@@ -816,6 +832,7 @@ impl ResponsesDecode {
     fn new(
         pd_timing: Option<context::PdTiming>,
         router_stop_strings: &[String],
+        server_call_allowance: Option<usize>,
     ) -> Result<Self, String> {
         let scanner = || {
             (!router_stop_strings.is_empty())
@@ -832,6 +849,7 @@ impl ResponsesDecode {
             message: None,
             content_part_added: false,
             calls: HashMap::new(),
+            server_call_allowance,
             finalized_analysis: None,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -1049,16 +1067,19 @@ impl ResponsesDecode {
         else {
             return;
         };
-        let event = match response_format {
-            Some(_) => emitter.emit_mcp_call_arguments_delta(*output_index, item_id, args),
-            None => emitter.emit_function_call_arguments_delta(*output_index, item_id, args),
+        let kind = match response_format {
+            Some(_) => McpEvent::CALL_ARGUMENTS_DELTA,
+            None => FunctionCallEvent::ARGUMENTS_DELTA,
         };
-        emitter.send_event_best_effort(&event, tx).await;
+        emitter
+            .send_arguments_delta_best_effort(kind, args, *output_index, item_id, tx)
+            .await;
     }
 
     /// A new call: its item allocated for the tool's format (an MCP tool's, where the session
     /// exposes it), `output_item.added`, the MCP progress events, and the first (empty)
-    /// arguments delta where the tool streams its arguments.
+    /// arguments delta where the tool streams its arguments. A server call past the turn's
+    /// allowance opens nothing.
     async fn open_call(
         &mut self,
         call: &HarmonyToolCallDelta,
@@ -1074,13 +1095,28 @@ impl ResponsesDecode {
             .and_then(|f| f.name.as_ref())
             .map(|n| n.as_str())
             .unwrap_or("");
-        // Determine response_format based on MCP context.
-        let response_format = session.and_then(|s| {
-            if s.has_exposed_tool(tool_name) {
-                format_registry.map(|reg| openai_bridge::lookup_tool_format(s, reg, tool_name))
-            } else {
-                None
+        let server = session.filter(|s| s.has_exposed_tool(tool_name));
+        // A server call past the turn's allowance opens no item: the loop will not run it (the
+        // request's cap, or the final turn after it), so it is parsed for the loop and dropped
+        // here, never emitted or stored as a completed call. Its place among the turn's server
+        // calls is read from the parser's completed messages, where the loop reads its
+        // permitted prefix, not counted over the deltas: a chunk that holds a whole call
+        // brings no delta for it.
+        if let (Some(server), Some(allowance)) = (server, self.server_call_allowance) {
+            let earlier = self
+                .parser
+                .get_messages()
+                .iter()
+                .filter_map(|message| message.recipient.as_deref()?.strip_prefix("functions."))
+                .filter(|name| server.has_exposed_tool(name))
+                .count();
+            if earlier >= allowance {
+                return;
             }
+        }
+        // The item's format: the server tool's from the registry, a function call's otherwise.
+        let response_format = server.and_then(|s| {
+            format_registry.map(|reg| openai_bridge::lookup_tool_format(s, reg, tool_name))
         });
         let type_str = ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
         let (output_index, item_id) = emitter.allocate_output_index_for_format(response_format);
@@ -1121,11 +1157,13 @@ impl ResponsesDecode {
         // `*.searching` / `*.generating` events emitted above instead of streaming their
         // arguments.
         if streams_arguments(response_format.as_ref()) {
-            let event = match &response_format {
-                Some(_) => emitter.emit_mcp_call_arguments_delta(output_index, &item_id, ""),
-                None => emitter.emit_function_call_arguments_delta(output_index, &item_id, ""),
+            let kind = match &response_format {
+                Some(_) => McpEvent::CALL_ARGUMENTS_DELTA,
+                None => FunctionCallEvent::ARGUMENTS_DELTA,
             };
-            emitter.send_event_best_effort(&event, tx).await;
+            emitter
+                .send_arguments_delta_best_effort(kind, "", output_index, &item_id, tx)
+                .await;
         }
     }
 

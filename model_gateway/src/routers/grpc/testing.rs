@@ -4,7 +4,9 @@
 //! contexts of the regular and the disaggregated modes read), and the
 //! labelled worker selection the stages' tests read a decode worker's
 //! labels from, and the forced call a thinking prompt takes under a parser,
-//! which the restamp and the parser-utility tests shape a constraint from.
+//! which the restamp and the parser-utility tests shape a constraint from,
+//! and the model directory a media test registers its tokenizer from, so
+//! that the model's config is not looked up on the model hub.
 
 use std::{
     sync::{Arc, Mutex, OnceLock},
@@ -20,7 +22,8 @@ use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::{json, Value};
 use smg_data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    ConversationItemStorage, ConversationStorage, MemoryConversationItemStorage,
+    MemoryConversationStorage, MemoryResponseStorage, ResponseStorage,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
 use tool_parser::{ParserFactory as ToolParserFactory, ToolConstraint};
@@ -94,6 +97,24 @@ pub(crate) fn grpc_ctx_from(
     config: &RouterConfig,
     mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
 ) -> Arc<AppContext> {
+    grpc_ctx_over_stores(
+        config,
+        mcp_orchestrator,
+        Arc::new(MemoryResponseStorage::new()),
+        Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
+    )
+}
+
+/// [`grpc_ctx_from`] over the given stores: a test that reads what reaches
+/// the store hands in its own (hooked) ones.
+pub(crate) fn grpc_ctx_over_stores(
+    config: &RouterConfig,
+    mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
+) -> Arc<AppContext> {
     Arc::new(
         AppContext::builder()
             .router_config(config.clone())
@@ -103,9 +124,9 @@ pub(crate) fn grpc_ctx_from(
             .tool_parser_factory(Some(ToolParserFactory::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
-            .response_storage(Arc::new(MemoryResponseStorage::new()))
-            .conversation_storage(Arc::new(MemoryConversationStorage::new()))
-            .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
             .worker_job_queue(Arc::new(OnceLock::new()))
             .workflow_engines(Arc::new(OnceLock::new()))
             .mcp_orchestrator(mcp_orchestrator)
@@ -247,4 +268,16 @@ pub(crate) fn bytes_allocated_during(f: impl FnOnce()) -> u64 {
     let before = allocated.get();
     f();
     allocated.get() - before
+}
+
+/// A model directory whose `config.json` is no JSON. A tokenizer registered
+/// from it keeps the media path's lookup of the model's config on this
+/// disk, where it fails as an unreadable checkpoint does; a source with no
+/// `config.json` in it is looked up on the model hub instead, and the test's
+/// answer follows the hub's. The directory is gone once dropped: a test
+/// holds it while its requests run.
+pub(crate) fn unreadable_model_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("config.json"), "no model configuration").expect("config.json");
+    dir
 }

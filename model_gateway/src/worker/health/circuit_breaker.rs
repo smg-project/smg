@@ -613,7 +613,9 @@ mod tests {
         let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
+        // As stored: `state()` moves an open circuit past its timeout to
+        // half-open, and a slow host can be past it here.
+        assert_eq!(cb.peek_state(), CircuitState::Open);
 
         thread::sleep(Duration::from_millis(150));
 
@@ -632,7 +634,9 @@ mod tests {
         let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
+        // As stored: `state()` moves an open circuit past its timeout to
+        // half-open, and a slow host can be past it here.
+        assert_eq!(cb.peek_state(), CircuitState::Open);
 
         thread::sleep(Duration::from_millis(100));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
@@ -655,15 +659,16 @@ mod tests {
         let cb = CircuitBreaker::with_config_and_label(config, String::new());
 
         cb.record_failure();
-        assert_eq!(cb.state(), CircuitState::Open);
+        // As stored: `state()` moves an open circuit past its timeout to
+        // half-open, and a slow host can be past it here.
+        assert_eq!(cb.peek_state(), CircuitState::Open);
 
         thread::sleep(Duration::from_millis(100));
         assert_eq!(cb.state(), CircuitState::HalfOpen);
 
         cb.record_failure();
 
-        assert_eq!(cb.state(), CircuitState::Open);
-        assert!(!cb.can_execute());
+        assert_eq!(cb.peek_state(), CircuitState::Open);
     }
 
     #[test]
@@ -739,6 +744,31 @@ mod tests {
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::Closed);
         assert!(cb.can_execute());
+    }
+
+    /// A failed trial reopens the circuit with a timestamp of its own: the
+    /// timeout that follows runs from the reopen, not from the trip or the
+    /// trial before it.
+    #[test]
+    fn a_failed_trial_reopens_the_circuit_with_its_own_timestamp() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        assert!(cb.try_half_open());
+        let trial_started_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+
+        // A lower bound: the millisecond clock has moved on by the failure,
+        // however slow the host.
+        thread::sleep(Duration::from_millis(5));
+        cb.record_failure();
+
+        assert_eq!(cb.peek_state(), CircuitState::Open);
+        assert!(cb.last_state_change_ms.load(Ordering::Acquire) > trial_started_ms);
     }
 
     /// Only an open circuit has a trial to start.
@@ -860,34 +890,40 @@ mod tests {
             ..Default::default()
         };
         let cb = CircuitBreaker::with_config_and_label(config, "worker".to_string());
-        let settle = Duration::from_millis(100);
+        // A lower bound: the millisecond clock has moved on by the next state
+        // change, however slow the host.
+        let tick = Duration::from_millis(5);
 
         cb.record_success();
+        let built_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        thread::sleep(tick);
         cb.record_failure(); // the swap path: closed -> open keeps the failure streak
         assert_eq!(cb.state(), CircuitState::Open);
         assert_eq!(
             (cb.consecutive_failures(), cb.consecutive_successes()),
             (1, 0)
         );
+        let opened_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        assert!(opened_ms > built_ms);
 
-        thread::sleep(settle);
-        let since_open = cb.time_since_last_state_change();
+        thread::sleep(tick);
+        assert!(cb.time_since_last_state_change() >= tick);
         assert!(cb.try_half_open()); // the CAS path: open -> half_open starts clean
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         assert_eq!(
             (cb.consecutive_failures(), cb.consecutive_successes()),
             (0, 0)
         );
-        assert!(cb.time_since_last_state_change() < since_open);
+        let trial_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        assert!(trial_ms > opened_ms);
 
-        thread::sleep(settle);
-        let since_trial = cb.time_since_last_state_change();
+        thread::sleep(tick);
         cb.record_success(); // the swap path again: half_open -> closed starts clean
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(
             (cb.consecutive_failures(), cb.consecutive_successes()),
             (0, 0)
         );
-        assert!(cb.time_since_last_state_change() < since_trial);
+        assert!(cb.last_state_change_ms.load(Ordering::Acquire) > trial_ms);
     }
 }

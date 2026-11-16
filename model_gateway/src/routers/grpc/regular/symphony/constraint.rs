@@ -29,7 +29,7 @@ use crate::{
     config::ParserChoice,
     routers::grpc::{
         common::stages::helpers::TagForStart,
-        spec::scans_for_tool_calls_for,
+        spec::{scans_for_tool_calls_for, ChatResponseSpec},
         utils::{ModelNames, Names, TagVocabulary, WorkerDecoding},
     },
     worker::{Worker, WorkerType},
@@ -319,6 +319,14 @@ impl<'a> Asks<'a> {
         }
     }
 
+    /// The tool calls the conversation's history already holds.
+    pub(super) fn history_tool_calls_count(self) -> usize {
+        match self {
+            Self::Chat(request) => request.history_tool_calls_count(),
+            Self::Messages { request, .. } => request.history_tool_calls_count(),
+        }
+    }
+
     /// The request carries a `regex` or `ebnf` constraint, which applies outside a template's
     /// format; a Messages request carries neither.
     fn constrains_outside_the_format(self) -> bool {
@@ -530,6 +538,20 @@ impl<'a> Asks<'a> {
             Self::Messages { .. } => false,
         }
     }
+
+    /// The request holds the answer to JSON: a chat request's `json_object` or `json_schema`
+    /// response format (the response spec's `json_mode`, the one rule both paths read through
+    /// [`ChatResponseSpec::json_mode_of`]; a structural tag is free text around its tags), a
+    /// Messages request's `output_config.format`. The table's engine then reads the answer's
+    /// quote state and keeps a marker the model spells inside one of the answer's strings as
+    /// the answer's text, as the family's own parsers do under their JSON mode
+    /// ([`Assignment::json_answer`](super::reader::Assignment::json_answer)).
+    pub(super) fn json_answer(self) -> bool {
+        match self {
+            Self::Chat(request) => ChatResponseSpec::json_mode_of(request),
+            Self::Messages { request, .. } => request.output_schema().is_some(),
+        }
+    }
 }
 
 /// The tools the request's `choice` leaves callable among `declared`: none for a `tool_choice` of
@@ -733,9 +755,9 @@ pub(crate) enum Prepared {
         /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
         first_token: bool,
         /// The table built it (its tag for the forced call, `calls_tag`), so the table reads
-        /// the response whatever the constraint's kind; `false` for the older registry's, whose
-        /// output the legacy parsers read, and for the request's own schema where no table
-        /// reads ([`WorkerConstraint::table`]).
+        /// the response with its own markers whatever the constraint's kind; `false` for the
+        /// older registry's, whose JSON the table reads with its forced call, and for the
+        /// request's own schema where no table reads ([`WorkerConstraint::table`]).
         table: bool,
     },
     /// A JSON answer's tag, which derives for the selected worker's own start as the `auto` tag
@@ -889,7 +911,8 @@ pub(crate) struct WorkerConstraint {
     /// The table built the constraint (the whole turn's grammar, the `auto` tag, a JSON
     /// answer's tag, a forced call's), so the table reads the response whatever the
     /// constraint's kind, which a backend's spelling may change; `false` for the older
-    /// registry's forced call, which the legacy parsers read, and where nothing constrains.
+    /// registry's forced call, which the table reads with its forced call, and where nothing
+    /// constrains.
     /// Symphony's assignment reads the older registry's by its kind alone
     /// (`regular::symphony::assign_for`).
     pub table: bool,
@@ -1424,7 +1447,8 @@ mod tests {
 
     /// A forced or required call on a table whose calls are given as data with JSON arguments
     /// takes the table's tag and the table reads the answer: the request is not handed to the
-    /// older path. The older path's JSON-schema constraint still leaves the table out, as before.
+    /// older path. Under the older registry's JSON-schema constraint the table reads the answer
+    /// too, with its forced call.
     #[test]
     fn a_forced_call_on_the_kimi_k2_table_takes_its_tag_and_the_table_reads_the_answer() {
         let kimi = names(Some("kimi_k2"), Some("kimi_k2"));
@@ -1495,14 +1519,19 @@ mod tests {
             .expect("assigned");
             assert_eq!(assigned.format.name(), "kimi_k2");
         }
-        // The older path's forced call (a JSON schema) is still read by the older parsers.
+        // The older registry's forced call (a JSON schema) is the table's to read too, with its
+        // forced call: the thought as the table reads one, then the arguments alone.
         let schema = ("json_schema".to_string(), "{}".to_string());
-        assert!(assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt).is_none());
+        let forced = assign(ParserChoice::Symphony, &kimi, &named, Some(&schema), prompt)
+            .expect("the table reads the forced call");
+        assert_eq!(forced.format.name(), "kimi_k2");
+        assert_eq!(forced.forcing.as_deref(), Some("lookup"));
     }
 
     /// A forced or required call on a table whose calls are named arguments inside a block takes
     /// the table's tag and the table reads the answer: the request is not handed to the older
-    /// path. The older path's JSON-schema constraint still leaves the table out, as before.
+    /// path. Under the older registry's JSON-schema constraint the table reads the answer too,
+    /// with its forced call.
     #[test]
     fn a_forced_call_on_the_deepseek_v3_1_table_takes_its_tag_and_the_table_reads_the_answer() {
         let deepseek = names(Some("deepseek31"), Some("deepseek_v31"));
@@ -1573,16 +1602,19 @@ mod tests {
             .expect("assigned");
             assert_eq!(assigned.format.name(), "deepseek_v3.1");
         }
-        // The older path's forced call (a JSON schema) is still read by the older parsers.
+        // The older registry's forced call (a JSON schema) is the table's to read too, with its
+        // forced call: the thought as the table reads one, then the arguments alone.
         let schema = ("json_schema".to_string(), "{}".to_string());
-        assert!(assign(
+        let forced = assign(
             ParserChoice::Symphony,
             &deepseek,
             &named,
             Some(&schema),
-            prompt
+            prompt,
         )
-        .is_none());
+        .expect("the table reads the forced call");
+        assert_eq!(forced.format.name(), "deepseek_v3.1");
+        assert_eq!(forced.forcing.as_deref(), Some("lookup"));
     }
 
     /// The model's workers name the start when they all carry the same label; none or a missing

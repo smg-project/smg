@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::response::Response;
-use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
+use openai_protocol::responses::{ResponseUsage, ResponsesRequest, ResponsesUsage};
 use serde_json::json;
 use smg_mcp::McpServerBinding;
 use tracing::{debug, warn};
@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::{
     common::{
         build_next_request_with_tools, open_mcp_session, owned_request,
-        strip_image_generation_from_request_tools, McpCallTracking,
+        strip_image_generation_from_request_tools, withhold_server_tools, McpCallTracking,
     },
     execution::execute_mcp_tools,
 };
@@ -32,7 +32,12 @@ use crate::{
                 await_stream_startup, ensure_mcp_connection, load_history,
                 persist_response_if_needed, stream_startup_channel,
                 streaming::{ResponseStreamEventEmitter, StreamStartupSender},
-                tool_call_limit, BackgroundStream, ReplayInto, ResponsesContext,
+                tool_call_limit,
+                utils::{
+                    add_model_call_usage, iteration_exceeds_safety_limit, tool_call_allowance,
+                    tool_call_overflow, McpToolCallLimit,
+                },
+                BackgroundStream, ReplayInto, ResponsesContext,
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
@@ -218,13 +223,18 @@ async fn execute_mcp_tool_loop_streaming(
     let mut current_request = Arc::new(current_request);
 
     let mut mcp_tracking = McpCallTracking::new();
+    // The request's `max_tool_calls` is spent: the generation under way is the
+    // response's final turn, made with the server tools withheld, and its
+    // answer ends the loop whatever it holds.
+    let mut final_turn = false;
 
     // Emit mcp_list_tools on first iteration
     for binding in session.mcp_servers() {
-        let tools_for_server = session.list_tools_for_server(&binding.server_key);
+        let tools_for_server = session.list_tools_for_binding(binding);
+        let list_error = binding.list_error.as_deref();
 
         if emitter
-            .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, tx)
+            .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, list_error, tx)
             .await
             .is_err()
         {
@@ -237,7 +247,10 @@ async fn execute_mcp_tool_loop_streaming(
         "Emitted mcp_list_tools on first iteration"
     );
 
-    // MCP tool loop (max 10 iterations)
+    // Every model call of the loop adds to it; every answering exit reports it.
+    let mut usage_total: Option<ResponseUsage> = None;
+
+    // MCP tool loop (bounded by the safety net below)
     let mut iteration_count = 0;
     loop {
         iteration_count += 1;
@@ -246,7 +259,7 @@ async fn execute_mcp_tool_loop_streaming(
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
-        if iteration_count > DEFAULT_MAX_ITERATIONS {
+        if iteration_exceeds_safety_limit(iteration_count, final_turn) {
             emitter
                 .emit_error(
                     &format!("Maximum tool iterations ({DEFAULT_MAX_ITERATIONS}) exceeded"),
@@ -291,6 +304,13 @@ async fn execute_mcp_tool_loop_streaming(
             }
         };
 
+        // The server calls this turn may open items for: the calls the request
+        // may still run, none on the final turn.
+        let server_call_allowance = if final_turn {
+            0
+        } else {
+            tool_call_allowance(max_tool_calls, mcp_tracking.total_calls())
+        };
         // Process stream with token-level streaming; the reservation is
         // settled with the engine's counts the stream brought, or closed
         // unsettled (its debit kept) when the stream broke or ended before
@@ -302,6 +322,7 @@ async fn execute_mcp_tool_loop_streaming(
             Some(&session),
             Some(&ctx.mcp_format_registry),
             &router_stops,
+            Some(server_call_allowance),
         )
         .await
         {
@@ -343,8 +364,10 @@ async fn execute_mcp_tool_loop_streaming(
                     "Tool calls found - separating MCP and function tools"
                 );
 
+                add_model_call_usage(&mut usage_total, Some(&usage));
+
                 // Separate MCP and function tool calls based on session exposure.
-                let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                let (mut mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                     .into_iter()
                     .partition(|tc| session.has_exposed_tool(&tc.function.name));
 
@@ -354,19 +377,36 @@ async fn execute_mcp_tool_loop_streaming(
                     "Tool calls separated by type in streaming"
                 );
 
-                // Check combined limit (user's max_tool_calls vs safety limit)
-                let effective_limit = tool_call_limit(max_tool_calls);
-
-                // Check if we would exceed the limit with these new MCP tool calls
-                let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
-                if total_calls_after > effective_limit {
+                // The cap the batch overflows, if any, and the batch's
+                // permitted prefix (the regular loop's rule): the request's own
+                // cap runs the prefix and gives the model one final turn on the
+                // results, the server tools withheld (the public contract at
+                // `max_tool_calls`); the internal safety cap ends the stream as
+                // failed with nothing of the batch executed. The final turn's
+                // own server calls, made with the tools withheld, do not run.
+                let overflow = if final_turn {
+                    mcp_tool_calls.clear();
+                    None
+                } else {
+                    tool_call_overflow(
+                        max_tool_calls,
+                        mcp_tracking.total_calls(),
+                        mcp_tool_calls.len(),
+                    )
+                };
+                if let Some((McpToolCallLimit::User, remaining)) = overflow {
+                    mcp_tool_calls.truncate(remaining);
+                }
+                if let Some((McpToolCallLimit::Safety, _)) = overflow {
+                    let effective_limit = tool_call_limit(max_tool_calls);
+                    let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
                     warn!(
                         current_calls = mcp_tracking.total_calls(),
                         new_calls = mcp_tool_calls.len() + function_tool_calls.len(),
                         total_after = total_calls_after,
                         effective_limit = effective_limit,
                         user_max = ?max_tool_calls,
-                        "Reached tool call limit in streaming - ending the stream as failed"
+                        "Reached the tool call safety limit in streaming - ending the stream as failed"
                     );
 
                     // The run is aborted, not answered: the stream ends as the
@@ -382,8 +422,8 @@ async fn execute_mcp_tool_loop_streaming(
                             "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
                         ),
                     });
-                    let final_response =
-                        emitter.finalize_failed(Some(usage.clone()), error.clone());
+                    let mut final_response = emitter.finalize_failed(None, error.clone());
+                    final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
                     // A foreground record that could not be written is already
                     // logged and counted by persist; the terminal keeps the
                     // run's own error, as the regular stream does, and the
@@ -404,9 +444,9 @@ async fn execute_mcp_tool_loop_streaming(
                             "The tool-call-limit exit keeps its own error over the store failure"
                         );
                     }
-                    let usage_json = json!(ResponseUsage::from(&usage));
+                    let usage_json = usage_total.as_ref().map(|usage| json!(usage));
                     if let Err(e) = emitter
-                        .emit_terminal(Some(&usage_json), Some(&error), tx)
+                        .emit_terminal(usage_json.as_ref(), Some(&error), tx)
                         .await
                     {
                         warn!(error = %e, "Failed to end the Harmony Responses stream at the tool-call limit");
@@ -452,10 +492,12 @@ async fn execute_mcp_tool_loop_streaming(
                     emitter.update_mcp_call_outputs(&mcp_results);
                 }
 
-                // If there are function tools, exit MCP loop and emit completion
-                if !function_tool_calls.is_empty() {
+                // A client call, or the final turn's answer, exits the MCP
+                // loop and emits the completion
+                if !function_tool_calls.is_empty() || final_turn {
                     debug!(
-                        "Function tool calls present - exiting MCP loop and emitting completion"
+                        final_turn,
+                        "Function tool calls present or the final turn answered - exiting MCP loop and emitting completion"
                     );
 
                     // Function tool calls were already emitted during streaming
@@ -465,7 +507,8 @@ async fn execute_mcp_tool_loop_streaming(
                     // `previous_response_id`, and a background response is
                     // polled from this record. Then response.completed with the
                     // usage the non-streamed response carries.
-                    let final_response = emitter.finalize(Some(usage.clone()));
+                    let mut final_response = emitter.finalize(None);
+                    final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
                     // As the completed exit: a foreground response the client
                     // expects stored ends with response.failed when its
                     // record could not be written.
@@ -481,7 +524,9 @@ async fn execute_mcp_tool_loop_streaming(
                     .await
                     .err()
                     .map(|e| e.error_object());
-                    emitter.finish_stream(&usage, not_stored.as_ref(), tx).await;
+                    emitter
+                        .finish_stream(usage_total.as_ref(), not_stored.as_ref(), tx)
+                        .await;
                     return;
                 }
 
@@ -489,13 +534,18 @@ async fn execute_mcp_tool_loop_streaming(
                 debug!("Only MCP tools - continuing loop with results");
 
                 // Build next request with appended history
-                current_request = Arc::new(build_next_request_with_tools(
+                let mut next_request = build_next_request_with_tools(
                     owned_request(current_request),
                     mcp_tool_calls,
                     mcp_results,
                     analysis,
                     partial_text,
-                ));
+                );
+                if matches!(overflow, Some((McpToolCallLimit::User, _))) {
+                    final_turn = true;
+                    withhold_server_tools(&mut next_request, |name| session.has_exposed_tool(name));
+                }
+                current_request = Arc::new(next_request);
 
                 // Continue loop
             }
@@ -506,9 +556,11 @@ async fn execute_mcp_tool_loop_streaming(
                     output_tokens = usage.completion_tokens,
                     "Harmony Responses streaming completed - no more tool calls"
                 );
+                add_model_call_usage(&mut usage_total, Some(&usage));
 
                 // Finalize response from emitter's accumulated data
-                let final_response = emitter.finalize(Some(usage.clone()));
+                let mut final_response = emitter.finalize(None);
+                final_response.usage = usage_total.clone().map(ResponsesUsage::Modern);
 
                 // Persist response to storage if store=true; a foreground
                 // response the client expects stored ends with
@@ -529,7 +581,9 @@ async fn execute_mcp_tool_loop_streaming(
 
                 // The terminal with the usage the non-streamed response (and
                 // the stored final response) carries
-                emitter.finish_stream(&usage, not_stored.as_ref(), tx).await;
+                emitter
+                    .finish_stream(usage_total.as_ref(), not_stored.as_ref(), tx)
+                    .await;
                 return;
             }
         }
@@ -594,6 +648,7 @@ async fn execute_without_mcp_streaming(
         None,
         None,
         &router_stops,
+        None,
     )
     .await
     {
@@ -644,5 +699,7 @@ async fn execute_without_mcp_streaming(
 
     // The terminal with the usage the non-streamed response (and the stored
     // final response) carries
-    emitter.finish_stream(&usage, not_stored.as_ref(), tx).await;
+    emitter
+        .finish_stream(Some(&ResponseUsage::from(&usage)), not_stored.as_ref(), tx)
+        .await;
 }

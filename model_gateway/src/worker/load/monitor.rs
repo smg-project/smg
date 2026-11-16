@@ -89,6 +89,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// shared `Arc<WorkerLoadManager>` and updates it on every successful
 /// poll; routing policies read from it via
 /// `select_and_increment_lowest_dp_load`.
+///
+/// Only a poll feeds it: a worker served by its load stream is not polled,
+/// so its entry is its last poll's, however old, and a reader for a worker
+/// that streams brings its own feed.
 #[derive(Debug, Default)]
 pub struct WorkerLoadManager {
     /// `<worker_url, <dp_rank, load>>`
@@ -107,17 +111,6 @@ impl WorkerLoadManager {
         debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-
-    /// One worker's rank loads replace its cached entry: a pushed record's
-    /// update, without the map of maps a poll tick hands over.
-    pub(crate) fn update_worker_dp_loads(&self, url: &str, loads: HashMap<isize, isize>) {
-        let mut cached = self.dp_cached_loads.write();
-        if let Some(entry) = cached.get_mut(url) {
-            *entry = loads;
-        } else {
-            cached.insert(url.to_string(), loads);
-        }
     }
 
     /// Select and increment the least-loaded eligible rank. A virtual worker
@@ -175,10 +168,10 @@ impl WorkerLoadManager {
     }
 }
 
-/// The token counts the DP-rank cache takes from `report`: one per rank
-/// whose row carries token capacity. A row without it is no token count of
-/// its rank, whatever the rows beside it carry: the report on file and a
-/// poll's report under the stream's rows hold rows of more than one origin.
+/// The token counts the DP-rank cache takes from a poll's `report`: one per
+/// rank whose row carries token capacity. A row without it is no token
+/// count of its rank, whatever the rows beside it carry: a poll's report
+/// under the stream's rows holds rows of more than one origin.
 fn dp_rank_token_loads(report: &WorkerLoadResponse) -> HashMap<isize, isize> {
     report
         .loads
@@ -543,7 +536,9 @@ impl WorkerMonitor {
         let url = worker.url();
         // The stream pushes: silence from this worker is judged by the
         // stream's cadence from now on (`liveness`, the stale rule).
-        worker.note_load_record();
+        if let Some(state) = worker.runtime_state() {
+            state.note_load_record();
+        }
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
         // A worker's entries are made on its first record; the lookups that
@@ -599,14 +594,11 @@ impl WorkerMonitor {
         // The record feeds its own rank's `smg_engine_*` series through the
         // handles kept for it; a poll's report feeds every rank's.
         Metrics::record_engine_rank_load(url, worker.model_id(), &report.loads[at]);
-        // The DP-rank token cache takes the rows that carry token capacity,
-        // as it takes a poll's: a row a poll wrote to the file without it is
-        // no token count of its rank. A core-only record leaves its
-        // last-known-good entry alone.
-        if report.has_absolute_token_data() && report.ranks_are_dp_ranks() {
-            self.worker_load_manager
-                .update_worker_dp_loads(url, dp_rank_token_loads(report));
-        }
+        // A record feeds the DP-rank token cache nothing. The cache's one
+        // reader is the HTTP pair router's rank pick, and a stream is opened
+        // for a gRPC worker alone: no pick reads a pushing worker's entry. A
+        // poll feeds the cache (`poll_group_once`).
+        //
         // The window's publish takes the report once, under the incarnation
         // that pushed last.
         {
@@ -2885,14 +2877,14 @@ mod native_loads_tests {
         // A transport failure noted on each rank worker: the one read's
         // contact must clear it on both.
         for worker in &workers {
-            worker.note_transport_failure();
+            worker.runtime_state().unwrap().note_transport_failure();
         }
         poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
 
         let snapshot = monitor.load_state.snapshot();
         for (worker, expected) in workers.iter().zip([(0, 3, 1, 300), (1, 9, 4, 900)]) {
             assert!(
-                !worker.transport_failure_pending(),
+                !worker.runtime_state().unwrap().transport_failure_pending(),
                 "the contact is every member's: {}",
                 worker.url()
             );
@@ -2983,7 +2975,7 @@ mod native_loads_tests {
         // A transport failure noted on each rank worker: the one GetLoads'
         // contact must clear it on both.
         for worker in &workers {
-            worker.note_transport_failure();
+            worker.runtime_state().unwrap().note_transport_failure();
         }
         poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
         assert_eq!(
@@ -3003,7 +2995,7 @@ mod native_loads_tests {
         );
         for worker in &workers {
             assert!(
-                !worker.transport_failure_pending(),
+                !worker.runtime_state().unwrap().transport_failure_pending(),
                 "the contact is every member's: {}",
                 worker.url()
             );
@@ -3112,8 +3104,8 @@ mod native_loads_tests {
 
     /// A record for a rank on file replaces the rank's entry in place: the
     /// figures are the record's, the telemetry it left out stays what the
-    /// last record that carried it said, the report keeps one entry per
-    /// rank, and the DP-rank token cache takes the report's counts.
+    /// last record that carried it said, and the report keeps one entry per
+    /// rank.
     #[tokio::test]
     async fn a_record_for_a_rank_on_file_replaces_its_entry_in_place() {
         let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
@@ -3154,11 +3146,6 @@ mod native_loads_tests {
             })
             .collect();
         assert_eq!(entries, vec![(0, 5, 0.75, 2048, 4096)]);
-        let cached = monitor.worker_load_manager.dp_cached_loads.read();
-        assert_eq!(
-            cached.get(worker.url()).and_then(|ranks| ranks.get(&0)),
-            Some(&2048)
-        );
     }
 
     /// What a fallback poll leaves of a worker whose rank 0 pushed a record
@@ -3216,6 +3203,15 @@ mod native_loads_tests {
             sample,
             ..Default::default()
         };
+        // What an earlier poll left in the rank cache. No record writes
+        // there, so the tick's poll is what replaces this entry or takes it
+        // away.
+        monitor
+            .worker_load_manager
+            .update_dp_loads(&HashMap::from([(
+                stub.url.clone(),
+                HashMap::from([(0, 150), (1, 250)]),
+            )]));
         monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200, 1), t0);
         monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
 
@@ -3439,6 +3435,19 @@ mod native_loads_tests {
             sample,
             ..Default::default()
         };
+        // What an earlier poll left in the rank cache: a count of its own
+        // for every rank on file, none of them a record's.
+        let earlier_poll: Vec<(isize, isize)> = [0, 1]
+            .into_iter()
+            .chain(also_quiet.iter().copied())
+            .map(|rank| (rank as isize, 150))
+            .collect();
+        monitor
+            .worker_load_manager
+            .update_dp_loads(&HashMap::from([(
+                stub.url.clone(),
+                earlier_poll.iter().copied().collect(),
+            )]));
         monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 1), t0);
         monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
         for &rank in also_quiet {
@@ -3460,7 +3469,11 @@ mod native_loads_tests {
                 ranks
             })
         };
-        assert!(cached(&monitor).is_some(), "the records fed the rank cache");
+        assert_eq!(
+            cached(&monitor),
+            Some(earlier_poll),
+            "the records feed the rank cache nothing: it holds the earlier poll's counts"
+        );
 
         let before_poll = Instant::now();
         poll_group_once(&monitor, &key, interval, tick).await;
@@ -3611,8 +3624,8 @@ mod native_loads_tests {
     /// An answer whose entries are annotated with their workers is a
     /// gateway's rollup: it carries token capacity, and its entries are not
     /// this worker's ranks. The rank cache takes none of them: the worker's
-    /// entry, fed by its records, leaves the cache with the poll. The
-    /// answer changes and retracts no rank on file.
+    /// entry, an earlier poll's, leaves the cache with the poll. The answer
+    /// changes and retracts no rank on file.
     #[tokio::test]
     async fn a_fallback_polls_rollup_by_worker_changes_no_rank_on_file() {
         const ROLLUP: &str = r#"{"loads":[
@@ -3637,10 +3650,10 @@ mod native_loads_tests {
     }
 
     /// A poll's row without token capacity is no token count of the rank it
-    /// names. On file for a quiet rank, beside rows that carry capacity, it
-    /// stays out of the rank cache when another rank's next record feeds the
-    /// cache from the file. Read as zero tokens, the quiet rank was the least
-    /// loaded one and was handed out.
+    /// names. The answer feeds the rank cache nothing and takes the earlier
+    /// poll's entry away. On file the row is its rank's, beside rows that
+    /// carry capacity, and the worker's next record feeds the cache nothing
+    /// either.
     #[tokio::test]
     async fn a_fallback_polls_row_without_token_capacity_is_no_token_count_in_the_rank_cache() {
         const RANK_2_NO_CAPACITY: &str = r#"{"loads":[
@@ -3657,16 +3670,16 @@ mod native_loads_tests {
             "the answer retracts no rank, and its row is rank 2's on file"
         );
         assert_eq!(
-            after.cached,
-            Some(vec![(0, 900), (1, 500)]),
-            "rank 1's record feeds the rows that carry capacity: rank 2's is no token count"
+            after.cached, None,
+            "the worker's next record feeds the rank cache nothing"
         );
     }
 
-    /// The poll's own feed reads its report row by row too: beside a row
-    /// that carries token capacity, an answer's row without it is no token
-    /// count, after the poll and after the worker's next record. The row
-    /// with capacity is an idle rank's: its zero is a count, and it is fed.
+    /// The poll's feed reads its report row by row: beside a row that
+    /// carries token capacity, an answer's row without it is no token
+    /// count. The row with capacity is an idle rank's: its zero is a count,
+    /// and it is fed. The worker's next record writes nothing over the
+    /// poll's entry.
     #[tokio::test]
     async fn a_fallback_polls_answer_feeds_the_rank_cache_its_rows_with_token_capacity_alone() {
         const CAPACITY_ON_RANK_1: &str = r#"{"loads":[
@@ -3682,17 +3695,21 @@ mod native_loads_tests {
         );
         assert_eq!(
             after.cached,
-            Some(vec![(1, 500)]),
-            "so does rank 1's next record, from the file"
+            Some(vec![(1, 0)]),
+            "rank 1's next record writes nothing over the poll's entry"
         );
     }
 
-    /// A pushed record on a file that carries token capacity on no row
-    /// feeds the rank cache nothing: the worker's last entry stays.
+    /// A pushed record feeds the rank cache nothing, whatever it carries:
+    /// the worker's last entry, a poll's, stays. A record's token count
+    /// reaches the worker's report, which routing reads, and no cache
+    /// entry: the cache's one reader picks a rank of a worker that has no
+    /// stream.
     #[tokio::test]
-    async fn a_record_on_a_file_without_token_capacity_leaves_the_rank_caches_last_entry() {
+    async fn a_pushed_record_leaves_the_rank_caches_last_entry() {
         let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
         let worker = vllm_worker("http://engine:8000");
+        worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let last_entry = HashMap::from([(0, 900), (1, 500)]);
         monitor
@@ -3702,22 +3719,43 @@ mod native_loads_tests {
                 last_entry.clone(),
             )]));
 
-        // A core-only record: no token count and no capacity.
+        // A core-only record, then one that carries a token count and its
+        // capacity for a rank the entry names.
         let core_only = EngineLoad {
             running_requests: 3,
             sample: 1,
             ..Default::default()
         };
-        monitor.apply_pushed_load(&worker, 0, &core_only, Instant::now());
+        let with_tokens = EngineLoad {
+            running_requests: 4,
+            num_used_tokens: Some(2048),
+            max_total_num_tokens: Some(4096),
+            sample: 2,
+            ..Default::default()
+        };
+        for record in [&core_only, &with_tokens] {
+            monitor.apply_pushed_load(&worker, 0, record, Instant::now());
+            assert_eq!(
+                monitor
+                    .worker_load_manager
+                    .dp_cached_loads
+                    .read()
+                    .get(worker.url())
+                    .cloned(),
+                Some(last_entry.clone()),
+                "no record writes over the last entry"
+            );
+        }
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get(worker.url()).expect("published");
         assert_eq!(
-            monitor
-                .worker_load_manager
-                .dp_cached_loads
-                .read()
-                .get(worker.url())
-                .cloned(),
-            Some(last_entry),
-            "a file with no capacity on any row writes nothing over the last entry"
+            (
+                report.loads[0].num_used_tokens,
+                report.loads[0].max_total_num_tokens
+            ),
+            (2048, 4096),
+            "the report takes the record's token count"
         );
     }
 }

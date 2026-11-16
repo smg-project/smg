@@ -3,7 +3,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::{ser::SerializeMap, Deserialize, Serialize};
+use serde::{
+    de::value::{MapAccessDeserializer, MapDeserializer},
+    ser::SerializeMap,
+    Deserialize, Serialize,
+};
 use serde_json::Value;
 use validator::{Validate, ValidationError};
 
@@ -2235,6 +2239,596 @@ pub enum ResponseInputOutputItem {
     },
 }
 
+/// One `input` item read by its shape. The derived reader of
+/// [`ResponseInputOutputItem`] (the `type` tag, with the two shapes sent
+/// without one as its fallbacks) reports a refusal inside a message sent
+/// without a tag, the shape every client sends, as "data did not match any
+/// variant of untagged enum ResponseInputOutputItem", naming no part and no
+/// field, and the same for a `message` sent without an `id`, which fails
+/// its tagged variant and lands in the same fallback. Both are read field
+/// by field instead, so the refusal names the field (`content[1].detail:
+/// unknown variant ...`); every other item is read in place by the reader
+/// of the tagged shapes alone ([`TaggedItem`]) when its `type` names one,
+/// and by the derived reader otherwise or when that shape refuses it, its
+/// refusal traced to the part it is about when the item carries parts, or
+/// to the item's own field (see [`typed_item_refusal`]).
+struct InputItem(ResponseInputOutputItem);
+
+impl<'de> Deserialize<'de> for InputItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = ItemFields::deserialize(deserializer)?;
+        let has = |name: &str| fields.get(name).is_some();
+        let item_type = fields.get("type");
+        let kind = item_type.and_then(Value::as_str);
+        // A message without a `type` carries a role and a content, or one
+        // of them and no `id`: an `{id, content}` or `{id, role}` stays the
+        // item reference the derived reader reads it as. A `message` with an
+        // `id` and a string `content` is the untagged shape too (the derived
+        // reader drops the `id`), read field by field so its refusal names
+        // the field and not the `content` the shape takes.
+        let by_field = if has("type") {
+            kind == Some("message")
+                && (!has("id") || fields.get("content").is_some_and(Value::is_string))
+        } else {
+            (has("role") && has("content")) || (!has("id") && (has("role") || has("content")))
+        };
+        let tag = (kind == Some("message")).then_some(SimpleInputMessageTypeTag::Message);
+        let item = if by_field {
+            simple_input_message(fields, tag)
+        } else {
+            // An item reference carries a `type` and has no tagged shape.
+            let in_place = item_type
+                .filter(|_| kind.is_some_and(|kind| kind != "item_reference"))
+                .and_then(|item_type| {
+                    let entries = fields.0.iter().map(|(name, value)| (name.as_str(), value));
+                    tagged_item(
+                        item_type,
+                        MapDeserializer::<_, serde_json::Error>::new(entries),
+                    )
+                    .ok()
+                });
+            match in_place {
+                Some(item) => Ok(item),
+                None => {
+                    let item = Value::Object(fields.0.into_iter().collect());
+                    ResponseInputOutputItem::deserialize(&item)
+                        .map_err(|error| typed_item_refusal(&item, error))
+                }
+            }
+        };
+        item.map(InputItem).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An item's fields, read one entry at a time so a repeated key is refused
+/// with serde's own words (`duplicate field `role``), as the derived readers
+/// refuse it, instead of the last value winning; each value is read by the
+/// crate's strict value reader, so a key repeated at any depth below the
+/// item's own is refused the same way. That is the derived readers' answer
+/// for a key a typed struct reads; a key it does not know, and a free-form
+/// value or a map inside an item (a shell call's `env`, an MCP tool's
+/// `input_schema`), is refused too, where a derived read passes over the
+/// key or keeps the last value: one rule for the whole item, since the
+/// buffer cannot tell these places apart. The place is the deserializer's
+/// to name, as it is for the derived readers (the door's path tracker
+/// records the nested read: `input[0].content[0]: duplicate field `text``).
+/// The item's own fields stay in arrival order: an item has a handful of
+/// keys, and a walk over them finds one for less than a hashed map spends
+/// on it.
+struct ItemFields(Vec<(String, Value)>);
+
+impl ItemFields {
+    fn get(&self, name: &str) -> Option<&Value> {
+        self.0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    fn take(&mut self, name: &str) -> Option<Value> {
+        let at = self.0.iter().position(|(key, _)| key == name)?;
+        Some(self.0.swap_remove(at).1)
+    }
+}
+
+impl<'de> Deserialize<'de> for ItemFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = ItemFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an input item")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut entries: A,
+            ) -> Result<Self::Value, A::Error> {
+                crate::strict_value::strict_fields(&mut entries).map(ItemFields)
+            }
+        }
+
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
+/// A message read field by field (see [`InputItem`]): the fields of
+/// [`ResponseInputOutputItem::SimpleInputMessage`] one by one so a refusal
+/// names its field, the content parts each from the buffered value so a
+/// part's refusal names its field too (see [`content_part_refusal`]).
+fn simple_input_message(
+    mut fields: ItemFields,
+    r#type: Option<SimpleInputMessageTypeTag>,
+) -> Result<ResponseInputOutputItem, String> {
+    let role = required_field(&mut fields, "role")?;
+    let content = match fields.take("content") {
+        Some(Value::String(text)) => StringOrContentParts::String(text),
+        Some(Value::Array(parts)) => StringOrContentParts::Array(content_parts("content", &parts)?),
+        Some(other) => {
+            let expected: &dyn serde::de::Expected = &"a string or an array of content parts";
+            let error =
+                <serde_json::Error as serde::de::Error>::invalid_type(unexpected(&other), expected);
+            return Err(format!("content: {error}"));
+        }
+        None => return Err("missing field `content`".to_string()),
+    };
+    let phase = optional_field(&mut fields, "phase")?;
+    Ok(ResponseInputOutputItem::SimpleInputMessage {
+        content,
+        role,
+        r#type,
+        phase,
+    })
+}
+
+/// The parts under `field`, each from its buffered value so a refusal names
+/// the part and its field.
+fn content_parts(field: &str, parts: &[Value]) -> Result<Vec<ResponseContentPart>, String> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            ResponseContentPart::deserialize(part)
+                .map_err(|error| content_part_refusal(field, index, part, &error))
+        })
+        .collect()
+}
+
+/// A typed item's refusal from the derived reader, named. When the item
+/// carries content parts (a `message`'s `content`, a `function_call_output`'s
+/// `output`) and serde refuses one on its own, that part's refusal. An
+/// `item_reference`, the untagged shape with a `type` of its own, is refused
+/// for its `id` alone, named by the field reader. Otherwise the words of the
+/// tagged shapes alone (see [`TaggedItem`]): the derived reader's fallback to
+/// the untagged shapes drops them, so a `function_call` without its `call_id`
+/// was "data did not match any variant of untagged enum
+/// ResponseInputOutputItem" to it; they stand at the field they are about
+/// (see [`refused_field`]). The derived reader's own words for an item
+/// without a `type`, and for one the tagged shapes read.
+fn typed_item_refusal(item: &Value, derived: serde_json::Error) -> String {
+    let kind = item.get("type").and_then(Value::as_str);
+    let parts = match kind {
+        Some("message") => Some("content"),
+        Some("function_call_output") => Some("output"),
+        _ => None,
+    };
+    let refused_part = parts.and_then(|field| {
+        let parts = item.get(field)?.as_array()?;
+        content_parts(field, parts).err()
+    });
+    if let Some(refusal) = refused_part {
+        return refusal;
+    }
+    let (Some(fields), Some(tag)) = (item.as_object(), item.get("type")) else {
+        return derived.to_string();
+    };
+    if kind == Some("item_reference") {
+        let mut fields = ItemFields(fields.clone().into_iter().collect());
+        return required_field::<String>(&mut fields, "id")
+            .err()
+            .unwrap_or_else(|| derived.to_string());
+    }
+    let Err(error) = tagged_item(tag, item) else {
+        return derived.to_string();
+    };
+    let reason = error.to_string();
+    let field = refused_field(fields, &reason, |entries| {
+        tagged_item(
+            tag,
+            MapDeserializer::<_, serde_json::Error>::new(entries.iter().copied()),
+        )
+        .err()
+        .map(|error| error.to_string())
+    });
+    match field {
+        Some(field) => format!("{field}: {reason}"),
+        None => reason,
+    }
+}
+
+/// A typed item read through [`TaggedItem`]: the variant from `tag`, the
+/// item's `type`; the variant's fields from `fields`, the item's entries
+/// where they stand, the `type` entry among them passed over like any key
+/// the variant does not know. Nothing is buffered.
+fn tagged_item<'de, F>(
+    tag: &'de Value,
+    fields: F,
+) -> Result<ResponseInputOutputItem, serde_json::Error>
+where
+    F: serde::de::IntoDeserializer<'de, serde_json::Error>,
+{
+    TaggedItem::deserialize(MapAccessDeserializer::new(MapDeserializer::new(
+        std::iter::once((tag, fields)),
+    )))
+}
+
+/// The tagged shapes of [`ResponseInputOutputItem`] on their own, keyed by
+/// variant name and read by [`tagged_item`], which is what the public
+/// reader's tag reads, with no buffered copy of the item. The request
+/// reader reads a typed item through it (see [`InputItem`]). So does the
+/// error path (see [`typed_item_refusal`]): the public reader falls back
+/// to its two untagged shapes (a message sent without a tag, an item
+/// reference) and reports their fallthrough text when a tagged variant
+/// refuses an item, so a typed item it refused is read again here, where the
+/// words name the reason (``missing field `call_id` ``). The derive
+/// constructs the public type, so a field added to, removed from or retyped
+/// in a tagged variant of the public enum fails the build until it is
+/// mirrored here; a field's serde attribute (a default, a custom reader) is
+/// repeated by hand, and the test feeding every variant's smallest payload
+/// to both readers tells one that is not. Nothing constructs this enum.
+#[derive(Deserialize)]
+#[serde(remote = "ResponseInputOutputItem", rename_all = "snake_case")]
+enum TaggedItem {
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        role: String,
+        content: Vec<ResponseContentPart>,
+        status: Option<String>,
+        #[serde(default)]
+        phase: Option<MessagePhase>,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<SummaryTextContent>,
+        #[serde(default)]
+        content: Vec<ResponseReasoningContent>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionToolCall {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        namespace: Option<String>,
+        arguments: String,
+        output: Option<String>,
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        output: StringOrContentParts,
+        status: Option<String>,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "mcp_approval_response")]
+    McpApprovalResponse {
+        id: Option<String>,
+        approval_request_id: String,
+        approve: bool,
+        reason: Option<String>,
+    },
+    #[serde(rename = "image_generation_call")]
+    ImageGenerationCall {
+        id: String,
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        background: Option<String>,
+        #[serde(default)]
+        output_format: Option<String>,
+        #[serde(default)]
+        quality: Option<String>,
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
+        revised_prompt: Option<String>,
+        #[serde(default)]
+        size: Option<String>,
+        #[serde(default)]
+        status: Option<ImageGenerationCallStatus>,
+    },
+    #[serde(rename = "compaction")]
+    Compaction {
+        encrypted_content: String,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    #[serde(rename = "computer_call")]
+    ComputerCall {
+        id: String,
+        call_id: String,
+        #[serde(default)]
+        action: Option<ComputerAction>,
+        #[serde(default)]
+        actions: Option<Vec<ComputerAction>>,
+        status: ComputerCallStatus,
+        #[serde(default)]
+        pending_safety_checks: Vec<ComputerSafetyCheck>,
+    },
+    #[serde(rename = "computer_call_output")]
+    ComputerCallOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        output: ComputerCallOutputContent,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
+        #[serde(default)]
+        status: Option<ComputerCallStatus>,
+    },
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        call_id: String,
+        input: String,
+        name: String,
+        id: Option<String>,
+        namespace: Option<String>,
+    },
+    #[serde(rename = "custom_tool_call_output")]
+    CustomToolCallOutput {
+        call_id: String,
+        output: CustomToolCallOutputContent,
+        id: Option<String>,
+    },
+    #[serde(rename = "shell_call")]
+    ShellCall {
+        action: ShellCallAction,
+        call_id: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        environment: Option<ShellCallEnvironment>,
+        #[serde(default)]
+        status: Option<ShellCallStatus>,
+        #[serde(default)]
+        created_by: Option<String>,
+    },
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput {
+        call_id: String,
+        output: Vec<ShellOutputChunk>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        max_output_length: Option<u64>,
+        #[serde(default)]
+        status: Option<ShellCallStatus>,
+        #[serde(default)]
+        created_by: Option<String>,
+    },
+    #[serde(rename = "apply_patch_call")]
+    ApplyPatchCall {
+        call_id: String,
+        operation: ApplyPatchOperation,
+        status: ApplyPatchCallStatus,
+        id: Option<String>,
+    },
+    #[serde(rename = "apply_patch_call_output")]
+    ApplyPatchCallOutput {
+        call_id: String,
+        status: ApplyPatchCallOutputStatus,
+        id: Option<String>,
+        output: Option<String>,
+    },
+    #[serde(rename = "local_shell_call")]
+    LocalShellCall {
+        id: String,
+        call_id: String,
+        action: LocalShellExec,
+        status: LocalShellCallStatus,
+    },
+    #[serde(rename = "local_shell_call_output")]
+    LocalShellCallOutput {
+        id: String,
+        output: String,
+        #[serde(default)]
+        status: Option<LocalShellCallStatus>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        arguments: String,
+        name: String,
+        server_label: String,
+        #[serde(default)]
+        approval_request_id: Option<String>,
+        #[serde(default, deserialize_with = "mcp_call_error_compat")]
+        error: Option<McpToolCallError>,
+        #[serde(default)]
+        output: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+/// A part's refusal, naming the part (`content[1]`) and, when one is, the
+/// field it is about (see [`refused_field`]).
+fn content_part_refusal(
+    field: &str,
+    index: usize,
+    part: &Value,
+    error: &serde_json::Error,
+) -> String {
+    let reason = error.to_string();
+    let located = part.as_object().and_then(|fields| {
+        refused_field(fields, &reason, |entries| {
+            ResponseContentPart::deserialize(MapDeserializer::<_, serde_json::Error>::new(
+                entries.iter().copied(),
+            ))
+            .err()
+            .map(|error| error.to_string())
+        })
+    });
+    match located {
+        Some(name) => format!("{field}[{index}].{name}: {reason}"),
+        None => format!("{field}[{index}]: {reason}"),
+    }
+}
+
+/// The field of a tagged object (a content part, a typed item) a refusal is
+/// about, `read` giving its reader's words for a probe, a list of entries
+/// (none when it reads them): `type` when the kind itself is refused;
+/// otherwise the first field whose value alone, beside the kind, draws the
+/// same words (serde names the value and the rule, not the field, inside a
+/// tagged object), and inside an array value the element that does
+/// (`annotations[0]`), unless an empty array draws them too: the field
+/// takes no array, and the refusal is its own whatever the array holds
+/// (`arguments`); nothing for a field the object itself misses, which
+/// serde's words name (the extractor appends it). A missed field is told own
+/// from nested by one probe of the whole object with a trailing duplicate of
+/// each of its keys: serde refuses a duplicate known field at the end of its
+/// walk, before it checks the object's own fields, so the same words from
+/// that probe came from inside a value, and other words mean the object's
+/// own field. Every field probe carries the same duplicate, so no probe can
+/// draw the object's own missing field; a key the reader does not know (the
+/// key and its duplicate ignored alike) is told by probing it with an
+/// object: a known field refuses it, or takes it (`logprobs`) and refuses
+/// the duplicate, so only an unknown key draws the kind's words alone.
+/// Every probe is one field or one element beside the kind, so the
+/// search costs the object's size, not its square.
+fn refused_field(
+    fields: &serde_json::Map<String, Value>,
+    reason: &str,
+    read: impl Fn(&[(&str, &Value)]) -> Option<String>,
+) -> Option<String> {
+    fn with<'a>(
+        kind: &[(&'a str, &'a Value)],
+        name: &'a str,
+        value: &'a Value,
+        null: &'a Value,
+    ) -> Vec<(&'a str, &'a Value)> {
+        let mut probe = kind.to_vec();
+        probe.push((name, value));
+        probe.push((name, null));
+        probe
+    }
+    let null = Value::Null;
+    let empty = Value::Object(serde_json::Map::new());
+    let no_elements = Value::Array(Vec::new());
+    let refused = |entries: &[(&str, &Value)]| read(entries).as_deref() == Some(reason);
+    let kind: Vec<(&str, &Value)> = fields
+        .get("type")
+        .map(|kind| ("type", kind))
+        .into_iter()
+        .collect();
+    let others = || fields.iter().filter(|(name, _)| name.as_str() != "type");
+    let missing = reason.starts_with("missing field `");
+    if missing {
+        let mut probe = kind.clone();
+        probe.extend(others().map(|(name, value)| (name.as_str(), value)));
+        probe.extend(others().map(|(name, _)| (name.as_str(), &null)));
+        if !refused(&probe) {
+            return None;
+        }
+    } else if !kind.is_empty() && refused(&kind) {
+        return Some("type".to_string());
+    }
+    let kind_alone = read(&kind);
+    for (name, value) in others() {
+        let name = name.as_str();
+        if missing && read(&with(&kind, name, &empty, &null)) == kind_alone {
+            continue;
+        }
+        if !refused(&with(&kind, name, value, &null)) {
+            continue;
+        }
+        let Some(elements) = value.as_array() else {
+            return Some(name.to_string());
+        };
+        if refused(&with(&kind, name, &no_elements, &null)) {
+            return Some(name.to_string());
+        }
+        let element = elements.iter().position(|element| {
+            let one = Value::Array(vec![element.clone()]);
+            refused(&with(&kind, name, &one, &null))
+        });
+        return Some(match element {
+            Some(position) => format!("{name}[{position}]"),
+            None => name.to_string(),
+        });
+    }
+    None
+}
+
+/// `fields[name]` as a `T`, the refusal naming the field; serde's words for
+/// a missing one.
+fn required_field<T: serde::de::DeserializeOwned>(
+    fields: &mut ItemFields,
+    name: &str,
+) -> Result<T, String> {
+    match fields.take(name) {
+        Some(value) => serde_json::from_value(value).map_err(|error| format!("{name}: {error}")),
+        None => Err(format!("missing field `{name}`")),
+    }
+}
+
+/// `fields[name]` as a `T` when present and not null, the refusal naming
+/// the field.
+fn optional_field<T: serde::de::DeserializeOwned>(
+    fields: &mut ItemFields,
+    name: &str,
+) -> Result<Option<T>, String> {
+    match fields.take(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| format!("{name}: {error}")),
+    }
+}
+
+/// The value as serde describes a refused one (`integer `7``, `map`, ...).
+fn unexpected(value: &Value) -> serde::de::Unexpected<'_> {
+    match value {
+        Value::Null => serde::de::Unexpected::Unit,
+        Value::Bool(flag) => serde::de::Unexpected::Bool(*flag),
+        Value::Number(number) => number
+            .as_u64()
+            .map(serde::de::Unexpected::Unsigned)
+            .or_else(|| number.as_i64().map(serde::de::Unexpected::Signed))
+            .or_else(|| number.as_f64().map(serde::de::Unexpected::Float))
+            .unwrap_or(serde::de::Unexpected::Other("a number")),
+        Value::String(text) => serde::de::Unexpected::Str(text),
+        Value::Array(_) => serde::de::Unexpected::Seq,
+        Value::Object(_) => serde::de::Unexpected::Map,
+    }
+}
+
 /// Single-value tag enum pinning [`ResponseInputOutputItem::ItemReference`]'s
 /// optional `type` discriminator to the spec's only permitted value,
 /// `"item_reference"`. Used because the outer enum is `type`-tagged and the
@@ -3477,11 +4071,53 @@ pub struct ResponsesRequest {
     pub repetition_penalty: f32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// The request's `input`: the conversation as an array of input items, or
+/// one text.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ResponseInput {
     Items(Vec<ResponseInputOutputItem>),
     Text(String),
+}
+
+/// `input` read by its JSON type. The derived untagged reader buffered the
+/// whole value, tried the items and then the text, and reported a refusal
+/// inside one item as "data did not match any variant of untagged enum
+/// ResponseInput" at `input`, naming no item; this one keeps the item's own
+/// refusal under its index, each item read by its shape (see `InputItem`).
+impl<'de> Deserialize<'de> for ResponseInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for InputVisitor {
+            type Value = ResponseInput;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string or an array of input items")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(ResponseInput::Text(text.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(ResponseInput::Text(text))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut items: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut read = Vec::new();
+                while let Some(InputItem(item)) = items.next_element()? {
+                    read.push(item);
+                }
+                Ok(ResponseInput::Items(read))
+            }
+        }
+
+        deserializer.deserialize_any(InputVisitor)
+    }
 }
 
 impl ResponsesRequest {
@@ -3842,30 +4478,27 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
     Ok(())
 }
 
-/// The public OpenAI API's structured-output rules: a strict function schema or
-/// a strict `json_schema` text format pins `additionalProperties: false` on
-/// every object node, and a `json_object` format needs the word "json"
-/// somewhere in the prompt (instructions or input text).
+/// The public OpenAI API's structured-output rules: a strict function schema
+/// (a top-level function's or a namespace member's) or a strict `json_schema`
+/// text format pins `additionalProperties: false` on every object node, and a
+/// `json_object` format needs the word "json" somewhere in the prompt
+/// (instructions or input text).
 fn validate_openai_structured_output_rules(
     request: &ResponsesRequest,
 ) -> Result<(), ValidationError> {
     for tool in request.tools.as_deref().unwrap_or_default() {
-        let ResponseTool::Function(function_tool) = tool else {
-            continue;
-        };
-        let function = &function_tool.function;
-        if function.strict == Some(true) {
-            if let Some(path) =
-                strict_schema_missing_additional_properties(function.parameters_schema())
-            {
-                return Err(invalid(
-                    "invalid_function_parameters",
-                    format!(
-                        "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
-                        function.name
-                    ),
-                ));
+        match tool {
+            ResponseTool::Function(function_tool) => {
+                validate_strict_function_schema(&function_tool.function)?;
             }
+            ResponseTool::Namespace(namespace) => {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Function(function_tool) = member {
+                        validate_strict_function_schema(&function_tool.function)?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3894,6 +4527,25 @@ fn validate_openai_structured_output_rules(
         _ => {}
     }
     Ok(())
+}
+
+/// A strict function's schema pins `additionalProperties: false` on every
+/// object node; a function that is not strict is not judged.
+fn validate_strict_function_schema(function: &Function) -> Result<(), ValidationError> {
+    if function.strict != Some(true) {
+        return Ok(());
+    }
+    let Some(path) = strict_schema_missing_additional_properties(function.parameters_schema())
+    else {
+        return Ok(());
+    };
+    Err(invalid(
+        "invalid_function_parameters",
+        format!(
+            "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
+            function.name
+        ),
+    ))
 }
 
 /// Whether the instructions or any input text mention "json" (case-insensitive).
@@ -4136,12 +4788,35 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
     Ok(())
 }
 
+/// A function's place in `tools` as a refusal names it: a top-level function's
+/// index, or its namespace's index and its own inside the namespace. It is
+/// written only into a refusal, so a function that passes formats no place.
+#[derive(Clone, Copy)]
+enum FunctionPlace {
+    Tool(usize),
+    Member(usize, usize),
+}
+
+impl std::fmt::Display for FunctionPlace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            Self::Tool(tool) => write!(formatter, "tools[{tool}]"),
+            Self::Member(namespace, member) => {
+                write!(formatter, "tools[{namespace}].tools[{member}]")
+            }
+        }
+    }
+}
+
 /// The public API's function-tool keys ([`FunctionTool::TOOL_KEYS`]) are kept
 /// untyped in the function's `extra`, so their shapes are checked here, as the
 /// custom tool's typed fields check theirs: `async` and `defer_loading` a
 /// boolean, `allowed_callers` an array of strings, `output_schema` an object,
 /// each of them also `null`.
-fn validate_function_tool_keys(function: &Function, at: &str) -> Result<(), ValidationError> {
+fn validate_function_tool_keys(
+    function: &Function,
+    at: FunctionPlace,
+) -> Result<(), ValidationError> {
     for key in FunctionTool::TOOL_KEYS {
         let Some(value) = function.extra.get(*key) else {
             continue;
@@ -4171,6 +4846,26 @@ fn validate_function_tool_keys(function: &Function, at: &str) -> Result<(), Vali
     Ok(())
 }
 
+/// A function's `parameters` are a JSON Schema object, a top-level function's
+/// and a namespace member's alike: the model is handed either as a function of
+/// its own.
+fn validate_function_parameters(
+    function: &Function,
+    at: FunctionPlace,
+) -> Result<(), ValidationError> {
+    let schema = function.parameters_schema();
+    if schema.is_object() {
+        return Ok(());
+    }
+    Err(invalid(
+        "invalid_type",
+        format!(
+            "Invalid type for '{at}.parameters': expected an object, but got {} instead.",
+            json_type_name(schema)
+        ),
+    ))
+}
+
 /// Validates ResponseTool structure based on tool type
 fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError> {
     // MCP server_label must be present and unique (case-insensitive).
@@ -4187,16 +4882,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                 if function.name.is_empty() {
                     return Err(empty_tool_name(&format!("tools[{idx}].name")));
                 }
-                if !function.parameters_schema().is_object() {
-                    return Err(invalid(
-                        "invalid_type",
-                        format!(
-                            "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
-                            json_type_name(function.parameters_schema())
-                        ),
-                    ));
-                }
-                validate_function_tool_keys(function, &format!("tools[{idx}]"))?;
+                let at = FunctionPlace::Tool(idx);
+                validate_function_parameters(function, at)?;
+                validate_function_tool_keys(function, at)?;
             }
             // A custom tool has a name: the model is given a function of that
             // name for it.
@@ -4206,7 +4894,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                 }
             }
             // A namespace has a name, and so has each of its members: the
-            // model addresses a member as `namespace.member`.
+            // model addresses a member as `namespace.member`. A function
+            // member is handed to the model as a function of its own, so its
+            // parameters are held to a top-level function's rule.
             ResponseTool::Namespace(namespace) => {
                 if namespace.name.is_empty() {
                     return Err(empty_tool_name(&format!("tools[{idx}].name")));
@@ -4222,10 +4912,9 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                         )));
                     }
                     if let NamespaceTool::Function(function_tool) = member {
-                        validate_function_tool_keys(
-                            &function_tool.function,
-                            &format!("tools[{idx}].tools[{member_idx}]"),
-                        )?;
+                        let at = FunctionPlace::Member(idx, member_idx);
+                        validate_function_parameters(&function_tool.function, at)?;
+                        validate_function_tool_keys(&function_tool.function, at)?;
                     }
                 }
             }
@@ -4858,6 +5547,407 @@ mod tests {
     #[test]
     fn a_function_tools_fields_end_with_its_tool_keys() {
         assert!(FunctionTool::FIELDS.ends_with(FunctionTool::TOOL_KEYS));
+    }
+
+    /// A twelve-turn conversation input (text turns and part turns, an
+    /// image, a function call and its output), read two hundred times: the
+    /// readers' cost on a representative request, for the measurement of a
+    /// change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_input_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut items = Vec::new();
+        for _ in 0..5 {
+            items.push(serde_json::json!({"role": "user", "content": [
+                {"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"},
+            ]}));
+            items.push(serde_json::json!({"role": "assistant", "content": text}));
+        }
+        items.push(serde_json::json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}", "status": "completed"}));
+        items.push(serde_json::json!({"type": "function_call_output", "call_id": "call_1", "output": text}));
+        let body =
+            serde_json::json!({"model": "m", "input": items, "max_output_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ResponsesRequest = serde_json::from_str(&body).expect("the body reads");
+            let ResponseInput::Items(items) = &request.input else {
+                panic!("the input is the items")
+            };
+            assert_eq!(items.len(), 12);
+        }
+    }
+
+    /// A long part is read in its own size: a missing field inside the last
+    /// of many annotations is located at its element, and a part with many
+    /// array-valued keys is refused at the part; a long item too: a missing
+    /// field inside the last of many safety checks beside a long own `id` of
+    /// the same name is located at its element. All within one generous
+    /// wall-clock bound (the quadratic shapes took tens of seconds here).
+    #[test]
+    fn a_long_part_is_located_in_linear_time() {
+        let started = std::time::Instant::now();
+        let mut annotations: Vec<Value> = (0..20_000)
+            .map(|index| {
+                serde_json::json!({"type": "file_citation", "file_id": "f", "filename": "n", "index": index})
+            })
+            .collect();
+        annotations.push(serde_json::json!({"type": "file_citation", "index": 20_000}));
+        let part =
+            serde_json::json!({"type": "output_text", "text": "hi", "annotations": annotations});
+        let error = ResponseContentPart::deserialize(&part)
+            .expect_err("the last annotation lacks its file_id");
+        assert_eq!(
+            content_part_refusal("content", 0, &part, &error),
+            "content[0].annotations[20000]: missing field `file_id`"
+        );
+        let mut fields = serde_json::Map::new();
+        fields.insert("type".to_string(), Value::String("input_text".to_string()));
+        for index in 0..20_000 {
+            fields.insert(format!("k{index}"), serde_json::json!([{}]));
+        }
+        let part = Value::Object(fields);
+        let error = ResponseContentPart::deserialize(&part).expect_err("the part lacks its text");
+        assert_eq!(
+            content_part_refusal("content", 0, &part, &error),
+            "content[0]: missing field `text`"
+        );
+        let mut checks: Vec<Value> = (0..20_000)
+            .map(|index| serde_json::json!({"id": format!("sc_{index}")}))
+            .collect();
+        checks.push(serde_json::json!({}));
+        let item = serde_json::json!({
+            "type": "computer_call",
+            "id": "x".repeat(1 << 20),
+            "call_id": "call_1",
+            "status": "completed",
+            "pending_safety_checks": checks,
+        });
+        let error = ResponseInputOutputItem::deserialize(&item)
+            .expect_err("the last safety check lacks its id");
+        assert_eq!(
+            typed_item_refusal(&item, error),
+            "pending_safety_checks[20000]: missing field `id`"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "located in {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An input item with a repeated key is refused with serde's words, as
+    /// the derived readers refuse it, instead of the last value winning: at
+    /// the item's own keys (one a shape reads, one no shape knows, one past
+    /// the keys the reader walks) and at any depth below them (the place is
+    /// the deserializer's to name, as for the derived readers; the door's
+    /// test reads it). The last row is a free-form value inside an item: a
+    /// derived read keeps its last value, the item's one rule refuses it.
+    #[test]
+    fn an_input_item_with_a_repeated_key_is_refused() {
+        for (body, refusal) in [
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","role":"system"}]}"#,
+                "duplicate field `role`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","type":"message","role":"user","content":"hi"}]}"#,
+                "duplicate field `type`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","x":1,"x":2}]}"#,
+                "duplicate field `x`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","k0":0,"k1":0,"k2":0,"k3":0,"k4":0,"k5":0,"k6":0,"k7":0,"k8":0,"k9":0,"k10":0,"k11":0,"k12":0,"k13":0,"k14":0,"k15":0,"k16":0,"k16":1}]}"#,
+                "duplicate field `k16`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                "duplicate field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"t","annotations":[{"type":"file_citation","file_id":"f","filename":"n","index":0,"index":1}]}]}]}"#,
+                "duplicate field `index`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call_output","call_id":"c","output":[{"type":"input_text","text":"a"},{"type":"input_image","detail":"low","detail":"high"}]}]}"#,
+                "duplicate field `detail`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","type":"input_image","text":"a"}]}]}"#,
+                "duplicate field `type`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"computer_call","id":"cu_1","call_id":"c","action":{"type":"screenshot"},"pending_safety_checks":[{"id":"s1","code":"k","message":"m","id":"s2"}],"status":"completed"}]}"#,
+                "duplicate field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"apply_patch_call","id":"ap_1","call_id":"c","operation":{"type":"create_file","path":"a","diff":"d","path":"b"},"status":"completed"}]}"#,
+                "duplicate field `path`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"local_shell_call","id":"ls_1","call_id":"c","action":{"type":"exec","command":["ls"],"env":{"A":"1","A":"2"}},"status":"completed"}]}"#,
+                "duplicate field `A`",
+            ),
+        ] {
+            let error = serde_json::from_str::<ResponsesRequest>(body)
+                .expect_err("the repeated key is refused");
+            assert!(error.to_string().starts_with(refusal), "{error}");
+        }
+    }
+
+    /// A typed item refused at its own field says which: serde's words for a
+    /// missing one (the extractor appends the field), the field before the
+    /// reason for an invalid one, `type` for a kind with no variant, the
+    /// element of one of the item's arrays for a field missing inside it or
+    /// an element refused on its own, the field itself when it takes no
+    /// array and is sent one.
+    #[test]
+    fn a_typed_item_refused_at_its_own_field_names_it() {
+        for (body, words) in [
+            (
+                r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}]}"#,
+                "missing field `call_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}]}"#,
+                "arguments: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":["{}"]}]}"#,
+                "arguments: invalid type: sequence, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search","input_schema":{}},{"name":7,"input_schema":{}}]}]}"#,
+                "tools[1]: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}]}"#,
+                "role: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"web_search_results","id":"ws_1"}]}"#,
+                "type: unknown variant `web_search_results`, expected one of `message`, `reasoning`, `function_call`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search"}]}]}"#,
+                "tools[0]: missing field `input_schema`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":[{}]}]}"#,
+                "acknowledged_safety_checks[0]: missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference"}]}"#,
+                "missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference","id":7}]}"#,
+                "id: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","content":"hi","role":7}]}"#,
+                "role: invalid type: integer `7`, expected a string",
+            ),
+        ] {
+            let error = serde_json::from_str::<ResponsesRequest>(body)
+                .expect_err("the typed item is refused");
+            assert!(error.to_string().starts_with(words), "{body}: {error}");
+        }
+    }
+
+    /// Every tagged variant's smallest payload.
+    const SMALLEST_TAGGED_ITEMS: [&str; 20] = [
+        r#"{"type":"message","id":"msg_1","role":"user","content":[]}"#,
+        r#"{"type":"reasoning","id":"rs_1"}"#,
+        r#"{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}"#,
+        r#"{"type":"function_call_output","call_id":"call_1","output":"found"}"#,
+        r#"{"type":"mcp_approval_request","id":"mcpr_1","server_label":"docs","name":"search","arguments":"{}"}"#,
+        r#"{"type":"mcp_approval_response","approval_request_id":"mcpr_1","approve":true}"#,
+        r#"{"type":"image_generation_call","id":"ig_1"}"#,
+        r#"{"type":"compaction","encrypted_content":"opaque"}"#,
+        r#"{"type":"computer_call","id":"cu_1","call_id":"call_1","status":"completed"}"#,
+        r#"{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":null}"#,
+        r#"{"type":"custom_tool_call","call_id":"call_1","input":"x","name":"grep"}"#,
+        r#"{"type":"custom_tool_call_output","call_id":"call_1","output":"y"}"#,
+        r#"{"type":"shell_call","call_id":"call_1","action":{"commands":["ls"]}}"#,
+        r#"{"type":"shell_call_output","call_id":"call_1","output":[]}"#,
+        r#"{"type":"apply_patch_call","call_id":"call_1","operation":{"type":"delete_file","path":"old.txt"},"status":"completed"}"#,
+        r#"{"type":"apply_patch_call_output","call_id":"call_1","status":"completed"}"#,
+        r#"{"type":"local_shell_call","id":"lsh_1","call_id":"call_1","action":{"type":"exec","command":["ls"],"env":{}},"status":"completed"}"#,
+        r#"{"type":"local_shell_call_output","id":"lsh_1","output":"ok"}"#,
+        r#"{"type":"mcp_call","id":"mcp_1","arguments":"{}","name":"search","server_label":"docs","error":"boom"}"#,
+        r#"{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[]}"#,
+    ];
+
+    /// Every tagged variant's smallest payload reads the same through the
+    /// public reader and the tagged-only mirror, and the payloads' kinds are
+    /// the kinds the public schema lists: a serde attribute a mirrored field
+    /// does not repeat (a default, a custom reader), or a variant the mirror
+    /// lacks, shows here, where the compiler cannot see it.
+    #[test]
+    fn the_tagged_mirror_reads_every_variant_as_the_public_reader_does() {
+        // The kinds the public schema lists: every object shape whose `type`
+        // is pinned to one word, under the variants and not under the
+        // definitions (the named types the fields refer to, tagged in their
+        // own right); the two untagged shapes left out, whatever the
+        // generator makes of them.
+        fn pinned_kinds(schema: &Value, kinds: &mut std::collections::BTreeSet<String>) {
+            match schema {
+                Value::Object(fields) => {
+                    let pinned = fields
+                        .get("properties")
+                        .and_then(|properties| properties.get("type"))
+                        .and_then(|tag| {
+                            tag.get("const")
+                                .or_else(|| tag.get("enum")?.as_array()?.first())
+                        })
+                        .and_then(Value::as_str);
+                    if let Some(kind) = pinned {
+                        kinds.insert(kind.to_string());
+                    }
+                    for (key, value) in fields {
+                        if key != "$defs" && key != "definitions" {
+                            pinned_kinds(value, kinds);
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        pinned_kinds(item, kinds);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut covered = std::collections::BTreeSet::new();
+        for payload in SMALLEST_TAGGED_ITEMS {
+            let value: Value = serde_json::from_str(payload).expect("a JSON object");
+            covered.insert(value["type"].as_str().expect("a tag").to_string());
+            let public = ResponseInputOutputItem::deserialize(&value).expect(payload);
+            let mirror = tagged_item(&value["type"], &value).expect(payload);
+            assert_eq!(format!("{public:?}"), format!("{mirror:?}"), "{payload}");
+        }
+        let mut listed = std::collections::BTreeSet::new();
+        pinned_kinds(
+            &schemars::schema_for!(ResponseInputOutputItem).to_value(),
+            &mut listed,
+        );
+        for untagged in ["simple_input_message", "item_reference"] {
+            listed.remove(untagged);
+        }
+        assert_eq!(listed, covered, "the payloads cover the schema's kinds");
+    }
+
+    /// The request reader takes an input item as the derived reader does,
+    /// class by class. The tagged forms: every tagged variant's smallest
+    /// payload and fuller items of the common kinds. Each as it stands, with
+    /// one key absent, with one value null (null against absent), with one
+    /// value swapped for another JSON value, with a key no shape knows, with
+    /// its `type` renamed and with a `phase`. The untagged forms: a message
+    /// and an item reference sent without a `type`, and the items neither
+    /// takes. The same item from both readers, or a refusal from both. A
+    /// repeated key is the reader's own rule, stricter than a derived read:
+    /// `an_input_item_with_a_repeated_key_is_refused` pins it.
+    #[test]
+    fn the_request_reader_takes_every_item_shape_as_the_derived_reader_does() {
+        let fuller = [
+            r#"{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}"#,
+            r#"{"id":"msg_2","type":"message","role":"user","status":"completed","content":[{"type":"input_text","text":"hi"}]}"#,
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}"#,
+            r#"{"type":"message","role":"user","content":"hi"}"#,
+            r#"{"role":"user","content":"hi"}"#,
+            r#"{"role":"user","content":[{"type":"input_text","text":"hi"}]}"#,
+            r#"{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}","status":"completed"}"#,
+            r#"{"type":"function_call_output","call_id":"call_1","output":"{\"found\":true}"}"#,
+            r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}],"content":[{"type":"reasoning_text","text":"step"}],"status":"completed"}"#,
+        ];
+        let untagged = [
+            serde_json::json!({"id": "msg_1"}),
+            serde_json::json!({"id": "msg_1", "type": "item_reference"}),
+            serde_json::json!({"type": "item_reference"}),
+            serde_json::json!({"id": "msg_1", "role": "user"}),
+            serde_json::json!({"id": "msg_1", "content": "hi"}),
+            serde_json::json!({"id": "msg_1", "role": "user", "content": "hi"}),
+            serde_json::json!({"type": "message", "id": "msg_1", "role": "user", "content": "hi"}),
+            serde_json::json!({"role": "user"}),
+            serde_json::json!({"content": "hi"}),
+            serde_json::json!({"role": 7, "content": "hi"}),
+            serde_json::json!({"role": "user", "content": 7}),
+            serde_json::json!({"role": "user", "content": [{"type": "input_text"}]}),
+            serde_json::json!({"type": 0, "id": "msg_1", "role": "user", "content": []}),
+            serde_json::json!({}),
+            serde_json::json!(7),
+            serde_json::json!("x"),
+            Value::Null,
+            serde_json::json!([]),
+        ];
+        let through_request = |item: &Value| {
+            let body = serde_json::json!({"model": "m", "input": [item]});
+            serde_json::from_value::<ResponsesRequest>(body)
+                .ok()
+                .map(|request| format!("{:?}", request.input))
+        };
+        let through_derive = |item: &Value| {
+            ResponseInputOutputItem::deserialize(item)
+                .ok()
+                .map(|item| format!("{:?}", ResponseInput::Items(vec![item])))
+        };
+        let mut probes: Vec<(&str, Value)> = untagged
+            .into_iter()
+            .map(|item| ("an untagged form", item))
+            .collect();
+        for text in SMALLEST_TAGGED_ITEMS.iter().chain(&fuller) {
+            let item: Value = serde_json::from_str(text).expect("a JSON object");
+            probes.push(("as it stands", item.clone()));
+            for key in item.as_object().expect("an object").keys() {
+                let mut absent = item.clone();
+                absent.as_object_mut().expect("an object").remove(key);
+                probes.push(("a key absent", absent));
+                for (class, other) in [
+                    ("a value null", Value::Null),
+                    ("a value swapped", serde_json::json!(7)),
+                    ("a value swapped", serde_json::json!("x")),
+                    ("a value swapped", serde_json::json!([])),
+                    ("a value swapped", serde_json::json!({})),
+                    ("a value swapped", serde_json::json!(true)),
+                ] {
+                    let mut swapped = item.clone();
+                    swapped[key.as_str()] = other;
+                    probes.push((class, swapped));
+                }
+            }
+            let mut unknown = item.clone();
+            unknown["a_key_no_shape_knows"] = serde_json::json!(1);
+            probes.push(("an unknown key", unknown));
+            for kind in [
+                "totally_made_up",
+                "item_reference",
+                "simple_input_message",
+                "message",
+            ] {
+                let mut renamed = item.clone();
+                renamed["type"] = serde_json::json!(kind);
+                probes.push(("the type renamed", renamed));
+            }
+            for phase in [serde_json::json!("commentary"), serde_json::json!(7)] {
+                let mut phased = item.clone();
+                phased["phase"] = phase;
+                probes.push(("a phase", phased));
+            }
+        }
+        let mut taken = 0;
+        for (class, probe) in &probes {
+            let expected = through_derive(probe);
+            assert_eq!(through_request(probe), expected, "{class}: {probe}");
+            taken += usize::from(expected.is_some());
+        }
+        assert!(
+            taken > SMALLEST_TAGGED_ITEMS.len() + fuller.len(),
+            "{taken} of {} probes taken",
+            probes.len()
+        );
     }
 
     /// The three sampling knobs the request keeps as plain values read as set

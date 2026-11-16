@@ -20,11 +20,13 @@ use super::{
     now, peer, Failures, LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Schedule, Target,
 };
 use crate::{
+    spec::{BindingSpec, OverloadSpec},
     store::{
-        GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, Signals, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, Signals, ViewBuffers,
+        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
+    AppliedSpec, PolicySpec,
 };
 
 /// A metrics body of the first gauge family: three running, five waiting,
@@ -909,6 +911,82 @@ async fn run_ticks_until_told_to_stop() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let first = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    let late = ready(&store, "grpc://b:1", "grpc://b:1", 0, 1, WireModes::GRPC, 0);
+    let busy = Figures {
+        running: 4,
+        waiting: 2,
+        usage: 0.5,
+    };
+    probe.answers("grpc://a:1", &[busy]);
+    probe.answers("grpc://b:1", &[busy]);
+    probe.held.lock().insert("grpc://b:1".to_owned());
+    // What a decision reads of the worker's load at this instant.
+    let seen = |id: WorkerId| {
+        let mut out = ViewBuffers::default();
+        store
+            .build_view(
+                "m",
+                Role::Single,
+                &Ask {
+                    gateway: GatewayId::LOCAL,
+                    now: now(),
+                    pinned: None,
+                    affinity: false,
+                },
+                &mut out,
+            )
+            .expect("the pool");
+        out.candidates
+            .iter()
+            .find(|row| row.id == id)
+            .and_then(|row| row.load)
+            .map(|load| load.running)
+    };
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (stop, stopped) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run(stopped).await });
+    let started = now();
+
+    // The first engine's answer lands after a quiet window and publishes by
+    // itself; the second engine's call is still out.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(seen(first), Some(4));
+    assert_eq!(seen(late), None);
+
+    // The second answer lands inside the window: its row is on file and no
+    // decision reads it yet.
+    tokio::time::sleep(Duration::from_millis(4)).await;
+    probe.held.lock().clear();
+    probe.release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(row(&store, late, 0).is_some());
+    assert_eq!(seen(late), None);
+    assert!(store.publish_due().is_some());
+
+    // No later write comes (the next tick writes nothing, the next poll is
+    // ten seconds away): the loop shows the row at the window's end.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        started + PUBLISH_WINDOW + Duration::from_millis(2),
+    ))
+    .await;
+    assert_eq!(seen(late), Some(4));
+    assert_eq!(store.publish_due(), None);
+
+    stop.send_replace(true);
+    tasks
+        .join_next()
+        .await
+        .expect("the run task")
+        .expect("it ended without a panic");
+}
+
+#[tokio::test(start_paused = true)]
 async fn with_one_silent_engine_the_others_advance_every_period_and_it_holds_exactly_one_call() {
     let store = Arc::new(MemoryStore::new());
     let probe = Arc::new(FakeProbe::default());
@@ -1169,4 +1247,342 @@ fn an_address_whose_host_cannot_be_told_from_its_userinfo_is_named_by_a_marker()
     ] {
         assert_eq!(peer(engine), "<unparsable address>", "{engine}");
     }
+}
+
+/// A generation whose one binding vetoes an engine at `waiting` queued
+/// requests over its ranks.
+fn vetoing_at(waiting: u32) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile")
+        .clone();
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile),
+        overload: Some(OverloadSpec {
+            waiting_requests: Some(waiting),
+            token_usage: Some(1.0),
+            ..OverloadSpec::default()
+        }),
+        ..BindingSpec::default()
+    }];
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// Each row of the model's pool: whether it carries the overload verdict.
+fn vetoed(store: &MemoryStore) -> Vec<bool> {
+    let mut out = ViewBuffers::default();
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: now(),
+        pinned: None,
+        affinity: false,
+    };
+    store
+        .build_view("m", Role::Single, &ask, &mut out)
+        .expect("the pool");
+    out.candidates
+        .iter()
+        .map(|row| row.health.overloaded)
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_poll_is_the_word_that_no_report_came_and_clears_the_engines_verdict() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let id = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    store.apply(vetoing_at(5)).expect("applied");
+    probe.answers(
+        "grpc://a:1",
+        &[Figures {
+            running: 0,
+            waiting: 5,
+            usage: 0.0,
+        }],
+    );
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+    tick(&driver, &mut schedule).await;
+    assert_eq!((vetoed(&store), store.overload_flips()), (vec![true], 1));
+
+    // The poll fails: nothing on file changes, and the verdict is cleared.
+    probe.failing.lock().insert("grpc://a:1".to_owned());
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(5));
+    assert_eq!((vetoed(&store), store.overload_flips()), (vec![false], 2));
+
+    // The engine answers again: its report is judged as any other.
+    probe.failing.lock().clear();
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!((vetoed(&store), store.overload_flips()), (vec![true], 3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_scrape_is_the_word_that_no_report_came_and_clears_the_engines_verdict() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let id = ready(
+        &store,
+        "http://h:1",
+        "http://h:1",
+        0,
+        1,
+        WireModes::HTTP,
+        500,
+    );
+    store.apply(vetoing_at(5)).expect("applied");
+    probe
+        .texts
+        .lock()
+        .insert("http://h:1".to_owned(), METRICS_TEXT.to_owned());
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+    tick(&driver, &mut schedule).await;
+    assert_eq!((vetoed(&store), store.overload_flips()), (vec![true], 1));
+
+    // The scrape fails: nothing on file changes, and the verdict is cleared.
+    probe.texts.lock().clear();
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(row(&store, id, 0).map(|(r, _)| r.queued), Some(5));
+    assert_eq!((vetoed(&store), store.overload_flips()), (vec![false], 2));
+
+    // The engine's text is back: its row is judged as any other.
+    probe
+        .texts
+        .lock()
+        .insert("http://h:1".to_owned(), METRICS_TEXT.to_owned());
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!((vetoed(&store), store.overload_flips()), (vec![true], 3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_poll_says_nothing_of_an_engine_whose_other_rank_its_stream_serves() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let rank0 = ready(
+        &store,
+        "grpc://b:1@0",
+        "grpc://b:1",
+        0,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    let _rank1 = ready(
+        &store,
+        "grpc://b:1@1",
+        "grpc://b:1",
+        1,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    store.apply(vetoing_at(5)).expect("applied");
+    // Rank 0's stream reports a queue at the count: the engine is over it.
+    store.record(
+        rank0,
+        0,
+        LoadRow {
+            queued: 5,
+            ..LoadRow::default()
+        },
+        now(),
+        LoadSource::Stream,
+    );
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+    probe.failing.lock().insert("grpc://b:1".to_owned());
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    // Time passes inside the freshness bound. The poll is for the quiet
+    // rank alone and fails at once: rank 0 is heard on its stream, and the
+    // failure says nothing of the engine.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(probe.polls(), vec!["grpc://b:1"]);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+
+    // Past the bound rank 0's stream serves it no more: the next poll is
+    // for both ranks, and its failure is the engine's word.
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(probe.polls().len(), 2);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![false, false], 2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_with_no_row_says_nothing_of_an_engine_whose_other_rank_its_stream_serves() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let rank0 = ready(
+        &store,
+        "grpc://b:1@0",
+        "grpc://b:1",
+        0,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    let _rank1 = ready(
+        &store,
+        "grpc://b:1@1",
+        "grpc://b:1",
+        1,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    store.apply(vetoing_at(5)).expect("applied");
+    store.record(
+        rank0,
+        0,
+        LoadRow {
+            queued: 5,
+            ..LoadRow::default()
+        },
+        now(),
+        LoadSource::Stream,
+    );
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+    // The engine answers its polls, with figures for no rank.
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+
+    // Inside the freshness bound the poll is for the quiet rank alone and
+    // its answer brings no row: rank 0 is heard on its stream, and the
+    // answer says nothing of the engine.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(probe.polls(), vec!["grpc://b:1"]);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+
+    // Past the bound the poll is for both ranks, and an answer with no row
+    // for either is the engine's word.
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(probe.polls().len(), 2);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![false, false], 2)
+    );
+    assert_eq!(driver.stats().rows.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rank_that_is_not_ready_does_not_hold_the_word_off() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let rank0 = ready(
+        &store,
+        "grpc://b:1@0",
+        "grpc://b:1",
+        0,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    let _rank1 = ready(
+        &store,
+        "grpc://b:1@1",
+        "grpc://b:1",
+        1,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    store.apply(vetoing_at(5)).expect("applied");
+    store.record(
+        rank0,
+        0,
+        LoadRow {
+            queued: 5,
+            ..LoadRow::default()
+        },
+        now(),
+        LoadSource::Stream,
+    );
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+    // Rank 0 fails its probes. No poll is for a rank that is not ready,
+    // and none leaves it out as served: the poll for the ready rank is the
+    // engine's whole poll, and its failure the engine's word.
+    let revision = store.get(rank0).expect("the row").revision;
+    store.set_status(rank0, WorkerStatus::NotReady, revision);
+    probe.failing.lock().insert("grpc://b:1".to_owned());
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(probe.polls(), vec!["grpc://b:1"]);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![false, false], 2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_engines_answer_is_one_write_so_ranks_that_trade_their_queues_move_no_verdict() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    for rank in 0..2 {
+        ready(
+            &store,
+            &format!("grpc://b:1@{rank}"),
+            "grpc://b:1",
+            rank,
+            2,
+            WireModes::GRPC,
+            0,
+        );
+    }
+    store.apply(vetoing_at(8)).expect("applied");
+    let figures = |waiting: i32| Figures {
+        running: 0,
+        waiting,
+        usage: 0.0,
+    };
+    probe.answers("grpc://b:1", &[figures(1), figures(6)]);
+    let driver = driver(&store, &probe, TEN);
+    let mut schedule = Schedule::default();
+    tick(&driver, &mut schedule).await;
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![false; 2], 0)
+    );
+
+    // The ranks trade their queues. Written a rank a call, the first write
+    // would read 6 and 6: the engine over its count for one publication.
+    probe.answers("grpc://b:1", &[figures(6), figures(1)]);
+    tokio::time::advance(TEN + Duration::from_secs(1)).await;
+    tick(&driver, &mut schedule).await;
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![false; 2], 0)
+    );
+    assert_eq!(driver.stats().rows.load(Ordering::Relaxed), 4);
 }

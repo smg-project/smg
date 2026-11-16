@@ -1144,7 +1144,7 @@
           "default": 120
         },
         "assignment": {
-          "description": "How a first-seen key picks its worker (default `delegate`).",
+          "description": "How a first-seen key picks its worker (default `delegate`); under\nthe `manual` picker, a request with no key as well.",
           "$ref": "#/$defs/Assignment",
           "default": "delegate"
         },
@@ -1173,7 +1173,7 @@
       ]
     },
     "Assignment": {
-      "description": "How a session key seen for the first time picks its worker.",
+      "description": "How a session key seen for the first time picks its worker. Under the\n`manual` picker the same assignment places a request with no key, which\nis not pinned, and a `manual` profile bound with no sessions rule places\nevery request by `min_load`.",
       "oneOf": [
         {
           "description": "A random worker.",

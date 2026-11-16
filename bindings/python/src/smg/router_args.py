@@ -406,6 +406,9 @@ class RouterArgs:
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 120
+    # Pin a routing key's requests to one engine of a grouped data-parallel
+    # worker: off (the default) or hash
+    grouped_dp_sticky: str = "off"
     # Seconds a request to a gRPC worker may take from its dispatch to its last
     # message; 0 (the default) arms no deadline
     grpc_request_timeout_secs: int = 0
@@ -1523,6 +1526,21 @@ class RouterArgs:
             help=(
                 "Ordered header names checked for the routing key; the first"
                 " header present with a valid value wins"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}grouped-dp-sticky",
+            type=str,
+            choices=["off", "hash"],
+            default=RouterArgs.grouped_dp_sticky,
+            help=(
+                "Whether, and how, a request that carries a routing key is pinned to one"
+                " engine of a grouped data-parallel worker (a ZMQ worker several engines"
+                " dial, as many as --zmq-engine-count says or its engines declare), so a"
+                " conversation keeps one engine's prefix cache. The key is the first valid"
+                " --routing-key-headers header, or the body rid under --routing-key-override."
+                " hash sends a key's requests to the engine its hash picks; off leaves each"
+                " request to the least-loaded engine"
             ),
         )
         routing_group.add_argument(

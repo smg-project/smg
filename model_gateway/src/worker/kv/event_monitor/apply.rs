@@ -188,8 +188,7 @@ impl KvEventMonitor {
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
     ) {
-        let first_level = stored.blocks.first().and_then(|block| block.cache_level);
-        let Some(tier) = indexed_tier(stored.tier, first_level) else {
+        let Some(tier) = stored_tier(stored) else {
             worker_blocks.counters.untracked_tier += 1;
             return;
         };
@@ -288,8 +287,7 @@ impl KvEventMonitor {
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
     ) {
-        let first_level = stored.blocks.first().and_then(|block| block.cache_level);
-        if indexed_tier(stored.tier, first_level).is_none() {
+        if stored_tier(stored).is_none() {
             worker_blocks.counters.untracked_tier += 1;
             return;
         }
@@ -502,6 +500,13 @@ fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<IndexedTi
         KvCacheTier::Host => Some(IndexedTier::Host),
         KvCacheTier::Disk | KvCacheTier::External => None,
     }
+}
+
+/// The tier a store's blocks are on, when the index tracks it: the store's
+/// `tier`, else its first block's `cache_level`.
+fn stored_tier(stored: &KvBlocksStored) -> Option<IndexedTier> {
+    let first_level = stored.blocks.first().and_then(|block| block.cache_level);
+    indexed_tier(stored.tier, first_level)
 }
 
 /// Cache-group kinds whose blocks hold the main attention KV, the ones the

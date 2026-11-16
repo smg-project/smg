@@ -68,8 +68,11 @@
 //! The first state in the table is where an output starts, unless the prompt moved the engine
 //! before the output began: the engine replays the prompt's terminals over the same table, from
 //! the last **turn opener** the table names (`<|im_start|>assistant` for Qwen's ChatML), so that
-//! a marker quoted in an earlier turn moves nothing. A table that names no opener is replayed
-//! from the prompt's start.
+//! a marker quoted in an earlier turn moves nothing. Where the opener is one of the table's
+//! terminals, which the model writes at every message (Inkling's `<|message_model|>`), the last
+//! one may stand inside a body the prompt left open and open nothing there: the replay starts at
+//! the first opener after the last message close before it. A table that names no opener is
+//! replayed from the prompt's start.
 //!
 //! A table read from a response template names its **turn anchors** instead, as Hugging Face's
 //! `start_anchor` does: one literal or several (Gemma 4's template starts a turn after
@@ -195,6 +198,13 @@ pub enum CallSyntax {
     /// than from the model. The table's one state is an arguments state entered at the output's
     /// start; the object's close ends the call, and what follows is wrapping or malformed.
     ForcedArguments,
+    /// The list of `{"name": …, "parameters": …}` objects alone: what the engine writes under the
+    /// JSON-schema constraint the gateway builds for a required call. Read as
+    /// [`Self::JsonAlone`] reads a list with no marker, but for what the end of the stream leaves
+    /// of an open one: the engine held the output to the list, so its separators, an object cut
+    /// before its arguments began and what a started call's object held behind its arguments are
+    /// refused, never content.
+    ForcedList,
     /// Gemma's `call:NAME{key:value,…}`: keys bare, a string between two tokens, numbers and
     /// words bare, lists and objects nested the same way, the keys sorted by the template, in the
     /// family's spelling of the string token and the null word (Gemma 4: `<|"|>` and `null`;
@@ -246,6 +256,7 @@ impl CallSyntax {
             | Self::JsonList
             | Self::JsonAlone(_)
             | Self::ForcedArguments
+            | Self::ForcedList
             | Self::Xml => Vec::new(),
         }
     }
@@ -274,6 +285,18 @@ pub enum Whitespace {
     Bounded(u32),
 }
 
+/// How the JSON of a forced call is written under the gateway's JSON-schema constraint
+/// ([`Format::with_forced_call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForcedCall {
+    /// The arguments object alone, of the function the request names
+    /// ([`CallSyntax::ForcedArguments`]).
+    Arguments,
+    /// A list of `{"name": …, "parameters": …}` objects, as a required call writes them
+    /// ([`CallSyntax::ForcedList`]).
+    List,
+}
+
 /// Where a call's id comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CallId {
@@ -291,9 +314,9 @@ pub enum CallId {
 }
 
 /// The text that opens the model's turn, with its reverse finder built once with the table:
-/// the prompt's replay starts at the opener's last occurrence, and a request searches for it two
-/// or three times (the replay, the turn, an unopened turn), so the searcher's preprocessing of
-/// the needle is paid here, not on every search.
+/// the turn's start is found from the opener's last occurrence, and a request searches for it
+/// two or three times (the replay, the turn, an unopened turn), so the searcher's preprocessing
+/// of the needle is paid here, not on every search.
 #[derive(Clone, Debug)]
 struct TurnOpener {
     text: String,
@@ -414,11 +437,30 @@ pub(crate) struct Replay {
 
 /// A literal that starts the model's turn in the prompt, and the state the output starts in after
 /// it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct Anchor {
     text: String,
     state: usize,
+    finder: memchr::memmem::Finder<'static>,
 }
+
+impl Anchor {
+    fn new(text: &str, state: usize) -> Self {
+        Self {
+            text: text.to_string(),
+            state,
+            finder: memchr::memmem::Finder::new(text).into_owned(),
+        }
+    }
+}
+
+impl PartialEq for Anchor {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.state == other.state
+    }
+}
+
+impl Eq for Anchor {}
 
 /// The unopened row: the state the output starts in when the prompt opens no turn for the model,
 /// and the text that ends a turn the model wrote in the prompt, after which the turn opener would
@@ -704,7 +746,8 @@ impl Format {
     }
 
     /// The text that opens the turn the model writes, `<|im_start|>assistant` for ChatML: the
-    /// prompt's replay starts at its last occurrence.
+    /// prompt's replay starts at its last occurrence, or, where the text is one of the table's
+    /// terminals, at the opener of the message the prompt left open.
     #[must_use]
     pub fn opens_turn(mut self, text: &str) -> Self {
         self.turn_opener = Some(TurnOpener::new(text));
@@ -717,10 +760,7 @@ impl Format {
     /// where several match at one place.
     #[must_use]
     pub fn turn_anchor(mut self, text: &str) -> Self {
-        self.anchors.push(Anchor {
-            text: text.to_string(),
-            state: 0,
-        });
+        self.anchors.push(Anchor::new(text, 0));
         self
     }
 
@@ -729,10 +769,7 @@ impl Format {
     #[must_use]
     pub fn turn_anchor_starting_in(mut self, text: &str, state: &str) -> Self {
         let state = self.state_named(state);
-        self.anchors.push(Anchor {
-            text: text.to_string(),
-            state,
-        });
+        self.anchors.push(Anchor::new(text, state));
         self
     }
 
@@ -748,6 +785,12 @@ impl Format {
     /// The state the start row names, if the table has one.
     pub(crate) fn start(&self) -> Option<usize> {
         self.start
+    }
+
+    /// The state the unopened row names, if the table has one: where a turn starts when the
+    /// prompt opens no turn for the model ([`Self::unopened_turn_starts_in`]).
+    pub(crate) fn unopened_start(&self) -> Option<usize> {
+        self.unopened.as_ref().map(|unopened| unopened.state)
     }
 
     /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
@@ -975,6 +1018,102 @@ impl Format {
         self
     }
 
+    /// The table for a request whose call the gateway's JSON-schema constraint forces, where the
+    /// engine holds the output to the schema only once the model's thought is over: the output
+    /// is the thought, as the table reads it, and then the JSON alone, with no call marker, no
+    /// name outside the JSON and no answer. The thought's states stay, with every row into, out
+    /// of and between them; every other state is one arguments state, the first, which reads
+    /// the JSON as `written` says: the arguments of the function the request names
+    /// ([`Declared::forcing`](crate::Declared::forcing)), or the list a required call writes
+    /// ([`CallSyntax::ForcedList`]: what the end of the stream leaves of an open list is refused,
+    /// never content).
+    /// So the output starts in the call unless the prompt's replay, an anchor or the unopened
+    /// row leaves it inside the thought, and the thought's close, wherever the table's own row
+    /// led, opens the call.
+    ///
+    /// A row out of the arguments state is taken only before the JSON's first byte, where a
+    /// marker is the template's framing: the thought's opener enters the thought, and any other
+    /// marker with a row from a state that is now this one (an answer's opener) is dropped as
+    /// wrapping. From the first byte on every marker is the call's text, which a JSON string
+    /// may hold: the assemblers of the two syntaxes close at no terminal once their value began.
+    /// A marker the table ignores is the call's text inside the value too, and wrapping the
+    /// engine drops before the value and after it, as everywhere. The rows the parser alone
+    /// reads (the leading and the recovery rows) are rows like the others here; where two
+    /// states that are now one read a marker differently, the row the table lists first
+    /// stands. An anchor that named a state other than a thought's names the arguments state.
+    /// An unopened row that named one goes, since the row cannot name a state that holds a
+    /// call ([`Self::validate`]), and so does a start row, the turn's first byte being the
+    /// call's. The layout goes, and the call's id is the engine's. The table keeps its name:
+    /// the model's table reads the output.
+    ///
+    /// A table without a thought becomes the arguments state alone, its markers dropped before
+    /// the JSON: what [`forced`](crate::formats::forced()) and [`json`](crate::formats::json())
+    /// read, for an output that is the JSON from its first byte. The variant
+    /// [`Self::without_reasoning`] makes of this one reads the thought as content and keeps its
+    /// markers dropped, which here are the rows into and out of the call.
+    #[must_use]
+    pub fn with_forced_call(mut self, written: ForcedCall) -> Self {
+        let mut states = vec![State {
+            name: "forced".to_string(),
+            emits: Emits::Arguments,
+            framing: false,
+            trimmed: false,
+            kept: false,
+            closes_at_stop: false,
+            remade: false,
+        }];
+        // Where each state of the table stands in the variant: a thought's state after the
+        // arguments state, in the table's order, every other state at the arguments state.
+        let moved: Vec<usize> = self
+            .states
+            .iter()
+            .map(|state| {
+                if state.emits == Emits::Reasoning {
+                    states.push(state.clone());
+                    states.len() - 1
+                } else {
+                    0
+                }
+            })
+            .collect();
+        // The rows in the table's order, so the first one listed for a state and a marker is the
+        // one a lookup finds ([`Self::next`]).
+        let rows: Vec<Transition> = self
+            .transitions
+            .iter()
+            .chain(&self.leading_transitions)
+            .chain(&self.recovery_transitions)
+            .map(|row| Transition {
+                from: moved[row.from],
+                on: row.on,
+                to: moved[row.to],
+            })
+            .collect();
+        for anchor in &mut self.anchors {
+            anchor.state = moved[anchor.state];
+        }
+        self.unopened = self
+            .unopened
+            .take()
+            .map(|row| Unopened {
+                state: moved[row.state],
+                end: row.end,
+            })
+            .filter(|row| row.state != 0);
+        self.start = None;
+        self.states = states;
+        self.transitions = rows;
+        self.leading_transitions = Vec::new();
+        self.recovery_transitions = Vec::new();
+        self.calls = Some(match written {
+            ForcedCall::Arguments => CallSyntax::ForcedArguments,
+            ForcedCall::List => CallSyntax::ForcedList,
+        });
+        self.call_id = CallId::Minted;
+        self.layout = None;
+        self
+    }
+
     /// The states of the turn's frame where the table starts in a message header: an arguments
     /// state a row returns to (Inkling's, where the call's name follows the message's opener, so
     /// the state reads the call, and the thought and the answer open from it too), and the
@@ -1068,34 +1207,82 @@ impl Format {
         }
     }
 
+    /// Where the turn opener that opens the model's turn stands in `prompt`: the last one. Where
+    /// the opener is one of the table's terminals, the model writes it at every message, and the
+    /// last one may stand inside a body the prompt left open, where no row reads it as an
+    /// opener: the turn then opens at the first opener after the last close before it, a close
+    /// being another terminal that leads into a state from which the opener leads to the first
+    /// state. A table whose rows name no close keeps the last opener.
+    fn turn_opens_at(&self, prompt: &str) -> Option<usize> {
+        let opener = self.turn_opener.as_ref()?;
+        let last = opener.rfind(prompt)?;
+        let Some(on) = self
+            .terminals
+            .iter()
+            .position(|terminal| !terminal.ignored && terminal.text == opener.text)
+        else {
+            return Some(last);
+        };
+        let before = &prompt[..last];
+        let mut closes = self
+            .transitions
+            .iter()
+            .filter(|opens| opens.on == on && opens.to == 0)
+            .flat_map(|opens| {
+                self.transitions.iter().filter(move |close| {
+                    close.to == opens.from && close.from != opens.from && close.on != on
+                })
+            })
+            .map(|close| self.terminals[close.on].text.as_str())
+            .peekable();
+        // No close in the rows, or the common prompt, whose last opener follows a close directly:
+        // the last opener opens the turn, and no search is owed.
+        if closes.peek().is_none() || closes.clone().any(|close| before.ends_with(close)) {
+            return Some(last);
+        }
+        // Rows that name one close one after another (Inkling's three into `ended`): its search
+        // is not repeated for the next of them.
+        let mut searched = "";
+        let closed = closes
+            .filter(|&close| std::mem::replace(&mut searched, close) != close)
+            .filter_map(|close| before.rfind(close).map(|at| at + close.len()))
+            .max()
+            .unwrap_or(0);
+        let first = before[closed..].find(opener.text.as_str());
+        Some(first.map_or(last, |at| closed + at))
+    }
+
     /// Where the model's turn starts in `prompt`: where the last turn anchor found
-    /// ([`Self::last_anchor`]), or else the last turn opener, starts, the text after it, and the
-    /// state the output starts in after it. `None` when the prompt holds neither.
+    /// ([`Self::last_anchor`]), or else the turn's opener ([`Self::turn_opens_at`]), starts, the
+    /// text after it, and the state the output starts in after it. `None` when the prompt holds
+    /// neither.
     pub(crate) fn turn_start<'p>(&self, prompt: &'p str) -> Option<(usize, &'p str, usize)> {
         if !self.anchors.is_empty() {
             let (at, anchor) = self.last_anchor(prompt)?;
             return Some((at, &prompt[at + anchor.text.len()..], anchor.state));
         }
         let opener = self.turn_opener.as_ref()?;
-        let at = opener.rfind(prompt)?;
+        let at = self.turn_opens_at(prompt)?;
         Some((at, &prompt[at + opener.text.len()..], 0))
     }
 
     /// The part of `prompt` the engine replays to find the state the generation starts in: from
-    /// the last occurrence of the turn opener, or the whole prompt when the table names none or
-    /// the prompt does not hold it; for a table with turn anchors, from the start of the last
-    /// anchor found, or nothing when the prompt holds none. A caller that keeps the prompt for a
-    /// later `Input::Prompt` need keep only this: replayed again, it gives itself.
+    /// the turn opener that opens the model's turn (the last one, or the open message's own
+    /// where the opener is a terminal the model writes at every message), or the whole prompt
+    /// when the table names none or the prompt does not hold it; for a table with turn anchors,
+    /// from the start of the last anchor found, or nothing when the prompt holds none. A prompt
+    /// that ends with the turn's end and opens no turn ([`Self::unopened_turn_starts_in`]) is
+    /// not replayed: that end alone stands for it. A caller that keeps the prompt for a later
+    /// `Input::Prompt` need keep only this: replayed again, it gives itself.
     pub fn replay<'p>(&self, prompt: &'p str) -> &'p str {
         if !self.anchors.is_empty() {
             let from = self.last_anchor(prompt).map_or(prompt.len(), |(at, _)| at);
             return &prompt[from..];
         }
-        match self
-            .turn_opener
-            .as_ref()
-            .and_then(|opener| opener.rfind(prompt))
-        {
+        if let Some(unopened) = self.ends_unopened(prompt) {
+            return &prompt[prompt.len() - unopened.end.len()..];
+        }
+        match self.turn_opens_at(prompt) {
             Some(at) => &prompt[at..],
             None => prompt,
         }
@@ -1124,10 +1311,51 @@ impl Format {
 
     /// The last turn anchor in `prompt` and where it starts, found as `finditer` finds the
     /// alternation of the anchors: the earliest match, the first anchor in the table's order
-    /// where several match there, then on from that match's end. Each anchor's next occurrence is
-    /// searched for again only once the matches have passed it, so a prompt costs one pass per
-    /// anchor. An anchor with no text never matches.
+    /// where several match there, then on from that match's end. A generation prompt ends with an
+    /// anchor, so the prompt's tail is searched first: no match crosses a place that no anchor's
+    /// occurrence crosses, so from such a place the matches are the whole scan's, and where an
+    /// anchor starts in the tail the scan starts at the last such place before it. Any other
+    /// prompt is scanned from its start: each anchor's next occurrence is searched for again only
+    /// once the matches have passed it, so the prompt costs one pass per anchor. An anchor with
+    /// no text never matches.
     fn last_anchor(&self, prompt: &str) -> Option<(usize, &Anchor)> {
+        let bytes = prompt.as_bytes();
+        let anchors = || self.anchors.iter().filter(|anchor| !anchor.text.is_empty());
+        let longest = anchors().map(|anchor| anchor.text.len()).max()?;
+        let tail = bytes.len().saturating_sub(4 * longest);
+        // Each anchor's last match in the tail: one that starts after it overlaps it, so none
+        // starts `longest` past the last of them.
+        let matched = anchors().filter_map(|anchor| anchor.finder.find_iter(&bytes[tail..]).last());
+        if let Some(last) = matched.max().map(|at| tail + at) {
+            // An occurrence that starts before `from` and ends after it lies within its own
+            // length of `from` on both sides: the scan starts before every one of those.
+            let mut from = last;
+            while let Some(crossing) = anchors()
+                .filter_map(|anchor| {
+                    let reach = anchor.text.len() - 1;
+                    let start = from.saturating_sub(reach);
+                    let window = &bytes[start..bytes.len().min(from + reach)];
+                    anchor.finder.find(window).map(|at| start + at)
+                })
+                .min()
+            {
+                from = crossing;
+            }
+            let mut found = None;
+            while from < bytes.len().min(last + longest) {
+                match anchors().find(|anchor| bytes[from..].starts_with(anchor.text.as_bytes())) {
+                    Some(anchor) => {
+                        found = Some((from, anchor));
+                        from += anchor.text.len();
+                    }
+                    None => from += 1,
+                }
+            }
+            return found;
+        }
+        if tail == 0 {
+            return None;
+        }
         let find = |anchor: &Anchor, from: usize| {
             if anchor.text.is_empty() {
                 return None;
@@ -1179,7 +1407,10 @@ impl Format {
     /// the turn starts in, the turn's first piece deciding its start where the table has a start
     /// row ([`Self::opening`]), a terminal the table ignores, or one with no row from where the
     /// walk stands, moving nothing; and the stay the output continues. A call the prompt left
-    /// open is not entered: the walk rests where the turn started. A prompt that opens no turn
+    /// open is not entered: the walk rests where the turn started. The first state is no such
+    /// call where the turn started elsewhere and a row led the walk back to it (a thought the
+    /// prompt opened and closed, in a table whose first state holds the call, as a forced
+    /// call's variant has it): the output starts there. A prompt that opens no turn
     /// for the model, where the table has an unopened row ([`Self::unopened_turn`]), is not
     /// replayed: the output starts in the row's state, with nothing begun. The engine starts the
     /// output where this leaves it, and [`Self::reasoning_open`] reads the same walk.
@@ -1234,7 +1465,12 @@ impl Format {
             }
         }
         if self.emits(state) == Emits::Arguments {
-            (state, begun) = (rest, false);
+            // A call the prompt left open is not entered. The first state reached from another one
+            // the turn started in is where the output starts, not a call left open.
+            if state != 0 || rest == 0 {
+                state = rest;
+            }
+            begun = false;
         }
         Replay {
             state,
@@ -1252,11 +1488,32 @@ impl Format {
         if prompt.is_empty() {
             return None;
         }
+        if self.ends_unopened(prompt).is_some() {
+            return Some(unopened.state);
+        }
         let opener = self.turn_opener.as_ref()?;
         let opened = opener
             .rfind(prompt)
             .is_some_and(|at| !prompt[at + opener.text.len()..].contains(unopened.end.as_str()));
         (!opened).then_some(unopened.state)
+    }
+
+    /// The unopened row, where `prompt` ends with the turn's end and no turn opener starts so
+    /// late that it runs into that end: such a prompt opens no turn wherever its last opener
+    /// stands, so the answer takes a suffix compare and a search of the last few bytes, not of
+    /// the prompt. A template that writes no opener ends every generation prompt so.
+    fn ends_unopened(&self, prompt: &str) -> Option<&Unopened> {
+        let unopened = self.unopened.as_ref().filter(|row| !row.end.is_empty())?;
+        let opener = self.turn_opener.as_ref()?;
+        let before = prompt.strip_suffix(unopened.end.as_str())?;
+        let late = before
+            .len()
+            .saturating_sub(opener.text.len().saturating_sub(1));
+        opener
+            .finder
+            .rfind(&prompt.as_bytes()[late..])
+            .is_none()
+            .then_some(unopened)
     }
 
     /// The state `prompt` leaves the table in ([`Self::replayed`]): where the engine starts the
@@ -2263,6 +2520,70 @@ mod tests {
     }
 
     #[test]
+    fn the_last_anchor_is_the_last_match_of_a_scan_from_the_prompts_start() {
+        // `finditer` over the alternation, a place at a time.
+        fn scanned<'f>(format: &'f Format, prompt: &str) -> Option<(usize, &'f str)> {
+            let mut last = None;
+            let mut at = 0;
+            while at < prompt.len() {
+                let here = format
+                    .anchors
+                    .iter()
+                    .find(|anchor| prompt.as_bytes()[at..].starts_with(anchor.text.as_bytes()));
+                match here {
+                    Some(anchor) => {
+                        last = Some((at, anchor.text.as_str()));
+                        at += anchor.text.len();
+                    }
+                    None => at += 1,
+                }
+            }
+            last
+        }
+        // Anchors that overlap themselves and each other, in both orders.
+        let tables: [&[&str]; 9] = [
+            &["aa"],
+            &["ab", "a"],
+            &["a", "ab"],
+            &["aaa", "aa"],
+            &["aa", "aaa"],
+            &["aba", "bab"],
+            &["ab", "ba", "b"],
+            &["abc", "bca", "cab"],
+            &["abab", "bc", "c"],
+        ];
+        // Tails that hold no anchor, as long as the search's first windows and longer, some of
+        // characters of several bytes, so that a window starts inside one.
+        let frames = [
+            ("", ""),
+            ("", "-----"),
+            ("--", "-------------"),
+            ("｜", "｜｜｜｜"),
+            ("", "｜｜｜｜｜｜｜｜｜｜｜"),
+        ];
+        for anchors in tables {
+            let format = anchors.iter().fold(
+                Format::new("t").state("content", Emits::Content),
+                |format, anchor| format.turn_anchor(anchor),
+            );
+            for length in 0..=6_u32 {
+                for code in 0..3_usize.pow(length) {
+                    let text: String = (0..length)
+                        .map(|place| ['a', 'b', 'c'][code / 3_usize.pow(place) % 3])
+                        .collect();
+                    for (head, tail) in frames {
+                        let prompt = format!("{head}{text}{tail}");
+                        let found = format
+                            .last_anchor(&prompt)
+                            .map(|(at, anchor)| (at, anchor.text.as_str()));
+                        assert_eq!(found, scanned(&format, &prompt), "{anchors:?} {prompt:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_prompt_without_an_anchor_replays_nothing_and_a_replay_gives_itself() {
         let format = gemma_anchors();
         assert_eq!(format.replay("hello "), "");
@@ -2363,6 +2684,54 @@ mod tests {
     }
 
     #[test]
+    fn an_opener_said_again_inside_an_open_message_opens_nothing() {
+        // Messages each opened by `<m>`, which opens the model's turn too, as Inkling's does:
+        // `<t>` makes a message the thought and `</m>` closes it.
+        let format = Format::new("messages")
+            .terminal("message", "<m>")
+            .terminal("thinking", "<t>")
+            .terminal("end", "</m>")
+            .state("header", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("ended", Emits::Wrapper)
+            .transition("header", "thinking", "thought")
+            .transition("header", "end", "ended")
+            .transition("thought", "end", "ended")
+            .transition("ended", "message", "header")
+            .opens_turn("<m>");
+        // The last opener stands inside the thought the prompt left open: the replay starts at
+        // the message's own opener and ends inside the thought.
+        let inside = "hi</m><m><t>Par<m>is.";
+        assert_eq!(format.replay(inside), "<m><t>Par<m>is.");
+        assert_eq!(format.turn_start(inside), Some((6, "<t>Par<m>is.", 0)));
+        assert_eq!(format.prompt_state(inside), 1);
+        // An opener after a close opens its message: the last one.
+        assert_eq!(format.replay("hi</m><m><t>Plan.</m><m>"), "<m>");
+        assert_eq!(
+            format.replay("</m><m><t>Plan.</m><m><t>Par<m>is."),
+            "<m><t>Par<m>is."
+        );
+        // No close before the last opener: the prompt's first opener is the message's.
+        assert_eq!(format.replay("<m><t>Par<m>is."), "<m><t>Par<m>is.");
+        for prompt in [inside, "hi</m><m>", "<m><t>Par<m>is.", "no opener"] {
+            let kept = format.replay(prompt);
+            assert_eq!(format.replay(kept), kept, "{prompt:?}");
+            assert_eq!(format.replayed(kept), format.replayed(prompt), "{prompt:?}");
+        }
+        // A table whose rows name no close keeps the last opener.
+        let unclosed = Format::new("unclosed")
+            .terminal("message", "<m>")
+            .state("content", Emits::Content)
+            .opens_turn("<m>");
+        assert_eq!(unclosed.replay("<m>a<m>b"), "<m>b");
+        // Under a forced call the states around the thought are one, the first: the opener's row
+        // stays in it and the thought's close leads into it, so a continued thought replays alike.
+        let forced = format.with_forced_call(ForcedCall::Arguments);
+        assert_eq!(forced.replay(inside), "<m><t>Par<m>is.");
+        assert_eq!(forced.prompt_state(inside), 1);
+    }
+
+    #[test]
     fn an_unopened_turn_starts_in_the_thought_and_the_close_leaves_it() {
         let format = opened_after_a_user_only();
         let output = "a thought</a>an answer";
@@ -2394,6 +2763,50 @@ mod tests {
             said(&shown),
             ("a thought</a>an answer".to_string(), String::new(), 0)
         );
+    }
+
+    #[test]
+    fn a_prompt_that_ends_with_the_turns_end_keeps_the_end_alone() {
+        let format = Format::new("ends")
+            .terminal("open", "<a>")
+            .terminal("close", "</a>")
+            .state("content", Emits::Content)
+            .state("inside", Emits::Reasoning)
+            .transition("content", "open", "inside")
+            .transition("inside", "close", "content")
+            .opens_turn("<|assistant|>")
+            .unopened_turn_starts_in("inside", "<|end|>");
+        // No opener at all, and an opener the end follows: the end alone is kept, and the output
+        // starts from it where it starts from the whole prompt.
+        for prompt in [
+            "User: hi<|end|>",
+            "<|assistant|><a>t</a>answer<|end|>User: more<|end|>",
+            "<|end|>",
+        ] {
+            let kept = format.replay(prompt);
+            assert_eq!(kept, "<|end|>", "{prompt:?}");
+            assert_eq!(format.replay(kept), kept, "{prompt:?}");
+            assert_eq!(format.replayed(kept), format.replayed(prompt), "{prompt:?}");
+            assert_eq!(format.prompt_state(prompt), 1, "{prompt:?}");
+        }
+        // A prompt that ends elsewhere is searched as before: an opened turn replays from its
+        // opener, and one that opens none is kept whole.
+        assert_eq!(
+            format.replay("User: hi<|end|><|assistant|><a>"),
+            "<|assistant|><a>"
+        );
+        assert_eq!(format.replay("User: hi<|end|>\n"), "User: hi<|end|>\n");
+        assert_eq!(format.prompt_state("User: hi<|end|>\n"), 1);
+        // An opener that runs into the end is followed by no whole end: the turn is opened.
+        let crossing = Format::new("crossing")
+            .state("content", Emits::Content)
+            .state("inside", Emits::Reasoning)
+            .opens_turn("ab")
+            .unopened_turn_starts_in("inside", "bc");
+        assert_eq!(crossing.replay("xabc"), "abc");
+        assert_eq!(crossing.prompt_state("xabc"), 0);
+        assert_eq!(crossing.replay("xab_bc"), "bc");
+        assert_eq!(crossing.prompt_state("xab_bc"), 1);
     }
 
     #[test]

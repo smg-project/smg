@@ -25,7 +25,7 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
-use tracing::{debug, trace, warn};
+use tracing::{debug, enabled, trace, warn, Level};
 
 use super::types::HarmonyBuildOutput;
 use crate::routers::grpc::{
@@ -456,8 +456,10 @@ impl HarmonyBuilder {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<HarmonyBuildOutput, String> {
-        utils::validate_chat_content_parts(&request.messages)?;
+        // Harmony takes media in no role: its own whole-request refusal speaks before
+        // the shared door names a role's rule.
         reject_chat_media(&request.messages)?;
+        utils::validate_chat_content_parts(&request.messages)?;
         let encoding = try_harmony_encoding()?;
 
         let mut all_messages = Vec::new();
@@ -527,18 +529,21 @@ impl HarmonyBuilder {
             .flat_map(|set| set.into_iter())
             .collect();
 
-        // Decode tokens to see what the model actually receives
-        let decoded_text = encoding
-            .tokenizer()
-            .decode_utf8(&token_ids)
-            .unwrap_or_else(|_| "<decode error>".to_string());
-        trace!(
-            token_count = token_ids.len(),
-            token_preview = ?&token_ids[..token_ids.len().min(20)],
-            decoded_length = decoded_text.len(),
-            "Encoded conversation to tokens - decoded text follows:"
-        );
-        trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        // What the model receives, decoded back for the trace lines alone:
+        // a pass over every prompt token, so it runs only when they print.
+        if enabled!(Level::TRACE) {
+            let decoded_text = encoding
+                .tokenizer()
+                .decode_utf8(&token_ids)
+                .unwrap_or_else(|_| "<decode error>".to_string());
+            trace!(
+                token_count = token_ids.len(),
+                token_preview = ?&token_ids[..token_ids.len().min(20)],
+                decoded_length = decoded_text.len(),
+                "Encoded conversation to tokens - decoded text follows:"
+            );
+            trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        }
 
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
@@ -1361,6 +1366,7 @@ mod tests {
         responses::{ImageGenerationTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
     use smg_grpc_client::vllm_proto as vllm;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
@@ -1482,6 +1488,30 @@ mod tests {
         let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
         assert!(error.contains("vendor_media"));
         assert!(error.contains("gRPC"));
+    }
+
+    /// Harmony takes media in no role, so its own whole-request refusal
+    /// speaks before the shared door names a role's rule: a system image is
+    /// refused by name and pointed at the regular multimodal path, not told
+    /// to move to a user message.
+    #[test]
+    fn build_from_chat_refuses_a_system_image_in_harmonys_own_words() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "You see the attached image."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+                ]},
+                {"role": "user", "content": "Describe it."}
+            ]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert_eq!(
+            error,
+            "Harmony does not support image content parts; use the regular multimodal path"
+        );
     }
 
     /// A Responses message item's `input_image` or `input_file` part has no
@@ -2228,5 +2258,29 @@ mod tests {
             "messages": [{"role": "user", "content": "Check Hangzhou weather."}]
         }));
         assert_eq!(prompt, REQUEST_TOOLS);
+    }
+
+    /// With trace logging on, a Responses build still writes its two trace
+    /// lines from the prompt decoded back: the decoded length on the first,
+    /// the text under the marker of the second.
+    #[test]
+    #[traced_test]
+    fn build_from_responses_traces_the_decoded_prompt() {
+        let request = ResponsesRequest {
+            model: "gpt-oss-120b".to_string(),
+            input: ResponseInput::Text("draw a cat".to_string()),
+            ..Default::default()
+        };
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+
+        assert!(logs_contain(&format!("decoded_length={}", decoded.len())));
+        assert!(logs_contain("DECODED_TEXT_START"));
     }
 }

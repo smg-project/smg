@@ -11,14 +11,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import gc
 import inspect
 import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -414,15 +417,14 @@ def test_epd_roles_this_process_cannot_serve_are_refused_up_front(monkeypatch):
     roles with one scheduler rank (the wire carries the bootstrap fields)
     and a plain worker; a prefill/decode side with more than one rank passes
     too (the servicer places a prefill side's request on the rank of its room
-    and a decode side's on its pin) but for the one shape the engine cannot
-    serve: a prefill side of several plain data-parallel replicas, whose KV
-    sender fails every request of a non-zero room residue (every replica is
-    attention-DP rank 0). Attention DP passes (the newer releases'
+    and a decode side's on its pin): under attention DP (the newer releases'
     ``attn_dp_size`` beside ``dp_size=1``, the pinned release's ``dp_size``
-    under ``enable_dp_attention``); the plain shape is refused whatever its
-    load-balance method and whether the engine's force-query switch is set
-    (its sender registers rank 0 then and the decode side bootstraps against
-    replica 0)."""
+    under ``enable_dp_attention``), and as plain data-parallel replicas that
+    follow the room (each request names its replica to the engine's KV
+    sender, where every replica is attention-DP rank 0). Plain replicas under
+    any other load-balance method, or with the engine's force-query switch
+    on, are refused: the decode side would wait for a rank the sender never
+    registers for a named request."""
     rust.refuse_epd_disaggregation(_server_args())
     rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="null"))
     rust.refuse_epd_disaggregation(_server_args(dp_size=2))
@@ -436,14 +438,25 @@ def test_epd_roles_this_process_cannot_serve_are_refused_up_front(monkeypatch):
         )
     rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="decode", dp_size=2))
     monkeypatch.delenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", raising=False)
-    for method in (None, "auto", "follow_bootstrap_room", "round_robin"):
+    following = _server_args(
+        disaggregation_mode="prefill", dp_size=2, load_balance_method="follow_bootstrap_room"
+    )
+    rust.refuse_epd_disaggregation(following)
+    rust.refuse_epd_disaggregation(
+        _server_args(disaggregation_mode="prefill", dp_size=2, load_balance_method="auto")
+    )
+    for method in (None, "round_robin"):
         with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
             rust.refuse_epd_disaggregation(
                 _server_args(disaggregation_mode="prefill", dp_size=2, load_balance_method=method)
             )
-    monkeypatch.setenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", "1")
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
-        rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="prefill", dp_size=2))
+    for on in ("1", "true", "Yes"):
+        monkeypatch.setenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", on)
+        with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
+            rust.refuse_epd_disaggregation(following)
+    for off in ("0", "false", ""):
+        monkeypatch.setenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", off)
+        rust.refuse_epd_disaggregation(following)
     monkeypatch.delenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK")
     for backend in ("zmq_to_scheduler", "mooncake"):
         rust.refuse_epd_disaggregation(
@@ -687,6 +700,7 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2) -> dict:
         monkeypatch,
         "sglang.srt.utils",
         configure_logger=lambda args: recorded["calls"].append("configure_logger"),
+        common=SimpleNamespace(),
     )
     recorded["target"] = run_scheduler_process
     recorded["port_args"] = port_args
@@ -776,6 +790,39 @@ def test_a_failing_rank_ends_the_group_through_its_signal_not_the_servicer(
     assert engine.poll() == 1
     assert [process.events[0] for process in recorded["processes"]] == ["terminate", "terminate"]
     assert "SGLang scheduler: a scheduler process signalled a failure (signal 3)" in caplog.text
+
+
+def test_metrics_directory_survives_repeated_environment_setup(
+    monkeypatch, tmp_path, restore_fault_signals
+):
+    recorded = _stub_rank_launch(monkeypatch)
+    common = sys.modules["sglang.srt.utils"].common
+    common.prometheus_multiproc_dir = tempfile.TemporaryDirectory(dir=tmp_path)
+    directory = Path(common.prometheus_multiproc_dir.name)
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(directory))
+
+    def set_envs_and_config(_args):
+        # SGLang's gRPC entrypoint already set the directory. The engine's
+        # second setup replaces its owner with a nested TemporaryDirectory.
+        common.prometheus_multiproc_dir = tempfile.TemporaryDirectory(dir=directory)
+
+    monkeypatch.setattr(
+        sys.modules["sglang.srt.entrypoints.engine"], "_set_envs_and_config", set_envs_and_config
+    )
+    engine = rust.launch_scheduler_ranks(_preparable_args(recorded), handshake_port=24321)
+    engine._manager.ready_thread.join(5)
+    try:
+        gc.collect()
+        # The scheduler creates its mmap files after the launcher has returned.
+        with (directory / "counter_1000.db").open("a+b") as counter:
+            counter.write(b"scheduler metrics")
+        assert any(held.name == str(directory) for held in engine._manager.holding)
+    finally:
+        engine._manager.shutdown(timeout=0)
+        engine._manager.holding.clear()
+        common.prometheus_multiproc_dir.cleanup()
+    gc.collect()
+    assert not directory.exists()
 
 
 def test_launch_scheduler_ranks_off_the_main_thread_keeps_the_spawned_launcher(monkeypatch):
@@ -987,10 +1034,11 @@ def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp
     holds readiness for it; the plan's inputs carry the engine's stand-in
     bootstrap host, so the requests are bound for nobody and the side warms up
     before its peer is there."""
-    monkeypatch.setitem(
-        sys.modules,
+    _install(
+        monkeypatch,
         "sglang.srt.disaggregation.utils",
-        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
+        FAKE_BOOTSTRAP_HOST="2.2.2.2",
+        DisaggregationMode=object,
     )
     planned = {}
     plan_for = rust_lifecycle.plan_for
@@ -1353,10 +1401,11 @@ def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     # The warm-up planner reads the engine's stand-in bootstrap host on a
     # disaggregation role (the facts here carry no vocabulary: nothing planned).
-    monkeypatch.setitem(
-        sys.modules,
+    _install(
+        monkeypatch,
         "sglang.srt.disaggregation.utils",
-        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
+        FAKE_BOOTSTRAP_HOST="2.2.2.2",
+        DisaggregationMode=object,
     )
     for mode in ("prefill", "decode"):
         args = _server_args(disaggregation_mode=mode)

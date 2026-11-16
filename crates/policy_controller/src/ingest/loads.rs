@@ -16,13 +16,19 @@
 //! engine-wide, so a data-parallel engine without a servicer is not scraped
 //! and its ranks have no row until a per-rank source names them: a row
 //! holds a figure measured for its rank, never an aggregate. A failed read
-//! writes nothing: the row on file ages, and health is the prober's (a
-//! later PR). A read that lands after its worker left writes nothing
-//! either: the store keeps a worker's load rows exactly as long as its row.
+//! writes no row: the row on file ages, the engine's overload verdict
+//! reads clear until the engine is heard again, and health is the
+//! prober's (a later PR). A read that lands after its worker left writes
+//! nothing: the store keeps a worker's load rows exactly as long as its
+//! row.
 //! A row reachable only through a gateway is never dialed: its records
 //! arrive relayed. The engines are asked through a [`LoadProbe`], so the
 //! tests drive the arbitration without a socket and the binary dials the
 //! engines.
+//!
+//! The loop also keeps the instant the store names for its publication
+//! ([`LoadSink::publish_due`]): a row that lands inside the store's window
+//! is shown to decisions at the window's end, with no later write.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -316,6 +322,9 @@ enum Read {
     Poll {
         /// The ranks the arbitration sent the poll for.
         ranks: Vec<(u16, WorkerId)>,
+        /// The arbitration left a ready rank of the engine out: its own
+        /// records serve it, by the freshness read when the poll went.
+        served: bool,
         answer: Result<WorkerLoadResponse, ReadError>,
     },
     Scrape {
@@ -327,6 +336,14 @@ enum Read {
 /// every instant the store compares.
 fn now() -> Instant {
     tokio::time::Instant::now().into_std()
+}
+
+/// Wait for the instant; for ever when there is none.
+async fn at(instant: Option<Instant>) {
+    match instant {
+        Some(instant) => tokio::time::sleep_until(tokio::time::Instant::from_std(instant)).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// What a log line calls an engine: the host and port of its address, never
@@ -380,12 +397,18 @@ where
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
         loop {
+            // The instant the store names for the rows its publication
+            // window still holds, read after every write of this loop: the
+            // last row of a burst is shown within one window of its
+            // receipt, with no later write.
+            let due = self.store.publish_due();
             // The stop first; then the answers before the tick, which finds
             // the engines whose calls landed free to be asked again.
             tokio::select! {
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
                 Some(joined) = schedule.calls.join_next() => self.land(&mut schedule.due, joined),
+                () = at(due) => self.store.publish(now()),
                 _ = ticker.tick() => self.tick(&mut schedule),
             }
         }
@@ -437,6 +460,7 @@ where
                 // one tick of the freshness bound, not one interval later.
                 if tick_at >= slot.poll && !slot.is_out(tick_at) {
                     if let Some(ranks) = self.ranks_to_poll(engine) {
+                        let served = ranks.len() < engine.ranks.len();
                         let mark = tick_at + self.config.poll_deadline;
                         slot.poll = tick_at + self.config.poll_interval;
                         slot.suppressed = slot.poll;
@@ -453,7 +477,11 @@ where
                                 engine: index,
                                 mark,
                                 polled_at,
-                                read: Read::Poll { ranks, answer },
+                                read: Read::Poll {
+                                    ranks,
+                                    served,
+                                    answer,
+                                },
                             }
                         });
                     } else if tick_at >= slot.suppressed {
@@ -562,18 +590,31 @@ where
         })
     }
 
-    /// Writes one call's answer: a poll's rows for the ranks it was for, a
-    /// scrape's sample for its engine's rank unless the rank's own records
-    /// are fresher; a failure counts and writes nothing. The store drops a
-    /// row for a worker that left while the call was out.
+    /// Writes one call's answer in one write: a poll's rows for the ranks
+    /// it was for, a scrape's sample for its engine's rank unless the
+    /// rank's own records are fresher. A failure counts. A failed poll and
+    /// an answer with no row are written as the word that no report came
+    /// when the poll was for each ready rank of the engine: a poll that
+    /// left out a rank its own records serve says nothing of the engine,
+    /// which is heard. The store drops a row for a worker that left while
+    /// the call was out.
     fn apply(&self, engine: &Engine, polled_at: Instant, read: Read) {
         match read {
-            Read::Poll { ranks, answer } => {
+            Read::Poll {
+                ranks,
+                served,
+                answer,
+            } => {
                 let report = match answer {
                     Ok(report) => report,
                     Err(error) => {
                         debug!(engine = peer(&engine.key), %error, "the load poll produced no report");
                         self.stats.poll_failures.count(&error);
+                        if !served {
+                            let none: Vec<_> =
+                                ranks.iter().map(|&(rank, id)| (id, rank, None)).collect();
+                            self.store.report(&none, polled_at, LoadSource::Poll);
+                        }
                         return;
                     }
                 };
@@ -583,19 +624,33 @@ where
                 // unavailable: nothing is written for it, never another
                 // rank's figures.
                 let parallel = engine.dp_size > 1;
-                for (rank, id) in ranks {
-                    let Some(scoped) = report
-                        .clone()
-                        .for_dp_rank(parallel.then_some(usize::from(rank)))
-                    else {
-                        continue;
-                    };
-                    let row =
-                        load_row(&scoped, engine.role, received, received, SignalSource::Poll);
-                    self.store
-                        .report(id, &[(rank, row)], polled_at, LoadSource::Poll);
-                    self.stats.rows.fetch_add(1, Ordering::Relaxed);
+                let answer: Vec<_> = ranks
+                    .into_iter()
+                    .map(|(rank, id)| {
+                        let row = report
+                            .clone()
+                            .for_dp_rank(parallel.then_some(usize::from(rank)))
+                            .map(|scoped| {
+                                load_row(
+                                    &scoped,
+                                    engine.role,
+                                    received,
+                                    received,
+                                    SignalSource::Poll,
+                                )
+                            });
+                        (id, rank, row)
+                    })
+                    .collect();
+                let rows = answer.iter().filter(|(_, _, row)| row.is_some()).count();
+                // The engine's answer in one write: its ranks are judged
+                // as the answer left them. An answer with no row writes
+                // none and is the word that no report came, which a poll
+                // that left out a served rank does not say.
+                if rows > 0 || !served {
+                    self.store.report(&answer, polled_at, LoadSource::Poll);
                 }
+                self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
             }
             Read::Scrape { text } => {
                 let kind = engine.kind.unwrap_or_default();
@@ -608,6 +663,12 @@ where
                     Err(error) => {
                         debug!(engine = peer(&engine.key), %error, "the scrape produced no row");
                         self.stats.scrape_failures.count(&error);
+                        let none: Vec<_> = engine
+                            .ranks
+                            .iter()
+                            .map(|&(rank, id)| (id, rank, None))
+                            .collect();
+                        self.store.report(&none, polled_at, LoadSource::Scrape);
                         return;
                     }
                 };
@@ -635,7 +696,7 @@ where
                         SignalSource::Scrape,
                     );
                     self.store
-                        .report(id, &[(rank, row)], polled_at, LoadSource::Scrape);
+                        .report(&[(id, rank, Some(row))], polled_at, LoadSource::Scrape);
                     self.stats.rows.fetch_add(1, Ordering::Relaxed);
                     wrote = true;
                 }

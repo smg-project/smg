@@ -1,9 +1,11 @@
 //! The HTTP admin listener: the probes, the version and the metrics. The
 //! probes keep the gateway's paths and bodies (`/liveness`, `/readiness`,
-//! `/health`; `OK`, `{"status": "ready"}`, `503 {"status": "not ready",
+//! `/health`; `OK`, `{"status": "ready", ...}`, `503 {"status": "not ready",
 //! "reason": ...}`) and the scrape keeps its path (`/metrics`), so one probe
-//! set and one scrape configuration serve both processes; `/version` names
-//! the binary, its version and the protocol package it speaks.
+//! set and one scrape configuration serve both processes; a ready controller
+//! adds its role (`"role": "leader"` or `"follower"`), read from the fence at
+//! the probe; `/version` names the binary, its version and the protocol
+//! package it speaks.
 
 use std::sync::Arc;
 
@@ -67,7 +69,11 @@ async fn liveness() -> Response {
 async fn readiness(AxumState(admin): AxumState<Admin>) -> Response {
     let state = admin.readiness.state();
     if state.is_ready() {
-        (StatusCode::OK, Json(json!({ "status": "ready" }))).into_response()
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ready", "role": state.as_str() })),
+        )
+            .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -87,14 +93,16 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        admin.metrics.render(&admin.loads),
+        admin
+            .metrics
+            .render(|| admin.readiness.state(), &admin.loads),
     )
         .into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use axum::{
         body::{to_bytes, Body},
@@ -104,7 +112,10 @@ mod tests {
 
     use super::{router, Admin, VERSION};
     use crate::{
-        controller::{metrics::Metrics, readiness, readiness::State},
+        controller::{
+            metrics::Metrics,
+            readiness::{tests::fenced, Phase},
+        },
         ingest::loads::Stats,
     };
 
@@ -132,7 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_probes_follow_the_state_and_liveness_never_fails() {
-        let (writer, reader) = readiness::channel();
+        let (mut elector, phase, _steps, reader) = fenced();
         let metrics = Metrics::new();
         let app = router(Admin {
             readiness: reader,
@@ -144,13 +155,27 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, r#"{"status":"not ready","reason":"starting"}"#);
 
-        writer.send_replace(State::Ready);
+        // Serving behind a closed fence: ready, and a follower.
+        phase.send_replace(Phase::Serving);
         let (status, content_type, body) = get(app.clone(), "/readiness").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type, "application/json");
-        assert_eq!(body, r#"{"status":"ready"}"#);
+        assert_eq!(body, r#"{"status":"ready","role":"follower"}"#);
+        let (_, _, scrape) = get(app.clone(), "/metrics").await;
+        assert!(scrape.contains("smg_policy_controller_state{state=\"follower\"} 1"));
+        assert!(scrape.contains("smg_policy_controller_state{state=\"leader\"} 0"));
 
-        writer.send_replace(State::Draining);
+        // The take opens the fence: the probe and the gauge say leader with
+        // no message between the election and the admin listener.
+        elector.tick(Instant::now()).expect("the take");
+        let (status, _, body) = get(app.clone(), "/readiness").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"status":"ready","role":"leader"}"#);
+        let (_, _, scrape) = get(app.clone(), "/metrics").await;
+        assert!(scrape.contains("smg_policy_controller_state{state=\"leader\"} 1"));
+        assert!(scrape.contains("smg_policy_controller_state{state=\"follower\"} 0"));
+
+        phase.send_replace(Phase::Draining);
         let (status, _, body) = get(app.clone(), "/readiness").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, r#"{"status":"not ready","reason":"draining"}"#);
@@ -163,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_and_metrics_render_the_controllers_own() {
-        let (_writer, reader) = readiness::channel();
+        let (_elector, _phase, _steps, reader) = fenced();
         let metrics = Metrics::new();
         let app = router(Admin {
             readiness: reader,

@@ -1,8 +1,9 @@
 name: PR Policy Controller Image
 
 # The controller image's own check on a pull request that touches its
-# Dockerfile, the crate's manifest, source or contract, the toolchain pin, or
-# what the Helm chart's controller cases read: the image builds, and the built
+# Dockerfile, the crate's manifest, build script, source or contracts, the
+# engine wire's messages the protocol imports, the toolchain pin, or what the
+# Helm chart's controller cases read: the image builds, and the built
 # image runs: the version, the help, then the controller started in a container
 # under the security context the Helm chart gives it, its probes read, a
 # clean stop and a log with no escape byte. The chart's controller cases then
@@ -14,13 +15,19 @@ on:
     paths:
       - 'docker/policy-controller.Dockerfile'
       - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/build.rs'
       - 'crates/policy_controller/src/**'
-      # The plugin contract: the binary's plugin bindings are compiled from it.
+      # The index crate the binary links.
+      - 'crates/kv_index/**'
+      # The contracts: the binary's protocol and plugin bindings are compiled
+      # from them, the protocol's with the engine wire's messages it imports.
       - 'crates/policy_controller/contracts/**'
+      - 'crates/grpc_client/proto/common.proto'
       - 'rust-toolchain.toml'
       # What the chart's controller cases read: the cases, what configures
-      # their run and what a render reads. The chart's README and its alert
-      # rule tests are read by no case and start nothing here.
+      # their run and what a render reads. The chart's alert rule tests are
+      # read by no case and start nothing here. Its README is read by one
+      # render case and by no case on the binary: the unit job runs that one.
       - 'bindings/python/tests/test_helm_chart_policy_controller.py'
       - 'bindings/python/tests/conftest.py'
       - 'bindings/python/pyproject.toml'

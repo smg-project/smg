@@ -204,11 +204,17 @@ fn stores() -> Stores {
     )
 }
 
-/// Linking a turn's items into a conversation stores each item's content once
-/// (the memory store's own copy of the record it keeps) and not again on the
-/// way: the bytes a persist with a conversation allocates beyond the same
-/// persist without one stay under one and a half times the items' content.
-/// (The record built from a borrowed item copied the content once more: two
+/// A persist without a conversation copies the items' content once, in the
+/// record it stores, and not in a list nothing links: its bytes stay under one
+/// and a half times the items' content. (With the output list copied for a
+/// linking that never happens: two times the content.)
+///
+/// Linking a turn's items into a conversation copies each item's content
+/// twice more and not a third time: the output list the item records are
+/// built from and the memory store's own copy of the record it keeps. The
+/// bytes a persist with a conversation allocates beyond the same persist
+/// without one stay under two and a half times the items' content. (The
+/// record built from a borrowed item copied the content once more: three
 /// times the content and above.)
 #[test]
 fn linking_a_turns_items_stores_each_once() {
@@ -264,7 +270,11 @@ fn linking_a_turns_items_stores_each_once() {
         linking * 100 / content_bytes
     );
     assert!(
-        linking < content_bytes * 3 / 2,
+        bytes_alone < content_bytes * 3 / 2,
+        "bytes allocated by a persist of eight 64 KiB messages without a conversation: {bytes_alone} (the content is {content_bytes})"
+    );
+    assert!(
+        linking < content_bytes * 5 / 2,
         "bytes allocated by linking eight 64 KiB messages: {linking} (the content is {content_bytes})"
     );
 }

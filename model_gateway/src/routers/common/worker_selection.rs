@@ -210,7 +210,7 @@ impl<'a> WorkerSelector<'a> {
 
         let futures: Vec<_> = external_workers
             .iter()
-            .map(|w| refresh_worker_models(w, auth_header))
+            .map(|w| refresh_worker_models(self.registry, w, auth_header))
             .collect();
 
         // Timeout prevents a slow/unresponsive worker from blocking all
@@ -254,6 +254,7 @@ fn filter_by_router(
 /// Anthropic uses `x-api-key`, OpenAI uses `Authorization: Bearer`). The
 /// response is parsed via [`ListModelsResponse::parse_upstream`].
 async fn refresh_worker_models(
+    registry: &WorkerRegistry,
     worker: &Arc<dyn Worker>,
     auth_header: Option<&HeaderValue>,
 ) -> bool {
@@ -284,13 +285,17 @@ async fn refresh_worker_models(
                             model_cards.len(),
                             Endpoint::redacted_str(&url)
                         );
-                        worker.set_models(model_cards);
+                        registry.refresh_models(worker, model_cards);
                         return true;
                     }
                     false
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to parse models response: {}", e);
+                    tracing::warn!(
+                        "Failed to parse models response from {}: {}",
+                        Endpoint::redacted_str(&url),
+                        e.without_url()
+                    );
                     false
                 }
             }
@@ -304,7 +309,11 @@ async fn refresh_worker_models(
             false
         }
         Err(e) => {
-            tracing::warn!("Failed to fetch models from backend: {}", e);
+            tracing::warn!(
+                "Failed to fetch models from backend {}: {}",
+                Endpoint::redacted_str(&url),
+                e.without_url()
+            );
             false
         }
     }
@@ -510,11 +519,57 @@ mod tests {
         });
 
         let slashed = worker(&format!("http://{addr}/"), false);
+        let registry = WorkerRegistry::new();
+        registry.register(Arc::clone(&slashed)).unwrap();
+        let published = || registry.get_routing_snapshot(crate::worker::UNKNOWN_MODEL_ID);
+        let before = published();
         assert!(
-            refresh_worker_models(&slashed, None).await,
+            refresh_worker_models(&registry, &slashed, None).await,
             "the refresh reads the stub's one model"
         );
-        assert_eq!(seen.lock().unwrap().as_slice(), ["/v1/models"]);
+        // The cards go through the registry: a snapshot is published for
+        // them, and none when the same cards come again.
+        let after = published();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(refresh_worker_models(&registry, &slashed, None).await);
+        assert!(Arc::ptr_eq(&after, &published()));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/v1/models", "/v1/models"]
+        );
         assert_eq!(slashed.url(), format!("http://{addr}/"));
+    }
+
+    /// A worker registered with a query whose model list is no JSON: the
+    /// refresh's line names the worker masked and does not repeat the query.
+    /// The HTTP client's text of a failed body read ends with the request
+    /// URL too.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn an_unparsed_model_refresh_goes_without_the_clients_url_in_its_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering no JSON; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { "not json" }),
+            )
+            .await
+            .unwrap();
+        });
+        let queried = worker(&format!("http://127.0.0.1:{port}?token=s3cret"), false);
+
+        let refreshed = refresh_worker_models(&WorkerRegistry::new(), &queried, None).await;
+        server.abort();
+
+        assert!(!refreshed);
+        assert!(logs_contain(&format!(
+            "Failed to parse models response from http://127.0.0.1:{port}: "
+        )));
+        assert!(!logs_contain("s3cret"));
     }
 }

@@ -1373,14 +1373,14 @@ impl PDRouter {
             context.route,
             prefill_body,
             headers,
-            false,
+            None,
         );
         let decode_request = self.build_post_with_headers(
             decode.as_ref(),
             context.route,
             decode_body,
             headers,
-            false,
+            None,
         );
 
         // Send both requests concurrently and wait for both
@@ -1602,9 +1602,9 @@ impl PDRouter {
         if prefill_endpoint.transfer != decode_endpoint.transfer {
             return Err(misconfigured(format!(
                 "prefill {} runs {:?} but decode {} runs {:?}",
-                prefill.url(),
+                prefill.redacted_url(),
                 prefill_endpoint.transfer,
-                decode.url(),
+                decode.redacted_url(),
                 decode_endpoint.transfer
             )));
         }
@@ -1731,43 +1731,18 @@ impl PDRouter {
             }
             .emit();
 
-            let prefill_request = Self::pin_dp_rank(
-                self.build_post_with_headers(
-                    prefill.as_ref(),
-                    context.route,
-                    prefill_body,
-                    headers,
-                    false,
-                ),
+            let prefill_request = self.build_post_with_headers(
+                prefill.as_ref(),
+                context.route,
+                prefill_body,
+                headers,
                 dp_rank,
             );
-            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
-            };
-            let prefill_status = prefill_response.status();
-            if !prefill_status.is_success() {
-                error!(
-                    "Prefill server returned error status prefill_url={} status={}",
-                    prefill.redacted_url(),
-                    prefill_status
-                );
-                Self::record_sequential_side(
-                    prefill.as_ref(),
-                    metrics_labels::WORKER_PREFILL,
-                    prefill_status,
-                );
-                return Self::side_refused(PdSide::Prefill, prefill_response).await;
-            }
-            let prefill_bytes = match prefill_response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => return Self::prefill_read_failed(prefill.as_ref(), &e),
-            };
-            Self::record_sequential_side(
-                prefill.as_ref(),
-                metrics_labels::WORKER_PREFILL,
-                prefill_status,
-            );
+            let prefill_bytes =
+                match Self::prefill_side_bytes(prefill.as_ref(), prefill_request).await {
+                    Ok(bytes) => bytes,
+                    Err(refusal) => return refusal,
+                };
             Metrics::record_pd_prefill_duration(
                 metrics_labels::BACKEND_PD,
                 context.model_id,
@@ -1857,14 +1832,11 @@ impl PDRouter {
             None => decode_body,
         };
 
-        let decode_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                decode.as_ref(),
-                context.route,
-                decode_body,
-                headers,
-                false,
-            ),
+        let decode_request = self.build_post_with_headers(
+            decode.as_ref(),
+            context.route,
+            decode_body,
+            headers,
             dp_rank,
         );
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
@@ -1924,57 +1896,21 @@ impl PDRouter {
         .emit();
 
         let dispatch_start = Instant::now();
-        let prefill_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                prefill.as_ref(),
-                context.route,
-                prefill_body,
-                headers,
-                false,
-            ),
+        let prefill_request = self.build_post_with_headers(
+            prefill.as_ref(),
+            context.route,
+            prefill_body,
+            headers,
             dp_rank,
         );
-        let decode_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                decode.as_ref(),
-                context.route,
-                decode_body,
-                headers,
-                false,
-            ),
+        let decode_request = self.build_post_with_headers(
+            decode.as_ref(),
+            context.route,
+            decode_body,
+            headers,
             dp_rank,
         );
-        let prefill_side = async {
-            let response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
-            };
-            let status = response.status();
-            if !status.is_success() {
-                error!(
-                    "Prefill server returned error status prefill_url={} status={}",
-                    prefill.redacted_url(),
-                    status
-                );
-                Self::record_sequential_side(
-                    prefill.as_ref(),
-                    metrics_labels::WORKER_PREFILL,
-                    status,
-                );
-                return Err(Self::side_refused(PdSide::Prefill, response).await);
-            }
-            match response.bytes().await {
-                Ok(bytes) => {
-                    Self::record_sequential_side(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        status,
-                    );
-                    Ok(bytes)
-                }
-                Err(e) => Err(Self::prefill_read_failed(prefill.as_ref(), &e)),
-            }
-        };
+        let prefill_side = Self::prefill_side_bytes(prefill.as_ref(), prefill_request);
         let decode_side = send_with_stale_conn_retry(decode_request);
         tokio::pin!(decode_side);
 
@@ -2051,6 +1987,36 @@ impl PDRouter {
             dispatch_start,
         )
         .await
+    }
+
+    /// The prefill side of a sequential or concurrent-write dispatch: sent,
+    /// refused on an error status, read whole and recorded on its worker. The
+    /// error is the response the client is answered with.
+    async fn prefill_side_bytes(
+        prefill: &dyn Worker,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Bytes, Response> {
+        let response = match send_with_stale_conn_retry(request).await {
+            Ok(response) => response,
+            Err(e) => return Err(Self::prefill_transport_failed(prefill, &e)),
+        };
+        let status = response.status();
+        if !status.is_success() {
+            error!(
+                "Prefill server returned error status prefill_url={} status={}",
+                prefill.redacted_url(),
+                status
+            );
+            Self::record_sequential_side(prefill, metrics_labels::WORKER_PREFILL, status);
+            return Err(Self::side_refused(PdSide::Prefill, response).await);
+        }
+        match response.bytes().await {
+            Ok(bytes) => {
+                Self::record_sequential_side(prefill, metrics_labels::WORKER_PREFILL, status);
+                Ok(bytes)
+            }
+            Err(e) => Err(Self::prefill_read_failed(prefill, &e)),
+        }
     }
 
     /// Per-side outcome accounting for the sequential path: a side that was
@@ -2442,7 +2408,9 @@ impl PDRouter {
     /// credential with the precedence every other upstream call has (the
     /// caller's `Authorization`, else the worker's configured key), so a worker
     /// behind a key-protected gateway, whose caller key ends at the
-    /// middleware, still carries the key the worker requires.
+    /// middleware, still carries the key the worker requires; and, for a
+    /// MoRI-IO side, the data-parallel rank both sides are pinned to, set
+    /// after the forwarded headers.
     #[expect(
         clippy::unused_self,
         reason = "method on PDRouter for consistent API; may use self.api_key in future"
@@ -2453,29 +2421,20 @@ impl PDRouter {
         route: &'static str,
         body: Bytes,
         headers: Option<&HeaderMap>,
-        connection_close: bool,
+        dp_rank: Option<usize>,
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         // Every side built here is sent; counted per side, on its worker.
         Metrics::record_worker_request(worker.url(), worker.model_id());
-        let mut request = attach_sized_body(
+        let request = attach_sized_body(
             worker
                 .http_client()
                 .post(endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
             body,
         );
-        if connection_close {
-            request = request.header("Connection", "close");
-        }
-        header_utils::apply_forwarded_request_headers(request, headers, worker.api_key())
-    }
-
-    /// Route a MoRI-IO side to the data-parallel rank both sides are pinned to.
-    fn pin_dp_rank(
-        request: reqwest::RequestBuilder,
-        dp_rank: Option<usize>,
-    ) -> reqwest::RequestBuilder {
+        let request =
+            header_utils::apply_forwarded_request_headers(request, headers, worker.api_key());
         match dp_rank {
             Some(rank) => request.header(DATA_PARALLEL_RANK_HEADER, rank.to_string()),
             None => request,
@@ -2779,12 +2738,19 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Prefill {} returned status {}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     res.status()
                 ));
             }
+            // The client's error names the request's address, its query
+            // kept: the answer carries its cause without the address, and
+            // the masked address beside it names the side.
             Err(e) => {
-                errors.push(format!("Prefill {} error: {}", prefill.url(), e));
+                errors.push(format!(
+                    "Prefill {} error: {}",
+                    prefill.redacted_url(),
+                    cause(&e)
+                ));
             }
         }
 
@@ -2798,12 +2764,16 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Decode {} returned status {}",
-                    decode.url(),
+                    decode.redacted_url(),
                     res.status()
                 ));
             }
             Err(e) => {
-                errors.push(format!("Decode {} error: {}", decode.url(), e));
+                errors.push(format!(
+                    "Decode {} error: {}",
+                    decode.redacted_url(),
+                    cause(&e)
+                ));
             }
         }
 
@@ -2812,8 +2782,8 @@ impl RouterTrait for PDRouter {
                 StatusCode::OK,
                 format!(
                     "Health generate passed on selected pair: prefill={}, decode={}",
-                    prefill.url(),
-                    decode.url()
+                    prefill.redacted_url(),
+                    decode.redacted_url()
                 ),
             )
                 .into_response()
@@ -3681,7 +3651,7 @@ mod tests {
                 "/generate",
                 Bytes::from(r#"{"text":"hello"}"#),
                 None,
-                false,
+                None,
             )
             .build()
             .expect("request should build");
@@ -3711,7 +3681,7 @@ mod tests {
                     "/generate",
                     Bytes::from(r#"{"text":"hello"}"#),
                     headers,
-                    false,
+                    None,
                 )
                 .build()
                 .expect("request should build")
@@ -4714,6 +4684,87 @@ mod tests {
                 .worker_registry
                 .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
         }
+    }
+
+    /// The health-generate probe names the pair it tried with each address
+    /// masked, whether a side answers, answers an error or refuses the
+    /// connection: a worker registered with a password and a token in its
+    /// query is named by its scheme, host and port, and a refused
+    /// connection's entry carries the transport's reason without the
+    /// request's address. The route is public. The stubs answer every path:
+    /// the probe's route joins such an address after its query.
+    #[tokio::test]
+    async fn health_generate_names_the_pair_it_tried_with_masked_addresses() {
+        async fn probe(prefill: &str, decode: &str) -> (StatusCode, String) {
+            let with_secrets = |url: &str| {
+                let with_password = url.replacen("http://", "http://user:s3cret@", 1);
+                format!("{with_password}/?token=s3cret")
+            };
+            let router = create_test_pd_router();
+            register_pd_pair(&router, with_secrets(prefill), with_secrets(decode));
+            let request = Request::builder().body(Body::empty()).unwrap();
+            let response = tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+                .await
+                .expect("the probe answers");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+        let answering = |status: StatusCode| {
+            spawn_stub(axum::Router::new().fallback(move || async move { status }))
+        };
+        let (healthy_prefill, healthy_decode) = (
+            answering(StatusCode::OK).await,
+            answering(StatusCode::OK).await,
+        );
+        let (failing_prefill, failing_decode) = (
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+        );
+        let (refused_prefill, refused_decode) =
+            (RefusedAddress::reserve(), RefusedAddress::reserve());
+        let (refused_prefill, refused_decode) =
+            (refused_prefill.http_url(), refused_decode.http_url());
+
+        let mut carrying = Vec::new();
+        for (prefill, decode, wanted) in [
+            (&healthy_prefill, &healthy_decode, StatusCode::OK),
+            (
+                &failing_prefill,
+                &refused_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                &refused_prefill,
+                &failing_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (status, body) = probe(prefill, decode).await;
+            assert_eq!(status, wanted, "{body}");
+            if body.contains("s3cret") {
+                carrying.push(body);
+                continue;
+            }
+            for side in [prefill, decode] {
+                let masked = side.replacen("http://", "http://***@", 1);
+                assert!(body.contains(&masked), "{masked} is not named in: {body}");
+            }
+            // The side that refused the connection is answered with the
+            // transport's reason after the client's own words.
+            if wanted == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(
+                    body.contains(" error: error sending request: "),
+                    "the refused side is answered without its reason: {body}"
+                );
+            }
+        }
+        assert!(
+            carrying.is_empty(),
+            "bodies of the probe that carry the secret: {carrying:#?}"
+        );
     }
 
     fn streaming_chat() -> ChatCompletionRequest {
@@ -5906,6 +5957,36 @@ mod tests {
         assert!(taken(&decode_seen).is_empty());
     }
 
+    /// A pair refused for running two transfer modes is named in the warning
+    /// by masked addresses.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_pair_refused_for_its_transfer_modes_is_named_masked() {
+        let worker = |url: &str, worker_type, mode: &str| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", mode)
+                .build()
+        };
+        let prefill = worker(
+            "http://user:s3cret@10.0.0.1:8100",
+            WorkerType::Prefill,
+            "read",
+        );
+        let decode = worker(
+            "http://user:s3cret@10.0.0.2:8200",
+            WorkerType::Decode,
+            "write",
+        );
+        assert!(PDRouter::moriio_pair(&prefill, &decode).is_err());
+        assert!(logs_contain(
+            "prefill http://***@10.0.0.1:8100 runs Read but decode http://***@10.0.0.2:8200 runs Write"
+        ));
+        assert!(!logs_contain("s3cret"));
+    }
+
     #[test]
     fn moriio_pair_needs_one_mode_and_a_write_target_the_prefill_reaches() {
         let worker = |url: &str, worker_type, mode: &str| {
@@ -6234,6 +6315,27 @@ mod tests {
 
         let completion = sanitized_prefill(json!({"prompt": "hi"}), "/v1/completions");
         assert_eq!(completion.get("max_tokens"), Some(&Value::from(1)));
+    }
+
+    /// A routed pair's request body carries the bootstrap host a client
+    /// dials: for a prefill side with no rank whose address is a token
+    /// before a host of digits, that host and never the token. One prompt
+    /// and a batch of two.
+    #[test]
+    fn a_pairs_request_body_carries_the_bootstrap_host_a_client_dials() {
+        let prefill = BasicWorkerBuilder::new("http://s3cret-token@2130706433")
+            .worker_type(WorkerType::Prefill)
+            .bootstrap_port(Some(8998))
+            .build();
+        let bytes = br#"{"text":"hi"}"#.to_vec();
+        for batch in [None, Some(2)] {
+            let mut body = RawBody::parse(&bytes).unwrap();
+            let fields = PDRouter::bootstrap_fields(&prefill, batch, None).unwrap();
+            PDRouter::inject_bootstrap(&mut body, fields);
+            let sent = String::from_utf8(body.to_bytes(None).unwrap().to_vec()).unwrap();
+            assert!(sent.contains("127.0.0.1"), "{sent}");
+            assert!(!sent.contains("s3cret"), "{sent}");
+        }
     }
 
     #[test]

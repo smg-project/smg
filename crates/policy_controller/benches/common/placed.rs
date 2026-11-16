@@ -24,7 +24,10 @@ const ASKS: usize = 1_024;
 /// asked until it hands such an address; a reject stays allocated until the
 /// end, so each ask gets another address. A build is never timed in a buffer
 /// that is not placed: when no ask of the bound lands on a page's start the
-/// bench stops here.
+/// bench stops here. The rejects are freed when the call returns, so a later
+/// call for the same size is handed them again before any new address: a
+/// size placed a fifth time in one process stops at the bound. A bench
+/// places each size once and keeps the buffer.
 pub fn page_start_buffer<T>(n: usize) -> Vec<T> {
     let mut rejects = Vec::new();
     let mut buffer = Vec::<T>::with_capacity(n);

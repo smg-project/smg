@@ -44,6 +44,17 @@ struct Rotation {
 /// again. A set seen for the first time starts from a shared, advancing
 /// position rather than its first worker, so a fleet whose shape keeps
 /// changing does not lean on index 0.
+///
+/// A list the caller names whole (a routing snapshot's pool) is rotated by
+/// row instead: its rotation is kept under the list's own address, and the
+/// row the count lands on is the pick when the request may use that worker.
+/// Nothing is asked of the other workers and nobody is listed, so the pick
+/// costs the same at any pool size. While every worker is admitted that is
+/// the set's own walk. A row the request may not use falls to the set's
+/// rotation over the admitted workers: each of them keeps its own turns and
+/// takes an even share of the refused rows', so the spread stays even while
+/// the order is no longer one strict rotation. A narrowed list (the decode
+/// partners of a cohort) is a set as before.
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
     counters: DashMap<u64, Rotation>,
@@ -71,6 +82,19 @@ impl RoundRobinPolicy {
         for &i in healthy {
             hasher.write_usize(Arc::as_ptr(&workers[i]).addr());
         }
+        hasher.finish()
+    }
+
+    /// The identity of a list the caller names whole: the list's own
+    /// address, one word. A snapshot never changes its list, so the address
+    /// stands for the members in their order until the registry publishes
+    /// another list, whose rotation starts from the shared position while
+    /// the old one ages out as a set's does. A list's key meets a set's only
+    /// through an address reused after a free, which is as harmless here as
+    /// it is there.
+    fn list_key(list: &Arc<[Arc<dyn Worker>]>) -> u64 {
+        let mut hasher = FxHasher::default();
+        hasher.write_usize(Arc::as_ptr(list).addr());
         hasher.finish()
     }
 
@@ -116,6 +140,21 @@ impl RoundRobinPolicy {
 
 impl LoadBalancingPolicy for RoundRobinPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        // A list named whole is rotated by row: the row's worker is the only
+        // one asked anything. A refused row falls to the set's rotation.
+        if let Some(named) = info.named.filter(|named| named.positions.is_none()) {
+            debug_assert!(
+                std::ptr::eq(&named.list[..], workers),
+                "a list named whole is the slice handed"
+            );
+            if !workers.is_empty() {
+                let row = self.advance(Self::list_key(named.list)) % workers.len();
+                if info.admits(workers[row].routing_state()) {
+                    return Some(row);
+                }
+            }
+        }
+
         let healthy_indices = get_healthy_worker_indices(workers, info);
 
         if healthy_indices.is_empty() {
@@ -149,7 +188,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::test_support::make_workers,
+        policies::{test_support::make_workers, NamedList},
         worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType},
     };
 
@@ -347,5 +386,127 @@ mod tests {
             RoundRobinPolicy::set_key(&workers, &healthy),
             words.finish()
         );
+    }
+
+    /// One pick over `list` named whole, as the single-worker placement
+    /// hands a routing snapshot's pool.
+    fn pick_named(policy: &RoundRobinPolicy, list: &Arc<[Arc<dyn Worker>]>) -> Option<usize> {
+        let info = SelectWorkerInfo {
+            named: Some(NamedList {
+                list,
+                positions: None,
+            }),
+            ..Default::default()
+        };
+        policy.select_worker(list, &info)
+    }
+
+    #[test]
+    fn a_list_named_whole_rotates_by_row_under_its_own_address() {
+        // While every worker is admitted the walk is the set's own, and the
+        // one rotation kept is the list's: no worker was hashed for it.
+        let list: Arc<[Arc<dyn Worker>]> = make_regular_workers("w", 3).into();
+        let policy = RoundRobinPolicy::new();
+        let named: Vec<_> = (0..5).map(|_| pick_named(&policy, &list)).collect();
+        assert_eq!(named, [Some(0), Some(1), Some(2), Some(0), Some(1)]);
+        assert_eq!(policy.counters.len(), 1);
+        assert!(policy
+            .counters
+            .contains_key(&RoundRobinPolicy::list_key(&list)));
+        assert!(!policy
+            .counters
+            .contains_key(&RoundRobinPolicy::set_key(&list, &[0, 1, 2])));
+
+        let unnamed = RoundRobinPolicy::new();
+        let info = SelectWorkerInfo::default();
+        let walked: Vec<_> = (0..5)
+            .map(|_| unnamed.select_worker(&list, &info))
+            .collect();
+        assert_eq!(walked, named);
+    }
+
+    #[test]
+    fn a_refused_row_falls_to_the_admitted_set_and_the_spread_stays_even() {
+        let list: Arc<[Arc<dyn Worker>]> = make_regular_workers("w", 4).into();
+        list[1].set_status(WorkerStatus::NotReady);
+        let policy = RoundRobinPolicy::new();
+        // Three turns of the list: nine rows are admitted and taken, three
+        // fall to the admitted set's rotation, one to each of its workers.
+        let mut picks = [0usize; 4];
+        for _ in 0..12 {
+            picks[pick_named(&policy, &list).unwrap()] += 1;
+        }
+        assert_eq!(picks, [4, 0, 4, 4]);
+    }
+
+    #[test]
+    fn a_row_is_asked_by_the_requests_own_admit_rule() {
+        // The row answers what `get_healthy_worker_indices` asks of every
+        // worker: a request whose overload veto the caller lifted takes an
+        // overloaded row, a request that keeps the veto steps past it.
+        let list: Arc<[Arc<dyn Worker>]> = make_regular_workers("w", 3).into();
+        list[0].set_overloaded(true);
+        let policy = RoundRobinPolicy::new();
+        let lifted = SelectWorkerInfo {
+            overload_lifted: true,
+            named: Some(NamedList {
+                list: &list,
+                positions: None,
+            }),
+            ..Default::default()
+        };
+        let walked: Vec<_> = (0..3)
+            .map(|_| policy.select_worker(&list, &lifted))
+            .collect();
+        assert_eq!(walked, [Some(0), Some(1), Some(2)]);
+        assert!(matches!(pick_named(&policy, &list), Some(1 | 2)));
+    }
+
+    #[test]
+    fn two_narrowings_of_one_list_each_keep_a_set_rotation() {
+        // A narrowed list is a set. Rotated under the list's address, two
+        // narrowings of one list would share a count, and each would be
+        // pinned to one of its two candidates.
+        let list: Arc<[Arc<dyn Worker>]> = make_regular_workers("w", 4).into();
+        let rows = [[0usize, 2], [1, 3]];
+        let candidates: [Vec<Arc<dyn Worker>>; 2] =
+            rows.map(|rows| rows.iter().map(|&row| Arc::clone(&list[row])).collect());
+        let policy = RoundRobinPolicy::new();
+        let mut picks = [[0usize; 2]; 2];
+        for _ in 0..4 {
+            for (which, positions) in rows.iter().enumerate() {
+                let info = SelectWorkerInfo {
+                    named: Some(NamedList {
+                        list: &list,
+                        positions: Some(&positions[..]),
+                    }),
+                    ..Default::default()
+                };
+                picks[which][policy.select_worker(&candidates[which], &info).unwrap()] += 1;
+            }
+        }
+        assert_eq!(picks, [[2, 2], [2, 2]]);
+    }
+
+    #[test]
+    fn a_list_published_again_starts_a_rotation_of_its_own() {
+        // The key is the list's address and nothing of its workers: the same
+        // handles in another list are another rotation, which starts from
+        // the shared position.
+        let workers = make_regular_workers("w", 3);
+        let first: Arc<[Arc<dyn Worker>]> = workers.clone().into();
+        let again: Arc<[Arc<dyn Worker>]> = workers.into();
+        let policy = RoundRobinPolicy::new();
+        assert_eq!(pick_named(&policy, &first), Some(0));
+        assert_eq!(pick_named(&policy, &again), Some(1));
+        assert_eq!(pick_named(&policy, &first), Some(1));
+        assert_eq!(pick_named(&policy, &again), Some(2));
+        assert_eq!(policy.counters.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_named_list_has_no_pick() {
+        let list: Arc<[Arc<dyn Worker>]> = Vec::new().into();
+        assert_eq!(pick_named(&RoundRobinPolicy::new(), &list), None);
     }
 }

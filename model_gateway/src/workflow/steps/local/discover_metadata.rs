@@ -159,10 +159,9 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
+    let resp = req.send().await.map_err(|e| {
+        MetadataError::Failed(format!("Failed to connect to {shown}: {}", e.without_url()))
+    })?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
@@ -174,7 +173,7 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     }
     resp.json::<T>()
         .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {}", e.without_url())))
 }
 
 pub async fn get_server_info(
@@ -1349,5 +1348,55 @@ mod tests {
             )),
             "{err}"
         );
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_refused_connection_goes_without_the_clients_url() {
+        use crate::worker::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = get_server_info(&http_client(), &url, None)
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// An address registered with a query that answers a body that is no
+    /// JSON: the failure does not repeat the query. The HTTP client's text of
+    /// a failed body read ends with the request URL too.
+    #[tokio::test]
+    async fn an_unparsed_answer_goes_without_the_clients_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering no JSON; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { "not json" }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = get_server_info(
+            &http_client(),
+            &format!("http://127.0.0.1:{port}?token=s3cret"),
+            None,
+        )
+        .await
+        .expect_err("a body that is no JSON is a failure");
+        server.abort();
+
+        assert!(err.contains("Failed to parse"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
     }
 }
