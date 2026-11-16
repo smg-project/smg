@@ -1909,8 +1909,16 @@ async fn logged(logs: &Mutex<Vec<String>>, text: &str) {
 /// dial's timeout as the caller reads it in the status).
 #[tokio::test]
 async fn diagnostics_name_the_peer_without_the_url_userinfo() {
+    use tracing::subscriber::NoSubscriber;
+
     let logs = Arc::new(Mutex::new(Vec::new()));
     let _subscriber = tracing::subscriber::set_default(Capture(Arc::clone(&logs)));
+    // While one dispatcher is registered, tracing decides whether a callsite
+    // is wanted by asking the default of the thread that reaches it first,
+    // and keeps the answer. Another test's thread has no subscriber, so its
+    // "nobody" would drop this thread's line. A second dispatcher, alive for
+    // the case, makes tracing ask every registered one.
+    let _second = tracing::Dispatch::new(NoSubscriber::default());
     let without_userinfo = |message: &str| !message.contains("secret") && !message.contains("user");
     let url = a_peer_that_ends_the_socket(SocketEnd::Close).await;
     let with_secret = url.replacen("http://", "grpc://user:secret@", 1);
