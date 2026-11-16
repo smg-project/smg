@@ -295,10 +295,11 @@ impl Records {
         pool: &PoolFacts<'_>,
     ) {
         self.candidates.clear();
-        // A candidate's affinity facts ride the request's column, by its
-        // index: the same index reads the row and its entry. The packed fill
-        // walks the column instead; this one keeps the read by index, whose
-        // two tests are lost in what a record a candidate costs.
+        // A candidate's affinity facts ride the request's column, or the
+        // rows the host names in the column's place, by its index: the same
+        // index reads the row and what it holds. The packed fill walks
+        // either feed instead; this one keeps the read by index, whose
+        // tests are lost in what a record a candidate costs.
         self.candidates.extend(
             (0u32..)
                 .zip(candidates)
@@ -746,10 +747,11 @@ impl Packed {
         // fill 2.5 ns a row at 512 candidates. An empty column is nothing
         // held by any candidate. Any other holds one entry a candidate, and
         // one that ends before the candidates fails here, as an index past
-        // its end does. Rows the host named in the column's place are read
-        // by index: a holder's row carries its two depths, and every row
-        // reads its age, growth and index size as zero, so a host fills
-        // the column for a profile whose guest reads those.
+        // its end does. Rows the host named in the column's place are
+        // walked beside the candidates: a holder's row carries its two
+        // depths, and every row reads its age, growth and index size as
+        // zero, so a host fills the column for a profile whose guest reads
+        // those.
         match facts.feed() {
             feed if feed.is_empty() => {
                 let nothing = AffinityFacts::default();
@@ -764,8 +766,9 @@ impl Packed {
                 }
             }
             Feed::Named(named) => {
+                let mut walk = named.walk();
                 for ((index, c), row) in (0u32..).zip(candidates).zip(rows) {
-                    Self::fill_row(row, c, named.entry(index));
+                    Self::fill_row(row, c, walk.entry(index));
                 }
             }
         }

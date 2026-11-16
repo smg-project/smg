@@ -1,10 +1,8 @@
 //! The cost of the affinity column a host feeds beside the candidate rows:
 //! the view build that writes each row and its entry of the column, and the
 //! decision of the preset whose stages read the column, at 8, 64 and 512
-//! candidates. Ids: `policy_affinity/view_build/<n>`,
-//! `policy_affinity/decide/cache_aware/<n>` and
-//! `policy_affinity/decide/cache_aware_named/<n>`, the same decision over
-//! the column's holders named in its place. The fleet is `common`'s with its
+//! candidates. Ids: `policy_affinity/view_build/<n>` and
+//! `policy_affinity/decide/cache_aware/<n>`. The fleet is `common`'s with its
 //! settled column: the warm-up stage reads the fleet's index level and
 //! slices nothing, the affinity stage ranks the holders. A bench target of
 //! its own: the pull-request gate's rows are the `decision` binary's, and a
@@ -26,9 +24,7 @@ use column::build_column;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use placed::page_start_buffer;
-use smg_policy_controller::{
-    AffinityFacts, Constraints, NamedAffinity, NamedHolder, PoolFacts, RequestFacts, Scratch,
-};
+use smg_policy_controller::{AffinityFacts, Constraints, PoolFacts, RequestFacts, Scratch};
 
 const SIZES: [usize; 3] = [8, 64, 512];
 
@@ -65,21 +61,6 @@ fn facts(seed: u64, held: &[AffinityFacts]) -> RequestFacts<'_> {
     }
 }
 
-fn named_facts(seed: u64, holders: &[NamedHolder]) -> RequestFacts<'_> {
-    RequestFacts {
-        model: "m",
-        prompt_tokens: 512,
-        seed,
-        now_micros: 1_000_000,
-        named: Some(NamedAffinity {
-            holders,
-            warming: &[],
-            thin: false,
-        }),
-        ..RequestFacts::default()
-    }
-}
-
 fn decide(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_affinity/decide");
     let engine = engine_of("cache_aware");
@@ -106,35 +87,6 @@ fn decide(c: &mut Criterion) {
                 seed += 1;
                 engine.decide(
                     &facts(seed, black_box(&held)),
-                    &pool,
-                    black_box(&rows),
-                    &cx,
-                    &mut scratch,
-                )
-            });
-        });
-        // Every holder of the column, named in its place. The settled fleet
-        // warms nobody, so no warming row is named.
-        let holders: Vec<NamedHolder> = (0u32..)
-            .zip(&held)
-            .filter(|(_, entry)| entry.overlap_blocks > 0 || entry.predicted_blocks > 0)
-            .map(|(row, entry)| NamedHolder {
-                row,
-                overlap_blocks: entry.overlap_blocks,
-                predicted_blocks: entry.predicted_blocks,
-            })
-            .collect();
-        let first = engine.decide(&named_facts(0, &holders), &pool, &rows, &cx, &mut scratch);
-        assert!(
-            first.pick().is_some(),
-            "{n}: the decision over named rows picks a worker"
-        );
-        group.bench_with_input(BenchmarkId::new("cache_aware_named", n), &n, |b, _| {
-            let mut seed = 0u64;
-            b.iter(|| {
-                seed += 1;
-                engine.decide(
-                    &named_facts(seed, black_box(&holders)),
                     &pool,
                     black_box(&rows),
                     &cx,

@@ -212,6 +212,10 @@ name = "affinity"
 harness = false
 
 [[bench]]
+name = "affinity_named"
+harness = false
+
+[[bench]]
 name = "elector"
 harness = false
 
