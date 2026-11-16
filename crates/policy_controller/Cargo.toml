@@ -32,6 +32,13 @@ thiserror = { workspace = true }
 # optional tracing declared with the controller's dependencies below; this
 # feature turns it on too.
 thread_local = { version = "1.1", optional = true }
+# The gRPC user plugin (`grpc`, under the `controller` feature): a Unix
+# socket's connector, the stream a channel's receiver is sent as, and the
+# service a connector is. The runtime, the transport and the protocol's
+# code are the controller's own, below.
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
 wasmtime = { workspace = true, optional = true }
 
 # The Kubernetes Lease elector (design 10), behind the `kubernetes` feature:
@@ -82,7 +89,7 @@ tracing-subscriber = { workspace = true, optional = true }
 # hides that page from the process (a run under valgrind); libc's read is the
 # one such tools serve.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { version = "1", default-features = false, features = ["std", "time", "use-libc-auxv"], optional = true }
+rustix = { version = "1", default-features = false, features = ["process", "std", "time", "use-libc-auxv"], optional = true }
 
 # The build script compiles the protocol under the `controller` feature
 # alone: the engine's own build runs nothing and needs no `protoc`.
@@ -111,15 +118,20 @@ controller = [
     "ingest",
     "dep:axum",
     "dep:clap",
+    "dep:hyper-util",
     "dep:metrics",
     "dep:metrics-exporter-prometheus",
     "dep:prost",
+    "dep:rustix",
     "dep:rustls",
+    "dep:thread_local",
     "dep:tokio",
+    "dep:tokio-stream",
     "dep:tonic",
     "dep:tonic-health",
     "dep:tonic-prost",
     "dep:tonic-prost-build",
+    "dep:tower",
     "dep:tracing",
     "dep:tracing-subscriber",
 ]
@@ -150,6 +162,9 @@ prost-types = { workspace = true }
 wit-parser = { version = "0.258.3", default-features = false, features = ["std"] }
 # The lease-file tests and bench write under a directory of their own.
 tempfile = "3"
+# The gRPC plugin's tests and bench serve a plugin of their own over a
+# socket in such a directory; this wraps its listener.
+tokio-stream = { version = "0.1", features = ["net"] }
 # The plugin host's test guests are WebAssembly text in the test sources,
 # assembled and wrapped into components of the committed world at test time:
 # no binary fixture and no cross target.
@@ -192,6 +207,10 @@ name = "fleet"
 required-features = ["controller"]
 
 [[test]]
+name = "grpc_plugin"
+required-features = ["controller"]
+
+[[test]]
 name = "ingest"
 required-features = ["controller"]
 
@@ -223,6 +242,11 @@ harness = false
 name = "wasm_plugin"
 harness = false
 required-features = ["wasm"]
+
+[[bench]]
+name = "grpc_plugin"
+harness = false
+required-features = ["controller"]
 
 [[bench]]
 name = "epd"
