@@ -90,6 +90,7 @@ mod scan;
 mod sentencepiece;
 mod short_pieces;
 mod unicode;
+mod wide_pieces;
 
 use long_entries::LongEntryFilter;
 use merge::{ByteTokens, MergeTable};
@@ -97,6 +98,7 @@ use nfc::NfcQuick;
 use pattern::Pattern;
 use sentencepiece::{CharSymbols, Marker, WORD_MARKER};
 use short_pieces::{ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTES};
+use wide_pieces::{WideKey, WidePieceTable};
 
 use crate::{
     encode_path::{Declined, Fallback},
@@ -140,7 +142,8 @@ fn class_pattern(ranges: &[(char, char)], runs: bool) -> String {
 
 /// Pieces up to this many bytes are cached per thread by their count (see
 /// `PIECE_CACHE_CAPACITY`): those of up to `SHORT_PIECE_MAX_BYTES` in a
-/// packed table, the longer ones in a map; longer pieces still, up to
+/// packed table, those of up to 32 bytes with up to seven ids in a second
+/// one (`wide_pieces`), the rest in a map; longer pieces still, up to
 /// `LONG_PIECE_MAX_BYTES`, by the bytes they take (see
 /// `LONG_PIECE_BYTES_CAPACITY`).
 const CACHED_PIECE_MAX_BYTES: usize = 64;
@@ -195,13 +198,20 @@ const ASCII_HEAD_BYTES: usize = 256;
 /// the ids as two boxes, about 140 bytes for a typical entry (a 20-byte
 /// piece with four ids) and about 430 at most (a 64-byte piece whose ids
 /// are its bytes), so a thread whose entries were all such pieces holds
-/// about 35 MiB, 108 MiB in that worst case. A clear at the bound keeps
-/// both tiers' arrays (the packed table's slots and its spill's capacity,
-/// and the map's buckets, unless the share fell below what they were grown
+/// about 35 MiB, 108 MiB in that worst case. A piece of 16 to 32 bytes
+/// with up to seven ids takes a slot of the wide table instead
+/// (`PieceCache::wide`: 65 bytes a slot, the table between three eighths
+/// and three quarters full past 4,096 slots, so 87 to 173 bytes an
+/// entry and 32.5 MiB at the full bound, inside the map's figures), and
+/// allocates nothing per entry. A clear at the bound keeps
+/// the tiers' arrays (the packed table's slots and its spill's capacity,
+/// the wide table's slots and the map's buckets, unless the share fell
+/// below what they were grown
 /// for) and drops their entries, so a thread that filled its packed table
 /// on one kind of text and then meets such pieces holds both, about 51 MiB
 /// with typical map entries and 140 MiB at the worst case the count bound
-/// allows.
+/// allows; a thread that filled its wide table between the two keeps those
+/// slots as well, 32.5 MiB more (about 84 MiB and 172 MiB).
 /// Measured on one thread after a corpus of 7,015 prompts: the peak RSS
 /// grew by 8 MB on a 128k-token vocabulary and did not move on three
 /// larger ones, whose peak is the file load.
@@ -220,12 +230,16 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// back inside its reservation keeps the pages it touched, 528 KiB at most,
 /// while the later threads hold their share's slots: about 440 MiB in all at
 /// 1,024 threads). The maps of the pieces of 16 to 64 bytes share the count at
-/// about 140 bytes a typical entry (430 at most, see `PIECE_CACHE_CAPACITY`),
+/// about 140 bytes a typical entry (430 at most, a wide table's entry within
+/// that; see `PIECE_CACHE_CAPACITY`),
 /// and a clear keeps the packed slots and the map's buckets (the map made anew,
 /// the packed table cut back, for a smaller share), so the count-bounded tiers
 /// of one tokenizer hold at most the sum of the two: about 820 MiB at sixteen
 /// threads with typical map entries (about 2.2 GiB, sixteen times the 140 MiB
-/// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
+/// of a thread, were every map entry the worst case), and the slots of wide
+/// tables that grew to the bound as well, kept through a clear like the packed
+/// slots (65 bytes a slot: 520 MiB more at sixteen threads, 693 MiB at the most
+/// however many threads share the total), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
 /// most (a thread's long tier keeps its map's slots through an eviction's
@@ -236,7 +250,7 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
 /// miss), so after threads join it is within the smaller share from its next
-/// call on, entries, packed slots and map buckets alike (the packed table's
+/// call on, entries, packed slots, wide slots and map buckets alike (the packed table's
 /// pages already touched inside its reservation stay resident,
 /// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
 /// thread: more than the share's slots only once those fall under the
@@ -379,11 +393,16 @@ struct PieceCache {
     /// the fewest slots when the cache is, grown with the pieces the thread
     /// meets, up to its share, and held plain (not in an `Option`): the hit
     /// path reads it at an offset of the cache, with no test of its
-    /// presence per piece. Bounded by count together with `short`.
+    /// presence per piece. Bounded by count together with `wide` and
+    /// `short`.
     packed: ShortPieceTable,
-    /// Pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
+    /// Pieces of 16 to 32 bytes whose ids fit an entry, packed, a line a
+    /// piece (`wide_pieces`): nothing is allocated per entry. Bounded by
+    /// their count together with `packed` and `short`.
+    wide: WidePieceTable,
+    /// The other pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
     /// `CACHED_PIECE_MAX_BYTES`, bounded by their count together with
-    /// `packed`.
+    /// `packed` and `wide`.
     short: PieceIds,
     /// Longer pieces, up to `LONG_PIECE_MAX_BYTES`, bounded by their bytes.
     long: PieceIds,
@@ -404,10 +423,12 @@ struct PieceCache {
 
 impl PieceCache {
     /// The empty cache of a thread whose share of the count-bounded tiers
-    /// is `share`: the packed table with the fewest slots, the maps empty.
+    /// is `share`: the packed table with the fewest slots, the wide table
+    /// with none, the maps empty.
     fn with_share(share: usize) -> Self {
         Self {
             packed: ShortPieceTable::new(),
+            wide: WidePieceTable::new(),
             short: PieceIds::default(),
             long: PieceIds::default(),
             long_bytes: 0,
@@ -447,9 +468,13 @@ impl PieceCache {
         self.long_bytes = 0;
     }
 
-    /// Entries of the tiers bounded by count, `packed` and `short`.
+    /// Entries of the tiers bounded by count: `packed`, `wide` and `short`.
     fn short_entries(&self) -> usize {
-        self.packed.len() + self.short.len()
+        self.packed.len() + self.wide.len() + self.short.len()
+    }
+
+    fn wide_slots(&self) -> usize {
+        self.wide.slots()
     }
 
     /// Slots of the packed tier.
@@ -471,9 +496,11 @@ impl PieceCache {
     /// that had moved past the reservation is made anew), the map is made
     /// anew when its capacity is above twice the share (a map that grew under
     /// the share stays under that, so the check never fires at a steady share
-    /// and a clear at the bound keeps the buckets).
+    /// and a clear at the bound keeps the buckets); the wide table keeps its
+    /// slots, or gives them back when it has more than the share takes.
     fn clear_short(&mut self, share: usize) {
         self.packed.clear(share);
+        self.wide.clear(share);
         if self.short.capacity() > 2 * share {
             self.short = PieceIds::default();
         } else {
@@ -3271,7 +3298,16 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
-        if vacancy.is_none() && cacheable {
+        // A piece of 16 to 32 bytes is the wide table's when its ids fit an
+        // entry; one the table does not hold may still be the map's.
+        let wide = match vacancy {
+            None => WideKey::of(bytes),
+            Some(_) => None,
+        };
+        if wide.is_some_and(|key| cache.wide.ids_into(key, ids)) {
+            return Ok(());
+        }
+        if vacancy.is_none() && cacheable && (wide.is_none() || !cache.short.is_empty()) {
             if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
@@ -3330,8 +3366,9 @@ impl NativeEncoder {
     }
 
     /// Remembers `ids[start..]` as the encoding of `piece` in the thread's
-    /// cache: the packed table for a piece with a key, the map for one of up
-    /// to `CACHED_PIECE_MAX_BYTES`, the long tier, by bytes, for one of up
+    /// cache: the packed table for a piece with a key, the wide table or the
+    /// map for one of up to `CACHED_PIECE_MAX_BYTES` (the table when it is
+    /// of at most 32 bytes and seven ids), the long tier, by bytes, for one of up
     /// to `LONG_PIECE_MAX_BYTES`; each within the thread's share. Inlined
     /// into both slow paths: out of line it is a call frame per cache miss
     /// on every vocabulary (four to eight instructions per token on a cold
@@ -3360,7 +3397,11 @@ impl NativeEncoder {
             if cache.short_entries() >= share {
                 cache.clear_short(share);
             }
-            cache.short.insert(piece.into(), ids[start..].into());
+            let kept =
+                WideKey::of(piece).is_some_and(|key| cache.wide.insert(key, &ids[start..], share));
+            if !kept {
+                cache.short.insert(piece.into(), ids[start..].into());
+            }
         } else if piece.len() <= LONG_PIECE_MAX_BYTES {
             let entry = LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(&ids[start..]);
             let share = self.long_piece_bytes_share();
@@ -3477,6 +3518,10 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) {
         let bytes = raw.as_bytes();
+        if vacancy.is_none() && WideKey::of(bytes).is_some_and(|key| cache.wide.ids_into(key, ids))
+        {
+            return;
+        }
         if vacancy.is_none() && bytes.len() <= LONG_PIECE_MAX_BYTES {
             if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
@@ -3513,8 +3558,8 @@ impl NativeEncoder {
     /// The calling thread's piece cache, borrowed for one encode call and
     /// within the thread's share at the start of it: a thread whose share
     /// fell since it last read it (threads joined) clears its count-bounded
-    /// tiers here, by their entries, by the slots of its packed table or by
-    /// the capacity of its map (arrays grown for the earlier share keep
+    /// tiers here, by their entries, by the slots of its packed or of its
+    /// wide table or by the capacity of its map (arrays grown for the earlier share keep
     /// their size through a clear at the bound; here the map is made anew for
     /// the share and the packed table is cut back to the share's slots inside
     /// its reservation, see `ShortPieceTable::clear`), and makes its long
@@ -3525,7 +3570,7 @@ impl NativeEncoder {
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
     /// never encodes again holds what it had until it exits). Two relaxed
-    /// loads, one store and four compares per call.
+    /// loads, one store and five compares per call.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
@@ -3533,6 +3578,7 @@ impl NativeEncoder {
         let slots = ShortPieceTable::slots_for(share);
         if cache.short_entries() > share
             || cache.packed_slots() > slots
+            || cache.wide_slots() > WidePieceTable::slots_for(share)
             || cache.map_capacity() > 2 * share
         {
             cache.clear_short(share);
