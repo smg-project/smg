@@ -7626,3 +7626,7 @@ mod tests {
         assert!(future <= 2048, "the dispatch future is {future} bytes");
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_encode_pair_rows;
