@@ -1,6 +1,32 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
+  "if": {
+    "required": ["policyController"],
+    "properties": {
+      "policyController": {
+        "type": "object",
+        "required": ["enabled"],
+        "properties": { "enabled": { "const": true } }
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "global": {
+        "properties": {
+          "image": {
+            "properties": {
+              "tag": {
+                "type": ["string", "null"],
+                "description": "With the controller on, its default tag is the router's with a suffix, so the router's tag is text: a tag of digits alone is quoted."
+              }
+            }
+          }
+        }
+      }
+    }
+  },
   "properties": {
     "router": {
       "type": "object",
@@ -388,6 +414,18 @@
           }
         },
         "replicas": { "type": ["integer", "null"], "minimum": 1 },
+        "election": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": ["boolean", "null"] },
+            "leaseName": {
+              "type": ["string", "null"],
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            }
+          }
+        },
         "ports": {
           "type": ["object", "null"],
           "additionalProperties": false,
