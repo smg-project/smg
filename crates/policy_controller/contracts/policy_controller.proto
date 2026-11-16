@@ -5,7 +5,11 @@
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
-// binds from then on.
+// binds from then on. Hello carries the range of protocol versions the
+// gateway speaks and Welcome the one the controller picked; a range that
+// holds no version the controller speaks is refused with
+// FAILED_PRECONDITION, the status message naming the range and the
+// controller's version.
 //
 // Scopes and principals: design 5.2. Four credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
@@ -39,15 +43,25 @@
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
 // role does not cover the RPC; FAILED_PRECONDITION not the leader (a
-// NotLeader in the status details), a floor above the term, a revision or
+// NotLeader in the status details; on Session, the NotLeader frame ahead
+// of the status), a first frame that is not Hello or a second Hello, no
+// protocol version in common, a floor above the term, a revision or
 // digest guard, or a rejoin position not held under its term (a
 // resync_required batch precedes it; the rejoin opens a new Replicate
 // stream); INVALID_ARGUMENT a spec or registration rejected (the field
 // path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
-// resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
-// ABORTED fenced mid-stream, reconnect through Leader; OUT_OF_RANGE and
-// DATA_LOSS never raised, forwarded as RelayResync. In-band within a stream:
+// resync_required batch precedes it), a Hello past the controller's
+// ceiling of present gateways, or a Session frame over the transport's
+// limit of 4 MiB a message; ALREADY_EXISTS a Hello whose id collides
+// with another present gateway's, refused while that one stands;
+// UNAVAILABLE a standby not yet synced;
+// ABORTED fenced mid-stream, reconnect through Leader, a Hello read
+// under a term the election left before its seat was taken, or a session
+// a newer one of its gateway replaced; OUT_OF_RANGE and
+// DATA_LOSS never raised, forwarded as RelayResync. Any other read of a
+// Session frame that the transport fails ends the stream under the
+// transport's own status. In-band within a stream:
 // Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
@@ -109,7 +123,7 @@ message GatewayFrame {
 // What the gateway holds; the leases, pins and vetoes follow in HelloPage
 // frames, the counts here size the restore.
 message Hello {
-  // Must equal the verified subject.
+  // Must equal the principal's subject.
   string gateway_id = 1;
   uint32 protocol_min = 2;
   uint32 protocol_max = 3;
@@ -206,7 +220,7 @@ message ControllerFrame {
   }
 }
 
-// The answer to Hello; `principal` echoes what the transport verified.
+// The answer to Hello; `principal` echoes the session's principal.
 message Welcome {
   uint32 protocol = 1;
   uint64 generation = 2;

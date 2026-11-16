@@ -1,9 +1,11 @@
 //! The standalone controller's run loop (design 2, 6, 8 and 10): the store,
 //! the load driver over it, the election, the gRPC listeners with their
 //! scopes, the service and the health service on each, the admin listener,
-//! readiness and the drain. The service answers `Leader`; the scopes' other
-//! call bodies arrive with the gateway, ingestion and control scope PRs, the
-//! other ingestion drivers with their move out of the gateway. In the
+//! readiness and the drain. The service answers `Leader` and a gateway's
+//! `Session`, and the run loop sweeps the gateways that are gone; the
+//! scopes' other call bodies arrive with the gateway, ingestion and control
+//! scope PRs, the other ingestion drivers with their move out of the
+//! gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process.
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
@@ -21,10 +23,12 @@
 pub mod admin;
 pub mod config;
 pub mod election;
+mod gateways;
 pub mod metrics;
 mod principal;
 pub mod readiness;
 mod service;
+mod session;
 pub mod tls;
 
 use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc};
@@ -70,9 +74,13 @@ pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The gRPC service every scope is a part of (design 8: one service, four
-/// credentialed scopes), as the health service names it. Every listener
-/// reports it `NOT_SERVING` until a scope's own call is served; `Leader` is
-/// every scope's.
+/// credentialed scopes), as the health service names it. A listener reports
+/// it `SERVING` while its replica leads, its door is open and its scope's
+/// work can be done there: on the control scope a registration is taken, on
+/// the gateway scope a decision is answered, on the ingestion scope a push is
+/// taken, on the replication scope a standby can follow. Any other listener
+/// reports it `NOT_SERVING`; `Leader` is every scope's and moves no
+/// listener's word.
 pub const SERVICE_NAME: &str = "smg.policy.v1.PolicyController";
 
 /// A controller with its listeners bound and nothing served yet.
@@ -486,6 +494,14 @@ impl Controller {
         let driver_stop = stop.subscribe();
         tasks.spawn(async move {
             driver.run(driver_stop).await;
+            Ok(())
+        });
+        // The presence sweep: what a gateway held is let go once its grace
+        // period ended with no new `Hello`.
+        let gateways = Arc::clone(&shared.gateways);
+        let sweep_stop = stop.subscribe();
+        tasks.spawn(async move {
+            gateways.run(sweep_stop).await;
             Ok(())
         });
         let app = admin::router(admin::Admin {
