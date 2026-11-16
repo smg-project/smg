@@ -35,7 +35,7 @@ use std::{
 };
 
 use engines::cpu_seconds;
-use fleet::{within, Harness, Shape, DIAL_TIMEOUT, POLL_INTERVAL, PROBE_INTERVAL, ROOM};
+use fleet::{within, DialEnd, Harness, Shape, DIAL_TIMEOUT, POLL_INTERVAL, PROBE_INTERVAL, ROOM};
 use net::vm_rss_kib;
 use smg_policy_controller::{
     store::WorkerStatus,
@@ -253,7 +253,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
 
         // The hang. An engine that stops answering with its sockets open
         // costs a probe turn its dial bound and no more: that turn writes
-        // the engine's row not ready, and no other row moves.
+        // the engine's row not ready, and no live row moves.
         let hung = engines[2];
         let hang = Instant::now();
         harness.hang(hung).expect("the hang");
@@ -284,6 +284,56 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 .collect::<Vec<_>>(),
             [(WorkerStatus::Ready, WorkerStatus::NotReady)],
             "one verdict for the hung engine's one rank: {moved:?}"
+        );
+        // That turn went on to every engine after the hung one, and from
+        // the hang on no live row moved.
+        let turn = moved[0].turn;
+        within("the turn that waited out the bound ends", ROOM, || {
+            harness.dialed(turn).len() == FLEET.len()
+        })
+        .await
+        .expect("the turn goes on");
+        assert_eq!(
+            harness.dialed(turn),
+            [
+                (engines[0], DialEnd::Answered(true)),
+                (busy, DialEnd::Answered(true)),
+                (hung, DialEnd::TimedOut),
+                (engines[3], DialEnd::Answered(true)),
+                (dead, DialEnd::Failed),
+            ],
+            "the turn that waited out the bound went on to every engine"
+        );
+        let others: Vec<_> = harness
+            .verdicts()
+            .into_iter()
+            .filter(|verdict| {
+                verdict.at >= hang && verdict.engine != hung && verdict.engine != dead
+            })
+            .collect();
+        assert!(
+            others.is_empty(),
+            "no live row moves at the hang: {others:?}"
+        );
+        // A hung engine is not a dead one: its listener still takes a
+        // connection.
+        harness
+            .connect(hung)
+            .await
+            .expect("a hung engine takes a connection");
+        // So the bound is spent on a fresh dial too: the next turn dials the
+        // hung engine anew and waits it out again.
+        within(
+            "a hung engine is dialed again",
+            2 * (PROBE_INTERVAL + DIAL_TIMEOUT) + ROOM,
+            || harness.ends(hung, turn).len() >= 2,
+        )
+        .await
+        .expect("the next turn dials the hung engine");
+        assert_eq!(
+            harness.ends(hung, turn)[..2],
+            [DialEnd::TimedOut, DialEnd::TimedOut],
+            "each dial of a hung engine waits out its bound"
         );
 
         // The Numbers: one process holds the controller, the engines and

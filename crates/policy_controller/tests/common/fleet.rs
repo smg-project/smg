@@ -127,6 +127,8 @@ pub struct Death {
 /// process's do.
 struct Engine {
     endpoint: String,
+    /// Where its listener is bound.
+    addr: SocketAddr,
     kill: Option<oneshot::Sender<()>>,
     /// Its sender drops when the engine's thread ends, the runtime gone: a
     /// wait on it is bounded, where a join of the thread is not.
@@ -151,12 +153,31 @@ struct Turns {
     verdicts: Mutex<Vec<Verdict>>,
 }
 
-/// What one dial of an engine heard.
+/// How one dial of an engine ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialEnd {
+    /// The engine's wire answered: healthy or not.
+    Answered(bool),
+    /// The dial failed inside its bound: a refused connection, a broken
+    /// one.
+    Failed,
+    /// Nothing came within [`DIAL_TIMEOUT`]: the bound ended the dial.
+    TimedOut,
+}
+
+impl DialEnd {
+    /// Whether the engine answered healthy.
+    fn healthy(self) -> bool {
+        self == Self::Answered(true)
+    }
+}
+
+/// One dial of an engine: the turn that dialed it and how it ended.
 #[derive(Clone, Copy, Debug)]
 struct Dialed {
     engine: usize,
     turn: u64,
-    healthy: bool,
+    end: DialEnd,
 }
 
 /// An engine as the stand-in prober dials it: its address and the rows its
@@ -271,15 +292,19 @@ fn serve_engine(
         if bound.send(Ok(addr)).is_err() {
             return;
         }
+        // Held outside the select: a branch's future is dropped before its
+        // arm runs, and this one owns the listener, which a hang keeps.
+        let mut serving = std::pin::pin!(mock_worker::grpc::serve_with_listener_until(
+            config,
+            listener,
+            std::future::pending(),
+        ));
         tokio::select! {
-            () = mock_worker::grpc::serve_with_listener_until(
-                config,
-                listener,
-                std::future::pending(),
-            ) => {}
+            () = &mut serving => {}
             _ = killed => {}
             Ok(release) = hung => {
-                // The thread stops here, and the runtime with it.
+                // The thread stops here, and the runtime with it; the
+                // serving future, the listener in it, is still held.
                 let _ = release.recv();
             }
         }
@@ -312,6 +337,7 @@ async fn start_engine(ranks: u16) -> Result<Engine, String> {
     .map_err(|error| error.to_string())?;
     Ok(Engine {
         endpoint: format!("http://{addr}"),
+        addr,
         kill: Some(kill),
         ended: Some(ended),
         witness: Some(witness),
@@ -320,10 +346,10 @@ async fn start_engine(ranks: u16) -> Result<Engine, String> {
     })
 }
 
-/// What one dial of an engine heard: its wire's health answer, or `false`
-/// when none came within [`DIAL_TIMEOUT`]. The connection is kept across
-/// turns and dropped at a failure, so the next turn dials anew.
-async fn dial(clients: &mut HashMap<String, VllmEngineClient>, endpoint: &str) -> bool {
+/// How one dial of an engine ended: its wire's health answer, a failure,
+/// or nothing within [`DIAL_TIMEOUT`]. The connection is kept across turns
+/// and dropped when no answer came, so the next turn dials anew.
+async fn dial(clients: &mut HashMap<String, VllmEngineClient>, endpoint: &str) -> DialEnd {
     let kept = clients.get(endpoint).cloned();
     let asked = tokio::time::timeout(DIAL_TIMEOUT, async {
         let client = match kept {
@@ -337,11 +363,15 @@ async fn dial(clients: &mut HashMap<String, VllmEngineClient>, endpoint: &str) -
     match asked {
         Ok(Some((client, healthy))) => {
             clients.insert(endpoint.to_owned(), client);
-            healthy
+            DialEnd::Answered(healthy)
         }
-        Ok(None) | Err(_) => {
+        Ok(None) => {
             clients.remove(endpoint);
-            false
+            DialEnd::Failed
+        }
+        Err(_) => {
+            clients.remove(endpoint);
+            DialEnd::TimedOut
         }
     }
 }
@@ -372,12 +402,9 @@ async fn probe(
             ids,
         } in engines
         {
-            let healthy = dial(&mut clients, &endpoint).await;
-            turns.dialed.lock().push(Dialed {
-                engine,
-                turn,
-                healthy,
-            });
+            let end = dial(&mut clients, &endpoint).await;
+            let healthy = end.healthy();
+            turns.dialed.lock().push(Dialed { engine, turn, end });
             for id in ids {
                 let Some(row) = store.get(id) else { continue };
                 // A verdict is pushed under the lock its write was made
@@ -651,10 +678,12 @@ impl Harness {
         else {
             return Err(format!("engine {engine} is dead already"));
         };
-        slot.hang = None;
-        slot.release = None;
+        // Both are read before a hung engine is let go: its release runs
+        // the thread to its end.
         let at = Instant::now();
         let asked = self.turns.begun.load(Ordering::SeqCst);
+        slot.hang = None;
+        slot.release = None;
         drop(kill);
         // The sender's drop is the thread's end: the wait ends on the error.
         let _ = bounded("a killed engine's thread ends", ROOM, ended).await?;
@@ -698,8 +727,49 @@ impl Harness {
             .dialed
             .lock()
             .iter()
-            .find(|dial| dial.engine == engine && dial.turn >= turn && !dial.healthy)
+            .find(|dial| dial.engine == engine && dial.turn >= turn && !dial.end.healthy())
             .map(|dial| dial.turn)
+    }
+
+    /// The dials of the turn numbered `turn` so far, in the order dialed:
+    /// each engine, and how its dial ended.
+    pub fn dialed(&self, turn: u64) -> Vec<(usize, DialEnd)> {
+        self.turns
+            .dialed
+            .lock()
+            .iter()
+            .filter(|dial| dial.turn == turn)
+            .map(|dial| (dial.engine, dial.end))
+            .collect()
+    }
+
+    /// How the dials of the engine at `engine` ended, from the turn
+    /// numbered `turn` on, in the order dialed.
+    pub fn ends(&self, engine: usize, turn: u64) -> Vec<DialEnd> {
+        self.turns
+            .dialed
+            .lock()
+            .iter()
+            .filter(|dial| dial.engine == engine && dial.turn >= turn)
+            .map(|dial| dial.end)
+            .collect()
+    }
+
+    /// Opens a connection to the engine at `engine` and closes it: an
+    /// engine that listens takes it, though it answers nothing.
+    pub async fn connect(&self, engine: usize) -> Result<(), String> {
+        let slot = self
+            .engines
+            .get(engine)
+            .ok_or_else(|| format!("no engine {engine}"))?;
+        bounded(
+            "an engine takes a connection",
+            ROOM,
+            TcpStream::connect(slot.addr),
+        )
+        .await?
+        .map(drop)
+        .map_err(|error| error.to_string())
     }
 
     /// The statuses the stand-in prober moved so far, in the order written.
