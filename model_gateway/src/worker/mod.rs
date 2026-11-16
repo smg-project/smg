@@ -19,7 +19,7 @@ pub use health::liveness::configure_from as configure_liveness;
 pub use health::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets},
-    manager::WorkerManager,
+    manager::{WorkerJobs, WorkerManager},
     overload::OverloadThresholds,
     resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES},
 };
