@@ -171,7 +171,7 @@
       "type": "object",
       "properties": {
         "filter": {
-          "description": "The hard filters, in order.",
+          "description": "The hard filters, in order. Which workers the hard filters keep does\nnot turn on their order; a shed's reason does: a shed names the\nfirst filter, in this order, that left nobody.",
           "type": "array",
           "items": {
             "type": "string"

@@ -51,6 +51,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{Map, Value};
 
 mod classic {
+    pub mod all_vetoed;
     pub mod encode_pair;
     pub mod manual;
     pub mod overload;
@@ -87,12 +88,46 @@ struct Owed {
 }
 
 /// The owed rows. The classic manual policy keeps a key's pins apart under
-/// each role of a pair; here a sessions rule runs under the single plan.
-const OWED: &[Owed] = &[Owed {
-    row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
-    refused: "sessions run under the single plan",
-    by: "sessions on the sides of a pair, which read the pair's partner lists",
-}];
+/// each role of a pair; here a sessions rule runs under the single plan. The
+/// gateway answers a pool over its thresholds on every worker by one rule
+/// under each of its policies; one of them has no preset here yet. A
+/// request placed by its routing key on the hash ring keeps its worker over
+/// the thresholds there; its rows are refused by their module until a key
+/// keeps its ring worker here ([`ring`]).
+const OWED: &[Owed] = &[
+    Owed {
+        row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
+        refused: "sessions run under the single plan",
+        by: "sessions on the sides of a pair, which read the pair's partner lists",
+    },
+    Owed {
+        row: "bucket-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
+        refused: r#"unknown preset "bucket""#,
+        by: "the bucket preset",
+    },
+    Owed {
+        row: "bucket-a-pool-over-on-every-worker-is-shed-under-shedding",
+        refused: r#"unknown preset "bucket""#,
+        by: "the bucket preset",
+    },
+    ring("consistent-hashing-a-key-keeps-its-worker-over-its-thresholds-beside-free-workers"),
+    ring("consistent-hashing-a-key-keeps-its-worker-with-every-worker-over"),
+    ring("consistent-hashing-a-key-leaves-its-worker-over-its-thresholds-under-shedding"),
+    ring("consistent-hashing-a-key-is-shed-with-every-worker-over-under-shedding"),
+    ring("consistent-hashing-a-key-passes-to-the-next-member-when-its-worker-is-down"),
+    ring("consistent-hashing-a-retry-that-tried-the-keys-worker-passes-the-key-on"),
+    ring("consistent-hashing-a-key-keeps-its-worker-when-the-next-member-is-over-too"),
+    ring("consistent-hashing-a-key-passes-to-a-next-member-over-its-thresholds-when-its-worker-is-down"),
+];
+
+/// A ring row of the all-vetoed sheet, owed in its module's words.
+const fn ring(row: &'static str) -> Owed {
+    Owed {
+        row,
+        refused: classic::all_vetoed::RING_ROW,
+        by: "the change that keeps a session key on its ring worker",
+    }
+}
 
 /// A sheet of the directory whose module has not landed here: `policy`
 /// is its head's, and `by` names the change that brings the module. The
@@ -107,16 +142,10 @@ struct OwedSheet {
 
 /// The owed sheets: each was recorded before the change that replays it
 /// landed here.
-const OWED_SHEETS: &[OwedSheet] = &[
-    OwedSheet {
-        policy: "all_vetoed",
-        by: "the rule that answers a pool the overload veto empties",
-    },
-    OwedSheet {
-        policy: "pair-select",
-        by: "the placement of a prefill and decode pair",
-    },
-];
+const OWED_SHEETS: &[OwedSheet] = &[OwedSheet {
+    policy: "pair-select",
+    by: "the placement of a prefill and decode pair",
+}];
 
 /// The owed sheet of a policy, when one is owed.
 fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
@@ -223,16 +252,6 @@ fn replay_rows<R: Recorded>(text: &str, source: &str) -> (usize, Vec<String>) {
     (sheet.rows.len(), defects)
 }
 
-/// The names of the rows of one policy's sheet.
-fn row_names<R: Recorded>(text: &str) -> Vec<String> {
-    let sheet: Rows<R> = serde_json::from_str(text).expect("a sheet of rows");
-    sheet
-        .rows
-        .iter()
-        .map(|row| row.name().to_string())
-        .collect()
-}
-
 /// A sheet's head: the commit its rows were recorded from, and the classic
 /// policy they record, which names the module that replays them.
 #[derive(Debug, Deserialize)]
@@ -274,7 +293,8 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-const MODULES: [Module; 6] = [
+const MODULES: [Module; 7] = [
+    module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     Module {
         policy: classic::encode_pair::POLICY,
         inline: classic::encode_pair::INLINE,
@@ -543,6 +563,13 @@ fn the_classic_power_of_two_rows_replay_pick_for_pick_and_share_for_share() {
 }
 
 #[test]
+fn the_classic_all_vetoed_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::all_vetoed::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
 fn the_classic_encode_pair_rows_replay_the_stores_part_list_for_list() {
     let (rows, defects) = replay_sheet(classic::encode_pair::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
@@ -587,10 +614,18 @@ fn a_sheet_owed_its_module_replays_no_row_and_is_no_defect() {
         );
         assert_eq!(replay_sheet(&text, "owed.json"), (0, Vec::new()));
     }
+    // The table's first entry, whichever sheet it is: a module that lands
+    // takes its entry out and moves no line of this case.
+    let Some(owed) = OWED_SHEETS.first() else {
+        return;
+    };
     let mut sheets = copied_sheets();
     sheets.push((
         "owed.json".to_string(),
-        r#"{"recorded_from": "a commit", "policy": "all_vetoed", "rows": []}"#.to_string(),
+        format!(
+            r#"{{"recorded_from": "a commit", "policy": "{}", "rows": []}}"#,
+            owed.policy
+        ),
     ));
     let (lines, defects) = replay_report(&sheets);
     assert_eq!(defects, Vec::<String>::new());
@@ -603,11 +638,14 @@ fn a_sheet_owed_its_module_replays_no_row_and_is_no_defect() {
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("owed all_vetoed: owed.json waits for ")),
+            .any(|line| line.starts_with(&format!("owed {}: owed.json waits for ", owed.policy))),
         "{lines:#?}"
     );
-    let unnamed = r#"{"recorded_from": "", "policy": "all_vetoed", "rows": []}"#;
-    let (_, defects) = replay_sheet(unnamed, "owed.json");
+    let unnamed = format!(
+        r#"{{"recorded_from": "", "policy": "{}", "rows": []}}"#,
+        owed.policy
+    );
+    let (_, defects) = replay_sheet(&unnamed, "owed.json");
     assert!(
         matches!(defects.as_slice(), [one] if one.contains("no commit")),
         "{defects:#?}"
@@ -658,7 +696,15 @@ fn an_owed_policy_with_no_sheet_is_a_defect_and_so_is_a_second_sheet() {
 /// that it is still refused, the copied rows' replay beside the whole one.
 #[test]
 fn every_owed_row_is_an_inline_row() {
-    let inline = row_names::<classic::manual::Row>(classic::manual::INLINE);
+    // The names as written: a module's rows need not pick to be named.
+    let inline: Vec<String> = MODULES
+        .iter()
+        .flat_map(|module| {
+            let written: Written = serde_json::from_str(module.inline).expect("inline rows");
+            written.rows
+        })
+        .filter_map(|row| row.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
     for owed in OWED {
         assert!(inline.iter().any(|name| name == owed.row), "{}", owed.row);
     }
@@ -819,21 +865,20 @@ fn a_policy_with_no_sheet_is_a_defect_and_so_is_a_second_sheet() {
         "{of_sheet:#?}"
     );
     assert_eq!(unheld, Vec::<String>::new());
-    let (_, unheld) = replay_sheets(sheets.get(..1).expect("the first sheet"));
+    // The table's first and last policies, whichever modules it holds.
+    let first = MODULES.first().expect("a module").policy;
+    let last = MODULES.last().expect("a module").policy;
+    let (_, kept) = sheets.split_last().expect("a sheet a module");
+    let (_, unheld) = replay_sheets(kept);
     assert!(
-        matches!(unheld.as_slice(), [one, other, third, fourth, last]
-            if one.starts_with("no sheet of manual")
-                && other.starts_with("no sheet of overload")
-                && third.starts_with("no sheet of pair-index")
-                && fourth.starts_with("no sheet of power_of_two")
-                && last.starts_with("no sheet of prefix_hash")),
+        matches!(unheld.as_slice(), [one] if one.starts_with(&format!("no sheet of {last}"))),
         "{unheld:#?}"
     );
     let mut twice = sheets.clone();
     twice.extend(sheets.first().cloned());
     let (_, unheld) = replay_sheets(&twice);
     assert!(
-        matches!(unheld.as_slice(), [one] if one.starts_with("2 sheets of encode_pair")),
+        matches!(unheld.as_slice(), [one] if one.starts_with(&format!("2 sheets of {first}"))),
         "{unheld:#?}"
     );
     // A sheet that lacks a copied row answers for it.
@@ -988,6 +1033,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
         names,
         [
             "a_second_name.json",
+            "all_vetoed.json",
             "broken.json",
             "encode_pair.json",
             "manual.json",
@@ -1021,72 +1067,79 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
 #[test]
 fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     let sheets = copied_sheets();
-    let (encode_pair, _) = replay_sheet(classic::encode_pair::INLINE, "the inline rows");
-    let (manual, _) = replay_sheet(classic::manual::INLINE, "the inline rows");
-    let (overload, _) = replay_sheet(classic::overload::INLINE, "the inline rows");
-    let (pair_index, _) = replay_sheet(classic::pair_index::INLINE, "the inline rows");
-    let (power_of_two, _) = replay_sheet(classic::power_of_two::INLINE, "the inline rows");
-    let (prefix_hash, _) = replay_sheet(classic::prefix_hash::INLINE, "the inline rows");
+    // Each module's policy and the rows of its copied sheet, in the table's
+    // order: a module more moves no line of this case.
+    let counted: Vec<(&str, usize)> = MODULES
+        .iter()
+        .map(|module| {
+            let (rows, _) = replay_sheet(module.inline, "the inline rows");
+            (module.policy, rows)
+        })
+        .collect();
+    let (first, _) = *counted.first().expect("a module");
+    let (last, kept_counted) = counted.split_last().expect("a module");
+    // The sheet this case changes last is the manual policy's, wherever the
+    // table holds it.
+    let manual_at = counted
+        .iter()
+        .position(|(policy, _)| *policy == "manual")
+        .expect("the manual module");
+    // The report's lines over the copied sheets, that sheet answering
+    // for `found` defects and every other for none.
+    let lines_with = |found: usize| -> Vec<String> {
+        let of = |at: usize| if at == manual_at { found } else { 0 };
+        let sheet_lines = counted
+            .iter()
+            .enumerate()
+            .map(|(at, (policy, rows))| format!("{policy}.json: {rows} rows, {} defects", of(at)));
+        let policy_lines = counted.iter().enumerate().map(|(at, (policy, rows))| {
+            format!("policy {policy}: {rows} rows, {} defects", of(at))
+        });
+        sheet_lines.chain(policy_lines).collect()
+    };
     let (lines, defects) = replay_report(&sheets);
-    assert_eq!(
-        lines,
-        [
-            format!("encode_pair.json: {encode_pair} rows, 0 defects"),
-            format!("manual.json: {manual} rows, 0 defects"),
-            format!("overload.json: {overload} rows, 0 defects"),
-            format!("pair-index.json: {pair_index} rows, 0 defects"),
-            format!("power_of_two.json: {power_of_two} rows, 0 defects"),
-            format!("prefix_hash.json: {prefix_hash} rows, 0 defects"),
-            format!("policy encode_pair: {encode_pair} rows, 0 defects"),
-            format!("policy manual: {manual} rows, 0 defects"),
-            format!("policy overload: {overload} rows, 0 defects"),
-            format!("policy pair-index: {pair_index} rows, 0 defects"),
-            format!("policy power_of_two: {power_of_two} rows, 0 defects"),
-            format!("policy prefix_hash: {prefix_hash} rows, 0 defects"),
-        ]
-    );
+    assert_eq!(lines, lines_with(0));
     assert_eq!(defects, Vec::<String>::new());
 
-    let (lines, defects) = replay_report(sheets.get(..1).expect("the first sheet"));
-    assert_eq!(
-        lines,
-        [
-            format!("encode_pair.json: {encode_pair} rows, 0 defects"),
-            format!("policy encode_pair: {encode_pair} rows, 0 defects"),
-            "policy manual: no sheet".to_string(),
-            "policy overload: no sheet".to_string(),
-            "policy pair-index: no sheet".to_string(),
-            "policy power_of_two: no sheet".to_string(),
-            "policy prefix_hash: no sheet".to_string(),
-        ]
+    // Without its sheet the table's last policy has none.
+    let (_, kept) = sheets.split_last().expect("a sheet a module");
+    let (lines, defects) = replay_report(kept);
+    let mut expected: Vec<String> = kept_counted
+        .iter()
+        .map(|(policy, rows)| format!("{policy}.json: {rows} rows, 0 defects"))
+        .collect();
+    expected.extend(
+        kept_counted
+            .iter()
+            .map(|(policy, rows)| format!("policy {policy}: {rows} rows, 0 defects")),
     );
+    expected.push(format!("policy {}: no sheet", last.0));
+    assert_eq!(lines, expected);
     assert!(
-        matches!(defects.as_slice(), [one, other, third, fourth, last]
-            if one.starts_with("no sheet of manual")
-                && other.starts_with("no sheet of overload")
-                && third.starts_with("no sheet of pair-index")
-                && fourth.starts_with("no sheet of power_of_two")
-                && last.starts_with("no sheet of prefix_hash")),
+        matches!(defects.as_slice(), [one] if one.starts_with(&format!("no sheet of {}", last.0))),
         "{defects:#?}"
     );
 
+    // A second sheet of the first policy: its line is the first policy line,
+    // behind a line a sheet.
     let mut twice = sheets.clone();
     twice.extend(sheets.first().cloned());
     let (lines, defects) = replay_report(&twice);
     assert_eq!(
-        lines.get(7).map(String::as_str),
-        Some("policy encode_pair: 2 sheets")
+        lines.get(twice.len()).map(String::as_str),
+        Some(format!("policy {first}: 2 sheets").as_str())
     );
     assert!(
-        matches!(defects.as_slice(), [one] if one.starts_with("2 sheets of encode_pair")),
+        matches!(defects.as_slice(), [one] if one.starts_with(&format!("2 sheets of {first}"))),
         "{defects:#?}"
     );
 
+    // A text that is no sheet has the last sheet line.
     let mut broken = sheets.clone();
     broken.push(("broken.json".to_string(), "no sheet".to_string()));
     let (lines, defects) = replay_report(&broken);
     assert_eq!(
-        lines.get(6).map(String::as_str),
+        lines.get(sheets.len()).map(String::as_str),
         Some("broken.json: 0 rows, 1 defects")
     );
     assert!(
@@ -1123,24 +1176,7 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
                 .all(|defect| defect.starts_with("manual.json")),
         "{defects:#?}"
     );
-    let found = defects.len();
-    assert_eq!(
-        lines,
-        [
-            format!("encode_pair.json: {encode_pair} rows, 0 defects"),
-            format!("manual.json: {manual} rows, {found} defects"),
-            format!("overload.json: {overload} rows, 0 defects"),
-            format!("pair-index.json: {pair_index} rows, 0 defects"),
-            format!("power_of_two.json: {power_of_two} rows, 0 defects"),
-            format!("prefix_hash.json: {prefix_hash} rows, 0 defects"),
-            format!("policy encode_pair: {encode_pair} rows, 0 defects"),
-            format!("policy manual: {manual} rows, {found} defects"),
-            format!("policy overload: {overload} rows, 0 defects"),
-            format!("policy pair-index: {pair_index} rows, 0 defects"),
-            format!("policy power_of_two: {power_of_two} rows, 0 defects"),
-            format!("policy prefix_hash: {prefix_hash} rows, 0 defects"),
-        ]
-    );
+    assert_eq!(lines, lines_with(defects.len()));
 }
 
 /// The whole replay, over the sheets beside this target: every row of each

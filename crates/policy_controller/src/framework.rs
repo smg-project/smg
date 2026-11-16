@@ -21,6 +21,10 @@ use crate::{
     Draw,
 };
 
+mod vetoed;
+
+use vetoed::AllVetoed;
+
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
 /// leave nothing: the engines a retry already tried step aside while another
 /// candidate remains, and a pool with nothing else is used whole.
@@ -785,9 +789,14 @@ fn filter(
 
 /// The single plan's opening for a request a sessions rule pins or places:
 /// the profile's filters over the whole pool, the survivors left in
-/// `buf.kept`. `Some` is the shed, when a filter leaves nobody
-/// ([`single_emptied`]).
+/// `buf.kept`. `Some` is the plan's answer when a filter leaves nobody
+/// ([`opening_emptied`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the profile run's inputs and the engine"
+)]
 fn single_survivors(
+    engine: &Engine,
     profile: &Profile,
     index: u16,
     facts: &RequestFacts<'_>,
@@ -803,14 +812,43 @@ fn single_survivors(
         encode: false,
     };
     let emptied_by = filter(profile, facts, cx, buf, set)?;
-    Some(single_emptied(index, facts, pool, candidates, emptied_by))
+    Some(opening_emptied(
+        engine, index, facts, pool, candidates, emptied_by, cx, buf,
+    ))
+}
+
+/// The answer of an opening whose filters left nobody: the plan's shed
+/// ([`single_emptied`]), put to the binding's all-vetoed rule
+/// ([`Engine::emptied_single`]), the two steps a plain pass takes in its
+/// own text ([`run_single`]). An opening takes them in one cold call out of
+/// line: its decision goes on to a pin or an assignment, and by the
+/// instruction count that path is shorter with this branch outside it.
+#[cold]
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the emptied pass's inputs and the engine"
+)]
+fn opening_emptied(
+    engine: &Engine,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    emptied_by: &'static str,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let shed = single_emptied(index, facts, pool, candidates, emptied_by);
+    engine.emptied_single(shed, facts, pool, candidates, cx, buf)
 }
 
 /// What the single plan decides over a pool its filter half emptied: the
 /// shed that names the stage. Every path of the plan ends here when a stage
 /// leaves nobody, a plain request ([`run_single`]) and the two a sessions
-/// rule or an assignment places ([`single_survivors`]): what the plan asks
-/// of an emptied pool has this one home.
+/// rule or an assignment places ([`single_survivors`], by
+/// [`opening_emptied`]): what the plan asks of an emptied pool has this one
+/// home.
 fn single_emptied(
     index: u16,
     facts: &RequestFacts<'_>,
@@ -1077,10 +1115,18 @@ fn run_profile(
 /// The single plan's whole pass for a plain request (an `epd` plan's encode
 /// item among them, its rules in `set`): the filter half of the profile's
 /// run, then the scoring half; a pool the filters emptied ends in the
-/// plan's one home for it ([`single_emptied`]). Inlined, as the profile's
-/// run was in the decision before a draw could stand in front of it.
+/// plan's one home for it ([`single_emptied`]), and that shed is put to
+/// the binding's all-vetoed rule ([`Engine::emptied_single`]): the pass
+/// takes the engine for that branch and carries nothing else of the rule.
+/// Inlined, as the profile's run was in the decision before a draw could
+/// stand in front of it.
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the profile run's inputs and the engine"
+)]
 fn run_single(
+    engine: &Engine,
     profile: &Profile,
     index: u16,
     facts: &RequestFacts<'_>,
@@ -1091,7 +1137,8 @@ fn run_single(
 ) -> Decision {
     let candidates = set.candidates;
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        return single_emptied(index, facts, pool, candidates, emptied_by);
+        let shed = single_emptied(index, facts, pool, candidates, emptied_by);
+        return engine.emptied_single(shed, facts, pool, candidates, cx, buf);
     }
     score_survivors(profile, index, facts, pool, candidates, buf)
 }
@@ -1171,7 +1218,8 @@ fn order_joined(
 /// ([`Picker::joined_by_named`]), the rows a host named join the rows drawn
 /// before the scorers run ([`order_joined`]). A draw that keeps nobody says
 /// nothing of the pool: the decision widens to the whole pass
-/// ([`run_single`]), which alone sheds and names a stage.
+/// ([`run_single`]), which alone sheds and names a stage; the engine rides
+/// for that pass's all-vetoed rule and for nothing else.
 ///
 /// Whatever follows the draw reads the seed's stream past the values the
 /// draw read. The stream is continued, never restarted: a pass behind
@@ -1182,6 +1230,10 @@ fn order_joined(
 /// Out of line, so a decision that draws nothing keeps the engine's decision
 /// path as it was.
 #[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the profile run's inputs and the engine"
+)]
 fn run_drawn(
     profile: &Profile,
     index: u16,
@@ -1190,6 +1242,7 @@ fn run_drawn(
     set: Set<'_>,
     cx: &Constraints<'_>,
     buf: &mut Buffers,
+    engine: &Engine,
 ) -> Decision {
     let candidates = set.candidates;
     buf.reserve(candidates.len());
@@ -1265,7 +1318,7 @@ fn run_drawn(
             });
         }
     }
-    let mut decision = run_single(profile, index, after, pool, set, cx, buf);
+    let mut decision = run_single(engine, profile, index, after, pool, set, cx, buf);
     match &mut decision {
         Decision::Pick(pick) => pick.trace.seed = facts.seed,
         Decision::Shed(shed) => shed.trace.seed = facts.seed,
@@ -1470,6 +1523,10 @@ struct Entry {
     /// is built, so no decision asks and the binding keeps the rule as
     /// declared.
     placing: Assignment,
+    /// What a decision of the binding does when the overload veto leaves it
+    /// no worker ([`AllVetoed`]): the document's word, or the default. Read
+    /// where a pass left nobody and nowhere else.
+    vetoed: AllVetoed,
 }
 
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
@@ -1964,6 +2021,7 @@ impl Engine {
                     .map_or(Assignment::Delegate, |rule| rule.assignment);
                 Entry {
                     placing: placed_by(declared, by_assignment),
+                    vetoed: AllVetoed::default(),
                     binding,
                 }
             })
@@ -2141,7 +2199,10 @@ impl Engine {
     }
 
     /// The first binding that matches, beside what the build derived from
-    /// it: the engine's own lookup.
+    /// it: the engine's own lookup. Always inlined: it is the head of every
+    /// decision, and its second caller (the all-vetoed rule resolves the
+    /// binding again where a pass left nobody) must not move it out of line.
+    #[inline(always)]
     fn entry(&self, model: &str, phase: Phase) -> Option<&Entry> {
         self.bindings
             .iter()
@@ -2156,8 +2217,11 @@ impl Engine {
     }
 
     /// The binding a request resolves to, with its profile for the phase: one
-    /// walk of the bindings per decision; `None` when no binding matches or
-    /// the binding's plan has no side for the phase.
+    /// walk of the bindings per decision, and a second where a pass left
+    /// nobody; `None` when no binding matches or the binding's plan has no
+    /// side for the phase. Always inlined, as [`Self::entry`] is and for its
+    /// reason.
+    #[inline(always)]
     fn resolve(&self, model: &str, phase: Phase) -> Option<(&Entry, u16, &Profile)> {
         let entry = self.entry(model, phase)?;
         let index = profile_index(&entry.binding, phase)?;
@@ -2175,7 +2239,9 @@ impl Engine {
     /// by the rows it draws where the pool is large enough, and by the whole
     /// pass under that size or when the draw keeps nobody. A picker the rows
     /// named join ([`Picker::joined_by_named`]) draws for a request that
-    /// names rows and for no other. The request's affinity
+    /// names rows and for no other. A pass whose filters leave nobody is put
+    /// to the binding's all-vetoed rule: the request goes to the least-vetoed
+    /// worker, or is shed where the binding says so. The request's affinity
     /// column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
     /// named in the column's place ([`NamedAffinity`]) are read as the host
@@ -2204,7 +2270,9 @@ impl Engine {
         let Some((entry, index, profile)) = self.resolve(facts.model, facts.phase) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
-        let Entry { binding, placing } = entry;
+        let Entry {
+            binding, placing, ..
+        } = entry;
         let marks = self.marks[usize::from(index)];
         let _opened = if marks.asks_nothing_first() {
             None
@@ -2257,9 +2325,9 @@ impl Engine {
             && candidates.len() >= DRAW_FROM
             && (draw == Marks::DRAWS_FIRST || facts.named.is_some())
         {
-            return run_drawn(profile, index, facts, pool, set, cx, buf);
+            return run_drawn(profile, index, facts, pool, set, cx, buf, self);
         }
-        run_single(profile, index, facts, pool, set, cx, buf)
+        run_single(self, profile, index, facts, pool, set, cx, buf)
     }
 
     /// A keyed decision under a sessions rule (design 4.6 and the host's
@@ -2289,8 +2357,10 @@ impl Engine {
         scratch: &mut Scratch,
     ) -> Decision {
         let buf = &mut scratch.single;
-        if let Some(shed) = single_survivors(profile, index, facts, pool, candidates, cx, buf) {
-            return shed;
+        if let Some(answer) =
+            single_survivors(self, profile, index, facts, pool, candidates, cx, buf)
+        {
+            return answer;
         }
         let key = facts.session();
         let pins = self.sessions.lookup(key, facts.now_micros, rule);
@@ -2400,8 +2470,10 @@ impl Engine {
         scratch: &mut Scratch,
     ) -> Decision {
         let buf = &mut scratch.single;
-        if let Some(shed) = single_survivors(profile, index, facts, pool, candidates, cx, buf) {
-            return shed;
+        if let Some(answer) =
+            single_survivors(self, profile, index, facts, pool, candidates, cx, buf)
+        {
+            return answer;
         }
         self.place(profile, index, assignment, facts, pool, candidates, buf)
     }
@@ -3754,7 +3826,8 @@ mod tests {
 
     #[test]
     fn an_all_overloaded_pool_sheds_as_saturated() {
-        let engine = strict_engine();
+        let mut engine = strict_engine();
+        engine.shed_when_all_vetoed(0);
         let mut pool = [candidate(0, 1), candidate(1, 1)];
         for c in &mut pool {
             c.health.overloaded = true;
@@ -3784,7 +3857,8 @@ mod tests {
 
     #[test]
     fn a_pool_emptied_behind_the_healthy_filter_names_the_later_stage() {
-        let engine = strict_engine();
+        let mut engine = strict_engine();
+        engine.shed_when_all_vetoed(0);
         let mut pool = [candidate(0, 1), candidate(1, 1)];
         pool[0].health.healthy = false;
         pool[1].health.overloaded = true;
@@ -7078,6 +7152,7 @@ mod tests {
             .profile_for(facts.model, Phase::Single)
             .expect("a profile");
         run_single(
+            engine,
             profile,
             index,
             facts,
