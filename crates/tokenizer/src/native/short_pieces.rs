@@ -427,45 +427,38 @@ impl ShortPieceTable {
 
     /// Places the entries stored in the first `old` slots again under the
     /// current mask, in the table as it is: no second table, no copy of the
-    /// whole. Every stored slot of the old range starts pending. A pending
-    /// entry's probe from its new home walks over placed slots and stops at
-    /// the first empty or pending one: its own slot means it is placed, an
-    /// empty slot takes it (its old slot empties), a pending slot swaps
-    /// entries with it (that slot is placed, this one is pending again with
-    /// the other entry). Each step places one slot, so the pass ends. A
-    /// placed entry's probe path holds placed slots only, which never
-    /// change afterwards, and never crosses a pending slot (the probe stops
-    /// there), so every path is whole once no slot is pending.
+    /// whole. One walk lifts each stored entry and probes it in from its new
+    /// home, which is the old home or the same slot of a later block of
+    /// `old` slots (the mask grew by whole bits). The walk starts at an
+    /// empty slot, so it cuts no run in two and comes to every entry after
+    /// its old home and the slots between them. A probe therefore meets
+    /// only slots that are final. Among the old slots those are the ones
+    /// the walk has passed: the slot just lifted ends the probe at the
+    /// latest, or the old slots' end does when the entry's run wrapped
+    /// around it, and the probe runs on into the next block. In a later
+    /// block only placed entries stand, each at or before the slot that
+    /// mirrors its old one, so no probe runs off the table's end before the
+    /// walk's last stretch, the slots ahead of its start, and one that does
+    /// comes back to the first old slots when the walk has passed them.
     fn place_again(&mut self, old: usize) {
-        let mut pending = vec![0u64; old.div_ceil(64)];
-        for slot in 0..old {
-            if self.tags[slot] != EMPTY_TAG {
-                pending[slot / 64] |= 1u64 << (slot % 64);
+        let start = self.tags[..old]
+            .iter()
+            .position(|&tag| tag == EMPTY_TAG)
+            .unwrap_or(0);
+        for step in 0..old {
+            let slot = (start + step) & (old - 1);
+            let tag = self.tags[slot];
+            if tag == EMPTY_TAG {
+                continue;
             }
-        }
-        let is_pending = |pending: &[u64], slot: usize| {
-            slot < old && pending[slot / 64] & (1u64 << (slot % 64)) != 0
-        };
-        for slot in 0..old {
-            while is_pending(&pending, slot) {
-                let key = ShortPieceKey(self.entries[slot].key & KEY_MASK);
-                let (mut at, _) = self.first_slot(key);
-                while self.tags[at] != EMPTY_TAG && !is_pending(&pending, at) {
-                    at = (at + 1) & self.mask;
-                }
-                if at == slot {
-                    pending[slot / 64] &= !(1u64 << (slot % 64));
-                } else if self.tags[at] == EMPTY_TAG {
-                    self.tags[at] = self.tags[slot];
-                    self.entries[at] = self.entries[slot];
-                    self.tags[slot] = EMPTY_TAG;
-                    pending[slot / 64] &= !(1u64 << (slot % 64));
-                } else {
-                    self.tags.swap(slot, at);
-                    self.entries.swap(slot, at);
-                    pending[at / 64] &= !(1u64 << (at % 64));
-                }
+            let entry = self.entries[slot];
+            let (mut to, _) = self.first_slot(ShortPieceKey(entry.key & KEY_MASK));
+            self.tags[slot] = EMPTY_TAG;
+            while self.tags[to] != EMPTY_TAG {
+                to = (to + 1) & self.mask;
             }
+            self.tags[to] = tag;
+            self.entries[to] = entry;
         }
     }
 
@@ -843,6 +836,39 @@ mod tests {
             "made anew inside the reservation"
         );
         assert_eq!(table.slots(), ShortPieceTable::slots_for(100));
+    }
+
+    /// A run that wrapped around the old slots' end is placed again whole,
+    /// for homes that stay behind that end and for homes at the grown
+    /// table's end, where the run wraps again.
+    #[test]
+    fn a_run_wrapped_around_the_old_end_reads_back_after_growth() {
+        let grown = ShortPieceTable::for_entries(100);
+        assert_eq!(grown.slots(), 256);
+        let slot_of = |i: u32| grown.first_slot(key(&i.to_le_bytes())).0;
+        for homes in [62..=63, 254..=255] {
+            let wrapped: Vec<u32> = (0..4000)
+                .filter(|&i| homes.contains(&slot_of(i)))
+                .take(6)
+                .collect();
+            assert_eq!(wrapped.len(), 6);
+            let mut table = ShortPieceTable::new();
+            for &i in &wrapped {
+                assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
+            }
+            assert_ne!(table.tags[3], EMPTY_TAG, "the run wrapped to the start");
+            let mut stored = wrapped.clone();
+            let mut rest = (0..4000).filter(|&i| slot_of(i) % MIN_SLOTS < 62);
+            while table.slots() == MIN_SLOTS {
+                let i = rest.next().expect("pieces enough to grow the table");
+                assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
+                stored.push(i);
+            }
+            assert_eq!(table.slots(), 256);
+            for &i in &stored {
+                assert_eq!(ids_of(&table, &i.to_le_bytes()), Some(vec![i]), "{i}");
+            }
+        }
     }
 
     #[test]
