@@ -25,7 +25,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
-use openai_protocol::worker::WorkerStatus;
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use rustc_hash::FxBuildHasher;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -36,7 +36,10 @@ use crate::{
     policies::hash_ring::HashRing,
     worker::{
         health::circuit_breaker::CircuitState,
-        identity::basic::{RuntimeType, WorkerType},
+        identity::{
+            basic::{RuntimeType, WorkerType},
+            endpoint::Endpoint,
+        },
         pd::{
             pair_index::{PdPairIndex, PdWire},
             pairing::PdPairingMode,
@@ -187,6 +190,20 @@ fn serves_disaggregated_role(worker: &Arc<dyn Worker>) -> bool {
     }
 }
 
+/// The narrowest known context windows of a pool for one model id, as a
+/// membership snapshot keeps them ([`ModelWorkerSnapshot::window_floor`]):
+/// `budget` over the workers that hold a request's completion budget,
+/// `prefill` over the prefill workers, which are held to the input alone.
+/// `None` where no worker of the class is bound by a window.
+///
+/// The figure depends on the pool and on the model id as spelled, never on
+/// a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowFloor {
+    pub(crate) budget: Option<u32>,
+    pub(crate) prefill: Option<u32>,
+}
+
 /// Immutable membership snapshot. Route-specific projections are populated
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
@@ -204,6 +221,9 @@ pub(crate) struct ModelWorkerSnapshot {
     /// Whether a worker of this generation serves a Harmony model, kept from
     /// the first request's reading (see [`Self::harmony`]).
     harmony: OnceLock<bool>,
+    /// The pools' window floors, each kept with the model id it was read
+    /// for (see [`Self::window_floor`]).
+    window_floors: [OnceLock<(Box<str>, WindowFloor)>; RoutingPool::COUNT],
 }
 
 impl ModelWorkerSnapshot {
@@ -213,6 +233,7 @@ impl ModelWorkerSnapshot {
             pools: std::array::from_fn(|_| OnceLock::new()),
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
+            window_floors: std::array::from_fn(|_| OnceLock::new()),
         }
     }
 
@@ -220,14 +241,43 @@ impl ModelWorkerSnapshot {
     /// model: `decide` reads the snapshot's workers on the first request
     /// after the membership change, every request after it reads the kept
     /// answer. A registration, a removal and a property rebuild each publish
-    /// a new snapshot, so the per-worker card scans run once, not per
-    /// request. A lazy model refresh (`Worker::set_models`) rewrites a
-    /// worker's cards in place without one and is read at the next
-    /// membership change; only external workers, which the gRPC pipeline
-    /// does not serve, are refreshed today. The rule itself stays with the
-    /// router's detector.
+    /// a new snapshot, and so does a model refresh that changes a worker's
+    /// cards in place ([`WorkerRegistry::refresh_models`]), so the
+    /// per-worker card scans run once, not per request. The rule itself
+    /// stays with the router's detector.
     pub(crate) fn harmony(&self, decide: impl FnOnce(&[Arc<dyn Worker>]) -> bool) -> bool {
         *self.harmony.get_or_init(|| decide(&self.all))
+    }
+
+    /// The window floor of `pool` for `model_id`: `read` reads the pool's
+    /// workers on the first request after the membership change, every
+    /// request after it reads the kept figure. Whatever changes a card
+    /// publishes a new snapshot (see [`Self::harmony`]). The rule that reads
+    /// a worker's window stays with the pipeline's context check, as
+    /// `harmony`'s stays with the router's detector.
+    ///
+    /// The figure is kept with the model id it was read for, as spelled: a
+    /// worker answers an id by the card that matches it and, with none, by
+    /// its primary card, so another spelling can read other windows. `None`
+    /// for another spelling than the kept one: the caller then asks the
+    /// workers themselves. The gRPC router resolves an alias to its
+    /// canonical id before it selects, so a model's snapshot is read under
+    /// one spelling.
+    pub(crate) fn window_floor(
+        &self,
+        pool: RoutingPool,
+        model_id: &str,
+        read: impl FnOnce(&[Arc<dyn Worker>]) -> WindowFloor,
+    ) -> Option<WindowFloor> {
+        let workers = self.pool(pool);
+        if workers.is_empty() {
+            // Nothing to keep, whatever the spelling: the snapshot shared by
+            // every unknown model keeps no client's model id.
+            return Some(WindowFloor::default());
+        }
+        let (spelling, floor) =
+            self.window_floors[pool.index()].get_or_init(|| (model_id.into(), read(workers)));
+        (**spelling == *model_id).then_some(*floor)
     }
 
     /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
@@ -240,6 +290,7 @@ impl ModelWorkerSnapshot {
                 Arc::new(PdPairIndex::build(
                     Arc::clone(self.pool(prefill)),
                     Arc::clone(self.pool(decode)),
+                    wire,
                     mode,
                 ))
             })
@@ -298,6 +349,10 @@ type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>, FxBuildHasher>>;
 
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
+
+/// The read a conditional removal makes of the worker as it stands, under its
+/// lock ([`WorkerRegistry::remove_if`]).
+type RemovalCondition<'a> = &'a dyn Fn(&Arc<dyn Worker>) -> bool;
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -922,7 +977,7 @@ impl WorkerRegistry {
             // Saturating: a double-clear must never wrap the counter into a
             // permanent all-overloaded verdict for the model.
             entry
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_sub(1))
                 })
                 .unwrap_or(0)
@@ -1430,7 +1485,7 @@ impl WorkerRegistry {
         // Recover by clearing the stale entry and retrying full registration.
         tracing::error!(
             "register_or_replace: inconsistent state for URL {}, clearing stale entry",
-            worker.url()
+            worker.redacted_url()
         );
         self.url_to_id.remove(worker.url());
         // register() will now succeed since we cleared the entry.
@@ -1537,7 +1592,7 @@ impl WorkerRegistry {
             if current != expected {
                 tracing::warn!(
                     worker_id = %worker_id.as_str(),
-                    worker_url = old_worker.url(),
+                    worker_url = old_worker.redacted_url(),
                     expected,
                     current,
                     "Aborting replacement: worker was replaced before the lock was acquired"
@@ -1552,8 +1607,8 @@ impl WorkerRegistry {
         // URL changes are not supported via replace — use remove + register instead
         if old_worker.url() != new_worker.url() {
             tracing::error!(
-                old_url = old_worker.url(),
-                new_url = new_worker.url(),
+                old_url = old_worker.redacted_url(),
+                new_url = new_worker.redacted_url(),
                 "replace() does not support URL changes"
             );
             return false;
@@ -1568,7 +1623,7 @@ impl WorkerRegistry {
         if !new_worker.inherit_shared_state_from(&*old_worker) {
             tracing::warn!(
                 worker_id = %worker_id.as_str(),
-                worker_url = old_worker.url(),
+                worker_url = old_worker.redacted_url(),
                 "replace() did not preserve shared mutable worker state"
             );
         }
@@ -1861,6 +1916,50 @@ impl WorkerRegistry {
             .insert(model_id.to_string(), config);
     }
 
+    /// Write the model cards a refresh read for `worker`, on the same handle.
+    ///
+    /// The cards the worker holds already write nothing and publish nothing:
+    /// a refresh that repeats them leaves every answer a snapshot keeps as
+    /// it is. Other cards are stored in place, so rotations and tables keyed
+    /// by the handle stand, and each model snapshot that holds the worker is
+    /// published again over the same list, with the global one: an answer a
+    /// snapshot keeps from its workers' cards
+    /// ([`ModelWorkerSnapshot::harmony`]) is read again by the next request.
+    /// The model index stays as the registration wrote it, so the worker is
+    /// found by its handle, not by its cards.
+    ///
+    /// Returns whether the cards changed. Emits no events.
+    pub(crate) fn refresh_models(&self, worker: &Arc<dyn Worker>, models: Vec<ModelCard>) -> bool {
+        if worker.models() == models {
+            return false;
+        }
+        // Stored before the publish: a snapshot published from here on reads
+        // the new cards.
+        worker.set_models(models);
+        let holding: Vec<String> = self
+            .model_index
+            .iter()
+            .filter(|entry| entry.iter().any(|member| Arc::ptr_eq(member, worker)))
+            .map(|entry| entry.key().clone())
+            .collect();
+        // As in add_worker_to_model_index: a replaced snapshot drops after
+        // its shard guard, not under it.
+        let mut previous = Vec::with_capacity(holding.len());
+        for model_id in &holding {
+            if let Some(mut entry) = self.model_index.get_mut(model_id) {
+                let members = Arc::clone(&entry.all);
+                previous.push(std::mem::replace(
+                    &mut *entry,
+                    Arc::new(ModelWorkerSnapshot::new(members)),
+                ));
+            }
+        }
+        drop(previous);
+        let _order = self.global_membership_order.read();
+        self.bump_global_routing_epoch();
+        true
+    }
+
     /// Reserve (or retrieve) a stable UUID for a worker URL.
     ///
     /// Used by `WorkerService::create_worker()` to return a worker ID in
@@ -1896,19 +1995,36 @@ impl WorkerRegistry {
     /// mutation lock for the whole teardown so it cannot race a
     /// concurrent `replace()`.
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
-        self.remove_inner(worker_id, None)
+        self.remove_inner(worker_id, None, None)
     }
 
-    /// Core removal shared by [`Self::remove`] and [`Self::remove_remote`].
-    /// When `expect_origin` is set, the origin is re-checked after the
-    /// per-worker mutation lock is acquired and the removal aborts on a
-    /// mismatch — a lock-free pre-check alone races `replace_inner`'s
-    /// promotion (check Mesh, block on the lock, promotion lands, then
-    /// delete a now locally-owned worker).
+    /// Remove the worker only while `condition` reads true of the worker as
+    /// it stands, the read and the removal under the same per-worker lock.
+    /// The removal workflow's final step removes the incarnation it drained
+    /// (the pinned revision, or a rebuild of it that still reads `Draining`:
+    /// that state is the removal's own mark, inherited through a rebuild
+    /// nothing re-activated) and leaves a replacement that stands on its own.
+    /// Returns `None` when the worker is gone or the condition reads false.
+    pub fn remove_if<F>(&self, worker_id: &WorkerId, condition: F) -> Option<Arc<dyn Worker>>
+    where
+        F: Fn(&Arc<dyn Worker>) -> bool,
+    {
+        self.remove_inner(worker_id, None, Some(&condition))
+    }
+
+    /// Core removal shared by [`Self::remove`], [`Self::remove_remote`] and
+    /// [`Self::remove_if`]. When `expect_origin` is set, the origin is
+    /// re-checked after the per-worker mutation lock is acquired and the
+    /// removal aborts on a mismatch — a lock-free pre-check alone races
+    /// `replace_inner`'s promotion (check Mesh, block on the lock, promotion
+    /// lands, then delete a now locally-owned worker). When `condition` is
+    /// set, it is read from the worker under the same lock and the removal
+    /// returns `None` unless it holds.
     fn remove_inner(
         &self,
         worker_id: &WorkerId,
         expect_origin: Option<WorkerOrigin>,
+        condition: Option<RemovalCondition<'_>>,
     ) -> Option<Arc<dyn Worker>> {
         // Acquire the same per-worker lock used by replace() to prevent
         // remove racing with a concurrent replace that has already snapshot
@@ -1919,6 +2035,16 @@ impl WorkerRegistry {
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
+
+        if let Some(condition) = condition {
+            let holds = self
+                .workers
+                .get(worker_id)
+                .map(|entry| condition(entry.value()));
+            if holds != Some(true) {
+                return None;
+            }
+        }
 
         if let Some(expected) = expect_origin {
             if self.origin_of(worker_id) != Some(expected) {
@@ -2035,7 +2161,9 @@ impl WorkerRegistry {
     /// `None` if the id is unknown or locally owned.
     pub fn remove_remote(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         match self.origin_of(worker_id) {
-            Some(WorkerOrigin::Mesh) => self.remove_inner(worker_id, Some(WorkerOrigin::Mesh)),
+            Some(WorkerOrigin::Mesh) => {
+                self.remove_inner(worker_id, Some(WorkerOrigin::Mesh), None)
+            }
             Some(WorkerOrigin::Local) => {
                 tracing::warn!(
                     worker_id = %worker_id.as_str(),
@@ -2148,7 +2276,7 @@ impl WorkerRegistry {
                     model_id = %model_id,
                     worker_type = %worker_type,
                     connection_mode = %ConnectionMode::Grpc,
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     observed_values = ?values,
                     "Divergent default sampling params reported by workers in the same routing group"
                 );
@@ -2655,7 +2783,9 @@ impl WorkerRegistry {
             return;
         }
         // The warm-up slice (cache_aware) counts from here.
-        worker.note_admitted();
+        if let Some(state) = worker.runtime_state() {
+            state.note_admitted();
+        }
         // A worker promoted to Ready does not wait out its circuit breaker's
         // timeout: the failures that opened the breaker belong to the outage
         // its probes just saw end. An open breaker goes half-open now, so
@@ -2770,7 +2900,7 @@ impl WorkerRegistry {
         // this guard also covers peers running older builds.
         if ConnectionMode::from_url(&state.url) == Some(ConnectionMode::Zmq) {
             tracing::debug!(
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 "Ignoring mesh state for host-local ZMQ worker"
             );
             return;
@@ -2792,7 +2922,7 @@ impl WorkerRegistry {
             // local health state machine is the single writer.
             if self.origin_of(&existing_id) == Some(WorkerOrigin::Local) {
                 tracing::debug!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     "Ignoring mesh state for locally-owned worker"
                 );
                 return;
@@ -2825,7 +2955,7 @@ impl WorkerRegistry {
                         if self.replace_inner(&existing_id, replacement, None, None, Some(record)) {
                             tracing::info!(
                                 worker_id = %existing_id.as_str(),
-                                url = %state.url,
+                                url = %Endpoint::redacted_str(&state.url),
                                 model = %state.model_id,
                                 version = state.version,
                                 "Rebuilt mesh-synced worker from its owner's replacement"
@@ -2847,7 +2977,7 @@ impl WorkerRegistry {
                     PublishedSpec::Undecodable(err) => {
                         tracing::warn!(
                             worker_id = %existing_id.as_str(),
-                            url = %state.url,
+                            url = %Endpoint::redacted_str(&state.url),
                             version = state.version,
                             %err,
                             "the owner's replacement of a mesh-synced worker carries a spec this node cannot decode"
@@ -2883,7 +3013,7 @@ impl WorkerRegistry {
             });
             if outcome.is_some() {
                 tracing::debug!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     healthy = state.health,
                     "Updated health for existing mesh-synced worker"
                 );
@@ -2902,7 +3032,7 @@ impl WorkerRegistry {
             PublishedSpec::Absent => None,
             PublishedSpec::Undecodable(err) => {
                 tracing::warn!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     %err,
                     "undecodable WorkerSpec in mesh state; importing minimal worker"
                 );
@@ -2942,7 +3072,7 @@ impl WorkerRegistry {
             self.import_records.insert(id.clone(), record);
             tracing::info!(
                 worker_id = %id.as_str(),
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 model = %state.model_id,
                 healthy = state.health,
                 spec_applied,
@@ -2981,7 +3111,7 @@ impl WorkerRegistry {
         if self.replace_inner(import_id, replacement, None, None, Some(record)) {
             tracing::info!(
                 worker_id = %import_id.as_str(),
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 model = %state.model_id,
                 version = state.version,
                 "Rebuilt the minimal mesh-synced worker from its owner's replacement"
@@ -3080,7 +3210,7 @@ impl WorkerRegistry {
                 // the URL scheme — not routable from this node.
                 if spec.connection_mode == ConnectionMode::Zmq {
                     tracing::debug!(
-                        url = %state.url,
+                        url = %Endpoint::redacted_str(&state.url),
                         "Ignoring mesh state for host-local ZMQ worker"
                     );
                     return PublishedSpec::HostLocal;

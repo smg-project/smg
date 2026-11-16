@@ -714,7 +714,7 @@ impl WorkerMediaPipeline {
             model_dir: settings.model_dir,
             tokenizer,
             assembly: VllmAssembly {
-                encoder_dtype: settings.encoder_dtype,
+                encoder_dtype: settings.encoder_dtype.into(),
                 device_normalizes: settings.pixel_format == PixelFormat::RawU8,
                 // In-process: the batches never leave this process as protos.
                 shm_enabled: false,

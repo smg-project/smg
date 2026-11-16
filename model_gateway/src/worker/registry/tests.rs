@@ -496,6 +496,267 @@ fn a_worker_keeps_the_policy_of_every_model_it_serves_and_of_its_primary_model()
     );
 }
 
+/// A gRPC worker of `model` whose card names `window` as its context
+/// window.
+fn worker_with_a_window(url: &str, model: &str, window: u32) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(vec![ModelCard::new(model).with_context_length(window)])
+            .build(),
+    )
+}
+
+/// The floor of a regular pool whose narrowest window is `window`.
+fn a_regular_floor_of(window: u32) -> WindowFloor {
+    WindowFloor {
+        budget: Some(window),
+        prefill: None,
+    }
+}
+
+/// A reader of a pool's floor for `model_id`: the narrowest window any
+/// worker names, as the budget's. The pipeline's own rule is its context
+/// check's to hold; these cases hold what the snapshot keeps of a reading.
+fn the_narrowest_window(model_id: &str) -> impl Fn(&[Arc<dyn Worker>]) -> WindowFloor + '_ {
+    move |workers| WindowFloor {
+        budget: workers
+            .iter()
+            .filter_map(|worker| worker.context_length(model_id))
+            .min(),
+        prefill: None,
+    }
+}
+
+/// Whether a worker of the list names `window` for qwen: an answer read
+/// from the cards, as a snapshot keeps them.
+fn a_worker_names(window: u32) -> impl Fn(&[Arc<dyn Worker>]) -> bool {
+    move |workers| {
+        workers
+            .iter()
+            .any(|worker| worker.context_length("qwen") == Some(window))
+    }
+}
+
+#[test]
+fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
+    let registry = WorkerRegistry::new();
+    let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
+    registry.register(Arc::clone(&worker)).unwrap();
+    let floor = |snapshot: &ModelWorkerSnapshot| {
+        snapshot.window_floor(
+            RoutingPool::GrpcPipelineRegular,
+            "qwen",
+            the_narrowest_window("qwen"),
+        )
+    };
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    let global = registry.current_global_routing_snapshot();
+    assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
+    assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
+    assert!(!model.harmony(a_worker_names(4_096)));
+
+    assert!(registry.refresh_models(
+        &worker,
+        vec![ModelCard::new("qwen").with_context_length(4_096)],
+    ));
+    // The snapshots drawn before the refresh keep what they answered; the
+    // ones a request draws now read the cards again.
+    assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
+    assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
+    assert!(!model.harmony(a_worker_names(4_096)));
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    assert_eq!(floor(&model), Some(a_regular_floor_of(4_096)));
+    assert_eq!(
+        floor(&registry.current_global_routing_snapshot()),
+        Some(a_regular_floor_of(4_096))
+    );
+    assert!(model.harmony(a_worker_names(4_096)));
+}
+
+#[test]
+fn a_refresh_publishes_the_snapshot_of_every_model_that_holds_the_worker() {
+    let registry = WorkerRegistry::new();
+    let cards = |window| {
+        vec![
+            ModelCard::new("qwen").with_context_length(window),
+            ModelCard::new("llama").with_context_length(window),
+        ]
+    };
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:8401")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(cards(8_192))
+            .build(),
+    );
+    registry.register(Arc::clone(&worker)).unwrap();
+    let floor = |model_id: &str| {
+        registry
+            .model_routing_snapshot(model_id)
+            .unwrap()
+            .window_floor(
+                RoutingPool::GrpcPipelineRegular,
+                model_id,
+                the_narrowest_window(model_id),
+            )
+    };
+    for model_id in ["qwen", "llama"] {
+        assert_eq!(floor(model_id), Some(a_regular_floor_of(8_192)));
+    }
+
+    assert!(registry.refresh_models(&worker, cards(4_096)));
+    // One worker under two models: each model's snapshot is published
+    // again, so the next answer of each is read from the new cards.
+    for model_id in ["qwen", "llama"] {
+        assert_eq!(
+            floor(model_id),
+            Some(a_regular_floor_of(4_096)),
+            "{model_id}"
+        );
+    }
+}
+
+#[test]
+fn a_pools_window_floor_is_kept_with_the_spelling_it_was_read_for() {
+    let registry = WorkerRegistry::new();
+    let card = |window| {
+        ModelCard::new("qwen")
+            .with_alias("qwen-latest")
+            .with_context_length(window)
+    };
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:8401")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(vec![card(8_192)])
+            .build(),
+    );
+    registry.register(Arc::clone(&worker)).unwrap();
+    let snapshot = registry.model_routing_snapshot("qwen").unwrap();
+    let pool = RoutingPool::GrpcPipelineRegular;
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // Another spelling of the model is not answered from the kept figure,
+    // and takes no place: the first spelling stays.
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen-latest", the_narrowest_window("qwen-latest")),
+        None
+    );
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // Kept, not read again: cards written past the registry leave this
+    // snapshot's figure as it was read.
+    worker.set_models(vec![card(4_096)]);
+    assert_eq!(worker.context_length("qwen"), Some(4_096));
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // A pool with no worker binds nothing under any spelling, and keeps none.
+    for spelling in ["qwen", "qwen-latest"] {
+        assert_eq!(
+            snapshot.window_floor(
+                RoutingPool::GrpcDecode,
+                spelling,
+                the_narrowest_window(spelling)
+            ),
+            Some(WindowFloor::default())
+        );
+    }
+}
+
+#[test]
+fn a_refresh_that_repeats_the_cards_publishes_nothing() {
+    let registry = WorkerRegistry::new();
+    let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
+    registry.register(Arc::clone(&worker)).unwrap();
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    let global = registry.current_global_routing_snapshot();
+
+    // The cards of its registration, then the cards of an earlier refresh.
+    for window in [8_192, 4_096, 4_096] {
+        let changed = worker.context_length("qwen") != Some(window);
+        let model = registry.model_routing_snapshot("qwen").unwrap();
+        let global = registry.current_global_routing_snapshot();
+        assert_eq!(
+            registry.refresh_models(
+                &worker,
+                vec![ModelCard::new("qwen").with_context_length(window)],
+            ),
+            changed
+        );
+        assert_eq!(
+            Arc::ptr_eq(&model, &registry.model_routing_snapshot("qwen").unwrap()),
+            !changed
+        );
+        assert_eq!(
+            Arc::ptr_eq(&global, &registry.current_global_routing_snapshot()),
+            !changed
+        );
+    }
+    assert!(!Arc::ptr_eq(
+        &model,
+        &registry.model_routing_snapshot("qwen").unwrap()
+    ));
+    assert!(!Arc::ptr_eq(
+        &global,
+        &registry.current_global_routing_snapshot()
+    ));
+}
+
+#[test]
+fn a_refresh_keeps_the_list_its_order_and_its_handles() {
+    let registry = WorkerRegistry::new();
+    let workers = [
+        "grpc://127.0.0.1:8401",
+        "grpc://127.0.0.1:8402",
+        "grpc://127.0.0.1:8403",
+    ]
+    .map(|url| worker_with_a_window(url, "qwen", 8_192));
+    for worker in &workers {
+        registry.register(Arc::clone(worker)).unwrap();
+    }
+    let list = registry.get_by_model("qwen");
+    let fleet = registry.get_routing_workers();
+
+    // The first and the middle worker: neither moves to the list's end. The
+    // second refresh renames the model: the worker stays where its
+    // registration indexed it and is found there by its handle.
+    for (refreshed, card) in [
+        (
+            &workers[1],
+            ModelCard::new("qwen").with_context_length(4_096),
+        ),
+        (
+            &workers[0],
+            ModelCard::new("llama").with_context_length(4_096),
+        ),
+    ] {
+        let before = registry.model_routing_snapshot("qwen").unwrap();
+        assert!(registry.refresh_models(refreshed, vec![card]));
+        let after = registry.model_routing_snapshot("qwen").unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(Arc::ptr_eq(&list, &registry.get_by_model("qwen")));
+        assert!(registry.get_by_model("llama").is_empty());
+        let fleet_now = registry.get_routing_workers();
+        assert_eq!(fleet.len(), fleet_now.len());
+        assert!(fleet
+            .iter()
+            .zip(fleet_now.iter())
+            .all(|(before, after)| Arc::ptr_eq(before, after)));
+    }
+    assert!(list
+        .iter()
+        .zip(&workers)
+        .all(|(listed, registered)| Arc::ptr_eq(listed, registered)));
+}
+
 /// The record a rebuild from a decoded spec is for.
 fn record(version: u64) -> ImportRecord {
     ImportRecord {
@@ -515,6 +776,173 @@ fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> smg_
         spec,
         owner: "peer".to_string(),
     }
+}
+
+/// The address a masked-line case registers: a password in its userinfo.
+const ADDRESS_WITH_A_PASSWORD: &str = "http://user:s3cret@remote:8080";
+
+/// Every captured line that says one of `messages` names the address masked,
+/// each message is said at least once, and the password is in no line.
+fn assert_the_lines_name_the_address_masked(
+    lines: &[&str],
+    messages: &[&str],
+) -> Result<(), String> {
+    if let Some(line) = lines.iter().find(|line| line.contains("s3cret")) {
+        return Err(format!("a line carries the password: {line}"));
+    }
+    for message in messages {
+        let mut said = lines
+            .iter()
+            .filter(|line| line.contains(message))
+            .peekable();
+        if said.peek().is_none() {
+            return Err(format!("no line says: {message}"));
+        }
+        if let Some(line) = said.find(|line| !line.contains("://***@remote:8080")) {
+            return Err(format!("a line does not name the address masked: {line}"));
+        }
+    }
+    Ok(())
+}
+
+/// A mesh import's lines name the address masked, at every level: each
+/// branch of the import that names the address is taken once with a state
+/// whose address carries a password.
+#[test]
+#[tracing_test::traced_test]
+fn a_mesh_imports_lines_name_the_address_masked() {
+    let url = ADDRESS_WITH_A_PASSWORD;
+    let spec = |model: &str| spec_bytes(url, model, WorkerType::Regular);
+    let undecodable = || b"not a worker spec".to_vec();
+    let state = |version: u64, health: bool, spec: Vec<u8>| smg_mesh::WorkerState {
+        version,
+        ..remote_state("peer-w1", url, health, spec)
+    };
+
+    // A first import from a spec, its health hint, its owner's replacement,
+    // and a replacement whose spec does not decode here.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, false, spec("llama-3")));
+    registry.on_remote_worker_state(&state(1, true, spec("llama-3")));
+    registry.on_remote_worker_state(&state(2, true, spec("llama-4")));
+    registry.on_remote_worker_state(&state(3, true, undecodable()));
+
+    // A first import whose spec does not decode, and its owner's
+    // replacement with no spec at all.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, true, undecodable()));
+    registry.on_remote_worker_state(&state(2, true, Vec::new()));
+
+    // A spec that declares the same-host transport.
+    let registry = WorkerRegistry::new();
+    let same_host = serde_json::json!({ "url": url, "connection_mode": "zmq" });
+    registry.on_remote_worker_state(&state(1, true, serde_json::to_vec(&same_host).unwrap()));
+
+    // An address of the same-host transport itself.
+    let registry = WorkerRegistry::new();
+    let same_host_address = "tcp://user:s3cret@remote:8080";
+    registry.on_remote_worker_state(&remote_state(
+        "peer-w2",
+        same_host_address,
+        true,
+        Vec::new(),
+    ));
+
+    // A peer's echo of a worker this node owns.
+    let registry = WorkerRegistry::new();
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .build(),
+    );
+    registry.register(local).unwrap();
+    registry.on_remote_worker_state(&state(1, false, Vec::new()));
+
+    logs_assert(|lines: &[&str]| {
+        assert_the_lines_name_the_address_masked(
+            lines,
+            &[
+                "Registered mesh-synced worker into local registry",
+                "Updated health for existing mesh-synced worker",
+                "Rebuilt mesh-synced worker from its owner's replacement",
+                "carries a spec this node cannot decode",
+                "undecodable WorkerSpec in mesh state; importing minimal worker",
+                "Rebuilt the minimal mesh-synced worker from its owner's replacement",
+                "Ignoring mesh state for host-local ZMQ worker",
+                "Ignoring mesh state for locally-owned worker",
+            ],
+        )?;
+        if lines
+            .iter()
+            .any(|line| line.contains("url=tcp://***@remote:8080"))
+        {
+            Ok(())
+        } else {
+            Err("no line names the same-host address masked".to_string())
+        }
+    });
+}
+
+/// The lines of a refused replacement and of divergent sampling defaults
+/// name the address masked.
+#[test]
+#[tracing_test::traced_test]
+fn a_replacements_lines_name_the_address_masked() {
+    let url = ADDRESS_WITH_A_PASSWORD;
+    let at = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let id = registry.register(at(url)).unwrap();
+    let revision = registry.get(&id).unwrap().revision();
+    assert!(
+        !registry.replace_claiming_local(&id, at(url), revision + 1),
+        "a replacement at a revision the worker is not at is refused"
+    );
+    assert!(
+        !registry.replace(&id, at("http://user:s3cret@remote:8081")),
+        "a replacement at another address is refused"
+    );
+
+    // Two gRPC workers of one routing group whose sampling defaults differ.
+    let registry = WorkerRegistry::new();
+    for (url, defaults) in [
+        (url, r#"{"temperature":0.1}"#),
+        ("grpc://user:s3cret@remote:8081", r#"{"temperature":0.9}"#),
+    ] {
+        registry.register(worker_with_sampling_defaults(
+            url,
+            "m",
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            Some(defaults),
+        ));
+    }
+
+    logs_assert(|lines: &[&str]| {
+        if let Some(line) = lines.iter().find(|line| line.contains("s3cret")) {
+            return Err(format!("a line carries the password: {line}"));
+        }
+        for message in [
+            "Aborting replacement: worker was replaced before the lock was acquired",
+            "replace() does not support URL changes",
+            "Divergent default sampling params reported by workers in the same routing group",
+        ] {
+            let said = lines.iter().find(|line| line.contains(message));
+            match said {
+                None => return Err(format!("no line says: {message}")),
+                Some(line) if !line.contains("://***@remote:808") => {
+                    return Err(format!("a line does not name the address masked: {line}"));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    });
 }
 
 #[test]
@@ -1260,7 +1688,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh))
+            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
             .is_none(),
         "removal must abort when the origin no longer matches"
     );
@@ -3291,7 +3719,7 @@ fn test_wildcard_hash_ring_follows_removals() {
 /// port: the port derived from a temporary ipc path is a hash into a band
 /// other listeners on the host may hold, and a collision there fails the
 /// handshake bind after the data-plane sockets are already bound.
-async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
+fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
     let worker = Arc::new(
         BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)
@@ -3300,7 +3728,7 @@ async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
             .build(),
     );
     assert!(
-        !worker.zmq_health_check().await.unwrap(),
+        !worker.zmq_health_check(),
         "worker is not ready until the handshake lands"
     );
     assert!(
@@ -3317,7 +3745,7 @@ async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
 async fn remove_aborts_the_zmq_handshake_driver() {
     let dir = tempfile::tempdir().unwrap();
     let registry = WorkerRegistry::new();
-    let worker = connecting_zmq_worker(dir.path()).await;
+    let worker = connecting_zmq_worker(dir.path());
 
     let id = registry
         .register(worker.clone() as Arc<dyn Worker>)
@@ -3336,7 +3764,7 @@ async fn remove_aborts_the_zmq_handshake_driver() {
 async fn replace_aborts_the_replaced_workers_zmq_handshake_driver() {
     let dir = tempfile::tempdir().unwrap();
     let registry = WorkerRegistry::new();
-    let worker = connecting_zmq_worker(dir.path()).await;
+    let worker = connecting_zmq_worker(dir.path());
     let url = worker.url().to_string();
 
     let id = registry
@@ -3642,4 +4070,43 @@ fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
             "the upkeep forgets the address once the replaced instance is gone"
         );
     });
+}
+
+/// `remove_if` reads its condition of the worker as it stands and removes
+/// the worker in the same step under its lock: a condition that reads false
+/// leaves the worker, one that reads true takes it, and a worker gone reads
+/// `None`.
+#[test]
+fn remove_if_removes_the_worker_only_while_its_condition_holds() {
+    let registry = WorkerRegistry::new();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w1:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    let id = registry
+        .register(Arc::clone(&worker))
+        .expect("the worker registers");
+    let revision = worker.revision();
+
+    assert!(
+        registry
+            .remove_if(&id, |w| w.revision() == revision + 1)
+            .is_none(),
+        "a condition that reads false leaves the worker"
+    );
+    assert!(registry.get(&id).is_some(), "the worker stands");
+    let removed = registry
+        .remove_if(&id, |w| w.revision() == revision)
+        .expect("a condition that reads true takes the worker");
+    assert!(
+        Arc::ptr_eq(&removed, &worker),
+        "the worker removed is the one registered"
+    );
+    assert!(registry.get(&id).is_none(), "the worker is gone");
+    assert!(
+        registry.remove_if(&id, |_| true).is_none(),
+        "a worker gone reads None"
+    );
 }

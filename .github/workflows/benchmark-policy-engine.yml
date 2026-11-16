@@ -1,28 +1,46 @@
 name: Benchmark - Policy Engine
 
+# Both path lists are one list in one sorted order (a `!` line stays under the
+# entry it narrows), so a row added by a pull request is one line in each.
 on:
   push:
     branches: [ main ]
     paths:
-      - '.github/workflows/benchmark-policy-engine.yml'
+      - '.github/bench-gates/policy-engine-affinity.toml'
+      - '.github/bench-gates/policy-engine-power-of-two.toml'
       - '.github/bench-gates/policy-engine.toml'
-      - 'scripts/bench_gate.py'
+      - '.github/workflows/benchmark-policy-engine.yml'
       - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/benches/affinity.rs'
+      - 'crates/policy_controller/benches/common/column.rs'
+      - 'crates/policy_controller/benches/common/mod.rs'
+      - 'crates/policy_controller/benches/common/placed.rs'
       - 'crates/policy_controller/benches/decision.rs'
+      - 'crates/policy_controller/benches/power_of_two.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/tests.rs'
       - '!crates/policy_controller/src/**/*_test.rs'
+      - 'scripts/bench_gate.py'
   pull_request:
     branches: [ main, release/** ]
     paths:
-      - '.github/workflows/benchmark-policy-engine.yml'
+      - '.github/bench-gates/policy-engine-affinity.toml'
+      - '.github/bench-gates/policy-engine-power-of-two.toml'
       - '.github/bench-gates/policy-engine.toml'
-      - 'scripts/bench_gate.py'
+      - '.github/workflows/benchmark-policy-engine.yml'
       - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/benches/affinity.rs'
+      - 'crates/policy_controller/benches/common/column.rs'
+      - 'crates/policy_controller/benches/common/mod.rs'
+      - 'crates/policy_controller/benches/common/placed.rs'
       - 'crates/policy_controller/benches/decision.rs'
+      - 'crates/policy_controller/benches/power_of_two.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
+      - '!crates/policy_controller/src/**/tests.rs'
       - '!crates/policy_controller/src/**/*_test.rs'
+      - 'scripts/bench_gate.py'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'
@@ -36,10 +54,29 @@ permissions:
 
 jobs:
   benchmark:
-    name: Policy Engine (decision)
+    name: Policy Engine (${{ matrix.bench }})
     if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      # One row a bench binary, with its own gate file, its own runner and its
+      # own bound: a failure or a lost runner on one row never takes another
+      # row's verdict. One path list starts every row: every binary is built
+      # from the crate's sources.
+      fail-fast: false
+      matrix:
+        include:
+          - bench: decision
+            gates: policy-engine.toml
+            artifact: policy-engine-results
+          - bench: power_of_two
+            gates: policy-engine-power-of-two.toml
+            artifact: policy-engine-power-of-two-results
+          - bench: affinity
+            gates: policy-engine-affinity.toml
+            artifact: policy-engine-affinity-results
     env:
+      BENCH: ${{ matrix.bench }}
+      GATES: ${{ matrix.gates }}
       # Every bench binary of this job, the gate's pair and the summary run's,
       # places every function on a 64-byte boundary, so a pull request's code
       # size does not move the unchanged hot functions into another placement
@@ -59,7 +96,8 @@ jobs:
       # A pull request is gated: its bench binary and the base branch's (the merge
       # commit's first parent) are built in this checkout, run interleaved on this
       # runner and compared id by id by scripts/bench_gate.py against the thresholds
-      # in .github/bench-gates/policy-engine.toml; the job fails on a gated regression.
+      # in the row's gate file under .github/bench-gates; the job fails on a gated
+      # regression.
       # A push to main keeps the single summary run.
       # The base's binary is built with the pull request's bench sources (the gate
       # file's `sources`), so the two differ in the measured code alone.
@@ -69,10 +107,10 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           mkdir -p "$RUNNER_TEMP/bench-gate"
-          cp scripts/bench_gate.py .github/bench-gates/policy-engine.toml "$RUNNER_TEMP/bench-gate/"
-          python3 scripts/bench_gate.py build --gates .github/bench-gates/policy-engine.toml \
+          cp scripts/bench_gate.py ".github/bench-gates/$GATES" "$RUNNER_TEMP/bench-gate/"
+          python3 scripts/bench_gate.py build --gates ".github/bench-gates/$GATES" \
             --out "$RUNNER_TEMP/bench-gate/pr" -- \
-            cargo bench -p smg-policy-controller --bench decision --no-run
+            cargo bench -p smg-policy-controller --bench "$BENCH" --no-run
 
       - name: Build the base branch's benchmark
         if: github.event_name == 'pull_request'
@@ -81,17 +119,32 @@ jobs:
           source "$HOME/.cargo/env"
           head=$(git rev-parse HEAD)
           git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
-          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --gates "$RUNNER_TEMP/bench-gate/policy-engine.toml" \
+          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --gates "$RUNNER_TEMP/bench-gate/$GATES" \
             --sources-from "$head" --out "$RUNNER_TEMP/bench-gate/base" -- \
-            cargo bench -p smg-policy-controller --bench decision --no-run
+            cargo bench -p smg-policy-controller --bench "$BENCH" --no-run
           git checkout --quiet "$head"
+
+      # The gate counts an id that fails by time, on both binaries under valgrind's
+      # callgrind, before the verdict (`count` in the row's gate file): the same
+      # instruction count on both sides, with the measured function moved and the
+      # change within twice the threshold, is a placement, reported and not failed.
+      # Without the tool the count is not read and the id fails as the time read
+      # it, so this step never fails the job.
+      - name: Install valgrind
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          bash scripts/ci_apt_mirror.sh
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends valgrind
 
       - name: Run the benchmark gate
         if: github.event_name == 'pull_request'
         timeout-minutes: 40
         run: |
           set -o pipefail
-          python3 scripts/bench_gate.py run --gates .github/bench-gates/policy-engine.toml \
+          python3 scripts/bench_gate.py run --gates ".github/bench-gates/$GATES" \
             --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
             --cwd crates/policy_controller --out bench-gate 2>&1 | tee benchmark_output.txt
 
@@ -101,15 +154,16 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           set -o pipefail
-          cargo bench -p smg-policy-controller --bench decision 2>&1 | tee benchmark_output.txt
+          cargo bench -p smg-policy-controller --bench "$BENCH" 2>&1 | tee benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: policy-engine-results-${{ github.sha }}
+          name: ${{ matrix.artifact }}-${{ github.sha }}
           path: |
             target/criterion/policy_engine*/
+            target/criterion/policy_affinity*/
             benchmark_output.txt
             bench-gate/
           retention-days: 30
@@ -117,7 +171,7 @@ jobs:
       - name: Summary
         if: always() && github.event_name != 'pull_request'
         run: |
-          echo "## Policy Engine Benchmark (decision)" >> $GITHUB_STEP_SUMMARY
+          echo "## Policy Engine Benchmark ($BENCH)" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_output.txt ]; then
             echo '```' >> $GITHUB_STEP_SUMMARY
             tail -100 benchmark_output.txt >> $GITHUB_STEP_SUMMARY

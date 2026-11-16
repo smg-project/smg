@@ -667,6 +667,58 @@ mod tests {
     }
 
     #[test]
+    fn what_a_table_or_its_variant_keeps_replays_as_the_whole_prompt() {
+        // Every variant keeps the unopened row, which names the thought: a prompt that ends with
+        // the turn's end keeps that end alone, and any other is kept from its last opener, as
+        // before.
+        let table = deepseek_v4();
+        let variants = [
+            table.clone(),
+            table.clone().without_calls(),
+            table.clone().without_reasoning(),
+            table.clone().without_calls().without_reasoning(),
+            table.clone().with_forced_call(crate::ForcedCall::Arguments),
+            table.clone().with_forced_call(crate::ForcedCall::List),
+            table
+                .clone()
+                .with_forced_call(crate::ForcedCall::Arguments)
+                .without_reasoning(),
+            table
+                .clone()
+                .with_forced_call(crate::ForcedCall::List)
+                .without_reasoning(),
+        ];
+        let ended = "<｜User｜>u1<｜Assistant｜><think>r1</think>a1<｜end▁of▁sentence｜>";
+        for (number, variant) in variants.iter().enumerate() {
+            assert_eq!(
+                variant.replay(ended),
+                "<｜end▁of▁sentence｜>",
+                "variant {number}"
+            );
+        }
+        let prompts = [
+            ended,
+            "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>Sure.<｜end▁of▁sentence｜>",
+            concat!(
+                "<｜User｜>u1<｜Assistant｜><think>r1</think>a1<｜end▁of▁sentence｜>",
+                "<｜User｜>u2# Environment\n - Platform: linux"
+            ),
+        ];
+        for prompt in prompts {
+            for (number, variant) in variants.iter().enumerate() {
+                assert!(variant.unopened_start().is_some(), "variant {number}");
+                for kept in [variant.replay(prompt), table.replay(prompt)] {
+                    assert_eq!(
+                        variant.replayed(kept),
+                        variant.replayed(prompt),
+                        "variant {number}: {kept:?} kept of {prompt:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn an_unopened_turn_reads_the_same_whole_at_every_byte_and_in_a_tokenizers_pieces() {
         let whole = said(&run(TRAILING_SYSTEM_PROMPT, &[OUTPUT]));
         for cut in 1..OUTPUT.len() {

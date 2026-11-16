@@ -11,7 +11,7 @@
 use axum::http;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{Tool, ToolChoice, ToolChoiceValue, Usage},
+    common::{Tool, ToolChoice, ToolChoiceValue, ToolReference, Usage},
     responses::{
         self, InputTokensDetails, OutputTokensDetails, ResponseInput, ResponseInputOutputItem,
         ResponseOutputItem, ResponseUsage, ResponsesRequest,
@@ -21,16 +21,19 @@ use serde_json::{json, Value};
 use smg_mcp::{McpToolSession, ToolExecutionOutput};
 use tracing::{trace, warn};
 
+pub(super) use crate::routers::grpc::common::responses::utils::McpToolCallLimit;
 use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::{
-            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
+            mcp_utils::prepare_hosted_dispatch_args,
             openai_bridge::{self, ResponseFormat},
         },
         grpc::common::responses::{
-            history::current_input_items, tool_call_limit, utils::resolve_function_identity,
+            history::current_input_items,
+            tool_call_limit,
+            utils::{resolve_function_identity, tool_call_overflow},
         },
     },
 };
@@ -56,6 +59,12 @@ pub(super) struct ToolLoopState {
     /// behind the items it already carries.
     pub calls_to_carry: Vec<ResponseInputOutputItem>,
     pub mcp_call_items: Vec<ResponseOutputItem>,
+    /// The request's `max_tool_calls` is spent: the next generation is the
+    /// response's final turn, made with the server tools withheld so the
+    /// model answers on the results it has, and its answer ends the loop
+    /// whatever it holds (a server call made anyway stays hidden and does
+    /// not run).
+    pub final_turn: bool,
 }
 
 /// Per-request parameters for chat pipeline execution.
@@ -136,12 +145,37 @@ impl ToolLoopState {
 // ============================================================================
 
 /// Set tool_choice based on iteration (the MCP tools join the request's tools
-/// where the chat request is built: `conversions::responses_to_chat_with_mcp_tools`)
-pub(super) fn prepare_tool_choice(chat_request: &mut ChatCompletionRequest, iteration: usize) {
+/// where the chat request is built: `conversions::responses_to_chat_with_mcp_tools`).
+/// The final turn allows the request's own tools only, the ones
+/// `is_server_tool` does not name: the prompt renders the allowed tools, so
+/// the model is offered no server tool, while the response is read against
+/// the whole list as on every turn. A legacy streaming parser takes a call to
+/// a tool outside that list for text, so a list without the server tools
+/// would leave a repeated server call's markup in the message.
+pub(super) fn prepare_tool_choice(
+    chat_request: &mut ChatCompletionRequest,
+    state: &ToolLoopState,
+    is_server_tool: impl Fn(&str) -> bool,
+) {
     // Set tool_choice based on iteration
     // - Iteration 0: Use user's tool_choice or default to auto
     // - Iteration 1+: Always use auto to avoid infinite loops
-    chat_request.tool_choice = if iteration == 0 {
+    chat_request.tool_choice = if state.final_turn {
+        Some(ToolChoice::AllowedTools {
+            tool_type: "allowed_tools".to_string(),
+            mode: "auto".to_string(),
+            tools: chat_request
+                .tools
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|tool| !is_server_tool(&tool.function.name))
+                .map(|tool| ToolReference::Function {
+                    name: tool.function.name.clone(),
+                })
+                .collect(),
+        })
+    } else if state.iteration == 0 {
         chat_request
             .tool_choice
             .take()
@@ -157,13 +191,6 @@ pub(super) struct ExtractedToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
-}
-
-/// Why a generated MCP batch must stop after its permitted calls execute.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum McpToolCallLimit {
-    User,
-    Safety,
 }
 
 /// One iteration's extracted tool calls, traced and split into the MCP
@@ -219,28 +246,17 @@ fn apply_mcp_tool_call_limit(
     total_calls: usize,
     max_tool_calls: Option<usize>,
 ) -> Option<McpToolCallLimit> {
-    let effective_limit = tool_call_limit(max_tool_calls);
-    let remaining = effective_limit.saturating_sub(total_calls);
-    if calls.len() <= remaining {
-        return None;
-    }
-
-    if max_tool_calls.is_none_or(|limit| limit > DEFAULT_MAX_ITERATIONS) {
+    let (limit, remaining) = tool_call_overflow(max_tool_calls, total_calls, calls.len())?;
+    if limit == McpToolCallLimit::Safety {
         warn!(
             total_calls,
             batch_size = calls.len(),
-            effective_limit,
+            effective_limit = tool_call_limit(max_tool_calls),
             "Internal MCP tool call safety limit reached"
         );
     }
     calls.truncate(remaining);
-    Some(
-        if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
-            McpToolCallLimit::User
-        } else {
-            McpToolCallLimit::Safety
-        },
-    )
+    Some(limit)
 }
 
 /// Whether a server call among `calls` has arguments that are not JSON. A
@@ -433,6 +449,47 @@ mod namespace_tests {
         assert_eq!(wire["name"], "lookup");
         assert_eq!(wire["namespace"], "weather");
         assert_eq!(wire["call_id"], "call_test");
+    }
+}
+
+#[cfg(test)]
+mod final_turn_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::routers::grpc::{spec::ChatResponseSpec, utils::request_as_rendered};
+
+    fn names(tools: Option<&[Tool]>) -> Vec<&str> {
+        tools
+            .unwrap_or_default()
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_final_turn_renders_the_requests_own_tools_and_is_read_against_every_tool() {
+        let mut chat_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "final-turn-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+            ],
+        }))
+        .unwrap();
+        let state = ToolLoopState {
+            iteration: 2,
+            final_turn: true,
+            ..Default::default()
+        };
+
+        prepare_tool_choice(&mut chat_request, &state, |name| name == "search");
+
+        let rendered = request_as_rendered(&chat_request);
+        assert_eq!(names(rendered.tools.as_deref()), ["lookup"]);
+        let spec = ChatResponseSpec::from(&chat_request);
+        assert_eq!(names(spec.tools.as_deref()), ["lookup", "search"]);
     }
 }
 

@@ -1,11 +1,13 @@
 //! What an operator hands the controller at start (design 5: the addresses,
 //! the credentials and the shutdown settings are read at start; the routing
 //! policy is the spec's and never here): the listeners with their scopes and
-//! TLS, the admin listener, the controller's identity and the shutdown
-//! bounds, validated as a whole before anything binds so a refusal names
-//! the field it refuses.
+//! TLS, the admin listener, the controller's identity, the election and the
+//! shutdown bounds, validated as a whole before anything binds so a refusal
+//! names the field it refuses.
 
 use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, time::Duration};
+
+use super::election::Election;
 
 /// A credentialed group of the controller's calls (design 8). Each scope is
 /// mounted on exactly one listener, alone or beside others; a listener's
@@ -111,6 +113,10 @@ pub struct Config {
     /// serving it, and the freshness bound a pushed record must meet to
     /// stand in for the poll: the gateway's `--load-monitor-interval`.
     pub load_poll_interval: Duration,
+    /// The election (design 5.3): where the lease lives, its timing and
+    /// this replica's dialable address. The default is one replica that
+    /// leads itself over a lease in its own process.
+    pub election: Election,
 }
 
 impl Config {
@@ -189,13 +195,22 @@ impl Config {
         if self.load_poll_interval.is_zero() {
             return Err(ConfigError::ZeroLoadPollInterval);
         }
+        // The holder identity names the gateway listener: every scope is
+        // mounted by now, so the listener is there.
+        if let Some(gateway) = self
+            .listeners
+            .iter()
+            .find(|listener| listener.scopes.contains(&Scope::Gateway))
+        {
+            self.election.validate(gateway.addr)?;
+        }
         Ok(())
     }
 }
 
 /// A configuration refused, by name. The last four come from the binary's
 /// command line, which maps one server identity and one client authority
-/// per scope onto the listeners.
+/// per scope onto the listeners; the eight before them are the election's.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConfigError {
     /// `controller_id` is empty.
@@ -234,6 +249,15 @@ pub enum ConfigError {
         /// The listener that named it again.
         second: String,
     },
+    /// A listener named to take identities as told that the configuration
+    /// does not hold.
+    #[error("no listener is named {0:?}: identities are taken as told on a listener of the configuration")]
+    UnknownListener(String),
+    /// A listener named to take identities as told that verifies its
+    /// callers against a client CA: the verified subject is the principal,
+    /// and a listener has one credential rule.
+    #[error("listener {0} verifies its callers against a client CA: it takes no identity as told")]
+    AsToldBesideClientCa(String),
     /// A grace period of zero: a drain needs a bound above zero.
     #[error("the shutdown grace period is zero")]
     ZeroShutdownGrace,
@@ -248,6 +272,38 @@ pub enum ConfigError {
         /// The grace period.
         grace: Duration,
     },
+    /// The election's timing is out of order: a renew period above zero, a
+    /// renew deadline longer than it, a duration longer than the deadline.
+    #[error("the election's settings: {0}")]
+    ElectionSettings(&'static str),
+    /// A shared lease, a gateway listener on the wildcard address and no
+    /// advertised address: the holder identity would name an address no
+    /// client can dial.
+    #[error("a shared lease needs an advertised address: the gateway listener binds every address, and the holder identity is what a client dials")]
+    AdvertiseAddressRequired,
+    /// An advertised address that is neither a host nor a `host:port`.
+    #[error("the advertised address {0:?} is not a host or a host:port a client could dial")]
+    MalformedAdvertiseAddress(String),
+    /// An advertised address that is the wildcard, in any spelling: a
+    /// listener's address, which a client dials as its own host.
+    #[error(
+        "the advertised address {0:?} is the wildcard: a client that dials it reaches its own host"
+    )]
+    WildcardAdvertiseAddress(String),
+    /// An advertised host that ends in a number and is no address in its
+    /// standard form.
+    #[error("the advertised address {0:?} ends in a number: a resolver reads it as an address, and an address is written in its standard form")]
+    NumericAdvertiseHost(String),
+    /// A lease file with no path, or a `Lease` object with no name.
+    #[error("the lease's place has an empty name")]
+    EmptyLeaseName,
+    /// A `Lease` object's namespace given empty: `None` takes the client
+    /// configuration's own.
+    #[error("the lease's namespace is empty: none given takes the client configuration's own")]
+    EmptyLeaseNamespace,
+    /// A `Lease` object stores its duration in whole seconds.
+    #[error("the lease duration of {0:?} has a fraction of a second: a Lease object stores whole seconds")]
+    LeaseDurationNotWholeSeconds(Duration),
     /// A certificate without its key, or a key without its certificate.
     #[error(
         "--tls-{given} without --tls-{missing}: the server identity is a certificate with its key"
@@ -287,7 +343,7 @@ pub enum ConfigError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         net::{Ipv4Addr, SocketAddr},
         path::PathBuf,
@@ -295,6 +351,10 @@ mod tests {
     };
 
     use super::{Config, ConfigError, Listener, Scope, Tls};
+    use crate::{
+        controller::election::{Election, LeasePlace},
+        elector::ElectionSettings,
+    };
 
     fn loopback(port: u16) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, port))
@@ -310,7 +370,7 @@ mod tests {
     }
 
     /// The binary's default shape on ephemeral ports.
-    fn valid() -> Config {
+    pub(crate) fn valid() -> Config {
         Config {
             controller_id: "controller-0".to_owned(),
             listeners: vec![
@@ -322,6 +382,7 @@ mod tests {
             shutdown_settle: Duration::from_millis(100),
             shutdown_grace: Duration::from_secs(2),
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+            election: Election::default(),
         }
     }
 
@@ -447,6 +508,146 @@ mod tests {
         );
         config.shutdown_settle = Duration::from_secs(4);
         assert_eq!(config.validate(), Ok(()), "half the grace is the bound");
+    }
+
+    #[test]
+    fn the_elections_settings_keep_their_order() {
+        let mut config = valid();
+        assert_eq!(config.election.settings, ElectionSettings::default());
+        config.election.settings.renew_period = Duration::ZERO;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::ElectionSettings("the renew period is zero"))
+        );
+        let mut config = valid();
+        config.election.settings.renew_deadline = Duration::from_secs(1);
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::ElectionSettings(
+                "the renew deadline is not longer than the renew period"
+            ))
+        );
+        let mut config = valid();
+        config.election.settings.duration = Duration::from_secs(2);
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::ElectionSettings(
+                "the duration is not longer than the renew deadline"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_shared_lease_needs_an_address_a_client_can_dial() {
+        // A lone controller needs none, on any listener.
+        let mut config = valid();
+        config.listeners[0].addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 30100));
+        assert_eq!(config.validate(), Ok(()));
+
+        // A shared lease behind the wildcard address is refused by name.
+        config.election.lease = LeasePlace::File(PathBuf::from("/run/smg/lease"));
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AdvertiseAddressRequired)
+        );
+        // The IPv4 wildcard mapped into IPv6 is a wildcard listener too.
+        config.listeners[0].addr =
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 30100));
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::AdvertiseAddressRequired)
+        );
+        // ... until an address is advertised, or the listener binds one.
+        config.election.advertise = Some("10.0.0.7".to_owned());
+        assert_eq!(config.validate(), Ok(()));
+        config.election.advertise = None;
+        config.listeners[0].addr = loopback(30100);
+        assert_eq!(config.validate(), Ok(()));
+
+        for bad in [
+            "",
+            "a b",
+            "controller@host",
+            "host:0",
+            "host:port",
+            ":30100",
+            "a/b",
+        ] {
+            config.election.advertise = Some(bad.to_owned());
+            assert_eq!(
+                config.validate(),
+                Err(ConfigError::MalformedAdvertiseAddress(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
+        // The wildcard is a listener's address, never a client's, and a
+        // host that ends in a number is an address to a resolver.
+        for wildcard in ["0.0.0.0", "[::]:30100"] {
+            config.election.advertise = Some(wildcard.to_owned());
+            assert_eq!(
+                config.validate(),
+                Err(ConfigError::WildcardAdvertiseAddress(wildcard.to_owned())),
+                "{wildcard:?}"
+            );
+        }
+        config.election.advertise = Some("0:30100".to_owned());
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::NumericAdvertiseHost("0:30100".to_owned()))
+        );
+        for good in [
+            "10.0.0.7",
+            "10.0.0.7:30100",
+            "fd00::7",
+            "[fd00::7]",
+            "[fd00::7]:30100",
+            "controller-0.policy.svc",
+            "controller-0.policy.svc:30100",
+        ] {
+            config.election.advertise = Some(good.to_owned());
+            assert_eq!(config.validate(), Ok(()), "{good}");
+        }
+
+        config.election.advertise = None;
+        config.election.lease = LeasePlace::File(PathBuf::new());
+        assert_eq!(config.validate(), Err(ConfigError::EmptyLeaseName));
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn a_lease_object_takes_a_name_and_whole_seconds() {
+        let object = |namespace: Option<&str>, name: &str| LeasePlace::Kubernetes {
+            namespace: namespace.map(str::to_owned),
+            name: name.to_owned(),
+        };
+        let mut config = valid();
+        config.election.lease = object(None, "smg-policy");
+        assert_eq!(config.validate(), Ok(()));
+        config.election.lease = object(Some("policy"), "smg-policy");
+        assert_eq!(config.validate(), Ok(()));
+
+        config.election.lease = object(None, "");
+        assert_eq!(config.validate(), Err(ConfigError::EmptyLeaseName));
+        config.election.lease = object(Some(""), "smg-policy");
+        assert_eq!(config.validate(), Err(ConfigError::EmptyLeaseNamespace));
+
+        // The object stores whole seconds: a fraction is refused here, not
+        // at the first write.
+        config.election.lease = object(None, "smg-policy");
+        config.election.settings = ElectionSettings {
+            duration: Duration::from_millis(2500),
+            renew_period: Duration::from_millis(500),
+            renew_deadline: Duration::from_millis(1500),
+        };
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::LeaseDurationNotWholeSeconds(
+                Duration::from_millis(2500)
+            ))
+        );
+        // A file takes the same settings.
+        config.election.lease = LeasePlace::File(PathBuf::from("/run/smg/lease"));
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

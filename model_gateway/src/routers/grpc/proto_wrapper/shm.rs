@@ -225,6 +225,22 @@ pub fn cleanup_mm_shm_handles(handles: &[common::ShmHandle]) {
     }
 }
 
+/// Unlink the `/dev/shm` segments a generate request references, for a
+/// request the send path refuses before any worker receives it. The wires
+/// whose payloads never ride shared memory have nothing to unlink.
+pub(crate) fn cleanup_generate_request_shm(request: &ProtoGenerateRequest) {
+    let handles = match request {
+        ProtoGenerateRequest::Vllm(request) => collect_vllm_generate_request_shm_handles(request),
+        ProtoGenerateRequest::TokenSpeed(request) => {
+            collect_tokenspeed_generate_request_shm_handles(request)
+        }
+        ProtoGenerateRequest::Sglang(_)
+        | ProtoGenerateRequest::Trtllm(_)
+        | ProtoGenerateRequest::Mlx(_) => return,
+    };
+    cleanup_mm_shm_handles(&handles);
+}
+
 /// Build a TokenSpeed proto `GenerateRequest` from the already-converted
 /// multimodal proto, unlinking any `/dev/shm` segments it references if `build`
 /// fails — so a build error doesn't leak SHM files before the send-path cleanup

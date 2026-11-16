@@ -32,7 +32,7 @@ use crate::{
 /// Initial reconnection delay after stream failure.
 const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 
-/// Resolves when the worker is heard from (see `Worker::contact_wake`), or
+/// Resolves when the worker is heard from (see `WorkerRuntime::contact_wake`), or
 /// never for a worker without a notifier.
 async fn woken(wake: Option<&Arc<tokio::sync::Notify>>) {
     match wake {
@@ -420,7 +420,7 @@ impl KvEventMonitor {
         // A contact with the worker (a poll answered, a probe passed) ends the
         // reconnect backoff early: a worker that is back gets its stream back
         // at once instead of after the remaining delay.
-        let wake = worker.contact_wake();
+        let wake = worker.runtime_state().map(|state| state.contact_wake());
         let subscription = WorkerSubscription {
             worker: &worker,
             worker_url: &worker_url,
@@ -1114,7 +1114,7 @@ mod tests {
     async fn the_subscribe_call_ends_at_its_deadline_a_contact_or_the_removal() {
         let (addr, server) = serve(Subscribe::Hang).await;
         let (worker, client) = connected(addr).await;
-        let wake = worker.contact_wake();
+        let wake = worker.runtime_state().map(|state| state.contact_wake());
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
 
         let Subscribed::Refused(status) = subscribe_with_deadline(
@@ -1143,7 +1143,7 @@ mod tests {
             )]
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                worker.note_contact();
+                worker.runtime_state().unwrap().note_contact();
             })
         };
         assert!(matches!(
@@ -1219,7 +1219,7 @@ mod tests {
             let indexer = KvIndex::chain();
             let worker_id = indexer.intern_worker(worker.url()).unwrap();
             let block_sizes = DashMap::new();
-            let wake = worker.contact_wake();
+            let wake = worker.runtime_state().map(|state| state.contact_wake());
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
@@ -1344,7 +1344,7 @@ mod tests {
             false,
         ));
         let sink = Arc::downgrade(&monitor);
-        let wake = worker.contact_wake();
+        let wake = worker.runtime_state().map(|state| state.contact_wake());
         let sub = WorkerSubscription {
             worker: &worker,
             worker_url: worker.url(),
@@ -1647,7 +1647,7 @@ mod tests {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    worker.note_contact();
+                    worker.runtime_state().unwrap().note_contact();
                 }
             })
         };
@@ -1803,6 +1803,48 @@ mod tests {
             errors >= 3.0 && errors as usize <= calls.len(),
             "{errors} errors for {} calls",
             calls.len()
+        );
+    }
+
+    /// The subscription takes the contact wake from its worker's own state:
+    /// a worker heard from on another path while its stream is in backoff
+    /// is retried at the floor, not after the delay. Without the wake a
+    /// connect never comes sooner after the one before it than the delay
+    /// slept between them, however loaded the host, so one that does is the
+    /// wake's doing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_contact_with_the_worker_ends_its_subscriptions_backoff_early() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (addr, server) = serve(Subscribe::FailFirstMessage(Arc::clone(&calls))).await;
+        let worker = grpc_worker(addr);
+        let monitor = KvEventMonitor::new();
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        // The worker is heard from on another path until six connects are in.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.lock().unwrap().len() < 6 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            worker.runtime_state().unwrap().note_contact();
+        }
+        monitor.on_worker_removed(worker.url()).await;
+        server.abort();
+
+        let calls = calls.lock().unwrap().clone();
+        let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        // The delay scheduled before each connect after the first, in the
+        // loop's own order: no stream here delivers a batch, so none resets.
+        let mut backoff = Backoff::new();
+        let delays: Vec<Duration> = std::iter::repeat_with(|| {
+            let delay = backoff.delay();
+            backoff.grow();
+            delay
+        })
+        .take(gaps.len())
+        .collect();
+        assert!(
+            gaps.iter().zip(&delays).any(|(gap, delay)| gap < delay),
+            "no connect came before its scheduled delay: gaps {gaps:?}, delays {delays:?}"
         );
     }
 

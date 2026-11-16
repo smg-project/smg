@@ -41,8 +41,8 @@ kube = { version = "3.0.1", default-features = false, features = ["client", "rus
 
 # The ingestion drivers (the `ingest` feature): the load path over the
 # store's ingress traits (the `GetLoads` poll through the engines' gRPC
-# clients, the metrics scrape over HTTP) and the load helpers the gateway
-# shares with the controller (the row conversion, the scrape parser).
+# clients, the metrics scrape over HTTP) and the load helpers (the row
+# conversion, the scrape parser).
 openai-protocol = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
 smg-grpc-client = { workspace = true, optional = true }
@@ -55,6 +55,9 @@ axum = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 metrics = { version = "0.24.6", optional = true }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
+# The protocol's generated messages, service and client (`proto`): the code
+# the build script writes from the contract files names both.
+prost = { workspace = true, optional = true }
 # The process TLS crypto provider, installed once before the first listener
 # or HTTP client; the gateway, the servicer and the mock worker install the
 # same one.
@@ -62,15 +65,32 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
 tonic = { workspace = true, features = ["tls-ring"], optional = true }
 tonic-health = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+
+# The plugin host measures a call's bound on the CPU its thread had: the
+# thread CPU clock, read at a tick a call is still in flight, at the start of
+# a call on an armed thread and at the end of a late call whose start was
+# read. Already in the tree under the WebAssembly runtime. Where no such
+# clock exists the bound stays on the wall clock. `use-libc-auxv`: the
+# clock's first read looks for the kernel's fast path through the process's
+# auxiliary vector, and the library's own read of it faults where a tool
+# hides that page from the process (a run under valgrind); libc's read is the
+# one such tools serve.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "time", "use-libc-auxv"], optional = true }
+
+# The build script compiles the protocol under the `controller` feature
+# alone: the engine's own build runs nothing and needs no `protoc`.
+[build-dependencies]
+tonic-prost-build = { version = "0.14.6", optional = true }
 
 [features]
 # The ingestion drivers over the store: the load path (the `GetLoads` poll
 # per engine under the store's poll arbitration, the metrics scrape of an
-# engine without a servicer) and the load helpers the gateway shares. Off by
-# default; the gateway turns it on for the helpers, the controller for the
-# drivers.
+# engine without a servicer) and the load helpers. Off by default; the
+# controller turns it on.
 ingest = [
     "dep:openai-protocol",
     "dep:reqwest",
@@ -81,18 +101,22 @@ ingest = [
     "dep:tracing",
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
-# scopes, the gRPC health service, the admin endpoints and the binary of the
-# package's name. Off by default: the engine alone has no server dependency.
+# scopes, the protocol's generated service and client, the election, the gRPC
+# health service, the admin endpoints and the binary of the package's name.
+# Off by default: the engine alone has no server dependency.
 controller = [
     "ingest",
     "dep:axum",
     "dep:clap",
     "dep:metrics",
     "dep:metrics-exporter-prometheus",
+    "dep:prost",
     "dep:rustls",
     "dep:tokio",
     "dep:tonic",
     "dep:tonic-health",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
     "dep:tracing",
     "dep:tracing-subscriber",
 ]
@@ -102,7 +126,7 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
-wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing"]
+wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 
 [dev-dependencies]
 criterion = "0.8"
@@ -113,8 +137,7 @@ axum = { workspace = true }
 http = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
-# The corpus test reads YAML documents; the gateway reads its spec file with
-# the same crate.
+# The corpus test reads YAML documents.
 serde_yaml = { workspace = true }
 # The contract tests (tests/contracts.rs) compile the protocol to a
 # descriptor set through protoc and resolve the WebAssembly world; no code
@@ -148,6 +171,11 @@ required-features = ["controller"]
 name = "binary"
 required-features = ["controller"]
 
+# Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
+[[test]]
+name = "classic_rows"
+required-features = ["ingest"]
+
 [[test]]
 name = "controller"
 required-features = ["controller"]
@@ -157,11 +185,27 @@ name = "elector_k8s_cell"
 required-features = ["kubernetes"]
 
 [[test]]
+name = "fleet"
+required-features = ["controller"]
+
+[[test]]
 name = "ingest"
+required-features = ["controller"]
+
+[[test]]
+name = "replicas"
 required-features = ["controller"]
 
 [[bench]]
 name = "decision"
+harness = false
+
+[[bench]]
+name = "pair_table"
+harness = false
+
+[[bench]]
+name = "affinity"
 harness = false
 
 [[bench]]
@@ -182,7 +226,19 @@ name = "contention"
 harness = false
 
 [[bench]]
+name = "store_view"
+harness = false
+
+[[bench]]
+name = "store_pair"
+harness = false
+
+[[bench]]
 name = "store"
+harness = false
+
+[[bench]]
+name = "power_of_two"
 harness = false
 
 [lints]

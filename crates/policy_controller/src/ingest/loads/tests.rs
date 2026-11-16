@@ -21,8 +21,8 @@ use super::{
 };
 use crate::{
     store::{
-        GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, Signals, WorkerFacts,
-        WorkerStatus, WorkersStore,
+        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, Signals, ViewBuffers,
+        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
 };
@@ -906,6 +906,82 @@ async fn run_ticks_until_told_to_stop() {
         .expect("the run task")
         .expect("it ended without a panic");
     assert!(tasks.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let first = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    let late = ready(&store, "grpc://b:1", "grpc://b:1", 0, 1, WireModes::GRPC, 0);
+    let busy = Figures {
+        running: 4,
+        waiting: 2,
+        usage: 0.5,
+    };
+    probe.answers("grpc://a:1", &[busy]);
+    probe.answers("grpc://b:1", &[busy]);
+    probe.held.lock().insert("grpc://b:1".to_owned());
+    // What a decision reads of the worker's load at this instant.
+    let seen = |id: WorkerId| {
+        let mut out = ViewBuffers::default();
+        store
+            .build_view(
+                "m",
+                Role::Single,
+                &Ask {
+                    gateway: GatewayId::LOCAL,
+                    now: now(),
+                    pinned: None,
+                    affinity: false,
+                },
+                &mut out,
+            )
+            .expect("the pool");
+        out.candidates
+            .iter()
+            .find(|row| row.id == id)
+            .and_then(|row| row.load)
+            .map(|load| load.running)
+    };
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (stop, stopped) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run(stopped).await });
+    let started = now();
+
+    // The first engine's answer lands after a quiet window and publishes by
+    // itself; the second engine's call is still out.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(seen(first), Some(4));
+    assert_eq!(seen(late), None);
+
+    // The second answer lands inside the window: its row is on file and no
+    // decision reads it yet.
+    tokio::time::sleep(Duration::from_millis(4)).await;
+    probe.held.lock().clear();
+    probe.release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(row(&store, late, 0).is_some());
+    assert_eq!(seen(late), None);
+    assert!(store.publish_due().is_some());
+
+    // No later write comes (the next tick writes nothing, the next poll is
+    // ten seconds away): the loop shows the row at the window's end.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        started + PUBLISH_WINDOW + Duration::from_millis(2),
+    ))
+    .await;
+    assert_eq!(seen(late), Some(4));
+    assert_eq!(store.publish_due(), None);
+
+    stop.send_replace(true);
+    tasks
+        .join_next()
+        .await
+        .expect("the run task")
+        .expect("it ended without a panic");
 }
 
 #[tokio::test(start_paused = true)]
