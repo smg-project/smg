@@ -12,6 +12,13 @@ router:
     - http://worker-1:8000
 policyController:
   enabled: true
+  # No listener takes a caller's stated name until it is named, and a
+  # listener that is not named refuses every call but Leader as
+  # unauthenticated. Nothing is verified on a named listener: whoever
+  # reaches its port acts as any principal of its scopes. Name the gateways'
+  # listener only behind a mesh that verifies its callers, or a network
+  # policy that admits them alone:
+  # identityAsTold: [gateway]
   # The controller runs 2 runtime worker threads by default
   # (runtimeWorkerThreads), the CPU limit here: raise the two together.
   resources:

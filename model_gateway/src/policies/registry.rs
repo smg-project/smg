@@ -2244,8 +2244,8 @@ mod tests {
         let _unrelated = [
             WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
             WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
-            WorkerLoadGuard::new(workers[pinned].clone(), None),
-            WorkerLoadGuard::new(workers[pinned].clone(), None),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), None),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), None),
         ];
         assert_eq!(reg.select_worker(&policy, &workers, &info), Some(pinned));
         assert!(logs_contain("occupied_hit"));
@@ -2809,10 +2809,10 @@ mod tests {
             worker.set_completion_sink(Some(Arc::clone(&sink)));
         }
 
-        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
-        drop(WorkerLoadGuard::new(Arc::clone(&decode), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&decode), None));
         // The regular worker's model policy (random) accepts the completion silently.
-        drop(WorkerLoadGuard::new(Arc::clone(&regular), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&regular), None));
 
         assert_eq!(
             prefill_policy.completed.lock().unwrap().as_slice(),
@@ -2825,7 +2825,7 @@ mod tests {
 
         // A worker that outlives its registry reports to nobody.
         drop(registry);
-        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
         assert_eq!(prefill_policy.completed.lock().unwrap().len(), 1);
     }
 
@@ -2845,8 +2845,8 @@ mod tests {
         // The count handed over is the router's live one: two guards held,
         // then none.
         let held = [
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         ];
         registry.reconcile_in_flight(decode.as_ref());
         drop(held);

@@ -1,5 +1,7 @@
-//! The standalone policy controller (design 2: the `remote` mode of the
-//! policy engine). The command line is the operator's surface: the
+//! The standalone policy controller's command line and start-up (design 2:
+//! the `remote` mode of the policy engine), as one function: the stock
+//! binary calls [`run`] with the stock catalog, a host's own binary with
+//! the stages it added. The command line is the operator's surface: the
 //! controller's identity, its listeners, their TLS, the election, the
 //! shutdown bounds and the logging; the routing policy itself is the spec's
 //! and arrives over the control scope.
@@ -10,18 +12,17 @@ use std::{
 };
 
 use clap::Parser;
-use smg_policy_controller::{
-    controller::{
-        Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
-    },
-    elector::ElectionSettings,
-};
 use tokio::{
     runtime::{Builder, Runtime},
     signal::unix::{signal, SignalKind},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+use super::{
+    Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
+};
+use crate::{catalog::Catalog, elector::ElectionSettings};
 
 /// The controller's ports sit in one block, apart from the gateway's data
 /// (30000) and metrics (29000) ports.
@@ -441,19 +442,34 @@ fn runtime(worker_threads: Option<u16>) -> std::io::Result<Runtime> {
     }
 }
 
-/// Binds the controller, then names the listeners that take identities as
-/// told: a refusal of either arrives before anything is served.
-async fn bind(config: Config, as_told: &[String]) -> Result<Controller, Error> {
-    let mut controller = Controller::bind(config).await?;
+/// Binds the controller over `catalog`, then names the listeners that take
+/// identities as told: a refusal of either arrives before anything is
+/// served.
+async fn bind(config: Config, catalog: Catalog, as_told: &[String]) -> Result<Controller, Error> {
+    let mut controller = Controller::bind_with(config, catalog).await?;
     for listener in as_told {
         controller.identity_as_told(listener)?;
     }
     Ok(controller)
 }
 
-/// The start-up sequence: parse, log, configure, then the runtime, built
-/// only now so a refusal costs no threads; bind and serve on it.
-fn main() -> ExitCode {
+/// Runs a controller to its end and returns the process's exit code. The
+/// start-up sequence: parse, log, configure, then the runtime, built only
+/// now so a refusal costs no threads; bind and serve on it. A policy
+/// document names the stages `catalog` holds.
+///
+/// The command line is the process's own and this crate's: a flag it does
+/// not know is refused, so a host's settings come from its environment or a
+/// file. At `--help`, `--version` and a refused flag the parser ends the
+/// process itself and the call does not return.
+///
+/// # Panics
+///
+/// When a global log subscriber is already set: `run` installs its own, so
+/// the `main` that calls it installs none. When called inside an async
+/// runtime: `run` builds its own and blocks on it, so that `main` is a
+/// plain `fn main`.
+pub fn run(catalog: Catalog) -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli.log_level, cli.log_json);
     let config = match cli.config() {
@@ -471,7 +487,7 @@ fn main() -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let controller = match bind(config, &cli.identity_as_told).await {
+        let controller = match bind(config, catalog, &cli.identity_as_told).await {
             Ok(controller) => controller,
             Err(error) => {
                 error!(%error, "start refused");
@@ -497,12 +513,14 @@ mod tests {
     };
 
     use clap::Parser;
-    use smg_policy_controller::{
-        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope},
-        elector::ElectionSettings,
-    };
 
     use super::{bind, color_for, set, truthy, Cli};
+    use crate::{
+        catalog::Catalog,
+        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope},
+        elector::ElectionSettings,
+        Candidate, Constraints, Filter, RequestFacts,
+    };
 
     fn parse(args: &[&str]) -> Cli {
         let mut argv = vec!["smg-policy-controller", "--controller-id", "controller-0"];
@@ -885,26 +903,58 @@ mod tests {
         );
     }
 
+    /// Every listener on loopback, at a port the host picks.
+    const EPHEMERAL: [&str; 8] = [
+        "--gateway-listen",
+        "127.0.0.1:0",
+        "--control-listen",
+        "127.0.0.1:0",
+        "--replication-listen",
+        "127.0.0.1:0",
+        "--admin-listen",
+        "127.0.0.1:0",
+    ];
+
+    /// Keeps every worker: a stage of a host's own.
+    #[derive(Debug)]
+    struct Any;
+
+    impl Filter for Any {
+        fn name(&self) -> &'static str {
+            "any"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+    }
+
+    /// The stages the run is handed are the ones the bound controller holds.
+    #[tokio::test]
+    async fn the_bound_controller_holds_the_stages_the_run_is_handed() {
+        let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+        let mut stages = Catalog::builtin();
+        stages.filter("any", || Box::new(Any)).expect("a free name");
+        let controller = bind(config, stages, &[]).await.expect("binds");
+        assert!(controller.catalog().filters().any(|name| name == "any"));
+        // The stock build holds no such stage.
+        assert!(Catalog::builtin().filters().all(|name| name != "any"));
+    }
+
     /// The flag's names reach the bound controller: a name the flags mount
     /// no listener under refuses the start, by that name.
     #[tokio::test]
     async fn a_listener_named_as_told_is_one_the_flags_mount() {
-        const EPHEMERAL: [&str; 8] = [
-            "--gateway-listen",
-            "127.0.0.1:0",
-            "--control-listen",
-            "127.0.0.1:0",
-            "--replication-listen",
-            "127.0.0.1:0",
-            "--admin-listen",
-            "127.0.0.1:0",
-        ];
         let start = |flags: &[&str]| {
             let mut args = EPHEMERAL.to_vec();
             args.extend_from_slice(flags);
             let cli = parse(&args);
             let config = cli.config().expect("the flags are in order");
-            async move { bind(config, &cli.identity_as_told).await.map(drop) }
+            async move {
+                bind(config, Catalog::builtin(), &cli.identity_as_told)
+                    .await
+                    .map(drop)
+            }
         };
         // The relays' calls ride the gateways' listener unless they get
         // their own: there is none of that name to take them as told.

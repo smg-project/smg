@@ -1021,6 +1021,13 @@ impl Pattern {
         }
     }
 
+    /// Whether an all-ASCII text has a walk of its own here
+    /// ([`Self::for_each_match`] with `ASCII`): the template scanner's lean
+    /// scan.
+    pub(crate) fn has_lean_scan(&self) -> bool {
+        matches!(self.matcher, Matcher::Template(_))
+    }
+
     /// Calls `f` with each match of `text`, leftmost first, each continuing
     /// after the last (what [`Self::find_iter`] yields), the matcher
     /// dispatched once per text: a scanner runs its own loop with `f`
@@ -1029,15 +1036,31 @@ impl Pattern {
     /// instructions of a warm long encode); the program keeps the iterator.
     /// `words` says the scanners' run loops take their word scans: the loop
     /// is compiled both ways, and the encoder chooses once per call on the
-    /// input's length (its `WORD_SCAN_MIN_BYTES`).
+    /// input's length (its `WORD_SCAN_MIN_BYTES`). `ASCII` says `text` is all
+    /// ASCII: the template scanner's runs then take the lean scan
+    /// (`Roles::run_end_ascii`) whatever `words` says. It is a constant and
+    /// no argument, so that the lean loop is compiled only into the caller's
+    /// copy for such a text and the other copy keeps the loops it had.
     #[inline(always)]
-    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(&self, text: &str, words: bool, mut f: F) {
+    pub(crate) fn for_each_match<const ASCII: bool, F: FnMut(usize, usize)>(
+        &self,
+        text: &str,
+        words: bool,
+        mut f: F,
+    ) {
+        debug_assert!(
+            !ASCII || text.is_ascii(),
+            "the lean scan reads no byte beyond ASCII"
+        );
         match &self.matcher {
+            Matcher::Template(scanner) if ASCII => {
+                scanner.for_each_match::<true, true, F>(&self.classes, text, &mut f);
+            }
             Matcher::Template(scanner) if words => {
-                scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
+                scanner.for_each_match::<true, false, F>(&self.classes, text, &mut f);
             }
             Matcher::Template(scanner) => {
-                scanner.for_each_match::<false, F>(&self.classes, text, &mut f);
+                scanner.for_each_match::<false, false, F>(&self.classes, text, &mut f);
             }
             Matcher::Cased(scanner) if words => {
                 scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
@@ -1624,13 +1647,13 @@ impl Scanner {
     /// Compiled into its callers' loops: out of line it was a call per
     /// piece, and every value the loop keeps across a call is a spill.
     #[inline(always)]
-    fn match_at<const WORDS: bool>(
+    fn match_at<const WORDS: bool, const ASCII: bool>(
         &self,
         classes: &[Class],
         text: &str,
         pos: usize,
     ) -> Option<usize> {
-        let (c, len) = self.roles.at(text, pos)?;
+        let (c, len) = self.roles.at_by::<ASCII>(text, pos)?;
         let after = pos + len;
         // 1. A clitic: the first alternative whose characters follow in order.
         let first = text.as_bytes()[pos];
@@ -1646,29 +1669,35 @@ impl Scanner {
         }
         // 2. A letter run, with the lead-in when a letter follows it.
         if c & Role::WordPrefix.bit() != 0 {
-            if let Some((d, n)) = self.roles.at(text, after) {
+            if let Some((d, n)) = self.roles.at_by::<ASCII>(text, after) {
                 if d & Role::Word.bit() != 0 {
-                    return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
-                        text,
-                        after + n,
-                        Role::Word.bit(),
-                    ));
+                    return Some(
+                        self.roles
+                            .run_end_by::<{ WordScan::LETTERS }, WORDS, ASCII>(
+                                text,
+                                after + n,
+                                Role::Word.bit(),
+                            ),
+                    );
                 }
             }
         }
         if c & Role::Word.bit() != 0 {
-            return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
-                text,
-                after,
-                Role::Word.bit(),
-            ));
+            return Some(
+                self.roles
+                    .run_end_by::<{ WordScan::LETTERS }, WORDS, ASCII>(
+                        text,
+                        after,
+                        Role::Word.bit(),
+                    ),
+            );
         }
         // 3. Up to the bound of digits.
         if c & Role::Digit.bit() != 0 {
             let mut end = after;
             let mut count = 1;
             while count < self.digit_cap {
-                match self.roles.at(text, end) {
+                match self.roles.at_by::<ASCII>(text, end) {
                     Some((d, n)) if d & Role::Digit.bit() != 0 => {
                         end += n;
                         count += 1;
@@ -1681,16 +1710,26 @@ impl Scanner {
         // 4. A punctuation run, with the space when punctuation follows it,
         //    and the line breaks after the run.
         if c & Role::PunctPrefix.bit() != 0 {
-            if let Some((d, n)) = self.roles.at(text, after) {
+            if let Some((d, n)) = self.roles.at_by::<ASCII>(text, after) {
                 if d & Role::Punct.bit() != 0 {
-                    let end = self.roles.run_end(text, after + n, Role::Punct.bit());
-                    return Some(self.roles.run_end(text, end, Role::PunctBreak.bit()));
+                    let end = self
+                        .roles
+                        .run_end_of::<ASCII>(text, after + n, Role::Punct.bit());
+                    return Some(
+                        self.roles
+                            .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit()),
+                    );
                 }
             }
         }
         if c & Role::Punct.bit() != 0 {
-            let end = self.roles.run_end(text, after, Role::Punct.bit());
-            return Some(self.roles.run_end(text, end, Role::PunctBreak.bit()));
+            let end = self
+                .roles
+                .run_end_of::<ASCII>(text, after, Role::Punct.bit());
+            return Some(
+                self.roles
+                    .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit()),
+            );
         }
         // 5. Whitespace ending in line breaks: the greedy whitespace run
         //    gives back to the last position where a line break stands,
@@ -1698,7 +1737,7 @@ impl Scanner {
         let mut end = pos;
         let mut last_break = None;
         loop {
-            match self.roles.at(text, end) {
+            match self.roles.at_by::<ASCII>(text, end) {
                 Some((d, n)) if d & Role::BreakSpace.bit() != 0 => {
                     if d & Role::Break.bit() != 0 {
                         last_break = Some(end);
@@ -1713,18 +1752,21 @@ impl Scanner {
             }
         }
         if let Some(start) = last_break {
-            return Some(self.roles.run_end(text, start, Role::Break.bit()));
+            return Some(
+                self.roles
+                    .run_end_of::<ASCII>(text, start, Role::Break.bit()),
+            );
         }
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+            let mut end = self.roles.run_end_by::<{ WordScan::SPACES }, WORDS, ASCII>(
                 text,
                 after,
                 Role::TrailSpace.bit(),
             );
             loop {
-                match self.roles.at(text, end) {
+                match self.roles.at_by::<ASCII>(text, end) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
                     _ => return Some(end),
                 }
@@ -1737,7 +1779,7 @@ impl Scanner {
         }
         // 7. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+            return Some(self.roles.run_end_by::<{ WordScan::SPACES }, WORDS, ASCII>(
                 text,
                 after,
                 Role::Space.bit(),
@@ -1748,9 +1790,11 @@ impl Scanner {
 
     /// Calls `f` with each piece of `text` in order (see
     /// [`Pattern::for_each_match`]): a position no alternative matches at
-    /// is passed over by one character, as the iterator does.
+    /// is passed over by one character, as the iterator does. With `ASCII`
+    /// (a text that is all ASCII) the runs take the lean scan, whatever
+    /// `WORDS` says.
     #[inline(always)]
-    fn for_each_match<const WORDS: bool, F: FnMut(usize, usize)>(
+    fn for_each_match<const WORDS: bool, const ASCII: bool, F: FnMut(usize, usize)>(
         &self,
         classes: &[Class],
         text: &str,
@@ -1762,7 +1806,7 @@ impl Scanner {
         each_match(
             text,
             #[inline(always)]
-            |pos| self.match_at::<WORDS>(classes, text, pos),
+            |pos| self.match_at::<WORDS, ASCII>(classes, text, pos),
             f,
         );
     }
@@ -2013,7 +2057,7 @@ impl Iterator for Matches<'_, '_> {
             let start = self.pos;
             let end = match &self.pattern.matcher {
                 Matcher::Template(scanner) => {
-                    scanner.match_at::<false>(&self.pattern.classes, self.text, start)
+                    scanner.match_at::<false, false>(&self.pattern.classes, self.text, start)
                 }
                 Matcher::Cased(scanner) => {
                     scanner.match_at::<false>(&self.pattern.classes, self.text, start)

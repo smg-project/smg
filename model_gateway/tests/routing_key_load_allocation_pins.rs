@@ -27,6 +27,7 @@ use std::{
 use metrics_exporter_prometheus::PrometheusHandle;
 use smg::{
     observability::metrics::{start_prometheus, Metrics, PrometheusConfig},
+    routers::common::header_utils::extract_routing_key,
     worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
 };
 
@@ -115,13 +116,16 @@ async fn a_keyed_request_with_its_key_in_flight_allocates_the_guards_copy_alone(
     let mut headers = http::HeaderMap::new();
     headers.insert("x-smg-routing-key", KEY.parse().expect("an ASCII key"));
     let ((), from_header) = allocations_during(|| {
-        drop(WorkerLoadGuard::new(Arc::clone(&worker), Some(&headers)));
+        drop(WorkerLoadGuard::with_key(
+            Arc::clone(&worker),
+            extract_routing_key(Some(&headers)),
+        ));
     });
     drop(held);
     // The key's first request, on a shard whose table has room.
     let ((), first_of_key) = allocations_during(|| keyed_request(&worker));
     let ((), unkeyed) =
-        allocations_during(|| drop(WorkerLoadGuard::new(Arc::clone(&worker), None)));
+        allocations_during(|| drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None)));
 
     eprintln!(
         "routing-key load: {in_flight} allocation calls per keyed request with its key in flight \
