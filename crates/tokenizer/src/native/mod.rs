@@ -822,8 +822,10 @@ pub(crate) struct AddedTokens {
 /// The distinct prefixes of a set's tokens as a packed searcher: the longest
 /// length up to [`Self::MAX_LEN`] bytes at which there are at most
 /// [`Self::MAX_COUNT`] of them (a token shorter than the length stands
-/// whole), so a hit is as close to a token as the set allows. A set whose
-/// prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
+/// whole), so a hit is as close to a token as the set allows; a set that
+/// comes to at most [`Self::NARROW_COUNT`] with [`Self::NARROW_MIN_LEN`]
+/// bytes or more is cut to that length, for the library's narrow form. A
+/// set whose prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
 /// automaton's own search. When the library declines the prefixes that fit
 /// (its SIMD searcher takes a one-byte pattern among at most sixteen, and a
 /// set with newline or tab runs among its tokens has such prefixes), the
@@ -840,6 +842,14 @@ impl Prefixes {
     const MAX_LEN: usize = 16;
     const MIN_LEN: usize = 3;
     const MAX_COUNT: usize = 64;
+    /// The most patterns the library's packed searcher takes in its narrow
+    /// form (as of its version 1.1), which reads up to twice the bytes a
+    /// step that its wide form reads.
+    const NARROW_COUNT: usize = 32;
+    /// The shortest prefixes the narrow form is preferred with: a prefix of
+    /// this many bytes is nearly as rare in text as its token, where a
+    /// shorter one would stop the pass at places no token stands.
+    const NARROW_MIN_LEN: usize = 8;
     const MAX_FIRST_BYTES: usize = 16;
 
     /// Whether the automaton's start-byte scan declines `tokens`: a first
@@ -854,34 +864,48 @@ impl Prefixes {
         firsts.len() > 3 || firsts.iter().any(|first| !first.is_ascii())
     }
 
-    /// The searcher over the prefixes of `tokens`; none when the prefixes
-    /// that fit are shorter than [`Self::MIN_LEN`] bytes for a token longer
-    /// than them (a set of added words: the pass would stop at nearly every
-    /// byte of ordinary text, where the automaton's own walk is cheaper),
-    /// when even the one-byte prefixes exceed [`Self::MAX_COUNT`], or when
-    /// the library declines the set.
-    fn of(tokens: &[Added]) -> Option<Self> {
-        let distinct = |len: usize| {
-            let mut prefixes: Vec<&[u8]> = tokens
-                .iter()
-                .map(|token| &token.content.as_bytes()[..token.content.len().min(len)])
-                .collect();
-            prefixes.sort_unstable();
-            prefixes.dedup();
-            prefixes
+    /// The distinct prefixes of `tokens` of up to `len` bytes.
+    fn distinct(tokens: &[Added], len: usize) -> Vec<&[u8]> {
+        let mut prefixes: Vec<&[u8]> = tokens
+            .iter()
+            .map(|token| &token.content.as_bytes()[..token.content.len().min(len)])
+            .collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        prefixes
+    }
+
+    /// The prefixes of `tokens` a searcher is made of: the longest of at
+    /// most [`Self::NARROW_COUNT`] when their length is
+    /// [`Self::NARROW_MIN_LEN`] bytes or more, so that the library takes its
+    /// narrow form; else the longest of at most [`Self::MAX_COUNT`]. None
+    /// when the prefixes that fit are shorter than [`Self::MIN_LEN`] bytes
+    /// for a token longer than them (a set of added words: the pass would
+    /// stop at nearly every byte of ordinary text, where the automaton's own
+    /// walk is cheaper), or when even the one-byte prefixes exceed
+    /// [`Self::MAX_COUNT`].
+    fn chosen(tokens: &[Added]) -> Option<Vec<&[u8]>> {
+        // The longest length from `shortest` up with at most `most` distinct
+        // prefixes. Their count never grows as the length shrinks, so the
+        // first length that fits, read from the longest down, is the one.
+        let longest = |shortest: usize, most: usize| {
+            (shortest..=Self::MAX_LEN)
+                .rev()
+                .map(|len| (len, Self::distinct(tokens, len)))
+                .find(|(_, prefixes)| prefixes.len() <= most)
         };
-        let mut len = Self::MAX_LEN;
-        let mut prefixes = distinct(len);
-        while prefixes.len() > Self::MAX_COUNT && len > 1 {
-            len -= 1;
-            prefixes = distinct(len);
-        }
+        let (len, prefixes) = longest(Self::NARROW_MIN_LEN, Self::NARROW_COUNT)
+            .or_else(|| longest(1, Self::MAX_COUNT))?;
         let cut_short = tokens.iter().any(|token| token.content.len() > len);
-        if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
-            return None;
-        }
+        (!cut_short || len >= Self::MIN_LEN).then_some(prefixes)
+    }
+
+    /// The searcher over the prefixes of `tokens` ([`Self::chosen`]); none
+    /// when there are none to take or the library declines the set.
+    fn of(tokens: &[Added]) -> Option<Self> {
+        let prefixes = Self::chosen(tokens)?;
         let searcher = Self::searcher(&prefixes).or_else(|| {
-            let firsts = distinct(1);
+            let firsts = Self::distinct(tokens, 1);
             (firsts.len() <= Self::MAX_FIRST_BYTES)
                 .then(|| Self::searcher(&firsts))
                 .flatten()
