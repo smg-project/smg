@@ -78,8 +78,44 @@ fn spec(name: &str, component: Vec<u8>, mode: u8) -> PluginSpec {
     spec
 }
 
+/// The host's frame of an `init`. Nothing watches an `init`: it ends at
+/// this deadline on the wall clock, whatever its thread had of the CPU.
+const INIT_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Loads `spec` and returns what the load said. Its `init` ends at a
+/// deadline on the wall clock, so a runner that holds the loading thread for
+/// the init frame has the host end an `init` that did nothing. Such a load
+/// is made again and says so, three loads at most: its thread was off the
+/// CPU half the frame. A guest that spends the frame itself has the CPU, and
+/// its load ends here as it did.
+#[expect(
+    clippy::print_stdout,
+    reason = "a run that loads again reports it on stdout under --nocapture"
+)]
+fn load_unheld(runtime: &Arc<Runtime>, spec: PluginSpec) -> Result<Arc<Plugin>, LoadError> {
+    let mut loads = 0;
+    loop {
+        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        let load = Plugin::load(runtime, spec.clone());
+        loads += 1;
+        let held = matches!(
+            &load,
+            Err(LoadError::Trap { reason, .. }) if reason.ends_with("wasm trap: interrupt")
+        ) && off_cpu_since(wall, cpu) >= INIT_FRAME / 2;
+        if !held || loads == 3 {
+            return load;
+        }
+        println!("a load: made again in this run: its thread was off the CPU half the init frame");
+    }
+}
+
+/// A load that must succeed, a held one made again.
+fn loaded(runtime: &Arc<Runtime>, spec: PluginSpec) -> Arc<Plugin> {
+    load_unheld(runtime, spec).expect("the guest loads")
+}
+
 fn load(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, mode: u8) -> Arc<Plugin> {
-    Plugin::load(runtime, spec(name, component, mode)).expect("the guest loads")
+    loaded(runtime, spec(name, component, mode))
 }
 
 /// `load` at the slow calibration, with its frame.
@@ -87,7 +123,7 @@ fn load_slow(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, mode: u8) -
     let mut spec = spec(name, component, mode);
     spec.fuel_per_micro = SLOW_CALIBRATION;
     spec.budget_micros = SLOW_FRAME_MICROS;
-    Plugin::load(runtime, spec).expect("the guest loads")
+    loaded(runtime, spec)
 }
 
 /// A profile whose three stages are the plugin's, each with the given
@@ -339,7 +375,7 @@ fn the_abi_pin_the_memory_floor_the_init_failure_and_bad_bytes_are_refused() {
         LoadError::Fuel { .. }
     ));
 
-    let err = Plugin::load(
+    let err = load_unheld(
         &runtime,
         spec("refusing", guest::record_guest(), mode::REFUSE_INIT),
     )
@@ -563,7 +599,7 @@ fn a_declined_filter_keeps_the_instance_and_takes_its_fallback() {
     );
     let mut closed = spec("closed", guest::record_guest(), mode::DECLINE_FILTER);
     closed.failure = Failure::Closed;
-    let closed = Plugin::load(&runtime, closed).expect("loads");
+    let closed = loaded(&runtime, closed);
     match decide(&plugin_engine(&closed), &candidates, 1) {
         Decision::Shed(shed) => {
             assert_eq!(shed.reason, ShedReason::NoEndpoints);
@@ -660,18 +696,18 @@ fn an_invalid_answer_is_a_fault_of_the_plugin() {
     for (mode, name) in cases {
         let plugin = load(&runtime, name, guest::record_guest(), mode);
         let engine = plugin_engine(&plugin);
+        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
         let decision = decide(&engine, &pool(4), 1);
+        let held = off_cpu_since(wall, cpu);
         assert!(
             matches!(decision, Decision::Pick(_)),
             "{name}: the fallbacks decide"
         );
         let stats = plugin.stats();
         assert_eq!(stats.invalid, 1, "{name}");
-        assert!(
-            plugin.is_warm(),
-            "{name}: the instance is dropped and the close rebuilds the slot"
-        );
-        assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
+        if the_close_rebuilt(name, &plugin, held) {
+            assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
+        }
     }
 }
 
@@ -706,7 +742,7 @@ fn a_declined_pick_takes_the_fallback_picker_or_sheds_when_closed() {
     assert_eq!(open.stats().declined, 1);
     let mut closed = spec("closed-pick", guest::record_guest(), mode::DECLINE_PICK);
     closed.failure = Failure::Closed;
-    let plugin = Plugin::load(&runtime, closed).expect("loads");
+    let plugin = loaded(&runtime, closed);
     match decide(&plugin_engine(&plugin), &pool(4), 1) {
         Decision::Shed(shed) => {
             assert_eq!(shed.reason, ShedReason::PolicyDeclined);
@@ -739,7 +775,7 @@ fn a_declined_score_has_no_veto_under_either_failure_mode() {
     for failure in [Failure::Open, Failure::Closed] {
         let mut declining = spec("no-score", guest::record_guest(), mode::DECLINE_SCORE);
         declining.failure = failure;
-        let plugin = Plugin::load(&runtime, declining).expect("loads");
+        let plugin = loaded(&runtime, declining);
         let decision = decide(&plugin_engine(&plugin), &pool(4), 1);
         let mut ids = pick_ids(&decision);
         assert_eq!(
@@ -767,7 +803,7 @@ fn the_breaker_opens_on_the_failure_threshold_and_bypasses_the_guest() {
         window_micros: 60_000_000,
         cooldown_micros: 60_000_000,
     };
-    let plugin = Plugin::load(&runtime, spec).expect("loads");
+    let plugin = loaded(&runtime, spec);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     decide(&engine, &candidates, 1);
@@ -902,7 +938,7 @@ fn an_opening_under_the_failure_rule_writes_one_line() {
         window_micros: 60_000_000,
         cooldown_micros: 60_000_000,
     };
-    let plugin = Plugin::load(&runtime, spec).expect("loads");
+    let plugin = loaded(&runtime, spec);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     decide(&engine, &candidates, 1);
@@ -1034,7 +1070,7 @@ fn the_memory_cap_is_the_specs_and_a_growth_past_it_traps() {
 
     let mut roomy = spec("roomy", guest::record_guest(), mode::GROW_32_MIB);
     roomy.memory_mib = 64;
-    let roomy = Plugin::load(&runtime, roomy).expect("loads");
+    let roomy = loaded(&runtime, roomy);
     decide(&plugin_engine(&roomy), &pool(4), 1);
     let stats = roomy.stats();
     assert_eq!(
@@ -1301,7 +1337,7 @@ fn a_withheld_session_key_is_withheld_from_the_lifecycle_too() {
     ] {
         let mut withheld = spec(name, component.clone(), mode::LEAST_IN_FLIGHT);
         withheld.view.session_key = Reveal::None;
-        let withheld = Plugin::load(&runtime, withheld).expect("the guest loads");
+        let withheld = loaded(&runtime, withheld);
         let hashed = load(&runtime, name, component, mode::LEAST_IN_FLIGHT);
         // A lease carries a request's session, which the request's facts
         // alone make.
@@ -1391,7 +1427,7 @@ fn the_decisions_budget_bounds_the_sum_of_its_calls() {
     // held off its core is still charged its fuel.
     burner.fuel_per_micro = SLOW_CALIBRATION;
     let fuel_per_micro = burner.fuel_per_micro;
-    let plugin = Plugin::load(&runtime, burner).expect("the guest loads");
+    let plugin = loaded(&runtime, burner);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     let pool_facts = PoolFacts {
@@ -1584,7 +1620,7 @@ fn a_bulk_memory_loop_meets_the_frames_bound_on_the_clock() {
     // asleep the case reads seconds and fails.
     let mut filler = spec("filler", guest::record_guest(), mode::FILL_IN_SCORE);
     filler.fuel_per_micro = 20_000_000;
-    let plugin = Plugin::load(&runtime, filler).expect("the guest loads");
+    let plugin = loaded(&runtime, filler);
     let engine = plugin_engine(&plugin);
     let (wall, started) = (std::time::Instant::now(), bound_clock());
     assert!(
@@ -1642,7 +1678,7 @@ fn a_pair_shares_one_decision_budget() {
     // Budgets in burns of fuel, at the slow calibration.
     burner.fuel_per_micro = SLOW_CALIBRATION;
     let fuel_per_micro = burner.fuel_per_micro;
-    let plugin = Plugin::load(&runtime, burner).expect("the guest loads");
+    let plugin = loaded(&runtime, burner);
     // One burning decision on a single profile calibrates a call's cost.
     let single = plugin_engine(&plugin);
     let before = plugin.stats().fuel_used;
@@ -1850,7 +1886,7 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
     );
     spec.fuel_per_micro = 20_000_000;
     spec.budget_micros = 1_000_000;
-    let plugin = Plugin::load(&runtime, spec).expect("the guest loads");
+    let plugin = loaded(&runtime, spec);
     let engine = plugin_engine(&plugin);
     let cpu_before = bound_clock();
     let started = std::time::Instant::now();
@@ -1987,7 +2023,7 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
     picker_spec.fuel_per_micro = SLOW_CALIBRATION;
     picker_spec.budget_micros = SLOW_FRAME_MICROS;
     let fuel_per_micro = picker_spec.fuel_per_micro;
-    let picker = Plugin::load(&runtime, picker_spec).expect("the guest loads");
+    let picker = loaded(&runtime, picker_spec);
     // One burn's fuel, from the scorer alone at a large budget.
     let before = scorer.stats().fuel_used;
     plugin_engine(&scorer).decide(
@@ -2077,7 +2113,7 @@ fn the_first_open_seeds_the_budget_and_later_opens_draw_on_it() {
     // Budgets in burns of fuel, at the slow calibration.
     spec.fuel_per_micro = SLOW_CALIBRATION;
     let fuel_per_micro = spec.fuel_per_micro;
-    let plugin = Plugin::load(&runtime, spec).expect("the guest loads");
+    let plugin = loaded(&runtime, spec);
     // One decision's fuel on a single profile: the burning constructor and
     // three cheap stages.
     let before = plugin.stats().fuel_used;
@@ -2789,7 +2825,7 @@ fn a_destructor_the_host_held_past_its_bound_is_not_ended() {
         window_micros: 60_000_000,
         cooldown_micros: 60_000_000,
     };
-    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     // The destructor's bound (the host's own constant, private to it, so by
@@ -2958,7 +2994,7 @@ fn a_score_the_host_held_that_then_traps_is_the_plugins_failure_and_no_stall() {
         window_micros: 60_000_000,
         cooldown_micros: 60_000_000,
     };
-    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     // On three candidates the guest's score traps after its log line.
     let candidates = pool(3);
@@ -3043,7 +3079,7 @@ fn burn_after_a_hold(
         window_micros: 60_000_000,
         cooldown_micros: 60_000_000,
     };
-    let plugin = Plugin::load(&runtime, slow).expect("the guest loads");
+    let plugin = loaded(&runtime, slow);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     hold(name, held, 1);
@@ -3303,16 +3339,20 @@ fn a_score_the_host_held_that_then_declines_is_a_decline_and_the_hosts_stall() {
 /// Sixty-four decisions of a plugin whose score the host holds inside its
 /// log line for six tenths of the decision's budget, short of late. With
 /// `arm`, the first is held past the frame instead: unread, it arms the
-/// thread. Returns the plugin and a witness: the thread's own clock across
-/// each decision says none had a quarter of the budget on the CPU.
+/// thread. Returns the plugin and the case's two witnesses. The thread's own
+/// clock across each decision says none had a quarter of the budget on the
+/// CPU. The wall clock says whether the window's faults are the runner's:
+/// each fell in a decision held short that took its hold and half of what
+/// the hold leaves of the budget, where the calls after the score run out
+/// under what is left.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool) {
+fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
     let runtime = runtime();
     let mut held = spec(name, guest::record_guest(), mode::LOG_IN_SCORE);
     // Every score's log line reaches the host's subscriber, where the case
     // holds it.
     held.log.per_second = 1_000;
-    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     let frame = std::time::Duration::from_micros(u64::from(FRAME_MICROS));
@@ -3323,9 +3363,19 @@ fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool) {
     } else {
         hold(name, short, 64);
     }
-    let mut cheap = true;
+    // What a short hold leaves of the budget bounds the calls after the
+    // score. A decision that took its hold and half of that again was held
+    // by the runner too, and a call that runs out in it ran out under what
+    // the runner left.
+    let late = short + (frame - short) / 2;
+    let faults = || {
+        let stats = plugin.stats();
+        (stats.fuel_exhausted, stats.traps)
+    };
+    let (mut cheap, mut by_the_runner, mut by_the_host) = (true, 0, 0);
     for seed in 0..64 {
-        let cpu = bound_clock();
+        let before = faults();
+        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
         let decision = engine.decide(
             &timed(seed),
             &four(),
@@ -3333,11 +3383,25 @@ fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool) {
             &Constraints::default(),
             &mut Scratch::new(),
         );
+        let took = wall.elapsed();
         cheap &= bound_clock().saturating_sub(cpu) < frame / 4;
         assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
+        if faults() != before {
+            if (arm && seed == 0) || took < late {
+                by_the_host += 1;
+            } else {
+                by_the_runner += 1;
+            }
+        }
     }
-    (plugin, cheap)
+    (plugin, cheap, by_the_runner > 0 && by_the_host == 0)
 }
+
+/// What a run of a window of short holds says when its faults are the
+/// runner's: its counts are not the case's to assert.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const A_HOLD_REACHED_A_PICK: &str =
+    "a call ran out in a decision that took its short hold and half of what the hold leaves of the budget";
 
 /// A reading gives a call one time, late or not. On an armed thread a score
 /// the host holds for six tenths of the decision's budget is short of late,
@@ -3352,10 +3416,19 @@ fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool) {
 /// process is off the CPU by the thread's own clock, but one that lands
 /// inside the case's own hold makes that sleep end on the CPU: the clock
 /// moves by about the hold, and that time is the call's by any reading.
+/// A call that runs out is the host's fault unless the wall clock says its
+/// decision took its short hold and half of what the hold leaves of the
+/// budget: a hold of the runner's own past that reaches the remainder the
+/// later calls run under. A run whose faults all fell there says so and
+/// asserts no count.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
-    let (plugin, cheap) = a_window_of_short_holds("held-short", true);
+    let (plugin, cheap, by_the_runner) = a_window_of_short_holds("held-short", true);
+    if by_the_runner {
+        excused("a window of holds short of late", A_HOLD_REACHED_A_PICK);
+        return;
+    }
     let stats = plugin.stats();
     assert_eq!(
         (stats.fuel_exhausted, stats.traps, stats.instantiations),
@@ -3395,11 +3468,19 @@ fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
 /// sixty-four read slow and the window opened at its first read. A guest
 /// slow by itself is slow by those readings and opens all the same (the
 /// case of the guest slow in what fuel does not price). That the breaker
-/// stays shut is asserted under the armed case's witness.
+/// stays shut is asserted under the armed case's witness, and the counts
+/// unless its wall clock says the window's faults are the runner's.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_window_of_holds_short_of_late_on_a_thread_nothing_armed_is_one_slow_sample() {
-    let (plugin, cheap) = a_window_of_short_holds("held-quiet", false);
+    let (plugin, cheap, by_the_runner) = a_window_of_short_holds("held-quiet", false);
+    if by_the_runner {
+        excused(
+            "a window of holds short of late on a thread nothing armed",
+            A_HOLD_REACHED_A_PICK,
+        );
+        return;
+    }
     let stats = plugin.stats();
     assert_eq!(
         (stats.fuel_exhausted, stats.traps, stats.instantiations),
@@ -3440,7 +3521,7 @@ fn an_arming_at_a_close_lasts_the_rings_length_and_no_longer() {
     // Every score's log line reaches the host's subscriber, where the case
     // holds three of them.
     held.log.per_second = 1_000;
-    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     let short = std::time::Duration::from_micros(u64::from(FRAME_MICROS)) * 6 / 10;
@@ -3505,7 +3586,7 @@ fn a_scorer_held_short_of_late_through_half_a_window_before_a_spinner_stays_shut
     // Every score's log line reaches the host's subscriber, where the case
     // holds the first thirty-three.
     held.log.per_second = 1_000;
-    let held = Plugin::load(&runtime, held).expect("the guest loads");
+    let held = loaded(&runtime, held);
     let spinner = load(
         &runtime,
         "spinner-behind",
@@ -3608,7 +3689,7 @@ fn two_scores_held_past_a_small_budget_and_short_of_late_are_one_slow_sample() {
     // Every score's log line reaches the host's subscriber, where the case
     // holds the first two.
     held.log.per_second = 1_000;
-    let plugin = Plugin::load(&runtime, held).expect("the guest loads");
+    let plugin = loaded(&runtime, held);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     hold(name, std::time::Duration::from_micros(HOLD_MICROS), 2);
@@ -3684,7 +3765,7 @@ fn a_guest_slow_in_what_fuel_does_not_price_is_opened_by_its_samples_at_the_firs
         window_micros: 60_000_000,
         cooldown_micros: 60_000_000,
     };
-    let plugin = Plugin::load(&runtime, slow).expect("the guest loads");
+    let plugin = loaded(&runtime, slow);
     let engine = plugin_engine(&plugin);
     let hold = std::time::Duration::from_micros(u64::from(BUDGET_MICROS) / 2);
     let mut on_the_cpu = true;
@@ -3848,6 +3929,43 @@ fn measure_rss_per_kept_instance_and_cpu_per_decision() {
     );
 }
 
+/// How many times each of the process's epoch ticker threads has had the
+/// CPU, by thread, from `/proc`: once a tick while a call is in flight.
+/// Empty where the host does not say.
+fn ticker_runs() -> Vec<(std::ffi::OsString, u64)> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| {
+            let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
+            if comm.trim() != "wasm-epoch" {
+                return None;
+            }
+            let schedstat = std::fs::read_to_string(task.path().join("schedstat")).ok()?;
+            let runs = schedstat.split_whitespace().nth(2)?.parse::<u64>().ok()?;
+            Some((task.file_name(), runs))
+        })
+        .collect()
+}
+
+/// The most times any one of the process's ticker threads had the CPU since
+/// `before` was read: the case's own ticker ticked no more often than that.
+/// `None` where the host does not say.
+fn most_ticker_runs_since(before: &[(std::ffi::OsString, u64)]) -> Option<u64> {
+    ticker_runs()
+        .into_iter()
+        .map(|(thread, runs)| {
+            let earlier = before
+                .iter()
+                .find(|(known, _)| *known == thread)
+                .map_or(0, |(_, earlier)| *earlier);
+            runs.saturating_sub(earlier)
+        })
+        .max()
+}
+
 /// The CPU ticks (user and system, at 100 per second) of the runtime's epoch
 /// ticker thread, from `/proc`.
 fn ticker_cpu_ticks() -> u64 {
@@ -3878,6 +3996,33 @@ fn four() -> PoolFacts<'static> {
         generation: 1,
         ..PoolFacts::default()
     }
+}
+
+/// How long the calling thread was off the CPU since `wall` and `cpu` were
+/// read together: the wall clock's time less the thread's own.
+fn off_cpu_since(wall: std::time::Instant, cpu: std::time::Duration) -> std::time::Duration {
+    wall.elapsed()
+        .saturating_sub(bound_clock().saturating_sub(cpu))
+}
+
+/// Whether the close rebuilt the instance a fault dropped, in a run that
+/// can say. The rebuild is an `init`, on the wall clock: a runner that kept
+/// the decision's thread off the CPU half the init frame (`held`, read over
+/// the decision) can have ended it, and that run says so and asserts no
+/// rebuild. A rebuild that fails with its thread on the CPU is the host's.
+fn the_close_rebuilt(case: &str, plugin: &Plugin, held: std::time::Duration) -> bool {
+    if !plugin.is_warm() && held >= INIT_FRAME / 2 {
+        excused(
+            case,
+            "the decision's thread was off the CPU half the init frame, the bound of the close's rebuild",
+        );
+        return false;
+    }
+    assert!(
+        plugin.is_warm(),
+        "{case}: the instance is dropped and the close rebuilds the slot"
+    );
+    true
 }
 
 /// Decides once, and says with the decision whether its thread kept the
@@ -4129,7 +4274,7 @@ fn three_honest_quarters_and_a_spinner_charge_nobody() {
     spinner_spec.fuel_per_micro = SLOW_CALIBRATION;
     spinner_spec.budget_micros = SLOW_FRAME_MICROS;
     let fuel_per_micro = spinner_spec.fuel_per_micro;
-    let spinner = Plugin::load(&runtime, spinner_spec).expect("the guest loads");
+    let spinner = loaded(&runtime, spinner_spec);
     // One burn's fuel, from a burner alone at a large budget.
     let before = burners[0].stats().fuel_used;
     plugin_engine(&burners[0]).decide(
@@ -4302,7 +4447,7 @@ fn plugin_whose_init_asks(
     let mut asks = spec("init-asks", guest::record_guest(), mode::LEAST_IN_FLIGHT);
     asks.config.push(mode::INIT_ASKS_THE_CLOCK);
     tweak(&mut asks);
-    let plugin = Plugin::load(&runtime, asks).expect("the guest loads");
+    let plugin = loaded(&runtime, asks);
     (clock, runtime, plugin)
 }
 
@@ -4445,7 +4590,8 @@ fn a_lazy_init_that_fails_long_on_the_clock_is_the_decisions_budget_spent_too() 
 /// wall time is charged its fuel at the calibration, the 100 ms of the init
 /// frame, which is the whole of a 100 ms decision. One failure on the breaker
 /// (the frame it ran out under was its own), and the neighbour's open finds
-/// the remainder gone.
+/// the remainder gone. An `init` the wall clock ended with its thread off
+/// the CPU burnt no frame: such a run says so and asserts no count.
 #[test]
 fn a_lazy_init_that_burns_its_frame_out_is_charged_its_fuel_at_the_calibration() {
     let (clock, runtime, cold) = plugin_whose_init_asks(0, |row| {
@@ -4459,8 +4605,19 @@ fn a_lazy_init_that_burns_its_frame_out_is_charged_its_fuel_at_the_calibration()
         mode::LEAST_IN_FLIGHT,
     );
     let before = cold.stats().fuel_used;
+    let (wall, cpu) = (std::time::Instant::now(), bound_clock());
     decide_on_a_cold_slot(&clock, 3, &cold, &neighbour, 100_000);
     let s = cold.stats();
+    // The init spins its frame out in a moment of wall time unless the
+    // runner keeps its thread off the CPU: then its deadline on the wall
+    // clock ends it with its fuel unburnt.
+    if s.fuel_used - before < 99_000 && off_cpu_since(wall, cpu) >= INIT_FRAME / 2 {
+        excused(
+            "a lazy init that burns its frame out",
+            "the decision's thread was off the CPU half the init frame, the init's bound on the wall clock",
+        );
+        return;
+    }
     assert!(
         s.fuel_used - before >= 99_000,
         "the fuel the failed init burnt is in the plugin's count: {s:?}"
@@ -4490,7 +4647,7 @@ fn a_kept_lazy_init_is_charged_its_fuel_at_the_calibration() {
     let runtime = runtime();
     let mut row = spec("kept-init", guest::record_guest(), mode::BURN_IN_INIT);
     row.fuel_per_micro = 10;
-    let cold = Plugin::load(&runtime, row).expect("the guest loads");
+    let cold = loaded(&runtime, row);
     // The load ran `init` once; the same code takes the same fuel every time.
     let loaded = cold.stats();
     let init_micros = u32::try_from(loaded.fuel_used.div_ceil(10)).expect("fits");
@@ -4535,7 +4692,7 @@ fn a_kept_lazy_init_is_charged_the_larger_of_its_terms_not_their_sum() {
     let mut row = spec("burns-and-waits", guest::record_guest(), mode::BURN_IN_INIT);
     row.config.push(mode::INIT_ASKS_THE_CLOCK);
     row.fuel_per_micro = 10;
-    let cold = Plugin::load(&runtime, row).expect("the guest loads");
+    let cold = loaded(&runtime, row);
     // The load ran `init` once, the clock answering at once: its fuel at the
     // calibration, the same every time.
     let init_micros = u32::try_from(cold.stats().fuel_used.div_ceil(10)).expect("fits");
@@ -4652,7 +4809,7 @@ fn a_held_init_on_a_thread_a_late_call_armed_is_no_slow_sample() {
     row.config.push(mode::INIT_ASKS_THE_CLOCK);
     // The held score's log line reaches the host's subscriber.
     row.log.per_second = 1_000;
-    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    let plugin = loaded(&runtime, row);
     let engine = plugin_engine(&plugin);
     let candidates = pool(4);
     // The first decision, on the warm slot: its score is held for three
@@ -4721,7 +4878,7 @@ fn a_lazy_init_slow_by_its_own_fuel_on_every_cold_slot_opens_the_window() {
     let runtime = runtime();
     let mut row = spec("init-burns", guest::record_guest(), mode::BURN_IN_INIT);
     row.fuel_per_micro = CALIBRATION;
-    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    let plugin = loaded(&runtime, row);
     // The load ran `init` once: its fuel at the calibration, the same every
     // time.
     let init_micros = u32::try_from(plugin.stats().fuel_used.div_ceil(CALIBRATION)).expect("fits");
@@ -4769,7 +4926,7 @@ fn a_lazy_inits_time_is_in_the_sample_of_the_decision_that_paid_it_alone() {
     let runtime = runtime();
     let mut row = spec("init-burns", guest::record_guest(), mode::BURN_IN_INIT);
     row.fuel_per_micro = CALIBRATION;
-    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    let plugin = loaded(&runtime, row);
     // The load ran `init` once: its fuel at the calibration, the same every
     // time.
     let init_micros = u32::try_from(plugin.stats().fuel_used.div_ceil(CALIBRATION)).expect("fits");
@@ -4825,7 +4982,7 @@ fn a_sample_slow_by_time_nothing_read_is_in_its_window_as_it_is() {
     let mut row = spec("init-burns-held", guest::record_guest(), mode::BURN_IN_INIT);
     row.config.push(mode::INIT_ASKS_THE_CLOCK);
     row.fuel_per_micro = CALIBRATION;
-    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    let plugin = loaded(&runtime, row);
     // The load ran `init` once, with no wait: its fuel at the calibration,
     // the same every time.
     let init_micros = u32::try_from(plugin.stats().fuel_used.div_ceil(CALIBRATION)).expect("fits");
@@ -4910,7 +5067,7 @@ fn two_clamped_inits_the_host_holds_are_one_slow_sample() {
     // A tenth of the default calibration: in fuel the init's burn outlasts
     // the 2 ms budget, so the remainder clamps it.
     heavy.fuel_per_micro = 100;
-    let plugin = Plugin::load(&runtime, heavy).expect("the guest loads");
+    let plugin = loaded(&runtime, heavy);
     let engine = plugin_engine(&plugin);
     let decide = |seed: u64, budget_micros: u32| {
         let decision = engine.decide(
@@ -5005,7 +5162,7 @@ fn a_cold_init_that_traps_short_of_its_clamp_is_its_own_failure() {
         failures: 2,
         ..BreakerSpec::default()
     };
-    let cold = Plugin::load(&runtime, row).expect("the guest loads");
+    let cold = loaded(&runtime, row);
     let neighbour = load(
         &runtime,
         "after-the-init",
@@ -5097,7 +5254,7 @@ fn a_gone_budget_fails_its_decision_once_on_a_pair() {
         failures: 2,
         ..BreakerSpec::default()
     };
-    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    let plugin = loaded(&runtime, row);
     let pair = pair_engine(
         vec![
             plugin_profile(&plugin, None, None, None),
@@ -5139,7 +5296,7 @@ fn a_rebuild_refused_after_a_counted_trap_is_no_second_failure() {
         failures: 2,
         ..BreakerSpec::default()
     };
-    let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+    let plugin = loaded(&runtime, row);
     let engine = plugin_engine(&plugin);
     let decide = |seed: u64| {
         engine.decide(
@@ -5254,6 +5411,10 @@ fn an_observe_fault_leaves_no_mark_for_a_decision_that_never_touched_the_slot() 
 /// not stretched by one; the run-out drops the instance and the close
 /// rebuilds it. A destructor is a watched call: its bound counts the time
 /// its thread had the CPU, so the case reads the clock the bound counts.
+/// It ends at a tick, and a ticker has the CPU once a millisecond while a
+/// call is in flight: a run that reads the destructor far past its bound
+/// while no ticker of the process had the CPU for half the decision's
+/// milliseconds was kept from its ticks, and says so instead.
 #[test]
 fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
     let runtime = runtime();
@@ -5263,9 +5424,9 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
     // the fill.
     filler.budget_micros = 0;
     filler.fuel_per_micro = 100_000_000;
-    let plugin = Plugin::load(&runtime, filler).expect("the guest loads");
+    let plugin = loaded(&runtime, filler);
     let engine = plugin_engine(&plugin);
-    let started = bound_clock();
+    let (wall, started, ticked) = (std::time::Instant::now(), bound_clock(), ticker_runs());
     let decision = engine.decide(
         &RequestFacts {
             budget_micros: 100_000,
@@ -5277,11 +5438,26 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
         &mut Scratch::new(),
     );
     let had = bound_clock().saturating_sub(started);
+    let (held, took) = (off_cpu_since(wall, started), wall.elapsed());
     assert!(matches!(decision, Decision::Pick(_)), "the decision stands");
-    assert!(
-        had < std::time::Duration::from_millis(30),
-        "the destructor's bound is its own, not the 100 ms frame: {had:?} on the clock it counts"
-    );
+    // No tick comes while the runner keeps the ticker from the CPU, and the
+    // destructor runs on until one does. A ticker that had the CPU for half
+    // the decision's milliseconds ticked: the time is the host's.
+    if had >= std::time::Duration::from_millis(30) {
+        let ran = most_ticker_runs_since(&ticked);
+        assert!(
+            ran.is_some_and(|ran| u128::from(ran) < took.as_millis() / 2),
+            "the destructor's bound is its own, not the 100 ms frame: {had:?} on the clock it counts, and a ticker had the CPU {ran:?} times in {took:?}"
+        );
+        excused(
+            "a destructor's bound",
+            &format!(
+                "no ticker had the CPU more than {} times in the {took:?} the decision took",
+                ran.unwrap_or(0)
+            ),
+        );
+    }
+    let rebuilt = the_close_rebuilt("a destructor's bound", &plugin, held);
     let s = plugin.stats();
     assert_eq!(
         (
@@ -5290,10 +5466,9 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
             s.breaker_opens,
             s.lazy_instantiations
         ),
-        (1, 0, 0, 1),
+        (1, 0, 0, u64::from(rebuilt)),
         "the destructor ran out, the instance went, the close rebuilt it: {s:?}"
     );
-    assert!(plugin.is_warm(), "the close rebuilt the dropped instance");
 }
 
 /// Under an operator frame below the budget, the charge is per call. A
@@ -5311,7 +5486,7 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged() {
     gauge.fuel_per_micro = SLOW_CALIBRATION;
     gauge.budget_micros = SLOW_FRAME_MICROS;
     let fuel_per_micro = gauge.fuel_per_micro;
-    let gauge = Plugin::load(&runtime, gauge).expect("the guest loads");
+    let gauge = loaded(&runtime, gauge);
     let before = gauge.stats().fuel_used;
     plugin_engine(&gauge).decide(
         &RequestFacts {
@@ -5330,14 +5505,14 @@ fn an_honest_multi_stage_plugin_clamped_under_its_own_frame_is_not_charged() {
     let mut three_stage = spec("three-stage", guest::record_guest(), mode::BURN_IN_STAGES);
     three_stage.budget_micros = burn_micros * 5 / 3;
     three_stage.fuel_per_micro = SLOW_CALIBRATION;
-    let three_stage = Plugin::load(&runtime, three_stage).expect("the guest loads");
+    let three_stage = loaded(&runtime, three_stage);
     let neighbours: Vec<Arc<Plugin>> = ["neighbour-a", "neighbour-b", "neighbour-c"]
         .into_iter()
         .map(|name| {
             let mut neighbour = spec(name, guest::record_guest(), mode::BURN_IN_STAGES);
             neighbour.fuel_per_micro = SLOW_CALIBRATION;
             neighbour.budget_micros = SLOW_FRAME_MICROS;
-            Plugin::load(&runtime, neighbour).expect("the guest loads")
+            loaded(&runtime, neighbour)
         })
         .collect();
     let bound = three_stage.bind();
@@ -5415,7 +5590,7 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     );
     let mut slow_calibration = spec("fuel-fast", guest::record_guest(), mode::SPIN_IN_SCORE);
     slow_calibration.fuel_per_micro = SLOW_CALIBRATION;
-    let spinner = Plugin::load(&runtime, slow_calibration).expect("the guest loads");
+    let spinner = loaded(&runtime, slow_calibration);
     let scorer = |plugin: &Arc<Plugin>| Weighted {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
@@ -5600,7 +5775,7 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
     gauge.fuel_per_micro = SLOW_CALIBRATION;
     gauge.budget_micros = SLOW_FRAME_MICROS;
     let fuel_per_micro = gauge.fuel_per_micro;
-    let gauge = Plugin::load(&runtime, gauge).expect("the guest loads");
+    let gauge = loaded(&runtime, gauge);
     let before = gauge.stats().fuel_used;
     plugin_engine(&gauge).decide(
         &RequestFacts {
@@ -5624,7 +5799,7 @@ fn a_constructor_hog_that_answers_opens_at_the_window() {
     let mut hog = spec("ctor-hog", guest::record_guest(), mode::BURN_IN_CONSTRUCTOR);
     hog.fuel_per_micro = SLOW_CALIBRATION;
     hog.budget_micros = SLOW_FRAME_MICROS;
-    let hog = Plugin::load(&runtime, hog).expect("the guest loads");
+    let hog = loaded(&runtime, hog);
     let scorer = |plugin: &Arc<Plugin>| Weighted {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
@@ -5749,7 +5924,7 @@ fn a_plugin_on_both_pair_sides_is_sampled_once_with_both_sides_summed() {
     let mut both = spec("both-sides", guest::record_guest(), mode::BURN_IN_STAGES);
     both.fuel_per_micro = SLOW_CALIBRATION;
     both.budget_micros = PAIR_BUDGET_MICROS;
-    let plugin = Plugin::load(&runtime, both).expect("the guest loads");
+    let plugin = loaded(&runtime, both);
     let shared = plugin_profile(&plugin, None, None, None);
     let engine = pair_engine(vec![shared], 0);
     for _ in 0..63 {
@@ -5798,7 +5973,7 @@ fn a_decode_side_plugin_is_sampled_at_its_own_last_close() {
     let mut heavy = spec("decode-heavy", guest::record_guest(), mode::BURN_IN_STAGES);
     heavy.fuel_per_micro = SLOW_CALIBRATION;
     heavy.budget_micros = PAIR_BUDGET_MICROS / 2;
-    let decode = Plugin::load(&runtime, heavy).expect("the guest loads");
+    let decode = loaded(&runtime, heavy);
     let engine = pair_engine(
         vec![
             plugin_profile(&prefill, None, None, None),
@@ -5845,7 +6020,7 @@ fn a_plugin_bound_as_a_filter_or_a_picker_alone_counts_in_the_profiles_needs() {
     let runtime = runtime();
     let mut reading = spec("reader", guest::record_guest(), mode::LEAST_IN_FLIGHT);
     reading.needs.affinity = true;
-    let plugin = Plugin::load(&runtime, reading).expect("the guest loads");
+    let plugin = loaded(&runtime, reading);
     let scorers = || {
         vec![Weighted {
             scorer: Box::new(LeastRequests),
