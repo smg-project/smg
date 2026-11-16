@@ -1199,7 +1199,7 @@ async fn upstream_round(
     let response = request_builder
         .send()
         .await
-        .map_err(|e| format!("upstream request failed: {e}"))?;
+        .map_err(|e| format!("upstream request failed: {}", e.without_url()))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1644,13 +1644,14 @@ mod tests {
     use super::{
         build_transformed_mcp_call_item, extract_openai_response_output_items,
         is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
-        not_executed_tool_call_item, ItemType, McpEvent, OutputItemEvent, SseEncoder,
-        ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
+        not_executed_tool_call_item, upstream_round, ItemType, McpEvent, OutputItemEvent,
+        SseEncoder, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
     use crate::{
+        header_utils::ApiProvider,
         openai::mcp::test_support,
         openai_bridge::{FormatRegistry, ResponseFormat},
-        test_support::counting_alloc,
+        test_support::{counting_alloc, http_client, RefusedAddress},
     };
 
     fn test_tool(name: &str) -> Tool {
@@ -2985,5 +2986,28 @@ mod tests {
             serde_json::to_string(&built).expect("JSON"),
             serde_json::to_string(&typed).expect("JSON")
         );
+    }
+
+    /// A round nothing answers fails without the request URL in its text. The
+    /// HTTP client's own error text ends with it, its query kept.
+    #[tokio::test]
+    async fn a_round_nothing_answers_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/responses?key=s3cret", refused.addr());
+
+        let Err(text) = upstream_round(
+            &http_client(),
+            &url,
+            &ApiProvider::Generic,
+            None,
+            &json!({}),
+        )
+        .await
+        else {
+            panic!("a failed send");
+        };
+
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains(&refused.addr().to_string()), "{text}");
     }
 }

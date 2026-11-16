@@ -66,7 +66,7 @@ pub(crate) async fn non_stream_request_execution(
         // around (see `request_timeout_response`).
         Err(e) if is_request_timeout(&e) => {
             worker.record_outcome(504);
-            tracing::warn!(url = %redacted_url(upstream_url), error = %e, "Request to worker timed out");
+            tracing::warn!(url = %redacted_url(upstream_url), error = %e.without_url(), "Request to worker timed out");
             return Err(request_timeout_response(
                 "Upstream worker request timed out",
             ));
@@ -74,6 +74,7 @@ pub(crate) async fn non_stream_request_execution(
         Err(e) => {
             let status = if e.is_timeout() { 504 } else { 502 };
             worker.record_outcome(status);
+            let e = e.without_url();
             tracing::warn!(url = %redacted_url(upstream_url), error = %e, "Request to worker failed");
 
             return if e.is_timeout() {
@@ -147,7 +148,8 @@ mod tests {
         gemini::context::{RequestContext, SharedComponents},
         tenant::{TenantKey, TenantRequestMeta},
         test_support::{
-            http_client, StubWorker, StubWorkers, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
+            http_client, RefusedAddress, StubWorker, StubWorkers, CREDENTIALED_WORKER_URL,
+            MASKED_WORKER_URL,
         },
     };
 
@@ -195,5 +197,23 @@ mod tests {
         assert!(logs_contain(&format!(
             "{MASKED_WORKER_URL}/v1beta/interactions"
         )));
+    }
+
+    /// A send nothing answers, to an address registered with a query: the
+    /// failure line says why without the query. The HTTP client's own error
+    /// text ends with the request URL, its query kept.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_send_goes_without_the_clients_url_in_its_line() {
+        let refused = RefusedAddress::reserve();
+        let mut ctx = context_for(&format!("http://{}?key=s3cret", refused.addr()));
+
+        let Err(response) = non_stream_request_execution(&mut ctx).await else {
+            panic!("a failed send");
+        };
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(logs_contain("Request to worker failed"));
+        assert!(!logs_contain("s3cret"));
     }
 }

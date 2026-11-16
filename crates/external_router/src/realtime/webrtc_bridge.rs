@@ -106,7 +106,9 @@ impl From<std::io::Error> for BridgeSetupError {
 
 impl From<reqwest::Error> for BridgeSetupError {
     fn from(err: reqwest::Error) -> Self {
-        Self::Other(err.into())
+        // The client's text ends with the request URL, its query kept, and
+        // the setup's failure line writes the text.
+        Self::Other(err.without_url().into())
     }
 }
 
@@ -1093,6 +1095,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+    use crate::test_support::{http_client, RefusedAddress};
 
     const TXN: [u8; 12] = [
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
@@ -1275,5 +1278,24 @@ mod tests {
                 assert!(data.iter().all(|byte| *byte == n as u8), "packet {n}");
             }
         }
+    }
+
+    /// An offer nothing answers fails without the request URL in its text,
+    /// which the setup's failure line writes. The HTTP client's own error
+    /// text ends with the URL, its query kept.
+    #[tokio::test]
+    async fn an_offer_nothing_answers_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/realtime/calls?key=s3cret", refused.addr());
+
+        let Err(BridgeSetupError::Other(error)) =
+            send_sdp_to_upstream(&http_client(), &url, "Bearer k", "v=0", None, "m").await
+        else {
+            panic!("a failed send");
+        };
+
+        let text = error.to_string();
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains(&refused.addr().to_string()), "{text}");
     }
 }
