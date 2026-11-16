@@ -19,6 +19,7 @@ use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
     ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
     profile::ProviderProfile,
+    strict_value::StrictValue,
     validated::Normalizable,
 };
 
@@ -213,7 +214,9 @@ pub enum MessageContent {
 /// A string is the text, a list is the parts. A part's refusal is kept as
 /// the refusal, under the part's place in the list (`content[1]`): a derived
 /// untagged read would replace it with its own generic words, and serde's
-/// path stops at the message a tagged enum buffers.
+/// path stops at the message a tagged enum buffers. Each part is buffered by
+/// the strict value reader: the plain one keeps the last of a repeated key,
+/// and the typed read after it would never see the repeat.
 impl<'de> Deserialize<'de> for MessageContent {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ContentVisitor;
@@ -235,8 +238,25 @@ impl<'de> Deserialize<'de> for MessageContent {
 
             fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut parts = Vec::new();
-                while let Some(value) = seq.next_element::<Value>()? {
-                    let part = serde_json::from_value::<ContentPart>(value).map_err(|error| {
+                loop {
+                    // Only a repeated key's refusal takes the part's place (any other error is
+                    // the deserializer's own), and as it is: the key is the client's and may
+                    // hold the separator `part_reason_at` splits on.
+                    let next = seq.next_element_seed(StrictValue).map_err(|error| {
+                        let reason = error.to_string();
+                        if reason.starts_with("duplicate field `") {
+                            de::Error::custom(format!("{reason}, in `content[{}]`", parts.len()))
+                        } else {
+                            error
+                        }
+                    })?;
+                    let Some(value) = next else { break };
+                    // The buffer's map is the part's fields: read by kind, not built a second time.
+                    let part = match value {
+                        Value::Object(fields) => ContentPart::from_fields(fields),
+                        other => serde_json::from_value(other),
+                    }
+                    .map_err(|error| {
                         <A::Error as de::Error>::custom(part_reason_at(parts.len(), &error))
                     })?;
                     parts.push(part);
@@ -2592,7 +2612,7 @@ mod tool_choice_tests {
 mod content_tests {
     use serde_json::json;
 
-    use super::{ChatMessage, MessageContent};
+    use super::{ChatCompletionRequest, ChatMessage, MessageContent};
 
     fn content_of(message: ChatMessage) -> MessageContent {
         match message {
@@ -2665,6 +2685,79 @@ mod content_tests {
                 serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": content}))
                     .unwrap_err();
             assert_eq!(error.to_string(), reason, "{content}");
+        }
+    }
+
+    /// A key repeated inside a content part is refused with serde's words
+    /// under the part's place, at any depth of the part and for any kind,
+    /// where a plain value read keeps the last value. A key that holds the
+    /// place's own separator does not move the place.
+    #[test]
+    fn a_content_part_with_a_repeated_key_is_refused() {
+        for (message, reason) in [
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"image_url","type":"text","text":"a"}]}"#,
+                "duplicate field `type`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","url":"data:image/png;base64,AB=="}}]}"#,
+                "duplicate field `url`, in `content[1]`",
+            ),
+            (
+                r#"{"role":"system","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"vendor_media","payload":{"a":1,"a":2}}]}"#,
+                "duplicate field `a`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","x, in `y":1,"x, in `y":2}]}"#,
+                "duplicate field `x, in `y`, in `content[0]`",
+            ),
+        ] {
+            let error = serde_json::from_str::<ChatMessage>(message).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{message}");
+        }
+    }
+
+    /// A twelve-turn conversation (part turns with an image, text turns, a
+    /// tool call and its result in parts), read two hundred times: the
+    /// content readers' cost on a representative request, for the
+    /// measurement of a change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_with_parts_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut messages = Vec::new();
+        for _ in 0..5 {
+            messages.push(json!({"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"}},
+            ]}));
+            messages.push(json!({"role": "assistant", "content": text}));
+        }
+        messages.push(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}},
+        ]}));
+        messages.push(
+            json!({"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": text},
+            ]}),
+        );
+        let body = json!({"model": "m", "messages": messages, "max_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ChatCompletionRequest =
+                serde_json::from_str(&body).expect("the body reads");
+            assert_eq!(request.messages.len(), 12);
         }
     }
 }

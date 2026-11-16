@@ -4,6 +4,8 @@
 //! common BF16 wire conversion. Grid cells are pixel-major RGB patches with two
 //! identical temporal slices; every cell produces one language-model token.
 
+use std::collections::HashMap;
+
 use image::{DynamicImage, GenericImageView};
 use ndarray::{ArrayD, IxDyn};
 use serde_json::{json, Value};
@@ -30,40 +32,41 @@ impl Inkling2ImageProcessor {
         Self
     }
 
-    /// The processor for `config`, which must be the checkpoint's exact
-    /// native policy (see [`Self::validate_config`]); any other config is
-    /// refused here, before a request.
+    /// The processor for `config`, which must be one of the checkpoint's
+    /// two forms of the fixed policy (see [`Self::validate_config`]); any
+    /// other config is refused here, before a request.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Result<Self, TransformError> {
         Self::validate_config(config)?;
         Ok(Self)
     }
 
-    /// Require the checkpoint's fixed native preprocessing policy.
+    /// Require the checkpoint's fixed preprocessing policy, in either form:
     ///
-    /// Missing native fields, training virtual-size controls, and generic
-    /// normalization/resize overrides fail rather than changing image semantics.
+    /// - the native `image_preprocessing.json`;
+    /// - the `Inkling2ImageProcessor` section of the released
+    ///   `processor_config.json` (Transformers): 40x40 patches, RGB
+    ///   conversion, `1/255` rescale and mean/std 0.5. A field it leaves out
+    ///   takes the Transformers class default, which is the same value.
+    ///
+    /// Both forms describe the same images. The processor sends the wire
+    /// format the engine expects in either case. Missing fields, training
+    /// virtual-size controls, and other normalization or resize settings fail
+    /// rather than change the image semantics.
     pub fn validate_config(config: &PreProcessorConfig) -> Result<(), TransformError> {
-        let patch = config.patch_size.as_ref();
-        let expected = json!({
-            "include_extra_column": false,
-            "rescale_image_frac": null,
-            "rescale_image_max_upscaled_long_edge": null,
-            "stretch_to_padded_grid": false,
-            "overlay_rgba_images_on_checkerboard": true,
-            "requires_image_grid_thw": true
-        });
-        let native_extra = Value::Object(config.extra.clone().into_iter().collect());
-        let has_override = config.do_convert_rgb.is_some()
-            || config.do_normalize.is_some()
-            || config.do_pad.is_some()
-            || config.do_rescale.is_some()
+        if Self::is_native_policy(config) || Self::is_transformers_policy(config) {
+            return Ok(());
+        }
+        Err(TransformError::ShapeError(
+            "Inkling2 requires its native image_preprocessing.json or the released processor_config.json Inkling2ImageProcessor section; resize, virtual-size and normalization overrides are unsupported".to_string(),
+        ))
+    }
+
+    /// Whether a generic field that neither policy form sets is present.
+    fn has_generic_override(config: &PreProcessorConfig) -> bool {
+        config.do_pad.is_some()
             || config.do_resize.is_some()
             || config.do_center_crop.is_some()
-            || config.image_mean.is_some()
-            || config.image_std.is_some()
-            || config.rescale_factor.is_some()
             || config.resampling.is_some()
-            || config.size.is_some()
             || config.crop_size.is_some()
             || config.merge_size.is_some()
             || config.min_pixels.is_some()
@@ -78,20 +81,59 @@ impl Inkling2ImageProcessor {
             || config.slice_end_token.is_some()
             || config.vision_start_token.is_some()
             || config.vision_end_token.is_some()
-            || config
+    }
+
+    fn is_native_policy(config: &PreProcessorConfig) -> bool {
+        let expected = json!({
+            "include_extra_column": false,
+            "rescale_image_frac": null,
+            "rescale_image_max_upscaled_long_edge": null,
+            "stretch_to_padded_grid": false,
+            "overlay_rgba_images_on_checkerboard": true,
+            "requires_image_grid_thw": true
+        });
+        let native_extra = Value::Object(config.extra.clone().into_iter().collect());
+        config
+            .patch_size
+            .as_ref()
+            .is_some_and(|size| size.height == Some(40) && size.width == Some(40))
+            && config.temporal_patch_size == Some(TEMPORAL_PATCH_SIZE)
+            && native_extra == expected
+            && !Self::has_generic_override(config)
+            && config.do_convert_rgb.is_none()
+            && config.do_normalize.is_none()
+            && config.do_rescale.is_none()
+            && config.image_mean.is_none()
+            && config.image_std.is_none()
+            && config.rescale_factor.is_none()
+            && config.size.is_none()
+            && config
                 .image_processor_type
                 .as_deref()
-                .is_some_and(|name| name != "Inkling2ImageProcessor");
-        if patch.is_none_or(|size| size.height != Some(40) || size.width != Some(40))
-            || config.temporal_patch_size != Some(TEMPORAL_PATCH_SIZE)
-            || native_extra != expected
-            || has_override
-        {
-            return Err(TransformError::ShapeError(
-                "Inkling2 requires its exact native image_preprocessing.json; resize, virtual-size and normalization overrides are unsupported".to_string(),
-            ));
-        }
-        Ok(())
+                .is_none_or(|name| name == "Inkling2ImageProcessor")
+    }
+
+    fn is_transformers_policy(config: &PreProcessorConfig) -> bool {
+        let half = |values: &Option<Vec<f64>>| {
+            values
+                .as_deref()
+                .is_none_or(|values| values == [0.5, 0.5, 0.5])
+        };
+        let size = HashMap::from([("height".to_string(), 40), ("width".to_string(), 40)]);
+        config.image_processor_type.as_deref() == Some("Inkling2ImageProcessor")
+            && config.do_convert_rgb.is_none_or(|on| on)
+            && config.do_normalize.is_none_or(|on| on)
+            && config.do_rescale.is_none_or(|on| on)
+            && half(&config.image_mean)
+            && half(&config.image_std)
+            && config
+                .rescale_factor
+                .is_none_or(|factor| factor == 1.0 / 255.0)
+            && config.size.as_ref().is_none_or(|value| *value == size)
+            && config.patch_size.is_none()
+            && config.temporal_patch_size.is_none()
+            && config.extra.is_empty()
+            && !Self::has_generic_override(config)
     }
 
     fn normalized(raw: f32, channel: usize) -> f32 {
@@ -402,6 +444,73 @@ mod tests {
         wrong = config();
         wrong.patch_size.as_mut().expect("patch size").width = Some(20);
         assert!(Inkling2ImageProcessor::validate_config(&wrong).is_err());
+    }
+
+    /// The `image_processor` section of the released `processor_config.json`.
+    fn released_section() -> Value {
+        json!({
+            "do_convert_rgb": true,
+            "do_normalize": true,
+            "do_rescale": true,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_processor_type": "Inkling2ImageProcessor",
+            "image_std": [0.5, 0.5, 0.5],
+            "rescale_factor": 0.00392156862745098,
+            "size": {"height": 40, "width": 40}
+        })
+    }
+
+    #[test]
+    fn inkling2_accepts_the_released_transformers_section() {
+        let section = PreProcessorConfig::from_value(released_section()).expect("section");
+        Inkling2ImageProcessor::from_preprocessor_config(&section).unwrap();
+        // Transformers fills a field the section leaves out from the class
+        // defaults, which are the same values.
+        let minimal = PreProcessorConfig::from_value(
+            json!({"image_processor_type": "Inkling2ImageProcessor"}),
+        )
+        .expect("minimal section");
+        Inkling2ImageProcessor::validate_config(&minimal).unwrap();
+    }
+
+    #[test]
+    fn inkling2_rejects_changed_transformers_sections() {
+        for (key, value) in [
+            ("image_processor_type", json!("CLIPImageProcessor")),
+            ("do_convert_rgb", json!(false)),
+            ("do_normalize", json!(false)),
+            ("do_rescale", json!(false)),
+            ("image_mean", json!([0.48145466, 0.4578275, 0.40821073])),
+            ("image_std", json!([0.26862954, 0.26130258, 0.27577711])),
+            ("rescale_factor", json!(1.0)),
+            ("size", json!({"height": 20, "width": 20})),
+            ("do_resize", json!(true)),
+            ("patch_size", json!(40)),
+            ("temporal_patch_size", json!(2)),
+            ("overlay_rgba_images_on_checkerboard", json!(true)),
+        ] {
+            let mut section = released_section();
+            section[key] = value;
+            let config = PreProcessorConfig::from_value(section).expect("section");
+            assert!(
+                Inkling2ImageProcessor::validate_config(&config).is_err(),
+                "{key}"
+            );
+        }
+        let mut untyped = released_section();
+        untyped
+            .as_object_mut()
+            .expect("object")
+            .remove("image_processor_type");
+        let config = PreProcessorConfig::from_value(untyped).expect("section");
+        assert!(Inkling2ImageProcessor::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn inkling2_native_policy_rejects_transformers_fields() {
+        let mut mixed = config();
+        mixed.image_mean = Some(vec![0.5, 0.5, 0.5]);
+        assert!(Inkling2ImageProcessor::validate_config(&mixed).is_err());
     }
 
     #[test]

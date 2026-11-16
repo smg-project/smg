@@ -71,23 +71,19 @@ impl Default for HealthPolicy {
     }
 }
 
-/// The overload thresholds a worker's reports are judged against, resolved
-/// at registration; a field left `None` is off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The overload thresholds a worker's registration names for itself. A
+/// field it names stands over the value of the binding that matches the
+/// worker's pool, whether that binding's block is switched on or off; a
+/// field left `None` takes the binding's. The store holds no default of
+/// its own: the spec's is the only one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overload {
-    /// KV usage at or above which the worker is overloaded, in permille.
+    /// KV usage in permille, the mean over the engine's ranks, at or above
+    /// which the worker's rows are vetoed.
     pub kv_usage_permille: Option<u16>,
-    /// Queued requests at or above which the worker is overloaded.
+    /// Queued requests, summed over the engine's ranks, at or above which
+    /// the worker's rows are vetoed.
     pub waiting_requests: Option<u32>,
-}
-
-impl Default for Overload {
-    fn default() -> Self {
-        Self {
-            kv_usage_permille: Some(800),
-            waiting_requests: Some(8),
-        }
-    }
 }
 
 /// How a worker's signals reach the store (the row's `signals`).

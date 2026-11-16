@@ -8089,6 +8089,7 @@ dependencies = [
  "http",
  "k8s-openapi",
  "kube",
+ "kv-index",
  "metrics",
  "metrics-exporter-prometheus",
  "mock-worker",
