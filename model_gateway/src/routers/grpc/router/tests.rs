@@ -275,6 +275,75 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
     }
 }
 
+/// count_tokens judges media of a model without a media spec by the template
+/// the count renders through, as `/v1/messages` does: the one for requests
+/// with tools when the request declares tools, the default one otherwise.
+#[tokio::test]
+async fn count_tokens_media_without_a_spec_is_judged_by_the_template_the_count_renders_through() {
+    use llm_tokenizer::{chat_template::ChatTemplateContentFormat, mock::MockTokenizer};
+
+    use crate::routers::grpc::regular::stages::testing::components_forwarding_media_of;
+
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    for (default, with_tools) in [
+        (
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ),
+        (
+            ChatTemplateContentFormat::OpenAI,
+            ChatTemplateContentFormat::String,
+        ),
+    ] {
+        let tokenizer = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![11, 12, 13])
+            .with_content_format(default)
+            .with_tool_content_format(with_tools);
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_registry
+            .register(grpc_worker_for_m_on(None))
+            .expect("register worker");
+        let mut router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+        router.shared_components = components;
+        for (declares_tools, format) in [(true, with_tools), (false, default)] {
+            let mut body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                    }}
+                ]}]
+            });
+            if declares_tools {
+                body["tools"] = json!([{
+                    "name": "lookup", "description": "Look a thing up",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]);
+            }
+            let request: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("count request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, request, "m")
+                .await;
+            if format == ChatTemplateContentFormat::String {
+                assert_eq!(
+                    error::extract_error_code_from_response(&response),
+                    "multimodal_not_supported",
+                    "declares tools: {declares_tools}"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "declares tools: {declares_tools}"
+                );
+            }
+        }
+    }
+}
+
 /// A tokenizer a removed worker left in the registry does not make its
 /// model served: the count is refused as an unknown model, like every
 /// other route refuses it.
