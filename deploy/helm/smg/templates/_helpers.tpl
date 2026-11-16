@@ -1058,9 +1058,12 @@ comparer can hold: any other tag takes the default.
 Policy controller CLI arguments -- every argument is a flag of
 smg-policy-controller, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
-start is refused at render: two listeners on one port, and a settle window
+start is refused at render: two listeners on one port, a settle window
 over half the grace period (the controller's own default of 5 seconds when
-shutdownSettleSeconds is null). With the election on the Lease is named,
+shutdownSettleSeconds is null) and, by the schema, a listener named to take
+identities as told that is none of the three. Those listeners are a set,
+said in the listeners' own order however the value was written: a reorder
+rolls no pod. With the election on the Lease is named,
 and the pod's own address, which the kubelet writes in place of $(POD_IP):
 the holder of the Lease is named by an address the others can dial.
 */}}
@@ -1080,6 +1083,12 @@ the holder of the Lease is named by an address the others can dial.
 {{- $settle = int $controller.shutdownSettleSeconds -}}
 {{- end -}}
 {{- $elected := include "smg.policyControllerElection" . -}}
+{{- $told := list -}}
+{{- range $listener := list "gateway" "control" "replication" -}}
+{{- if has $listener ($controller.identityAsTold | default list) -}}
+{{- $told = append $told $listener -}}
+{{- end -}}
+{{- end -}}
 {{- if gt (mul $settle 2) $grace -}}
 {{- fail (printf "policyController: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
 {{- end -}}
@@ -1091,6 +1100,10 @@ the holder of the Lease is named by an address the others can dial.
 - {{ printf "0.0.0.0:%d" (int $controller.ports.replication) | quote }}
 - "--admin-listen"
 - {{ printf "0.0.0.0:%d" (int $controller.ports.admin) | quote }}
+{{- with $told }}
+- "--identity-as-told"
+- {{ join "," . | quote }}
+{{- end }}
 - "--shutdown-grace-period-secs"
 - {{ $grace | quote }}
 {{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) }}

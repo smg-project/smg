@@ -584,6 +584,7 @@ def test_the_arguments_follow_the_values():
         "policyController.ports.control=31101",
         "policyController.ports.replication=31102",
         "policyController.ports.admin=31103",
+        "policyController.identityAsTold={gateway,control}",
         "policyController.shutdownGracePeriodSeconds=60",
         "policyController.shutdownSettleSeconds=20",
         "policyController.terminationGraceMarginSeconds=15",
@@ -601,6 +602,8 @@ def test_the_arguments_follow_the_values():
         "0.0.0.0:31102",
         "--admin-listen",
         "0.0.0.0:31103",
+        "--identity-as-told",
+        "gateway,control",
         "--shutdown-grace-period-secs",
         "60",
         "--shutdown-settle-secs",
@@ -629,6 +632,16 @@ def test_the_arguments_follow_the_values():
     # the controller's default.
     zero = controller_args("policyController.shutdownSettleSeconds=0")
     assert zero[zero.index("--shutdown-settle-secs") + 1] == "0"
+    # No listener takes a caller's stated name unless the values name it: an
+    # empty list and a null pass no flag, and the controller then names none.
+    assert "--identity-as-told" not in controller_args()
+    assert "--identity-as-told" not in controller_args("policyController.identityAsTold=null")
+    told = controller_args("policyController.identityAsTold={replication}")
+    assert told[told.index("--identity-as-told") + 1] == "replication"
+    # The value is a set: it renders in the listeners' own order however it
+    # was written, so a reorder rolls no pod.
+    reordered = controller_args("policyController.identityAsTold={replication,gateway}")
+    assert reordered[reordered.index("--identity-as-told") + 1] == "gateway,replication"
 
 
 @needs_helm
@@ -1013,6 +1026,12 @@ def test_the_schema_refuses_a_value_the_block_does_not_have():
             *ON, f"policyController.runtimeWorkerThreads={threads}"
         )
     assert "policyController.ports.admin" in render_error(*ON, "policyController.ports.admin=65536")
+    # A listener is named by one of the chart's three names, once, in a list:
+    # the controller refuses a name that is no listener at its start.
+    for names in ("{admin}", "{ingestion}", "{gateway,gateway}", "gateway"):
+        assert "policyController.identityAsTold" in render_error(
+            *ON, f"policyController.identityAsTold={names}"
+        )
     # An empty path is no path: the kubelet would ask the root.
     for probe in ("livenessProbe", "readinessProbe"):
         assert f"policyController.{probe}.path" in render_error(
@@ -1058,6 +1077,7 @@ SAME_AS_THE_DEFAULT = {
     "podLabels",
     "extraArgs",
     "extraEnv",
+    "identityAsTold",
     "shutdownSettleSeconds",
     # The election off, and the Lease under the controller's own name.
     "election",
@@ -1197,6 +1217,7 @@ ARGUMENT_SETS = {
         "policyController.ports.replication=31102",
         "policyController.ports.admin=31103",
     ),
+    "listeners-as-told": ("policyController.identityAsTold={gateway,control,replication}",),
     "extra-arguments": (
         "policyController.extraArgs={--ingestion-listen,0.0.0.0:30104,--load-monitor-interval,2}",
     ),
@@ -1346,8 +1367,9 @@ def refusal(binary: str, args: list[str]) -> str:
 
 
 def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
-    """The two refusals of the chart, as the controller words them: the rule
-    and the default window are the controller's, not the chart's guess."""
+    """The refusals of the chart, as the controller words them: the rule, the
+    default window and the listeners' names are the controller's, not the
+    chart's guess."""
     port = free_ports(1)[0]
     shared = refusal(
         binary, ["--gateway-listen", f"127.0.0.1:{port}", "--control-listen", f"127.0.0.1:{port}"]
@@ -1356,14 +1378,18 @@ def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
     grace = 2 * DEFAULT_SETTLE_SECONDS - 1
     over = refusal(binary, ["--shutdown-grace-period-secs", str(grace)])
     assert f"settle window of {DEFAULT_SETTLE_SECONDS}s is over half the grace period" in over
+    # A name the schema refuses is no listener of the controller's.
+    unknown = refusal(binary, ["--identity-as-told", "admin"])
+    assert 'no listener is named "admin"' in unknown
 
 
 @needs_helm
 def test_the_binary_starts_on_the_rendered_arguments(binary):
     """The controller started with exactly what the Deployment passes (on
-    ports free here, a short grace period) answers its readiness probe and
-    stops clean on SIGTERM."""
-    gateway, control, replication, admin = free_ports(4)
+    ports free here, a short grace period, each gRPC listener named to take
+    identities as told) answers its readiness probe and stops clean on
+    SIGTERM."""
+    gateway, control, replication, admin, ingestion = free_ports(5)
     documents = render(
         *ON,
         f"policyController.ports.gateway={gateway}",
@@ -1372,6 +1398,12 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
         f"policyController.ports.admin={admin}",
         "policyController.shutdownGracePeriodSeconds=4",
         "policyController.shutdownSettleSeconds=1",
+        "policyController.identityAsTold={gateway,control,replication}",
+        # A flag in extraArgs adds to the value's set: the ingestion listener
+        # is named where it is turned on, and a name said in both places
+        # names its listener once more.
+        "policyController.extraArgs={--ingestion-listen,"
+        f"127.0.0.1:{ingestion},--identity-as-told,ingestion,--identity-as-told,gateway}}",
         "router.metrics.serviceMonitor.enabled=true",
     )
     found = container(documents)
@@ -1426,6 +1458,13 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
         # The output is a pipe here, as it is under a container runtime: the
         # log is plain text, with no color escape.
         assert "smg_policy_controller" in output, "the controller logged nothing"
+        # Each of the chart's three names is a listener of the controller's,
+        # and so is the one extraArgs turns on: the controller says so once
+        # a naming, the gateways' listener named in both places twice.
+        told = [line for line in output.splitlines() if "identities are taken as told" in line]
+        assert len(told) == 5, output
+        for listener in ("gateway", "control", "replication", "ingestion"):
+            assert any(f"listener={listener}" in line for line in told), (listener, output)
         assert "\x1b" not in output, f"an escape byte with no terminal: {output!r}"
     finally:
         if process.poll() is None:
