@@ -250,6 +250,7 @@ impl TokenSpeedSchedulerClient {
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
             max_new_tokens: request.output_token_cap(),
+            min_new_tokens: request.min_tokens.unwrap_or(0),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens: true,
@@ -678,6 +679,47 @@ mod logit_bias_tests {
         let params = TokenSpeedSchedulerClient::build_sampling_params_from_completion(&plain)
             .expect("build sampling params");
         assert!(params.logit_bias.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod min_tokens_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A chat request's `min_tokens` reaches the proto as `min_new_tokens`, as
+    /// a completion request's does; a request without one sends the proto's
+    /// zero, which the engine reads as no minimum.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let unset: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_chat(
+            &unset,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 0);
     }
 }
 
