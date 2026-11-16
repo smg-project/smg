@@ -2588,7 +2588,7 @@ mod fanout_tests {
                     }
                 } else {
                     PrefillLoadGuard::Unbounded {
-                        _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
+                        _guard: WorkerLoadGuard::with_key(Arc::clone(&worker), None),
                     }
                 };
                 let guards = guard.replicate_to(2).into_iter().map(Some).collect();

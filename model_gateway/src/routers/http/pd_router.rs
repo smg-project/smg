@@ -6512,8 +6512,8 @@ mod tests {
             true,
         ));
 
-        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone(), None);
-        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone(), None);
+        let _prefill_guard = WorkerLoadGuard::with_key(prefill_worker.clone(), None);
+        let _decode_guard = WorkerLoadGuard::with_key(decode_worker.clone(), None);
 
         assert_eq!(prefill_worker.load(), 1);
         assert_eq!(decode_worker.load(), 1);
@@ -7047,7 +7047,7 @@ mod tests {
                 Arc::clone(&decode),
             ),
             None,
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         );
 
         // The head is out and the relay has not run: the success is recorded.
@@ -7297,9 +7297,9 @@ mod tests {
 
         {
             let prefill_guard = PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
+                _guard: WorkerLoadGuard::with_key(prefill_ref.clone(), None),
             };
-            let decode_guard = WorkerLoadGuard::new(decode_ref.clone(), None);
+            let decode_guard = WorkerLoadGuard::with_key(decode_ref.clone(), None);
 
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
@@ -8131,9 +8131,9 @@ mod tests {
         );
         let guards = PdLoadGuards {
             prefill: PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+                _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
             },
-            decode: WorkerLoadGuard::new(Arc::clone(&decode), None),
+            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         };
         assert_eq!((prefill.load(), decode.load()), (1, 1));
         let mut headers = HeaderMap::new();

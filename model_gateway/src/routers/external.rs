@@ -18,6 +18,7 @@ use openai_protocol::{
     worker::ProviderType,
 };
 use smg_external_router::{
+    header_utils::extract_routing_key,
     worker::{ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
     ExternalContext, ExternalRouter, ExternalRouterSpec, RetryConfig,
 };
@@ -87,7 +88,10 @@ impl ExternalWorker for GatewayWorker {
     }
 
     fn hold_load(&self, headers: Option<&HeaderMap>) -> LoadHold {
-        Box::new(WorkerLoadGuard::new(Arc::clone(&self.0), headers))
+        Box::new(WorkerLoadGuard::with_key(
+            Arc::clone(&self.0),
+            extract_routing_key(headers),
+        ))
     }
 }
 
@@ -432,7 +436,10 @@ mod tests {
     use smg_external_router::spec_for_provider;
 
     use super::*;
-    use crate::middleware::{RouteRequestMeta, TenantKey};
+    use crate::{
+        middleware::{RouteRequestMeta, TenantKey},
+        worker::BasicWorkerBuilder,
+    };
 
     /// A provider router of the kind the adapter mounts, keeping the
     /// Messages request it was handed as the JSON it would post: the trait's
@@ -498,5 +505,29 @@ mod tests {
         assert!(posted.get("rid").is_none(), "{posted}");
         assert_eq!(posted["model"], "m");
         assert_eq!(posted["messages"][0]["content"], "q");
+    }
+
+    /// The adapter holds a worker's load under the request's routing key:
+    /// the key the header names counts on the worker until the hold drops,
+    /// and a request without the header holds unkeyed load.
+    #[test]
+    fn a_hold_counts_the_requests_routing_key() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://external:8000").build());
+        let adapter = GatewayWorker::handle(Arc::clone(&worker));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-smg-routing-key",
+            "key-123".parse().expect("a header value"),
+        );
+
+        let keyed = adapter.hold_load(Some(&headers));
+        assert_eq!((worker.load(), worker.routing_key_load()), (1, 1));
+        let unkeyed = adapter.hold_load(None);
+        assert_eq!((worker.load(), worker.routing_key_load()), (2, 1));
+
+        drop(keyed);
+        drop(unkeyed);
+        assert_eq!((worker.load(), worker.routing_key_load()), (0, 0));
     }
 }

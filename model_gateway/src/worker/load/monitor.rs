@@ -2185,7 +2185,7 @@ mod native_loads_tests {
                 .build(),
         );
         worker.set_status(WorkerStatus::Ready);
-        let held = WorkerLoadGuard::new(Arc::clone(&worker), None);
+        let held = WorkerLoadGuard::with_key(Arc::clone(&worker), None);
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
