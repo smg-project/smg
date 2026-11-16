@@ -486,9 +486,10 @@ impl World {
     /// ([`MemoryStore::apply`](crate::store::MemoryStore::apply)) admits a
     /// number above the standing one alone.
     ///
-    /// A door that decides is to hand the engine under the borrow its rows
-    /// are built from, never an owned world, whose shared count a deciding
-    /// thread would write. No door of this store decides yet.
+    /// The store's deciding door
+    /// ([`MemoryStore::deciding`](crate::store::MemoryStore::deciding))
+    /// hands the engine under the borrow its rows are built from, never an
+    /// owned world, whose shared count a deciding thread would write.
     pub fn spec(&self) -> &AppliedSpec {
         &self.spec
     }

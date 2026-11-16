@@ -3112,10 +3112,16 @@ mod tests {
             .expect("default")
             .filter
             .push("wire-compatible".into());
-        assert!(matches!(
-            unknown_filter.validate(),
-            Err(SpecError::UnknownFilter { .. })
-        ));
+        // The catalog names no filter of a gateway's wires: the deciders
+        // read them before any profile runs, and a profile that lists one
+        // is refused by its name.
+        assert_eq!(
+            unknown_filter.validate().err(),
+            Some(SpecError::UnknownFilter {
+                profile: "default".into(),
+                name: "wire-compatible".into()
+            })
+        );
         let mut unbound = spec.clone();
         unbound.bindings[1].profile = Some("missing".into());
         assert_eq!(
