@@ -90,7 +90,7 @@ pub struct McpToolSession<'a> {
 }
 
 /// A binding with its allowlist as a set (`None` for an open binding), built
-/// once per session construction for the tools' attribution to a label.
+/// once per pass over the session's tools.
 type LabelledAllowlist<'b> = (&'b McpServerBinding, Option<HashSet<&'b str>>);
 
 impl<'a> McpToolSession<'a> {
@@ -339,24 +339,47 @@ impl<'a> McpToolSession<'a> {
             .unwrap_or_else(|| fallback_label.to_string())
     }
 
-    /// Set the approval mode for every binding matching `server_label`,
-    /// optionally narrowed to a subset of resolved tool names.
+    /// Set the approval mode of every tool that a binding labelled
+    /// `server_label` admits, optionally narrowed to a subset of resolved
+    /// tool names. A server bound under several labels attributes each tool
+    /// to one of them, and every label that admits a tool still gates it: the
+    /// stricter mode stays.
     pub fn set_approval_mode(
         &mut self,
         server_label: &str,
         allowed_tool_names: Option<&[String]>,
         mode: ApprovalMode,
     ) {
-        for binding in self.exposed_name_map.values_mut() {
-            if binding.server_label != server_label {
+        let bindings: Vec<LabelledAllowlist<'_>> = self
+            .all_mcp_servers
+            .iter()
+            .filter(|b| b.label == server_label)
+            .map(|b| (b, b.allowed_tools.as_deref().map(Self::allowlist)))
+            .collect();
+        for entry in &self.mcp_tools {
+            let key = Self::associated_server_key(entry);
+            let admitted = bindings.iter().any(|(b, allowed)| {
+                b.server_key == key
+                    && allowed
+                        .as_ref()
+                        .is_none_or(|allowed| Self::matches_allowed_tool_name(entry, allowed))
+            });
+            if !admitted
+                || allowed_tool_names
+                    .is_some_and(|names| !names.iter().any(|n| n == entry.tool_name()))
+            {
                 continue;
             }
-            if let Some(allowed) = allowed_tool_names {
-                if !allowed.iter().any(|n| n == &binding.resolved_tool_name) {
-                    continue;
-                }
+            let Some(name) = self.exposed_name_by_qualified.get(&entry.qualified_name) else {
+                continue;
+            };
+            if let Some(binding) = self
+                .exposed_name_map
+                .get_mut(name)
+                .filter(|binding| binding.approval_mode == ApprovalMode::PolicyOnly)
+            {
+                binding.approval_mode = mode;
             }
-            binding.approval_mode = mode;
         }
     }
 
@@ -874,6 +897,54 @@ mod tests {
                 panic!("expected pending approval, got executed result: {output:?}")
             }
         }
+    }
+
+    #[test]
+    fn a_labels_approval_reaches_a_tool_attributed_to_another_label_of_its_server() {
+        fn mode(session: &McpToolSession<'_>, tool: &str) -> Option<ApprovalMode> {
+            session.exposed_name_map.get(tool).map(|b| b.approval_mode)
+        }
+        let orchestrator = McpOrchestrator::new_test();
+        insert_test_tool(&orchestrator, "server1", "echo");
+        insert_test_tool(&orchestrator, "server1", "big");
+        let open = McpServerBinding {
+            label: "conf".to_string(),
+            server_key: "server1".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        };
+        let narrow = McpServerBinding {
+            label: "conf-b".to_string(),
+            allowed_tools: Some(vec!["echo".to_string()]),
+            ..open.clone()
+        };
+
+        // `echo` is attributed to `conf`, the first label that admits it.
+        let mut session = McpToolSession::new(
+            &orchestrator,
+            vec![open.clone(), narrow.clone()],
+            "test-request",
+        );
+        session.set_approval_mode("conf-b", None, ApprovalMode::Interactive);
+        assert_eq!(mode(&session, "echo"), Some(ApprovalMode::Interactive));
+        assert_eq!(
+            mode(&session, "big"),
+            Some(ApprovalMode::PolicyOnly),
+            "`conf-b` does not admit `big`"
+        );
+
+        // The other order attributes `echo` to `conf-b`.
+        let mut session = McpToolSession::new(&orchestrator, vec![narrow, open], "test-request");
+        session.set_approval_mode("conf", None, ApprovalMode::Interactive);
+        assert_eq!(mode(&session, "echo"), Some(ApprovalMode::Interactive));
+        assert_eq!(mode(&session, "big"), Some(ApprovalMode::Interactive));
+
+        session.set_approval_mode("conf-b", None, ApprovalMode::PolicyOnly);
+        assert_eq!(
+            mode(&session, "echo"),
+            Some(ApprovalMode::Interactive),
+            "the stricter mode stays"
+        );
     }
 
     #[test]
