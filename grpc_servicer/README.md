@@ -1269,6 +1269,12 @@ subscription from zero while it is complete, and a state snapshot
 replay is conservatively reset because it cannot distinguish an idle publisher
 from a restarted one.
 
+The load record on the stream differs the same way while the publisher is
+quiet: the Python servicers repeat one record, that of the rank whose batch
+went out last, and the Rust servicer's relay repeats every rank's record on
+the rank's own clock. An engine with several data-parallel ranks behind one
+address wants the Rust servicer.
+
 #### Rust request path (`--servicer-impl rust`)
 
 `sglang serve --grpc-mode` (`python -m sglang.launch_server --grpc-mode`)
