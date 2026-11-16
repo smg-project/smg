@@ -890,7 +890,9 @@ mod tests {
             ..Default::default()
         };
         let cb = CircuitBreaker::with_config_and_label(config, "worker".to_string());
-        let settle = Duration::from_millis(100);
+        // A lower bound: the millisecond clock has moved on by the next state
+        // change, however slow the host.
+        let tick = Duration::from_millis(5);
 
         cb.record_success();
         cb.record_failure(); // the swap path: closed -> open keeps the failure streak
@@ -899,25 +901,26 @@ mod tests {
             (cb.consecutive_failures(), cb.consecutive_successes()),
             (1, 0)
         );
+        let opened_ms = cb.last_state_change_ms.load(Ordering::Acquire);
 
-        thread::sleep(settle);
-        let since_open = cb.time_since_last_state_change();
+        thread::sleep(tick);
+        assert!(cb.time_since_last_state_change() >= tick);
         assert!(cb.try_half_open()); // the CAS path: open -> half_open starts clean
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         assert_eq!(
             (cb.consecutive_failures(), cb.consecutive_successes()),
             (0, 0)
         );
-        assert!(cb.time_since_last_state_change() < since_open);
+        let trial_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        assert!(trial_ms > opened_ms);
 
-        thread::sleep(settle);
-        let since_trial = cb.time_since_last_state_change();
+        thread::sleep(tick);
         cb.record_success(); // the swap path again: half_open -> closed starts clean
         assert_eq!(cb.state(), CircuitState::Closed);
         assert_eq!(
             (cb.consecutive_failures(), cb.consecutive_successes()),
             (0, 0)
         );
-        assert!(cb.time_since_last_state_change() < since_trial);
+        assert!(cb.last_state_change_ms.load(Ordering::Acquire) > trial_ms);
     }
 }
