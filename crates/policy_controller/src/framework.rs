@@ -304,7 +304,7 @@ impl Drop for Opened<'_> {
 /// the one the host sees. Where one is already unwinding (a stage's, or the
 /// open of a pair's other side), a close's panic stops here: let out, it
 /// would end the process. Where none is, the first close's panic goes on
-/// once every scope is closed.
+/// once every scope is closed. A payload that stops here is released.
 #[cold]
 #[inline(never)]
 fn close_scopes(profile: &Profile) {
@@ -312,12 +312,10 @@ fn close_scopes(profile: &Profile) {
     for scope in profile.scopes() {
         let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.close()));
         let Err(payload) = closed else { continue };
-        // A payload is resumed or forgotten, never dropped here: its own
-        // destructor could panic.
         if first.is_none() && !std::thread::panicking() {
             first = Some(payload);
         } else {
-            std::mem::forget(payload);
+            release(payload);
         }
     }
     if let Some(payload) = first {
@@ -346,11 +344,25 @@ impl Drop for Opening<'_> {
 }
 
 /// Runs `f` on a path that is already unwinding, where a second panic let
-/// out would end the process: a panic of `f` stops here. Its payload is
-/// forgotten, not dropped, since a payload's own destructor could panic too.
+/// out would end the process: a panic of `f` stops here, and its payload is
+/// released.
 pub(crate) fn contained(f: impl FnOnce()) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        std::mem::forget(payload);
+        release(payload);
+    }
+}
+
+/// Frees a caught payload the engine does not resume. A payload's own
+/// destructor can panic, and a panic let out here would end the process or
+/// take the first panic's place: the drop runs under a catch of its own.
+/// Only the payload of a drop that panicked is forgotten, since its drop
+/// could panic in turn.
+#[cold]
+#[inline(never)]
+fn release(payload: Box<dyn std::any::Any + Send>) {
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+    if let Err(again) = dropped {
+        std::mem::forget(again);
     }
 }
 

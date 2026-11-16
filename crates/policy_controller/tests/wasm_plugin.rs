@@ -2898,17 +2898,21 @@ fn a_pairs_decode_close_that_panics_inside_its_own_opens_unwinding_stops_at_the_
     assert_eq!(panicked.read(), (2, 1));
 }
 
-/// A panic payload whose own destructor panics.
-struct DropPanics;
+/// A panic payload whose own destructor panics, with a payload whose
+/// destructor panics in turn for as many drops as it counts.
+struct DropPanics(u8);
 
 impl Drop for DropPanics {
     fn drop(&mut self) {
-        std::panic::resume_unwind(Box::new("this payload's drop panics"));
+        match self.0 {
+            0 => std::panic::resume_unwind(Box::new("this payload's drop panics")),
+            more => std::panic::resume_unwind(Box::new(DropPanics(more - 1))),
+        }
     }
 }
 
 /// A stage of the host's own whose scope's close panics, once, with a
-/// payload whose own drop panics.
+/// payload whose own drop panics, as does the drop of that panic's payload.
 #[derive(Debug)]
 struct ClosePanicsWithADrop(AtomicBool);
 
@@ -2931,17 +2935,19 @@ impl smg_policy_controller::DecisionScope for ClosePanicsWithADrop {
 
     fn close(&self) {
         if self.0.swap(false, Ordering::Relaxed) {
-            std::panic::resume_unwind(Box::new(DropPanics));
+            std::panic::resume_unwind(Box::new(DropPanics(1)));
         }
     }
 }
 
-/// The engine forgets a payload it caught and does not resume: dropped, its
-/// own destructor could panic. Inside an unwinding that would end the
-/// process; on a decision's own way out it would take the first panic's
-/// place and leave the scopes after it open.
+/// The engine drops a payload it caught and does not resume under a catch
+/// of its own: the payload's destructor can panic, and so can the
+/// destructor of that panic's payload, which is forgotten. Let out inside
+/// an unwinding, either panic would end the process; on a decision's own
+/// way out it would take the first panic's place and leave the scopes
+/// after it open.
 #[test]
-fn a_caught_payload_whose_drop_panics_is_never_dropped() {
+fn a_caught_payload_whose_drop_panics_stops_at_the_engine() {
     // Inside an open's unwinding: the closes of the scopes that had opened.
     let with_a_drop = Box::new(ClosePanicsWithADrop(AtomicBool::new(true)));
     let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
@@ -2967,7 +2973,7 @@ fn a_caught_payload_whose_drop_panics_is_never_dropped() {
     assert_eq!(closed_after_it.read(), (1, 1), "inside a stage's unwinding");
 
     // On a decision's own way out: the first close's panic goes on, and the
-    // second close's payload is forgotten.
+    // second close's payload is released.
     let first = Box::new(ClosePanicsWith(1, AtomicBool::new(true)));
     let with_a_drop = Box::new(ClosePanicsWithADrop(AtomicBool::new(true)));
     let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
@@ -2977,6 +2983,102 @@ fn a_caught_payload_whose_drop_panics_is_never_dropped() {
     assert_eq!(
         closed_after_it.read(),
         (1, 1),
+        "on a decision's own way out"
+    );
+}
+
+/// A panic payload that counts its drops, so a case can read whether the
+/// engine freed it.
+struct CountsItsDrop(Arc<AtomicU32>);
+
+impl Drop for CountsItsDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A stage of the host's own whose scope's close panics, once, with a
+/// payload that counts its drops.
+#[derive(Debug)]
+struct ClosePanicsWithACount(AtomicBool, Arc<AtomicU32>);
+
+impl ClosePanicsWithACount {
+    fn stage() -> (Box<Self>, Arc<AtomicU32>) {
+        let drops = Arc::new(AtomicU32::new(0));
+        let stage = Box::new(Self(AtomicBool::new(true), Arc::clone(&drops)));
+        (stage, drops)
+    }
+}
+
+impl smg_policy_controller::Filter for ClosePanicsWithACount {
+    fn name(&self) -> &'static str {
+        "close-panics-with-a-count"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+        Some(self)
+    }
+}
+
+impl smg_policy_controller::DecisionScope for ClosePanicsWithACount {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+    fn close(&self) {
+        if self.0.swap(false, Ordering::Relaxed) {
+            std::panic::resume_unwind(Box::new(CountsItsDrop(Arc::clone(&self.1))));
+        }
+    }
+}
+
+/// The engine frees a payload it caught and does not resume. Forgotten, a
+/// fault that repeats would leave one payload allocated a decision, with
+/// nothing to bound it.
+#[test]
+fn a_caught_payload_the_engine_does_not_resume_is_freed() {
+    // Inside an open's unwinding: the closes of the scopes that had opened.
+    let (with_a_count, drops) = ClosePanicsWithACount::stage();
+    let (open_panics, _) = StoresAtItsOpen::stage(true);
+    let engine = single_engine(host_profile(vec![with_a_count, open_panics]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this scope's open panics before its store, once")
+    );
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        1,
+        "inside an open's unwinding"
+    );
+
+    // Inside a stage's unwinding: the decision's own closes.
+    let (with_a_count, drops) = ClosePanicsWithACount::stage();
+    let keep_panics = Box::new(PanicsAtItsKeep(AtomicBool::new(true)));
+    let engine = single_engine(host_profile(vec![with_a_count, keep_panics]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this stage's keep panics, once")
+    );
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        1,
+        "inside a stage's unwinding"
+    );
+
+    // On a decision's own way out: the first close's panic goes on, and the
+    // second close's payload is freed.
+    let first = Box::new(ClosePanicsWith(1, AtomicBool::new(true)));
+    let (with_a_count, drops) = ClosePanicsWithACount::stage();
+    let engine = single_engine(host_profile(vec![first, with_a_count]));
+    let payload = decide_caught(&engine);
+    assert_eq!(payload.downcast_ref::<u32>().copied(), Some(1));
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        1,
         "on a decision's own way out"
     );
 }
