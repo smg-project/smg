@@ -54,11 +54,11 @@ pub(crate) struct Prepared {
     /// stores them (`ProcessingState::parser_names`) and request building reads them in
     /// place of a second resolution.
     pub names: Names,
-    /// The table's replay of the rendered prompt, when preparation replayed it for the forced
-    /// call's tag: the stage stores it (`ProcessingState::prompt_thought`) and request building's
-    /// reasoning decision reads it in place of a second replay of the same prompt. `None` when
-    /// the request's thinking switch armed the reasoning and no replay was needed.
-    pub prompt_thought: Option<PromptReplay>,
+    /// The table's replay of the rendered prompt, asked for the forced call's tag whatever the
+    /// request's thinking switch says: the stage stores it (`ProcessingState::prompt_thought`)
+    /// and request building's reasoning decision reads it in place of a second replay of the
+    /// same prompt.
+    pub prompt_thought: PromptReplay,
     /// The table decision for the request (`regular::symphony::reading`: which table reads the
     /// response under the parser, or why the legacy parsers do), read here once for the replay,
     /// the constraint and the decoder's special tokens: the stage stores it
@@ -124,17 +124,19 @@ pub(crate) fn prepare(
     // (the names ask for a response template the model cannot compile) is the
     // constraint's to carry, as before.
     let reading = symphony::reading(parser, &names, model, &ctx.components.templates);
-    let prompt_thought = (!switch).then(|| {
-        reading
-            .as_ref()
-            .ok()
-            .and_then(|read| symphony::reasoning_open_for(read, processed_text))
-    });
-    let replay = prompt_thought.flatten();
-    let reasoning = switch || replay.is_some_and(|thought| thought.open);
+    // The replay is asked whatever the thinking switch says: a template may
+    // close the thought for a request that names no switch while the switch's
+    // default says thinking, and a prompt that closed the thought is past it.
+    let prompt_thought = reading
+        .as_ref()
+        .ok()
+        .and_then(|read| symphony::reasoning_open_for(read, processed_text));
     // The prompt closed the thought itself and wrote the template's text
-    // after it (thinking switched off): the calls' tag owes none of it.
-    let thought_closed = replay.is_some_and(|thought| thought.closed);
+    // after it (thinking switched off): the calls' tag owes none of it, and
+    // no thought stands in front of the calls.
+    let thought_closed = prompt_thought.is_some_and(|thought| thought.closed);
+    let reasoning =
+        !thought_closed && (switch || prompt_thought.is_some_and(|thought| thought.open));
     let from_the_table = reading.as_ref().map_err(Clone::clone).and_then(|read| {
         symphony::constraint_for(
             read,
@@ -222,8 +224,9 @@ pub(crate) fn prepare(
 /// (the API's: `utils::chat_reasoning_starts_in_rendered_prefill`,
 /// `utils::messages_reasoning_starts_in_prefill`, over `model`'s tokenizer),
 /// or alone where the family's rule sets the switch aside (Gemma 4 prefills
-/// an open channel only after a tool response), and no legacy parser is built
-/// to be asked; otherwise native Gemma4 channels follow the rendered prompt
+/// an open channel only after a tool response) or the prompt closed the
+/// thought itself, and no legacy parser is built to be asked; otherwise
+/// native Gemma4 channels follow the rendered prompt
 /// when that parser decides, and other parsers keep their tokenizer-driven
 /// preference for the engine's reasoning gate. With it, whether the prompt
 /// closed the thought itself and wrote the template's text after it
@@ -713,6 +716,12 @@ mod tests {
             reasoning_decision(&ctx, MODEL, PROMPT, |_| false),
             (false, true)
         );
+        // A prompt that closed the thought overrules a switch that says the model thinks.
+        ctx.state.tokenizer = Some(hiding(&["<think>", "</think>"]));
+        assert_eq!(
+            reasoning_decision(&ctx, MODEL, PROMPT, |_| true),
+            (false, true)
+        );
         // Under a legacy assignment the kept replay is not read: no closed thought is reported.
         ctx.state.parser = Some(ParserChoice::Legacy);
         ctx.state.prompt_thought = Some(symphony::reasoning_open(
@@ -971,6 +980,46 @@ mod tests {
                 prepared.keeps_special_tokens,
                 "separate_reasoning {separate_reasoning}"
             );
+        }
+    }
+
+    /// A prompt that closed the thought itself overrules a thinking switch that says the model
+    /// thinks: a template may write the closed thought for a request that names no switch while
+    /// the switch's default says thinking. The forced call's tag is then the one the same prompt
+    /// gets with the switch off, the call with no thought in front of it, wherever the model's
+    /// workers start a grammar.
+    #[test]
+    fn a_prompt_that_closed_the_thought_overrules_the_thinking_switch() {
+        const CLOSED: &str =
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        for start in [Some("first_token"), Some("after_reasoning"), None] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let tools = chat.tools.clone().unwrap_or_default();
+            let tag = |switch: bool| {
+                let prepared = prepare(
+                    &ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    CLOSED,
+                    switch,
+                    &tokenizer,
+                    "test",
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused");
+                format!("{:?}", prepared.constraint)
+            };
+            let off = tag(false);
+            assert!(off.contains("lookup"), "a tag over the forced tool: {off}");
+            assert_eq!(tag(true), off, "workers that start at {start:?}");
         }
     }
 
