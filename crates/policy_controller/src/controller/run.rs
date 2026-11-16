@@ -197,6 +197,13 @@ struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=4096), help_heading = "Runtime")]
     runtime_worker_threads: Option<u16>,
 
+    /// Deciding threads, from 1 to 256, each behind a queue of 128
+    /// requests. A model's decisions all run on one of them, so a fleet
+    /// that serves one model decides on one thread. Default: one a CPU
+    /// available to the process, eight at most
+    #[arg(long, default_value_t = default_decide_shards(), value_parser = clap::value_parser!(u16).range(1..=256), help_heading = "Runtime")]
+    decide_shards: u16,
+
     // ==================== Logging ====================
     /// Set the logging level of this binary's own crates; RUST_LOG, when
     /// set, replaces it whole
@@ -211,6 +218,10 @@ struct Cli {
 /// A duration in whole milliseconds, as the election's flags take it.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn default_decide_shards() -> u16 {
+    u16::try_from(Config::default_decide_shards()).unwrap_or(1)
 }
 
 impl Cli {
@@ -331,6 +342,7 @@ impl Cli {
             shutdown_settle: Duration::from_secs(self.shutdown_settle_secs),
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
             load_poll_interval: Duration::from_secs(self.load_monitor_interval),
+            decide_shards: usize::from(self.decide_shards),
             election: Election {
                 lease: self.lease(),
                 settings: ElectionSettings {
@@ -1056,6 +1068,25 @@ mod tests {
             "loud"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn the_deciding_threads_take_the_operators_count_inside_their_range() {
+        let default = config(&[]).expect("parsed");
+        assert_eq!(default.decide_shards, Config::default_decide_shards());
+        assert_eq!(default.validate(), Ok(()));
+        let three = config(&["--decide-shards", "3"]).expect("parsed");
+        assert_eq!(three.decide_shards, 3);
+        for bad in ["0", "257", "many"] {
+            let flags = [
+                "smg-policy-controller",
+                "--controller-id",
+                "c",
+                "--decide-shards",
+                bad,
+            ];
+            assert!(Cli::try_parse_from(flags).is_err(), "{bad}");
+        }
     }
 
     #[test]

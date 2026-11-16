@@ -96,13 +96,18 @@ use crate::{
     view::{fingerprint, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, WireModes},
 };
 
-/// What the deciders count on the controller's own side: the requests this
-/// build has no decision for, by cause, the requests whose block hashes
+/// What the deciders and the streams count on the controller's own side,
+/// for its scrape to render: each `Busy` by its reason, the requests this
+/// build has no decision for by cause, the requests whose block hashes
 /// were cut, the answers no stream took, the candidates a gateway's wires
 /// took from its decisions, and the decisions whose budget ended while they
-/// were made. The step that serves the call renders them.
+/// were made. A request that is decided inside its budget, with its hashes
+/// inside the cap and every candidate one its gateway can dial, moves none
+/// of them.
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
+    /// `Busy` answers, each at its reason's number on the wire.
+    pub(crate) busy: [AtomicU64; 5],
     /// Decisions that panicked.
     pub(crate) faults: AtomicU64,
     /// Requests for a side of a pair plan: prefill or decode under either
@@ -110,46 +115,72 @@ pub(crate) struct Counts {
     pub(crate) pair_sides: AtomicU64,
     /// Requests that carried their prompt as text.
     pub(crate) texts: AtomicU64,
-    /// Requests that carried more block hashes than their generation's
-    /// view reads.
-    pub(crate) hashes_cut: AtomicU64,
-    /// Answers a stream's queue had no place for: its gateway waits its
-    /// budget out for each.
+    /// Requests whose decider's thread had ended.
+    pub(crate) gone: AtomicU64,
+    /// Answers a stream's queue had no place for. A stream's window rules
+    /// it out: its requests in flight are at most its queue's places.
     pub(crate) dropped_full: AtomicU64,
     /// Answers whose stream had ended.
     pub(crate) dropped_gone: AtomicU64,
-    /// Candidates the wires of their decision's gateway took from its
-    /// view, members that share no wire with it: each decider's part, read
-    /// whole by [`Counts::undialed`].
-    undialed: [Part; PARTS],
+    /// What a decision that is made may count, each decider's in a part of
+    /// its own: read whole by [`Counts::undialed`] and
+    /// [`Counts::hashes_cut`].
+    parts: [Part; PARTS],
     /// Decisions whose budget ended while they were made. Each leaves as
     /// `Busy` under the reason a late arrival is told, and this count is
     /// of them alone.
     pub(crate) outlasted: AtomicU64,
 }
 
-/// The parts the wires' count is kept in. A decider adds to the one at its
-/// index, and deciders past this many share one.
+/// The parts a made decision's counts are kept in. A decider adds to the
+/// one at its index, and deciders past this many share one.
 const PARTS: usize = 16;
 
-/// One decider's part of a count that every decision can move, on cache
+/// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
-/// members, each decision counts the candidates it lost, and one count for
-/// every decider would be a line they all write.
+/// members, each decision counts the candidates it lost; where prompts run
+/// past the view's cap, each counts its request. One count for every
+/// decider would be a line they all write.
 #[derive(Debug, Default)]
 #[repr(align(128))]
-struct Part(AtomicU64);
+pub(crate) struct Part {
+    /// Candidates the wires of their decision's gateway took from its
+    /// view, members that share no wire with it.
+    pub(crate) undialed: AtomicU64,
+    /// Requests that carried more block hashes than their generation's
+    /// view reads.
+    pub(crate) hashes_cut: AtomicU64,
+}
 
 impl Counts {
+    /// The reasons of a `Busy`, in the order of their numbers on the wire.
+    pub(crate) const BUSY: [&'static str; 5] = [
+        "unspecified",
+        "queue_depth",
+        "no_credit",
+        "budget_gone_on_arrival",
+        "not_leader",
+    ];
+
     /// The part decider `index` counts in.
-    fn undialed_of(&self, index: usize) -> &AtomicU64 {
-        &self.undialed[index % PARTS].0
+    pub(crate) fn part(&self, index: usize) -> &Part {
+        &self.parts[index % PARTS]
     }
 
     /// Candidates the wires took, over every decider.
     pub(crate) fn undialed(&self) -> u64 {
-        let parts = self.undialed.iter();
-        parts.map(|part| part.0.load(Ordering::Relaxed)).sum()
+        self.whole(|part| &part.undialed)
+    }
+
+    /// Requests whose block hashes were cut, over every decider.
+    pub(crate) fn hashes_cut(&self) -> u64 {
+        self.whole(|part| &part.hashes_cut)
+    }
+
+    /// One of a part's counts, summed over the parts.
+    fn whole(&self, count: impl Fn(&Part) -> &AtomicU64) -> u64 {
+        let parts = self.parts.iter();
+        parts.map(|part| count(part).load(Ordering::Relaxed)).sum()
     }
 }
 
@@ -160,6 +191,11 @@ pub(crate) const WIRES: &str = "wires";
 /// The stage a decision is shed under when its gateway hints a subset of 0
 /// of a pool that has rows: a decision over no candidates, as it asked.
 pub(crate) const SUBSET_HINT: &str = "subset-hint";
+
+/// The requests one decider's queue holds: one stream's window. At the
+/// design's cost of a decision a full queue is one cross-node budget of
+/// waiting, and a request behind it is told at once to decide locally.
+pub(crate) const QUEUE_DEPTH: usize = 128;
 
 /// The clock a decider reads, twice a decision.
 pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
@@ -175,6 +211,24 @@ pub(crate) struct Reads {
     pub(crate) standing: watch::Receiver<Standing>,
     pub(crate) clock: Clock,
     pub(crate) counts: Arc<Counts>,
+}
+
+impl Reads {
+    /// The highest term this replica knows, which a `Busy` and a `Credit`
+    /// carry: no answer of a replica falls in term, leading or not.
+    pub(crate) fn known_term(&self) -> u64 {
+        let seen = self.standing.borrow().term;
+        seen.max(self.fence.term())
+    }
+
+    /// The `Busy` that answers the request `id` for `reason`, under the
+    /// highest term this replica knows, counted at its reason.
+    pub(crate) fn busy(&self, id: Vec<u8>, reason: Reason) -> proto::DecideAnswer {
+        if let Some(count) = self.counts.busy.get(reason as usize) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        wire::busy(id, self.known_term(), reason)
+    }
 }
 
 /// One request on its way to its decider.
@@ -207,6 +261,8 @@ pub(crate) struct Deciders {
     queues: Box<[SyncSender<Job>]>,
     /// Shows `true` once a decider's thread unwound.
     told: Arc<watch::Sender<bool>>,
+    /// What every decider reads: the scrape reads its counts.
+    reads: Reads,
 }
 
 /// A decider's thread holds one: it tells when the thread unwinds. A thread
@@ -238,11 +294,17 @@ impl Deciders {
                 watched(index, &told, move || decider.run(&jobs)).map(|_running| queue)
             })
             .collect::<io::Result<_>>()?;
-        Ok(Self { queues, told })
+        Ok(Self {
+            queues,
+            told,
+            reads: reads.clone(),
+        })
     }
 
     /// Shows `true` once a decider's thread unwound outside a decision: its
-    /// models have no decider from then on.
+    /// models have no decider from then on. The word is awaited by its
+    /// value (`wait_for`), never by a change: a receiver made after the
+    /// unwind has seen it.
     pub(crate) fn ended(&self) -> watch::Receiver<bool> {
         self.told.subscribe()
     }
@@ -257,6 +319,11 @@ impl Deciders {
     /// goes to one, whichever stream carries it.
     pub(crate) fn of(&self, model: &str) -> usize {
         (fingerprint(model.as_bytes()) % self.queues.len() as u64) as usize
+    }
+
+    /// What the deciders and their streams count.
+    pub(crate) fn counts(&self) -> &Arc<Counts> {
+        &self.reads.counts
     }
 
     /// Hands `job` to its model's decider, without waiting. `Some` is the
@@ -343,7 +410,7 @@ impl Decider {
         let faulted = decided.is_err();
         let answer = match decided {
             Ok(Ok((term, decision))) => wire::decided(request.into_id(), term, &decision),
-            Ok(Err(reason)) => wire::busy(request.into_id(), self.known_term(), reason),
+            Ok(Err(reason)) => self.reads.busy(request.into_id(), reason),
             Err(payload) => {
                 // A payload's own drop can panic, and that panic let out
                 // here would unwind this thread with the request
@@ -361,7 +428,7 @@ impl Decider {
                         "a decision panicked: its request is answered Busy with no reason, and so is each one that panics after it until one does not"
                     );
                 }
-                wire::busy(request.into_id(), self.known_term(), Reason::Unspecified)
+                self.reads.busy(request.into_id(), Reason::Unspecified)
             }
         };
         self.faulted = faulted;
@@ -393,8 +460,8 @@ impl Decider {
         }
         let taken =
             Taken::at(request, gateway, received, now).ok_or(Reason::BudgetGoneOnArrival)?;
-        let (buffers, undialed) = (&mut self.buffers, counts.undialed_of(self.index));
-        let decided = store.deciding(|world| decide_in(world, &taken, buffers, counts, undialed));
+        let (buffers, own) = (&mut self.buffers, counts.part(self.index));
+        let decided = store.deciding(|world| decide_in(world, &taken, buffers, own));
         let Some(decision) = decided else {
             counts.pair_sides.fetch_add(1, Ordering::Relaxed);
             return Err(Reason::Unspecified);
@@ -414,13 +481,6 @@ impl Decider {
             return Err(Reason::BudgetGoneOnArrival);
         }
         Ok((term, decision))
-    }
-
-    /// The highest term this replica knows, which a `Busy` carries: no
-    /// answer of a replica falls in term, leading or not.
-    fn known_term(&self) -> u64 {
-        let seen = self.reads.standing.borrow().term;
-        seen.max(self.reads.fence.term())
     }
 }
 
@@ -484,13 +544,13 @@ fn pair_side(plan: Plan, phase: Phase) -> bool {
 /// The engine's decision over the world of one load: the rows and the
 /// engine are of one publication. `None` for a request for a side of a
 /// pair plan ([`pair_side`]): the pair door decides those, and one side's
-/// entry of the engine never does.
+/// entry of the engine never does. What a decision that is made counts, it
+/// counts in `own`, its decider's part.
 fn decide_in(
     world: &World,
     taken: &Taken<'_>,
     buffers: &mut Buffers,
-    counts: &Counts,
-    undialed: &AtomicU64,
+    own: &Part,
 ) -> Option<Decision> {
     let spec = world.spec();
     let engine = spec.engine();
@@ -505,13 +565,13 @@ fn decide_in(
         return None;
     }
     if taken.request.hashes() > spec.max_block_hashes() {
-        counts.hashes_cut.fetch_add(1, Ordering::Relaxed);
+        own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
     Some(hand(
         world,
         taken,
         buffers,
-        undialed,
+        &own.undialed,
         |facts, pool, candidates, constraints, scratch| {
             if candidates.is_empty() && pool.pool_size > 0 {
                 // What the gateway states of itself left none of a pool
@@ -677,7 +737,7 @@ fn cut_reach(built: u64, wires: WireModes) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::{BTreeSet, VecDeque},
         io, mem,
@@ -697,8 +757,8 @@ mod tests {
     };
 
     use super::{
-        cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Decider, Deciders, Job, Reads,
-        Refused, Taken, PARTS,
+        cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Decider, Deciders, Job, Part,
+        Reads, Refused, Taken, PARTS,
     };
     use crate::{
         controller::{
@@ -721,17 +781,17 @@ mod tests {
     };
 
     /// How long a case waits for a decider before it fails.
-    const PATIENCE: Duration = Duration::from_secs(20);
-    const MODEL: &str = "model-a";
-    const GATEWAY: GatewayId = GatewayId(11);
+    pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
+    pub(crate) const MODEL: &str = "model-a";
+    pub(crate) const GATEWAY: GatewayId = GatewayId(11);
     const OTHER: GatewayId = GatewayId(12);
     /// The budget a case's frame gives its decision.
-    const BUDGET: Duration = Duration::from_secs(5);
+    pub(crate) const BUDGET: Duration = Duration::from_secs(5);
     /// Past the renew deadline of the bed's election.
     const FENCED: Duration = Duration::from_secs(1_801);
 
     /// What one read of the case's clock does before it shows the hour.
-    enum Step {
+    pub(crate) enum Step {
         /// Shows the taken instant plus this much, from this read on.
         At(Duration),
         /// Tells the case a decider reached this read, then waits for the
@@ -757,16 +817,16 @@ mod tests {
     /// The clock of a case: each read takes the script's next step, and a
     /// read past the script shows what the last one showed. It keeps the
     /// name of every thread that read it.
-    struct Script {
+    pub(crate) struct Script {
         /// When the bed's candidate took its lease.
-        taken: Instant,
-        steps: Mutex<VecDeque<Step>>,
-        shown: Mutex<Duration>,
-        readers: Mutex<Vec<String>>,
+        pub(crate) taken: Instant,
+        pub(crate) steps: Mutex<VecDeque<Step>>,
+        pub(crate) shown: Mutex<Duration>,
+        pub(crate) readers: Mutex<Vec<String>>,
     }
 
     impl Script {
-        fn read(&self) -> Instant {
+        pub(crate) fn read(&self) -> Instant {
             let reader = thread::current().name().unwrap_or_default().to_owned();
             self.readers.lock().push(reader);
             let step = self.steps.lock().pop_front();
@@ -806,7 +866,7 @@ mod tests {
     }
 
     /// A preset of this build as generation `generation`.
-    fn preset(name: &str, generation: u64) -> AppliedSpec {
+    pub(crate) fn preset(name: &str, generation: u64) -> AppliedSpec {
         let mut document = PolicySpec::preset(name).expect("a preset of this build");
         document.generation = generation;
         applied(&document)
@@ -846,7 +906,7 @@ mod tests {
     /// Three ready members serving [`MODEL`] in the single role, and one in
     /// each other role beside the phase that role serves. None states a
     /// wire.
-    fn fleet(store: &MemoryStore) -> (Vec<WorkerId>, [(proto::Phase, WorkerId); 3]) {
+    pub(crate) fn fleet(store: &MemoryStore) -> (Vec<WorkerId>, [(proto::Phase, WorkerId); 3]) {
         let member = |name: &str, role: Role| ready(store, name, MODEL, role, WireModes::NONE);
         let singles = ["w0", "w1", "w2"].map(|name| member(name, Role::Single));
         let sides = [
@@ -922,7 +982,7 @@ mod tests {
     }
 
     /// A frame for `model` with the case's budget.
-    fn frame_for(model: &str, id: u8, seed: u64) -> proto::DecideRequest {
+    pub(crate) fn frame_for(model: &str, id: u8, seed: u64) -> proto::DecideRequest {
         proto::DecideRequest {
             request_id: vec![id],
             facts: Some(proto::RequestFacts {
@@ -935,7 +995,7 @@ mod tests {
         }
     }
 
-    fn frame(id: u8, seed: u64) -> proto::DecideRequest {
+    pub(crate) fn frame(id: u8, seed: u64) -> proto::DecideRequest {
         frame_for(MODEL, id, seed)
     }
 
@@ -1029,7 +1089,7 @@ mod tests {
     }
 
     /// The reason of a `Busy` answer.
-    fn busy(answer: &proto::DecideAnswer) -> Reason {
+    pub(crate) fn busy(answer: &proto::DecideAnswer) -> Reason {
         match &answer.answer {
             Some(Answer::Busy(busy)) => busy.reason(),
             other => panic!("a Busy: {other:?}"),
@@ -1037,7 +1097,7 @@ mod tests {
     }
 
     /// The outcome of a decision's answer.
-    fn outcome(answer: &proto::DecideAnswer) -> &Outcome {
+    pub(crate) fn outcome(answer: &proto::DecideAnswer) -> &Outcome {
         match &answer.answer {
             Some(Answer::Decision(proto::Decision {
                 outcome: Some(outcome),
@@ -1048,7 +1108,7 @@ mod tests {
     }
 
     /// The worker a pick names first.
-    fn picked(answer: &proto::DecideAnswer) -> WorkerId {
+    pub(crate) fn picked(answer: &proto::DecideAnswer) -> WorkerId {
         match outcome(answer) {
             Outcome::Pick(pick) => WorkerId(pick.targets.first().expect("a target").id),
             other => panic!("a pick: {other:?}"),
@@ -1143,6 +1203,48 @@ mod tests {
         assert!(bed.deciders.submit(job).is_none());
         assert_eq!(bed.ask(frame(6, 1)).await.request_id, [6]);
         assert_eq!(dropped(&bed.counts), [1, 1]);
+    }
+
+    /// Each `Busy` a decider answers is counted at its reason, and a
+    /// decision moves no count.
+    #[tokio::test]
+    async fn each_busy_is_counted_at_its_reason_and_a_decision_moves_no_count() {
+        // A decision; a request taken with its budget gone; one whose
+        // decision panics; two taken past the renew deadline.
+        let steps = [
+            Step::At(Duration::ZERO),
+            Step::At(Duration::ZERO),
+            Step::At(BUDGET),
+            Step::Panic,
+            Step::At(FENCED),
+        ];
+        let mut bed = bed(Some(preset("random", 1)), true, (1, 8), steps);
+        let counted = |counts: &Counts| {
+            counts
+                .busy
+                .each_ref()
+                .map(|count| count.load(Ordering::Relaxed))
+        };
+        let answer = bed.ask(frame(1, 1)).await;
+        assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
+        assert_eq!(counted(&bed.counts), [0; 5]);
+        assert_eq!(
+            busy(&bed.ask(frame(2, 2)).await),
+            Reason::BudgetGoneOnArrival
+        );
+        assert_eq!(busy(&bed.ask(frame(3, 3)).await), Reason::Unspecified);
+        for id in [4, 5] {
+            assert_eq!(busy(&bed.ask(frame(id, 1)).await), Reason::NotLeader);
+        }
+        // In the order of the reasons' numbers on the wire.
+        assert_eq!(Counts::BUSY[3..], ["budget_gone_on_arrival", "not_leader"]);
+        assert_eq!(counted(&bed.counts), [1, 0, 0, 1, 2]);
+        // The counts are sized by hand beside the wire's enum: every reason
+        // the contract names has a place, and the number past them is no
+        // reason. A reason added to the contract fails here, not silently.
+        let places = i32::try_from(Counts::BUSY.len()).expect("a handful of reasons");
+        assert!((0..places).all(|number| Reason::try_from(number).is_ok()));
+        assert!(Reason::try_from(places).is_err());
     }
 
     #[tokio::test]
@@ -1249,12 +1351,13 @@ mod tests {
 
     /// The deciders as they stand once their one thread ended: its queue
     /// has no reader.
-    fn gone() -> Deciders {
+    pub(crate) fn gone(reads: &Reads) -> Deciders {
         let (queue, jobs) = std_mpsc::sync_channel(1);
         drop(jobs);
         Deciders {
             queues: Box::new([queue]),
             told: Arc::new(watch::Sender::new(false)),
+            reads: reads.clone(),
         }
     }
 
@@ -1262,7 +1365,7 @@ mod tests {
     /// models comes back whole, as gone and never as a full queue.
     #[test]
     fn a_request_for_a_decider_whose_thread_ended_comes_back_as_gone() {
-        let deciders = gone();
+        let deciders = gone(&leading([]).reads);
         let (answers, _unread) = mpsc::channel(1);
         let job = Job {
             request: checked(frame(1, 1)),
@@ -1483,10 +1586,10 @@ mod tests {
         );
         let counted = |count: &AtomicU64| count.load(Ordering::Relaxed);
         let Counts {
+            busy: busies,
             faults,
             pair_sides,
             texts,
-            hashes_cut,
             ..
         } = &*bed.counts;
         assert_eq!(
@@ -1494,10 +1597,12 @@ mod tests {
                 counted(faults),
                 counted(pair_sides),
                 counted(texts),
-                counted(hashes_cut)
+                bed.counts.hashes_cut()
             ),
             (0, 2, 1, 0)
         );
+        // Each of the three is a `Busy` with no reason, and counted as one.
+        assert_eq!(busies.each_ref().map(counted), [3, 0, 0, 0, 0]);
         // The same document's other phases are decided: the single binding
         // covers them.
         for (id, phase) in [(4, proto::Phase::Single), (5, proto::Phase::Encode)] {
@@ -1693,9 +1798,12 @@ mod tests {
         let answer = bed.ask(frame(2, 2)).await;
         assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
         assert!(!*bed.deciders.ended().borrow());
-        // The word a thread's unwind says is the one the deciders show.
+        // The word a thread's unwind says is the one the deciders show, and
+        // a receiver made after it reads it by its value.
         bed.deciders.tell_unwound();
         assert!(*bed.deciders.ended().borrow());
+        let mut late = bed.deciders.ended();
+        assert!(late.wait_for(|ended| *ended).await.is_ok());
     }
 
     /// The engine is handed its generation's cap of a request's block
@@ -1738,7 +1846,7 @@ mod tests {
             let answer = bed.ask(hashed(id, hashes)).await;
             assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
         }
-        assert_eq!(bed.counts.hashes_cut.load(Ordering::Relaxed), 1);
+        assert_eq!(bed.counts.hashes_cut(), 1);
     }
 
     #[tokio::test]
@@ -2018,16 +2126,22 @@ mod tests {
         assert_eq!(bed.script.readers.lock().len(), 7);
     }
 
-    /// The wires' count is kept in parts, a decider's own at its index, so
-    /// no line is written by two of them, and it is read whole. A model on
-    /// each of the bed's two deciders, each with one member its gateway
-    /// cannot dial: a decision counts in its own decider's part, and
-    /// deciders past the parts share one.
+    /// The counts a made decision can move are kept in parts, a decider's
+    /// own at its index, so no line is written by two of them, and each is
+    /// read whole. A model on each of the bed's two deciders, each with one
+    /// member its gateway cannot dial, and each decider's first request
+    /// with one block hash more than the view reads: a decision counts in
+    /// its own decider's part, and deciders past the parts share one.
     #[tokio::test]
-    async fn a_decider_counts_the_candidates_the_wires_took_in_its_own_part() {
+    async fn a_decider_counts_what_its_decisions_move_in_its_own_part() {
         let mut bed = leading([]);
         let store = Arc::clone(&bed.store);
-        let part = |counts: &Counts, index| counts.undialed_of(index).load(Ordering::Relaxed);
+        let part = |counts: &Counts, index| {
+            let part = counts.part(index);
+            let read = |count: &AtomicU64| count.load(Ordering::Relaxed);
+            (read(&part.undialed), read(&part.hashes_cut))
+        };
+        let cap = store.deciding(|world| world.spec().max_block_hashes());
         let mut id = 0;
         for decider in 0..2 {
             let model = (0..)
@@ -2041,26 +2155,44 @@ mod tests {
                 Role::Single,
                 WireModes::HTTP,
             );
-            // One decision on the first decider, two on the second.
+            // One decision on the first decider, two on the second, and
+            // the first of each with its hashes past the cap.
             for seed in 0..=decider {
                 id += 1;
-                let frame = constrained(frame_for(&model, id, seed as u64), 0b010, None);
+                let mut frame = constrained(frame_for(&model, id, seed as u64), 0b010, None);
+                if seed == 0 {
+                    frame
+                        .facts
+                        .as_mut()
+                        .expect("the case's frame has facts")
+                        .block_hashes = (0..=cap as u64).collect();
+                }
                 let answer = bed.ask(frame).await;
                 let shed = declined(proto::ShedReason::NoEndpoints, "wires");
                 assert_eq!(outcome(&answer), &shed);
             }
         }
-        assert_eq!((part(&bed.counts, 0), part(&bed.counts, 1)), (1, 2));
-        assert_eq!(bed.counts.undialed(), 3);
+        assert_eq!(
+            (part(&bed.counts, 0), part(&bed.counts, 1)),
+            ((1, 1), (2, 1))
+        );
+        assert_eq!((bed.counts.undialed(), bed.counts.hashes_cut()), (3, 2));
+        // A part stands on cache lines of its own, so two deciders' parts
+        // share none.
+        assert_eq!((size_of::<Part>(), align_of::<Part>()), (128, 128));
         let counts = Counts::default();
         for index in 0..PARTS + 2 {
-            counts
-                .undialed_of(index)
-                .fetch_add(1 << index, Ordering::Relaxed);
+            let part = counts.part(index);
+            part.undialed.fetch_add(1 << index, Ordering::Relaxed);
+            part.hashes_cut.fetch_add(3 << index, Ordering::Relaxed);
         }
-        assert_eq!(part(&counts, 0), 1 + (1 << PARTS));
-        assert_eq!(part(&counts, PARTS + 1), 2 + (2 << PARTS));
-        assert_eq!(counts.undialed(), (1 << (PARTS + 2)) - 1);
+        let whole = (1 << (PARTS + 2)) - 1;
+        assert_eq!(part(&counts, 0), (1 + (1 << PARTS), 3 + (3 << PARTS)));
+        assert_eq!(
+            part(&counts, PARTS + 1),
+            (2 + (2 << PARTS), 6 + (6 << PARTS))
+        );
+        assert_eq!((counts.undialed(), counts.hashes_cut()), (whole, 3 * whole));
     }
 
     /// The name of a cut list. Over three builds' words, the pool's whole

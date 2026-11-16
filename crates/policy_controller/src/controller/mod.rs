@@ -281,10 +281,17 @@ pub enum Error {
     /// The election thread could not be started.
     #[error("the election thread: {0}")]
     ElectionThread(#[source] io::Error),
+    /// A deciding thread could not be started.
+    #[error("the deciding threads: {0}")]
+    Deciders(#[source] io::Error),
     /// The election thread ended before the shutdown: nothing renews the
     /// lease, so the controller stops.
     #[error("the election thread ended before the shutdown")]
     ElectionEnded,
+    /// A deciding thread ended before the shutdown: the models it decided
+    /// have no decider, so the controller stops and gives the lead up.
+    #[error("a deciding thread ended before the shutdown")]
+    DeciderEnded,
     /// A listener returned before the shutdown signal.
     #[error("a listener stopped before the shutdown")]
     Stopped,
@@ -396,14 +403,17 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(Standing::default());
         let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
-        let shared = Arc::new(Shared::new(
+        let shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             stood,
             Arc::new(MemoryStore::new()),
             Arc::clone(&catalog),
-        ));
+            config.decide_shards,
+        )
+        .map_err(Error::Deciders)?;
+        let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
             config,
@@ -561,8 +571,9 @@ impl Controller {
     /// registration call reads the fence itself and is refused in that
     /// window.
     ///
-    /// A listener or an election thread that ends before the shutdown ends
-    /// the serve with its error, the other listeners closed.
+    /// A listener, an election thread or a deciding thread that ends before
+    /// the shutdown ends the serve with its error, the other listeners
+    /// closed.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
         self.serve_until(shutdown, std::future::pending()).await
     }
@@ -685,10 +696,26 @@ impl Controller {
                     .map_err(|join| Error::Task(join.to_string()))
             });
         }
+        // A deciding thread that unwound decides nothing from then on and
+        // nothing starts it again: the serve ends by its error, as it ends
+        // by the election thread's.
+        let mut unwound = shared.deciders.ended();
+        let mut deciders_stop = stop.subscribe();
+        tasks.spawn(async move {
+            let told = async { unwound.wait_for(|unwound| *unwound).await.is_ok() };
+            let stopped = async {
+                let _ = deciders_stop.wait_for(|stop| *stop).await;
+            };
+            tokio::select! {
+                true = told => Err(Error::DeciderEnded),
+                () = stopped => Ok(()),
+            }
+        });
         let app = admin::router(admin::Admin {
             readiness: readiness.clone(),
             metrics: Arc::clone(&metrics),
             loads,
+            decides: Arc::clone(shared.deciders.counts()),
         });
         let mut admin_stop = stop.subscribe();
         tasks.spawn(async move {
@@ -826,10 +853,10 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     //! What no case outside the module reaches: a serve whose election
-    //! thread is gone on its own, and a serve that leaves by a listener's
-    //! error.
+    //! thread is gone on its own, one whose deciding thread unwound, and a
+    //! serve that leaves by a listener's error.
 
-    use std::{future::pending, thread, time::Duration};
+    use std::{future::pending, sync::Arc, thread, time::Duration};
 
     use axum::serve::Listener as _;
     use tokio::{
@@ -839,7 +866,7 @@ mod tests {
     };
     use tonic::codegen::tokio_stream::StreamExt as _;
 
-    use super::{config::tests::valid, Controller, Error};
+    use super::{config::tests::valid, Controller, Error, Phase};
     use crate::elector::{
         ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Written,
     };
@@ -911,6 +938,20 @@ mod tests {
         drop(dialed);
     }
 
+    /// The deciding threads are the configuration's count: a model's
+    /// requests go to one of that many.
+    #[tokio::test]
+    async fn the_controller_starts_the_deciding_threads_its_configuration_counts() {
+        let mut config = valid();
+        config.decide_shards = 3;
+        let controller = Controller::bind(config).await.expect("the listeners bind");
+        let deciders = &controller.shared.deciders;
+        let highest = (0..64)
+            .map(|index| deciders.of(&format!("model-{index}")))
+            .max();
+        assert_eq!(highest, Some(2));
+    }
+
     /// The thread gone at its take, before the serve read ready, and at its
     /// first renewal, after: the serve ends with the error either way, so
     /// the process exits and its supervisor starts it again.
@@ -938,6 +979,47 @@ mod tests {
             assert!(
                 matches!(served, Err(Error::ElectionEnded)),
                 "a lease that gave way after {writes} writes: {served:?}"
+            );
+        }
+    }
+
+    /// A deciding thread that unwound leaves its models with no decider:
+    /// the serve ends with the error, told before the serve began, before
+    /// it read ready or after, so the process exits and its supervisor
+    /// starts it again. A word told before the serve began is one its
+    /// receiver was made after: the serve reads it by its value.
+    #[tokio::test]
+    async fn a_serve_whose_deciding_thread_unwound_ends_with_an_error() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Told {
+            BeforeTheServe,
+            BeforeReady,
+            AfterReady,
+        }
+        for told in [Told::BeforeTheServe, Told::BeforeReady, Told::AfterReady] {
+            let controller = Controller::bind(valid()).await.expect("the listeners bind");
+            let shared = Arc::clone(&controller.shared);
+            let mut phase = controller.phase.subscribe();
+            if told == Told::BeforeTheServe {
+                shared.deciders.tell_unwound();
+            }
+            let unwinds = async move {
+                if told == Told::AfterReady {
+                    let serving = |phase: &Phase| *phase == Phase::Serving;
+                    assert!(phase.wait_for(serving).await.is_ok(), "the serve is ready");
+                }
+                if told != Told::BeforeTheServe {
+                    shared.deciders.tell_unwound();
+                }
+            };
+            let (served, ()) = timeout(Duration::from_secs(20), async {
+                tokio::join!(controller.serve(pending()), unwinds)
+            })
+            .await
+            .expect("the serve ends within twenty seconds");
+            assert!(
+                matches!(served, Err(Error::DeciderEnded)),
+                "told {told:?}: {served:?}"
             );
         }
     }
