@@ -1,24 +1,25 @@
 //! The end-to-end case, the harness first: a controller on ephemeral ports,
 //! a fleet of mock engines and the generated client, in one process. The
-//! fleet registers; the controller's own load driver polls it; a probe turn
-//! of the case asks each engine its health and writes what it heard; and
-//! the pool is read back as a decision's view reads it: every rank a row,
-//! healthy by its probe, its load from a poll, an engine that holds
-//! requests reading them. That engine's KV events follow: a subscriber of
-//! the case hands each batch of its stream to the sink, and its row's index
-//! holds every block the events left the engine holding. Then one engine is
-//! killed: the first dial that hears it dead writes it, and the pool reads
-//! its rows unhealthy and every other row healthy. Next, an engine stops
-//! answering with its sockets open: a probe turn waits out its dial bound,
-//! writes it and goes on. Last, the gateway sends requests of its own and
-//! reports each on its session: the store holds the completion of the engine
-//! that answered, none of class ok for the dead and the hung one, and nothing
-//! of it for another gateway; a frame that reads wrong ends the session of
-//! the gateway that sent it.
+//! fleet registers, an engine of one rank through the control scope's call;
+//! the controller's own load driver polls it; a probe turn of the case asks
+//! each engine its health and writes what it heard; and the pool is read
+//! back as a decision's view reads it: every rank a row, healthy by its
+//! probe, its load from a poll, an engine that holds requests reading them.
+//! That engine's KV events follow: a subscriber of the case hands each batch
+//! of its stream to the sink, and its row's index holds every block the
+//! events left the engine holding. Then one engine is killed: the first dial
+//! that hears it dead writes it, and the pool reads its rows unhealthy and
+//! every other row healthy. Next, an engine stops answering with its sockets
+//! open: a probe turn waits out its dial bound, writes it and goes on. Last,
+//! the gateway sends requests of its own and reports each on its session:
+//! the store holds the completion of the engine that answered, none of class
+//! ok for the dead and the hung one, and nothing of it for another gateway;
+//! a frame that reads wrong ends the session of the gateway that sent it.
 //!
-//! No decision is asked yet: the service answers `Leader` and takes the
-//! session's reports, and the case asserts both end to end. The decisions
-//! take the views' place when the service answers them.
+//! No decision is asked yet: of a gateway's calls the service answers
+//! `Leader` and takes the session's reports, and the case asserts both end
+//! to end. The decisions take the views' place when the service answers
+//! them.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
