@@ -1673,6 +1673,46 @@ mod tests {
         }
     }
 
+    /// A repeated key below an input item's own keys is refused at its
+    /// place: serde's words, the path the extractor's tracker recorded
+    /// through the nested read; the item's own keys answer `input[0]`. The
+    /// code is `json_parse_error`: the reason table names no duplicate field.
+    #[tokio::test]
+    async fn a_repeated_key_below_an_input_items_own_keys_is_refused_at_its_place() {
+        for (body, param, message) in [
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}],"max_output_tokens":2}"#,
+                "input[0].content[0]",
+                "input[0].content[0]: duplicate field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"t","annotations":[{"type":"file_citation","file_id":"f","filename":"n","index":0,"index":1}]}]}],"max_output_tokens":2}"#,
+                "input[0].content[0].annotations[0]",
+                "input[0].content[0].annotations[0]: duplicate field `index`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"apply_patch_call","id":"ap_1","call_id":"c","operation":{"type":"create_file","path":"a","diff":"d","path":"b"},"status":"completed"}],"max_output_tokens":2}"#,
+                "input[0].operation",
+                "input[0].operation: duplicate field `path`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","role":"system"}],"max_output_tokens":2}"#,
+                "input[0]",
+                "input[0]: duplicate field `role`",
+            ),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+    }
+
     /// The Chat Completions rules checked across fields name their field;
     /// a provider profile's rule keeps its code and message with nothing in
     /// front; the Messages rules print the public API's words alone.
