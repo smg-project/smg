@@ -140,7 +140,10 @@ pub(crate) fn channel(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     use tokio::sync::watch;
 
@@ -194,13 +197,18 @@ pub(crate) mod tests {
     fn the_role_is_the_fences_at_the_instant_of_the_read() {
         // A lease that is handed in may have a holder this candidate never
         // saw, so its take waits to lead.
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(100),
+            renew_deadline: Duration::from_millis(400),
+        };
         let (mut elector, phase, _steps, readiness) = over(
             Elector::new(
                 Box::new(MemoryLease::new()),
                 "controller-0@127.0.0.1:1",
-                ElectionSettings::default(),
+                settings,
             )
-            .expect("the default settings are in order"),
+            .expect("the settings are in order"),
         );
         assert_eq!(readiness.state(), State::Starting);
 
@@ -209,20 +217,24 @@ pub(crate) mod tests {
         assert_eq!(readiness.state(), State::Follower);
 
         // The take of a lease that held no record opens no fence: still a
-        // follower. The first renewal a renew deadline later opens it: the
-        // leader, with no message sent. The instants are ahead of the clock:
-        // the wait is dated by the later of the two.
-        let taken = Instant::now() + elector.settings().renew_period;
+        // follower, through a renewal inside the wait. The lead opens one
+        // renew deadline after the take's write, between two steps: the
+        // leader from that instant, with no step taken and no message sent.
+        // The renewal's instant is ahead of the clock and just short of the
+        // opening, so the fence stays open most of a renew deadline past it.
+        let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
             Tick::Acquired { term: 1 }
         );
         assert_eq!(readiness.state(), State::Follower);
-        let opens = taken + elector.settings().renew_deadline;
+        let renewed = taken + settings.renew_deadline - Duration::from_millis(10);
         assert_eq!(
-            elector.tick(opens).expect("the renewal"),
+            elector.tick(renewed).expect("the renewal"),
             Tick::Renewed { term: 1 }
         );
+        assert_eq!(readiness.state(), State::Follower);
+        thread::sleep(settings.renew_deadline);
         assert_eq!(readiness.state(), State::Leader);
 
         // Draining says so whatever the fence says.
@@ -277,7 +289,7 @@ pub(crate) mod tests {
         let mut waiter = reader.clone();
         let (waited, ()) = tokio::join!(within(&mut waiter, State::Leader), async {
             tokio::task::yield_now().await;
-            elector.lead_at(Instant::now() + elector.settings().renew_deadline);
+            elector.lead_at(Instant::now());
             steps.send_replace(Standing::default());
         });
         assert_eq!(waited, Some(State::Leader));

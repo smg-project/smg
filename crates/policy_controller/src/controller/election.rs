@@ -673,10 +673,11 @@ fn report(
             debug!(identity = elector.identity(), ?tick, "election step");
         }
     }
-    // One line when the fence opens: at the take, or one renew deadline
-    // after a take of a record with no holder to wait for. The elector
-    // says which take it made: after a slow step the fence reads closed
-    // here as well, with no wait to name, and the next renewal leads.
+    // One line when the fence opens: at the take, or at the first step
+    // after the opening of a take of a record with no holder to wait for,
+    // one renew deadline after that take's write. The elector says which
+    // take it made: after a slow step the fence reads closed here as well,
+    // with no wait to name, and the next renewal leads.
     match tick {
         Tick::Acquired { term } | Tick::Renewed { term } => {
             if !*leading {
@@ -1652,6 +1653,11 @@ mod tests {
     }
 
     impl Looping {
+        /// The lines so far hold `words`.
+        fn said(&self, words: &str) -> bool {
+            String::from_utf8_lossy(&self.lines.0.lock()).contains(words)
+        }
+
         /// Stops the loop, waits its end out, bounded, and counts the lines
         /// that hold `words`; the whole text comes back for a failure's
         /// message.
@@ -1952,7 +1958,7 @@ mod tests {
         assert_eq!((leading, text.matches(TOOK).count()), (0, 1), "{text}");
 
         // The same take under a deadline the case outlives: one line of
-        // leading, after the take's, at the renewal that opens the fence.
+        // leading, after the take's, at the first step after the opening.
         let mut lease = MemoryLease::new();
         let taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
             .expect("the settings are in order");
@@ -1962,6 +1968,8 @@ mod tests {
         until("the fence's opening", || {
             fence.leader_term(Instant::now()) == Some(1)
         });
+        // The fence opens between two steps: the next one writes the line.
+        until("the line of leading", || outlived.said(": leading"));
         // Another holder takes the lease away and stalls. Its record is
         // waited out and taken above: a holder was waited for, so that take
         // leads at once, under the line of leading and no line of the take.
@@ -2422,6 +2430,8 @@ mod tests {
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
         });
+        // The fence opens between two steps: the next one writes the line.
+        until("the line of leading", || looping.said(": leading"));
 
         // A term of seven is said: the replica leaves, and it names nobody
         // under that term while it waits its turn.
@@ -2605,6 +2615,8 @@ mod tests {
         until("the first lead", || {
             fence.leader_term(Instant::now()) == Some(1)
         });
+        // The fence opens between two steps: the next one writes the line.
+        until("the line of leading", || looping.said(": leading"));
 
         // The release fails at the word and at the step after it, and lands
         // at the third try. The fence is closed from the word, nobody is
