@@ -1047,8 +1047,13 @@ impl<'de> Deserialize<'de> for KeptSchema {
 /// Walks `properties`, `items`, `prefixItems`, `anyOf`/`oneOf`/`allOf`,
 /// `$defs`/`definitions` and `not`; returns the JSON-pointer-like path of the
 /// first object node that lacks the pin.
+///
+/// A schema that holds the rule is walked without an allocation: the path is
+/// put together on the way back from a miss, a segment a level.
 pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<String> {
-    fn walk(node: &Value, path: &str) -> Option<String> {
+    // The path from `node` to the first unpinned object node under it, empty
+    // when `node` is that node.
+    fn walk(node: &Value) -> Option<String> {
         let obj = node.as_object()?;
         let is_object_node = obj.get("type").and_then(Value::as_str) == Some("object")
             || obj
@@ -1057,17 +1062,13 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
                 .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("object")))
             || (obj.get("type").is_none() && obj.contains_key("properties"));
         if is_object_node && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
-            return Some(if path.is_empty() {
-                "()".to_string()
-            } else {
-                path.to_string()
-            });
+            return Some(String::new());
         }
         for key in ["properties", "$defs", "definitions"] {
             if let Some(children) = obj.get(key).and_then(Value::as_object) {
                 for (name, child) in children {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{name}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{name}{rest}"));
                     }
                 }
             }
@@ -1075,22 +1076,27 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
         for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
             if let Some(children) = obj.get(key).and_then(Value::as_array) {
                 for (index, child) in children.iter().enumerate() {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{index}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{index}{rest}"));
                     }
                 }
             }
         }
         for key in ["items", "not"] {
             if let Some(child) = obj.get(key) {
-                if let Some(found) = walk(child, &format!("{path}/{key}")) {
-                    return Some(found);
+                if let Some(rest) = walk(child) {
+                    return Some(format!("/{key}{rest}"));
                 }
             }
         }
         None
     }
-    walk(schema, "")
+    let path = walk(schema)?;
+    Some(if path.is_empty() {
+        "()".to_string()
+    } else {
+        path
+    })
 }
 
 /// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
@@ -2860,6 +2866,147 @@ mod tests {
                 }
                 None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
             }
+        }
+    }
+
+    /// The strict walk names the first object node that lacks the pin by its
+    /// path from the root, a segment a step, and the root itself as `()`; a
+    /// schema that pins every object node names none.
+    #[test]
+    fn the_strict_walk_names_the_first_unpinned_node_by_its_path() {
+        let open = || json!({"type": "object", "properties": {"x": {"type": "string"}}});
+        let pinned = |key: &str, child: Value| {
+            let mut node = json!({"type": "object", "additionalProperties": false});
+            node[key] = child;
+            node
+        };
+        let text = json!({"type": "string"});
+        let cases = [
+            (open(), Some("()")),
+            (json!({"type": ["object", "null"]}), Some("()")),
+            (json!({"properties": {}}), Some("()")),
+            (
+                pinned("properties", json!({"a": open()})),
+                Some("/properties/a"),
+            ),
+            (
+                pinned("properties", json!({"": open()})),
+                Some("/properties/"),
+            ),
+            (pinned("$defs", json!({"a": open()})), Some("/$defs/a")),
+            (
+                pinned("definitions", json!({"a": open()})),
+                Some("/definitions/a"),
+            ),
+            (pinned("anyOf", json!([text, open()])), Some("/anyOf/1")),
+            (pinned("oneOf", json!([open()])), Some("/oneOf/0")),
+            (
+                pinned("allOf", json!([text, text, open()])),
+                Some("/allOf/2"),
+            ),
+            (
+                pinned("prefixItems", json!([text, open()])),
+                Some("/prefixItems/1"),
+            ),
+            (pinned("items", open()), Some("/items")),
+            (pinned("not", open()), Some("/not")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": {"type": "array", "items": {"anyOf": [
+                        text,
+                        pinned("properties", json!({"b": open()}))
+                    ]}}}),
+                ),
+                Some("/properties/a/items/anyOf/1/properties/b"),
+            ),
+            // First is depth first: the node under the first name, not its nearer sibling.
+            (
+                pinned(
+                    "properties",
+                    json!({"a": pinned("properties", json!({"deep": open()})), "b": open()}),
+                ),
+                Some("/properties/a/properties/deep"),
+            ),
+            // First is by kind: named children, then the lists, then `items` and `not`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()], "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open()
+                }),
+                Some("/items"),
+            ),
+            // First within a kind is by key: `properties`, `$defs`, `definitions`,
+            // and `anyOf`, `oneOf`, `allOf`, `prefixItems`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()},
+                    "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()}
+                }),
+                Some("/$defs/d"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()],
+                    "oneOf": [open()], "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()], "oneOf": [open()]
+                }),
+                Some("/oneOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()]
+                }),
+                Some("/allOf/0"),
+            ),
+            // First in a list is its first element.
+            (pinned("anyOf", json!([open(), open()])), Some("/anyOf/0")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": text, "b": pinned("items", text.clone())}),
+                ),
+                None,
+            ),
+            (text.clone(), None),
+            (json!(true), None),
+        ];
+        for (schema, path) in cases {
+            assert_eq!(
+                strict_schema_missing_additional_properties(&schema).as_deref(),
+                path,
+                "{schema}"
+            );
         }
     }
 
