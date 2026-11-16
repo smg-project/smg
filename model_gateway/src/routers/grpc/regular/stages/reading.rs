@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use ::symphony::grammar::GrammarStart;
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::Tool, profile::ProviderProfile};
@@ -67,6 +68,11 @@ pub(crate) struct Prepared {
     /// decide for the selected worker. `None` when the names refused (the constraint carries the
     /// refusal).
     pub reading: Option<Reading>,
+    /// Where the model's workers start a grammar together, as preparation read it among the
+    /// workers it fetched and built the constraint for: the stage stores it
+    /// (`ProcessingState::grammar_start`), and a forced call's reader at request building starts
+    /// there, whatever the registry holds by then.
+    pub grammar_start: GrammarStart,
 }
 
 /// The constraint preparation finds for what the request asks, and whether
@@ -135,6 +141,8 @@ pub(crate) fn prepare(
     // The prompt closed the thought itself and wrote the template's text
     // after it (thinking switched off): the calls' tag owes none of it.
     let thought_closed = replay.is_some_and(|thought| thought.closed);
+    // The start a forced call's tag is built for, kept for its reader at request building.
+    let grammar_start = symphony::grammar_start_of(&workers);
     let from_the_table = reading.as_ref().map_err(Clone::clone).and_then(|read| {
         symphony::constraint_for(
             read,
@@ -142,7 +150,7 @@ pub(crate) fn prepare(
             tools,
             reasoning,
             thought_closed,
-            symphony::grammar_start_of(&workers),
+            grammar_start,
             symphony::vocabulary_of(&workers),
         )
     });
@@ -211,6 +219,7 @@ pub(crate) fn prepare(
         names: names.labels,
         prompt_thought,
         reading: reading.ok(),
+        grammar_start,
     })
 }
 
@@ -396,15 +405,21 @@ pub(crate) fn decide(
         None => symphony::reading(parser, &names, model, &ctx.components.templates)
             .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
     };
-    // A forced call's reader starts where the model's workers start a grammar together, the
-    // start preparation built the constraint for, read among the same workers; the assignment
-    // asks under a forced call's JSON schema alone, so no other request walks the registry here.
+    // A forced call's reader starts where the model's workers start a grammar together: the
+    // start preparation read among them and built the constraint for, kept with the request, so
+    // a worker set that changed since gives the reader no other start. Where none was kept
+    // (another endpoint's preparation) the start is read among the model's workers now; the
+    // assignment asks under a forced call's JSON schema alone, so no other request walks the
+    // registry here.
+    let kept_start = ctx.state.grammar_start;
     let assignment = symphony::assign_for(read, asks, registry, processed_text, provider, || {
-        symphony::grammar_start_of(
-            &ctx.components
-                .worker_registry
-                .get_by_model(&ctx.input.model_id),
-        )
+        kept_start.unwrap_or_else(|| {
+            symphony::grammar_start_of(
+                &ctx.components
+                    .worker_registry
+                    .get_by_model(&ctx.input.model_id),
+            )
+        })
     });
     ctx.state.parser = Some(match assignment {
         Some(_) => ParserChoice::Symphony,
@@ -1019,5 +1034,68 @@ mod tests {
             assert_eq!(assignment.prompt, replayed, "{case}");
             assert_eq!(assignment.opener, opener, "{case}");
         }
+    }
+
+    /// The forced call's reader starts where preparation read the model's workers, the start the
+    /// constraint was built for, whatever the registry holds by request building: a worker that
+    /// starts a grammar once the thought is over joins the model between the two stages, beside
+    /// the one that starts at the first token, and the reader still starts in the call with
+    /// nothing of the prompt replayed, where the two workers together would leave the output's
+    /// first bytes to decide.
+    #[test]
+    fn a_forced_calls_reader_starts_where_preparation_read_the_workers() {
+        let components = pool("inkling", Some("first_token"));
+        let tokenizer = hiding(&["<|content_thinking|>", "<|end_message|>"]);
+        let chat = forced(true);
+        let mut ctx = RequestContext::for_chat(
+            Arc::clone(&chat),
+            None,
+            SERVED.into(),
+            Arc::clone(&components),
+        );
+        ctx.state.parser = Some(ParserChoice::Symphony);
+        let tools = chat.tools.clone().unwrap_or_default();
+        let prepared = prepare(
+            &ctx,
+            Asks::Chat(&chat),
+            &tools,
+            THINKING,
+            false,
+            &tokenizer,
+            "test",
+        )
+        .map_err(|response| response.status())
+        .expect("nothing refused");
+        assert!(prepared.json_schema, "{:?}", prepared.constraint);
+        // What the preparation stage keeps for request building.
+        ctx.state.parser_names = Some(prepared.names);
+        ctx.state.prompt_thought = prepared.prompt_thought;
+        ctx.state.reading = prepared.reading;
+        ctx.state.grammar_start = Some(prepared.grammar_start);
+        // A worker of another start joins the model between the stages.
+        components.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new("grpc://engine-2:50051")
+                .model(ModelCard::new(SERVED).with_reasoning_parser("inkling"))
+                .worker_type(WorkerType::Regular)
+                .label(tool_parser::GrammarStart::LABEL, "after_reasoning")
+                .build(),
+        ));
+        let decided = decide(
+            &mut ctx,
+            Asks::Chat(&chat),
+            &tools,
+            THINKING,
+            prepared.constraint,
+            |_| panic!("the policy is requested: no auto tag"),
+        )
+        .map_err(|response| response.status())
+        .expect("nothing refused");
+        let assignment = decided.assignment.expect("the table reads the forced call");
+        assert_eq!(assignment.forcing.as_deref(), Some("lookup"));
+        assert_eq!(
+            (assignment.prompt.as_str(), assignment.opener),
+            ("", None),
+            "the reader starts in the call, as on the workers preparation read"
+        );
     }
 }

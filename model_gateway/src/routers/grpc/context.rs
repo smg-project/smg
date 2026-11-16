@@ -293,6 +293,13 @@ pub(crate) struct ProcessingState {
     /// endpoints whose preparation decides nothing, and when the names refused (the constraint
     /// carries the refusal); the assignment then decides itself.
     pub reading: Option<Reading>,
+    /// Where the model's workers start a grammar together, as preparation read it among the
+    /// workers it fetched and built the request's constraint for (`reading::prepare`): a forced
+    /// call's reader at request building starts there (`reading::decide`), so a worker set that
+    /// changed between the two stages gives the reader no other start than the constraint's.
+    /// `None` on the endpoints whose preparation reads no workers; the assignment then reads the
+    /// start among the model's workers itself.
+    pub grammar_start: Option<::symphony::grammar::GrammarStart>,
 
     /// A Messages request's tools, taken out of the request by the route
     /// while it still owned it (`MessagesTools::take_from`) and stored by

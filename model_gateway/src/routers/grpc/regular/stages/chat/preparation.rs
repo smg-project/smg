@@ -190,6 +190,7 @@ pub(crate) async fn prepare_chat_like(
             names: parser_names,
             prompt_thought,
             reading,
+            grammar_start,
         } = reading::prepare(
             ctx,
             symphony::Asks::Chat(request),
@@ -208,6 +209,7 @@ pub(crate) async fn prepare_chat_like(
         ctx.state.parser_names = Some(parser_names);
         ctx.state.prompt_thought = prompt_thought;
         ctx.state.reading = reading;
+        ctx.state.grammar_start = Some(grammar_start);
 
         let skip_special_tokens = skips_special_tokens(
             request,
@@ -454,5 +456,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The stage keeps with the request the grammar start preparation read among the model's
+    /// workers, where request building starts a forced call's reader: over one worker that
+    /// starts at the first token, the stage's own run leaves that start.
+    #[tokio::test]
+    async fn the_stage_keeps_the_grammar_start_read_among_the_workers() {
+        use std::sync::Arc;
+
+        use ::symphony::grammar::GrammarStart;
+        use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, TokenizerRegistry};
+        use openai_protocol::model_card::ModelCard;
+
+        use crate::{
+            config::ParserChoice,
+            routers::grpc::regular::stages::testing::components_over,
+            worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
+        };
+
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(MockTokenizer::new().with_deferred_chat_ids(vec![1, 2, 3]));
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        tokenizer_registry
+            .load("m", "m", "test", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let workers = Arc::new(WorkerRegistry::new());
+        workers.register(Arc::new(
+            BasicWorkerBuilder::new("grpc://engine:50051")
+                .model(ModelCard::new("m"))
+                .worker_type(WorkerType::Regular)
+                .label(
+                    tool_parser::GrammarStart::LABEL,
+                    tool_parser::GrammarStart::FIRST_TOKEN,
+                )
+                .build(),
+        ));
+        let components = components_over(tokenizer_registry, workers, ParserChoice::Legacy);
+        let mut ctx = RequestContext::for_chat(
+            Arc::new(request(json!({"model": "m", "messages": [user()]}))),
+            None,
+            "m".into(),
+            components,
+        );
+        assert_eq!(
+            ctx.state.grammar_start, None,
+            "nothing is kept before the stage"
+        );
+        ChatPreparationStage::new(&[])
+            .prepare(&mut ctx)
+            .await
+            .unwrap_or_else(|response| panic!("the stage refused: {}", response.status()));
+        assert_eq!(ctx.state.grammar_start, Some(GrammarStart::FirstToken));
     }
 }
