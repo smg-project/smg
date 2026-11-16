@@ -58,9 +58,11 @@
 //! the answer of a frame already in flight for the other side of a pair is
 //! not read. A pick over the whole view that the profile's own filters
 //! dropped meanwhile is no fault: the picker falls back. A stream that ends
-//! or errs counts once and is reopened behind a decision of its thread, no
-//! sooner than a pause (100 ms) after the failure, whatever the breaker is
-//! set to; a wait its stream broke draws the time its thread blocked; a
+//! or errs counts once, and the breaker hears a plugin's streams as one: at
+//! most one failure a pause, so a plugin that goes away is one outage, not
+//! one a deciding thread. A stream is reopened behind a decision of its thread,
+//! no sooner than a pause (100 ms) after the failure, whatever the breaker
+//! is set to; a wait its stream broke draws the time its thread blocked; a
 //! frame past the stream's window is not sent; a pool larger than the
 //! plugin's `max_candidates` sends no frame (whole view or none: a truncated
 //! view would make the answer depend on the host's candidate order), takes
@@ -77,7 +79,12 @@
 //! never go down whichever threads raise the events; an event the queue
 //! cannot take at once is dropped and counted,
 //! never a wait on a deciding thread. A number counts the events sent and
-//! the events refused, so a gap tells the plugin what it lost. Each profile
+//! the events refused, for the plugin's life and across its streams, so a
+//! gap tells the plugin what it lost: events refused at a full queue, or in
+//! flight on a stream that ended. A gap's size is exact and its place is
+//! not: events raised before the loss can arrive behind it, and a loss after
+//! the last event sent shows at the next. The stream's task is started again a
+//! pause after one that panicked, the queue and the numbers kept. Each profile
 //! that binds the plugin holds one [`Bound`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
 //! the plugin once per engine.

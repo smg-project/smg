@@ -443,6 +443,32 @@ fn an_init_failure_carries_the_start_of_the_plugins_words() {
     }
 }
 
+/// The cut of the plugin's words falls at a character's start: three-byte
+/// characters put the bound's last byte inside one, and the words end at
+/// the character before it.
+#[test]
+fn an_init_failures_words_are_cut_at_a_characters_start() {
+    let served = TestPlugin::serve();
+    served.script(|s| {
+        s.ack_ok = false;
+        s.ack_error = "\u{20ac}".repeat(4_000);
+    });
+    let runtime = runtime();
+    match Plugin::load(&runtime, spec(&served, "wordy-euros")) {
+        Err(LoadError::Init(why)) => {
+            assert!(why.ends_with("..."), "the cut is said: {why}");
+            let words = why.trim_end_matches("...");
+            assert!(
+                words.chars().all(|c| c == '\u{20ac}'),
+                "the words end inside a character: {why}"
+            );
+            let euros = why.matches('\u{20ac}').count();
+            assert_eq!(euros, 85, "256 bytes hold 85 whole characters of three");
+        }
+        other => panic!("an init failure, not {other:?}"),
+    }
+}
+
 /// One plugin speaks one version: the host offers the one it speaks on every
 /// stream, and a stream whose ack names another is cancelled with an error
 /// that names both, however many deciding threads open theirs at once. The
@@ -1825,7 +1851,11 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
         budget_micros: SHORT_MICROS,
         ..facts(1)
     };
-    // The window's first read is at its 64th sample.
+    // The window's first read is at its 64th sample. A round whose frame
+    // the stream did not take (the I/O thread held, its window full) is no
+    // sample and costs microseconds, so the loop is bounded on the clock:
+    // a count of rounds runs out before a held thread is seen again.
+    let started = Instant::now();
     let mut rounds = 0_u32;
     loop {
         let stats = last.stats();
@@ -1833,7 +1863,10 @@ fn a_wait_the_remainder_ended_first_is_the_decisions_spend_at_what_the_frame_was
             break;
         }
         rounds += 1;
-        assert!(rounds <= 400, "the frames do not leave: {stats:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the frames do not leave: {stats:?}"
+        );
         assert!(matches!(
             decide_with(&engine, &short, &candidates),
             Decision::Pick(_)
@@ -2658,17 +2691,186 @@ fn a_stream_that_ends_counts_on_the_breaker() {
     assert_eq!(plugin.stats().bypassed, 1);
 }
 
+/// A plugin that goes away ends every deciding thread's stream at once.
+/// That is one outage and one failure on the breaker, not one a thread:
+/// here two threads' streams end together under a threshold of two and the
+/// breaker stays closed. The plugin stays away, a decision asks for its
+/// stream again a pause later, and that failed open is the second failure:
+/// the breaker opens, as it does for one thread.
+#[test]
+fn streams_that_end_together_are_one_failure_on_the_breaker() {
+    let mut served = TestPlugin::serve();
+    let runtime = runtime();
+    let mut spec = spec(&served, "gone-once");
+    spec.breaker = BreakerSpec {
+        failures: 2,
+        window_micros: 60_000_000,
+        cooldown_micros: 60_000_000,
+    };
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    // A second deciding thread, with a stream of its own.
+    std::thread::scope(|scope| {
+        let warmed = scope.spawn(|| plugin.warm()).join();
+        assert!(matches!(warmed, Ok(Ok(()))), "the second thread's stream");
+    });
+    assert_eq!(plugin.stats().connects, 2);
+    served.stop();
+    assert!(
+        eventually(|| plugin.stats().failed_streams == 2),
+        "both streams ended: {:?}",
+        plugin.stats()
+    );
+    assert_eq!(
+        plugin.stats().breaker_opens,
+        0,
+        "one outage is one failure: {:?}",
+        plugin.stats()
+    );
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    assert!(
+        eventually(|| {
+            decide(&engine, &candidates, 1);
+            plugin.stats().breaker_opens == 1
+        }),
+        "a failed open a pause later is the second failure: {:?}",
+        plugin.stats()
+    );
+}
+
+/// The apply's ask does not wait the pause: a thread whose stream just
+/// failed warms at once when the plugin answers again. Here a second server
+/// takes the first's socket path before the first goes.
+#[test]
+fn the_applys_ask_does_not_wait_the_pause() {
+    let mut first = TestPlugin::serve();
+    let second = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &first, "warmed-again");
+    let path = first.socket.clone();
+    first.stop();
+    std::fs::rename(&second.socket, &path).expect("the second server takes the first's path");
+    assert!(
+        eventually(|| plugin.stats().failed_streams == 1),
+        "{:?}",
+        plugin.stats()
+    );
+    let warmed = plugin.warm();
+    assert!(
+        warmed.is_ok(),
+        "the ask inside the pause was refused: {warmed:?}"
+    );
+    assert_eq!(plugin.stats().connects, 2);
+}
+
+/// A broken stream's status is the plugin's words: the host's line carries
+/// their start and no more than the bound. The words are three-byte
+/// characters, so the cut falls inside one and backs up to its start.
+#[test]
+fn a_streams_status_is_cut_in_the_hosts_line() {
+    said();
+    let served = TestPlugin::serve();
+    served.script(|s| {
+        s.behaviour = Behaviour::EndStream;
+        s.end_status = "\u{20ac}".repeat(1_000);
+    });
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "wordy-status");
+    let engine = single_engine(profile(&plugin, ALL));
+    assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(103));
+    assert!(
+        eventually(|| !lines("wordy-status", "a plugin stream failed").is_empty()),
+        "no line of the stream: {:?}",
+        plugin.stats()
+    );
+    let line = lines("wordy-status", "a plugin stream failed").remove(0);
+    let words = line.matches('\u{20ac}').count();
+    assert!(
+        (20..=85).contains(&words),
+        "the line carries {words} of the plugin's characters"
+    );
+}
+
+/// A stream that fails to open is told to the plugin like one that ends:
+/// the lane's state moves first. Here the telling's read of the clock
+/// panics after a failed open: the host says its task panicked, the lane
+/// reads as failed all the same, and a decision a pause later asks for the
+/// stream again. Told first, the lane would stay connecting for good.
+#[test]
+fn an_open_that_fails_under_a_clock_that_panics_is_asked_for_again() {
+    let kept = said();
+    let mut served = TestPlugin::serve();
+    let armed = Arc::new(AtomicBool::new(false));
+    let told = Arc::clone(&armed);
+    let deciding = std::thread::current().id();
+    let runtime = Runtime::with_clock(&OpenDecisions::new(), move || {
+        assert!(
+            std::thread::current().id() == deciding || !told.swap(false, Ordering::Relaxed),
+            "the clock panics where a failed open is told"
+        );
+        1_000_000
+    })
+    .expect("a runtime");
+    let plugin = load(&runtime, &served, "opens-under-a-panic");
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    assert_eq!(lead(&decide(&engine, &candidates, 1)), Some(103));
+    served.stop();
+    assert!(eventually(|| plugin.stats().failed_streams == 1));
+    armed.store(true, Ordering::Relaxed);
+    assert!(
+        eventually(|| {
+            decide(&engine, &candidates, 2);
+            !armed.load(Ordering::Relaxed)
+        }),
+        "no failed open was told: {:?}",
+        plugin.stats()
+    );
+    assert!(
+        eventually(|| {
+            kept.lock().expect("the kept lines").iter().any(|line| {
+                line.contains("task panicked") && line.contains("a failed open is told")
+            })
+        }),
+        "the host said nothing of the task that panicked"
+    );
+    let before = plugin.stats().failed_streams;
+    assert!(
+        eventually(|| {
+            decide(&engine, &candidates, 3);
+            plugin.stats().failed_streams > before
+        }),
+        "the lane was left connecting over a failed open: {:?}",
+        plugin.stats()
+    );
+}
+
 /// The hello's ack is awaited under the connect frame on the I/O thread
 /// too. A plugin that takes a cold thread's stream and never acks leaves
 /// it failed at the frame's end, and the thread's later decisions ask for
 /// it again.
 #[test]
 fn a_hello_never_acked_fails_a_cold_threads_stream_at_the_connect_frame() {
-    let served = TestPlugin::serve();
     let runtime = runtime();
-    let mut spec = spec(&served, "mute-hello");
-    spec.connect_micros = 100_000;
-    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    // The frame is short for the cold stream's sake, and the load's own
+    // hello is acked under it too: a load the runner held past it is made
+    // again, on a plugin that has seen no hello.
+    let until = Instant::now() + Duration::from_secs(60);
+    let (served, plugin) = loop {
+        let served = TestPlugin::serve();
+        let mut spec = spec(&served, "mute-hello");
+        spec.connect_micros = 100_000;
+        match Plugin::load(&runtime, spec) {
+            Ok(plugin) => break (served, plugin),
+            Err(why) => {
+                assert!(Instant::now() < until, "the plugin loads: {why:?}");
+                made_again(
+                    "a mute hello's load",
+                    "the load's own hello was acked past the connect frame",
+                );
+            }
+        }
+    };
     served.script(|s| s.hello_delay = Duration::from_secs(30));
     let engine = single_engine(profile(&plugin, ALL));
     std::thread::scope(|scope| {
@@ -2924,6 +3126,71 @@ fn a_refused_event_leaves_a_gap_in_the_numbers() {
         Some(sent + refused),
         "the last number counts every event raised, sent or refused"
     );
+}
+
+/// The numbers go on across two `Observe` streams: the first server goes, a
+/// second takes its socket's path, and what the second is sent is numbered
+/// above everything the first was.
+#[test]
+fn the_numbers_go_on_across_two_observe_streams() {
+    let mut first = TestPlugin::serve();
+    let runtime = runtime();
+    let mut row = spec(&first, "two-streams");
+    row.connect_micros = 1_000_000;
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    for _ in 0..40 {
+        engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    }
+    assert!(eventually(|| first.seen().events.len() == 40));
+    let last = first.seen().events.last().map(|event| event.seq);
+    assert_eq!(last, Some(40));
+    let path = first.socket.clone();
+    first.stop();
+    let second = TestPlugin::serve();
+    std::fs::rename(&second.socket, &path).expect("the second server takes the first's path");
+    let mut raised = 0_u32;
+    while second.seen().events.len() < 20 {
+        raised += 1;
+        assert!(raised <= 15_000, "no event reached the second server");
+        engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let seen = second.seen();
+    let numbers: Vec<u64> = seen.events.iter().map(|event| event.seq).collect();
+    assert!(
+        numbers.first().copied() > last,
+        "the numbers went down across two streams: {numbers:?}"
+    );
+    assert!(
+        numbers.windows(2).all(|pair| pair[1] > pair[0]),
+        "{numbers:?}"
+    );
+}
+
+/// The `Observe` call's answer is bounded in bytes like a decision's: an Ack
+/// past the row's bound ends the call as a status about its length, and the
+/// host's line carries no more of the status than its own bound.
+#[test]
+fn an_observe_answer_past_the_message_bound_is_refused_by_its_length() {
+    said();
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "wordy-ack");
+    let engine = single_engine(profile(&plugin, ALL));
+    served.script(|s| s.observe_ack = "x".repeat(300_000));
+    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    assert!(
+        eventually(|| !lines("wordy-ack", "observe stream failed").is_empty()),
+        "no line of the observe stream: {:?}",
+        plugin.stats()
+    );
+    let line = lines("wordy-ack", "observe stream failed").remove(0);
+    assert!(
+        line.contains("too large") || line.contains("OutOfRange"),
+        "an Ack past the bound was read: {line}"
+    );
+    assert!(line.len() < 600, "the line is {} bytes", line.len());
 }
 
 /// A build that binds the plugin to two profiles takes both bound sets from

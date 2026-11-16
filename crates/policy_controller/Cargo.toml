@@ -230,7 +230,7 @@ required-features = ["client"]
 name = "grpc_plugin"
 required-features = ["controller"]
 
-# One case in a process of its own: it lowers the process's descriptor limit.
+# Two cases in a process of their own: each lowers a limit of the process.
 [[test]]
 name = "grpc_runtime"
 required-features = ["controller"]

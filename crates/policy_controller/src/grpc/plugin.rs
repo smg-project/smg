@@ -125,7 +125,8 @@ pub struct Stats {
     pub refused: u64,
     /// `Decide` streams that settled (the hello acked).
     pub connects: u64,
-    /// Streams that failed to open, ended or erred.
+    /// Streams that failed to open, ended or erred. The breaker hears a
+    /// plugin's streams as one: at most one failure a pause.
     pub failed_streams: u64,
     /// Answers for a decision nobody waited for any more.
     pub late_answers: u64,
@@ -247,10 +248,10 @@ impl LaneEvents for Inner {
         }
     }
 
-    fn stream_failed(&self, why: &str) {
+    fn stream_failed(&self, why: &str, at: Instant) {
         bump(&self.tally.failed_streams);
         tracing::warn!(plugin = self.name, why, "a plugin stream failed");
-        self.unit.report(self.now());
+        self.unit.stream_failed(at, || self.now());
     }
 
     fn late_answer(&self) {

@@ -1,7 +1,7 @@
 //! The gRPC plugin runtime's constructor in a process out of descriptors or
 //! out of threads. Two cases in a test binary of their own: each lowers a
 //! limit of the process, which no other case could run beside, so the two
-//! take turns.
+//! take turns. The thread case is Linux's alone.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::sync::{Mutex, PoisonError};
@@ -46,6 +46,9 @@ fn a_runtime_that_cannot_be_built_is_the_constructors_error() {
 /// loop, so nothing that blocks is dropped on the caller. A loop built by the
 /// constructor and moved into the closure is dropped on the calling thread
 /// when the spawn fails, and inside an async context that drop panics.
+/// Linux alone: its limit counts threads, where another system's counts
+/// processes and the spawn succeeds whatever the limit.
+#[cfg(target_os = "linux")]
 #[test]
 #[expect(
     clippy::print_stdout,
