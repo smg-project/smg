@@ -100,9 +100,11 @@ fn forms(c: &mut Criterion) {
     }
     // The resident form with one dispatch credit per row in the tally: every
     // decision reads each reporting row's entry. The credits date after
-    // every sample instant, so no decision releases them.
-    let engine = form_of(RESIDENT);
+    // every sample instant, so no decision releases them. Each size takes
+    // an engine of its own: the fleet's ids repeat from size to size, and
+    // one engine would keep a smaller size's credits.
     for &n in &SIZES {
+        let engine = form_of(RESIDENT);
         let view = view_of(n);
         let lease = Lease {
             issued_micros: 1_000_000,

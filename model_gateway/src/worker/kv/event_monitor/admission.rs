@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use smg_grpc_client::common_proto::{kv_cache_event, KvEventBatch, KvSnapshotChunk};
@@ -262,7 +262,7 @@ impl KvEventMonitor {
         }
 
         on_batch(batch);
-        if !state.indexes(batch) {
+        if !indexed {
             // Another rank's batch: its cursor moved and the stream is
             // working, but its blocks are that rank's cache, not this
             // worker's. Counted, not indexed.
@@ -272,30 +272,10 @@ impl KvEventMonitor {
             }
             return BatchOutcome::Skipped;
         }
-        let started = Instant::now();
-        let counters_before = state.index.counters;
-        let (mut stored_blocks, mut removed_blocks) = (0usize, 0usize);
-        for event in &batch.events {
-            match &event.data {
-                Some(kv_cache_event::Data::Stored(stored)) => stored_blocks += stored.blocks.len(),
-                Some(kv_cache_event::Data::Removed(removed)) => {
-                    removed_blocks += removed.block_hashes.len();
-                }
-                _ => {}
-            }
-        }
-        Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
-        Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
-        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
-        if stored_blocks > 0 {
-            Metrics::record_kv_event_blocks(worker_url, "stored", stored_blocks);
-        }
-        if removed_blocks > 0 {
-            Metrics::record_kv_event_blocks(worker_url, "removed", removed_blocks);
-        }
-        Self::record_lag(worker_url, batch.timestamp);
-        Metrics::record_kv_event_batch(worker_url, "applied");
-        Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
+        let took = Self::apply_indexed_batch(
+            batch, worker_url, worker_id, indexer, state, "stored", "applied",
+        );
+        Metrics::record_kv_event_apply(worker_url, took.as_secs_f64());
         if degraded_changed {
             Metrics::set_kv_event_degraded_ranks(worker_url, state.degraded_ranks());
         }
@@ -373,21 +353,9 @@ impl KvEventMonitor {
         // its blocks: they are that rank's cache, not this worker's.
         let indexed = state.indexes(batch);
         if indexed {
-            let counters_before = state.index.counters;
-            let mut snapshot_blocks = 0usize;
-            for event in &batch.events {
-                if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
-                    snapshot_blocks += stored.blocks.len();
-                }
-            }
-            Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
-            Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
-            if snapshot_blocks > 0 {
-                Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);
-            }
-            Self::record_lag(worker_url, batch.timestamp);
-            Metrics::record_kv_event_batch(worker_url, "snapshot");
-            Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
+            Self::apply_indexed_batch(
+                batch, worker_url, worker_id, indexer, state, "snapshot", "snapshot",
+            );
         } else {
             Metrics::record_kv_event_batch(worker_url, "other_rank");
         }
@@ -410,6 +378,47 @@ impl KvEventMonitor {
         } else {
             BatchOutcome::Skipped
         }
+    }
+
+    /// Apply a batch this worker indexes and account for it: the blocks it
+    /// stored (under `stored_op`) and removed, the stores the index did not
+    /// take as is, the batch's age, the batch itself under `disposition`,
+    /// and the worker's index-blocks gauge. Returns how long the apply took;
+    /// the live stream publishes it as its pace, a snapshot chunk does not.
+    fn apply_indexed_batch(
+        batch: &KvEventBatch,
+        worker_url: &str,
+        worker_id: u32,
+        indexer: &KvIndex,
+        state: &mut WorkerStreamState,
+        stored_op: &'static str,
+        disposition: &'static str,
+    ) -> Duration {
+        let started = Instant::now();
+        let counters_before = state.index.counters;
+        let (mut stored_blocks, mut removed_blocks) = (0usize, 0usize);
+        for event in &batch.events {
+            match &event.data {
+                Some(kv_cache_event::Data::Stored(stored)) => stored_blocks += stored.blocks.len(),
+                Some(kv_cache_event::Data::Removed(removed)) => {
+                    removed_blocks += removed.block_hashes.len();
+                }
+                _ => {}
+            }
+        }
+        Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
+        let took = started.elapsed();
+        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
+        if stored_blocks > 0 {
+            Metrics::record_kv_event_blocks(worker_url, stored_op, stored_blocks);
+        }
+        if removed_blocks > 0 {
+            Metrics::record_kv_event_blocks(worker_url, "removed", removed_blocks);
+        }
+        Self::record_lag(worker_url, batch.timestamp);
+        Metrics::record_kv_event_batch(worker_url, disposition);
+        Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
+        took
     }
 
     /// One rank's publisher lost its history (a restart, or an unreplayable
@@ -630,7 +639,8 @@ mod tests {
     /// A subscription served by a relay snapshot accounts its blocks the way
     /// the live path does: once the chunks are applied the worker's gauge
     /// reads the index's count, the snapshot's blocks are counted under
-    /// `op="snapshot"`, and the live events after it keep counting from there.
+    /// `op="snapshot"`, the live events after it keep counting from there,
+    /// and only a live batch's apply is a sample of the stream's pace.
     #[test]
     fn a_relay_snapshot_sets_the_worker_gauge_and_counts_its_blocks() {
         use metrics_exporter_prometheus::PrometheusBuilder;
@@ -679,11 +689,21 @@ mod tests {
                 None,
                 "a snapshot is not a publisher's store"
             );
+            assert_eq!(
+                series("smg_kv_event_apply_seconds_count{", &[worker]),
+                None,
+                "a snapshot chunk's apply is not the live stream's pace"
+            );
 
             // Live events after the cut keep both moving.
             assert_eq!(
                 sim.feed(&batch(6, None, vec![stored(Some(5), &[6, 7])])),
                 BatchOutcome::Applied
+            );
+            assert_eq!(
+                series("smg_kv_event_apply_seconds_count{", &[worker]),
+                Some(1.0),
+                "a live batch's apply is one sample of it"
             );
             assert_eq!(
                 sim.feed(&batch(7, None, vec![removed(&[7])])),

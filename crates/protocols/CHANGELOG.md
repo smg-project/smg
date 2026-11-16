@@ -6,6 +6,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Changed
 
+- `EmbeddingObject.embedding` is an `Embedding`: the float array, or the base64 string of the
+  vector's little-endian f32 bytes when the request asked for `encoding_format: "base64"`; the
+  type is untagged, so an answer reads either shape. The gateway's gRPC embeddings path answered
+  the float array for every value of `encoding_format`; it now encodes for `base64`. Breaking:
+  `EmbeddingObject.embedding` is `Embedding`, not `Vec<f32>`.
+
 - A Messages request's `tool_use` block whose `input` is not an object is still refused under
   `tool_use_input_not_an_object` with the public API's sentence, and the sentence now names the
   block: `messages.1.content.0.tool_use.input: Input should be a valid dictionary (the tool_use
@@ -59,6 +65,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the caller derived already, beside `template_thinking_for`. The readers without the suffix
   derive the profile from the model id as before; a serving path that derives it once per
   request no longer derives it again at each of them.
+- `ModelCard` derives `PartialEq`: a caller that holds a worker's cards tells a refresh that
+  repeats them from one that changes them (the gateway's model refresh publishes nothing for the
+  first).
 
 ### Changed
 
@@ -147,6 +156,16 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A function declared as a member of a Responses namespace is held to the two rules a top-level
+  function is held to. `parameters` that are not a JSON object are refused (`400`, `error.code`
+  `invalid_type`, `Invalid type for 'tools[0].tools[1].parameters': expected an object, but got a
+  string instead.`, `error.param` `tools`). For one of OpenAI's own models a strict member whose
+  schema does not pin `additionalProperties: false` on every object is refused
+  (`invalid_function_parameters`, the message naming the member's function), as a top-level strict
+  function is. Such a member passed validation, and the model was handed a function whose schema
+  was a string, an array, a number or a boolean. A member with an object, with `null` or with no
+  `parameters` is accepted as before, and a self-hosted model's strict member is passed through as
+  before.
 - A tool the model calls by name is refused when that name is the empty string (`400`,
   `error.code` `empty_string`, in the public API's words: `Invalid 'tools[1].function.name': empty
   string. Expected a string with minimum length 1, but got an empty string instead.`). On Chat

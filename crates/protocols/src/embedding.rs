@@ -31,7 +31,9 @@ pub struct EmbeddingRequest {
     pub input: Value,
 
     /// Optional encoding format of the vectors: `float`, `base64`, or one the
-    /// serving engine answers; the gateway does not read it.
+    /// serving engine answers. The gRPC path encodes `base64` itself (the
+    /// engine's wire carries floats) and answers floats for any other value;
+    /// the HTTP path forwards it to the engine.
     pub encoding_format: Option<String>,
 
     /// Optional user identifier
@@ -209,12 +211,23 @@ impl GenerationRequest for EmbeddingRequest {
     }
 }
 
-/// One embedding of the answer, object `embedding`: the vector and the index of
-/// the input it embeds.
+/// The vector of one embedding as the answer carries it, in the public API's
+/// two encodings: the float array (`encoding_format: "float"`, or none), or
+/// the base64 of the vector's little-endian f32 bytes (`"base64"`). Untagged,
+/// so an answer reads either: a JSON array is the floats, a string the base64.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum Embedding {
+    Floats(Vec<f32>),
+    Base64(String),
+}
+
+/// One embedding of the answer, object `embedding`: the vector, in the
+/// encoding the request asked for, and the index of the input it embeds.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingObject {
     pub object: String, // "embedding"
-    pub embedding: Vec<f32>,
+    pub embedding: Embedding,
     pub index: u32,
 }
 
@@ -286,6 +299,23 @@ mod tests {
                 .expect("an object")
                 .extend(options.as_object().expect("an object").clone());
             assert!(request(body.clone()).validate().is_ok(), "{body}");
+        }
+    }
+
+    /// An answer's vector is the float array or the base64 string, bare in
+    /// the JSON as the public API has it, and either reads back.
+    #[test]
+    fn an_embedding_is_the_float_array_or_the_base64_string() {
+        let floats = Embedding::Floats(vec![0.5, 0.25]);
+        let base64 = Embedding::Base64("AAAAPwAAgD4=".to_string());
+        assert_eq!(serde_json::to_value(&floats).unwrap(), json!([0.5, 0.25]));
+        assert_eq!(
+            serde_json::to_value(&base64).unwrap(),
+            json!("AAAAPwAAgD4=")
+        );
+        for value in [floats, base64] {
+            let text = serde_json::to_string(&value).unwrap();
+            assert_eq!(serde_json::from_str::<Embedding>(&text).unwrap(), value);
         }
     }
 

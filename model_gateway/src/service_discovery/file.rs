@@ -47,7 +47,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    config::{ConfigError, ConfigResult, RoutingMode},
+    config::{validation::listed_worker_url_refusal, ConfigError, ConfigResult, RoutingMode},
     fs_watch::{settle, DirectoryWatch},
     observability::metrics::metrics_labels,
     worker::{identity::endpoint::Endpoint, EndpointKey},
@@ -193,9 +193,30 @@ pub(crate) fn export_manifest(workers: &[WorkerInfo]) -> Manifest {
 
 impl ManifestWorker {
     fn into_worker(self, roles: Roles) -> Result<DiscoveredWorker, String> {
-        // `parse` rejects an `@rank` suffix: ranks are the workflow's to
-        // assign. Its errors name the host or port, never the userinfo.
+        // The worker URL door first, as the worker API and a start ask it:
+        // an address its two readers read apart is not stored, and neither
+        // is a `@rank` suffix, which is the workflow's to assign. The door's
+        // reason names no part of the address behind its scheme. The parse
+        // below names the host or the port as it reads them, and in an
+        // address the two read apart that is a credential to a client.
+        let written = self.url.trim();
+        if let Some(reason) = listed_worker_url_refusal(written) {
+            return Err(format!("invalid url: {reason}"));
+        }
         let endpoint = Endpoint::parse(&self.url).map_err(|e| format!("invalid url: {e}"))?;
+        // The door again, of the address as it is kept: the registration is
+        // handed the endpoint as it renders, which is not always the text as
+        // written. The rendering drops a path's trailing slashes, and the
+        // door reads an address less its slashes under `http` and `https`
+        // alone: `grpc://token@8080/` is a userinfo and a host as written,
+        // and a host and its rank as kept.
+        let kept = endpoint.render();
+        let kept_refusal = (kept != written)
+            .then(|| listed_worker_url_refusal(&kept))
+            .flatten();
+        if let Some(reason) = kept_refusal {
+            return Err(format!("invalid url: {reason}"));
+        }
 
         let worker_type = match self.worker_type {
             Some(worker_type) if roles.allows(worker_type) => worker_type,
@@ -692,7 +713,7 @@ mod tests {
                 "rank suffix",
                 manifest(r#"{"url": "10.0.0.11:8000@1"}"#),
                 Roles::Regular,
-                "DP rank suffix",
+                "the gateway reads them as a rank suffix",
             ),
             (
                 "unparsable url",
@@ -754,6 +775,170 @@ mod tests {
             ),
             "workers[1]: duplicate id '10.0.0.11:8000'",
         );
+    }
+
+    /// The worker URL door is asked before the reader's own parse: an
+    /// address the worker API refuses is refused here in the door's words,
+    /// which name no part of it behind its scheme. The parse names the host
+    /// or the port as it reads them: it read the password of the second
+    /// spelling as a port, and it took the first, which is stored and named
+    /// without its slash.
+    #[test]
+    fn an_address_the_worker_url_door_refuses_is_refused_with_no_part_named() {
+        let entry = |url: &str| manifest(&format!(r#"{{"url": "{url}"}}"#));
+        for url in [
+            "http://adm1n:s3cret@2130706433/",
+            "http://adm1n:s3cret@2130706433",
+            "http://adm1n:s3cret@99999999999",
+            "adm1n:s3cret@2130706433/",
+            "adm1n:s3cret@2130706433",
+            "http://s3cret@2130706433",
+        ] {
+            let reason = parse_err(&entry(url), Roles::Regular);
+            assert!(
+                reason.starts_with("workers[0]: invalid url: "),
+                "{url}: {reason}"
+            );
+            for part in ["adm1n", "s3cret", "2130706433", "99999999999"] {
+                assert!(
+                    !reason.contains(part),
+                    "{url}: the refusal names '{part}': {reason}"
+                );
+            }
+        }
+        assert_eq!(
+            parse_err(&entry("http://adm1n:s3cret@2130706433"), Roles::Regular),
+            "workers[0]: invalid url: the gateway cannot read this address as a host and a port, \
+             though a URL client can: write it as scheme://host:port, with a port from 1 to 65535",
+        );
+
+        // The controls: a userinfo before a host and a port, a plain address,
+        // a known scheme in upper case, an address with no scheme, and one
+        // with blanks around it.
+        for (url, stored) in [
+            (
+                "http://adm1n:s3cret@10.0.0.11:8000",
+                "http://adm1n:s3cret@10.0.0.11:8000",
+            ),
+            ("http://10.0.0.11:8000", "http://10.0.0.11:8000"),
+            ("HTTP://10.0.0.11:8000", "http://10.0.0.11:8000"),
+            ("adm1n:s3cret@10.0.0.11:8000", "adm1n:s3cret@10.0.0.11:8000"),
+            (" 10.0.0.11:8000 ", "10.0.0.11:8000"),
+        ] {
+            let workers = parse(&entry(url), Roles::Regular).unwrap();
+            assert_eq!(workers[0].endpoint.render(), stored, "{url}");
+        }
+    }
+
+    /// The door is asked of the address as it is kept, too. The registration
+    /// is handed the endpoint as it renders, without a path's trailing
+    /// slashes, and the door reads an address less its slashes under `http`
+    /// and `https` alone. The first spelling is a userinfo and a host as
+    /// written, and a host and its rank as kept: it was listed, and named
+    /// with the token as its host.
+    #[test]
+    fn an_address_the_door_refuses_as_it_is_kept_is_refused_with_no_part_named() {
+        let entry = |url: &str| manifest(&format!(r#"{{"url": "{url}"}}"#));
+        for (url, reason) in [
+            (
+                "grpc://s3cret-token@2130706433/",
+                "the gateway reads them as a rank suffix",
+            ),
+            (
+                "GRPC://s3cret-token@2130706433//",
+                "the gateway reads them as a rank suffix",
+            ),
+            (
+                "grpc://adm1n:s3cret@2130706433/",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            (
+                "grpc://decode.internal\u{a0}/",
+                "the address reads two ways",
+            ),
+            ("tcp://decode.internal\u{a0}/", "the address reads two ways"),
+        ] {
+            let refusal = parse_err(&entry(url), Roles::Regular);
+            assert!(
+                refusal.starts_with("workers[0]: invalid url: ") && refusal.contains(reason),
+                "{url}: {refusal}"
+            );
+            for part in ["adm1n", "s3cret", "2130706433", "decode"] {
+                assert!(
+                    !refusal.contains(part),
+                    "{url}: the refusal names '{part}': {refusal}"
+                );
+            }
+        }
+
+        // The controls: a trailing slash refuses nothing by itself, and the
+        // address is kept without it.
+        for (url, stored) in [
+            (
+                "grpc://decode.internal:9000/",
+                "grpc://decode.internal:9000",
+            ),
+            (
+                "grpc://adm1n:s3cret@10.0.0.11:9000/",
+                "grpc://adm1n:s3cret@10.0.0.11:9000",
+            ),
+            ("http://10.0.0.11:8000/", "http://10.0.0.11:8000"),
+            ("tcp://10.0.0.11:5555/", "tcp://10.0.0.11:5555"),
+        ] {
+            let workers = parse(&entry(url), Roles::Regular).unwrap();
+            assert_eq!(workers[0].endpoint.render(), stored, "{url}");
+        }
+    }
+
+    /// A scheme is a known one at the start of an address, as the address
+    /// type reads it and the registration keeps it. An address with none
+    /// may hold a `://` further in, in a path, in a query or behind a
+    /// userinfo: it is listed and kept as written. Read as the end of a
+    /// scheme, that `://` had the door refuse the address, and the manifest
+    /// whole. A scheme the gateway does not know is no scheme: the address
+    /// is read as one with none, and refused in the door's words, which
+    /// name no part of it.
+    #[test]
+    fn a_scheme_is_read_at_the_start_of_a_listed_address_alone() {
+        let entry = |url: &str| manifest(&format!(r#"{{"url": "{url}"}}"#));
+        for url in [
+            "10.0.0.11:8000/a://b",
+            "10.0.0.11:8000/proxy/http://backend:9000",
+            "decode.internal:8000/v1?next=http://x",
+            "adm1n:s3cret@10.0.0.11:8000/a://b",
+            "http://10.0.0.11:8000/a://b",
+        ] {
+            let workers = parse(&entry(url), Roles::Regular).unwrap();
+            assert_eq!(workers[0].endpoint.render(), url, "{url}");
+        }
+
+        for (url, reason) in [
+            (
+                "ftp://10.0.0.11:8000",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            (
+                "S3CRET.Token+1://10.0.0.11:8000",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            (
+                "adm1n:s3cr://et@10.0.0.11:8000",
+                "Invalid URL format: invalid port number",
+            ),
+        ] {
+            let refusal = parse_err(&entry(url), Roles::Regular);
+            assert!(
+                refusal.starts_with("workers[0]: invalid url: ") && refusal.contains(reason),
+                "{url}: {refusal}"
+            );
+            let lowered = refusal.to_ascii_lowercase();
+            for part in ["ftp", "s3cr", "token", "adm1n", "10.0.0.11"] {
+                assert!(
+                    !lowered.contains(part),
+                    "{url}: the refusal names '{part}': {refusal}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -849,6 +1034,40 @@ mod tests {
         std::fs::write(&path, manifest("")).unwrap();
         discovery.reread().await;
         assert_eq!(listed(&discovery), Some(vec![]), "an empty fleet is valid");
+    }
+
+    /// One entry the worker URL door refuses refuses its manifest whole, as
+    /// any entry the reader cannot take does: at a first read the worker
+    /// listed beside it is not listed either. The warning names the entry's
+    /// index and the door's reason, and no line names a part of its address.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn one_entry_the_door_refuses_refuses_its_manifest_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.json");
+        let mut discovery = discovery(&path);
+        for (refused, reason) in [
+            (
+                "grpcs://127.0.0.1:9000",
+                "grpcs:// workers are not supported",
+            ),
+            (
+                "tcp://adm1n:s3cret@127.0.0.1:31000",
+                "a tcp:// worker URL takes no userinfo",
+            ),
+        ] {
+            let workers = format!(r#"{{"url": "10.0.0.11:8000"}}, {{"url": "{refused}"}}"#);
+            std::fs::write(&path, manifest(&workers)).unwrap();
+            discovery.reread().await;
+            assert_eq!(listed(&discovery), None, "{refused}: a worker is listed");
+            assert!(
+                logs_contain(&format!("workers[1]: invalid url: {reason}")),
+                "{refused}: no warning names the entry and the door's reason"
+            );
+        }
+        for part in ["adm1n", "s3cret", "127.0.0.1"] {
+            assert!(!logs_contain(part), "a line names '{part}'");
+        }
     }
 
     /// Until the manifest's directory exists the provider polls only: the

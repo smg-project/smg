@@ -191,14 +191,28 @@ pub(crate) fn candidate(c: &Candidate, held: AffinityFacts) -> wit::Candidate {
 /// An identity under the plugin's exposure: withheld, its fingerprint, or
 /// the plain form when the host holds it (its fingerprint otherwise).
 pub(crate) fn identity<'a>(id: &Identity<'a>, reveal: Reveal) -> wit::Identity<'a> {
+    exposed(id, reveal, || id.hash)
+}
+
+/// [`identity`] with the hash form's value made on demand: the exposure is
+/// asked first, and `hash` runs only where that form crosses.
+fn exposed<'a>(id: &Identity<'a>, reveal: Reveal, hash: impl FnOnce() -> u64) -> wit::Identity<'a> {
     if id.is_none() {
         return wit::Identity::None;
     }
     match (reveal, id.plain) {
         (Reveal::None, _) => wit::Identity::None,
         (Reveal::Plain, Some(plain)) => wit::Identity::Plain(plain),
-        (Reveal::Hash | Reveal::Plain, _) => wit::Identity::Hash(id.hash),
+        (Reveal::Hash | Reveal::Plain, _) => wit::Identity::Hash(hash()),
     }
+}
+
+/// The request's session key as a plugin sees it under its exposure: the
+/// session's value in the hash form, which is what a lease carries, so a
+/// plugin matches the two; the key itself in the plain form. A value the
+/// plugin is not shown is never made.
+fn session_identity<'a>(facts: &RequestFacts<'a>, reveal: Reveal) -> wit::Identity<'a> {
+    exposed(&facts.session_key, reveal, || facts.session().get())
 }
 
 /// The allow-listed headers the exposure lets through, as the record form
@@ -228,7 +242,7 @@ pub(crate) fn request<'a>(
         prompt_tokens: facts.prompt_tokens,
         block_hashes: facts.block_hashes,
         hash_kind: hash_kind(facts.hash_kind),
-        session_key: identity(&facts.session_key, exposure.session_key),
+        session_key: session_identity(facts, exposure.session_key),
         phase: phase(facts.phase),
         attempt: facts.attempt,
         tried,
@@ -301,8 +315,8 @@ impl Records {
 /// change to the table changes these numbers and the test that pins them.
 pub mod layout {
     /// One candidate row, with the five affinity facts in it. The fields of
-    /// the engine's own row take 104 bytes WITHOUT them: the two numbers
-    /// are equal by accident, each pinned in its own file, and nothing ties
+    /// the engine's own row take 103 bytes WITHOUT them: the two numbers
+    /// are near by accident, each pinned in its own file, and nothing ties
     /// one to the other.
     pub const ROW: usize = 104;
     /// The request block's fixed header; the variable sections follow.
@@ -661,9 +675,9 @@ impl Packed {
         buf.clear();
         buf.resize(HEADER, 0);
         let tenant = identity(&facts.tenant, exposure.tenant);
-        let session = identity(&facts.session_key, exposure.session_key);
-        let (tenant_hash, tenant_plain) = packed_identity(&tenant, facts.tenant.hash);
-        let (session_hash, session_plain) = packed_identity(&session, facts.session_key.hash);
+        let session = session_identity(facts, exposure.session_key);
+        let (tenant_hash, tenant_plain) = packed_identity(&tenant, || facts.tenant.hash);
+        let (session_hash, session_plain) = packed_identity(&session, || facts.session().get());
         let model_len = section_len(facts.model)?;
         let exposed = facts
             .headers
@@ -828,12 +842,16 @@ impl Packed {
 }
 
 /// The packed block's identity fields: the fingerprint under both the hash
-/// and the plain form (`0` withheld), and the plain string when it crosses.
-fn packed_identity<'a>(id: &wit::Identity<'a>, hash: u64) -> (u64, Option<&'a str>) {
+/// and the plain form (`0` withheld), and the plain string when it crosses;
+/// `hash` makes the fingerprint the plain form carries beside its string.
+fn packed_identity<'a>(
+    id: &wit::Identity<'a>,
+    hash: impl FnOnce() -> u64,
+) -> (u64, Option<&'a str>) {
     match id {
         wit::Identity::None => (0, None),
         wit::Identity::Hash(h) => (*h, None),
-        wit::Identity::Plain(plain) => (hash, Some(plain)),
+        wit::Identity::Plain(plain) => (hash(), Some(plain)),
     }
 }
 
@@ -851,7 +869,7 @@ pub(crate) fn lease(l: &Lease, exposure: &Exposure) -> wit::Lease {
         generation: l.generation,
         session_key: match exposure.session_key {
             Reveal::None => 0,
-            Reveal::Hash | Reveal::Plain => l.session_key,
+            Reveal::Hash | Reveal::Plain => l.session.get(),
         },
         tokens: l.tokens,
     }
@@ -1222,6 +1240,7 @@ mod tests {
         ];
         let facts = RequestFacts {
             model: "twelve-bytes",
+            model_fingerprint: crate::ModelFingerprint::NONE,
             namespace_seed: 1,
             tenant: Identity::plain("acme"),
             priority: -7,
@@ -1273,7 +1292,11 @@ mod tests {
         assert_eq!(&b[132..136], b"acme");
         assert_eq!(b.len(), 136);
         assert_eq!(le_u64(b, REQ_TENANT), facts.tenant.hash);
-        assert_eq!(le_u64(b, REQ_SESSION_KEY), facts.session_key.hash);
+        assert_eq!(
+            le_u64(b, REQ_SESSION_KEY),
+            facts.session().get(),
+            "the session's value, as a lease of the request carries it"
+        );
         assert_eq!(
             b[REQ_BITS],
             REQ_BIT_STREAMING | REQ_BIT_TENANT_PLAIN,
@@ -1319,14 +1342,14 @@ mod tests {
         assert_eq!(le_u64(&packed.request, REQ_TENANT), 0);
         assert_eq!(
             le_u64(&packed.request, REQ_SESSION_KEY),
-            77,
-            "plain asked, hash held: the fingerprint crosses"
+            facts.session().get(),
+            "plain asked, hash held: the session's value crosses"
         );
         assert_eq!(packed.request[REQ_BITS], 0);
         assert_eq!(identity(&facts.tenant, Reveal::None), wit::Identity::None);
         assert_eq!(
-            identity(&facts.session_key, Reveal::Plain),
-            wit::Identity::Hash(77)
+            session_identity(&facts, Reveal::Plain),
+            wit::Identity::Hash(facts.session().get())
         );
         assert_eq!(
             identity(&facts.tenant, Reveal::Plain),
@@ -1336,6 +1359,67 @@ mod tests {
             identity(&Identity::NONE, Reveal::Plain),
             wit::Identity::None
         );
+    }
+
+    /// The exposure is asked before the session is made: a plugin that is
+    /// not shown the session key costs the request no session, and neither
+    /// does a plain key in the record form. The carried fingerprint here is
+    /// another name's, which stops a debug build wherever the session is
+    /// made, so no form below made one.
+    #[test]
+    fn a_session_key_the_plugin_is_not_shown_makes_no_session() {
+        let facts = RequestFacts {
+            model: "model-a",
+            model_fingerprint: crate::ModelFingerprint::of("model-b"),
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let withheld = Exposure {
+            session_key: Reveal::None,
+            ..Exposure::default()
+        };
+        let record = request(&facts, &withheld, &[], &[]);
+        assert_eq!(record.session_key, wit::Identity::None);
+        let mut packed = Packed::default();
+        packed
+            .fill_request(&facts, &withheld)
+            .expect("the request packs");
+        assert_eq!(le_u64(&packed.request, REQ_SESSION_KEY), 0);
+        let plain = Exposure {
+            session_key: Reveal::Plain,
+            ..Exposure::default()
+        };
+        let record = request(&facts, &plain, &[], &[]);
+        assert_eq!(record.session_key, wit::Identity::Plain("conversation-7"));
+    }
+
+    /// A plain session key under the plain exposure packs the session's
+    /// value beside its string: the number a lease of the request carries,
+    /// so a plugin shown the key matches the two. The key's own fingerprint
+    /// is another number, and the case tells them apart.
+    #[test]
+    fn a_plain_session_key_packs_the_sessions_value_beside_its_string() {
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let exposure = Exposure {
+            session_key: Reveal::Plain,
+            ..Exposure::default()
+        };
+        let mut packed = Packed::default();
+        packed
+            .fill_request(&facts, &exposure)
+            .expect("the request packs");
+        let b = &packed.request;
+        let session = facts.session().get();
+        assert_ne!(session, facts.session_key.hash);
+        assert_eq!(le_u64(b, REQ_SESSION_KEY), session);
+        assert_eq!(b[REQ_BITS], REQ_BIT_SESSION_PLAIN);
+        // The string follows the model's padded section: (len u16, bytes).
+        assert_eq!(le_u16(b, HEADER + 8), 14);
+        assert_eq!(&b[HEADER + 10..], b"conversation-7");
     }
 
     #[test]

@@ -4,21 +4,23 @@
 //! listener's counters are read back. The Numbers cell at the end drives
 //! the driver against a fleet of mock engines and prints its cost.
 
+#[path = "common/engines.rs"]
+mod engines;
 #[path = "common/net.rs"]
 mod net;
 
 use std::{
     io::Write,
-    net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
 use axum::{routing::get, Router};
+use engines::{cpu_seconds, eventually, mock_engine};
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
-    controller::{Config, Controller, Listener, Scope},
+    controller::{Config, Controller, Election, Listener, Scope},
     ingest::{
         loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
         probe::EngineProbe,
@@ -38,33 +40,6 @@ const METRICS_TEXT: &str = "# HELP vllm:num_requests_running Requests running.\n
                             vllm:num_requests_running{model_name=\"m\"} 3\n\
                             vllm:num_requests_waiting{model_name=\"m\"} 5\n\
                             vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
-
-/// A mock gRPC engine of the vLLM wire with `ranks` data-parallel ranks,
-/// served until the returned sender drops. Returns its address.
-async fn mock_engine(ranks: u16) -> Result<(SocketAddr, oneshot::Sender<()>), std::io::Error> {
-    let listener = TcpListener::bind(loopback()).await?;
-    let addr = listener.local_addr()?;
-    let cfg = Arc::new(mock_worker::config::Config {
-        grpc_base_port: addr.port(),
-        grpc_count: 1,
-        grpc_dp_size: ranks,
-        grpc_wire: mock_worker::config::SchedulerWire::Vllm,
-        loads_like: mock_worker::engine::LoadsLike::Vllm,
-        realistic: true,
-        ..mock_worker::config::Config::default()
-    });
-    let (stop, stopped) = oneshot::channel();
-    let mut served = JoinSet::new();
-    served.spawn(mock_worker::grpc::serve_with_listener_until(
-        cfg,
-        listener,
-        async move {
-            let _ = stopped.await;
-        },
-    ));
-    served.detach_all();
-    Ok((addr, stop))
-}
 
 /// An HTTP server answering `/metrics` with `body`, served until the
 /// returned sender drops. Returns its base URL.
@@ -119,18 +94,6 @@ fn ready(
     let revision = store.get(id)?.revision;
     store.set_status(id, WorkerStatus::Ready, revision);
     Some(id)
-}
-
-/// Waits until `check` passes or `within` runs out.
-async fn eventually(within: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if check() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    check()
 }
 
 #[tokio::test]
@@ -363,6 +326,7 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         // Long enough that the counter below reads the first poll alone,
         // however slow the host; the first tick polls at once.
         load_poll_interval: Duration::from_secs(10),
+        election: Election::default(),
     })
     .await
     .expect("the controller binds");
@@ -424,21 +388,6 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         .expect("the serve task")
         .expect("no panic")
         .expect("the serve ends clean");
-}
-
-/// CPU seconds of this process (user + system), from `/proc/self/stat`.
-fn cpu_seconds() -> f64 {
-    let ticks = std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|stat| {
-            let after = stat.rsplit_once(')')?.1;
-            let fields: Vec<&str> = after.split_whitespace().collect();
-            let utime: f64 = fields.get(11)?.parse().ok()?;
-            let stime: f64 = fields.get(12)?.parse().ok()?;
-            Some(utime + stime)
-        })
-        .unwrap_or(0.0);
-    ticks / 100.0
 }
 
 /// The Numbers cell: the driver alone against `SMG_LOAD_BED_ENGINES` mock

@@ -128,22 +128,11 @@ impl Breaker {
 /// a p99 past it is slow. The p99 of a window is its second-slowest sample,
 /// so one outlier does not open the breaker, and a window that read slow is
 /// forgotten, so it does not open it twice.
-///
-/// The ring also says whether its thread reads its CPU clock at the start
-/// and the end of the plugin's calls ([`Latency::arm`]): the sample of a
-/// late call no reading covers is the time the call took, which a hold of
-/// the host makes slow, so the ring that is about to take one is armed until
-/// that sample has left it, and at most one of them is ever in a window. A
-/// call that runs out under a decision's remainder arms it too where the
-/// two ends of the time nothing read part: by the time the plugin's unread
-/// calls took the run-out is its own, by their fuel it is not.
 #[derive(Debug)]
 pub(crate) struct Latency {
     ring: [u32; Self::SAMPLES],
     next: usize,
     filled: usize,
-    /// The samples the ring still takes armed.
-    armed: usize,
 }
 
 impl Latency {
@@ -157,37 +146,37 @@ impl Latency {
             ring: [0; Self::SAMPLES],
             next: 0,
             filled: 0,
-            armed: 0,
         }
     }
 
-    /// Arms the ring's thread for the ring's length in samples: the sample
-    /// of the decision in flight and the [`Latency::SAMPLES`] - 1 after it.
-    /// The sample that follows those overwrites this decision's.
-    pub(crate) fn arm(&mut self) {
-        self.armed = Self::SAMPLES;
-    }
-
-    /// Whether the thread reads its CPU clock at the start and the end of a
-    /// call.
-    pub(crate) fn armed(&self) -> bool {
-        self.armed != 0
-    }
-
-    /// Records one call of `micros` under a frame of `frame_micros` (a call
-    /// without a frame is not a sample); `true` when this call completed a
-    /// window and the window reads slow, which forgets the window.
-    pub(crate) fn record(&mut self, micros: u32, frame_micros: u32) -> bool {
+    /// What a sample is: a charge of `micros` as a share of a frame of
+    /// `frame_micros`, in the ring's unit. A call without a frame is none.
+    /// Whoever asks whether a call is a sample asks here.
+    pub(crate) fn share(micros: u32, frame_micros: u32) -> Option<u32> {
         if frame_micros == 0 {
-            return false;
+            return None;
         }
         let share = u64::from(micros) * u64::from(Self::FRAME) / u64::from(frame_micros);
-        self.ring[self.next] = u32::try_from(share).unwrap_or(u32::MAX);
+        Some(u32::try_from(share).unwrap_or(u32::MAX))
+    }
+
+    /// How many of the two marks a read holds a window to a sample of
+    /// `share` is past: half the frame, where the median reads slow, and
+    /// the frame, where the tail does.
+    pub(crate) fn marks(share: u32) -> u8 {
+        u8::from(share > Self::FRAME / 2) + u8::from(share > Self::FRAME)
+    }
+
+    /// Records one call of `micros` under a frame of `frame_micros`, when
+    /// it is a sample ([`Latency::share`]); `true` when this call completed
+    /// a window and the window reads slow, which forgets the window.
+    pub(crate) fn record(&mut self, micros: u32, frame_micros: u32) -> bool {
+        let Some(share) = Self::share(micros, frame_micros) else {
+            return false;
+        };
+        self.ring[self.next] = share;
         self.next = (self.next + 1) % Self::SAMPLES;
         self.filled = (self.filled + 1).min(Self::SAMPLES);
-        // The arm falls by one where a sample is written, so it is counted
-        // in the ring's own unit.
-        self.armed = self.armed.saturating_sub(1);
         if !self.next.is_multiple_of(Self::EVERY) || self.filled < 2 {
             return false;
         }
@@ -199,7 +188,7 @@ impl Latency {
         // is the window's second-slowest call, so one outlier is not it.
         let p50 = window[(self.filled.div_ceil(2)).saturating_sub(1)];
         let p99 = window[self.filled - 2];
-        let slow = p50 > Self::FRAME / 2 || p99 > Self::FRAME;
+        let slow = Self::marks(p50) >= 1 || Self::marks(p99) == 2;
         if slow {
             self.next = 0;
             self.filled = 0;
@@ -213,7 +202,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{Breaker, Latency};
-    use crate::wasm::config::BreakerSpec;
+    use crate::plugins::config::BreakerSpec;
 
     fn spec() -> BreakerSpec {
         BreakerSpec {
@@ -505,6 +494,17 @@ mod tests {
             "one call past the frame is not the p99 of the ring"
         );
 
+        let mut at_the_frame = Latency::new();
+        let mut tripped = false;
+        for i in 0..Latency::SAMPLES {
+            let micros = if i == 5 || i == 9 { 100 } else { 10 };
+            tripped |= at_the_frame.record(micros, 100);
+        }
+        assert!(
+            !tripped,
+            "two calls at the frame, past its half, are not a slow p99"
+        );
+
         let mut tail = Latency::new();
         let mut tripped = false;
         for i in 0..Latency::SAMPLES {
@@ -530,52 +530,5 @@ mod tests {
 
         let mut unbudgeted = Latency::new();
         assert!(!(0..Latency::SAMPLES).any(|_| unbudgeted.record(1_000, 0)));
-    }
-
-    /// An armed ring stays armed for its own length in samples and no
-    /// longer: through the sample of the decision that armed it and the 127
-    /// after it, so the next sample a late call can leave unread overwrites
-    /// the first one's. A decision that records nothing does not count.
-    #[test]
-    fn an_armed_ring_stays_armed_for_its_length_in_samples() {
-        let mut ring = Latency::new();
-        assert!(!ring.armed(), "a new ring is not armed");
-        ring.arm();
-        for sample in 0..Latency::SAMPLES - 1 {
-            assert!(ring.armed(), "armed before sample {sample}");
-            assert!(!ring.record(10, 0), "no frame: not a sample");
-            assert!(
-                ring.armed(),
-                "a decision that records nothing does not count"
-            );
-            ring.record(10, 100);
-        }
-        assert!(
-            ring.armed(),
-            "the call 127 samples after the first is still read"
-        );
-        ring.record(10, 100);
-        assert!(!ring.armed(), "the arm fell with the ring's length");
-    }
-
-    /// One slow sample a window is never its p99. A ring armed by each late
-    /// call no reading covers takes such a sample once a length at most, so
-    /// those samples alone never read slow.
-    #[test]
-    fn one_unread_sample_a_ring_length_never_reads_slow() {
-        let mut ring = Latency::new();
-        let mut tripped = false;
-        for round in 0..4 {
-            assert!(!ring.armed(), "round {round}: the last arm has fallen");
-            // The unread call's decision: its sample is the time the call
-            // took, five hundred times its budget. It arms the ring.
-            ring.arm();
-            tripped |= ring.record(50_000, 100);
-            // Armed, a late call is read: its sample is the plugin's own.
-            for _ in 1..Latency::SAMPLES {
-                tripped |= ring.record(10, 100);
-            }
-        }
-        assert!(!tripped, "one slow sample in every window of the ring");
     }
 }

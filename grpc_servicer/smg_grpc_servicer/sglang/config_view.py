@@ -59,6 +59,7 @@ class ServerArgsSection:
     attn_cp_size: int | None
     kv_events_config: Any
     disaggregation_mode: str
+    load_balance_method: str
     language_only: bool
     encoder_only: bool
 
@@ -81,6 +82,7 @@ class ServerArgsSection:
             attn_cp_size=positive_int(getattr(server_args, "attn_cp_size", None)),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
+            load_balance_method=str(getattr(server_args, "load_balance_method", None) or ""),
             language_only=bool(getattr(server_args, "language_only", False)),
             encoder_only=bool(getattr(server_args, "encoder_only", False)),
         )

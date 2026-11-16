@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use llm_tokenizer::TokenizerRegistry;
+use llm_tokenizer::{traits::Tokenizer, TokenizerRegistry};
+use openai_protocol::worker::MmProcessingMode;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::{vllm_proto, VllmEngineClient};
 use tokio::task::JoinHandle;
@@ -17,6 +18,7 @@ use crate::{
         client::GrpcClient,
         common::stages::helpers::{IdStamp, SamplingBaseline, ToolConstraintStamp},
         context::{AttemptStamp, ExecutionPlan, SharedComponents},
+        multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
         proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
         regular::symphony::template::Templates,
         test_engine::mock_engine,
@@ -54,6 +56,46 @@ pub(crate) fn components() -> Arc<SharedComponents> {
         Arc::new(WorkerRegistry::new()),
         ParserChoice::Symphony,
     )
+}
+
+/// The components of a gateway whose workers process the media of `model`,
+/// a model without a media spec: `tokenizer` registered for it over a text
+/// family's config, in the directory handed back for the test to keep.
+pub(crate) async fn components_forwarding_media_of(
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+) -> (tempfile::TempDir, Arc<SharedComponents>) {
+    let dir = tempfile::tempdir().expect("a config directory");
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type": "llama", "architectures": ["LlamaForCausalLM"]}"#,
+    )
+    .expect("write the config");
+    let source = dir.path().to_str().expect("a utf-8 path");
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+    tokenizer_registry
+        .load(model, model, source, || async move { Ok(tokenizer) })
+        .await
+        .expect("register the tokenizer");
+    let mut multimodal = MultimodalComponents::new(
+        Arc::new(MultimodalConfigRegistry::new()),
+        None,
+        None,
+        &MultimodalSettings::default(),
+    )
+    .expect("multimodal components");
+    multimodal.processing = MmProcessingMode::Worker;
+    let components = Arc::into_inner(components_over(
+        tokenizer_registry,
+        Arc::new(WorkerRegistry::new()),
+        ParserChoice::Legacy,
+    ))
+    .expect("the only handle");
+    let components = SharedComponents {
+        multimodal: Some(Arc::new(multimodal)),
+        ..components
+    };
+    (dir, Arc::new(components))
 }
 
 /// A builder client connected to a mock engine serving `model_id`, with the

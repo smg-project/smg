@@ -366,6 +366,7 @@ mod tests {
             label: server_name.to_string(),
             server_key: server_name.to_string(),
             allowed_tools: None,
+            list_error: None,
         }]
     }
 

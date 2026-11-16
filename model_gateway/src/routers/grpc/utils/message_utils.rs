@@ -341,6 +341,7 @@ pub(crate) async fn resolve_messages_media(
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
     record_media: bool,
+    has_tools: bool,
 ) -> Result<ResolvedMedia, Response> {
     resolve_media(
         components,
@@ -349,6 +350,7 @@ pub(crate) async fn resolve_messages_media(
         "resolve_messages_media",
         || multimodal::media_plan_messages(messages),
         record_media,
+        has_tools,
     )
     .await
 }
@@ -362,7 +364,10 @@ pub(crate) async fn resolve_messages_media(
 /// recorded all the same. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
 /// refuse a request alike; `stage` names the caller in the log lines, as
-/// each caller's own lines named it before.
+/// each caller's own lines named it before. `has_tools` picks the template
+/// the request renders through, as its renderer picks it: media of a model
+/// without a media spec is refused here when that template takes one string
+/// per message.
 pub(crate) async fn resolve_media(
     components: &SharedComponents,
     model_id: &str,
@@ -370,6 +375,7 @@ pub(crate) async fn resolve_media(
     stage: &'static str,
     plan: impl FnOnce() -> MediaPlan,
     record_media: bool,
+    has_tools: bool,
 ) -> Result<ResolvedMedia, Response> {
     // What a generation request carries, counted once and before any
     // refusal or limit (a refused request's media included); a token count
@@ -475,6 +481,30 @@ pub(crate) async fn resolve_media(
         );
         multimodal::config_unavailable_response(&e).unwrap_or_else(|| invalid_multimodal_request(e))
     })?;
+    // A model without a media spec is served where its template takes
+    // content parts and writes the engine's own placeholders. A template
+    // that takes one string per message leaves the anchors to the gateway,
+    // which knows none for this model: rendered, the prompt would carry no
+    // anchor for media the worker is still handed.
+    if placeholders.is_worker_only()
+        && tokenizer.chat_template_content_format_for_request(has_tools)
+            == ChatTemplateContentFormat::String
+    {
+        let modalities = plan
+            .modalities()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(error::bad_request(
+            "multimodal_not_supported",
+            format!(
+                "{modalities} input is not supported by model '{model_id}': its chat template \
+                 takes text content only and the gateway writes no media placeholder for this \
+                 model"
+            ),
+        ));
+    }
     // The media-part order comes from the model registry so every path
     // renders a model consistently. It is looked up after the placeholders,
     // whose preparation resolved the model's configs and cached them, so the
@@ -707,7 +737,7 @@ fn convert_user_message(
                     content_format,
                     placeholder_tokens,
                     media_order,
-                );
+                )?;
                 result.push(json!({"role": "user", "content": content}));
             }
             result.extend(tool_msgs);
@@ -894,28 +924,40 @@ fn format_content_parts(
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Value {
-    let image_placeholder = placeholder_tokens.and_then(|tokens| tokens.get(Modality::Image));
+) -> Result<Value, String> {
     match content_format {
         ChatTemplateContentFormat::String => {
             let ordered = order_media_parts(parts, media_order);
-            // Extract text parts; optionally replace image parts with placeholders
+            // Text parts as they are, an image part as its placeholder. An
+            // image the placeholders hold no token for is refused, as the
+            // chat renderer refuses it: left out, the prompt would carry no
+            // anchor for media that still travels with the request. A caller
+            // without model metadata passes no placeholders and its media
+            // parts are left out.
             let text: String = ordered
                 .iter()
                 .filter_map(|p| {
                     let obj = p.as_object()?;
                     let type_str = obj.get("type")?.as_str()?;
                     match type_str {
-                        "text" => obj.get("text")?.as_str().map(String::from),
-                        "image" => image_placeholder.map(String::from),
+                        "text" => obj.get("text")?.as_str().map(|text| Ok(String::from(text))),
+                        "image" => placeholder_tokens.map(|tokens| {
+                            tokens
+                                .get(Modality::Image)
+                                .map(String::from)
+                                .ok_or_else(|| {
+                                    "missing image placeholder for string-format chat template"
+                                        .to_owned()
+                                })
+                        }),
                         _ => None,
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, String>>()?
                 .join("\n");
-            Value::String(text)
+            Ok(Value::String(text))
         }
-        ChatTemplateContentFormat::OpenAI => Value::Array(parts),
+        ChatTemplateContentFormat::OpenAI => Ok(Value::Array(parts)),
     }
 }
 
@@ -1941,6 +1983,107 @@ mod tests {
             declaration < user && user < forbids,
             "declaration at {declaration}, user turn at {user}, instruction at {forbids}"
         );
+    }
+
+    /// The media resolution of one image for model "m", which has no media
+    /// spec, where a worker would process the media, through a template of
+    /// `format`.
+    async fn resolve_image_without_a_spec(
+        format: ChatTemplateContentFormat,
+    ) -> Result<ResolvedMedia, Response> {
+        use llm_tokenizer::mock::MockTokenizer;
+
+        use crate::routers::grpc::regular::stages::testing::components_forwarding_media_of;
+
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(MockTokenizer::new().with_content_format(format));
+        let (_dir, components) = components_forwarding_media_of("m", Arc::clone(&tokenizer)).await;
+        resolve_media(
+            &components,
+            "m",
+            &*tokenizer,
+            "test",
+            || {
+                MediaPlan::new([llm_multimodal::MediaContentPart::ImageUrl {
+                    url: "https://a/1.png".to_string().into(),
+                    detail: None,
+                    uuid: None,
+                    max_long_side_pixel: None,
+                }])
+            },
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// Media of a model without a media spec is refused before rendering
+    /// when its template takes one string per message, with the capability
+    /// code and a sentence naming the modality and the model: neither the
+    /// template nor the gateway would write an anchor for it. A template
+    /// that takes content parts writes the engine's own placeholders, and
+    /// the request goes on to a worker that processes its media.
+    #[tokio::test]
+    async fn media_nothing_would_anchor_is_refused_before_rendering() {
+        let Err(refused) = resolve_image_without_a_spec(ChatTemplateContentFormat::String).await
+        else {
+            panic!("an image that nothing would anchor in the prompt is refused");
+        };
+        assert_eq!(refused.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-smg-error-code")
+                .and_then(|code| code.to_str().ok()),
+            Some("multimodal_not_supported")
+        );
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "image input is not supported by model 'm': its chat template takes text content \
+             only and the gateway writes no media placeholder for this model"
+        );
+
+        let Ok(served) = resolve_image_without_a_spec(ChatTemplateContentFormat::OpenAI).await
+        else {
+            panic!("a template that takes content parts writes the anchor itself");
+        };
+        assert!(served
+            .placeholders()
+            .is_some_and(PlaceholderTokens::is_worker_only));
+    }
+
+    /// An image block the string format has no placeholder to write for is
+    /// refused, as the chat renderer refuses it, never dropped from a prompt
+    /// whose media still travels. A caller without model metadata passes no
+    /// placeholders, and its media parts are left out as before.
+    #[test]
+    fn an_image_block_with_no_placeholder_is_refused_not_dropped() {
+        let messages: Vec<InputMessage> = serde_json::from_value(json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "question"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]
+        }]))
+        .unwrap();
+        let render = |placeholders: Option<&PlaceholderTokens>| {
+            process_message_content_format(
+                &messages,
+                ChatTemplateContentFormat::String,
+                placeholders,
+                MediaPartOrder::MediaFirst,
+            )
+        };
+
+        assert_eq!(
+            render(Some(&PlaceholderTokens::worker_only())).unwrap_err(),
+            "missing image placeholder for string-format chat template"
+        );
+        assert_eq!(render(None).unwrap()[0]["content"], "question");
     }
 
     /// With a string-format template an image is the placeholder the model's

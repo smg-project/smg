@@ -142,6 +142,11 @@ pub struct ToolEntry {
     pub arg_mapping: Option<ArgMapping>,
     pub cached_at: Instant,
     pub ttl: Option<Duration>,
+    /// The tool's position in its server's listing (`tools/list` order): the
+    /// order the server's tools are listed and offered in. `None` for an
+    /// entry made otherwise than by a listing; such an entry sorts after
+    /// the listed ones.
+    pub position: Option<usize>,
 }
 
 impl ToolEntry {
@@ -156,6 +161,7 @@ impl ToolEntry {
             arg_mapping: None,
             cached_at: Instant::now(),
             ttl: None,
+            position: None,
         }
     }
 
@@ -198,6 +204,12 @@ impl ToolEntry {
     #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
+        self
+    }
+
+    #[must_use]
+    pub fn with_position(mut self, position: usize) -> Self {
+        self.position = Some(position);
         self
     }
 

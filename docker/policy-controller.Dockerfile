@@ -78,8 +78,9 @@ COPY --from=local_src /src /opt/smg
 # the package's name and answers `--version`). The features are named with
 # the crate, so the one line builds either: the listeners, the WebAssembly
 # plugin host the crate turns on by default, and the Kubernetes Lease
-# elector. The stock binary compiles both in and runs neither yet: they are
-# there for a controller of your own that does.
+# elector. The stock binary elects its leader over a Lease when a flag names
+# one; the plugin host is compiled in for a controller of your own that runs
+# it.
 ARG PACKAGE=smg-policy-controller
 # A cross build names its Rust target, and cargo then writes the binary under
 # that name.

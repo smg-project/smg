@@ -128,6 +128,7 @@ use crate::{
     observability::{cache_trace, metrics::Metrics},
     worker::{
         health::liveness,
+        identity::endpoint::Endpoint,
         load::state::{LoadReceiver, LoadSnapshot},
         KvEventMonitor, KvIndex, Worker,
     },
@@ -931,7 +932,7 @@ impl CacheAwarePolicy {
 
         debug!(
             branch = "kv_pressure_expected_wait",
-            worker = worker_url,
+            worker = workers[selected].redacted_url(),
             model_id,
             "Cache-aware selection"
         );
@@ -1518,7 +1519,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if released > 0 {
             Metrics::record_policy_inflight_reconciled(self.name(), released);
             debug!(
-                worker = worker_url,
+                worker = Endpoint::redacted_url(worker_url).as_str(),
                 in_flight, released, "Released bookings whose completion never arrived"
             );
         }
@@ -1567,7 +1568,7 @@ impl CacheAwarePolicy {
             let eligible = info.admits(state);
             if cache_trace::enabled() && !eligible {
                 cache_trace::gate(serde_json::json!({
-                    "phase": "eligibility", "worker": worker.url(),
+                    "phase": "eligibility", "worker": worker.redacted_url(),
                     "load": state.load, "overloaded": state.overloaded,
                     "eligible": false,
                 }));
@@ -2083,7 +2084,7 @@ impl CacheAwarePolicy {
         let spill = self.over_count_pressure_gate(load, avg_load, held_tokens);
         if cache_trace::enabled() {
             cache_trace::gate(serde_json::json!({
-                "worker": workers[selected].url(), "load": load, "average_load": avg_load,
+                "worker": workers[selected].redacted_url(), "load": load, "average_load": avg_load,
                 "relative_threshold": self.config.balance_rel_threshold,
                 "absolute_threshold": self.config.balance_abs_threshold,
                 "held_tokens": held_tokens,
@@ -2500,8 +2501,10 @@ impl CacheAwarePolicy {
                 cache_trace::mark_truncated();
             }
             for candidate in inputs.iter().take(32) {
+                // The candidate's address stays whole for the policies that
+                // match on it; the row names the worker masked.
                 cache_trace::score(serde_json::json!({
-                    "source": "policy_affinity", "worker": candidate.url,
+                    "source": "policy_affinity", "worker": workers[candidate.idx].redacted_url(),
                     "device_blocks": candidate.device_blocks, "effective_score": candidate.effective_score,
                     "request_blocks": request.request_blocks, "block_size": request.block_size,
                     "selection_policy": self.selection.name(),
@@ -2630,7 +2633,7 @@ impl CacheAwarePolicy {
                     .iter()
                     .any(|tenant| tenant.as_ref() == workers[idx].url());
                 cache_trace::score(serde_json::json!({
-                    "source": "approximate_tree", "worker": workers[idx].url(),
+                    "source": "approximate_tree", "worker": workers[idx].redacted_url(),
                     "matched_units": holder.then_some(matched_units),
                     "match_status": if holder { "deepest_holder" } else { "shallower_match_unknown" },
                     "input_units": request.prompt_tokens, "block_size": self.config.block_size,
@@ -2757,7 +2760,7 @@ impl CacheAwarePolicy {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 observe(overlap_of(idx));
                 debug!(
-                    worker = workers[idx].url(),
+                    worker = workers[idx].redacted_url(),
                     branch = "warmup_slice",
                     request_blocks = content_hashes.len(),
                     "Cache miss routed to a warming worker"
@@ -2775,7 +2778,7 @@ impl CacheAwarePolicy {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
             observe(overlap_of(idx));
             debug!(
-                worker = workers[idx].url(),
+                worker = workers[idx].redacted_url(),
                 branch = "warmup_divert",
                 overlap_blocks = best_overlap as u64,
                 request_blocks = content_hashes.len(),
@@ -2808,7 +2811,7 @@ impl CacheAwarePolicy {
         Metrics::record_worker_cache_aware_policy_branch(branch);
         observe(overlap);
         debug!(
-            worker = workers[idx].url(),
+            worker = workers[idx].redacted_url(),
             branch,
             overlap_blocks,
             request_blocks = content_hashes.len(),
@@ -3217,7 +3220,11 @@ impl CacheAwarePolicy {
         debug!(
             index = "tree",
             branch,
-            worker = selected_url.or(fallback_url).unwrap_or("none"),
+            worker = selected_url
+                .or(fallback_url)
+                .map(Endpoint::redacted_url)
+                .as_deref()
+                .unwrap_or("none"),
             model_id,
             matched_ratio = f64::from(matched_ratio),
             threshold = f64::from(self.config.cache_threshold),
@@ -3229,7 +3236,8 @@ impl CacheAwarePolicy {
     }
 
     /// One decision line per hash-mode selection. `level` is the matched
-    /// boundary (0 for the fallback branches).
+    /// boundary (0 for the fallback branches), `worker` the selected worker's
+    /// masked address.
     fn log_hash_decision(branch: &'static str, level: usize, worker: &str, model_id: &str) {
         if cache_trace::enabled() {
             cache_trace::prediction(serde_json::json!({
@@ -3334,7 +3342,7 @@ impl CacheAwarePolicy {
                 workers[selected].url(),
                 now,
             );
-            Self::log_hash_decision(branch, boundary, workers[selected].url(), model_id);
+            Self::log_hash_decision(branch, boundary, workers[selected].redacted_url(), model_id);
             return Some(selected);
         }
 
@@ -3378,7 +3386,7 @@ impl CacheAwarePolicy {
                 now,
             );
         }
-        Self::log_hash_decision(branch, 0, workers[idx].url(), model_id);
+        Self::log_hash_decision(branch, 0, workers[idx].redacted_url(), model_id);
         Some(idx)
     }
 

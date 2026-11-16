@@ -495,6 +495,10 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// Keys not listed are treated as shared (replicated across all media items).
     /// The `"pixel_values"` key mirrors the reference processors' vision kwargs and should be
     /// included when the primary encoder input differs from batched layout.
+    ///
+    /// This is the legacy map, read only by the default of [`Self::encoder_field_layouts_for`]:
+    /// an entry that overrides that method, or declares hooks for every modality, need not
+    /// declare this map and keeps the default here, so a caller asks that method.
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // Default: encoder_input is batched (most models).
         HashMap::from([("pixel_values".to_string(), FieldLayout::Batched)])

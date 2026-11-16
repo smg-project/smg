@@ -361,7 +361,8 @@ fn install_crypto_provider() {
     }
 }
 
-/// The provider's HTTP client: a 10 s timeout and no redirects (SSRF).
+/// The provider's HTTP client: a 10 s timeout, no redirects (SSRF) and the
+/// provider's request headers.
 #[expect(
     clippy::disallowed_methods,
     reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
@@ -371,8 +372,23 @@ fn http_client() -> Result<reqwest::Client, JwksError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF via redirects
+        .default_headers(default_request_headers())
         .build()
         .map_err(|e| JwksError::HttpClientError(e.to_string()))
+}
+
+/// The headers the provider's client sends with every request: it names
+/// `identity` as the one content coding it accepts. The client is built
+/// without decoders, so a coded discovery document or key set would fail to
+/// parse; a server that honours the header never sends one (RFC 9110,
+/// section 12.5.3).
+fn default_request_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    headers
 }
 
 /// The response body, bounded by [`MAX_JWKS_RESPONSE_SIZE`] as it is read: a
@@ -1068,5 +1084,70 @@ mod tests {
             panic!("a document naming the issuer with a slash is not for the issuer without it");
         };
         assert!(matches!(err, JwksError::IssuerMismatch { .. }), "{err:?}");
+    }
+
+    /// The provider's client names `identity` as the content coding it
+    /// accepts, so a key-set server that compresses every request naming no
+    /// coding answers this one in the clear and the key is read. Without the
+    /// header the server sends a gzip body, which the client, built without
+    /// decoders, cannot parse.
+    #[tokio::test]
+    async fn the_client_names_identity_so_a_server_compressing_unasked_answers_in_the_clear() {
+        use axum::{
+            http::{
+                header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
+                HeaderMap,
+            },
+            response::{IntoResponse, Response},
+        };
+        // `{"keys":[]}` under gzip: what the server sends a request that names no coding.
+        const GZIPPED_KEY_SET: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xab, 0x56, 0xca, 0x4e,
+            0xad, 0x2c, 0x56, 0xb2, 0x8a, 0x8e, 0xad, 0x05, 0x00, 0xef, 0x67, 0x88, 0x2a, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        fn respond(headers: HeaderMap) -> Response {
+            let names_identity = headers
+                .get(ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+                });
+            if names_identity {
+                let (n, e) = rsa_components();
+                return Json(json!({ "keys": [
+                    { "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "k1", "n": n, "e": e }
+                ] }))
+                .into_response();
+            }
+            (
+                [
+                    (CONTENT_TYPE, "application/json"),
+                    (CONTENT_ENCODING, "gzip"),
+                ],
+                GZIPPED_KEY_SET,
+            )
+                .into_response()
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/jwks.json",
+            listener.local_addr().unwrap().port()
+        );
+        let app = Router::new().route(
+            "/jwks.json",
+            get(|headers: HeaderMap| async move { respond(headers) }),
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the server lives exactly as long as the test"
+        )]
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = JwksProvider::new(url, Duration::from_secs(3600)).unwrap();
+        let key = provider.get_key("k1").await.unwrap();
+        assert_eq!(key.jwk.common.key_id.as_deref(), Some("k1"));
     }
 }
