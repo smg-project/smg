@@ -82,16 +82,20 @@ fn spec(name: &str, component: Vec<u8>, mode: u8) -> PluginSpec {
 /// this deadline on the wall clock, whatever its thread had of the CPU.
 const INIT_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How many times a case makes what a hold of the runner can have moved: a
+/// load, a close's rebuild, a lazy `init`, a destructor's time, a window of
+/// short holds. A try whose witness says a hold reached it says so and is
+/// made again. No witness passes a run: the last try asserts whatever its
+/// witness says, so a host that fails by itself fails each try, and the
+/// case.
+const TRIES: u32 = 3;
+
 /// Loads `spec` and returns what the load said. Its `init` ends at a
 /// deadline on the wall clock, so a runner that holds the loading thread for
 /// the init frame has the host end an `init` that did nothing. Such a load
-/// is made again and says so, three loads at most: its thread was off the
-/// CPU half the frame. A guest that spends the frame itself has the CPU, and
-/// its load ends here as it did.
-#[expect(
-    clippy::print_stdout,
-    reason = "a run that loads again reports it on stdout under --nocapture"
-)]
+/// is made again, [`TRIES`] loads at most: its thread was off the CPU half
+/// the frame. A guest that spends the frame itself has the CPU, and its load
+/// ends here as it did.
 fn load_unheld(runtime: &Arc<Runtime>, spec: PluginSpec) -> Result<Arc<Plugin>, LoadError> {
     let mut loads = 0;
     loop {
@@ -102,10 +106,10 @@ fn load_unheld(runtime: &Arc<Runtime>, spec: PluginSpec) -> Result<Arc<Plugin>, 
             &load,
             Err(LoadError::Trap { reason, .. }) if reason.ends_with("wasm trap: interrupt")
         ) && off_cpu_since(wall, cpu) >= INIT_FRAME / 2;
-        if !held || loads == 3 {
+        if !held || loads == TRIES {
             return load;
         }
-        println!("a load: made again in this run: its thread was off the CPU half the init frame");
+        made_again("a load", "its thread was off the CPU half the init frame");
     }
 }
 
@@ -694,19 +698,25 @@ fn an_invalid_answer_is_a_fault_of_the_plugin() {
         (mode::PICK_FILTERED_OUT, "filtered out"),
     ];
     for (mode, name) in cases {
-        let plugin = load(&runtime, name, guest::record_guest(), mode);
-        let engine = plugin_engine(&plugin);
-        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
-        let decision = decide(&engine, &pool(4), 1);
-        let held = off_cpu_since(wall, cpu);
-        assert!(
-            matches!(decision, Decision::Pick(_)),
-            "{name}: the fallbacks decide"
-        );
-        let stats = plugin.stats();
-        assert_eq!(stats.invalid, 1, "{name}");
-        if the_close_rebuilt(name, &plugin, held) {
-            assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
+        let case = format!("an invalid answer, {name}");
+        let mut made = 0;
+        loop {
+            made += 1;
+            let plugin = load(&runtime, name, guest::record_guest(), mode);
+            let engine = plugin_engine(&plugin);
+            let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+            let decision = decide(&engine, &pool(4), 1);
+            let held = off_cpu_since(wall, cpu);
+            assert!(
+                matches!(decision, Decision::Pick(_)),
+                "{name}: the fallbacks decide"
+            );
+            let stats = plugin.stats();
+            assert_eq!(stats.invalid, 1, "{name}");
+            if the_close_rebuilt(&case, &plugin, held, made) {
+                assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
+                break;
+            }
         }
     }
 }
@@ -3017,9 +3027,7 @@ fn a_score_the_host_held_that_then_traps_is_the_plugins_failure_and_no_stall() {
             &Constraints::default(),
             &mut Scratch::new(),
         );
-        let off_the_cpu = wall
-            .elapsed()
-            .saturating_sub(bound_clock().saturating_sub(cpu));
+        let off_the_cpu = off_cpu_since(wall, cpu);
         assert!(
             matches!(decision, Decision::Pick(_)),
             "decision {seed}: the fallbacks decide"
@@ -3341,12 +3349,14 @@ fn a_score_the_host_held_that_then_declines_is_a_decline_and_the_hosts_stall() {
 /// `arm`, the first is held past the frame instead: unread, it arms the
 /// thread. Returns the plugin and the case's two witnesses. The thread's own
 /// clock across each decision says none had a quarter of the budget on the
-/// CPU. The wall clock says whether the window's faults are the runner's:
-/// each fell in a decision held short that took its hold and half of what
-/// the hold leaves of the budget, where the calls after the score run out
-/// under what is left.
+/// CPU. The same clock says whether the window's faults are the runner's:
+/// each fell in a decision held short whose thread was off the CPU for its
+/// hold and half of what the hold leaves of the budget, where the calls
+/// after the score run out under what is left. The case's hold is off the
+/// CPU and a decision's own work is not: a call that work ends is the
+/// host's fault, however long its decision took.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
+fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
     let runtime = runtime();
     let mut held = spec(name, guest::record_guest(), mode::LOG_IN_SCORE);
     // Every score's log line reaches the host's subscriber, where the case
@@ -3364,9 +3374,9 @@ fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
         hold(name, short, 64);
     }
     // What a short hold leaves of the budget bounds the calls after the
-    // score. A decision that took its hold and half of that again was held
-    // by the runner too, and a call that runs out in it ran out under what
-    // the runner left.
+    // score. A decision whose thread was off the CPU for its hold and half
+    // of that again was held by the runner too, and a call that runs out in
+    // it ran out under what the runner left.
     let late = short + (frame - short) / 2;
     let faults = || {
         let stats = plugin.stats();
@@ -3383,11 +3393,11 @@ fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
             &Constraints::default(),
             &mut Scratch::new(),
         );
-        let took = wall.elapsed();
+        let off_the_cpu = off_cpu_since(wall, cpu);
         cheap &= bound_clock().saturating_sub(cpu) < frame / 4;
         assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
         if faults() != before {
-            if (arm && seed == 0) || took < late {
+            if (arm && seed == 0) || off_the_cpu < late {
                 by_the_host += 1;
             } else {
                 by_the_runner += 1;
@@ -3397,11 +3407,30 @@ fn a_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
     (plugin, cheap, by_the_runner > 0 && by_the_host == 0)
 }
 
-/// What a run of a window of short holds says when its faults are the
-/// runner's: its counts are not the case's to assert.
+/// What a window of short holds says when its faults are the runner's: it
+/// is made again.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const A_HOLD_REACHED_A_PICK: &str =
-    "a call ran out in a decision that took its short hold and half of what the hold leaves of the budget";
+    "a call ran out in a decision whose thread was off the CPU for its short hold and half of what the hold leaves of the budget";
+
+/// [`one_window_of_short_holds`], made again while its faults are the
+/// runner's, [`TRIES`] windows at most, each under a plugin name of its own
+/// (a hold is kept by name). Returns the last window's plugin and its
+/// witness on the CPU: a case asserts that window's counts, whatever its
+/// faults were.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn a_window_of_short_holds(case: &str, name: &str, arm: bool) -> (Arc<Plugin>, bool) {
+    let mut made = 0;
+    loop {
+        made += 1;
+        let (plugin, cheap, by_the_runner) =
+            one_window_of_short_holds(&format!("{name}-{made}"), arm);
+        if !by_the_runner || made == TRIES {
+            return (plugin, cheap);
+        }
+        made_again(case, A_HOLD_REACHED_A_PICK);
+    }
+}
 
 /// A reading gives a call one time, late or not. On an armed thread a score
 /// the host holds for six tenths of the decision's budget is short of late,
@@ -3416,19 +3445,16 @@ const A_HOLD_REACHED_A_PICK: &str =
 /// process is off the CPU by the thread's own clock, but one that lands
 /// inside the case's own hold makes that sleep end on the CPU: the clock
 /// moves by about the hold, and that time is the call's by any reading.
-/// A call that runs out is the host's fault unless the wall clock says its
-/// decision took its short hold and half of what the hold leaves of the
-/// budget: a hold of the runner's own past that reaches the remainder the
-/// later calls run under. A run whose faults all fell there says so and
-/// asserts no count.
+/// A call that runs out is the host's fault unless its decision's thread
+/// was off the CPU for its short hold and half of what the hold leaves of
+/// the budget: a hold of the runner's own past that reaches the remainder
+/// the later calls run under. A window whose faults all fell there says so
+/// and is made again, [`TRIES`] windows at most.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
-    let (plugin, cheap, by_the_runner) = a_window_of_short_holds("held-short", true);
-    if by_the_runner {
-        excused("a window of holds short of late", A_HOLD_REACHED_A_PICK);
-        return;
-    }
+    let (plugin, cheap) =
+        a_window_of_short_holds("a window of holds short of late", "held-short", true);
     let stats = plugin.stats();
     assert_eq!(
         (stats.fuel_exhausted, stats.traps, stats.instantiations),
@@ -3468,19 +3494,16 @@ fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
 /// sixty-four read slow and the window opened at its first read. A guest
 /// slow by itself is slow by those readings and opens all the same (the
 /// case of the guest slow in what fuel does not price). That the breaker
-/// stays shut is asserted under the armed case's witness, and the counts
-/// unless its wall clock says the window's faults are the runner's.
+/// stays shut is asserted under the armed case's witness. A window whose
+/// faults are the runner's by the same reading is made again.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_window_of_holds_short_of_late_on_a_thread_nothing_armed_is_one_slow_sample() {
-    let (plugin, cheap, by_the_runner) = a_window_of_short_holds("held-quiet", false);
-    if by_the_runner {
-        excused(
-            "a window of holds short of late on a thread nothing armed",
-            A_HOLD_REACHED_A_PICK,
-        );
-        return;
-    }
+    let (plugin, cheap) = a_window_of_short_holds(
+        "a window of holds short of late on a thread nothing armed",
+        "held-quiet",
+        false,
+    );
     let stats = plugin.stats();
     assert_eq!(
         (stats.fuel_exhausted, stats.traps, stats.instantiations),
@@ -3786,9 +3809,7 @@ fn a_guest_slow_in_what_fuel_does_not_price_is_opened_by_its_samples_at_the_firs
             &Constraints::default(),
             &mut Scratch::new(),
         );
-        let off_the_cpu = wall
-            .elapsed()
-            .saturating_sub(bound_clock().saturating_sub(cpu));
+        let off_the_cpu = off_cpu_since(wall, cpu);
         on_the_cpu &= off_the_cpu < hold;
         assert!(
             matches!(decision, Decision::Pick(_)),
@@ -3929,41 +3950,96 @@ fn measure_rss_per_kept_instance_and_cpu_per_decision() {
     );
 }
 
-/// How many times each of the process's epoch ticker threads has had the
-/// CPU, by thread, from `/proc`: once a tick while a call is in flight.
-/// Empty where the host does not say.
-fn ticker_runs() -> Vec<(std::ffi::OsString, u64)> {
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
-        return Vec::new();
-    };
-    tasks
-        .flatten()
-        .filter_map(|task| {
-            let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
-            if comm.trim() != "wasm-epoch" {
-                return None;
-            }
-            let schedstat = std::fs::read_to_string(task.path().join("schedstat")).ok()?;
-            let runs = schedstat.split_whitespace().nth(2)?.parse::<u64>().ok()?;
-            Some((task.file_name(), runs))
+/// The ids of the process's threads, from `/proc`. Empty where the host
+/// does not say.
+fn threads() -> Vec<std::ffi::OsString> {
+    std::fs::read_dir("/proc/self/task")
+        .map(|tasks| tasks.flatten().map(|task| task.file_name()).collect())
+        .unwrap_or_default()
+}
+
+/// A runtime, and the threads born while it was made: its epoch ticker is
+/// one of them. A case beside this one can make a runtime in the same
+/// moment, so this one is made again, eight times at most, until no second
+/// ticker was born with it.
+fn runtime_and_the_threads_born_with_it() -> (Arc<Runtime>, Vec<std::ffi::OsString>) {
+    let mut made = 0;
+    loop {
+        made += 1;
+        let before = threads();
+        let runtime = runtime();
+        // A thread names itself as it starts.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let born: Vec<_> = threads()
+            .into_iter()
+            .filter(|thread| !before.contains(thread))
+            .collect();
+        if ticker_waits(&born).len() <= 1 || made == 8 {
+            return (runtime, born);
+        }
+    }
+}
+
+/// The `/proc` directory of `thread` where it is an epoch ticker.
+fn ticker_task(thread: &std::ffi::OsString) -> Option<std::path::PathBuf> {
+    let task = std::path::Path::new("/proc/self/task").join(thread);
+    let comm = std::fs::read_to_string(task.join("comm")).ok()?;
+    (comm.trim() == "wasm-epoch").then_some(task)
+}
+
+/// How long each epoch ticker among `threads` has waited on a runqueue, in
+/// nanoseconds, by thread from `/proc`: runnable, and kept from the CPU. A
+/// ticker that sleeps or is parked waits on none.
+fn ticker_waits(threads: &[std::ffi::OsString]) -> Vec<(std::ffi::OsString, u64)> {
+    threads
+        .iter()
+        .filter_map(|thread| {
+            let schedstat = std::fs::read_to_string(ticker_task(thread)?.join("schedstat")).ok()?;
+            let waited = schedstat.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+            Some((thread.clone(), waited))
         })
         .collect()
 }
 
-/// The most times any one of the process's ticker threads had the CPU since
-/// `before` was read: the case's own ticker ticked no more often than that.
-/// `None` where the host does not say.
-fn most_ticker_runs_since(before: &[(std::ffi::OsString, u64)]) -> Option<u64> {
-    ticker_runs()
+/// Waits, a second at most, until no epoch ticker among `threads` is
+/// runnable. The kernel adds what a thread waited on a runqueue when the
+/// thread next has the CPU, so a ticker still waiting reads short. With no
+/// call in flight a ticker parks as soon as it has the CPU.
+fn tickers_at_rest(threads: &[std::ffi::OsString]) {
+    for _ in 0..1_000 {
+        let runnable = threads.iter().filter_map(ticker_task).any(|task| {
+            std::fs::read_to_string(task.join("stat")).is_ok_and(|stat| {
+                stat.rsplit(") ")
+                    .next()
+                    .is_some_and(|rest| rest.starts_with('R'))
+            })
+        });
+        if !runnable {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The least any epoch ticker among `threads` waited on a runqueue since
+/// `before` was read, read once the tickers are at rest. The case's own
+/// ticker is one of them: it waited no less. `None` where the host does not
+/// say.
+fn least_ticker_wait_since(
+    before: &[(std::ffi::OsString, u64)],
+    threads: &[std::ffi::OsString],
+) -> Option<std::time::Duration> {
+    tickers_at_rest(threads);
+    ticker_waits(threads)
         .into_iter()
-        .map(|(thread, runs)| {
+        .map(|(thread, waited)| {
             let earlier = before
                 .iter()
                 .find(|(known, _)| *known == thread)
                 .map_or(0, |(_, earlier)| *earlier);
-            runs.saturating_sub(earlier)
+            std::time::Duration::from_nanos(waited.saturating_sub(earlier))
         })
-        .max()
+        .min()
 }
 
 /// The CPU ticks (user and system, at 100 per second) of the runtime's epoch
@@ -4005,14 +4081,16 @@ fn off_cpu_since(wall: std::time::Instant, cpu: std::time::Duration) -> std::tim
         .saturating_sub(bound_clock().saturating_sub(cpu))
 }
 
-/// Whether the close rebuilt the instance a fault dropped, in a run that
-/// can say. The rebuild is an `init`, on the wall clock: a runner that kept
-/// the decision's thread off the CPU half the init frame (`held`, read over
-/// the decision) can have ended it, and that run says so and asserts no
-/// rebuild. A rebuild that fails with its thread on the CPU is the host's.
-fn the_close_rebuilt(case: &str, plugin: &Plugin, held: std::time::Duration) -> bool {
-    if !plugin.is_warm() && held >= INIT_FRAME / 2 {
-        excused(
+/// Whether the close rebuilt the instance a fault dropped: asserted, unless
+/// the decision is to be made again. The rebuild is an `init`, on the wall
+/// clock: a runner that kept the decision's thread off the CPU half the init
+/// frame (`held`, read over the decision) can have ended it. Such a decision
+/// says so and is made again, [`TRIES`] at most (`made` counts them). A
+/// rebuild that fails with its thread on the CPU is the host's, and so is
+/// one that fails in the last try.
+fn the_close_rebuilt(case: &str, plugin: &Plugin, held: std::time::Duration, made: u32) -> bool {
+    if !plugin.is_warm() && held >= INIT_FRAME / 2 && made < TRIES {
+        made_again(
             case,
             "the decision's thread was off the CPU half the init frame, the bound of the close's rebuild",
         );
@@ -4032,10 +4110,7 @@ fn decide_on_the_cpu(decide: impl FnOnce() -> Decision) -> (Decision, bool) {
     let hold = std::time::Duration::from_micros(u64::from(FRAME_MICROS) / 4);
     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
     let decision = decide();
-    let off_the_cpu = wall
-        .elapsed()
-        .saturating_sub(bound_clock().saturating_sub(cpu));
-    (decision, off_the_cpu < hold)
+    (decision, off_cpu_since(wall, cpu) < hold)
 }
 
 /// Decides until `plugin`'s breaker has opened; says how many decisions that
@@ -4080,6 +4155,17 @@ fn decide_until_open(plugin: &Plugin, decide: impl Fn(u64) -> Decision) -> (u64,
 )]
 fn excused(case: &str, why: &str) {
     println!("{case}: a count is not asserted in this run: {why}");
+}
+
+/// A try a hold of the runner can have ended says so: the one line of a try
+/// that asserts nothing and is made again (read under `--nocapture`), so a
+/// row of runs can say in how many a hold reached the case.
+#[expect(
+    clippy::print_stdout,
+    reason = "a try that is made again reports it on stdout under --nocapture"
+)]
+fn made_again(case: &str, why: &str) {
+    println!("{case}: made again in this run: {why}");
 }
 
 /// A run its host put in another lawful world says so: the one line of a
@@ -4591,49 +4677,58 @@ fn a_lazy_init_that_fails_long_on_the_clock_is_the_decisions_budget_spent_too() 
 /// frame, which is the whole of a 100 ms decision. One failure on the breaker
 /// (the frame it ran out under was its own), and the neighbour's open finds
 /// the remainder gone. An `init` the wall clock ended with its thread off
-/// the CPU burnt no frame: such a run says so and asserts no count.
+/// the CPU burnt no frame: such a decision says so and is made again,
+/// [`TRIES`] at most.
 #[test]
 fn a_lazy_init_that_burns_its_frame_out_is_charged_its_fuel_at_the_calibration() {
-    let (clock, runtime, cold) = plugin_whose_init_asks(0, |row| {
-        row.fuel_per_micro = SLOW_CALIBRATION;
-        row.budget_micros = SLOW_FRAME_MICROS;
-    });
-    let neighbour = load_slow(
-        &runtime,
-        "after-the-init",
-        guest::record_guest(),
-        mode::LEAST_IN_FLIGHT,
-    );
-    let before = cold.stats().fuel_used;
-    let (wall, cpu) = (std::time::Instant::now(), bound_clock());
-    decide_on_a_cold_slot(&clock, 3, &cold, &neighbour, 100_000);
-    let s = cold.stats();
-    // The init spins its frame out in a moment of wall time unless the
-    // runner keeps its thread off the CPU: then its deadline on the wall
-    // clock ends it with its fuel unburnt.
-    if s.fuel_used - before < 99_000 && off_cpu_since(wall, cpu) >= INIT_FRAME / 2 {
-        excused(
-            "a lazy init that burns its frame out",
-            "the decision's thread was off the CPU half the init frame, the init's bound on the wall clock",
+    let mut made = 0;
+    loop {
+        made += 1;
+        let (clock, runtime, cold) = plugin_whose_init_asks(0, |row| {
+            row.fuel_per_micro = SLOW_CALIBRATION;
+            row.budget_micros = SLOW_FRAME_MICROS;
+        });
+        let neighbour = load_slow(
+            &runtime,
+            "after-the-init",
+            guest::record_guest(),
+            mode::LEAST_IN_FLIGHT,
         );
-        return;
+        let before = cold.stats().fuel_used;
+        let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+        decide_on_a_cold_slot(&clock, 3, &cold, &neighbour, 100_000);
+        let s = cold.stats();
+        // The init spins its frame out in a moment of wall time unless the
+        // runner keeps its thread off the CPU: then its deadline on the wall
+        // clock ends it with its fuel unburnt.
+        if s.fuel_used - before < 99_000
+            && off_cpu_since(wall, cpu) >= INIT_FRAME / 2
+            && made < TRIES
+        {
+            made_again(
+                "a lazy init that burns its frame out",
+                "the decision's thread was off the CPU half the init frame, the init's bound on the wall clock",
+            );
+            continue;
+        }
+        assert!(
+            s.fuel_used - before >= 99_000,
+            "the fuel the failed init burnt is in the plugin's count: {s:?}"
+        );
+        assert_eq!(
+            (s.lazy_instantiations, s.answered, s.breaker_opens),
+            (0, 0, 0),
+            "the init ran its own frame out: one failure, short of the breaker's five: {s:?}"
+        );
+        assert!(!cold.is_warm(), "an init that ran out leaves no instance");
+        let n = neighbour.stats();
+        assert_eq!(
+            (n.answered, n.budget_spent),
+            (0, 1),
+            "the init's fuel at the calibration is the whole 100 ms: {n:?}"
+        );
+        break;
     }
-    assert!(
-        s.fuel_used - before >= 99_000,
-        "the fuel the failed init burnt is in the plugin's count: {s:?}"
-    );
-    assert_eq!(
-        (s.lazy_instantiations, s.answered, s.breaker_opens),
-        (0, 0, 0),
-        "the init ran its own frame out: one failure, short of the breaker's five: {s:?}"
-    );
-    assert!(!cold.is_warm(), "an init that ran out leaves no instance");
-    let n = neighbour.stats();
-    assert_eq!(
-        (n.answered, n.budget_spent),
-        (0, 1),
-        "the init's fuel at the calibration is the whole 100 ms: {n:?}"
-    );
 }
 
 /// The fuel side on the arm that keeps its instance, at a calibration a
@@ -5411,64 +5506,79 @@ fn an_observe_fault_leaves_no_mark_for_a_decision_that_never_touched_the_slot() 
 /// not stretched by one; the run-out drops the instance and the close
 /// rebuilds it. A destructor is a watched call: its bound counts the time
 /// its thread had the CPU, so the case reads the clock the bound counts.
-/// It ends at a tick, and a ticker has the CPU once a millisecond while a
-/// call is in flight: a run that reads the destructor far past its bound
-/// while no ticker of the process had the CPU for half the decision's
-/// milliseconds was kept from its ticks, and says so instead.
+/// It ends at a tick, and a ticker ticks once a millisecond while a call is
+/// in flight: a destructor far past its bound had no tick for that long. A
+/// ticker the runner kept from the CPU was runnable all that time, and the
+/// kernel counts what a thread waits on a runqueue: a decision whose ticker
+/// waited half of what the destructor had says so and is made again,
+/// [`TRIES`] at most. A ticker its host parked, never woke or left asleep
+/// waited on none, and that run is red at once. The last try is red
+/// whatever its ticker waited: a ticker that shares its destructor's core
+/// waits there and ticks all the same.
 #[test]
 fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
-    let runtime = runtime();
-    let mut filler = spec("fill-dtor", guest::record_guest(), mode::FILL_IN_DESTRUCTOR);
-    // The frame is the request's 100 ms, and the calibration makes the
-    // destructor's fuel frame outlast it: only its bound on the clock ends
-    // the fill.
-    filler.budget_micros = 0;
-    filler.fuel_per_micro = 100_000_000;
-    let plugin = loaded(&runtime, filler);
-    let engine = plugin_engine(&plugin);
-    let (wall, started, ticked) = (std::time::Instant::now(), bound_clock(), ticker_runs());
-    let decision = engine.decide(
-        &RequestFacts {
-            budget_micros: 100_000,
-            ..facts(1)
-        },
-        &four(),
-        &pool(4),
-        &Constraints::default(),
-        &mut Scratch::new(),
-    );
-    let had = bound_clock().saturating_sub(started);
-    let (held, took) = (off_cpu_since(wall, started), wall.elapsed());
-    assert!(matches!(decision, Decision::Pick(_)), "the decision stands");
-    // No tick comes while the runner keeps the ticker from the CPU, and the
-    // destructor runs on until one does. A ticker that had the CPU for half
-    // the decision's milliseconds ticked: the time is the host's.
-    if had >= std::time::Duration::from_millis(30) {
-        let ran = most_ticker_runs_since(&ticked);
-        assert!(
-            ran.is_some_and(|ran| u128::from(ran) < took.as_millis() / 2),
-            "the destructor's bound is its own, not the 100 ms frame: {had:?} on the clock it counts, and a ticker had the CPU {ran:?} times in {took:?}"
+    let mut made = 0;
+    loop {
+        made += 1;
+        let (runtime, born) = runtime_and_the_threads_born_with_it();
+        let mut filler = spec("fill-dtor", guest::record_guest(), mode::FILL_IN_DESTRUCTOR);
+        // The frame is the request's 100 ms, and the calibration makes the
+        // destructor's fuel frame outlast it: only its bound on the clock
+        // ends the fill.
+        filler.budget_micros = 0;
+        filler.fuel_per_micro = 100_000_000;
+        let plugin = loaded(&runtime, filler);
+        let engine = plugin_engine(&plugin);
+        let waits = ticker_waits(&born);
+        let (wall, started) = (std::time::Instant::now(), bound_clock());
+        let decision = engine.decide(
+            &RequestFacts {
+                budget_micros: 100_000,
+                ..facts(1)
+            },
+            &four(),
+            &pool(4),
+            &Constraints::default(),
+            &mut Scratch::new(),
         );
-        excused(
-            "a destructor's bound",
-            &format!(
-                "no ticker had the CPU more than {} times in the {took:?} the decision took",
-                ran.unwrap_or(0)
+        let had = bound_clock().saturating_sub(started);
+        let held = off_cpu_since(wall, started);
+        assert!(matches!(decision, Decision::Pick(_)), "the decision stands");
+        // No tick comes while the runner keeps the ticker from the CPU, and
+        // the destructor runs on until one does. A ticker that waited on no
+        // runqueue for half of that was free to tick: the time is the
+        // host's. So is the time of the last try.
+        if had >= std::time::Duration::from_millis(30) {
+            let waited = least_ticker_wait_since(&waits, &born);
+            assert!(
+                waited.is_some_and(|waited| waited >= had / 2) && made < TRIES,
+                "the destructor's bound is its own, not the 100 ms frame: {had:?} on the clock it counts in try {made}, and its ticker waited {waited:?} on a runqueue"
+            );
+            made_again(
+                "a destructor's bound",
+                &format!(
+                    "its ticker waited {:?} on a runqueue of the {had:?} the destructor had",
+                    waited.unwrap_or_default()
+                ),
+            );
+            continue;
+        }
+        if !the_close_rebuilt("a destructor's bound", &plugin, held, made) {
+            continue;
+        }
+        let s = plugin.stats();
+        assert_eq!(
+            (
+                s.fuel_exhausted,
+                s.traps,
+                s.breaker_opens,
+                s.lazy_instantiations
             ),
+            (1, 0, 0, 1),
+            "the destructor ran out, the instance went, the close rebuilt it: {s:?}"
         );
+        break;
     }
-    let rebuilt = the_close_rebuilt("a destructor's bound", &plugin, held);
-    let s = plugin.stats();
-    assert_eq!(
-        (
-            s.fuel_exhausted,
-            s.traps,
-            s.breaker_opens,
-            s.lazy_instantiations
-        ),
-        (1, 0, 0, u64::from(rebuilt)),
-        "the destructor ran out, the instance went, the close rebuilt it: {s:?}"
-    );
 }
 
 /// Under an operator frame below the budget, the charge is per call. A
