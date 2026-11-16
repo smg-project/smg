@@ -2689,6 +2689,10 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         "zaed",
         "ed",
         "qa",
+        "<\u{FF5C}call_07__a_tail\u{FF5C}>",
+        "<\u{FF5C}call_07__b_tail\u{FF5C}>",
+        "<\u{FF5C}call_07__",
+        "\u{FF5C}end\u{FF5C}",
     ];
     // Sets of added words: the prefixes that fit are one byte (70 words with
     // distinct two-byte prefixes) or two bytes (60 pairs sharing one), under
@@ -2713,6 +2717,9 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         .into_iter()
         .chain(tags.iter().map(String::as_str))
         .collect();
+    // A set cut to thirteen-byte prefixes for the narrow searcher: a hit
+    // names its token less closely, and the anchored automaton still decides.
+    let calls = bar_fenced_calls();
     let mut all: Vec<(Vec<&str>, bool)> = sets
         .iter()
         .map(|(tokens, by_prefixes)| (tokens.to_vec(), *by_prefixes))
@@ -2720,6 +2727,7 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     all.push((words_one.iter().map(String::as_str).collect(), false));
     all.push((words_two.iter().map(String::as_str).collect(), false));
     all.push((declined, true));
+    all.push((calls.iter().map(String::as_str).collect(), true));
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for (tokens, by_prefixes) in &all {
         let list: Vec<Added> = tokens
@@ -2756,6 +2764,66 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
             );
         }
     }
+}
+
+/// Forty-one added tokens, most fenced in fullwidth bars: twenty-one
+/// distinct prefixes of thirteen bytes, forty-one of sixteen.
+fn bar_fenced_calls() -> Vec<String> {
+    let letter = |i: usize| (b'a' + i as u8) as char;
+    (0..40)
+        .map(|i| {
+            format!(
+                "<\u{FF5C}call_{:02}__{}_tail\u{FF5C}>",
+                i % 20,
+                letter(i / 20)
+            )
+        })
+        .chain(["\u{FF5C}end\u{FF5C}".to_owned()])
+        .collect()
+}
+
+/// The prefixes an added-token set is searched by: the longest of at most
+/// thirty-two when they keep eight bytes or more (the library then takes
+/// its narrow searcher), else the longest of at most sixty-four.
+#[test]
+fn the_added_tokens_prefixes_fit_the_narrow_searcher_where_they_stay_long() {
+    let chosen = |tokens: Vec<String>| {
+        let list: Vec<Added> = tokens
+            .into_iter()
+            .enumerate()
+            .map(|(i, token)| Added::plain(token, 1000 + i as u32))
+            .collect();
+        let picked = Prefixes::chosen(&list).map(|prefixes| {
+            let longest = prefixes.iter().map(|prefix| prefix.len()).max();
+            (prefixes.len(), longest.unwrap_or(0))
+        });
+        picked
+    };
+    let letter = |i: usize| (b'a' + i as u8) as char;
+    // Forty-one prefixes of sixteen bytes, twenty-one of thirteen: cut to
+    // the narrow searcher's count.
+    assert_eq!(chosen(bar_fenced_calls()), Some((21, 13)));
+    // Thirty-two prefixes of sixteen bytes fit as they stand; a
+    // thirty-third cuts them to the fifteen bytes that five share.
+    let reserved = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|i| format!("<|reserved_tok{}{}|>", letter(i / 8), i % 8))
+            .collect()
+    };
+    assert_eq!(chosen(reserved(32)), Some((32, 16)));
+    assert_eq!(chosen(reserved(33)), Some((5, 15)));
+    // Forty prefixes that only seven bytes would bring under thirty-two:
+    // too short to name a token, so the wide searcher keeps all sixteen.
+    let tools: Vec<String> = (0..40)
+        .map(|i| format!("<tool_{}{}_and_a_long_tail>", i % 10, letter(i / 10)))
+        .collect();
+    assert_eq!(chosen(tools), Some((40, 16)));
+    // Seventy words with distinct two-byte prefixes: nothing of three
+    // bytes fits, and the set keeps the automaton's own search.
+    let words: Vec<String> = (0..70)
+        .map(|i| format!("{}{}ing", letter(i % 26), letter(i / 26)))
+        .collect();
+    assert_eq!(chosen(words), None);
 }
 
 /// An added token matched after normalization whose inner space is the
