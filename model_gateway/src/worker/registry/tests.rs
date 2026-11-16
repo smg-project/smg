@@ -3061,8 +3061,6 @@ fn test_builder_status_override_on_replace() {
 #[test]
 fn test_replace_preserves_runtime_state_and_circuit_breaker() {
     let registry = WorkerRegistry::new();
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-routing-key", "sticky-key".parse().unwrap());
 
     let first: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://worker:8080")
@@ -3075,7 +3073,7 @@ fn test_replace_preserves_runtime_state_and_circuit_breaker() {
 
     first.set_status(WorkerStatus::NotReady);
     first.increment_processed();
-    let load_guard = WorkerLoadGuard::new(first.clone(), Some(&headers));
+    let load_guard = WorkerLoadGuard::with_key(first.clone(), Some("sticky-key"));
 
     for _ in 0..5 {
         first.record_outcome(503);
@@ -4044,7 +4042,7 @@ fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
         let registry = WorkerRegistry::new();
         let first = worker();
         let id = registry.register(Arc::clone(&first)).unwrap();
-        let guard = WorkerLoadGuard::new(first, None);
+        let guard = WorkerLoadGuard::with_key(first, None);
         assert!(
             listed(),
             "the guard's load is a series of the registered address"

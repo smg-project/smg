@@ -2189,7 +2189,7 @@ mod tests {
         );
 
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         assert_eq!(prefill.load(), 1);
         drop(prefill_guard);
@@ -2514,7 +2514,7 @@ mod tests {
         // the prefill side with its own guard when the prefill phase ends.
         let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         drop(prefill_guard);
         assert_eq!(
