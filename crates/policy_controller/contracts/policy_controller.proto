@@ -40,8 +40,10 @@
 // Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
 // ride the Decide stream as deltas (Credit) and are never taken back; with
 // no credit the gateway decides locally; a Decide whose budget is gone on
-// arrival is answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease; a
-// Decision that arrives after a fallback is answered with Released.
+// arrival, or ends while it is decided, is answered
+// Busy { BUDGET_GONE_ON_ARRIVAL } without a lease, and the controller counts
+// the second apart; a Decision that arrives after a fallback is answered
+// with Released.
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
 // role does not cover the RPC; FAILED_PRECONDITION not the leader (a

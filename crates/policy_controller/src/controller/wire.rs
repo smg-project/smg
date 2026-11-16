@@ -28,6 +28,16 @@
 //! in either form, and a stage that reads the key itself reads one key.
 //! The one value that would give the fingerprint no key has is refused.
 //!
+//! A range the contract fixes refuses a frame; a bound a generation's
+//! document sets never does, since the gateway may be a generation behind.
+//! The block hashes past the view's cap of the deciding generation are cut
+//! at the read, the first ones kept: a prefix cut short is still a prefix.
+//!
+//! A request that carries its prompt as text is checked like any other and
+//! says so ([`Checked::has_text`]): the controller is to hash the text into
+//! block hashes before any stage reads the view, and its decider has no
+//! decision for it until a step does.
+//!
 //! An answer carries no lease here: a decision is written as the engine
 //! made it, and the call that issues leases adds them.
 
@@ -49,9 +59,6 @@ pub(crate) enum Refusal {
     /// The field holds a number its record has no place for.
     #[error("{0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
-    /// The field asks for what no step of this build serves.
-    #[error("{0} is not served by this build")]
-    Unserved(&'static str),
 }
 
 /// A `DecideRequest` the engine's record holds whole.
@@ -92,12 +99,6 @@ impl Checked {
             .any(|header| u8::try_from(header.name).is_err())
         {
             return Err(Refusal::OutOfRange("facts.headers.name"));
-        }
-        // The controller is to hash the text into block hashes before any
-        // stage reads the view; no step does yet, and a decision made as if
-        // the request carried no prefix would be another request's.
-        if !facts.prompt_text.is_empty() {
-            return Err(Refusal::Unserved("facts.prompt_text"));
         }
         // A session key's hash form is the session's value: the key's
         // fingerprint is read back from it within the request's model and
@@ -141,6 +142,18 @@ impl Checked {
     /// receipt.
     pub(crate) fn budget(&self) -> Duration {
         Duration::from_micros(u64::from(self.facts.budget_micros))
+    }
+
+    /// Whether the request carries its prompt as text, for the controller
+    /// to hash.
+    pub(crate) fn has_text(&self) -> bool {
+        !self.facts.prompt_text.is_empty()
+    }
+
+    /// How many block hashes the frame carries: a read hands the engine
+    /// its view's cap of them at most.
+    pub(crate) fn hashes(&self) -> usize {
+        self.facts.block_hashes.len()
     }
 
     /// The request's id, for its answer.
@@ -207,7 +220,11 @@ impl Checked {
                 streaming: facts.streaming,
                 max_output_tokens: facts.max_output_tokens,
                 prompt_tokens: facts.prompt_tokens,
-                block_hashes: &facts.block_hashes,
+                // The first hashes, up to the view's cap.
+                block_hashes: facts
+                    .block_hashes
+                    .get(..view.max_block_hashes)
+                    .unwrap_or(&facts.block_hashes),
                 hash_kind: self.hash_kind,
                 session_key: match facts.session_key.as_ref().and_then(|key| key.form.as_ref()) {
                     Some(Form::Plain(key)) if !key.is_empty() => Identity::plain(key),
@@ -252,6 +269,8 @@ pub(crate) struct Viewed<'a> {
     pub(crate) budget_micros: u32,
     /// The candidates' affinity column, as the view's build filled it.
     pub(crate) affinity: &'a [AffinityFacts],
+    /// How many block hashes the deciding generation's view reads.
+    pub(crate) max_block_hashes: usize,
 }
 
 /// The lists of one request in the engine's form, on buffers their decider
@@ -471,6 +490,7 @@ mod tests {
             now_micros: 77,
             budget_micros: 1_500,
             affinity: &affinity,
+            max_block_hashes: 256,
         };
         checked.read(lists, view, check)
     }
@@ -748,14 +768,33 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_carries_its_prompt_as_text_is_refused_as_unserved() {
-        let refused = Checked::new(with(|facts| facts.prompt_text = b"hello".to_vec()))
-            .expect_err("no step hashes the text yet");
-        assert_eq!(refused, Refusal::Unserved("facts.prompt_text"));
-        assert_eq!(
-            refused.to_string(),
-            "facts.prompt_text is not served by this build"
-        );
+    fn a_frame_that_carries_its_prompt_as_text_is_checked_and_says_so() {
+        let plain = Checked::new(full()).expect("a frame the record holds");
+        assert!(!plain.has_text());
+        let text = Checked::new(with(|facts| facts.prompt_text = b"hello".to_vec()))
+            .expect("text is no field out of its range");
+        assert!(text.has_text());
+    }
+
+    #[test]
+    fn the_hashes_past_the_views_cap_are_cut_at_the_read_and_the_first_ones_kept() {
+        let frame = with(|facts| facts.block_hashes = (1..=6).collect());
+        let checked = Checked::new(frame).expect("a frame the record holds");
+        assert_eq!(checked.hashes(), 6);
+        let read = |max_block_hashes| {
+            let view = Viewed {
+                now_micros: 0,
+                budget_micros: 1,
+                affinity: &[],
+                max_block_hashes,
+            };
+            checked.read(&mut Lists::default(), view, |facts, _| {
+                facts.block_hashes.to_vec()
+            })
+        };
+        assert_eq!(read(4), [1, 2, 3, 4]);
+        assert_eq!(read(6), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(read(7), [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
