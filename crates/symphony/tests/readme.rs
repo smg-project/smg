@@ -825,7 +825,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("deepseek_v41"), Some("deepseek_v41")),
         table: Some(Table::DeepSeekV4_1),
         set: Some(589_671),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "devstral-2-123b-instruct-2512",
