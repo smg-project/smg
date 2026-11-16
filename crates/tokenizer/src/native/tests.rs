@@ -5716,7 +5716,8 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
 }
 
 /// Holds the scanner of each of `patterns` against the pattern's program:
-/// the same match ranges on every fixture text and on the fuzz inputs.
+/// the same match ranges on every fixture text, on the fuzz inputs and on
+/// two all-ASCII forms of each fuzz input.
 fn scanner_differential(patterns: &[&str]) {
     let fixtures = fixture_texts();
     let rounds = fuzz_rounds();
@@ -5754,7 +5755,20 @@ fn scanner_differential(patterns: &[&str]) {
             check(text);
         }
         for _ in 0..rounds {
-            check(&fuzz_text(&mut state, &fixtures));
+            let text = fuzz_text(&mut state, &fixtures);
+            check(&text);
+            // Nearly every fuzz text holds a character beyond ASCII, so the
+            // all-ASCII walk gets texts of its own: the text's ASCII
+            // characters, and those with each one repeated up to twelve
+            // times, which makes letter runs and space runs longer than the
+            // eight bytes the lean scan tests in line.
+            let ascii: String = text.chars().filter(char::is_ascii).collect();
+            check(&ascii);
+            let runs: String = ascii
+                .chars()
+                .flat_map(|c| std::iter::repeat_n(c, 1 + pseudo_random(&mut state) as usize % 12))
+                .collect();
+            check(&runs);
         }
     }
 }
