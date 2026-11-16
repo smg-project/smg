@@ -73,6 +73,21 @@ count cannot see a change that runs the same instructions slower, a load that mi
 branch that stops predicting: where the function moved too, such a row reads as a placement
 up to twice its threshold, by name, in the summary. A placement is still a row to read.
 
+An id that times a whole pass, many functions over many pages as a decision of the policy
+engine is, is marked in its gate entry: `whole_pass = true`. Its time follows which of the
+pass's code lines share a set of the processor's op cache, and every change to the executable
+draws that again. A change to the pass itself moves its count by a few instructions, so the
+same count is not there to read: a pull request read two decide ids 11.9 and 15.2 % slower on
+6 and 2 instructions more an iteration, 0.03 and 0.04 % of their counts, and the same two
+sources built without the alignment read them 3.8 and 5.1 % faster (2026-11-16). For a marked
+id the placement's first fact is a level count: the two counts within half a percent of each
+other (`LEVEL_COUNT`), each executable's own two counts the same. No function's address is
+asked, since any line of the pass can move. The ceiling of twice the threshold holds as for
+every id, and a count that moved further leaves the failure as before: work inserted into
+the decision read the same two ids 16.2 and 11.3 % slower on counts 3.1 and 3.4 % higher.
+Half a percent of a count carries a twentieth of a 10 % threshold by itself: the rest of
+such a time is not work.
+
 Usage:
     bench_gate.py build --out FILE [--name BENCH] [--gates FILE [--sources-from REV]]
                    -- cargo bench ... --no-run
@@ -122,6 +137,8 @@ class Gate:
     pattern: str
     threshold: float
     note: str = ""
+    # The id times a whole pass: at the count a level count places it (`LEVEL_COUNT`).
+    whole_pass: bool = False
 
     def matches(self, bench_id: str) -> bool:
         return re.search(self.pattern, bench_id) is not None
@@ -155,7 +172,7 @@ class Gates:
 
 
 GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "sources", "count", "run_budget", "gate"}
-GATE_ENTRY_KEYS = {"pattern", "threshold", "note"}
+GATE_ENTRY_KEYS = {"pattern", "threshold", "note", "whole_pass"}
 
 
 def load_gates(path: Path) -> Gates:
@@ -242,7 +259,18 @@ def load_gates(path: Path) -> Gates:
             re.compile(pattern)
         except re.error as err:
             raise ValueError(f"{path}: pattern {pattern!r} does not compile: {err}") from err
-        gates.gates.append(Gate(pattern, threshold, str(entry.get("note", ""))))
+        whole_pass = entry.get("whole_pass", False)
+        if not isinstance(whole_pass, bool):
+            raise ValueError(
+                f"{path}: [[gate]] entry {index}: whole_pass must be true or false, "
+                f"got {whole_pass!r}"
+            )
+        if whole_pass and not gates.count:
+            raise ValueError(
+                f"{path}: [[gate]] entry {index}: whole_pass = true needs count = true, "
+                "the mark is read at the count"
+            )
+        gates.gates.append(Gate(pattern, threshold, str(entry.get("note", "")), whole_pass))
     return gates
 
 
@@ -632,6 +660,12 @@ COUNT_TIMEOUT_S = 120.0
 # +10.4 % at most on rows gated at 10 %: a change beyond twice the threshold on the same
 # instructions is more than where they sit has explained.
 PLACEMENT_CEILING = 2.0
+# What part of a count still reads as level for an id that times a whole pass (`whole_pass`
+# in its gate entry). A change to the pass moves its count by a few instructions (0.03 and
+# 0.04 % where two decide ids read 11.9 and 15.2 % slower by where their code sat), and work
+# inserted into the decision that read the same two ids 16.2 and 11.3 % slower moved their
+# counts by 3.1 and 3.4 %.
+LEVEL_COUNT = 0.005
 
 
 @dataclass
@@ -1038,10 +1072,37 @@ class Row:
         return change is not None and change <= PLACEMENT_CEILING * threshold
 
     @property
+    def whole_pass(self) -> bool:
+        """Whether the id's gate entry marks it as one that times a whole pass."""
+        return self.gate is not None and self.gate.whole_pass
+
+    @property
+    def level_count(self) -> bool:
+        """Whether the count read level on the two executables: the same, or moved by no more
+        than `LEVEL_COUNT` of the base's with each executable's own two counts the same."""
+        counted = self.counted
+        if counted is None or counted.state == "unsteady":
+            return False
+        if counted.state == "moved" and not self.counted_twice:
+            return False
+        return abs(counted.pr - counted.base) <= LEVEL_COUNT * counted.base
+
+    @property
+    def counted_twice(self) -> bool:
+        """Whether each executable was counted a second time, which two counts that differ
+        ask before either is read."""
+        return all(((self.counts or {}).get(side) or {}).get("again") for side in SIDES)
+
+    @property
     def placed(self) -> bool:
-        """Whether where the code sits can carry the time: the same count, a measured
-        function that starts elsewhere, and a change within twice the threshold."""
-        return bool(self.same_count and self.moved) and self.within_ceiling
+        """Whether where the code sits can carry the time, within twice the threshold: for
+        an id that times a whole pass a level count, for any other the same count and a
+        measured function that starts elsewhere."""
+        if not self.within_ceiling:
+            return False
+        if self.whole_pass:
+            return self.level_count
+        return bool(self.same_count and self.moved)
 
 
 def judge(row: Row) -> str:
@@ -1221,9 +1282,39 @@ def fmt_count(row: Row) -> str:
                 f"the {counted.side}'s own two counts differ by {abs(counted.own):.3%}. The "
                 "time alone decides."
             )
-        twice = ", the same in two counts of each" if all(s.get("again") for s in sides) else ""
+        twice = ", the same in two counts of each" if row.counted_twice else ""
+        if row.whole_pass:
+            return fmt_level_count(row, counted, differs, twice)
         return f" The count moved too: {differs}{twice}."
     return fmt_same_count(row, counted)
+
+
+def fmt_level_count(row: Row, counted: Counted, differs: str, twice: str) -> str:
+    """The sentences of an id that times a whole pass whose two counts differ: a placement
+    on a level count, or what leaves the failure."""
+    level = f"the {LEVEL_COUNT:.1%} that reads as level for an id that times a whole pass"
+    if abs(counted.pr - counted.base) > LEVEL_COUNT * counted.base:
+        return f" The count moved too: {differs}{twice}, beyond {level}."
+    if not twice:
+        return (
+            f" The count moved too: {differs}. A level count is two counts of each executable "
+            "that agree, and a second one was not read: the failure stands."
+        )
+    if not row.placed:
+        return f" The count is level: {differs}{twice}, within {level}.{fmt_ceiling(row)}"
+    return (
+        f" The count is level: {differs}{twice}, within {level}. The time is where the "
+        "pass's code sits in the bench executable, not work the pull request adds."
+    )
+
+
+def fmt_ceiling(row: Row) -> str:
+    """The sentence of a count that would place a row whose change is beyond the ceiling."""
+    ceiling = PLACEMENT_CEILING * (row.gate.threshold if row.gate else 0.0)
+    return (
+        f" A placement excuses a change up to {PLACEMENT_CEILING:g} times the threshold, "
+        f"{fmt_pct(ceiling, signed=False)}: the failure stands."
+    )
 
 
 def fmt_same_count(row: Row, counted: Counted) -> str:
@@ -1234,6 +1325,13 @@ def fmt_same_count(row: Row, counted: Counted) -> str:
         f"first, {counted.base:,} over the {counted.iterations:,} iterations of the last "
         f"({counted.base / counted.iterations:,.1f} an iteration)"
     )
+    if row.whole_pass:
+        if not row.placed:
+            return f"{same}.{fmt_ceiling(row)}"
+        return (
+            f"{same}: the id times a whole pass, and the time is where the pass's code sits "
+            "in the bench executable, not work the pull request adds."
+        )
     sides = [(row.counts or {}).get(side) or {} for side in SIDES]
     unit, places = sides[0].get("unit"), [side.get("address") for side in sides]
     moved = row.moved
@@ -1258,11 +1356,7 @@ def fmt_same_count(row: Row, counted: Counted) -> str:
             f"executable and at {fmt_place(places[1])} in the pull request's."
         )
     if not row.placed:
-        ceiling = PLACEMENT_CEILING * (row.gate.threshold if row.gate else 0.0)
-        return (
-            f"{same}. {where} A placement excuses a change up to {PLACEMENT_CEILING:g} times "
-            f"the threshold, {fmt_pct(ceiling, signed=False)}: the failure stands."
-        )
+        return f"{same}. {where}{fmt_ceiling(row)}"
     return (
         f"{same}: the time is where the code sits in the bench executable, not work the pull "
         f"request adds. {where}"
@@ -1346,6 +1440,7 @@ def markdown(results: dict, rows: list[Row]) -> str:
         ]
     reads = results.get("count") or {}
     counted = sorted(bench_id for bench_id, read in reads.items() if "skipped" not in read)
+    whole = [row.bench_id for row in rows if row.whole_pass and row.bench_id in counted]
     if counted:
         lines += [
             "Counted before the verdict, on both executables under callgrind: "
@@ -1353,7 +1448,16 @@ def markdown(results: dict, rows: list[Row]) -> str:
             "fails by time is a placement (where its code sits in the bench executable) when "
             "it runs the same instruction count on both, its measured function starts at "
             "another address and the change is within twice its threshold: reported, not "
-            "failed, and still a row to read.",
+            "failed, and still a row to read."
+            + (
+                " An id that times a whole pass ("
+                + ", ".join(f"`{bench_id}`" for bench_id in whole)
+                + f") is a placement on a level count instead: its two counts within "
+                f"{LEVEL_COUNT:.1%} of each other, each executable's own two the same, and "
+                "the change within twice its threshold."
+                if whole
+                else ""
+            ),
             "",
         ]
     for why, said in NOT_COUNTED.items():
@@ -1394,6 +1498,10 @@ def markdown(results: dict, rows: list[Row]) -> str:
         + (
             f" {len(placed)} placement (beyond the threshold on the same instruction count, "
             "the measured function moved, within twice the threshold: not failed)."
+            if placed and not any(row.whole_pass for row in placed)
+            else f" {len(placed)} placement (beyond the threshold within twice of it: on the "
+            "same instruction count with the measured function moved, or for an id that "
+            "times a whole pass on a level count; not failed)."
             if placed
             else ""
         )
