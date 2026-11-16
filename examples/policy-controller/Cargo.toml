@@ -20,10 +20,18 @@ smg-policy-controller = { path = "../../crates/policy_controller", features = ["
 tikv-jemallocator = { workspace = true }
 
 # The tests read the example's document as the controller reads one, and
-# bind a controller as the run loop does.
+# bind a controller as the run loop does. The started binary's cases serve
+# mock engines in their own process and hold requests on one through the
+# engine's client. They register workers through the generated client and
+# ask decisions through the crate's reference client, a feature the tests
+# alone turn on.
 [dev-dependencies]
+mock-worker = { path = "../../crates/mock_worker" }
 serde_yaml = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+smg-grpc-client = { workspace = true }
+smg-policy-controller = { path = "../../crates/policy_controller", features = ["client"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tonic = { workspace = true }
 
 [lints]
 workspace = true
