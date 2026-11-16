@@ -40,7 +40,10 @@ use serde_json::{json, Value};
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 #[cfg(feature = "axum")]
-use crate::{common::FIELD_PARAM, strict_value::StrictValue};
+use crate::{
+    common::FIELD_PARAM,
+    strict_value::{strict_entries, StrictValue},
+};
 
 /// A JSON extractor that automatically validates and normalizes the request body
 ///
@@ -121,25 +124,7 @@ impl<'de> Visitor<'de> for BodyVisitor {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
-        let mut fields = serde_json::Map::new();
-        while let Some(key) = entries.next_key::<String>()? {
-            let slot = match fields.entry(key) {
-                serde_json::map::Entry::Occupied(slot) => {
-                    return Err(serde::de::Error::custom(format!(
-                        "duplicate field `{}`",
-                        slot.key()
-                    )));
-                }
-                serde_json::map::Entry::Vacant(slot) => slot,
-            };
-            let value = if slot.key() == "metadata" {
-                entries.next_value()?
-            } else {
-                entries.next_value_seed(StrictValue)?
-            };
-            slot.insert(value);
-        }
-        Ok(Value::Object(fields))
+        strict_entries(&mut entries, Some("metadata")).map(Value::Object)
     }
 }
 
