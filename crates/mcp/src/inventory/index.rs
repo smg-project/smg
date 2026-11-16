@@ -368,9 +368,11 @@ impl ToolInventory {
     }
 
     /// Keep the server's tools named in `listed` and drop its others, with
-    /// the aliases that target a dropped tool, index and entry alike. A
-    /// refresh installs its listing first and calls this after, so a reader
-    /// never finds the server without the tools both listings hold.
+    /// the aliases that target a dropped tool, index and entry alike. An
+    /// alias that targets a kept tool takes that tool's definition as it is
+    /// now: its entry is a copy, and the listing may have changed the tool.
+    /// A refresh installs its listing first and calls this after, so a
+    /// reader never finds the server without the tools both listings hold.
     pub fn retain_server_tool_entries(&self, server_key: &str, listed: &HashSet<String>) {
         let dropped: Vec<QualifiedToolName> = self
             .tools_by_server
@@ -387,16 +389,13 @@ impl ToolInventory {
             self.remove_entry(&qualified);
         }
 
-        let aliases: Vec<String> = self
+        let (kept, gone): (Vec<_>, Vec<_>) = self
             .aliases
             .iter()
-            .filter(|entry| {
-                entry.value().server_key() == server_key
-                    && !listed.contains(entry.value().tool_name())
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
-        for alias in aliases {
+            .filter(|entry| entry.value().server_key() == server_key)
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .partition(|(_, target)| listed.contains(target.tool_name()));
+        for (alias, _) in gone {
             self.aliases.remove(&alias);
             let qualified = QualifiedToolName::new(ALIAS_SERVER_KEY, &alias);
             self.remove_entry(&qualified);
@@ -405,6 +404,17 @@ impl ToolInventory {
             }
             self.tools_by_server
                 .remove_if(ALIAS_SERVER_KEY, |_, names| names.is_empty());
+        }
+        // The entry under the alias key is a copy of the target's tool, taken
+        // when the alias was registered: a kept alias takes the tool again.
+        for (alias, target) in kept {
+            let tool = self
+                .tools_by_qualified
+                .get(&target)
+                .map(|entry| entry.tool.clone());
+            if let Some(tool) = tool {
+                self.update_entry(ALIAS_SERVER_KEY, &alias, |entry| entry.tool = tool);
+            }
         }
     }
 
@@ -1139,6 +1149,39 @@ mod tests {
             .is_none());
         // another server's tool of the same name is not this server's to drop
         assert_eq!(inventory.get_tool_servers("gone"), ["other"]);
+    }
+
+    #[test]
+    fn a_kept_alias_takes_its_targets_refreshed_definition() {
+        let inventory = ToolInventory::new();
+        let target = QualifiedToolName::new("s", "search");
+        inventory.insert_entry(ToolEntry::new(target.clone(), create_test_tool("search")));
+        inventory.insert_entry(
+            ToolEntry::new(
+                QualifiedToolName::new(ALIAS_SERVER_KEY, "web_search"),
+                create_test_tool("search"),
+            )
+            .with_alias(AliasTarget::new(target.clone())),
+        );
+        inventory.register_alias("web_search".to_string(), target.clone());
+
+        // A refresh: the listing's entry goes in, then the retain.
+        let mut relisted = create_test_tool("search");
+        relisted.description = Some("searches the newer index".into());
+        inventory.insert_entry(ToolEntry::new(target.clone(), relisted));
+        inventory.retain_server_tool_entries("s", &HashSet::from(["search".to_string()]));
+
+        let alias = inventory
+            .get_entry(ALIAS_SERVER_KEY, "web_search")
+            .expect("an alias whose target is still listed stays");
+        assert_eq!(
+            alias.tool.description.as_deref(),
+            Some("searches the newer index"),
+            "the definition under the alias"
+        );
+        // still an alias of the same target, under its own name
+        assert_eq!(alias.tool_name(), "web_search");
+        assert_eq!(inventory.resolve_alias("web_search"), Some(target));
     }
 
     #[test]
