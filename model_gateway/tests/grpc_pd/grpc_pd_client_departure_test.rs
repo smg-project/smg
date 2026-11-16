@@ -354,7 +354,7 @@ async fn chat_whose_client_leaves(router: &dyn RouterTrait, streaming: bool) -> 
     .unwrap();
     let routed = tokio::time::timeout(
         LEAVE_AFTER,
-        router.route_chat(None, &tenant(), request, MODEL),
+        router.route_chat(None, &tenant(), Arc::new(request), MODEL),
     )
     .await;
     match routed {

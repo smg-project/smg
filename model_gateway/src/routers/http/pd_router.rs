@@ -2865,13 +2865,13 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_pd(
             headers,
             Some(tenant_meta),
-            super::chat_for_upstream(body),
+            super::chat_for_upstream(Arc::unwrap_or_clone(body)),
             model_id,
         )
         .await
@@ -4124,7 +4124,7 @@ mod tests {
 
             let started = Instant::now();
             let response = router
-                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
                 .await;
             let elapsed = started.elapsed();
 
@@ -4221,7 +4221,7 @@ mod tests {
         .expect("valid chat request");
 
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -4323,7 +4323,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5055,7 +5055,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             ROUND_TRIP_GUARD,
-            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+            router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream must not wait for the prefill body");
@@ -5105,7 +5105,7 @@ mod tests {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let response = router
-            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
             .await;
 
         // A prefill 5xx stays a status the retry layer and the client can act
@@ -5146,7 +5146,7 @@ mod tests {
                 let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
                 let response = router
-                    .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+                    .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
                     .await;
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             });
@@ -5201,7 +5201,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5259,7 +5259,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5438,7 +5438,7 @@ mod tests {
             "/v1/chat/completions" => {
                 let request = serde_json::from_value(body).expect("valid chat request");
                 router
-                    .route_chat(headers, &tenant, request, UNKNOWN_MODEL_ID)
+                    .route_chat(headers, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                     .await
             }
             "/v1/completions" => {
@@ -7469,7 +7469,7 @@ mod tests {
     async fn stream_chat_through(router: &PDRouter) -> Response {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         router
-            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
             .await
     }
 
@@ -7497,7 +7497,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             ROUND_TRIP_GUARD,
-            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+            router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream starts on the decode head");
@@ -7550,7 +7550,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             ROUND_TRIP_GUARD,
-            router.route_chat(None, &tenant, request, UNKNOWN_MODEL_ID),
+            router.route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream starts once the prefill answered");
@@ -7893,7 +7893,7 @@ mod tests {
         }))
         .expect("valid chat request");
         router
-            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await
     }
 
@@ -8088,7 +8088,7 @@ mod tests {
             }))
             .expect("valid chat request");
             let response = router
-                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(
@@ -8132,7 +8132,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let response = metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(router.route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID))
+            runtime.block_on(router.route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID))
         });
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(

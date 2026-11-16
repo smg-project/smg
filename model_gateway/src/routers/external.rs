@@ -320,12 +320,12 @@ impl RouterTrait for ExternalRouterAdapter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_reserved(
             tenant_meta,
-            body,
+            Arc::unwrap_or_clone(body),
             "/v1/chat/completions",
             model_id,
             |body| self.inner.route_chat(headers, tenant_meta, body, model_id),

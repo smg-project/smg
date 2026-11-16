@@ -556,12 +556,12 @@ async fn one_chat(
     }))
     .unwrap();
     let started = Instant::now();
-    let response =
-        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
-            .await
-            .expect(
-                "the request must be answered within the case cap, not held to the request timeout",
-            );
+    let response = tokio::time::timeout(
+        CASE_CAP,
+        router.route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await
+    .expect("the request must be answered within the case cap, not held to the request timeout");
     let status = response.status();
     let bytes = tokio::time::timeout(
         CASE_CAP,
@@ -590,12 +590,12 @@ async fn one_long_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode,
     }))
     .unwrap();
     let started = Instant::now();
-    let response =
-        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
-            .await
-            .expect(
-                "the request must be answered within the case cap, not held to the request timeout",
-            );
+    let response = tokio::time::timeout(
+        CASE_CAP,
+        router.route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await
+    .expect("the request must be answered within the case cap, not held to the request timeout");
     let status = response.status();
     let bytes = tokio::time::timeout(
         CASE_CAP,
