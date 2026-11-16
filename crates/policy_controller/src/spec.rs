@@ -15,12 +15,14 @@
 
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     collections::{btree_map, BTreeMap, BTreeSet},
     fmt, io,
     marker::PhantomData,
     sync::LazyLock,
 };
 
+use rustc_hash::FxHashMap;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
     de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
@@ -65,6 +67,18 @@ pub const MAX_HEADERS: usize = 256;
 /// eight bytes a hash and ten of tags and lengths. A higher cap would
 /// bind on no frame the call accepts.
 pub const MAX_BLOCK_HASHES: u32 = 8_190;
+
+/// The most label selectors `view.labels` may list: a row holds its labels
+/// as one bit a selector, in 64 bits.
+pub const MAX_LABELS: usize = 64;
+
+/// The most zones `view.zones` may list. A row's position is wider: the cap
+/// is the document's own, so a list never meets the width by accident.
+pub const MAX_ZONES: usize = 256;
+
+/// The most engine families `view.engines` may list, capped as the zones
+/// are.
+pub const MAX_ENGINES: usize = 64;
 
 /// The filters this build carries.
 pub const FILTERS: [&str; 5] = [
@@ -212,8 +226,10 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 }
 
 /// What the host builds into every decision's view beyond the facts it
-/// derives itself: the request headers a stage may read, and the hashing
-/// inputs a host keeps until it learns them from its engines.
+/// derives itself: the request headers a stage may read, the hashing
+/// inputs a host keeps until it learns them from its engines, and the
+/// lists a worker's row names its labels, its zone and its engine family
+/// by.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ViewSpec {
@@ -238,6 +254,29 @@ pub struct ViewSpec {
     /// at most: one frame of the Decide call carries no more.
     #[schemars(range(min = 1, max = 8190))]
     pub max_block_hashes: u32,
+    /// The worker labels a stage may read, each a selector of one label
+    /// key: `key` (the worker carries the label, whatever its value) or
+    /// `key=value` (it carries the label with that value), split at the
+    /// first `=`. A worker's row holds one bit for each selector it meets,
+    /// in this order. At most 64; empty for none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub labels: Vec<String>,
+    /// The zones a stage may tell apart. A worker's row names its zone by
+    /// its position in this list, from 1; a worker with no zone reads 0,
+    /// and so does one whose zone this list does not name. At most 256;
+    /// empty for none, where every row reads 0.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 256))]
+    pub zones: Vec<String>,
+    /// The engine families a stage may tell apart, spelled as a worker's
+    /// registration spells its own. A worker's row names its family by its
+    /// position in this list, from 1; a worker whose family this list does
+    /// not name reads 0. At most 64; empty for none, where every row reads
+    /// 0.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub engines: Vec<String>,
 }
 
 impl Default for ViewSpec {
@@ -247,6 +286,9 @@ impl Default for ViewSpec {
             block_size: None,
             boundaries: Vec::new(),
             max_block_hashes: 256,
+            labels: Vec::new(),
+            zones: Vec::new(),
+            engines: Vec::new(),
         }
     }
 }
@@ -1564,6 +1606,12 @@ pub enum SpecError {
     TooManyProfiles { count: usize, max: u16 },
     #[error("view.headers names {count} headers; at most {max}")]
     TooManyHeaders { count: usize, max: usize },
+    #[error("{path} lists {count} entries; at most {max}")]
+    TooManyListed {
+        path: &'static str,
+        count: usize,
+        max: usize,
+    },
     #[error("binding {index}: profiles names an unknown side {side:?}")]
     UnknownSide { index: usize, side: String },
     #[error("binding {index}: the {plan} plan has no {side:?} side")]
@@ -1659,6 +1707,7 @@ impl SpecError {
             Self::HashIndexNeedsBoundaries { model } => format!("index.{model}.kind"),
             Self::TooManyProfiles { .. } | Self::Empty => "profiles".to_owned(),
             Self::TooManyHeaders { .. } => "view.headers".to_owned(),
+            Self::TooManyListed { path, .. } => (*path).to_owned(),
             Self::BadField { path, .. }
             | Self::NotInBuild { path, .. }
             | Self::DeniedHeader { path, .. }
@@ -1827,7 +1876,46 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
             "at most 8190, the hashes one Decide frame carries",
         ));
     }
-    Ok(())
+    check_list(&view.labels, "view.labels", MAX_LABELS)?;
+    for (i, label) in view.labels.iter().enumerate() {
+        let (key, value) = selector(label);
+        if key.is_empty() || value == Some("") {
+            return Err(SpecError::BadField {
+                path: format!("view.labels[{i}]"),
+                value: format!("{label:?}"),
+                reason: "a label key or `key=value` with no empty side",
+            });
+        }
+    }
+    check_list(&view.zones, "view.zones", MAX_ZONES)?;
+    check_list(&view.engines, "view.engines", MAX_ENGINES)
+}
+
+/// A label selector's two sides: the key, and the value after the first
+/// `=` when it names one.
+fn selector(label: &str) -> (&str, Option<&str>) {
+    label
+        .split_once('=')
+        .map_or((label, None), |(key, value)| (key, Some(value)))
+}
+
+/// A list the view declares: at most `max` entries, none empty, each once.
+fn check_list(list: &[String], path: &'static str, max: usize) -> Result<(), SpecError> {
+    if list.len() > max {
+        return Err(SpecError::TooManyListed {
+            path,
+            count: list.len(),
+            max,
+        });
+    }
+    if let Some(i) = list.iter().position(String::is_empty) {
+        return Err(SpecError::BadField {
+            path: format!("{path}[{i}]"),
+            value: "\"\"".to_string(),
+            reason: "a name",
+        });
+    }
+    check_unique(list, path)
 }
 
 fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(), SpecError> {
@@ -3388,6 +3476,7 @@ pub struct AppliedSpec {
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
     pairing: Pairing,
+    lists: ViewLists,
 }
 
 impl AppliedSpec {
@@ -3430,6 +3519,7 @@ impl AppliedSpec {
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
             pairing: document.plans.pd_pair.pairing,
+            lists: ViewLists::of(&document.view),
         }
     }
 
@@ -3446,6 +3536,7 @@ impl AppliedSpec {
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
             pairing: Pairing::default(),
+            lists: ViewLists::default(),
         }
     }
 
@@ -3517,6 +3608,131 @@ impl AppliedSpec {
     #[must_use]
     pub fn pairing(&self) -> Pairing {
         self.pairing
+    }
+
+    /// The lists this generation declares, as a store reads them when it
+    /// writes a worker's row.
+    #[must_use]
+    pub fn lists(&self) -> &ViewLists {
+        &self.lists
+    }
+}
+
+/// The lists a generation declares, as a store reads them when it writes a
+/// worker's row ([`Candidate`](crate::view::Candidate)): the row names its
+/// engine family and its zone by a position from 1, and holds one bit for
+/// each label selector the worker meets. Built once, at validation.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ViewLists {
+    /// The label selectors in their keys' order, each with its bit: a
+    /// worker's labels are in their keys' order too, so one pass over the
+    /// two finds every selector the worker meets.
+    labels: Vec<LabelSelector>,
+    zones: FxHashMap<Box<str>, u16>,
+    engines: FxHashMap<Box<str>, u16>,
+}
+
+/// One label selector: its key, the value it asks for when it names one,
+/// and its bit, which is its place in the document's list.
+#[derive(Debug, PartialEq, Eq)]
+struct LabelSelector {
+    key: Box<str>,
+    value: Option<Box<str>>,
+    bit: u8,
+}
+
+/// What one worker's registration reads as under a generation's lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Listed {
+    /// The position of the worker's engine family, from 1; `0` when the
+    /// list does not name it.
+    pub engine_kind: u16,
+    /// The position of the worker's zone, from 1; `0` for a worker with no
+    /// zone and for a zone the list does not name.
+    pub zone: u16,
+    /// One bit for each label selector the worker meets.
+    pub labels: u64,
+    /// The worker names an engine family, and the list holds entries and
+    /// not that one.
+    pub engine_outside: bool,
+    /// The worker names a zone, and the list holds entries and not that
+    /// one.
+    pub zone_outside: bool,
+}
+
+impl ViewLists {
+    fn of(view: &ViewSpec) -> Self {
+        let positions = |list: &[String]| {
+            let named = list.iter().zip(1u16..);
+            named.map(|(name, at)| (name.as_str().into(), at)).collect()
+        };
+        let sides = |(label, bit): (&String, u8)| {
+            let (key, value) = selector(label);
+            LabelSelector {
+                key: key.into(),
+                value: value.map(Into::into),
+                bit,
+            }
+        };
+        let mut labels: Vec<LabelSelector> = view.labels.iter().zip(0u8..).map(sides).collect();
+        // The sort is stable: selectors of one key keep the list's order.
+        labels.sort_by(|a, b| a.key.cmp(&b.key));
+        Self {
+            labels,
+            zones: positions(&view.zones),
+            engines: positions(&view.engines),
+        }
+    }
+
+    /// Whether the generation declares no list: every row reads 0 in the
+    /// three fields, and a store looks nothing up.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.labels.is_empty() && self.zones.is_empty() && self.engines.is_empty()
+    }
+
+    /// A worker's three fields under these lists, from the engine family,
+    /// the zone and the labels of its registration.
+    #[must_use]
+    pub fn listed(
+        &self,
+        engine: &str,
+        zone: Option<&str>,
+        labels: &BTreeMap<String, String>,
+    ) -> Listed {
+        let engine_at = self.engines.get(engine).copied();
+        let zone = zone.filter(|zone| !zone.is_empty());
+        let zone_at = zone.and_then(|zone| self.zones.get(zone).copied());
+        Listed {
+            engine_kind: engine_at.unwrap_or(0),
+            zone: zone_at.unwrap_or(0),
+            labels: self.met(labels),
+            engine_outside: engine_at.is_none() && !engine.is_empty() && !self.engines.is_empty(),
+            zone_outside: zone_at.is_none() && zone.is_some() && !self.zones.is_empty(),
+        }
+    }
+
+    /// The bits of the selectors a worker's labels meet, in one pass over
+    /// the two, each in its keys' order.
+    fn met(&self, labels: &BTreeMap<String, String>) -> u64 {
+        let mut bits = 0;
+        let mut wanted = self.labels.iter().peekable();
+        'held: for (key, held) in labels {
+            while let Some(want) = wanted.peek() {
+                match (*want.key).cmp(key.as_str()) {
+                    Ordering::Less => {}
+                    Ordering::Greater => continue 'held,
+                    Ordering::Equal => {
+                        let value = want.value.as_deref();
+                        let met = value.is_none_or(|value| value == held.as_str());
+                        bits |= u64::from(met) << want.bit;
+                    }
+                }
+                wanted.next();
+            }
+            break;
+        }
+        bits
     }
 }
 
@@ -4645,6 +4861,111 @@ mod tests {
         let spec = spec_with_view(r#"{"block_size":128,"boundaries":[256,1024,4096]}"#);
         assert!(spec.validate().is_ok());
         assert_eq!(spec.view.max_block_hashes, 256);
+    }
+
+    #[test]
+    fn the_view_lists_are_capped_named_and_listed_once() {
+        let list = |count: usize| {
+            let names: Vec<String> = (0..count).map(|n| format!("\"n{n}\"")).collect();
+            format!("[{}]", names.join(","))
+        };
+        let caps = [
+            ("labels", MAX_LABELS),
+            ("zones", MAX_ZONES),
+            ("engines", MAX_ENGINES),
+        ];
+        for (field, max) in caps {
+            let at_cap = spec_with_view(&format!(r#"{{"{field}":{}}}"#, list(max)));
+            assert!(at_cap.validate().is_ok(), "{field}");
+            let over = spec_with_view(&format!(r#"{{"{field}":{}}}"#, list(max + 1)));
+            assert!(
+                matches!(
+                    over.validate(),
+                    Err(SpecError::TooManyListed { path, count, max: cap })
+                        if path == format!("view.{field}") && count == max + 1 && cap == max
+                ),
+                "{field}"
+            );
+            let unnamed = spec_with_view(&format!(r#"{{"{field}":["a",""]}}"#));
+            assert_eq!(bad_field(&unnamed), format!("view.{field}[1]"));
+            let twice = spec_with_view(&format!(r#"{{"{field}":["a","b","a"]}}"#));
+            assert!(
+                matches!(
+                    twice.validate(),
+                    Err(SpecError::Duplicate { path, name })
+                        if path == format!("view.{field}") && name == "a"
+                ),
+                "{field}"
+            );
+        }
+        // A label is a key, or a key and a value split at the first `=`:
+        // neither side is empty, and the value may hold a `=` of its own.
+        for label in ["=gold", "tier="] {
+            let empty = spec_with_view(&format!(r#"{{"labels":["tier","{label}"]}}"#));
+            assert_eq!(bad_field(&empty), "view.labels[1]", "{label}");
+        }
+        let spec = spec_with_view(r#"{"labels":["tier","tier=gold","note=a=b"]}"#);
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn a_view_that_declares_no_list_is_written_as_before() {
+        let written = serde_json::to_string(&ViewSpec::default()).expect("the view serializes");
+        for field in ["labels", "zones", "engines"] {
+            assert!(!written.contains(field), "{written}");
+        }
+        let spec =
+            spec_with_view(r#"{"labels":["tier=gold"],"zones":["east"],"engines":["alpha"]}"#);
+        let written = serde_json::to_string(&spec.view).expect("the view serializes");
+        let read: ViewSpec = serde_json::from_str(&written).expect("the view reads back");
+        assert_eq!(read, spec.view);
+        assert_eq!(
+            (read.labels.len(), read.zones.len(), read.engines.len()),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn the_lists_read_a_worker_by_position_and_by_bit() {
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            let owned = |(key, value): &(&str, &str)| ((*key).to_string(), (*value).to_string());
+            pairs.iter().map(owned).collect()
+        };
+        let spec = spec_with_view(
+            r#"{"labels":["tier","tier=gold","note=a=b"],"zones":["east","west"],"engines":["alpha","beta"]}"#,
+        );
+        let applied = AppliedSpec::validate(&spec).expect("the document validates");
+        let lists = applied.lists();
+        assert!(!lists.is_empty());
+        let held = labels(&[("tier", "gold"), ("note", "a=b")]);
+        let gold = lists.listed("beta", Some("west"), &held);
+        assert_eq!((gold.engine_kind, gold.zone, gold.labels), (2, 2, 0b111));
+        assert!(!gold.engine_outside && !gold.zone_outside);
+        let held = labels(&[("tier", "silver"), ("note", "a")]);
+        let silver = lists.listed("alpha", Some("east"), &held);
+        assert_eq!(
+            (silver.engine_kind, silver.zone, silver.labels),
+            (1, 1, 0b001)
+        );
+        // A bit is the selector's place in the list, whatever the keys'
+        // order: two selectors of one key stand apart here.
+        let mixed = spec_with_view(r#"{"labels":["z","b=1","m","b","a=2","q=x"]}"#);
+        let mixed = AppliedSpec::validate(&mixed).expect("the document validates");
+        let held = labels(&[("a", "2"), ("b", "1"), ("c", "9"), ("m", ""), ("q", "y")]);
+        assert_eq!(mixed.lists().listed("", None, &held).labels, 0b01_1110);
+        // A name the list does not hold reads 0 and says so. No name reads
+        // 0 and is not outside.
+        let stray = lists.listed("gamma", Some("north"), &labels(&[]));
+        assert_eq!((stray.engine_kind, stray.zone, stray.labels), (0, 0, 0));
+        assert!(stray.engine_outside && stray.zone_outside);
+        for zone in [None, Some("")] {
+            assert_eq!(lists.listed("", zone, &labels(&[])), Listed::default());
+        }
+        // No list: every worker reads 0 and none is outside.
+        let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
+        assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
+        let read = none.lists().listed("beta", Some("west"), &held);
+        assert_eq!(read, Listed::default());
     }
 
     #[test]
@@ -5786,6 +6107,14 @@ mod tests {
                     max: 256,
                 },
                 "view.headers",
+            ),
+            (
+                SpecError::TooManyListed {
+                    path: "view.zones",
+                    count: 300,
+                    max: 256,
+                },
+                "view.zones",
             ),
             (
                 SpecError::BadField {

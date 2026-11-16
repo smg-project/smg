@@ -1135,6 +1135,37 @@ pub(crate) mod tests {
         (world.spec().generation(), world.spec().digest())
     }
 
+    /// The door builds a generation with its document's lists: a document
+    /// of engine families alone, applied through it, lists the member that
+    /// joins after.
+    #[test]
+    fn a_document_applied_through_the_door_lists_the_member_that_joins() {
+        use crate::store::{OutsideLists, WorkerFacts, WorkersStore};
+
+        let (store, generations) = generations();
+        let document = format!("{RANDOM}view:\n  engines: [alpha]\n");
+        yaml(&generations, document).expect("a valid document");
+        let join = |key: &str, engine: &str| {
+            store.upsert(WorkerFacts {
+                key: key.to_owned(),
+                engine: key.to_owned(),
+                incarnation: 1,
+                engine_kind: engine.to_owned(),
+                models: vec!["m".to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            });
+        };
+        join("http://a:8000", "alpha");
+        assert_eq!(store.outside_lists(), OutsideLists::default());
+        join("http://b:8000", "beta");
+        let outside = OutsideLists {
+            engines: 1,
+            zones: 0,
+        };
+        assert_eq!(store.outside_lists(), outside);
+    }
+
     #[test]
     fn a_files_form_is_read_off_its_name() {
         for (name, format) in [

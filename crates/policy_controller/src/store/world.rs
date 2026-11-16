@@ -588,6 +588,19 @@ pub struct StaleGeneration {
     pub offered: u64,
 }
 
+/// How many members of the standing membership name an engine family or a
+/// zone that the standing generation's list, which holds entries, does not
+/// hold: each reads position 0 in that field. Counted at every write that
+/// reads the members under the lists, a membership write and an apply that
+/// changes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutsideLists {
+    /// Members outside `view.engines`.
+    pub engines: u32,
+    /// Members outside `view.zones`.
+    pub zones: u32,
+}
+
 /// Everything a decision reads, as one publication left it. A decision
 /// borrows it for its build
 /// ([`MemoryStore::build_view`](crate::store::MemoryStore::build_view)), and
@@ -995,7 +1008,9 @@ impl Iterator for Segments<'_> {
 
 /// The candidate row of one member: its fixed fields from its registration,
 /// its status bits, and its load record when one is on file. Its pair class
-/// is the membership's to derive ([`pair_up`]).
+/// is the membership's to derive ([`pair_up`]), and its engine family, zone
+/// and labels are the standing generation's lists' to say
+/// ([`Writer::list`]).
 fn row_of(member: &WorkerRow, sample: Option<&LoadSample>, origin: Instant) -> Candidate {
     let facts = &member.facts;
     Candidate {
@@ -1335,6 +1350,8 @@ pub(super) struct Writer {
     silenced: u32,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
+    /// The standing members outside the standing generation's lists.
+    outside: OutsideLists,
     /// The last publication the window counts from: a window's end, or a
     /// load write that published by itself.
     last_window: Option<Instant>,
@@ -1373,6 +1390,7 @@ impl Writer {
             judging: false,
             silenced: 0,
             flips: 0,
+            outside: OutsideLists::default(),
             last_window: None,
             waiting: false,
         }
@@ -1409,15 +1427,19 @@ impl Writer {
     /// nothing is published: the number only rises, so no reader sees a
     /// generation and then a lower one. Each pool takes the thresholds of
     /// the new generation's binding, and every engine is judged again
-    /// under them from what is on file.
+    /// under them from what is on file. A generation whose lists differ
+    /// from the standing one's has each of `members`, the standing
+    /// membership, read again under them, so the first world of a
+    /// generation holds rows of its own lists.
     ///
     /// The pair classes are derived under the generation's pairing mode.
     /// A generation of the standing mode keeps the rows' classes; one
     /// of another mode derives `members`, the standing membership, again by
-    /// the membership write's own door ([`Writer::rebuild`]) and publishes
-    /// once, under the new generation at the standing epoch: the epoch is
-    /// the membership's and the generation the document's, and what is
-    /// derived from both is published under both.
+    /// the membership write's own door ([`Writer::rebuild`]), which reads
+    /// each member under the lists that stand, and publishes once, under
+    /// the new generation at the standing epoch: the epoch is the
+    /// membership's and the generation the document's, and what is derived
+    /// from both is published under both.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
@@ -1438,11 +1460,15 @@ impl Writer {
                 offered: spec.generation(),
             });
         }
+        let relisted = spec.lists() != self.spec.lists();
         let derive = spec.pairing() != self.spec.pairing();
         let before = self.retired.replace(mem::replace(&mut self.spec, spec));
         let world = if derive {
             self.rebuild(self.epoch, members, sample_of, Classes::Derive)
         } else {
+            if relisted {
+                self.list(members);
+            }
             self.bind();
             // A generation of the standing mode comes with no membership
             // write: the receipts are read from the samples as the rows
@@ -1452,6 +1478,43 @@ impl Writer {
             self.publish()
         };
         Ok((world, before))
+    }
+
+    /// Read every member under the standing generation's lists: its engine
+    /// family and its zone as positions, its labels as bits, in each of
+    /// its rows. For a membership write, whose rows are new, and for an
+    /// apply whose lists differ. A pool with a row that moved is published
+    /// whole.
+    fn list<'a>(&mut self, members: impl Iterator<Item = &'a WorkerRow>) {
+        let Self {
+            places,
+            working,
+            spec,
+            outside,
+            ..
+        } = self;
+        let lists = spec.lists();
+        *outside = OutsideLists::default();
+        for member in members {
+            let facts = &member.facts;
+            let listed = lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
+            outside.engines += u32::from(listed.engine_outside);
+            outside.zones += u32::from(listed.zone_outside);
+            let now = (listed.engine_kind, listed.zone, listed.labels);
+            for place in places_of(places, member.id) {
+                let Some(pool) = working.get_mut(place.pool as usize) else {
+                    continue;
+                };
+                let Some(row) = pool.rows.get_mut(place.row as usize) else {
+                    continue;
+                };
+                if (row.engine_kind, row.zone, row.labels) == now {
+                    continue;
+                }
+                (row.engine_kind, row.zone, row.labels) = now;
+                pool.dirty = true;
+            }
+        }
     }
 
     /// Each pool's thresholds under the standing generation: those of the
@@ -1777,6 +1840,11 @@ impl Writer {
         self.flips
     }
 
+    /// The standing members outside the standing generation's lists.
+    pub(super) fn outside(&self) -> OutsideLists {
+        self.outside
+    }
+
     /// Derive the pools of the membership `members` at the store's `epoch`,
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the
@@ -1821,7 +1889,7 @@ impl Writer {
         let mut owned = false;
         let mut groups: FxHashMap<Box<str>, [Vec<Entry<'a>>; ROLES]> = FxHashMap::default();
         // The members' ids are read by the vetoes alone: a membership write
-        // with no veto standing neither collects nor sorts them.
+        // with no veto standing does not collect them.
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
         // The members in id order, by this write's one sort, each id beside
@@ -1831,7 +1899,7 @@ impl Writer {
         let mut members: Vec<(WorkerId, &'a WorkerRow)> =
             members.map(|member| (member.id, member)).collect();
         members.sort_unstable_by_key(|&(id, _)| id);
-        for (_, member) in members {
+        for &(_, member) in &members {
             if standing {
                 ids.push(member.id);
             }
@@ -1967,6 +2035,16 @@ impl Writer {
         }
         self.places
             .sort_unstable_by_key(|place| (place.id, place.pool));
+        // Each row's engine family, zone and labels under the standing
+        // generation's lists, before the rows are cut for the publication.
+        // The members are walked once more where the generation declares a
+        // list. One with none counts no member outside a list: an apply
+        // that derives the classes again may have dropped the last one's.
+        if self.spec.lists().is_empty() {
+            self.outside = OutsideLists::default();
+        } else {
+            self.list(members.iter().map(|&(_, member)| member));
+        }
         // The engines, from the places, which stand by member: a member's
         // first place is where its record is read, each is where a verdict
         // is written. The writer's lists are written over in place, so the
