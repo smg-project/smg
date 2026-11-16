@@ -9,6 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc::sync_channel,
         Arc, Weak,
     },
     thread,
@@ -624,6 +625,8 @@ pub(crate) struct ObserveLane {
     peer: Arc<Peer>,
     events: Weak<dyn LaneEvents>,
     queue: Mutex<Option<mpsc::Receiver<proto::ObserveRequest>>>,
+    /// The events the plugin's queue refused: an event's number counts them.
+    refused: Arc<AtomicU64>,
 }
 
 impl ObserveLane {
@@ -631,11 +634,13 @@ impl ObserveLane {
         peer: Arc<Peer>,
         events: Weak<dyn LaneEvents>,
         queue: mpsc::Receiver<proto::ObserveRequest>,
+        refused: Arc<AtomicU64>,
     ) -> Self {
         Self {
             peer,
             events,
             queue: Mutex::new(Some(queue)),
+            refused,
         }
     }
 
@@ -693,19 +698,46 @@ impl Runtime {
     ) -> Result<Arc<Self>, io::Error> {
         let (commands, rx) = mpsc::unbounded_channel();
         let witness = Arc::new(Witness::new());
-        // The event loop is built here, on the calling thread: a host that
-        // cannot build one reads the error where it asked.
-        let io_loop = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        // The I/O thread builds its event loop and says how that went before
+        // the constructor returns: a host that cannot build one reads the
+        // error where it asked. The thread's closure owns no loop, so a
+        // thread that cannot start drops nothing that blocks on the caller.
+        let (built, building) = sync_channel(1);
         let io = thread::Builder::new()
             .name("smg-policy-grpc".to_owned())
             .spawn({
                 let witness = Arc::clone(&witness);
-                // Every stream's task is owned by the loop's set and goes
-                // with it.
-                move || io_loop.block_on(async move { drop(run_commands(rx, witness).await) })
+                move || {
+                    let io_loop = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(io_loop) => io_loop,
+                        Err(error) => {
+                            let _ = built.send(Err(error));
+                            return;
+                        }
+                    };
+                    let _ = built.send(Ok(()));
+                    // Every stream's task is owned by the loop's set and goes
+                    // with it.
+                    io_loop.block_on(async move { drop(run_commands(rx, witness).await) });
+                }
             })?;
+        match building.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                // The thread ends once it has said so.
+                let _ = io.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = io.join();
+                return Err(io::Error::other(
+                    "the I/O thread ended before its event loop was built",
+                ));
+            }
+        }
         Ok(Arc::new(Self {
             decisions: Arc::clone(decisions),
             commands,
@@ -965,9 +997,11 @@ async fn run_observe(lane: Arc<ObserveLane>) {
     // One line per outage: the first failure after a call that carried an
     // event.
     let mut reported = false;
-    // The events' numbers, one count for the plugin's life: a number never
-    // goes down, on one stream or across two.
-    let mut seq = 0_u64;
+    // The events sent, one count for the plugin's life. An event's number
+    // is that count plus the events the queue refused: both only grow, so a
+    // number never goes down, on one stream or across two, and a gap is
+    // what the plugin lost.
+    let mut sent = 0_u64;
     loop {
         if lane.events.strong_count() == 0 {
             return;
@@ -1010,12 +1044,13 @@ async fn run_observe(lane: Arc<ObserveLane>) {
                 match queue.recv().await {
                     Some(mut event) => {
                         // Numbered here, where it enters the stream: one
-                        // task numbers every event, in the order it sends.
+                        // task numbers every event, in the order it sends,
+                        // by what the stream owed until now.
                         if let Some(proto::observe_request::Request::Event(numbered)) =
                             event.request.as_mut()
                         {
-                            seq += 1;
-                            numbered.seq = seq;
+                            sent += 1;
+                            numbered.seq = sent + lane.refused.load(Ordering::Relaxed);
                         }
                         if tx.send(event).await.is_err() {
                             return true;

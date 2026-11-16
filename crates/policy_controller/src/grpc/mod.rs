@@ -76,10 +76,11 @@
 //! numbered by the I/O thread where it enters the stream, so the numbers
 //! never go down whichever threads raise the events; an event the queue
 //! cannot take at once is dropped and counted,
-//! never a wait on a deciding thread. Each profile that binds the plugin
-//! holds one [`Bound`] set, taken from its engine build's [`Binder`]: one
-//! adapter of a build forwards, so an event reaches the plugin once per
-//! engine.
+//! never a wait on a deciding thread. A number counts the events sent and
+//! the events refused, so a gap tells the plugin what it lost. Each profile
+//! that binds the plugin holds one [`Bound`] set, taken from its engine
+//! build's [`Binder`]: one adapter of a build forwards, so an event reaches
+//! the plugin once per engine.
 //!
 //! The runtime: one I/O thread per process ([`Runtime`]) owns every stream;
 //! a deciding thread hands it a frame and waits on that frame's place in
