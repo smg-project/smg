@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, identity_of, BatchFacts, BatchOutcome, ContentHash, GatewayId, HealthSink, KvEvent,
-    KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
+    identity, identity_of, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink,
+    KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
     MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, ReservationKind,
     ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
     StoredBlock, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
@@ -291,6 +291,30 @@ fn a_gateway_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear()
     assert!(
         !health.completed_ok_since(g1, id, now),
         "one gateway's dispatch keeps the worker routable for that gateway alone"
+    );
+}
+
+/// The health table keeps the latest instant of a gateway's completions on
+/// a worker: an earlier one that arrives after it moves nothing back.
+#[test]
+fn a_gateways_completion_on_a_worker_is_kept_at_its_latest_instant() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://e:8000");
+    let health: &dyn HealthSink = &store;
+    let gateway = GatewayId(1);
+    let first = Instant::now();
+    let second = first + Duration::from_millis(5);
+    health.completed(gateway, id, TransportClass::Ok, first);
+    assert!(!health.completed_ok_since(gateway, id, second));
+    health.completed(gateway, id, TransportClass::Ok, second);
+    assert!(
+        health.completed_ok_since(gateway, id, second),
+        "the later completion is the one kept"
+    );
+    health.completed(gateway, id, TransportClass::Ok, first);
+    assert!(
+        health.completed_ok_since(gateway, id, second),
+        "an earlier one that arrives late moves nothing back"
     );
 }
 
@@ -1031,8 +1055,8 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
     );
     assert_eq!(leases.issue(lease(gateway, 2, 3, now)), Ok(()));
     assert_eq!(leases.live(gateway), 2);
-    assert!(leases.dispatched(gateway, LeaseId(1), Side::Single, now));
-    assert!(!leases.dispatched(GatewayId(2), LeaseId(1), Side::Single, now));
+    assert!(leases.dispatched(gateway, LeaseId(1), Dispatch::default(), now));
+    assert!(!leases.dispatched(GatewayId(2), LeaseId(1), Dispatch::default(), now));
     let expired = leases.expire(now + Duration::from_secs(2));
     assert_eq!(
         expired.len(),
@@ -1056,7 +1080,7 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
         duration_micros: 0,
     };
     assert!(leases.completed(gateway, LeaseId(1), &outcome));
-    assert!(!leases.released(gateway, LeaseId(1), ReleaseReason::ClientGone));
+    assert!(!leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
     assert_eq!(leases.live(gateway), 0);
 }
 

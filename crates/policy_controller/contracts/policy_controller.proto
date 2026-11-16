@@ -51,17 +51,24 @@
 // digest guard, or a rejoin position not held under its term (a
 // resync_required batch precedes it; the rejoin opens a new Replicate
 // stream); INVALID_ARGUMENT a spec or registration rejected (the field
-// path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
+// path in ApplyResult.issues and the status detail), a Dispatched,
+// Completed or Released whose side, class, reason or number reads wrong,
+// or a Released that names neither a lease nor a ticket (the field's name
+// in the message); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
 // resync_required batch precedes it), a Hello past the controller's
 // ceiling of present gateways, or a Session frame over the transport's
 // limit of 4 MiB a message; ALREADY_EXISTS a Hello whose id collides
 // with another present gateway's, refused while that one stands;
-// UNAVAILABLE a standby not yet synced;
+// DEADLINE_EXCEEDED a Session stream that said no Hello within 5 s of
+// its open; UNAVAILABLE a standby not yet synced;
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced; OUT_OF_RANGE and
-// DATA_LOSS never raised, forwarded as RelayResync. Any other read of a
+// DATA_LOSS raised by no handler, forwarded as RelayResync. The
+// transport answers OUT_OF_RANGE itself to a request over its limit of
+// 4 MiB on a call of one request message; on a Session stream the reader
+// answers that finding RESOURCE_EXHAUSTED. Any other read of a
 // Session frame that the transport fails ends the stream under the
 // transport's own status. In-band within a stream:
 // Busy, NotLeader, SpecAck { accepted: false }, Decline.
@@ -234,7 +241,9 @@ message Welcome {
   // Initial credit per Decide stream; a new Decide stream starts here again.
   uint32 decide_window = 7;
   uint32 max_decide_streams = 8;
-  // The stream rule's grace period and the default dispatch TTL.
+  // The stream rule's grace period and the default dispatch TTL. A gateway
+  // is let go one grace period after its last session ended, and one period
+  // more at most while a session that a newer one replaced still runs.
   uint32 grace_period_ms = 9;
   uint32 dispatch_ttl_ms = 10;
   // How often the gateway polls Leader for its term floor.

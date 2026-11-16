@@ -22,7 +22,7 @@ use crate::{
         health::HealthSink,
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
-        leases::{LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
+        leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
         loads::{LoadSample, LoadSink, LoadSource, PollMode},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
@@ -284,11 +284,14 @@ impl MemoryStore {
         self.show(world);
     }
 
-    /// How many entries the health tables hold, over every gateway.
+    /// How many entries the health tables hold, over every gateway. A
+    /// gateway's table that holds none counts as one: a table left behind
+    /// shows.
     #[cfg(test)]
-    pub(super) fn health_entries(&self) -> usize {
+    pub(crate) fn health_entries(&self) -> usize {
         let health = self.health.lock();
-        health.vetoes.len() + health.ok_at.len()
+        let completions = health.ok_at.values().map(|workers| workers.len().max(1));
+        health.vetoes.len() + completions.sum::<usize>()
     }
 
     /// How many writes to the load table moved an overload verdict: a
@@ -333,6 +336,15 @@ impl MemoryStore {
         health.forget(id);
         let mut loads = self.loads.lock();
         loads.ranks.remove(&id);
+    }
+
+    /// A gateway is gone past its grace period: what the health tables
+    /// hold under its key leaves with it, here and nowhere else. Its
+    /// completions today; its vetoes join with the arm that writes them.
+    /// Called from [`LeasesStore::drop_gateway`]: one door tells the store
+    /// a gateway is gone.
+    fn forget_gateway(&self, gateway: GatewayId) {
+        self.health.lock().ok_at.remove(&gateway);
     }
 
     /// How many times a publication allocated a pool's rows since the store
@@ -633,15 +645,20 @@ struct HealthTables {
     /// A gateway's veto on a worker, until the instant.
     vetoes: FxHashMap<(GatewayId, WorkerId), Instant>,
     /// The latest completed dispatch of class `Ok` on a worker by each
-    /// gateway: the precedence rule is per gateway.
-    ok_at: FxHashMap<(GatewayId, WorkerId), Instant>,
+    /// gateway: the precedence rule is per gateway. One table a gateway:
+    /// a gateway's end lets its own go whole and walks no other's.
+    ok_at: FxHashMap<GatewayId, FxHashMap<WorkerId, Instant>>,
 }
 
 impl HealthTables {
-    /// Drop every gateway's entries on the worker.
+    /// Drop every gateway's entries on the worker; a gateway's table that
+    /// holds none after it goes too.
     fn forget(&mut self, id: WorkerId) {
         self.vetoes.retain(|(_, worker), _| *worker != id);
-        self.ok_at.retain(|(_, worker), _| *worker != id);
+        self.ok_at.retain(|_, workers| {
+            workers.remove(&id);
+            !workers.is_empty()
+        });
     }
 }
 
@@ -767,7 +784,12 @@ impl HealthSink for MemoryStore {
             return;
         }
         let mut health = self.health.lock();
-        let latest = health.ok_at.entry((gateway, id)).or_insert(at);
+        let latest = health
+            .ok_at
+            .entry(gateway)
+            .or_default()
+            .entry(id)
+            .or_insert(at);
         if at > *latest {
             *latest = at;
         }
@@ -777,7 +799,8 @@ impl HealthSink for MemoryStore {
         self.health
             .lock()
             .ok_at
-            .get(&(gateway, id))
+            .get(&gateway)
+            .and_then(|workers| workers.get(&id))
             .is_some_and(|at| *at >= since)
     }
 }
@@ -1223,7 +1246,13 @@ impl LeasesStore for MemoryStore {
         Ok(())
     }
 
-    fn dispatched(&self, gateway: GatewayId, lease: LeaseId, _side: Side, at: Instant) -> bool {
+    fn dispatched(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        _dispatch: Dispatch,
+        at: Instant,
+    ) -> bool {
         let mut leases = self.leases.lock();
         let Some(record) = leases.records.get_mut(&(gateway, lease)) else {
             return false;
@@ -1248,7 +1277,15 @@ impl LeasesStore for MemoryStore {
         true
     }
 
-    fn released(&self, gateway: GatewayId, lease: LeaseId, _reason: ReleaseReason) -> bool {
+    fn released(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        _side: Option<Side>,
+        _reason: ReleaseReason,
+    ) -> bool {
+        // No side is read yet: a release of one side of a pair ends the
+        // whole lease. The step that issues a pair's lease reads it.
         self.leases
             .lock()
             .records
@@ -1297,6 +1334,7 @@ impl LeasesStore for MemoryStore {
     }
 
     fn drop_gateway(&self, gateway: GatewayId) -> usize {
+        self.forget_gateway(gateway);
         let mut leases = self.leases.lock();
         let before = leases.records.len();
         leases.records.retain(|(owner, _), _| *owner != gateway);
