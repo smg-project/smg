@@ -11,6 +11,10 @@
 //! hold one take a term. The promotion's time is read and printed; its bound
 //! is the settings' own with room for a loaded host.
 //!
+//! A second case kills a lone leader and starts it again under its
+//! identity: the new run leads under the term above, after the wait of
+//! every candidate.
+//!
 //! No stub server: the client is the generated one and the server is the
 //! binary. The cells at the end are the Numbers table's rows, run by name.
 #![expect(
@@ -65,6 +69,30 @@ fn start(id: &str, lease: &Path, settings: ElectionSettings) -> Replica {
     Replica::start(id, Lease::File(lease), settings, SETTLE_SECS).expect("the replica starts")
 }
 
+/// The address a replica of the restart cases advertises: the holder
+/// identity is the id at this address whatever its listeners bind, so a
+/// second process started the same way is the first one's restart to the
+/// election. Nothing dials it: the cases ask each process where it listens.
+const ADVERTISED: &str = "127.0.0.1:9";
+
+fn start_at(id: &str, lease: &Path, settings: ElectionSettings) -> Replica {
+    Replica::start_at(id, ADVERTISED, Lease::File(lease), settings, SETTLE_SECS)
+        .expect("the replica starts")
+}
+
+/// Samples until a replica answers as the leader: that answer.
+async fn led(record: &mut Record, replicas: &mut [Replica]) -> replicas::Answer {
+    let started = Instant::now();
+    loop {
+        let answers = record.sample(replicas).await;
+        if let Some(answer) = answers.into_iter().find(|answer| answer.info.is_leader) {
+            return answer;
+        }
+        assert!(started.elapsed() < ROOM, "no replica led in {ROOM:?}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 /// One leader, named by every replica: its place and the term.
 async fn agreed(record: &mut Record, replicas: &mut [Replica]) -> (usize, u64) {
     record
@@ -103,6 +131,63 @@ fn stored(lease: &Path) -> LeaseRecord {
 
 fn millis(duration: Duration) -> u128 {
     duration.as_millis()
+}
+
+/// A leader killed and started again under its identity, as a lone
+/// controller over its lease file or a container restarted in its pod. The
+/// new run waits its earlier run's record out for the record's duration, as
+/// every candidate does, and takes the term above: it never leads under the
+/// term its earlier run led under. A term is taken once, so what a reader
+/// holds under a term came from one run of one store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leader_restarted_under_its_identity_leads_under_the_term_above() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lease = dir.path().join("lease");
+    let settings = short();
+    let mut record = Record::default();
+    let mut replicas = vec![start_at("replica-a", &lease, settings)];
+    let first = led(&mut record, &mut replicas).await;
+    let identity = replicas[0].identity();
+    let mut earlier = replicas.remove(0);
+    earlier.kill().expect("SIGKILL");
+    let killed = Instant::now();
+    let last = stored(&lease);
+    assert_eq!(
+        (last.holder.as_str(), last.term),
+        (identity.as_str(), first.info.term)
+    );
+
+    // The same id at the same advertised address: the earlier run's record
+    // is under this run's own name. The new process answers into a record
+    // of its own: it answers term zero until its first look at the lease,
+    // which one record over both runs would read as the first run's term
+    // falling.
+    replicas.push(start_at("replica-a", &lease, settings));
+    let mut restarted = Record::default();
+    let again = led(&mut restarted, &mut replicas).await;
+    assert_eq!(
+        again.info.term,
+        first.info.term + 1,
+        "the restart leads under the term above its earlier run's"
+    );
+    let waited = again.returned.duration_since(killed);
+    assert!(
+        waited >= settings.duration,
+        "the restart led {waited:?} after the kill, inside the record's duration"
+    );
+    let taken = stored(&lease);
+    assert_eq!(
+        (taken.holder.as_str(), taken.term),
+        (identity.as_str(), again.info.term)
+    );
+    assert!(
+        taken.acquired_at_micros > last.renewed_at_micros,
+        "a take in every field"
+    );
+    record.check().expect("the election's promise holds");
+    restarted
+        .check()
+        .expect("the election's promise holds after the restart");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -645,4 +730,107 @@ async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
         "REMOVED_ROUNDS n={counted} with_two_leaders={with_two} promise_broken={broken}"
     )
     .expect("stdout");
+}
+
+/// What a leader's restart costs, at the design's default settings or at
+/// the timings the environment names. Over `SMG_REPLICAS_ROUNDS` rounds
+/// (default 5) a lone leader under an advertised identity is killed, at
+/// another point of its renew period each round, and started again at once;
+/// the kill to the new run's first answer as the leader is read by this
+/// test's clock, with the term before and after. A measurement, run by name
+/// with `--ignored`; it asserts nothing of the election, so it reads a
+/// binary that leads again under its earlier run's term, or one that takes
+/// with no wait, as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn restart_times_of_a_leader_under_its_identity() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lease = dir.path().join("lease");
+    let mut out = std::io::stdout();
+    let settings = replicas::timings(ElectionSettings::default(), &mut out);
+    let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
+    let period = settings.renew_period;
+    let mut record = Record::default();
+    let mut replicas = vec![start_at("replica-a", &lease, settings)];
+    let (mut from_kill, mut same_term) = (Vec::new(), 0u64);
+    for round in 0..rounds {
+        let term = led(&mut record, &mut replicas).await.info.term;
+        tokio::time::sleep(spread(round, 0, period)).await;
+        let mut earlier = replicas.remove(0);
+        earlier.kill().expect("SIGKILL");
+        let at = Instant::now();
+        replicas.push(start_at("replica-a", &lease, settings));
+        let again = led(&mut record, &mut replicas).await;
+        let kill_ms = millis(again.returned.duration_since(at));
+        same_term += u64::from(again.info.term == term);
+        writeln!(
+            out,
+            "RESTART round={round} term={term}->{} from_kill_ms={kill_ms}",
+            again.info.term
+        )
+        .expect("stdout");
+        from_kill.push(kill_ms);
+    }
+    summaries(
+        &mut out,
+        [("RESTART_KILL_TO_LEADER_ANSWER_MS", &mut from_kill)],
+    );
+    writeln!(
+        out,
+        "RESTART_ROUNDS n={rounds} under_the_earlier_term={same_term}"
+    )
+    .expect("stdout");
+}
+
+/// What the restart's wait is for, at the same timings. Over the rounds a
+/// second process is started under a live leader's identity, at another
+/// point of the leader's renew period each round, and both are asked
+/// `Leader` every few milliseconds for a lease duration and a renew period
+/// more. A round is read two ways: the longest run of samples in which both
+/// answered as the leader, and whether the second process led at all. A
+/// measurement, run by name with `--ignored`; it asserts nothing of the
+/// election, so it reads a binary that takes with no wait as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_second_process_started_under_a_live_leaders_identity() {
+    let mut out = std::io::stdout();
+    let settings = replicas::timings(ElectionSettings::default(), &mut out);
+    let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
+    let period = settings.renew_period;
+    let (mut two_ms, mut second_led) = (Vec::new(), 0u64);
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let mut record = Record::default();
+        let mut replicas = vec![start_at("replica-a", &lease, settings)];
+        led(&mut record, &mut replicas).await;
+        tokio::time::sleep(spread(round, 0, period)).await;
+        replicas.push(start_at("replica-a", &lease, settings));
+        let started = Instant::now();
+        let (mut samples, mut both, mut led_too) = (0u64, 0u64, false);
+        let mut two = Stretch::default();
+        while started.elapsed() < settings.duration + period {
+            let at = Instant::now();
+            let mut leaders = 0;
+            for (place, replica) in replicas.iter_mut().enumerate() {
+                let leads = replica.leader().await.is_some_and(|info| info.is_leader);
+                leaders += usize::from(leads);
+                led_too |= leads && place == 1;
+            }
+            samples += 1;
+            both += u64::from(leaders == 2);
+            two.read(leaders == 2, at);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        second_led += u64::from(led_too);
+        writeln!(
+            out,
+            "TWIN round={round} samples={samples} both={both} both_ms={} second_led={led_too}",
+            millis(two.longest)
+        )
+        .expect("stdout");
+        two_ms.push(millis(two.longest));
+    }
+    summaries(&mut out, [("TWIN_TWO_LEADERS_MS", &mut two_ms)]);
+    writeln!(out, "TWIN_ROUNDS n={rounds} second_led={second_led}").expect("stdout");
 }
