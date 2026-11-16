@@ -19,11 +19,26 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use smg::routers::grpc::{EngineScript, StreamBench};
 
-/// The gateway binary runs on jemalloc (see `src/main.rs`); the benchmark
-/// links the same allocator.
+/// The gateway binary runs on jemalloc with its own run-time options (see
+/// `src/main.rs`); the benchmark links the same allocator under the same
+/// options, as `stream_state_machines` does.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
-#[global_allocator]
-static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+mod allocator {
+    use smg::observability::metrics::SERVER_MALLOC_CONF;
+    use tikv_jemallocator::Jemalloc;
+
+    /// The gateway's jemalloc options, exported as `src/main.rs` exports
+    /// them.
+    #[expect(
+        unsafe_code,
+        reason = "jemalloc reads its options from this exported symbol, as src/main.rs exports it"
+    )]
+    #[export_name = "_rjem_malloc_conf"]
+    pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
+
+    #[global_allocator]
+    static GLOBAL_ALLOCATOR: Jemalloc = Jemalloc;
+}
 
 /// The tokens of one stream: the chunks before the completion.
 const TOKENS: usize = 300;
