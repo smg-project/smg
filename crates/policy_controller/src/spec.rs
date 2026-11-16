@@ -2640,9 +2640,12 @@ impl PolicySpec {
 /// engine's own, the document's `generation` line: there is no second
 /// holder.
 ///
-/// It is made by validation alone ([`AppliedSpec::validate`]), so a document
-/// that fails validation never becomes one. Before any document is applied
-/// a store holds [`AppliedSpec::unbound`], the only generation 0.
+/// A document becomes one by validation alone ([`AppliedSpec::validate`]):
+/// one that fails validation never does. The other constructor validates
+/// nothing: [`AppliedSpec::unbound`] is what a store holds before any
+/// document is applied, and the only generation 0 a store ever holds. A
+/// document that names no generation validates to number 0 too, and the
+/// store's apply refuses it as not above the standing one.
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
@@ -3375,6 +3378,33 @@ mod tests {
             .validate()
             .expect("an allow-listed header");
         assert!(engine.needs().headers);
+    }
+
+    #[test]
+    fn a_generation_is_refused_for_a_header_the_host_denies() {
+        let tenant = spec_with_view(r#"{"headers":["x-smg-tenant-id"]}"#);
+        assert!(AppliedSpec::validate(&tenant).is_ok());
+        assert_eq!(
+            AppliedSpec::validate_with(&tenant, &["X-SMG-Tenant-Id"]).err(),
+            Some(SpecError::DeniedHeader {
+                path: "view.headers[0]".into(),
+                name: "x-smg-tenant-id".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_generation_declares_the_needs_of_its_engine() {
+        for name in PRESETS {
+            let document = PolicySpec::preset(name).expect(name);
+            let applied = AppliedSpec::validate(&document).expect(name);
+            assert_eq!(applied.needs(), applied.engine().needs(), "{name}");
+        }
+        let cache_aware = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        let needs = AppliedSpec::validate(&cache_aware)
+            .expect("a preset validates")
+            .needs();
+        assert!(needs.loads && needs.events && needs.affinity);
     }
 
     #[test]
