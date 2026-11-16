@@ -4586,6 +4586,61 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     assert_handshake_released(&handshake).await;
 }
 
+/// A stop while the link is still waiting for its engine releases the
+/// handshake endpoint too: the connect that was waiting ends with the server,
+/// and its endpoint file does not outlive `stop`.
+#[tokio::test]
+async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    wait_until(|| fs::metadata(&endpoint).is_ok()).await;
+    assert!(
+        server.last_error().unwrap().is_none(),
+        "the link is still waiting for the engine"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+    assert_handshake_released(&handshake).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+}
+
 /// Between HELLO and READY a real engine loads its model, and nothing crosses
 /// the wire meanwhile. The lifecycle owner's reports that the engine process
 /// is alive keep the link waiting well past the silence bound, and the start

@@ -47,7 +47,10 @@
 //! structural tag of a forced or required call, or of a JSON `response_format`
 //! ([`constraint_for`]) before the older registry. Both decide with one predicate, so the
 //! output a table's tag constrains is read by that table and never by the older parsers, which
-//! expect another syntax. Request building decides what constrains the output on the worker
+//! expect another syntax. Where the table has no tag for a forced or required call, the older
+//! registry constrains it with its JSON schema and the table reads that output too, with its
+//! forced call ([`assign_for`]): the thought as the table reads one, then the JSON alone.
+//! Request building decides what constrains the output on the worker
 //! selected for the request ([`worker_constraint`]): a worker whose engine takes a grammar on every
 //! turn from its first token gets the whole turn's grammar where the response template's table
 //! spells one ([`turn_constraint`]); a table's refusal in preparation waits for that decision. The

@@ -7,11 +7,11 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, json_type_name, on_field,
-        validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
-        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse, FunctionChoice,
-        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
-        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        deserialize_null_as_true, empty_tool_name, invalid, invalid_at, is_false, is_true,
+        json_type_name, on_field, validate_json_schema_shape, validate_logit_bias, validate_stop,
+        CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -879,16 +879,25 @@ fn validate_chat_cross_parameters(
             .map_err(|error| on_field(error, "response_format"))?;
     }
 
-    // The provider profile, derived once here for the tool-choice rule (7)
-    // and the contract rules (10).
+    // 7. A function has a name. The rule stands ahead of the choice's, so
+    //    the unnamed tool is the one refused whatever `tool_choice` says
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
+        if tool.function.name.is_empty() {
+            let field = format!("tools[{index}].function.name");
+            return Err(on_field(empty_tool_name(&field), field));
+        }
+    }
+
+    // The provider profile, derived once here for the tool-choice rule (8)
+    // and the contract rules (11).
     let provider = ProviderProfile::for_model(&req.model);
 
-    // 7. A tool_choice against the tools the model will see
+    // 8. A tool_choice against the tools the model will see
     if let Some(tool_choice) = &req.tool_choice {
         validate_tool_choice(req, provider, tool_choice)?;
     }
 
-    // 8. A function's `parameters`, when given, is a JSON Schema object (an
+    // 9. A function's `parameters`, when given, is a JSON Schema object (an
     //    absent or null schema was read as none and passes)
     for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
         let Some(schema) = &tool.function.parameters else {
@@ -907,7 +916,7 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 9. A continued final message and the generation header exclude each
+    // 10. A continued final message and the generation header exclude each
     //     other: the pair set together is refused, as the engine that has
     //     the field refuses it; `continue_final_message` alone continues.
     if req.continue_final_message && req.add_generation_prompt == Some(true) {
@@ -918,7 +927,7 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. Provider-profile contract rules, selected from the model id. Both
+    // 11. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -2373,6 +2382,54 @@ mod request_contract_tests {
         );
         let empty = request(json!({"tools": [{"type": "function", "function": {"name": "f"}}]}));
         assert_eq!(rejection(&empty), None);
+    }
+
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: the model can be made to call it, and no client can dispatch
+    /// a call that names nothing. The first such tool is the one named, under
+    /// every `tool_choice`: a choice that names the empty function, and the
+    /// choices their own rule refuses (a function not declared, a mode not
+    /// known), which the name's rule stands ahead of.
+    #[test]
+    fn a_function_has_a_name() {
+        use crate::common::FIELD_PARAM;
+
+        let parameters = json!({"type": "object", "properties": {}});
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": parameters}});
+        for (tools, at) in [
+            (json!([tool("")]), 0),
+            (json!([tool("f"), tool(""), tool("")]), 1),
+        ] {
+            for choice in [
+                json!("auto"),
+                json!("required"),
+                json!("none"),
+                json!({"type": "function", "function": {"name": ""}}),
+                json!({"type": "function", "function": {"name": "not declared"}}),
+                json!({"type": "allowed_tools", "mode": "sometimes",
+                       "tools": [{"type": "function", "name": "f"}]}),
+            ] {
+                let unnamed = request(json!({"tools": tools, "tool_choice": choice}));
+                let errors = unnamed.validate().expect_err("an empty name");
+                let error = &errors.field_errors()["__all__"][0];
+                assert_eq!(error.code, "empty_string", "{choice}");
+                let field = format!("tools[{at}].function.name");
+                assert_eq!(error.params[FIELD_PARAM], field.as_str(), "{choice}");
+                assert_eq!(
+                    error.message.as_deref(),
+                    Some(
+                        format!(
+                            "Invalid '{field}': empty string. Expected a string with minimum \
+                             length 1, but got an empty string instead."
+                        )
+                        .as_str()
+                    ),
+                    "{choice}"
+                );
+            }
+        }
+        let named = request(json!({"tools": [tool("f")], "tool_choice": "required"}));
+        assert_eq!(rejection(&named), None);
     }
 
     /// `logit_bias` is keyed by token ids, no two of them spelling one id,

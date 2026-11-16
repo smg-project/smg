@@ -307,7 +307,12 @@ async fn a_kernel_built_for_a_new_shape_is_not_a_wedge() {
     common::wait_until(
         "the worker's stream pushes load records",
         Duration::from_secs(10),
-        || worker.pushes_load_records(),
+        || {
+            worker
+                .runtime_state()
+                .expect("a gateway worker keeps its state")
+                .pushes_load_records()
+        },
     )
     .await;
 
@@ -363,7 +368,12 @@ async fn a_frozen_engine_on_a_shape_shown_is_still_vetoed_within_the_budget() {
     common::wait_until(
         "the worker's stream pushes load records",
         Duration::from_secs(10),
-        || worker.pushes_load_records(),
+        || {
+            worker
+                .runtime_state()
+                .expect("a gateway worker keeps its state")
+                .pushes_load_records()
+        },
     )
     .await;
 

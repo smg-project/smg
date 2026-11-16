@@ -22,13 +22,23 @@ use rcgen::{
 };
 use smg_policy_controller::{
     controller::{
-        Config, ConfigError, Controller, Error, Listener, Scope, State, Tls, TlsError, SERVICE_NAME,
+        Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, State, Tls,
+        TlsError, SERVICE_NAME,
+    },
+    elector::{ElectionSettings, FileLease, LeaseBackend},
+    proto::{
+        policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, LeaderRequest,
+        WatchWorkersRequest,
     },
     store::{LoadSink, LoadSource, WorkerFacts, WorkersStore},
     view::{LoadRow, Role},
 };
 use tokio::{net::TcpStream, sync::oneshot};
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use tonic::{
+    metadata::AsciiMetadataValue,
+    transport::{Certificate, Channel, ClientTlsConfig, Identity},
+    Code, Request,
+};
 use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
@@ -56,6 +66,7 @@ fn config() -> Config {
         shutdown_settle: Duration::from_millis(100),
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+        election: Election::default(),
     }
 }
 
@@ -131,7 +142,7 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
         let _ = stopped.await;
     });
     let probe = async {
-        assert_eq!(readiness.wait_for(State::Ready).await, Some(State::Ready));
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
         for listener in &addresses.listeners {
             assert_eq!(
                 health(listener.addr, "").await,
@@ -154,7 +165,10 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
         }
 
         let (status, body) = http_get(addresses.admin, "/readiness").await.expect("GET");
-        assert_eq!((status, body.as_str()), (200, r#"{"status":"ready"}"#));
+        assert_eq!(
+            (status, body.as_str()),
+            (200, r#"{"status":"ready","role":"leader"}"#)
+        );
         let (status, body) = http_get(addresses.admin, "/liveness").await.expect("GET");
         assert_eq!((status, body.as_str()), (200, "OK"));
         let (status, body) = http_get(addresses.admin, "/health").await.expect("GET");
@@ -168,7 +182,7 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
         let (status, body) = http_get(addresses.admin, "/metrics").await.expect("GET");
         assert_eq!(status, 200);
         assert!(
-            body.contains("smg_policy_controller_state{state=\"ready\"} 1"),
+            body.contains("smg_policy_controller_state{state=\"leader\"} 1"),
             "{body}"
         );
         assert!(
@@ -189,6 +203,81 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
     assert_eq!(readiness.state(), State::Draining);
 }
 
+/// `message` as a call that states `name`, or states none.
+fn stating<T>(name: Option<&'static str>, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(name) = name {
+        request
+            .metadata_mut()
+            .insert("x-smg-principal", AsciiMetadataValue::from_static(name));
+    }
+    request
+}
+
+/// A listener its operator named takes the name a call states, and no
+/// step serves the call yet. The other listeners take none: a call of
+/// theirs that needs a principal is refused whatever it states. `Leader`
+/// asks for no principal on either.
+#[tokio::test]
+async fn a_listener_named_as_told_takes_the_stated_name_and_the_others_take_none() {
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    assert_eq!(
+        controller.identity_as_told("nowhere"),
+        Err(ConfigError::UnknownListener("nowhere".to_owned()))
+    );
+    controller
+        .identity_as_told("control")
+        .expect("a listener of the configuration");
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let dial = |scope| {
+            let addr = addresses.of(scope).expect("every scope is mounted");
+            PolicyControllerClient::connect(format!("http://{addr}"))
+        };
+        let mut control = dial(Scope::Control).await.expect("the listener accepts");
+        let mut gateway = dial(Scope::Gateway).await.expect("the listener accepts");
+
+        let read = |name| stating(name, GetPolicySpecRequest::default());
+        let told = control
+            .get_policy_spec(read(Some("operator-a")))
+            .await
+            .expect_err("no step serves the call");
+        assert_eq!(told.code(), Code::Unimplemented, "{told:?}");
+        let silent = control
+            .get_policy_spec(read(None))
+            .await
+            .expect_err("no name is stated");
+        assert_eq!(silent.code(), Code::Unauthenticated, "{silent:?}");
+
+        let watch = stating(Some("gateway-a"), WatchWorkersRequest::default());
+        let unread = gateway
+            .watch_workers(watch)
+            .await
+            .expect_err("the listener takes no identity as told");
+        assert_eq!(unread.code(), Code::Unauthenticated, "{unread:?}");
+
+        for client in [&mut control, &mut gateway] {
+            let info = client
+                .leader(LeaderRequest::default())
+                .await
+                .expect("Leader asks for no principal")
+                .into_inner();
+            assert!(info.is_leader, "{info:?}");
+        }
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}
+
 #[tokio::test]
 async fn readiness_fails_at_the_signal_and_the_listeners_settle_before_they_close() {
     let mut config = config();
@@ -204,7 +293,7 @@ async fn readiness_fails_at_the_signal_and_the_listeners_settle_before_they_clos
         let _ = stopped.await;
     });
     let probe = async {
-        assert_eq!(readiness.wait_for(State::Ready).await, Some(State::Ready));
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
         let (status, _) = http_get(addresses.admin, "/readiness").await.expect("GET");
         assert_eq!(status, 200);
 
@@ -252,6 +341,93 @@ async fn readiness_fails_at_the_signal_and_the_listeners_settle_before_they_clos
         TcpStream::connect(addresses.admin).await.is_err(),
         "the admin listener closed"
     );
+}
+
+/// A controller that cannot read its lease is not ready: its probes answer
+/// starting and `Leader` names nobody, however long it runs. Once the lease
+/// reads, the next step takes it and the probes turn ready. A rollout stops
+/// at a replica that cannot reach its lease.
+#[tokio::test]
+async fn a_controller_that_cannot_read_its_lease_is_not_ready_until_it_can() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    // A directory where the lease file belongs: every look fails.
+    let lease = dir.path().join("lease");
+    std::fs::create_dir(&lease).expect("a directory in the lease's place");
+    let mut config = config();
+    // No settle window: the stop's release is all the serve waits for.
+    config.shutdown_settle = Duration::ZERO;
+    config.election = Election {
+        lease: LeasePlace::File(lease.clone()),
+        settings: ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(50),
+            renew_deadline: Duration::from_millis(400),
+        },
+        advertise: None,
+    };
+    let controller = Controller::bind(config).await.expect("bind");
+    let addresses = controller.addresses();
+    let gateway = addresses.of(Scope::Gateway).expect("the gateway listener");
+    let fence = controller.fence();
+    let mut readiness = controller.readiness();
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        // Ten renew periods of failed looks: the listeners answer, and the
+        // controller is not ready.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(readiness.state(), State::Starting);
+        let (status, body) = http_get(addresses.admin, "/readiness").await.expect("GET");
+        assert_eq!(
+            (status, body.as_str()),
+            (503, r#"{"status":"not ready","reason":"starting"}"#)
+        );
+        assert_eq!(health(gateway, "").await, Ok(ServingStatus::NotServing));
+        assert_eq!(fence.leader_term(Instant::now()), None);
+        let mut client = PolicyControllerClient::connect(format!("http://{gateway}"))
+            .await
+            .expect("the gateway listener accepts");
+        let nobody = client
+            .leader(LeaderRequest::default())
+            .await
+            .expect("Leader is served while starting")
+            .into_inner();
+        assert!(!nobody.is_leader);
+        assert_eq!(
+            (nobody.controller_id.as_str(), nobody.address.as_str()),
+            ("", "")
+        );
+
+        // The lease reads again: the next step takes it.
+        std::fs::remove_dir(&lease).expect("the directory goes");
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        assert_eq!(fence.leader_term(Instant::now()), Some(1));
+        assert_eq!(health(gateway, "").await, Ok(ServingStatus::Serving));
+        let leader = client
+            .leader(LeaderRequest::default())
+            .await
+            .expect("Leader is served")
+            .into_inner();
+        assert!(leader.is_leader);
+        assert_eq!(leader.controller_id, "test-controller");
+        assert_eq!(leader.address, gateway.to_string());
+        assert_eq!(leader.term, 1);
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+
+    // The stop released the lease: the file names nobody, under the term.
+    let record = FileLease::new(&lease)
+        .read()
+        .expect("the lease file reads")
+        .expect("the lease file holds a record");
+    assert!(record.is_released(), "{record:?}");
+    assert_eq!(record.term, 1);
 }
 
 #[tokio::test]
@@ -395,7 +571,13 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
         key,
         client_ca: None,
     });
-    let controller = Controller::bind(config).await.expect("bind");
+    let mut controller = Controller::bind(config).await.expect("bind");
+    // A listener has one credential rule: the one that verifies its callers
+    // against a client CA takes no identity as told.
+    assert_eq!(
+        controller.identity_as_told("gateway"),
+        Err(ConfigError::AsToldBesideClientCa("gateway".to_owned()))
+    );
     let addresses = controller.addresses();
     let mut readiness = controller.readiness();
     assert_eq!(
@@ -424,7 +606,7 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
         let _ = stopped.await;
     });
     let probe = async {
-        assert_eq!(readiness.wait_for(State::Ready).await, Some(State::Ready));
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
 
         assert_eq!(
             health_over_tls(gateway, trust().identity(identity_of(&gateway_client)), "").await,
@@ -477,7 +659,7 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
         let _ = stopped.await;
     });
     let feed = async {
-        assert_eq!(readiness.wait_for(State::Ready).await, Some(State::Ready));
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
         tokio::time::sleep(Duration::from_millis(200)).await;
         let idle = vm_rss_kib();
         let now = Instant::now();
