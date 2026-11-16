@@ -74,10 +74,13 @@ pub(crate) fn is_interned(s: &str) -> bool {
     STRING_INTERNER.contains_key(s)
 }
 
-/// Per-worker caches of the handles the gateway's per-request records go
-/// through: the HTTP layer's, the stream-timing set's, the per-worker
-/// request counters' and gauges', the breaker's outcomes', the selection's,
-/// the cache-aware decision's, the admission gauges' and the body path's.
+/// Per-worker caches of the handles the gateway's records go through. The
+/// per-request ones: the HTTP layer's, the stream-timing set's, the
+/// per-worker request counters' and gauges', the breaker's outcomes', the
+/// selection's, the cache-aware decision's, the admission gauges' and the
+/// body path's. The ones a worker's own streams move, with no request in
+/// hand: the engine load set, which a load record sets, and the KV-event
+/// set, which a batch of the event stream records.
 /// The helpers, the installed flag and the router's request and duration
 /// caches are the external router crate's
 /// (`smg_external_router::metrics::handles`), so every router records the
@@ -168,6 +171,23 @@ mod handles {
         pub(super) kv_capacity: Option<Gauge>,
         /// The PD gauges, under the role label the engine last reported.
         pd: Option<EnginePdHandles>,
+    }
+
+    /// The KV-event handles of one worker that a batch of its stream moves,
+    /// each built the first time a batch has something for it, so the
+    /// series that exist are exactly the ones recorded to.
+    #[derive(Default)]
+    pub(super) struct KvEventHandles {
+        /// `smg_kv_event_batches_total` by disposition.
+        pub(super) batches: FxHashMap<&'static str, Counter>,
+        /// `smg_kv_event_blocks_total` by op.
+        pub(super) blocks: FxHashMap<&'static str, Counter>,
+        /// `smg_kv_index_blocks`.
+        pub(super) index_blocks: Option<Gauge>,
+        /// `smg_kv_event_apply_seconds`.
+        pub(super) apply: Option<Histogram>,
+        /// `smg_kv_event_lag_seconds`.
+        pub(super) lag: Option<Histogram>,
     }
 
     /// The labels of one rank's core series, interned once per record that
@@ -444,6 +464,8 @@ mod handles {
         pub(super) static WORKER_CB_OUTCOMES: RefCell<WorkerOutcomes> = RefCell::new(WorkerOutcomes::default());
         /// The `smg_engine_*` set.
         pub(super) static ENGINE_LOADS: RefCell<EngineLoads> = RefCell::new(EngineLoads::default());
+        /// The KV-event set a batch moves.
+        pub(super) static KV_EVENTS: RefCell<ByWorker<KvEventHandles>> = RefCell::new(ByWorker::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
         pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
@@ -484,6 +506,7 @@ mod handles {
         WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
         ENGINE_LOADS.with_borrow_mut(|kept| *kept = EngineLoads::default());
+        KV_EVENTS.with_borrow_mut(|kept| *kept = ByWorker::default());
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -3351,14 +3374,32 @@ impl Metrics {
         .increment(1);
     }
 
+    /// The KV-event records of a batch go through this thread's kept
+    /// handles for the worker (dropped when the worker set changes, as every
+    /// kept per-worker handle is), or through handles built for the one
+    /// call when handles are not kept.
+    fn with_kv_event_handles(worker_url: &str, record: impl FnOnce(&mut handles::KvEventHandles)) {
+        if handles::keep_handles() {
+            handles::KV_EVENTS.with_borrow_mut(|kept| record(kept.for_worker(worker_url)));
+        } else {
+            record(&mut handles::KvEventHandles::default());
+        }
+    }
+
     /// Count a KV event batch by what the subscriber did with it.
     pub fn record_kv_event_batch(worker_url: &str, disposition: &'static str) {
-        counter!(
-            "smg_kv_event_batches_total",
-            "worker" => intern_string(worker_url),
-            "disposition" => disposition
-        )
-        .increment(1);
+        Self::with_kv_event_handles(worker_url, |kept| {
+            kept.batches
+                .entry(disposition)
+                .or_insert_with(|| {
+                    counter!(
+                        "smg_kv_event_batches_total",
+                        "worker" => intern_string(worker_url),
+                        "disposition" => disposition
+                    )
+                })
+                .increment(1);
+        });
     }
 
     /// Count a sequence gap and the batches it skipped.
@@ -3400,20 +3441,31 @@ impl Metrics {
 
     /// Observe how old a batch was when it was applied.
     pub fn record_kv_event_lag(worker_url: &str, seconds: f64) {
-        histogram!("smg_kv_event_lag_seconds", "worker" => intern_string(worker_url))
-            .record(seconds);
+        Self::with_kv_event_handles(worker_url, |kept| {
+            kept.lag
+                .get_or_insert_with(|| {
+                    histogram!("smg_kv_event_lag_seconds", "worker" => intern_string(worker_url))
+                })
+                .record(seconds);
+        });
     }
 
     /// Count the blocks an applied batch's events named (`stored` or
     /// `removed`), before the monitor's tier and group filters: the rate the
     /// index is offered.
     pub fn record_kv_event_blocks(worker_url: &str, op: &'static str, blocks: usize) {
-        counter!(
-            "smg_kv_event_blocks_total",
-            "worker" => intern_string(worker_url),
-            "op" => op
-        )
-        .increment(blocks as u64);
+        Self::with_kv_event_handles(worker_url, |kept| {
+            kept.blocks
+                .entry(op)
+                .or_insert_with(|| {
+                    counter!(
+                        "smg_kv_event_blocks_total",
+                        "worker" => intern_string(worker_url),
+                        "op" => op
+                    )
+                })
+                .increment(blocks as u64);
+        });
     }
 
     /// Count the stores a batch placed without their parent (as new chains
@@ -3445,8 +3497,13 @@ impl Metrics {
 
     /// Time to apply one batch to the index.
     pub fn record_kv_event_apply(worker_url: &str, seconds: f64) {
-        histogram!("smg_kv_event_apply_seconds", "worker" => intern_string(worker_url))
-            .record(seconds);
+        Self::with_kv_event_handles(worker_url, |kept| {
+            kept.apply
+                .get_or_insert_with(|| {
+                    histogram!("smg_kv_event_apply_seconds", "worker" => intern_string(worker_url))
+                })
+                .record(seconds);
+        });
     }
 
     /// Time of one index lookup on the routing path, recorded after the
@@ -3465,7 +3522,13 @@ impl Metrics {
     /// the KV event subscriber where it already counts applied batches, never
     /// from the lookup path, so routing reads nothing that writes.
     pub fn set_kv_index_blocks(worker_url: &str, blocks: usize) {
-        gauge!("smg_kv_index_blocks", "worker" => intern_string(worker_url)).set(blocks as f64);
+        Self::with_kv_event_handles(worker_url, |kept| {
+            kept.index_blocks
+                .get_or_insert_with(
+                    || gauge!("smg_kv_index_blocks", "worker" => intern_string(worker_url)),
+                )
+                .set(blocks as f64);
+        });
     }
 
     /// Publish the lines a log writer's queue has dropped so far, by sink.
