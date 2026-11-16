@@ -234,16 +234,18 @@ fn validate_completion_cross_parameters(
         ));
     }
 
+    // The public API gives `n` and `best_of` the same default, so equality
+    // is the plain request and only a `best_of` under `n` is refused.
     if let (Some(best_of), Some(n)) = (req.best_of, req.n) {
-        if best_of <= n {
+        if best_of < n {
             return Err(invalid(
                 "best_of_less_than_n",
-                "best_of must be greater than n",
+                "best_of must be greater than or equal to n",
             ));
         }
     }
 
-    if req.stream && req.best_of.is_some() {
+    if req.stream && req.best_of.is_some_and(|best_of| best_of > req.choices()) {
         return Err(invalid(
             "best_of_not_supported_with_stream",
             "best_of is not supported when stream is enabled",
@@ -598,6 +600,38 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["code"], "integer_above_max_value");
         assert_eq!(body["error"]["param"], "logprobs");
+    }
+
+    /// A `best_of` equal to `n` asks for no candidate beyond the choices
+    /// returned, so the request is the plain one, streamed or not.
+    #[test]
+    fn best_of_equal_to_n_is_the_plain_request() {
+        for body in [
+            serde_json::json!({"n": 1, "best_of": 1}),
+            serde_json::json!({"n": 2, "best_of": 2}),
+            serde_json::json!({"n": 2, "best_of": 3}),
+            serde_json::json!({"best_of": 1, "stream": true}),
+            serde_json::json!({"n": 2, "best_of": 2, "stream": true}),
+        ] {
+            assert!(req(body.clone()).validate().is_ok(), "{body}");
+        }
+        for (body, code) in [
+            (
+                serde_json::json!({"n": 2, "best_of": 1}),
+                "best_of_less_than_n",
+            ),
+            (
+                serde_json::json!({"best_of": 2, "stream": true}),
+                "best_of_not_supported_with_stream",
+            ),
+            (
+                serde_json::json!({"n": 2, "best_of": 3, "stream": true}),
+                "best_of_not_supported_with_stream",
+            ),
+        ] {
+            let errors = req(body.clone()).validate().expect_err(&body.to_string());
+            assert_eq!(errors.field_errors()["__all__"][0].code, code, "{body}");
+        }
     }
 
     /// The public API allows `"echo": null`. It reads as the default and the
