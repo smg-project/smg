@@ -31,6 +31,7 @@ use url::Url;
 use crate::opencv_buffer::{open_capture, BufferedCapture, RgbOutputBuffer};
 use crate::{
     audio::decode_audio_mono_f32,
+    data_url::{base64_payload, data_url_payload},
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
     hasher::{hash_audio, hash_image_with_transparency, hash_video_with_sampling},
     jpeg_turbo::{decode_jpeg_rgb, end_is_served, is_jpeg},
@@ -316,6 +317,22 @@ impl Default for VideoFetchConfig {
     }
 }
 
+/// Encoded media bytes and the source metadata needed to decode them with
+/// the same identity as the fused fetch path.
+#[derive(Debug, Clone)]
+pub struct RawMedia<S> {
+    pub bytes: Bytes,
+    pub source: S,
+}
+
+#[derive(Debug)]
+enum RawFetchSource {
+    Url(String),
+    DataUrl,
+    InlineBytes,
+    File(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub enum MediaSource {
     /// A URL fetched over the network, shared with the request.
@@ -502,6 +519,107 @@ impl MediaConnector {
         })
     }
 
+    /// Fetch encoded image bytes without parsing the image header or pixels.
+    pub async fn fetch_image_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<ImageSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(source, self.fetch_timeout, image_max_input_bytes(), "image")
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => ImageSource::Url { url },
+            RawFetchSource::DataUrl => ImageSource::DataUrl,
+            RawFetchSource::InlineBytes => ImageSource::InlineBytes,
+            RawFetchSource::File(path) => ImageSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    /// Fetch encoded video bytes without decoding or sampling its frames.
+    pub async fn fetch_video_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<VideoSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(
+                source,
+                self.video_fetch_timeout,
+                video_max_input_bytes(),
+                "video",
+            )
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => VideoSource::Url { url },
+            RawFetchSource::DataUrl => VideoSource::DataUrl,
+            RawFetchSource::InlineBytes => VideoSource::InlineBytes,
+            RawFetchSource::File(path) => VideoSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    /// Fetch encoded audio bytes without decoding its samples.
+    pub async fn fetch_audio_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<AudioSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(source, self.fetch_timeout, audio_max_input_bytes(), "audio")
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => AudioSource::Url { url },
+            RawFetchSource::DataUrl => AudioSource::DataUrl,
+            RawFetchSource::InlineBytes => AudioSource::InlineBytes,
+            RawFetchSource::File(path) => AudioSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    async fn fetch_raw_bytes(
+        &self,
+        source: MediaSource,
+        budget: Duration,
+        limit: usize,
+        media: &'static str,
+    ) -> Result<(Bytes, RawFetchSource), MediaConnectorError> {
+        match source {
+            MediaSource::Url(url) => {
+                let parsed = Url::parse(url.as_str())
+                    .map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
+                let bytes = self.fetch_http_bytes(&parsed, budget, limit, media).await?;
+                Ok((bytes, RawFetchSource::Url(parsed.to_string())))
+            }
+            MediaSource::DataUrl(data_url) => {
+                let bytes =
+                    decode_base64_with_limit(data_url_payload(&data_url)?.trim(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::DataUrl))
+            }
+            MediaSource::Base64 { data, .. } => {
+                let bytes = decode_base64_with_limit(data.trim(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::DataUrl))
+            }
+            MediaSource::InlineBytes(bytes) => {
+                ensure_input_byte_limit(bytes.len(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::InlineBytes))
+            }
+            MediaSource::File(path) => {
+                let allowed_root = self.allowed_local_media_path.as_ref().ok_or_else(|| {
+                    MediaConnectorError::DisallowedLocalPath(path.display().to_string())
+                })?;
+                let canonical = fs::canonicalize(&path)
+                    .await
+                    .map_err(MediaConnectorError::Io)?;
+                if !canonical.starts_with(allowed_root) {
+                    return Err(MediaConnectorError::DisallowedLocalPath(
+                        path.display().to_string(),
+                    ));
+                }
+                let bytes = read_file_with_limit(&canonical, limit, media).await?;
+                Ok((bytes, RawFetchSource::File(canonical)))
+            }
+        }
+    }
+
     pub async fn fetch_image(
         &self,
         source: MediaSource,
@@ -618,7 +736,8 @@ impl MediaConnector {
         data: &str,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let decoded = decode_base64_with_limit(data.trim(), image_max_input_bytes(), "image")?;
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, image_max_input_bytes(), "image")?;
         Self::decode_image(
             decoded.into(),
             cfg.detail,
@@ -642,7 +761,8 @@ impl MediaConnector {
         data: &str,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let decoded = decode_base64_with_limit(data.trim(), video_max_input_bytes(), "video")?;
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, video_max_input_bytes(), "video")?;
         self.decode_video(decoded.into(), cfg, VideoSource::DataUrl)
             .await
     }
@@ -655,7 +775,8 @@ impl MediaConnector {
     }
 
     async fn fetch_audio_base64(&self, data: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let decoded = decode_base64_with_limit(data.trim(), audio_max_input_bytes(), "audio")?;
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, audio_max_input_bytes(), "audio")?;
         self.decode_audio(decoded.into(), AudioSource::DataUrl)
             .await
     }
@@ -741,13 +862,13 @@ impl MediaConnector {
     /// in either phase (before the headers, or while the body arrives) is
     /// reported as the timeout it is, with the URL and the budget.
     ///
-    /// Every hop is admitted under the host policy before it is connected:
-    /// the URL the request named and each redirect target, by name against
-    /// the allow-list and by address against the address policy, with the
-    /// checked addresses pinned for the client's resolver while the hop
-    /// connects. A redirect the policy refuses is reported with its target;
-    /// the chain is followed at most [`MAX_REDIRECTS`] times, under the one
-    /// budget.
+    /// Every hop is held to the connector's scheme rule and admitted under
+    /// the host policy before it is connected: the URL the request named and
+    /// each redirect target, by name against the allow-list and by address
+    /// against the address policy, with the checked addresses pinned for the
+    /// client's resolver while the hop connects. A redirect the policy
+    /// refuses is reported with its target; the chain is followed at most
+    /// [`MAX_REDIRECTS`] times, under the one budget.
     async fn fetch_http_bytes(
         &self,
         url: &Url,
@@ -755,6 +876,14 @@ impl MediaConnector {
         limit: usize,
         media: &'static str,
     ) -> Result<Bytes, MediaConnectorError> {
+        // The scheme rule before any client is built for the URL: a scheme
+        // the connector does not fetch is refused in its own words, as a
+        // redirect to one is, not in the client library's.
+        if !fetched_scheme(url.scheme()) {
+            return Err(MediaConnectorError::UnsupportedScheme(
+                url.scheme().to_string(),
+            ));
+        }
         let started = Instant::now();
         let timed_out = || MediaConnectorError::Timeout {
             url: url.to_string(),
@@ -874,7 +1003,7 @@ impl MediaConnector {
             .await
     }
 
-    fn decode_image(
+    pub fn decode_image(
         bytes: Bytes,
         detail: ImageDetail,
         max_long_side_pixel: Option<u32>,
@@ -898,7 +1027,7 @@ impl MediaConnector {
         ))
     }
 
-    async fn decode_audio(
+    pub async fn decode_audio(
         &self,
         bytes: Bytes,
         source: AudioSource,
@@ -909,7 +1038,7 @@ impl MediaConnector {
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
 
-    async fn decode_video(
+    pub async fn decode_video(
         &self,
         bytes: Bytes,
         cfg: VideoFetchConfig,
@@ -1009,9 +1138,9 @@ fn redirect_target(response: &reqwest::Response) -> Option<Result<Url, RefusedRe
             reason: "the redirect location is not a URL".to_string(),
         }));
     };
-    if !matches!(target.scheme(), "http" | "https") {
+    if !fetched_scheme(target.scheme()) {
         return Some(Err(RefusedRedirect {
-            reason: format!("unsupported media scheme: {}", target.scheme()),
+            reason: MediaConnectorError::UnsupportedScheme(target.scheme().to_string()).to_string(),
             target: target.to_string(),
         }));
     }
@@ -1095,6 +1224,12 @@ async fn collect_http_body_with_limit(
     Ok(body.freeze())
 }
 
+/// Whether the connector fetches URLs of `scheme`: the request's own URL and
+/// every redirect target are held to the same two.
+fn fetched_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https")
+}
+
 fn checked_payload_length(
     current: usize,
     additional: usize,
@@ -1105,19 +1240,6 @@ fn checked_payload_length(
         .checked_add(additional)
         .filter(|length| *length <= limit)
         .ok_or(MediaConnectorError::PayloadTooLarge { media, limit })
-}
-
-/// The base64 payload of `data_url`, as every data URL fetch reads it.
-fn data_url_payload(data_url: &str) -> Result<&str, MediaConnectorError> {
-    let (metadata, data) = data_url
-        .split_once(',')
-        .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
-    if !metadata.ends_with(";base64") {
-        return Err(MediaConnectorError::DataUrl(
-            "only base64 encoded data URLs are supported".into(),
-        ));
-    }
-    Ok(data)
 }
 
 fn decode_base64_with_limit(

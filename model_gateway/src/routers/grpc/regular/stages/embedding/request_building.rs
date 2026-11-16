@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::embedding::EmbeddingRequest;
 use tracing::error;
 
 use crate::routers::{
@@ -16,7 +17,7 @@ use crate::routers::{
             PreparationOutput, RequestContext, RequestType,
         },
         proto_wrapper::ProtoEmbedRequest,
-        spec::ResponseSpec,
+        spec::{EmbeddingResponseSpec, ResponseSpec},
     },
 };
 
@@ -71,7 +72,12 @@ impl BuildStage for EmbeddingRequestBuildingStage {
         // Embeddings/classify are single-worker only (never disaggregated).
         let (prefix, spec) = match &ctx.input.request_type {
             RequestType::Classify(_) => ("classify-", ResponseSpec::Classify),
-            RequestType::Embedding(_) => ("embed-", ResponseSpec::Embedding),
+            RequestType::Embedding(request) => (
+                "embed-",
+                ResponseSpec::Embedding(EmbeddingResponseSpec {
+                    base64: asked_for_base64(request.as_ref()),
+                }),
+            ),
             request_type => {
                 error!(
                     function = "EmbeddingRequestBuildingStage::build",
@@ -154,6 +160,14 @@ impl BuildStage for EmbeddingRequestBuildingStage {
     fn signature(&self) -> String {
         "EmbeddingRequestBuildingStage".to_string()
     }
+}
+
+/// Whether the request asked for `encoding_format: "base64"`, the one
+/// encoding besides the float array the public API names; any other value,
+/// or none, answers the float array as it always did. Read here, where the
+/// request is at hand, and carried to the response stage on its spec.
+pub(super) fn asked_for_base64(request: &EmbeddingRequest) -> bool {
+    request.encoding_format.as_deref() == Some("base64")
 }
 
 /// The backend's embed request for one input under `request_id`: its text

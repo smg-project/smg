@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     config::PowerOfTwoLoadMetric,
-    worker::{load_state::LoadReceiver, Worker},
+    worker::{load::state::LoadReceiver, Worker},
 };
 
 /// Power-of-two choices policy: sample two distinct healthy workers uniformly
@@ -175,7 +175,7 @@ mod tests {
     use super::*;
     use crate::{
         policies::test_support::{fed_pair, make_worker},
-        worker::load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+        worker::load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
     };
 
     #[test]

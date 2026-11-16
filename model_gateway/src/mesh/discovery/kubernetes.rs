@@ -14,7 +14,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
     runtime::{
-        watcher::{watcher, Config, Event},
+        watcher::{watcher, Event},
         WatchStreamExt,
     },
     Client,
@@ -27,7 +27,12 @@ use smg_mesh::{
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-use crate::config::DiscoveryConfig;
+use crate::{
+    config::DiscoveryConfig,
+    service_discovery::{
+        build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string,
+    },
+};
 
 /// Configuration for Kubernetes router-peer discovery.
 #[derive(Debug, Clone)]
@@ -76,11 +81,7 @@ impl MeshDiscoveryConfig {
     /// when unset, in which case the watcher lists without server-side
     /// label filtering.
     fn label_selector(&self) -> String {
-        self.router_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",")
+        selector_string(&self.router_selector)
     }
 }
 
@@ -101,23 +102,8 @@ impl RouterPodInfo {
             return None;
         }
         let status = pod.status.clone()?;
-        let raw_ip = status.pod_ip?;
-        let ip: IpAddr = match raw_ip.parse() {
-            Ok(ip) => ip,
-            Err(e) => {
-                warn!(
-                    "Router pod {} has an unparsable Pod IP '{}': {e}",
-                    name, raw_ip
-                );
-                return None;
-            }
-        };
-
-        let is_ready = status.conditions.as_ref().is_some_and(|conditions| {
-            conditions
-                .iter()
-                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
-        });
+        let ip = pod_ip(&name, &status.pod_ip?)?;
+        let is_ready = pod_is_ready(status.conditions.as_deref());
 
         let mesh_port = pod
             .metadata
@@ -147,30 +133,6 @@ impl RouterPodInfo {
 
     fn is_healthy(&self) -> bool {
         self.is_ready && self.phase == "Running"
-    }
-}
-
-fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
-    if selector.is_empty() {
-        return false;
-    }
-    pod.metadata
-        .labels
-        .as_ref()
-        .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
-}
-
-/// Build a kube watcher Config that pushes the given label selector down to
-/// the API server. An empty selector falls back to `Config::default()`.
-fn build_watcher_config(label_selector: &str) -> Config {
-    info!(
-        "Starting K8s router watcher | selector: '{}'",
-        label_selector
-    );
-    if label_selector.is_empty() {
-        Config::default()
-    } else {
-        Config::default().labels(label_selector)
     }
 }
 
@@ -364,7 +326,7 @@ fn run_mesh_discovery(
             Api::all(client)
         };
 
-        let watcher_config = build_watcher_config(&config.label_selector());
+        let watcher_config = build_watcher_config("router", &config.label_selector());
         let mut stream = watcher(pods, watcher_config).default_backoff().boxed();
 
         while let Some(item) = stream.next().await {
@@ -662,14 +624,14 @@ mod tests {
             router_selector: router,
             ..Default::default()
         };
-        let watcher_config = build_watcher_config(&config.label_selector());
+        let watcher_config = build_watcher_config("router", &config.label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=smg"));
     }
 
     #[traced_test]
     #[test]
     fn test_build_watcher_config_logs_router_kind_with_empty_selector() {
-        let _ = build_watcher_config("");
+        let _ = build_watcher_config("router", "");
         assert!(logs_contain("Starting K8s router watcher"));
         assert!(logs_contain("selector: ''"));
     }

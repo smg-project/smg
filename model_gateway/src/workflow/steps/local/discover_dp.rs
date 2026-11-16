@@ -10,7 +10,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_metadata::get_server_info;
 use crate::{
-    worker::{endpoint::Endpoint, ConnectionMode, UNKNOWN_MODEL_ID},
+    worker::{identity::endpoint::Endpoint, ConnectionMode, UNKNOWN_MODEL_ID},
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 

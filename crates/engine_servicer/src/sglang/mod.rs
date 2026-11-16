@@ -18,7 +18,8 @@
 //! room's residue instead (`bootstrap_room % dp_size`: where SGLang's prefill
 //! side requires it and the decode side looks for the KV), the pin yielding
 //! to it (a warning on the connection's first such request, a debug line on
-//! each later one); the decode side keeps the pin.
+//! each later one); the decode side keeps the pin. A prefill side of plain
+//! data-parallel replicas also names that rank to the engine.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
 //! works as behind the engine's own frontend: a request's media references
@@ -200,6 +201,21 @@ pub(super) fn places_by_rendezvous_room(model: &SglangModelInfo) -> bool {
     args.get("disaggregation_mode")
         .and_then(serde_json::Value::as_str)
         == Some("prefill")
+}
+
+/// Whether the scheduler ranks are plain data-parallel replicas (`--dp-size`
+/// above one without attention DP), read off the launcher's `server_args` in
+/// either release's spelling of attention DP: `attn_dp_size` above one beside
+/// a `dp_size` of 1, or `enable_dp_attention` beside the `dp_size`.
+pub(super) fn ranks_are_replicas(model: &SglangModelInfo) -> bool {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let width = |name: &str| args.get(name).and_then(serde_json::Value::as_u64);
+    let attention_dp = width("attn_dp_size").is_some_and(|ranks| ranks > 1)
+        || args
+            .get("enable_dp_attention")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    width("dp_size").is_some_and(|replicas| replicas > 1) && !attention_dp
 }
 
 /// SGLang's `CaptureHiddenMode`: how much of the hidden states the scheduler

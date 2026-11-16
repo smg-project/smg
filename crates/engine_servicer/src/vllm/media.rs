@@ -181,7 +181,7 @@ impl MediaGate {
     async fn acquire(&self) -> Result<OwnedSemaphorePermit, Status> {
         let admitted = self
             .waiting
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
                 (waiting < self.limit).then_some(waiting + 1)
             });
         if admitted.is_err() {
