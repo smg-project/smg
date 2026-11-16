@@ -167,7 +167,7 @@ mock-worker = { path = "../mock_worker" }
 
 [[bin]]
 name = "smg-policy-controller"
-path = "src/main.rs"
+path = "src/bin/smg-policy-controller.rs"
 required-features = ["controller"]
 
 [[test]]
