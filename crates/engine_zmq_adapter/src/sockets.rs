@@ -284,43 +284,61 @@ pub(crate) async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// One connect to the socket file at `path`, closed at once: `Ok` when a
+/// listener answers, `ConnectionRefused` when none is behind the file. The
+/// connect never waits: a listener whose backlog is full fails it instead.
+#[cfg(unix)]
+pub async fn knock_ipc_socket(path: &Path) -> std::io::Result<()> {
+    tokio::net::UnixStream::connect(path).await.map(drop)
+}
+
 /// Whether the bind sequence sweeps the socket file at this handshake
 /// address before it binds: an `ipc://` socket of this user's own, in a
-/// directory this user owns. Such a file is the leftover of a process of
-/// this user that died without cleanup (one process binds a handshake
-/// address at a time). The data sockets' directory is created or refused
-/// before their sweep; a handshake's is of the caller's choosing and may be
-/// shared, so the socket's own owner is read too: a file of another owner is
-/// never removed, and it fails the bind as in use. So does a leftover in a
-/// directory of another owner, a leftover at an address with no directory
-/// part (no directory is read for it), and anything at the path that is not
-/// a socket.
+/// directory this user owns, that refuses a connect. Such a file is the
+/// leftover of a process of this user that died without cleanup. A socket
+/// that answers has a live listener (nothing keeps a handshake address to
+/// one process): it is never removed, and it fails the bind as in use. The
+/// data sockets' directory is created or refused before their sweep; a
+/// handshake's is of the caller's choosing and may be shared, so the
+/// socket's own owner is read too: a file of another owner is never removed
+/// either. Nor is a leftover in a directory of another owner, a leftover at
+/// an address with no directory part (no directory is read for it), or
+/// anything at the path that is not a socket.
 #[cfg(unix)]
-pub fn is_leftover_handshake_socket(address: &str) -> bool {
+pub async fn is_leftover_handshake_socket(address: &str) -> bool {
     let uid = rustix::process::geteuid().as_raw();
-    leftover_handshake_socket_of(address, uid, uid)
+    leftover_handshake_socket_of(address, uid, uid).await
 }
 
 #[cfg(not(unix))]
-pub fn is_leftover_handshake_socket(_address: &str) -> bool {
-    false
+pub fn is_leftover_handshake_socket(_address: &str) -> std::future::Ready<bool> {
+    std::future::ready(false)
 }
 
 /// The two owners are one user outside the tests, which cannot make a file
 /// of another owner and read each clause as a user who is not the owner.
 #[cfg(unix)]
-fn leftover_handshake_socket_of(address: &str, dir_owner: u32, socket_owner: u32) -> bool {
+async fn leftover_handshake_socket_of(address: &str, dir_owner: u32, socket_owner: u32) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let Some(path) = address.strip_prefix("ipc://").map(Path::new) else {
         return false;
     };
+    let Some(dir) = path.parent() else {
+        return false;
+    };
     // symlink_metadata: neither a symlinked directory nor a symlink at the
     // path may point the sweep at a file this check did not read.
-    path.parent()
-        .and_then(|dir| std::fs::symlink_metadata(dir).ok())
-        .is_some_and(|dir| dir.is_dir() && dir.uid() == dir_owner)
-        && std::fs::symlink_metadata(path)
-            .is_ok_and(|file| file.file_type().is_socket() && file.uid() == socket_owner)
+    let own = tokio::fs::symlink_metadata(dir)
+        .await
+        .is_ok_and(|dir| dir.is_dir() && dir.uid() == dir_owner)
+        && tokio::fs::symlink_metadata(path)
+            .await
+            .is_ok_and(|file| file.file_type().is_socket() && file.uid() == socket_owner);
+    // Only a refusal says no listener is behind the file: an answer, and a
+    // connect that fails any other way, leave it alone.
+    own && knock_ipc_socket(path)
+        .await
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// Remove a stale ipc socket file left by a previous gateway process, if any.
@@ -361,33 +379,59 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[test]
-    fn a_leftover_handshake_socket_is_this_users_own() {
-        use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    #[tokio::test]
+    async fn a_leftover_handshake_socket_is_this_users_own() {
+        use std::os::unix::{
+            fs::{symlink, MetadataExt},
+            net::UnixListener,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("handshake");
         let address = format!("ipc://{}", path.display());
         let uid = std::fs::metadata(dir.path()).unwrap().uid();
         let leftover = leftover_handshake_socket_of;
-        assert!(!leftover(&address, uid, uid), "a free path");
+        assert!(!leftover(&address, uid, uid).await, "a free path");
 
-        // A bound-then-dropped listener leaves the socket file behind, as a
-        // process that died without cleanup does.
-        drop(UnixListener::bind(&path).unwrap());
-        assert!(leftover(&address, uid, uid));
-        assert!(is_leftover_handshake_socket(&address));
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(!leftover(&address, uid, uid).await, "a listener answers");
+        // A dropped listener leaves the socket file behind, as a process
+        // that died without cleanup does.
+        drop(listener);
+        assert!(leftover(&address, uid, uid).await);
+        assert!(is_leftover_handshake_socket(&address).await);
 
         // No test can make a file of another owner without privileges, so
         // each owner clause is read as a user who is not the owner.
         let other = uid.wrapping_add(1);
-        assert!(!leftover(&address, uid, other), "another owner's socket");
-        assert!(!leftover(&address, other, uid), "another owner's directory");
+        assert!(
+            !leftover(&address, uid, other).await,
+            "another owner's socket"
+        );
+        assert!(
+            !leftover(&address, other, uid).await,
+            "another owner's directory"
+        );
+
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        let via_link = format!("ipc://{}", link.display());
+        assert!(
+            !leftover(&via_link, uid, uid).await,
+            "a symlink at the path"
+        );
+        std::fs::remove_file(&link).unwrap();
+        symlink(dir.path(), &link).unwrap();
+        let via_link = format!("ipc://{}", link.join("handshake").display());
+        assert!(
+            !leftover(&via_link, uid, uid).await,
+            "a symlinked directory"
+        );
 
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"not a socket").unwrap();
-        assert!(!leftover(&address, uid, uid), "a regular file");
-        assert!(!leftover("tcp://127.0.0.1:5555", uid, uid));
+        assert!(!leftover(&address, uid, uid).await, "a regular file");
+        assert!(!leftover("tcp://127.0.0.1:5555", uid, uid).await);
     }
 
     #[cfg(unix)]

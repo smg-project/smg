@@ -304,9 +304,10 @@ pub async fn connect_with_eos(
         unlink_stale_socket(&input).await?;
         unlink_stale_socket(&output).await?;
         // The handshake's directory is the caller's choice and is not
-        // verified above, so its leftover is swept only where the directory
-        // and the socket are this user's own.
-        if is_leftover_handshake_socket(&handshake) {
+        // verified above, and nothing keeps its address to one process: its
+        // leftover is swept only where the directory and the socket are this
+        // user's own and no listener answers.
+        if is_leftover_handshake_socket(&handshake).await {
             unlink_stale_socket(&handshake).await?;
         }
     }
@@ -2204,6 +2205,36 @@ mod tests {
         let client = connected_client(dir.path(), "resolved", resolved.clone()).await;
         client.adopt_tokenizer_eos(Some(&tokenizer));
         assert_eq!(client.effective_eos(), &resolved);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_handshake_listener_is_not_swept() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let path = dir.path().join("hs.sock");
+        let handshake = format!("ipc://{}", path.display());
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let Err(reason) = connect_with_eos(
+            &base_url,
+            "m".to_string(),
+            RuntimeType::Vllm,
+            Handshake::TcpOrIpc(&handshake),
+            1,
+            EosTokenIds::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        else {
+            panic!("a bind over a live listener's socket must fail");
+        };
+        assert!(reason.contains("in use"), "{reason}");
+        crate::sockets::knock_ipc_socket(&path)
+            .await
+            .expect("the listener still answers at its path");
     }
 
     /// The gateway's connect path across a retry: the first handshake greets

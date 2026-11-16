@@ -345,13 +345,10 @@ const _: () = assert!(HANDSHAKE_RELEASE_BOUND.as_millis() * 2 <= STOP_MARGIN.as_
 /// That file is another process's (the bind fails as in use), and nothing
 /// here would release it. A leftover socket the bind sequence sweeps first
 /// counts as a free path: the file there at stop is this servicer's.
-fn own_handshake_endpoint(handshake_address: &str) -> Option<String> {
-    handshake_address
-        .strip_prefix("ipc://")
-        .filter(|path| {
-            std::fs::metadata(path).is_err() || is_leftover_handshake_socket(handshake_address)
-        })
-        .map(str::to_owned)
+async fn own_handshake_endpoint(handshake_address: &str) -> Option<String> {
+    let path = handshake_address.strip_prefix("ipc://")?;
+    (std::fs::metadata(path).is_err() || is_leftover_handshake_socket(handshake_address).await)
+        .then(|| path.to_owned())
 }
 
 /// Wait until the handshake endpoint file at `path` is gone, or `bound` has
@@ -455,7 +452,7 @@ impl Server {
                     .local_addr()
                     .map(|address| address.to_string())
                     .unwrap_or_default();
-                let handshake_endpoint = own_handshake_endpoint(&handshake_address);
+                let handshake_endpoint = own_handshake_endpoint(&handshake_address).await;
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "engine connect runs in the background; the shutdown aborts it below"
@@ -612,26 +609,32 @@ mod tests {
     /// The stop waits only for an endpoint file of its own: a path nothing
     /// holds yet. A file already there is an earlier process's, and an
     /// address that names no file leaves nothing to wait for.
-    #[test]
-    fn the_stop_waits_only_for_a_handshake_endpoint_of_its_own() {
+    #[tokio::test]
+    async fn the_stop_waits_only_for_a_handshake_endpoint_of_its_own() {
         use std::os::unix::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("handshake");
         let address = format!("ipc://{}", path.display());
         assert_eq!(
-            own_handshake_endpoint(&address),
+            own_handshake_endpoint(&address).await,
             Some(path.display().to_string())
         );
 
         std::fs::write(&path, b"").expect("an earlier process's file");
-        assert_eq!(own_handshake_endpoint(&address), None);
-        assert_eq!(own_handshake_endpoint("tcp://127.0.0.1:5555"), None);
+        assert_eq!(own_handshake_endpoint(&address).await, None);
+        assert_eq!(own_handshake_endpoint("tcp://127.0.0.1:5555").await, None);
 
         std::fs::remove_file(&path).expect("the file goes");
-        drop(UnixListener::bind(&path).expect("a listener"));
+        let listener = UnixListener::bind(&path).expect("a listener");
         assert_eq!(
-            own_handshake_endpoint(&address),
+            own_handshake_endpoint(&address).await,
+            None,
+            "a socket a listener answers at is a live process's"
+        );
+        drop(listener);
+        assert_eq!(
+            own_handshake_endpoint(&address).await,
             Some(path.display().to_string()),
             "a leftover socket the bind sequence sweeps reads as free"
         );
