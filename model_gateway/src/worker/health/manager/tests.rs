@@ -875,15 +875,17 @@ async fn wait_until(deadline: tokio::time::Instant, what: &str, done: impl Fn() 
 
 /// Registers `worker` demoted under the running manager and waits for the
 /// registration's probe to read the health stub (`hits`), which is held:
-/// the worker is still demoted once that read has landed.
+/// the worker is still demoted once that read has landed. Returns the
+/// instant read before the registration: the manager's schedule for the
+/// worker runs from the launch of that probe, not from its answer.
 async fn registered_and_held(
     registry: &WorkerRegistry,
     worker: &Arc<dyn Worker>,
     hits: &AtomicUsize,
-) {
+) -> tokio::time::Instant {
     worker.set_status(WorkerStatus::NotReady);
-    registry.register(worker.clone()).unwrap();
     let registered = tokio::time::Instant::now();
+    registry.register(worker.clone()).unwrap();
     wait_until(
         registered + Duration::from_secs(5),
         "the registration's probe did not read the health in time",
@@ -891,6 +893,7 @@ async fn registered_and_held(
     )
     .await;
     assert_eq!(worker.status(), WorkerStatus::NotReady);
+    registered
 }
 
 /// Through the running loop, against a `/health` that is held: the probe
@@ -976,20 +979,20 @@ async fn a_demoted_worker_returns_on_consecutive_reads_not_consecutive_intervals
 
     // Registered under the running manager: probed at once, and held.
     let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 3);
-    registered_and_held(&registry, &worker, &hits).await;
+    let registered = registered_and_held(&registry, &worker, &hits).await;
 
-    // The engine is back; the next probe is a whole interval away.
+    // The engine is back; the next probe is an interval after the
+    // registration's, however long the held read took.
     serving.store(true, Ordering::SeqCst);
-    let back = tokio::time::Instant::now();
     wait_until(
-        back + Duration::from_millis(5500),
+        registered + Duration::from_millis(5500),
         "the worker did not return within one interval and a probe timeout",
         || worker.status() == WorkerStatus::Ready,
     )
     .await;
     let returned = tokio::time::Instant::now();
     assert!(
-        returned >= back + Duration::from_millis(3500),
+        returned >= registered + Duration::from_millis(3500),
         "the first passing read was the scheduled one, an interval after the launch, and the \
          promoting read a probe timeout after it"
     );
@@ -1017,19 +1020,18 @@ async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
     let mut manager = manager_over(&registry);
 
     let worker = probed_worker_with_timeout(&url, ConnectionMode::Http, 2, 2, 5);
-    registered_and_held(&registry, &worker, &hits).await;
+    let registered = registered_and_held(&registry, &worker, &hits).await;
 
     serving.store(true, Ordering::SeqCst);
-    let back = tokio::time::Instant::now();
     wait_until(
-        back + Duration::from_millis(5500),
+        registered + Duration::from_millis(5500),
         "the worker did not return within two intervals: the brought-forward read landed \
          after the scheduled one",
         || worker.status() == WorkerStatus::Ready,
     )
     .await;
     assert!(
-        tokio::time::Instant::now() >= back + Duration::from_millis(3500),
+        tokio::time::Instant::now() >= registered + Duration::from_millis(3500),
         "the scheduled pass an interval after the launch, the promoting read an interval later"
     );
     assert_eq!(
