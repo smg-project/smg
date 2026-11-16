@@ -3,10 +3,13 @@
 //! shipped binary builds it).
 //!
 //! It dials a controller's gateway listener, asks who leads and opens the
-//! gateway's session: a `Hello`, answered by the leader's `Welcome`. The term
-//! of every answer raises its term floor. What a gateway's own host adds is
-//! not here: a fallback engine, the spec push and its acknowledgement, and
-//! reconnection.
+//! gateway's session: a `Hello`, answered by the leader's `Welcome`. On that
+//! session it reports a request's life as its caller tells it: a
+//! `Dispatched`, a `Completed`, a `Released`. The term of every answer raises
+//! its term floor, and a frame of the session under a term below the floor
+//! is refused. What a gateway's own host adds is not here: a fallback
+//! engine, the decision a lease comes from, the spec push and its
+//! acknowledgement, and reconnection.
 //!
 //! The client takes its channel and makes no credential:
 //! [`Client::connect`] dials an address in the clear, and
@@ -16,9 +19,12 @@
 //! drives the same calls for a caller that runs no runtime.
 //!
 //! No wait of the client for its peer outlasts [`ANSWER_WAIT`], on any
-//! endpoint: the dial, each call from its send to its answer's end, and the
-//! session's call with its first frame. An endpoint's own time-outs end a
-//! wait sooner.
+//! endpoint: the dial, each call from its send to its answer's end, the
+//! session's call with its first frame, a report's wait for room in the
+//! session's queue and the wait for the session's end. An endpoint's own
+//! time-outs end a wait sooner, and as the channel's error, not as the
+//! client's [`Error::NoAnswer`]: [`Error::Status`] for a call and
+//! [`Error::Connect`] for the dial.
 
 use std::{future::Future, time::Duration};
 
@@ -35,7 +41,8 @@ use crate::{
     controller::{PRINCIPAL_ENTRY, PROTOCOL_VERSION},
     proto::{
         controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
-        ControllerFrame, GatewayFrame, Hello, LeaderInfo, LeaderRequest, Welcome,
+        Completed, ControllerFrame, Dispatched, GatewayFrame, Hello, LeaderInfo, LeaderRequest,
+        Released, Welcome,
     },
 };
 
@@ -63,9 +70,12 @@ pub enum Error {
     /// The dial failed.
     #[error("the connection failed: {0}")]
     Connect(#[source] tonic::transport::Error),
-    /// The peer did not answer inside the client's bound. Every wait of the
-    /// client that runs out ends as this kind and names the wait: the dial,
-    /// the `Leader` ask or the session's welcome.
+    /// The peer did not answer inside the client's bound. Every wait that
+    /// bound ends is this kind and names the wait: the dial, the `Leader`
+    /// ask, the session's welcome, the session's queue or the session's
+    /// end. A time-out the caller set on its own endpoint is not this
+    /// kind: it ends a call as [`Error::Status`] and the dial as
+    /// [`Error::Connect`].
     #[error("no answer within {wait:?}: {what}")]
     NoAnswer {
         /// The wait that ran out.
@@ -73,8 +83,10 @@ pub enum Error {
         /// The bound it ran out under.
         wait: Duration,
     },
-    /// The controller answered the call with a status.
-    #[error("the controller answered: {0}")]
+    /// The call ended with a status: the controller's answer, or the
+    /// channel's own, as when a time-out the caller set on its endpoint
+    /// ends the call.
+    #[error("the call ended with a status: {0}")]
     Status(#[source] Box<Status>),
     /// The replica dialed does not lead. The address is the leader's as the
     /// replica names it, empty when it knows none.
@@ -84,15 +96,15 @@ pub enum Error {
     /// welcome.
     #[error("the session answered the hello with no welcome: {0}")]
     NoWelcome(String),
-    /// The session's first frame came under a term below the client's
-    /// floor. A gateway rejects a frame below its floor whatever it
-    /// carries: the session is not taken, and the address a `NotLeader`
-    /// names is not read.
-    #[error("the first frame's term {term} is below the floor {floor}")]
+    /// A frame of the session came under a term below the client's floor.
+    /// A gateway rejects a frame below its floor whatever it carries. At
+    /// the open the session is not taken, and the address a `NotLeader`
+    /// names is not read; after the welcome the frame is read no further.
+    #[error("a frame's term {term} is below the floor {floor}")]
     BelowFloor {
         /// The term the frame came under.
         term: u64,
-        /// The floor the hello stated.
+        /// The floor the frame was read under.
         floor: u64,
     },
     /// The blocking form could not build its runtime.
@@ -132,26 +144,28 @@ impl Interceptor for Principal {
 }
 
 /// The gateway's session, open from its welcome until the client is
-/// dropped. This form reads no frame after the welcome: a controller that
-/// sends more fills the stream's window and waits there.
+/// dropped or the controller ends the stream. After the welcome its answers
+/// are read by [`Client::session_end`] and by a report that finds the
+/// stream ended, and by nothing else: a controller that sends more
+/// meanwhile fills the stream's window and waits there.
 #[derive(Debug)]
 struct Session {
-    #[expect(
-        dead_code,
-        reason = "held: its drop ends the gateway's side of the stream"
-    )]
+    /// The queue toward the controller. Its drop ends the gateway's side of
+    /// the stream.
     frames: mpsc::Sender<GatewayFrame>,
-    #[expect(dead_code, reason = "held: its drop cancels the stream")]
+    /// The controller's answers. Its drop cancels the stream.
     answers: Streaming<ControllerFrame>,
+    /// The number of the last frame queued: the hello's is 1.
+    seq: u64,
     welcome: Welcome,
 }
 
 impl Session {
     /// Opens the stream with the hello as its first frame and takes the
     /// welcome: the call's answer and its first frame must come within
-    /// `wait`. Returns the session and the term its welcome came under. A
-    /// first frame under a term below `floor` is refused before its kind
-    /// is read: the contract has a gateway reject a frame below its floor.
+    /// `wait`. Returns the session and the term its welcome came under. The
+    /// first frame takes the floor's check before its kind is read
+    /// ([`read_under`]).
     async fn open(
         stub: &mut Stub,
         gateway_id: &str,
@@ -172,10 +186,7 @@ impl Session {
             Ok::<_, Status>((answers, first))
         };
         let (answers, first) = answered("the session's welcome", wait, opened).await??;
-        match first {
-            Some(ControllerFrame { term, .. }) if term < floor => {
-                Err(Error::BelowFloor { term, floor })
-            }
+        match first.map(|frame| read_under(floor, frame)).transpose()? {
             Some(ControllerFrame {
                 term,
                 frame: Some(controller_frame::Frame::Welcome(welcome)),
@@ -184,6 +195,7 @@ impl Session {
                 Self {
                     frames,
                     answers,
+                    seq: 1,
                     welcome,
                 },
                 term,
@@ -194,6 +206,68 @@ impl Session {
             }) => Err(Error::NotLeader(not_leader.leader_address)),
             other => Err(Error::NoWelcome(format!("{other:?}"))),
         }
+    }
+
+    /// Queues one frame after the hello, numbered next and stating `floor`,
+    /// within `wait`: a queue the peer stopped draining is a wait for the
+    /// peer. A stream that ended tells the status it ended with.
+    async fn send(
+        &mut self,
+        floor: &mut u64,
+        frame: gateway_frame::Frame,
+        wait: Duration,
+    ) -> Result<(), Error> {
+        let frame = numbered(self.seq + 1, *floor, frame);
+        match answered("the session's queue", wait, self.frames.send(frame)).await? {
+            Ok(()) => {
+                self.seq += 1;
+                Ok(())
+            }
+            Err(_) => Err(self.end(floor, wait).await?.into()),
+        }
+    }
+
+    /// The stream's end, awaited within `wait`: the status the controller
+    /// ended it with, an `Ok` one when it closed the stream with none. A
+    /// frame that comes first takes the floor's check ([`read_under`]),
+    /// raises `floor` by its term and is read no further.
+    async fn end(&mut self, floor: &mut u64, wait: Duration) -> Result<Status, Error> {
+        let ended = async {
+            loop {
+                match self.answers.message().await {
+                    Ok(Some(frame)) => {
+                        let term = read_under(*floor, frame)?.term;
+                        *floor = (*floor).max(term);
+                    }
+                    Ok(None) => return Ok(Status::ok("the session's stream ended")),
+                    Err(status) => return Ok::<_, Error>(status),
+                }
+            }
+        };
+        answered("the session's end", wait, ended).await?
+    }
+}
+
+/// The floor's check, at the one place every frame the session reads
+/// passes: a frame under a term below `floor` is refused whatever it
+/// carries, as the contract has a gateway reject it.
+fn read_under(floor: u64, frame: ControllerFrame) -> Result<ControllerFrame, Error> {
+    if frame.term < floor {
+        return Err(Error::BelowFloor {
+            term: frame.term,
+            floor,
+        });
+    }
+    Ok(frame)
+}
+
+/// A frame after the hello: numbered `seq`, stating `floor` as its term
+/// floor.
+fn numbered(seq: u64, floor: u64, frame: gateway_frame::Frame) -> GatewayFrame {
+    GatewayFrame {
+        seq,
+        term_floor: floor,
+        frame: Some(frame),
     }
 }
 
@@ -265,7 +339,10 @@ impl Client {
     /// that does not lead is [`Error::NotLeader`]; a first frame of the
     /// session below the floor is [`Error::BelowFloor`]. No wait for the
     /// replica outlasts [`ANSWER_WAIT`]: a dial, a `Leader` ask or a
-    /// welcome that would is [`Error::NoAnswer`].
+    /// welcome that would is [`Error::NoAnswer`]. One that a time-out of
+    /// the endpoint's own ends sooner is the channel's error:
+    /// [`Error::Status`], or [`Error::Connect`] for the dial. The three
+    /// wait one after another, so a connect whole can last three bounds.
     pub async fn connect_with(endpoint: Endpoint, gateway_id: &str) -> Result<Self, Error> {
         Self::connect_within(endpoint, gateway_id, ANSWER_WAIT).await
     }
@@ -310,6 +387,42 @@ impl Client {
         Ok(info)
     }
 
+    /// Reports a request this gateway sent to a worker: one `Dispatched`
+    /// frame on the session, numbered after the last and stating the term
+    /// floor. The client decides nothing and keeps no lease: the report is
+    /// its caller's. The frame is queued within the client's bound and
+    /// leaves when the connection sends it: a queue with no room in time
+    /// is [`Error::NoAnswer`]. A session the controller ended tells the
+    /// status it ended with here ([`Error::Status`]).
+    pub async fn dispatched(&mut self, report: Dispatched) -> Result<(), Error> {
+        self.report(gateway_frame::Frame::Dispatched(report)).await
+    }
+
+    /// Reports how a request ended on a worker: one `Completed` frame, sent
+    /// as [`Client::dispatched`] sends its own.
+    pub async fn completed(&mut self, report: Completed) -> Result<(), Error> {
+        self.report(gateway_frame::Frame::Completed(report)).await
+    }
+
+    /// Gives a lease or a ticket up: one `Released` frame, sent as
+    /// [`Client::dispatched`] sends its own.
+    pub async fn released(&mut self, report: Released) -> Result<(), Error> {
+        self.report(gateway_frame::Frame::Released(report)).await
+    }
+
+    async fn report(&mut self, frame: gateway_frame::Frame) -> Result<(), Error> {
+        self.session.send(&mut self.floor, frame, self.wait).await
+    }
+
+    /// The session's end, awaited within the client's bound: the status the
+    /// controller ended the stream with. A frame that comes first raises the
+    /// floor by its term and is read no further; one under a term below the
+    /// floor is [`Error::BelowFloor`]. A session still open at the bound is
+    /// [`Error::NoAnswer`].
+    pub async fn session_end(&mut self) -> Result<Status, Error> {
+        self.session.end(&mut self.floor, self.wait).await
+    }
+
     /// The welcome that answered the session's hello.
     pub fn welcome(&self) -> &Welcome {
         &self.session.welcome
@@ -328,23 +441,26 @@ impl Client {
 
 /// The client for a caller that runs no runtime.
 pub mod blocking {
-    use std::future::Future;
+    use std::{future::Future, io};
 
     use tokio::runtime::{Builder, Runtime};
-    use tonic::transport::Endpoint;
+    use tonic::{transport::Endpoint, Status};
 
     use super::Error;
-    use crate::proto::{LeaderInfo, Welcome};
+    use crate::proto::{Completed, Dispatched, LeaderInfo, Released, Welcome};
 
     /// [`super::Client`] driven to each call's end on a runtime of its own.
     /// It holds no protocol: every call is the async client's. The runtime
-    /// is this client's alone, so a call, and the drop, must come from a
-    /// thread that runs no runtime. The drop of a connected client waits
-    /// for a name lookup that runtime still runs.
+    /// keeps one thread, which drives the connection between calls: a
+    /// report leaves when it is made. The runtime is this client's alone,
+    /// so a call, and the drop, must come from a thread that runs no
+    /// runtime. The drop waits for nothing the runtime still runs.
     #[derive(Debug)]
     pub struct Client {
-        runtime: Runtime,
+        // Declared before the runtime: its drop comes first, on a runtime
+        // that still runs.
         inner: super::Client,
+        runtime: Background,
     }
 
     impl Client {
@@ -359,25 +475,41 @@ pub mod blocking {
         }
 
         /// Drives `connect` to its end on a runtime of the client's own. A
-        /// connect that fails shuts that runtime down without waiting for
-        /// it: a dial's name lookup runs on a thread no bound ends, and a
-        /// drop that waited for it would hold the caller past the bound.
+        /// connect that fails drops that runtime, and the drop waits for
+        /// nothing: a dial's name lookup runs on a thread no bound ends,
+        /// and a drop that waited for it would hold the caller past the
+        /// bound.
         pub(super) fn driven(
             connect: impl Future<Output = Result<super::Client, Error>>,
         ) -> Result<Self, Error> {
-            let runtime = runtime()?;
-            match runtime.block_on(connect) {
-                Ok(inner) => Ok(Self { runtime, inner }),
-                Err(error) => {
-                    runtime.shutdown_background();
-                    Err(error)
-                }
-            }
+            let runtime = Background::start()?;
+            let inner = runtime.drive(connect)?;
+            Ok(Self { inner, runtime })
         }
 
         /// [`super::Client::leader`].
         pub fn leader(&mut self) -> Result<LeaderInfo, Error> {
-            self.runtime.block_on(self.inner.leader())
+            self.runtime.drive(self.inner.leader())
+        }
+
+        /// [`super::Client::dispatched`].
+        pub fn dispatched(&mut self, report: Dispatched) -> Result<(), Error> {
+            self.runtime.drive(self.inner.dispatched(report))
+        }
+
+        /// [`super::Client::completed`].
+        pub fn completed(&mut self, report: Completed) -> Result<(), Error> {
+            self.runtime.drive(self.inner.completed(report))
+        }
+
+        /// [`super::Client::released`].
+        pub fn released(&mut self, report: Released) -> Result<(), Error> {
+            self.runtime.drive(self.inner.released(report))
+        }
+
+        /// [`super::Client::session_end`].
+        pub fn session_end(&mut self) -> Result<Status, Error> {
+            self.runtime.drive(self.inner.session_end())
         }
 
         /// [`super::Client::welcome`].
@@ -396,11 +528,43 @@ pub mod blocking {
         }
     }
 
-    fn runtime() -> Result<Runtime, Error> {
-        Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(Error::Runtime)
+    /// The blocking client's runtime: one thread, which drives the
+    /// connection between calls. Its drop shuts the runtime down in the
+    /// background and waits for nothing: a name lookup still running on it
+    /// would hold a drop that waited for as long as the lookup lasts.
+    #[derive(Debug)]
+    pub(super) struct Background(Option<Runtime>);
+
+    impl Background {
+        pub(super) fn start() -> Result<Self, Error> {
+            Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map(|runtime| Self(Some(runtime)))
+                .map_err(Error::Runtime)
+        }
+
+        /// Drives `call` to its end on the runtime.
+        pub(super) fn drive<T>(
+            &self,
+            call: impl Future<Output = Result<T, Error>>,
+        ) -> Result<T, Error> {
+            match &self.0 {
+                Some(runtime) => runtime.block_on(call),
+                // The runtime leaves at the drop alone, and no call follows
+                // a drop.
+                None => Err(Error::Runtime(io::Error::other("the runtime is shut down"))),
+            }
+        }
+    }
+
+    impl Drop for Background {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.0.take() {
+                runtime.shutdown_background();
+            }
+        }
     }
 }
 
@@ -421,18 +585,18 @@ mod tests {
     use prost::Message as _;
     use tokio::{net::TcpListener, task::JoinSet, time::timeout};
     use tonic::{
-        codegen::tokio_stream::{once, pending, StreamExt},
+        codegen::tokio_stream::{iter, once, pending, StreamExt},
         service::{Interceptor, Routes},
         transport::{server::TcpIncoming, Endpoint, Server},
         Request,
     };
 
     use super::{
-        blocking, controller_frame, gateway_frame, hello, Client, ControllerFrame, Error,
+        blocking, controller_frame, gateway_frame, hello, numbered, Client, ControllerFrame, Error,
         PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT, PRINCIPAL_ENTRY,
         PROTOCOL_VERSION,
     };
-    use crate::proto::NotLeader;
+    use crate::proto::{Completed, Dispatched, NotLeader};
 
     /// The bound a case gives a wait it wants ended.
     const SHORT: Duration = Duration::from_millis(300);
@@ -537,18 +701,38 @@ mod tests {
 
     /// An answer of headers and one frame under `term` that never ends.
     fn one_frame(term: u64, frame: controller_frame::Frame) -> Body {
-        let frame = ControllerFrame {
+        frames(vec![under(term, Some(frame))])
+    }
+
+    /// A frame under `term` that carries `frame`.
+    fn under(term: u64, frame: Option<controller_frame::Frame>) -> ControllerFrame {
+        ControllerFrame {
             term,
-            frame: Some(frame),
+            frame,
             ..ControllerFrame::default()
-        };
-        // A message on the wire: its flag, its length, its bytes.
-        let length = u32::try_from(frame.encoded_len()).expect("a short frame");
-        let mut message = vec![0];
-        message.extend(length.to_be_bytes());
-        message.extend(frame.encode_to_vec());
-        let message = once(Ok::<_, Infallible>(Bytes::from(message)));
-        Body::from_stream(message.chain(pending()))
+        }
+    }
+
+    /// An answer of headers and `frames` in turn, that never ends.
+    fn frames(frames: Vec<ControllerFrame>) -> Body {
+        let messages = frames.into_iter().map(|frame| {
+            // A message on the wire: its flag, its length, its bytes.
+            let length = u32::try_from(frame.encoded_len()).expect("a short frame");
+            let mut message = vec![0];
+            message.extend(length.to_be_bytes());
+            message.extend(frame.encode_to_vec());
+            Ok::<_, Infallible>(Bytes::from(message))
+        });
+        Body::from_stream(iter(messages).chain(pending()))
+    }
+
+    /// A welcome and a `NotLeader`, as frames.
+    fn welcome() -> controller_frame::Frame {
+        controller_frame::Frame::Welcome(Welcome::default())
+    }
+
+    fn not_leader() -> controller_frame::Frame {
+        controller_frame::Frame::NotLeader(NotLeader::default())
     }
 
     /// A peer that takes each connection and answers nothing, for as long
@@ -662,6 +846,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_endpoints_own_time_out_ends_a_leader_ask_as_a_status() {
+        let (address, _serving) = mute().await;
+        let endpoint = Endpoint::from_shared(format!("http://{address}"))
+            .expect("a URI")
+            .timeout(SHORT);
+        let asked = timeout(
+            ROOM / 2,
+            Client::connect_within(endpoint, "gateway-1", ROOM),
+        )
+        .await
+        .expect("the endpoint's own time-out ends a Leader ask nothing answers");
+        assert!(matches!(asked, Err(Error::Status(_))), "{asked:?}");
+    }
+
+    #[tokio::test]
     async fn a_dial_that_never_ends_ends_at_its_bound() {
         let dialed = timeout(
             ROOM,
@@ -763,5 +962,124 @@ mod tests {
             .recv_timeout(ROOM)
             .expect("the named bound ends the blocking plain form's stalled ask");
         assert!(ran_out(&asked, "the Leader ask", ANSWER_WAIT), "{asked:?}");
+    }
+
+    #[test]
+    fn a_report_is_numbered_as_told_and_states_the_floor() {
+        let report = gateway_frame::Frame::Dispatched(Dispatched::default());
+        let frame = numbered(2, 7, report);
+        assert_eq!((frame.seq, frame.term_floor), (2, 7), "{frame:?}");
+        assert!(
+            matches!(frame.frame, Some(gateway_frame::Frame::Dispatched(_))),
+            "{frame:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_frame_that_carries_nothing_below_the_floor_is_refused() {
+        let (address, _serving) = answering(|| frames(vec![under(6, None)])).await;
+        let mut stub = stub(address).await;
+        let opened = Session::open(&mut stub, "gateway-1", 7, ROOM).await;
+        assert!(
+            matches!(opened, Err(Error::BelowFloor { term: 6, floor: 7 })),
+            "{opened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_after_the_welcome_below_the_floor_is_refused() {
+        let (address, _serving) = answering(|| {
+            frames(vec![
+                under(7, Some(welcome())),
+                under(6, Some(not_leader())),
+            ])
+        })
+        .await;
+        let mut stub = stub(address).await;
+        let (mut session, _) = Session::open(&mut stub, "gateway-1", 7, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        let mut floor = 7;
+        let ended = session.end(&mut floor, ROOM).await;
+        assert!(
+            matches!(ended, Err(Error::BelowFloor { term: 6, floor: 7 })),
+            "{ended:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_after_the_welcome_raises_the_floor_and_an_open_session_ends_the_wait() {
+        let (address, _serving) = answering(|| {
+            frames(vec![
+                under(7, Some(welcome())),
+                under(8, Some(not_leader())),
+            ])
+        })
+        .await;
+        let mut stub = stub(address).await;
+        let (mut session, _) = Session::open(&mut stub, "gateway-1", 7, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        let mut floor = 7;
+        let ended = timeout(ROOM, session.end(&mut floor, SHORT))
+            .await
+            .expect("the client's own bound ends the wait for the session's end");
+        assert!(ran_out(&ended, "the session's end", SHORT), "{ended:?}");
+        assert_eq!(floor, 8, "the frame's term raised the floor");
+    }
+
+    #[tokio::test]
+    async fn a_report_into_a_session_whose_peer_stopped_reading_ends_at_its_bound() {
+        let (address, _serving) = answering(|| welcome_under(0)).await;
+        let mut stub = stub(address).await;
+        let (mut session, _) = Session::open(&mut stub, "gateway-1", 0, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        let mut floor = 0;
+        // The peer reads no frame: the stream's window fills, then the
+        // session's queue, and a report waits for room.
+        let waited: Result<(), Error> = timeout(ROOM * 2, async {
+            loop {
+                let report = gateway_frame::Frame::Completed(Completed {
+                    lease_id: u64::MAX,
+                    served: u64::MAX,
+                    ttft_micros: u32::MAX,
+                    tokens_in: u32::MAX,
+                    tokens_out: u32::MAX,
+                    duration_micros: u32::MAX,
+                    ..Completed::default()
+                });
+                session.send(&mut floor, report, SHORT).await?;
+            }
+        })
+        .await
+        .expect("a peer that reads nothing leaves a report waiting for room");
+        assert!(ran_out(&waited, "the session's queue", SHORT), "{waited:?}");
+    }
+
+    #[test]
+    fn the_blocking_runtimes_drop_does_not_wait_for_a_task_it_still_runs() {
+        // A blocking task stands for a name lookup a connector started: it
+        // runs until the case lets it go.
+        let (release, held) = mpsc::channel::<()>();
+        let (told, dropped) = mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            let runtime = blocking::Background::start()?;
+            runtime.drive(async move {
+                drop(tokio::task::spawn_blocking(move || held.recv()));
+                Ok(())
+            })?;
+            drop(runtime);
+            told.send(())
+                .map_err(|_| Error::NoWelcome("the case left".to_owned()))
+        });
+        dropped
+            .recv_timeout(ROOM)
+            .expect("the runtime's drop returns while its task still runs");
+        drop(release);
+        dropping
+            .join()
+            .expect("the dropping thread ends")
+            .expect("the case took the drop's end");
     }
 }
