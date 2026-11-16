@@ -95,7 +95,7 @@ struct StreamState<T: Send + 'static, C: AbortOnDropClient> {
     defer_abort_until_first_item: bool,
     /// How long a deferred abort waits for that first item:
     /// [`DEFERRED_ABORT_MAX_WAIT`], or the shorter bound the caller holds for
-    /// the item (see [`Self::defer_abort_within`]).
+    /// the item (see [`AbortOnDropStream::defer_abort_within`]).
     deferred_abort_bound: Duration,
     /// Whether `poll_next` has yielded at least one item (data or error).
     saw_item: bool,
@@ -103,7 +103,7 @@ struct StreamState<T: Send + 'static, C: AbortOnDropClient> {
     /// abort before releasing it with a reset (see `Drop`).
     release_drain_bound: Duration,
     /// The request's deadline and its timer, when the stream is bounded by
-    /// one (see [`Self::with_deadline`]).
+    /// one (see [`AbortOnDropStream::with_deadline`]).
     deadline: Option<(RequestDeadline, Pin<Box<Sleep>>)>,
     _marker: PhantomData<fn() -> T>,
 }
@@ -409,6 +409,14 @@ mod tests {
         // `Send + Sync` regardless of `T`.
         fn assert_send_sync<X: Send + Sync>() {}
         assert_send_sync::<AbortOnDropStream<(), DummyClient>>();
+
+        // Handing a stream on moves one pointer: its state lives in one
+        // allocation. A field added to the wrapper itself would bring the
+        // inline moves back in every layer that passes a stream on.
+        assert_eq!(
+            size_of::<AbortOnDropStream<(), DummyClient>>(),
+            size_of::<usize>()
+        );
     }
 
     /// A backend whose abort handler is wedged (answers the transport but never
