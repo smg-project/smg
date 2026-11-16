@@ -1729,26 +1729,26 @@ mod tests {
                 monitor
                     .on_worker_added(&worker, SubscriptionKind::Events)
                     .await;
-                tokio::time::sleep(Duration::from_millis(1_900)).await;
+                // Four connects are three failed streams, each with its
+                // delay slept before the next connect.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while calls.lock().unwrap().len() < 4 {
+                    assert!(Instant::now() < deadline, "no fourth subscribe call");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 monitor.on_worker_removed(worker.url()).await;
                 server.abort();
                 addr
             })
         });
 
-        // Attempts at about 0, 100, 300, 700 and 1,500 ms: five in 1.9 s,
-        // where a backoff reset on every connect made nineteen.
         let calls = calls.lock().unwrap().clone();
-        assert!(
-            (3..=6).contains(&calls.len()),
-            "{} subscribe calls in 1.9 s",
-            calls.len()
-        );
         // The delay scheduled after each failed stream doubles up to the cap,
         // and each was slept: the gap before a connect is at least the delay
         // the retry line before it scheduled. A loaded host only stretches a
-        // gap, and a connect it pushes past the window takes its delay with
-        // it, so the floor reads the retry lines rather than a fixed value.
+        // gap, so the floor reads the retry lines rather than a fixed value.
+        // A backoff that restarted on every connect would schedule the
+        // initial delay each time, and fail here.
         let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
         logs_assert(|lines: &[&str]| {
             let delays = lines

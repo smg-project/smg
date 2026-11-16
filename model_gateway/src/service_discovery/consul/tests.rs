@@ -1,5 +1,7 @@
 use std::{collections::VecDeque, sync::Mutex};
 
+use tokio::sync::watch;
+
 use super::*;
 use crate::{
     config::test_support::{pd_routing_mode, regular_routing_mode},
@@ -977,17 +979,26 @@ async fn ticks_never_restart_the_query_in_flight() {
 
 // ---- A change that lands while the instance still registers. ----
 
-/// An engine for one instance of the scripted service: `/health` after
-/// `delay`, then the metadata a registration reads; 404 elsewhere, as the
-/// metadata fallbacks expect.
-async fn fake_engine(delay: Duration) -> (u16, task::JoinHandle<()>) {
+/// An engine for one instance of the scripted service: `/health`, held
+/// until the gate opens when the test passes one, then the metadata a
+/// registration reads; 404 elsewhere, as the metadata fallbacks expect.
+async fn fake_engine(held: Option<watch::Receiver<bool>>) -> (u16, task::JoinHandle<()>) {
     use axum::{routing::get, Json, Router};
     let app = Router::new()
         .route(
             "/health",
-            get(move || async move {
-                time::sleep(delay).await;
-                Json(serde_json::json!({"status": "ok"}))
+            get(move || {
+                let held = held.clone();
+                async move {
+                    if let Some(mut held) = held {
+                        while !*held.borrow() {
+                            held.changed()
+                                .await
+                                .expect("the test keeps the gate until its end");
+                        }
+                    }
+                    Json(serde_json::json!({"status": "ok"}))
+                }
             }),
         )
         .route(
@@ -1015,11 +1026,11 @@ async fn fake_engine(delay: Duration) -> (u16, task::JoinHandle<()>) {
 /// e2e keeps its pass on for this reason.
 #[tokio::test]
 async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
-    let (a, _engine_a) = fake_engine(Duration::ZERO).await;
-    // Its registration waits on this answer twice (the classification
-    // probe, then connection detection): past Consul's second answer, a
-    // gap after the first, and the query that follows it.
-    let (b, _engine_b) = fake_engine(Duration::from_millis(1500)).await;
+    let (a, _engine_a) = fake_engine(None).await;
+    // Its registration waits on this engine's health answer, which the
+    // test holds until Consul has dropped the instance.
+    let (answer, held) = watch::channel(false);
+    let (b, _engine_b) = fake_engine(Some(held)).await;
     let instance = |node: &str, id: &str, port: u16, created: u64| {
         serde_json::json!({
             "Node": {"Node": node, "Address": "127.0.0.1", "Datacenter": "dc1"},
@@ -1038,8 +1049,9 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
         Reply::ok(20, &only_a).held(Duration::from_millis(250)),
     ])
     .await;
+    let pass = Duration::from_secs(4);
     let mut config = consul.config(&regular_routing_mode());
-    config.check_interval = Duration::from_secs(4);
+    config.check_interval = pass;
     let client = config.client().unwrap();
     let app_context = live_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
@@ -1056,12 +1068,22 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
     )]
     let handle = task::spawn(ConsulDiscovery::new(config, app_context, client).run());
 
-    // worker-b registers once its engine answers, after Consul dropped it.
-    while !registered(b) {
+    // Consul drops worker-b while its engine has not answered. The query
+    // after the dropping answer starts once that answer's pass is done.
+    let guard = Duration::from_secs(30);
+    while consul.requests() < 3 {
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "worker-b never registered"
+            started.elapsed() < guard,
+            "the query after the dropping answer never came"
         );
+        time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!registered(b), "registered before its engine answered");
+
+    // worker-b registers once its engine answers, after Consul dropped it.
+    answer.send(true).expect("worker-b's engine holds the gate");
+    while !registered(b) {
+        assert!(started.elapsed() < guard, "worker-b never registered");
         time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
@@ -1071,18 +1093,16 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
     );
     assert!(registered(a));
 
-    // Nothing but a pass removes it: until the next one it stays.
-    time::sleep_until(started + Duration::from_millis(3500)).await;
-    assert!(registered(b), "removed before the next pass");
-
-    // The pass at 4 s removes it.
+    // Nothing but a pass removes it, and the first pass comes one interval
+    // after the start: a removal before that is not the pass's.
     while registered(b) {
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < guard,
             "worker-b not removed by the next pass"
         );
         time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(started.elapsed() >= pass, "removed before the next pass");
     assert!(registered(a));
     handle.abort();
 }
