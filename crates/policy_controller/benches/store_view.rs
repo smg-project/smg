@@ -10,10 +10,23 @@
 //! - `policy_store/publish/<n>`: one window's publication of the pool: one
 //!   copy, one pointer swap;
 //! - `policy_store/floor/<n>`: the decision benches' gated build, rows
-//!   written from facts in hand, in this binary: a build from the store
-//!   stays within twice this cell, and one job reads both;
+//!   written from facts in hand, in this binary, so that one job reads a
+//!   build from the store beside it. No check holds a build to the floor:
+//!   the gate compares each id with its own base alone, and the design's
+//!   bound (a build within twice the floor) is for a reader of the two
+//!   rows. A build may read under the floor;
 //! - `policy_store/view_build_veto1/<n>` and `view_build_veto8/<n>`: the
-//!   build with one and with eight standing vetoes of the asking gateway.
+//!   build with one and with eight standing vetoes of the asking gateway;
+//! - `policy_store/view_build_foreign64/8`: the build in the pool of eight
+//!   beside sixty-four vetoes of other gateways, none the asking one's;
+//! - `policy_store/view_build_gateways8/8`, `view_build_gateways64/8` and
+//!   `view_build_gateways512/8`: the build in the pool of eight with one
+//!   member vetoed by the asking gateway and by eight, by sixty-four and
+//!   by 512 others, one veto each: the first two reach the asking
+//!   gateway's vetoes by a walk, the third by a search;
+//! - `policy_store/veto_write/512` and `policy_store/member_write/512`: one
+//!   veto's write and one membership write beside 512 standing vetoes of
+//!   eight other gateways.
 //!
 //! `policy_store_vetoes/*` are the veto cells outside the gate: `k3/<n>`
 //! with three vetoes of the asking gateway, `foreign8/<n>` with eight other
@@ -208,14 +221,19 @@ fn floor(c: &mut Criterion, fixtures: &mut [Fixture]) {
 /// gateways alone, which mask nothing for the asking one:
 /// `policy_store_vetoes/foreign8/<n>` (eight gateways on one member) and
 /// `policy_store_vetoes/foreign64/<n>` (eight gateways on eight members).
+/// Of the asking gateway and of others on one member, one veto each, which
+/// is every gateway vetoing one sick worker:
+/// `policy_store/view_build_gateways8/8` and
+/// `policy_store/view_build_gateways64/8`, beside eight and sixty-four
+/// others.
 fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
     for fixture in fixtures.iter_mut() {
         let n = fixture.n;
         let ask = fixture.ask(false);
         let until = ask.now + Duration::from_secs(60);
         let member = |nth: usize| fixture.ids[nth * n / 8];
-        let mut cell = |c: &mut Criterion, group: &str, id: &str, masked: usize| {
-            assert_eq!(build(&fixture.store, &ask, &mut fixture.out), n);
+        let mut cell = |c: &mut Criterion, group: &str, id: &str, ask: &Ask, masked: usize| {
+            assert_eq!(build(&fixture.store, ask, &mut fixture.out), n);
             let stalled = fixture
                 .out
                 .candidates
@@ -226,7 +244,7 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
             let mut group = c.benchmark_group(group);
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(BenchmarkId::new(id, n), &n, |b, _| {
-                b.iter(|| build(&fixture.store, &ask, &mut fixture.out));
+                b.iter(|| build(&fixture.store, ask, &mut fixture.out));
             });
             group.finish();
         };
@@ -242,7 +260,7 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
                     .gateway_veto(ask.gateway, member(standing), Some(until));
                 standing += 1;
             }
-            cell(c, group, id, count);
+            cell(c, group, id, &ask, count);
         }
         for nth in 0..standing {
             fixture.store.gateway_veto(ask.gateway, member(nth), None);
@@ -257,16 +275,128 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
                         .gateway_veto(gateway, member(nth), Some(until));
                 }
             }
-            cell(c, "policy_store_vetoes", id, 0);
+            cell(c, "policy_store_vetoes", id, &ask, 0);
+        }
+        // The gate reads the sixty-four in the pool of eight: where a build
+        // that walked another gateway's entries paid most.
+        if n == 8 {
+            cell(c, "policy_store", "view_build_foreign64", &ask, 0);
         }
         for gateway in others {
             for nth in 0..8 {
                 fixture.store.gateway_veto(gateway, member(nth), None);
             }
         }
+        // One member vetoed by the asking gateway and by other gateways,
+        // one veto each. The others hold the even ids and the asking
+        // gateway an odd one in their middle: its run is the farthest from
+        // both ends of the pool's runs, the longest way a build has to its
+        // own. Read in the pool of eight, where that way is most of what a
+        // veto adds to a build. Beside 8 and 64 others the way is a walk;
+        // beside 512 the runs are more than a build walks, and the row
+        // holds the search.
+        if n == 8 {
+            let sick = member(0);
+            let mut holders = 0_u64;
+            for (count, id) in [
+                (8_u64, "view_build_gateways8"),
+                (64, "view_build_gateways64"),
+                (512, "view_build_gateways512"),
+            ] {
+                while holders < count {
+                    holders += 1;
+                    fixture
+                        .store
+                        .gateway_veto(GatewayId(2 * holders), sick, Some(until));
+                }
+                let middle = Ask {
+                    gateway: GatewayId(count + 1),
+                    ..ask
+                };
+                fixture
+                    .store
+                    .gateway_veto(middle.gateway, sick, Some(until));
+                cell(c, "policy_store", id, &middle, 1);
+                fixture.store.gateway_veto(middle.gateway, sick, None);
+            }
+            for gateway in (1..=holders).map(|holder| GatewayId(2 * holder)) {
+                fixture.store.gateway_veto(gateway, sick, None);
+            }
+        }
         assert_eq!(build(&fixture.store, &ask, &mut fixture.out), n);
         assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
     }
+}
+
+/// The store's rare writes beside standing vetoes, in the largest pool
+/// alone: eight other gateways each hold a veto on the same 64 members, 512
+/// in all. `policy_store/veto_write/<n>` is one write of the asking
+/// gateway's veto on one more member, set and cleared in turn;
+/// `policy_store/member_write/<n>` is one membership write, a worker
+/// joining the pool and leaving it in turn. The pool is left as it was.
+fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
+    let Some(fixture) = fixtures.iter_mut().max_by_key(|fixture| fixture.n) else {
+        return;
+    };
+    let (n, store) = (fixture.n, &fixture.store);
+    let ask = fixture.ask(false);
+    let until = ask.now + Duration::from_secs(60);
+    let others = (2..10).map(GatewayId);
+    let vetoed = |nth: usize| fixture.ids[nth * n / 64];
+    for gateway in others.clone() {
+        for nth in 0..64 {
+            store.gateway_veto(gateway, vetoed(nth), Some(until));
+        }
+    }
+    let mut group = c.benchmark_group("policy_store");
+    // A member the others' vetoes name as well: the asking gateway's entry
+    // stands beside theirs on one row.
+    let target = vetoed(31);
+    let mut set = false;
+    group.bench_with_input(BenchmarkId::new("veto_write", n), &n, |b, _| {
+        b.iter(|| {
+            set = !set;
+            store.gateway_veto(ask.gateway, black_box(target), set.then_some(until));
+        });
+    });
+    store.gateway_veto(ask.gateway, target, None);
+    let joining = WorkerFacts {
+        key: "http://joining:8000".to_string(),
+        engine: "http://joining:8000".to_string(),
+        incarnation: 1,
+        models: vec![MODEL.to_string()],
+        dp_size: 1,
+        max_running: Some(4),
+        ..WorkerFacts::default()
+    };
+    let mut joined = None;
+    group.bench_with_input(BenchmarkId::new("member_write", n), &n, |b, _| {
+        b.iter(|| match joined.take() {
+            Some((id, revision)) => {
+                store
+                    .remove(id, revision)
+                    .expect("the joined worker leaves");
+            }
+            None => {
+                let id = store.upsert(black_box(joining.clone())).id();
+                let revision = WorkersStore::get(&**store, id).expect("the row").revision;
+                joined = Some((id, revision));
+            }
+        });
+    });
+    group.finish();
+    if let Some((id, revision)) = joined {
+        store
+            .remove(id, revision)
+            .expect("the joined worker leaves");
+    }
+    for gateway in others {
+        for nth in 0..64 {
+            store.gateway_veto(gateway, vetoed(nth), None);
+        }
+    }
+    assert_eq!(build(store, &ask, &mut fixture.out), n);
+    assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
 }
 
 fn view_build(c: &mut Criterion, fixtures: &mut [Fixture]) {
@@ -533,6 +663,7 @@ fn store_view(c: &mut Criterion) {
     publish(c, &mut fixtures);
     cadence(c, &mut fixtures);
     vetoed(c, &mut fixtures);
+    writes_beside_vetoes(c, &mut fixtures);
 }
 
 criterion_group!(benches, store_view);

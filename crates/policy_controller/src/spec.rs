@@ -2630,6 +2630,71 @@ impl PolicySpec {
     }
 }
 
+/// One generation as a store applies it: the engine validated from a
+/// document, with the generation's number and its needs.
+///
+/// One invariant: **a decision reads its rows, its engine and its number
+/// in one load.** A store publishes every world under one of these
+/// ([`World::spec`](crate::store::World::spec)), so no reader pairs one
+/// generation's engine with rows published under another. The number is the
+/// engine's own, the document's `generation` line: there is no second
+/// holder.
+///
+/// It is made by validation alone ([`AppliedSpec::validate`]), so a document
+/// that fails validation never becomes one. Before any document is applied
+/// a store holds [`AppliedSpec::unbound`], the only generation 0.
+#[derive(Debug)]
+pub struct AppliedSpec {
+    engine: Engine,
+}
+
+impl AppliedSpec {
+    /// The generation `document` validates into ([`PolicySpec::validate`]).
+    pub fn validate(document: &PolicySpec) -> Result<Self, SpecError> {
+        Self::validate_with(document, &[])
+    }
+
+    /// [`AppliedSpec::validate`] with the host's own denied header names,
+    /// as [`PolicySpec::validate_with`] takes them.
+    pub fn validate_with(
+        document: &PolicySpec,
+        denied_headers: &[&str],
+    ) -> Result<Self, SpecError> {
+        document
+            .validate_with(denied_headers)
+            .map(|engine| Self { engine })
+    }
+
+    /// The generation a store holds before any document is applied: number
+    /// 0, an engine with no profile and no binding, which declines every
+    /// decision by name as an engine declines a model no binding covers.
+    #[must_use]
+    pub fn unbound() -> Self {
+        Self {
+            engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
+        }
+    }
+
+    /// The generation's number: the engine's own.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.engine.generation()
+    }
+
+    /// The engine a decision under this generation runs.
+    #[must_use]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// What the host must feed under this generation
+    /// ([`Engine::needs`]).
+    #[must_use]
+    pub fn needs(&self) -> Needs {
+        self.engine.needs()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

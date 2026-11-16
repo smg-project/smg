@@ -9,14 +9,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{Ask, Built, ViewBuffers, World, Writer, PUBLISH_WINDOW};
+use super::{
+    run_of, seek, Ask, Built, GatewayRun, PoolVeto, PoolVetoes, StaleGeneration, ViewBuffers,
+    World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+};
 use crate::{
     store::{
         GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, WorkerFacts,
         WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, AffinityFacts, Candidate, LoadRow, Phase, Role, WireModes, WorkerId},
-    PolicySpec,
+    AppliedSpec, PolicySpec,
 };
 
 const MODEL: &str = "m";
@@ -1395,4 +1398,451 @@ fn a_veto_past_its_end_leaves_at_the_next_windows_publication() {
     assert_eq!(stalled(&store, ASKER, t0), [standing]);
     // The sink's own answer keeps its compare.
     assert!(store.vetoed(ASKER, ended, t0));
+}
+
+#[test]
+fn each_of_many_gateways_is_masked_by_its_own_vetoes_alone() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let mut workers: Vec<WorkerId> = (0..24)
+        .map(|n| member(&store, &format!("http://w{n}:8000")))
+        .collect();
+    workers.sort_unstable();
+    // Twenty-four gateways whose ids follow no order of their writes, each
+    // with three vetoes; a worker is vetoed by three of them.
+    let gateways: Vec<GatewayId> = (0..24).map(|n| GatewayId(n * 856 % 1_009 + 2)).collect();
+    let own = |n: usize| {
+        let mut own: Vec<WorkerId> = (0..3).map(|step| workers[(n + step * 5) % 24]).collect();
+        own.sort_unstable();
+        own
+    };
+    for (n, &gateway) in gateways.iter().enumerate().rev() {
+        for id in own(n) {
+            store.gateway_veto(gateway, id, Some(until));
+        }
+    }
+    let each_reads_its_own = || {
+        for (n, &gateway) in gateways.iter().enumerate() {
+            assert_eq!(stalled(&store, gateway, t0), own(n), "gateway {n}");
+        }
+        // A gateway that holds no veto reads none among the others'.
+        assert_eq!(stalled(&store, ASKER, t0), []);
+    };
+    // As each veto's write left the runs,
+    each_reads_its_own();
+    // as a membership write builds every run again,
+    member(&store, "http://joined:8000");
+    each_reads_its_own();
+    // and after one gateway cleared its own: the others' stand.
+    for id in own(7) {
+        store.gateway_veto(gateways[7], id, None);
+    }
+    assert_eq!(stalled(&store, gateways[7], t0), []);
+    assert_eq!(stalled(&store, gateways[6], t0), own(6));
+    assert_eq!(stalled(&store, gateways[8], t0), own(8));
+}
+
+#[test]
+fn a_gateways_run_is_found_by_the_walk_and_by_the_search_and_none_where_it_holds_none() {
+    let until = Instant::now() + Duration::from_secs(60);
+    // Runs of gateways three apart, on both sides of the count a build
+    // walks: an asker stands under them, between two and above them. Each
+    // run's one veto names its own place.
+    for count in [
+        0,
+        1,
+        2,
+        WALKED_RUNS - 1,
+        WALKED_RUNS,
+        WALKED_RUNS + 1,
+        3 * WALKED_RUNS,
+    ] {
+        let runs: Vec<GatewayRun> = (0..count)
+            .map(|place| GatewayRun {
+                gateway: GatewayId(3 * place as u64 + 3),
+                vetoes: Arc::from([PoolVeto {
+                    row: place as u32,
+                    id: WorkerId(place as u64),
+                    until,
+                }]),
+            })
+            .collect();
+        for asker in 0..=3 * count as u64 + 4 {
+            let found = run_of(&runs, GatewayId(asker)).map(|run| run.vetoes[0].row);
+            let holds = asker >= 3 && asker % 3 == 0 && asker / 3 <= count as u64;
+            let held = holds.then(|| (asker / 3 - 1) as u32);
+            assert_eq!(found, held, "{count} runs, gateway {asker}");
+        }
+    }
+}
+
+#[test]
+fn one_worker_vetoed_by_every_gateway_is_masked_for_each_whatever_their_count() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let mut workers: Vec<WorkerId> = (0..4)
+        .map(|n| member(&store, &format!("http://w{n}:8000")))
+        .collect();
+    workers.sort_unstable();
+    // Gateways two apart. Each vetoes the one sick worker and, by its own
+    // number, one of the three others: a build that took a neighbour's run
+    // would mask another row.
+    let gateway = |n: u64| GatewayId(2 * n + 2);
+    let own = |n: u64| {
+        let mut own = vec![workers[0], workers[1 + (n % 3) as usize]];
+        own.sort_unstable();
+        own
+    };
+    let walked = WALKED_RUNS as u64;
+    let mut holders = 0;
+    // Few gateways, as many as a build walks, one more, and many.
+    for count in [1, 9, walked, walked + 1, 2 * walked] {
+        for n in holders..count {
+            for id in own(n) {
+                store.gateway_veto(gateway(n), id, Some(until));
+            }
+        }
+        holders = count;
+        for n in 0..count {
+            assert_eq!(
+                stalled(&store, gateway(n), t0),
+                own(n),
+                "{count} gateways, gateway {n}"
+            );
+            // The gateway under each holder holds none.
+            assert_eq!(
+                stalled(&store, GatewayId(2 * n + 1), t0),
+                [],
+                "{count} gateways, under gateway {n}"
+            );
+        }
+        assert_eq!(
+            stalled(&store, GatewayId(2 * count + 3), t0),
+            [],
+            "{count} gateways, above them"
+        );
+    }
+}
+
+/// Every pool's runs as plain values: per gateway its entries.
+fn runs_of(writer: &Writer) -> Vec<Vec<(GatewayId, Vec<PoolVeto>)>> {
+    writer
+        .pool_vetoes
+        .iter()
+        .map(|runs| {
+            runs.iter()
+                .map(|run| (run.gateway, run.vetoes.to_vec()))
+                .collect()
+        })
+        .collect()
+}
+
+/// A member row of the writer's own cases: worker `id`, ready, serving
+/// `models`.
+fn row_serving(id: u64, models: &[&str], admitted_at: Instant) -> WorkerRow {
+    WorkerRow {
+        id: WorkerId(id),
+        facts: facts(&format!("http://w{id}:8000"), Role::Single, models),
+        status: WorkerStatus::Ready,
+        revision: 1,
+        admitted_at,
+    }
+}
+
+#[test]
+fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
+    let origin = Instant::now();
+    let until = origin + Duration::from_secs(60);
+    // Eight workers of the model; the first four serve a second model too.
+    let members: Vec<WorkerRow> = (1..=8)
+        .map(|id| {
+            let models: &[&str] = if id <= 4 {
+                &[MODEL, "second"]
+            } else {
+                &[MODEL]
+            };
+            row_serving(id, models, origin)
+        })
+        .collect();
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, members.iter(), |_, _| None);
+    let (writing, other) = (GatewayId(3), GatewayId(7));
+    for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
+        writer
+            .veto(gateway, WorkerId(id), Some(until))
+            .expect("a new veto");
+    }
+    let run = |runs: &PoolVetoes, gateway: GatewayId| {
+        runs.iter()
+            .find(|run| run.gateway == gateway)
+            .map(|run| Arc::clone(&run.vetoes))
+    };
+    // One more veto of the writing gateway, on a worker of the first pool
+    // alone.
+    let before = Arc::clone(&writer.pool_vetoes);
+    writer
+        .veto(writing, WorkerId(7), Some(until))
+        .expect("a new veto");
+    let after = Arc::clone(&writer.pool_vetoes);
+    let mut whole = 0;
+    for (was, is) in before.iter().zip(after.iter()) {
+        if Arc::ptr_eq(was, is) {
+            // The pool the worker has no row in: not built again at all.
+            whole += 1;
+            continue;
+        }
+        // In the worker's pool the writing gateway's run is a new one with
+        // the entry, and the other gateway's is the allocation it was.
+        let (old, new) = (run(was, other), run(is, other));
+        assert!(old
+            .zip(new)
+            .is_some_and(|(old, new)| Arc::ptr_eq(&old, &new)));
+        assert_eq!(run(is, writing).map(|run| run.len()), Some(2));
+    }
+    assert_eq!((before.len(), whole), (2, 1));
+    // The clear takes the entry out the same way; the last clear of a
+    // gateway takes its run out of the pool, and the last of the store
+    // leaves no list at all.
+    let before = Arc::clone(&writer.pool_vetoes);
+    writer.veto(writing, WorkerId(7), None).expect("a clear");
+    let after = Arc::clone(&writer.pool_vetoes);
+    assert_eq!(
+        before
+            .iter()
+            .zip(after.iter())
+            .filter(|(was, is)| Arc::ptr_eq(was, is))
+            .count(),
+        1
+    );
+    writer.veto(writing, WorkerId(3), None).expect("a clear");
+    assert!(writer
+        .pool_vetoes
+        .iter()
+        .all(|runs| run(runs, writing).is_none()));
+    for id in [2, 6] {
+        writer.veto(other, WorkerId(id), None).expect("a clear");
+    }
+    assert!(writer.pool_vetoes.is_empty());
+}
+
+#[test]
+fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
+    let origin = Instant::now();
+    let at = |ms: u64| origin + Duration::from_millis(ms);
+    // Twelve workers of the model; each third one serves a second model.
+    let all: Vec<WorkerRow> = (1..=12)
+        .map(|id| {
+            let models: &[&str] = if id % 3 == 0 {
+                &[MODEL, "second"]
+            } else {
+                &[MODEL]
+            };
+            row_serving(id, models, origin)
+        })
+        .collect();
+    let mut present = [true; 12];
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, all.iter(), |_, _| None);
+    // A fixed sequence: the case makes the same writes at every run.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let mut clock = 1_000;
+    let mut standing_most = 0;
+    for step in 0..3_000_u64 {
+        let (gateway, worker) = (GatewayId(next(5) * 11 + 2), WorkerId(next(12) + 1));
+        match next(16) {
+            // A membership write: one worker joins or leaves.
+            0 => {
+                let n = next(12) as usize;
+                present[n] = !present[n];
+                let members = all
+                    .iter()
+                    .zip(present)
+                    .filter_map(|(row, here)| here.then_some(row));
+                writer.rebuild(step + 2, members, |_, _| None);
+            }
+            // A window's publication, which drops what its instant ended.
+            1 => {
+                clock += next(40);
+                writer.publish_window(at(clock));
+            }
+            // A clear, of a veto that stands or of none.
+            2..=5 => drop(writer.veto(gateway, worker, None)),
+            // A veto, new or with a new end.
+            _ => drop(writer.veto(gateway, worker, Some(at(clock + 1 + next(60))))),
+        }
+        let left = runs_of(&writer);
+        for runs in &left {
+            assert!(
+                runs.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "step {step}: a pool's runs stand by gateway"
+            );
+            for (_, run) in runs {
+                assert!(!run.is_empty(), "step {step}: no run is empty");
+                assert!(
+                    run.windows(2).all(|pair| pair[0].row < pair[1].row),
+                    "step {step}: a run stands by row"
+                );
+            }
+        }
+        let standing: usize = left.iter().flatten().map(|(_, run)| run.len()).sum();
+        standing_most = standing_most.max(standing);
+        writer.derive_vetoes();
+        assert_eq!(left, runs_of(&writer), "step {step}");
+    }
+    // The sequence held vetoes of several gateways in both pools at once.
+    assert!(standing_most >= 12, "{standing_most}");
+    // Then every standing veto is cleared, one write each: each clear
+    // leaves what a derive builds, the last one no list at all.
+    for gateway in (0..5).map(|n| GatewayId(n * 11 + 2)) {
+        for worker in (1..=12).map(WorkerId) {
+            if writer.veto(gateway, worker, None).is_none() {
+                continue;
+            }
+            let left = runs_of(&writer);
+            writer.derive_vetoes();
+            assert_eq!(left, runs_of(&writer), "{gateway:?} clears {worker:?}");
+        }
+    }
+    assert!(writer.pool_vetoes.is_empty());
+}
+
+#[test]
+fn a_seek_from_any_place_finds_what_a_search_of_the_whole_list_finds() {
+    // Ids with gaps and repeats, in a list longer than the steps on foot.
+    let ids = [
+        1, 1, 3, 4, 4, 4, 7, 9, 10, 12, 15, 15, 18, 21, 22, 25, 30, 31, 31, 40,
+    ]
+    .map(WorkerId);
+    for from in 0..=ids.len() {
+        for id in (0..=41).map(WorkerId) {
+            let whole = ids.partition_point(|&at| at < id).max(from);
+            assert_eq!(seek(&ids, from, id, |&at| at), whole, "from {from}, {id:?}");
+        }
+    }
+}
+
+/// A document that validates, under the generation `number`.
+fn generation(number: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+#[test]
+fn a_store_starts_under_the_unbound_generation_which_binds_nothing() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    let world = store.world();
+    assert_eq!(world.spec().generation(), 0);
+    for phase in [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode] {
+        assert!(world.spec().engine().binding(MODEL, phase).is_none());
+    }
+    // A build under it reads the same number with its rows.
+    let built = view(&store, &ask(t0)).2;
+    assert_eq!((built.generation, built.pool_facts().generation), (0, 0));
+}
+
+#[test]
+fn a_generation_is_applied_above_the_standing_one_and_no_other() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    // A document that names no generation is number 0: not above the
+    // unbound start, which stays the only generation 0.
+    assert_eq!(
+        store.apply(generation(0)),
+        Err(StaleGeneration {
+            standing: 0,
+            offered: 0
+        })
+    );
+    store.apply(generation(3)).expect("above the unbound start");
+    let built = view(&store, &ask(t0)).2;
+    assert_eq!(
+        (
+            built.generation,
+            built.pool_facts().generation,
+            built.pool_size
+        ),
+        (3, 3, 1)
+    );
+    let standing = store.world();
+    assert_eq!(standing.spec().generation(), 3);
+    assert!(standing
+        .spec()
+        .engine()
+        .binding(MODEL, Phase::Single)
+        .is_some());
+    // The number only rises: the standing one again and any under it are
+    // refused by naming the standing one, and nothing is published.
+    for offered in [3, 2, 0] {
+        let refused = store.apply(generation(offered)).expect_err("not above");
+        assert_eq!(
+            refused,
+            StaleGeneration {
+                standing: 3,
+                offered
+            }
+        );
+        assert!(refused.to_string().ends_with("the standing generation 3"));
+    }
+    assert!(Arc::ptr_eq(&standing, &store.world()));
+    store.apply(generation(4)).expect("above the standing one");
+    assert_eq!(view(&store, &ask(t0)).2.generation, 4);
+}
+
+#[test]
+fn an_applied_generation_is_published_at_once_with_the_rows_as_they_stand() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    status(&store, id, WorkerStatus::Ready);
+    store.gateway_veto(ASKER, id, Some(t0 + Duration::from_secs(60)));
+    // The first record opens a window; the second waits inside it.
+    store.record(id, 0, load(1, 0), t0, LoadSource::Stream);
+    store.record(
+        id,
+        0,
+        load(2, 0),
+        t0 + Duration::from_millis(1),
+        LoadSource::Stream,
+    );
+    assert_eq!(running(&store, t0), Some(1));
+    let epoch = store.world().epoch();
+    store.apply(generation(1)).expect("above the unbound start");
+    // One publication: the generation, the membership and its veto as they
+    // stood, and the record that waited.
+    let (rows, _, built) = view(&store, &ask(t0));
+    assert_eq!((built.generation, built.membership_epoch), (1, epoch));
+    assert_eq!(rows[0].load.map(|load| load.running), Some(2));
+    assert!(rows[0].health.healthy && rows[0].health.stalled);
+}
+
+#[test]
+fn the_pair_door_builds_no_decode_side_beside_an_empty_prefill_pool() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let _decode = store.upsert(facts("http://d:8000", Role::Decode, &[MODEL]));
+    let (mut prefill, mut decode) = (ViewBuffers::default(), ViewBuffers::default());
+    assert_eq!(
+        store.build_pair(MODEL, &ask(t0), &mut prefill, &mut decode),
+        None
+    );
+    // The decode pool has a member and its buffer never grew: the door
+    // stopped at the prefill pool it did not find.
+    assert_eq!(decode.candidates.capacity(), 0);
+    let _prefill = store.upsert(facts("http://p:8000", Role::Prefill, &[MODEL]));
+    assert!(store
+        .build_pair(MODEL, &ask(t0), &mut prefill, &mut decode)
+        .is_some());
+    assert_eq!((prefill.candidates.len(), decode.candidates.len()), (1, 1));
 }

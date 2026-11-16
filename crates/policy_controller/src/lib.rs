@@ -107,7 +107,7 @@ pub use lease::{
 pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
 pub use spec::{
-    Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
+    AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
     fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
