@@ -10,9 +10,11 @@
 //!
 //! An OpenAI-shaped error's `error.code` is not copied into the body. Where
 //! the response carries the code in its `x-smg-error-code` header, this
-//! layer keeps the header and a Messages client reads the code there; an
-//! OpenAI-shaped error that names its code in the body alone leaves
-//! without one.
+//! layer keeps the header and a Messages client reads the code there. A
+//! refusal of the request extractors names its code in the body alone and
+//! passes this layer without the header; the HTTP metrics layer, outside
+//! this one, adds it. Any other OpenAI-shaped error that names its code in
+//! the body alone (a worker's relayed refusal) still leaves without one.
 
 use std::{
     convert::Infallible,
