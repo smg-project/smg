@@ -2924,8 +2924,10 @@ impl NativeEncoder {
             (Some(chain), _, None) => {
                 // The chain's scanned walk costs a repeated text no more
                 // than its byte loops, so a short unit that opens as ASCII
-                // text takes it too.
-                let words = words || Self::opens_as_ascii(text);
+                // text takes it too. An all-ASCII unit does by definition:
+                // the head is counted only for a unit with a byte beyond
+                // ASCII.
+                let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
                 chain.pieces(text, words, &mut |start, end| {
                     if let Err(declined) =
                         self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
