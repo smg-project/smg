@@ -1762,6 +1762,29 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A launcher that left the publisher off for the model's sake wrote why
+/// into the server args (`kv_events_left_off`), and `SubscribeKvEvents` is
+/// refused in those words.
+#[tokio::test]
+async fn a_publisher_the_launcher_left_off_is_refused_in_the_launchers_words() {
+    let left_off = "KV event publishing left off: org/model keeps recurrent state in 3 of its \
+                    4 layers; pass --kv-events-config to turn the publisher on anyway";
+    let mut model = model_info();
+    let mut server_args: serde_json::Value =
+        serde_json::from_str(&model.server_args_json).expect("the fixture's server args");
+    server_args["kv_events_left_off"] = left_off.into();
+    model.server_args_json = server_args.to_string();
+    let mut h = harness(model, None).await;
+    let events = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect_err("no publisher");
+    assert_eq!(events.code(), Code::Unimplemented);
+    assert_eq!(events.message(), left_off);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The relay follows the publisher from the servicer's start, before any
 /// gateway subscribes: batches published with nobody listening are in its
 /// history, and the first subscription gets them as the engine's whole state.
