@@ -14,7 +14,10 @@
 //! it hands back and for no other peer, and adds what it reads to
 //! [`Shared`], which [`Shared::new`] alone builds.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::watch;
 use tonic::{service::Routes, Request, Response, Status, Streaming};
@@ -55,6 +58,8 @@ pub(crate) struct Shared {
     /// Who is present: the gateways a `Session` welcomed, over this fence
     /// and this store.
     pub(crate) gateways: Arc<Gateways>,
+    /// How long a `Session` stream may stand with no `Hello`.
+    pub(crate) hello_deadline: Duration,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -96,6 +101,7 @@ impl Shared {
             standing,
             store,
             gateways,
+            hello_deadline: session::HELLO_DEADLINE,
         }
     }
 

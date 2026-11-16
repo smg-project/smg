@@ -85,7 +85,7 @@ pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
-pub use leases::{LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
+pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use memory::MemoryStore;
 pub use reservations::{ReservationKind, ReservationStore};

@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, identity_of, BatchFacts, BatchOutcome, ContentHash, GatewayId, HealthSink, KvEvent,
-    KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
+    identity, identity_of, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink,
+    KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
     MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, ReservationKind,
     ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
     StoredBlock, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
@@ -1031,8 +1031,8 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
     );
     assert_eq!(leases.issue(lease(gateway, 2, 3, now)), Ok(()));
     assert_eq!(leases.live(gateway), 2);
-    assert!(leases.dispatched(gateway, LeaseId(1), Side::Single, now));
-    assert!(!leases.dispatched(GatewayId(2), LeaseId(1), Side::Single, now));
+    assert!(leases.dispatched(gateway, LeaseId(1), Dispatch::default(), now));
+    assert!(!leases.dispatched(GatewayId(2), LeaseId(1), Dispatch::default(), now));
     let expired = leases.expire(now + Duration::from_secs(2));
     assert_eq!(
         expired.len(),
@@ -1056,7 +1056,7 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
         duration_micros: 0,
     };
     assert!(leases.completed(gateway, LeaseId(1), &outcome));
-    assert!(!leases.released(gateway, LeaseId(1), ReleaseReason::ClientGone));
+    assert!(!leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
     assert_eq!(leases.live(gateway), 0);
 }
 

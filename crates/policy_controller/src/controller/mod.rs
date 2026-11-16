@@ -27,6 +27,7 @@ pub mod admin;
 pub mod config;
 pub mod election;
 mod gateways;
+mod lifecycle;
 pub mod metrics;
 mod principal;
 pub mod readiness;
@@ -79,13 +80,13 @@ pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The gRPC service every scope is a part of (design 8: one service, four
-/// credentialed scopes), as the health service names it. A listener reports
-/// it `SERVING` while its replica leads, its door is open and its scope's
-/// work can be done there: on the control scope a registration is taken, on
-/// the gateway scope a decision is answered, on the ingestion scope a push is
-/// taken, on the replication scope a standby can follow. Any other listener
-/// reports it `NOT_SERVING`; `Leader` is every scope's and moves no
-/// listener's word.
+/// credentialed scopes), as the health service names it. Every listener
+/// reports it `NOT_SERVING` from its bind on, and no line reports it
+/// `SERVING` yet: `Session` being served moves no listener's word. The
+/// design's rule waits for the steps that serve a scope's work: `SERVING`
+/// while the listener's replica leads and its scope's work can be done
+/// there (on the gateway scope, a decision answered). `Leader` is every
+/// scope's and moves no listener's word.
 pub const SERVICE_NAME: &str = "smg.policy.v1.PolicyController";
 
 /// A controller with its listeners bound and nothing served yet.

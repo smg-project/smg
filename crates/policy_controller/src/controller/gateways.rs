@@ -1,6 +1,7 @@
 //! Who is present (design 4.3, the stream rule): a gateway is present from
-//! its `Welcome` until its grace period ends with no new `Hello`, and its
-//! lease records live exactly that long.
+//! its `Welcome` until its grace period ends with no new `Hello`, and what
+//! the store holds under its key lives exactly that long: its lease
+//! records and its completions.
 //!
 //! Presence is read from the clock at the instant of the question, as the
 //! fence is: a gateway is present while a session of it stands and for the
@@ -359,9 +360,10 @@ impl Gateways {
             .is_some_and(|gone| now.saturating_duration_since(gone) >= self.grace)
     }
 
-    /// The end of a presence, under the table's lock: the gateway's lease
-    /// records are released, then the row goes and its decide streams are
-    /// told.
+    /// The end of a presence, under the table's lock: the store lets go
+    /// what it holds under the gateway's key through its one door for a
+    /// gone gateway (its lease records and its completions), then the row
+    /// goes and its decide streams are told.
     fn end(&self, gateway: GatewayId, row: Row) {
         let leases = self.store.drop_gateway(gateway);
         info!(
@@ -395,9 +397,13 @@ pub(crate) mod tests {
 
     use super::{Gateways, Refused, Seat};
     use crate::{
+        controller::lifecycle::{
+            self,
+            tests::{a_completed, worker},
+        },
         elector::{ElectionSettings, Elector, MemoryLease, Tick},
         lease::{Lease, LeaseId},
-        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
+        store::{GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
         view::WorkerId,
     };
 
@@ -546,6 +552,60 @@ pub(crate) mod tests {
                 .is_err(),
             "a presence that stands resolves no handle"
         );
+    }
+
+    /// What the store holds under a gateway's key ends with its presence:
+    /// its completions with its lease records, and no other gateway's.
+    #[test]
+    fn a_gateway_let_go_leaves_no_completion_in_the_store() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let served = worker(&store, "http://a:8000");
+        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
+        for gateway in [A, B] {
+            lifecycle::completed(&store, gateway, &a_completed(1, served), t0)
+                .expect("the frame reads");
+        }
+        gone.end(t0);
+
+        assert_eq!(gateways.sweep(t0 + GRACE - MS), 0);
+        assert!(
+            store.completed_ok_since(A, served, t0),
+            "inside the period nothing is let go"
+        );
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        assert!(
+            !store.completed_ok_since(A, served, t0),
+            "the gateway's completion went with it"
+        );
+        assert!(
+            store.completed_ok_since(B, served, t0),
+            "another gateway's stands"
+        );
+    }
+
+    /// The completions on file are bounded by who is present, never by who
+    /// was ever welcomed: waves of gateways under the table's ceiling, each
+    /// reporting a completion and let go, leave nothing behind.
+    #[test]
+    fn the_completions_on_file_do_not_grow_with_the_gateways_ever_welcomed() {
+        let (_elector, store, gateways, t0) = ceiled(GRACE, 8);
+        let served = worker(&store, "http://a:8000");
+        let mut now = t0;
+        for wave in 0..5_u64 {
+            for n in 0..8_u64 {
+                let gateway = GatewayId(100 + wave * 8 + n);
+                let subject = format!("gateway-{wave}-{n}");
+                let seat = welcomed(&gateways, gateway, &subject, TERM, now);
+                lifecycle::completed(&store, gateway, &a_completed(1, served), now)
+                    .expect("the frame reads");
+                seat.end(now);
+            }
+            assert_eq!(store.health_entries(), 8, "a completion a gateway");
+            now += GRACE;
+            assert_eq!(gateways.sweep(now), 8);
+            assert_eq!(store.health_entries(), 0, "wave {wave}");
+        }
     }
 
     /// A welcome and a letting-go of one gateway at one instant are
