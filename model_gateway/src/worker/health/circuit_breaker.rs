@@ -741,6 +741,31 @@ mod tests {
         assert!(cb.can_execute());
     }
 
+    /// A failed trial reopens the circuit with a timestamp of its own: the
+    /// timeout that follows runs from the reopen, not from the trip or the
+    /// trial before it.
+    #[test]
+    fn a_failed_trial_reopens_the_circuit_with_its_own_timestamp() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config_and_label(config, String::new());
+
+        cb.record_failure();
+        assert!(cb.try_half_open());
+        let trial_started_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+
+        // A lower bound: the millisecond clock has moved on by the failure,
+        // however slow the host.
+        thread::sleep(Duration::from_millis(5));
+        cb.record_failure();
+
+        assert_eq!(cb.peek_state(), CircuitState::Open);
+        assert!(cb.last_state_change_ms.load(Ordering::Acquire) > trial_started_ms);
+    }
+
     /// Only an open circuit has a trial to start.
     #[test]
     fn try_half_open_leaves_a_circuit_that_is_not_open_alone() {
