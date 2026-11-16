@@ -41,6 +41,11 @@ pub const LOAD_ROWS_TOTAL: &str = "smg_policy_controller_load_rows_total";
 /// The generation of the policy spec the controller runs. Rendered by a
 /// controller with a spec source, from its first document on.
 pub const SPEC_GENERATION: &str = "smg_policy_spec_generation";
+/// Policy spec documents a running source handed over, by `result`:
+/// `applied` as a new generation, or `rejected` with the running generation
+/// kept. A document that is the standing one counts as neither. Rendered
+/// with [`SPEC_GENERATION`].
+pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
@@ -62,6 +67,8 @@ pub(crate) struct Metrics {
 struct SpecSeries {
     generations: Arc<Generations>,
     generation: Gauge,
+    applied: Counter,
+    rejected: Counter,
 }
 
 /// The load driver's counts as the recorder's counters, set absolute from
@@ -165,9 +172,9 @@ impl Metrics {
         metrics
     }
 
-    /// Renders the generation `generations` runs from here on. Bound once,
-    /// when a spec source has applied its first document; a controller with
-    /// no source renders no spec series.
+    /// Renders the generation `generations` runs and its apply counter by
+    /// result from here on. Bound once, when a spec source has applied its
+    /// first document; a controller with no source renders no spec series.
     pub(crate) fn spec(&self, generations: Arc<Generations>) {
         self.spec.get_or_init(|| {
             let metadata = Metadata::new(module_path!(), Level::INFO, Some(module_path!()));
@@ -176,10 +183,23 @@ impl Metrics {
                 None,
                 "The generation of the policy spec the controller runs".into(),
             );
+            self.recorder.describe_counter(
+                KeyName::from_const_str(SPEC_APPLY_TOTAL),
+                None,
+                "Policy spec documents a source handed over, by result (applied, rejected)".into(),
+            );
+            let result = |result: &'static str| {
+                self.recorder.register_counter(
+                    &Key::from_parts(SPEC_APPLY_TOTAL, vec![Label::new("result", result)]),
+                    &metadata,
+                )
+            };
             SpecSeries {
                 generation: self
                     .recorder
                     .register_gauge(&Key::from_name(SPEC_GENERATION), &metadata),
+                applied: result("applied"),
+                rejected: result("rejected"),
                 generations,
             }
         });
@@ -194,7 +214,10 @@ impl Metrics {
         self.set_state(state());
         self.observe_loads(loads);
         if let Some(spec) = self.spec.get() {
+            let counts = spec.generations.counts();
             spec.generation.set(spec.generations.generation() as f64);
+            spec.applied.absolute(counts.applied);
+            spec.rejected.absolute(counts.rejected);
         }
         self.handle.render()
     }
@@ -239,7 +262,9 @@ impl Metrics {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use super::{Generations, Metrics, SPEC_GENERATION, START_TIME_SECONDS, STATE};
+    use super::{
+        Generations, Metrics, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+    };
     use crate::{controller::readiness::State, ingest::loads::Stats};
 
     fn line(rendered: &str, series: &str, label: &str) -> Option<String> {
@@ -405,12 +430,13 @@ mod tests {
     }
 
     /// A controller with no spec source renders no spec series. Once one is
-    /// bound, every render reads the generation that stands at that render.
+    /// bound, every render reads the generation and the apply counter by
+    /// result as they stand at that render.
     #[test]
-    fn the_spec_generation_renders_once_a_source_is_bound() {
+    fn the_spec_series_render_once_a_source_is_bound() {
         use crate::{
             controller::generations::{
-                tests::{LEAST_LOAD, RANDOM},
+                tests::{with_line, LEAST_LOAD, RANDOM},
                 Format,
             },
             store::MemoryStore,
@@ -425,16 +451,32 @@ mod tests {
             Arc::new(crate::Catalog::builtin()),
         ));
         metrics.spec(Arc::clone(&generations));
-        for (document, generation) in [(LEAST_LOAD, 1), (RANDOM, 2)] {
-            generations
-                .apply(document.into(), Format::Yaml)
-                .expect("a valid document");
+        let series = |generation: u64, applied: u64, rejected: u64| {
             let rendered = metrics.render(|| State::Leader, &Stats::default());
-            let line = format!("{SPEC_GENERATION} {generation}");
-            assert!(
-                rendered.lines().any(|rendered| rendered == line),
-                "no line {line:?} in {rendered}"
-            );
-        }
+            for line in [
+                format!("{SPEC_GENERATION} {generation}"),
+                format!("{SPEC_APPLY_TOTAL}{{result=\"applied\"}} {applied}"),
+                format!("{SPEC_APPLY_TOTAL}{{result=\"rejected\"}} {rejected}"),
+            ] {
+                assert!(
+                    rendered.lines().any(|rendered| rendered == line),
+                    "no line {line:?} in {rendered}"
+                );
+            }
+        };
+        series(0, 0, 0);
+        generations
+            .apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        series(1, 1, 0);
+        let refused = generations
+            .apply(with_line(RANDOM, 1), Format::Yaml)
+            .expect_err("a changed document under the standing line");
+        generations.reject(refused);
+        series(1, 1, 1);
+        generations
+            .apply(RANDOM.into(), Format::Yaml)
+            .expect("a valid document");
+        series(2, 2, 1);
     }
 }
