@@ -399,20 +399,47 @@ mod tests {
             "the parser ran and found no reasoning: zero, not absent"
         );
         assert_eq!(
-            reasoning_tokens(with_parsed_reasoning_tokens(usage, Some(7))),
-            Some(7)
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), Some(3))),
+            Some(3)
         );
-        let engine_counted = Usage::from_counts(10, 4).with_reasoning_tokens(5);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage, Some(7))),
+            Some(4),
+            "the part is not above the whole: four tokens counted, seven read as reasoning"
+        );
+        let engine_counted = Usage::from_counts(10, 4).with_reasoning_tokens(4);
         assert_eq!(
             reasoning_tokens(with_parsed_reasoning_tokens(engine_counted, Some(3))),
-            Some(5),
+            Some(4),
             "an engine that counts reasoning itself is not overruled"
         );
-        let engine_counted_fewer = Usage::from_counts(10, 4).with_reasoning_tokens(3);
+        let engine_counted_fewer = Usage::from_counts(10, 4).with_reasoning_tokens(2);
         assert_eq!(
-            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(5))),
-            Some(3),
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(3))),
+            Some(2),
             "nor when its count is lower than the parser's"
+        );
+    }
+
+    #[test]
+    fn an_engines_reasoning_count_above_its_completion_count_is_reported_and_settled_within_it() {
+        let counts = TokenCounts {
+            completion: 4,
+            reasoning: 7,
+            ..TokenCounts::default()
+        };
+        assert_eq!(
+            counts
+                .usage()
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            Some(4),
+            "four tokens generated, seven counted as reasoning"
+        );
+        assert_eq!(
+            counts.settlement().reasoning_tokens,
+            4,
+            "the settlement takes the count the usage reports"
         );
     }
 

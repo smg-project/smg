@@ -497,8 +497,11 @@ mod tests {
             );
         }
         // The engine counted reasoning itself: its count stands on both paths.
-        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(7));
-        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(7));
-        assert_eq!(reasoning_of(&iteration_usage(counts(7), 0)), Some(7));
+        assert_eq!(reasoning_of(&chat_usage(counts(4), 3)), Some(4));
+        assert_eq!(reasoning_of(&iteration_usage(counts(4), 3)), Some(4));
+        assert_eq!(reasoning_of(&iteration_usage(counts(4), 0)), Some(4));
+        // A count above the five completion tokens is reported as five on both.
+        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(5));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(5));
     }
 }
