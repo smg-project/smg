@@ -858,6 +858,30 @@ mod tests {
         assert_eq!(a.pick, Some(2));
     }
 
+    /// The view's trace is the contract's pair. A counted trace leaves with
+    /// its count and no word of a draw; a drawn one leaves with the count
+    /// unset, which is no zero, and `drew_first` set.
+    #[test]
+    fn the_views_trace_says_its_count_or_that_the_decision_drew() {
+        use crate::decision::{Survivors, Trace};
+        let counted = Trace {
+            profile: 3,
+            survivors: Survivors::counted(5),
+            seed: 41,
+            generation: 6,
+            ..Trace::default()
+        };
+        let wire = super::trace(&counted);
+        assert_eq!((wire.survivors, wire.drew_first), (Some(5), false));
+        assert_eq!((wire.profile, wire.seed, wire.generation), (3, 41, 6));
+        let drawn = Trace {
+            survivors: Survivors::NOT_COUNTED,
+            ..counted
+        };
+        let wire = super::trace(&drawn);
+        assert_eq!((wire.survivors, wire.drew_first), (None, true));
+    }
+
     /// A measurement for the Numbers table, not a check: run in release
     /// with `--ignored measure --nocapture`. What one frame costs before
     /// the stream takes it, with a load row on every candidate: the message

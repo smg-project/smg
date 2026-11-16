@@ -381,12 +381,15 @@ const fn shed_reason(reason: ShedReason) -> proto::ShedReason {
     }
 }
 
-/// The record's trace: the five facts it holds. The observability contract
-/// fills the wire's other fields; they stay unset until then.
+/// The record's trace: the five facts it holds. Its count fills two of the
+/// wire's fields: `survivors` where a pass counted, and `drew_first` where
+/// the decision drew and counted none. The observability contract fills
+/// the wire's other fields; they stay unset until then.
 fn trace(trace: &Trace) -> proto::Trace {
     proto::Trace {
         profile: u32::from(trace.profile),
         survivors: trace.survivors.get(),
+        drew_first: trace.drew_first(),
         top: trace
             .top
             .iter()
@@ -950,6 +953,36 @@ mod tests {
         );
         assert_eq!(trace, Some(wire_trace()));
         assert_eq!(leases, 0);
+    }
+
+    /// A decision that drew counted no survivor, and the wire says so in
+    /// the contract's two words: `survivors` stays unset, which is no
+    /// count and no zero, and `drew_first` is set. The trace's other facts
+    /// leave as a counted trace's do.
+    #[test]
+    fn a_drawn_decisions_trace_says_drew_first_and_carries_no_count() {
+        let mut targets = Targets::new();
+        targets.push(Target {
+            position: 0,
+            id: WorkerId(53),
+            dp_rank: 0,
+            pair: None,
+        });
+        let pick = Decision::Pick(Pick {
+            targets,
+            trace: Trace {
+                survivors: Survivors::NOT_COUNTED,
+                ..traced()
+            },
+            ..Pick::default()
+        });
+        let (_, trace, _) = carried(decided(Vec::new(), 1, &pick));
+        let drawn = proto::Trace {
+            survivors: None,
+            drew_first: true,
+            ..wire_trace()
+        };
+        assert_eq!(trace, Some(drawn));
     }
 
     #[test]
