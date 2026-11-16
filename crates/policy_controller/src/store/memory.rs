@@ -169,6 +169,15 @@ impl MemoryStore {
         store
     }
 
+    /// The term the journal followed where the store's last take started
+    /// no term in it: the journal had seen that term or a later one, so
+    /// the store's writes stand under no term and no standby follows them
+    /// until a later take. `None` while the store leads the journal's
+    /// term, and for a store with no journal.
+    pub fn followed(&self) -> Option<u64> {
+        self.journal.as_ref().and_then(|journal| journal.followed())
+    }
+
     /// The tables of `kinds` as one journaled write of those kinds left
     /// them, with that write's position: the rows, and with [`Kinds::All`]
     /// the load rows. What a watcher of the rows starts from, and what a
@@ -178,7 +187,8 @@ impl MemoryStore {
     /// its apply to its telling, so none stands half told here. A writer
     /// of those tables waits for the copy; a decision reads the published
     /// world and does not, and a cut of the rows leaves the load writers
-    /// be.
+    /// be. Where the journal carries no load row a cut of every kind has
+    /// no tail: that journal is lost to a reader of every kind.
     pub fn cut(&self, kinds: Kinds) -> Cut {
         // Copied under the locks, sorted after them: a writer waits for the
         // copy alone.

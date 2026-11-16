@@ -499,13 +499,14 @@ mod tests {
     use crate::{
         controller::{
             config::Scope,
-            election::Standing,
+            election::{LeasePlace, Standing},
             gateways::{
                 tests::{lease, PATIENT},
                 Gateways, Refused,
             },
             lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
+            replication::journaled,
             service::{Service, Shared},
             PROTOCOL_VERSION,
         },
@@ -515,7 +516,7 @@ mod tests {
             self, controller_frame, gateway_frame::Frame,
             policy_controller_client::PolicyControllerClient,
         },
-        store::{HealthSink, LeaseState, LeasesStore, MemoryStore},
+        store::{HealthSink, LeaseState, LeasesStore},
     };
 
     const ID: &str = "controller-0";
@@ -552,7 +553,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            Arc::new(MemoryStore::new()),
+            journaled(&LeasePlace::Process),
             Arc::new(crate::Catalog::builtin()),
             2,
         )

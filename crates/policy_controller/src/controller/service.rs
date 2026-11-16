@@ -36,6 +36,7 @@ use super::{
     generations::Generations,
     membership::Door,
     principal::{self, Layer, Principal},
+    replication::{Batches, Replication},
     session, PROTOCOL_VERSION,
 };
 use crate::{
@@ -45,6 +46,7 @@ use crate::{
         self,
         policy_controller_server::{PolicyController, PolicyControllerServer},
     },
+    replication::Log,
     store::MemoryStore,
 };
 
@@ -76,6 +78,8 @@ pub(crate) struct Shared {
     /// The membership door over that store: the control scope's
     /// registration calls.
     pub(crate) door: Door,
+    /// The replication scope's calls over that store and its log.
+    pub(crate) replication: Replication,
     /// The threads the decisions run on, a model's on one.
     pub(crate) deciders: Deciders,
     /// The decide streams each gateway holds open.
@@ -103,7 +107,8 @@ impl Shared {
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
     /// another fence guards. A spec document names the stages `catalog`
-    /// holds. `deciders` is how many threads decide.
+    /// holds. `deciders` is how many threads decide. The store comes with
+    /// the log it journals to, the pair one place builds.
     ///
     /// # Errors
     ///
@@ -113,7 +118,7 @@ impl Shared {
         address: String,
         elector: &Elector,
         standing: watch::Receiver<Standing>,
-        store: Arc<MemoryStore>,
+        (store, log): (Arc<MemoryStore>, Arc<Log>),
         catalog: Arc<Catalog>,
         deciders: usize,
     ) -> io::Result<Self> {
@@ -142,6 +147,7 @@ impl Shared {
             standing,
             generations: Arc::new(Generations::new(Arc::clone(&store), catalog)),
             door: Door::new(Arc::clone(&store)),
+            replication: Replication::new(Arc::clone(&store), log, elector.fence()),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -434,7 +440,7 @@ impl PolicyController for Service {
     type DecideStream = decide::Answers;
     type WatchWorkersStream = Unserved<proto::WorkerEvent>;
     type WatchRegimeStream = Unserved<proto::Regime>;
-    type ReplicateStream = Unserved<proto::ReplicationBatch>;
+    type ReplicateStream = Batches;
 
     async fn session(
         &self,
@@ -508,11 +514,23 @@ impl PolicyController for Service {
             .map(Response::new)
     }
 
+    /// The complete snapshot, on the listener that mounts the replication
+    /// scope: a caller admitted there can ask `Replicate` for the same
+    /// rows. The control scope's redacted read is not served yet.
     async fn get_snapshot(
         &self,
         request: Request<proto::SnapshotRequest>,
     ) -> Result<Response<proto::Snapshot>, Status> {
-        self.unserved(Call::GetSnapshot, &request)
+        if !self.scopes.contains(&Scope::Replication) {
+            return self.unserved(Call::GetSnapshot, &request);
+        }
+        self.admit(Call::GetSnapshot, &request)?;
+        let now = Instant::now();
+        let term = self.leading(now)?;
+        self.shared
+            .replication
+            .snapshot(term, &self.shared.controller_id, now)
+            .map(Response::new)
     }
 
     async fn explain(
@@ -584,7 +602,13 @@ impl PolicyController for Service {
         &self,
         request: Request<Streaming<proto::ReplicaFrame>>,
     ) -> Result<Response<Self::ReplicateStream>, Status> {
-        self.unserved(Call::Replicate, &request)
+        let standby = self.admit(Call::Replicate, &request)?.subject.clone();
+        let term = self.leading(Instant::now())?;
+        self.shared
+            .replication
+            .replicate(term, &standby, request.into_inner())
+            .await
+            .map(Response::new)
     }
 }
 
@@ -611,12 +635,13 @@ mod tests {
         catalog::Catalog,
         controller::{
             config::Scope,
-            election::{self, Standing},
+            election::{self, LeasePlace, Standing},
             generations::{tests::LEAST_LOAD, Format},
             principal::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
+            replication::journaled,
             PROTOCOL_VERSION,
         },
         elector::{
@@ -624,7 +649,6 @@ mod tests {
             MemoryLease, Tick, Written,
         },
         proto::{self, policy_controller_server::PolicyController},
-        store::MemoryStore,
     };
 
     const ID: &str = "controller-0";
@@ -647,7 +671,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                Arc::new(MemoryStore::new()),
+                journaled(&LeasePlace::Process),
                 Arc::new(Catalog::builtin()),
                 2,
             )
@@ -701,14 +725,14 @@ mod tests {
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let store = Arc::new(MemoryStore::new());
+        let (store, log) = journaled(&LeasePlace::Process);
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                Arc::clone(&store),
+                (Arc::clone(&store), log),
                 Arc::new(Catalog::builtin()),
                 2,
             )
@@ -893,12 +917,13 @@ mod tests {
         assert_eq!(unplaced.code(), Code::Unauthenticated);
         assert_eq!(unplaced.message(), NO_PRINCIPAL);
 
-        // The snapshot is the operators' read and a standby's re-sync base.
+        // The snapshot: the operators' read is unserved; a standby's
+        // re-sync base is the leader's to answer.
         let snapshot = || from("standby-a", proto::SnapshotRequest::default());
         for (listener, code) in [
             (&gateway, Code::PermissionDenied),
             (&control, Code::Unimplemented),
-            (&replication, Code::Unimplemented),
+            (&replication, Code::FailedPrecondition),
         ] {
             let status = listener
                 .get_snapshot(snapshot())
@@ -920,13 +945,14 @@ mod tests {
             .collect()
     }
 
-    /// The calls a step serves, beside `Leader`. Each is the leader's to
-    /// answer: a replica that never took the lease refuses it as a write.
-    const fn served(call: Call) -> bool {
+    /// The calls a step serves on a listener of `scopes`, beside `Leader`.
+    /// Each is the leader's to answer: a replica that never took the lease
+    /// refuses it. The snapshot is served on the replication scope alone.
+    fn served(call: Call, scopes: &[Scope]) -> bool {
         matches!(
             call,
-            Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker
-        )
+            Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker | Call::Replicate
+        ) || (matches!(call, Call::GetSnapshot) && scopes.contains(&Scope::Replication))
     }
 
     /// Every method of the contract, called by its own name over a socket
@@ -1021,7 +1047,10 @@ mod tests {
                         Code::Unimplemented,
                         format!("{method} is not served by a controller started with no spec file"),
                     )
-                } else if layer == Layer::AsTold && stated && call.is_some_and(served) {
+                } else if layer == Layer::AsTold
+                    && stated
+                    && call.is_some_and(|call| served(call, scopes))
+                {
                     (
                         Code::FailedPrecondition,
                         "this replica does not lead".to_owned(),
@@ -1108,7 +1137,7 @@ mod tests {
                     ADDRESS.to_owned(),
                     &elector,
                     stood,
-                    Arc::new(MemoryStore::new()),
+                    journaled(&LeasePlace::Process),
                     Arc::new(Catalog::builtin()),
                     2,
                 )
