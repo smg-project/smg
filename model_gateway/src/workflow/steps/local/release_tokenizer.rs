@@ -117,13 +117,13 @@ impl ReleaseTokenizerStep {
     /// same entry and the first's release took it), and the multimodal
     /// config keyed by it, unless a worker of the model appeared since the
     /// candidates were read (its registration's tokenizer job read the entry
-    /// as already loaded): then
-    /// the entry goes back as it was, under its own id, and the config stays
-    /// (see [`Self::put_back`] for the job that loaded afresh instead). The
-    /// put-back runs on its own task: its wait on the registry's per-name
-    /// lock, which a registration's load of the same name may hold for its
-    /// whole load, is not the step's budget to cut, and a step cut with the
-    /// removed entry in hand would lose it. Whether the entry left.
+    /// as already loaded): then the entry goes back as it was, under its own
+    /// id, and the config stays (see [`Self::put_back`] for the job that
+    /// loaded afresh instead). The put-back runs on its own task: its wait
+    /// on the registry's per-name lock, which a registration's load of the
+    /// same name may hold for its whole load, is not the step's budget to
+    /// cut, and a step cut with the removed entry in hand would lose it.
+    /// Whether the entry left.
     fn release(app_context: &Arc<AppContext>, model_id: &str, entry_id: &str) -> bool {
         let Some(entry) = app_context
             .tokenizer_registry

@@ -298,7 +298,7 @@ mod tests {
     use crate::{
         server::http_client_builder,
         worker::{
-            circuit_breaker::CircuitBreakerConfig,
+            health::circuit_breaker::CircuitBreakerConfig,
             test_support::{no_health_check, RefusedAddress},
             BasicWorkerBuilder,
         },

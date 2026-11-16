@@ -258,7 +258,22 @@ impl Assembler {
     /// value the close cut short is said to be one, by a `Malformed` event of no bytes before the
     /// end; an object that never named its call comes back as `Malformed` whole. Either way no
     /// byte is lost.
-    pub fn finish(mut self, out: &mut Events) {
+    pub fn finish(self, out: &mut Events) {
+        self.end(returned, out);
+    }
+
+    /// [`Self::finish`] for the list a schema holds the output to
+    /// ([`Framing::Forced`](super::list::Framing::Forced)), where no byte of an open object is
+    /// prose: the bytes `finish` returns as `Malformed` (a started call's behind its arguments
+    /// value, an object the end cut before its call started) are refused
+    /// ([`crate::tagged::refuse`]). The call itself ends as `finish` ends it.
+    pub(super) fn finish_forced(self, out: &mut Events) {
+        self.end(crate::tagged::refuse, out);
+    }
+
+    /// The end of an object that never closed. `left_over` takes the bytes that are no call's:
+    /// it returns them ([`Self::finish`]) or refuses them ([`Self::finish_forced`]).
+    fn end(mut self, left_over: fn(String, MalformedReason, &mut Events), out: &mut Events) {
         if self.done {
             return;
         }
@@ -288,10 +303,11 @@ impl Assembler {
                 .and_then(|span| span.end)
                 .unwrap_or(self.text.len());
             if tail_start < self.text.len() {
-                out.push(Event::Malformed {
-                    text: Text::uncounted(self.text[tail_start..].to_owned()),
-                    why: MalformedReason::UnterminatedRegion,
-                });
+                left_over(
+                    self.text[tail_start..].to_owned(),
+                    MalformedReason::UnterminatedRegion,
+                    out,
+                );
             }
             out.push(Event::ToolCallEnd {
                 index: self.index,
@@ -302,10 +318,7 @@ impl Assembler {
         // `feed` answers an object that closed without a name at its brace, so what is left here
         // never closed.
         if !self.text.is_empty() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(self.text),
-                why: MalformedReason::UnterminatedRegion,
-            });
+            left_over(self.text, MalformedReason::UnterminatedRegion, out);
         }
     }
 
@@ -368,6 +381,15 @@ impl Assembler {
         }
         self.fragments.send_rest(bytes, arrived, self.index, out);
     }
+}
+
+/// The bytes an object that never closed still held, returned as `Malformed` text
+/// ([`Assembler::finish`]).
+fn returned(text: String, why: MalformedReason, out: &mut Events) {
+    out.push(Event::Malformed {
+        text: Text::uncounted(text),
+        why,
+    });
 }
 
 impl crate::engine::CallAssembler for Assembler {

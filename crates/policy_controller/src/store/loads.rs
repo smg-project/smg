@@ -99,4 +99,21 @@ pub trait LoadSink: Send + Sync {
 
     /// The worker left, or its reports stopped: nothing on file for it.
     fn evict(&self, id: WorkerId);
+
+    /// When the writes this sink took and has not yet shown its readers are
+    /// due to be shown; `None` when nothing waits. A sink that shows each
+    /// write at once never names an instant. The crate's load driver keeps
+    /// the instant; a host that writes from a task of its own reads it
+    /// after a write and calls [`LoadSink::publish`] at it. A host that
+    /// does neither shows a waiting write with its next one, and the row's
+    /// age says so meanwhile.
+    fn publish_due(&self) -> Option<Instant> {
+        None
+    }
+
+    /// Show the readers what waits, when `now` is at or past the instant
+    /// [`LoadSink::publish_due`] names; a call before it shows nothing.
+    fn publish(&self, now: Instant) {
+        let _ = now;
+    }
 }

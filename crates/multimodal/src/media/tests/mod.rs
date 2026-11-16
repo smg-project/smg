@@ -632,6 +632,38 @@ fn enforces_media_payload_limit_for_each_label() {
     assert!(checked_payload_length(usize::MAX, 1, usize::MAX, "audio").is_err());
 }
 
+#[tokio::test]
+async fn raw_inline_fetch_enforces_limit_for_each_media_type() {
+    let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+        .expect("default connector");
+
+    for media in ["image", "video", "audio"] {
+        let raw = connector
+            .fetch_raw_bytes(
+                MediaSource::InlineBytes(b"1234".to_vec()),
+                std::time::Duration::ZERO,
+                4,
+                media,
+            )
+            .await
+            .expect("inline payload at limit");
+        assert_eq!(raw.0, Bytes::from_static(b"1234"));
+
+        assert!(matches!(
+            connector
+                .fetch_raw_bytes(
+                    MediaSource::InlineBytes(b"12345".to_vec()),
+                    std::time::Duration::ZERO,
+                    4,
+                    media,
+                )
+                .await,
+            Err(MediaConnectorError::PayloadTooLarge { media: actual, limit: 4 })
+                if actual == media
+        ));
+    }
+}
+
 #[test]
 fn enforces_base64_payload_limit_before_and_after_decode() {
     for media in ["image", "video", "audio"] {
@@ -1096,6 +1128,36 @@ async fn decode_video_rejects_an_invalid_long_side_cap() {
                     if got == value
             ),
             "cap {value}: unexpected error {err:?}"
+        );
+    }
+}
+
+/// A URL of a scheme the connector does not fetch is refused in the
+/// connector's own words before any client is built for it, as a redirect to
+/// such a scheme is; the client library's builder error (its words, repeated
+/// through the error chain) never reaches the caller.
+#[tokio::test]
+async fn a_url_scheme_the_connector_does_not_fetch_is_refused_before_the_client() {
+    let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+        .expect("default connector");
+    for (url, scheme) in [
+        ("ftp://media.example/a.jpg", "ftp"),
+        ("file:///etc/hostname", "file"),
+    ] {
+        let error = connector
+            .fetch_image(
+                MediaSource::Url(std::sync::Arc::new(url.to_string())),
+                ImageFetchConfig::default(),
+            )
+            .await
+            .expect_err("a scheme the connector does not fetch");
+        assert!(
+            matches!(&error, MediaConnectorError::UnsupportedScheme(got) if got == scheme),
+            "{url}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("unsupported media scheme: {scheme}")
         );
     }
 }

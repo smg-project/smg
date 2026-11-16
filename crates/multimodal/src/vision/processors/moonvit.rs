@@ -18,10 +18,9 @@
 //! over a background before patchify — see [`MoonVitParams`] and the
 //! `transparent_bg` argument to [`preprocess`].
 
-use std::borrow::Cow;
+use std::{borrow::Cow, iter::repeat_n};
 
 use image::{DynamicImage, GenericImageView};
-use ndarray::Array3;
 
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
@@ -140,14 +139,12 @@ fn normalized_levels(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
     })
 }
 
-/// Fused resize + zero-pad + normalize into a single [C, H_padded, W_padded] tensor.
-///
-/// Avoids intermediate allocations by:
-/// 1. Allocating the final padded canvas directly
-/// 2. Pre-filling with normalized black (the table's entry for a zero byte,
-///    as the reference zero-pads the bytes before it normalizes)
-/// 3. Deinterleaving + normalizing the image region in one pass, every byte
-///    through its channel's table of [`normalized_levels`]
+/// Fused resize + zero-pad + normalize + patchify: appends the image's
+/// `[3, patch_size, patch_size]` patches to `out`, row-major over the padded
+/// grid. Every byte of the resized image maps through its channel's table of
+/// [`normalized_levels`] straight into its patch, and the cells of the padding
+/// take the table's entry for a zero byte, as the reference zero-pads the
+/// bytes before it normalizes.
 ///
 /// The resize is the reference's `PIL.Image.resize(.., BICUBIC)`: Pillow's
 /// separable bicubic in 22-bit fixed point (`transforms::resize_bicubic_pil_rgb`)
@@ -166,15 +163,14 @@ fn normalized_levels(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
 /// carries an alpha channel here only when the gateway decoded it under
 /// `TransparencyPolicy::KeepAlpha` (K3 asks for that through `keeps_alpha`;
 /// otherwise the destination engine's loader rule was applied at the decode).
-fn resize_pad_and_normalize(
+fn append_patches(
     image: &DynamicImage,
     cfg: &ResizeConfig,
+    patch_size: usize,
     levels: &[[f32; 256]; 3],
     transparent_bg: Option<TransparentBg>,
-) -> Result<Array3<f32>, TransformError> {
-    let canvas_h = cfg.new_height + cfg.pad_height;
-    let canvas_w = cfg.new_width + cfg.pad_width;
-
+    out: &mut Vec<f32>,
+) -> Result<(), TransformError> {
     // Nothing to composite over if the image has no alpha to begin with.
     let bg = transparent_bg.filter(|_| image.color().has_alpha());
 
@@ -221,60 +217,38 @@ fn resize_pad_and_normalize(
         ),
         None => transforms::rgb_bytes(resized),
     };
-    let canvas_pixels = canvas_h * canvas_w;
-
-    // Pooled: this per-image CHW buffer (tens of MB) is recycled by the
-    // caller after patch extraction, keeping its pages mapped and hot.
-    let mut data = scratch::take_f32(3 * canvas_pixels);
-    transforms::paint_rgb_onto_planes_by_table(
-        &raw,
-        (img_w, img_h),
-        (canvas_w, canvas_h),
-        levels,
-        &mut data,
+    let grid = (
+        (cfg.new_width + cfg.pad_width) / patch_size,
+        (cfg.new_height + cfg.pad_height) / patch_size,
     );
-
-    #[expect(
-        clippy::expect_used,
-        reason = "data has exactly 3*canvas_h*canvas_w elements by construction"
-    )]
-    Ok(Array3::from_shape_vec((3, canvas_h, canvas_w), data)
-        .expect("shape matches pre-allocated buffer"))
+    write_patches(&raw, (img_w, img_h), grid, patch_size, levels, out);
+    Ok(())
 }
 
-/// Extract [C, patch_size, patch_size] patches from a contiguous [C, H, W] tensor.
-///
-/// Uses row-based `copy_from_slice` instead of per-element indexing so the
-/// compiler can auto-vectorize the inner copy.
-/// Append this image's patches directly into `out` (no per-image intermediate
-/// Vec): `out` is the pooled batch buffer pre-sized for the whole request.
-fn extract_patches_into(tensor: &Array3<f32>, patch_size: usize, out: &mut Vec<f32>) {
-    let channels = tensor.shape()[0];
-    let height = tensor.shape()[1];
-    let width = tensor.shape()[2];
-
-    let grid_h = height / patch_size;
-    let grid_w = width / patch_size;
-
-    // Get contiguous slice for direct row addressing
-    let flat = tensor.as_standard_layout();
-    #[expect(
-        clippy::expect_used,
-        reason = "as_standard_layout guarantees contiguous C-order memory"
-    )]
-    let data = flat
-        .as_slice()
-        .expect("as_standard_layout guarantees contiguous memory");
-
-    for gh in 0..grid_h {
-        for gw in 0..grid_w {
-            let h_start = gh * patch_size;
-            let w_start = gw * patch_size;
-            for c in 0..channels {
-                let plane_offset = c * height * width;
-                for ph in 0..patch_size {
-                    let row_start = plane_offset + (h_start + ph) * width + w_start;
-                    out.extend_from_slice(&data[row_start..row_start + patch_size]);
+/// Append the `[3, patch, patch]` patches of a `grid_w` x `grid_h` grid laid
+/// over interleaved RGB bytes: a byte maps through its channel's table, a
+/// cell beyond the image through the table's entry for a zero byte.
+fn write_patches(
+    rgb: &[u8],
+    (image_w, image_h): (usize, usize),
+    (grid_w, grid_h): (usize, usize),
+    patch: usize,
+    levels: &[[f32; 256]; 3],
+    out: &mut Vec<f32>,
+) {
+    let (pixels, _) = rgb.as_chunks::<3>();
+    for top in (0..grid_h * patch).step_by(patch) {
+        for left in (0..grid_w * patch).step_by(patch) {
+            let inside = image_w.saturating_sub(left).min(patch);
+            for (channel, table) in levels.iter().enumerate() {
+                for y in top..top + patch {
+                    let row = if y < image_h && inside > 0 {
+                        &pixels[y * image_w + left..][..inside]
+                    } else {
+                        &[]
+                    };
+                    out.extend(row.iter().map(|pixel| table[usize::from(pixel[channel])]));
+                    out.extend(repeat_n(table[0], patch - row.len()));
                 }
             }
         }
@@ -314,8 +288,14 @@ pub fn preprocess(
         let (w, h) = image.dimensions();
         let cfg = params.compute_resize_config(w as usize, h as usize);
 
-        // Fused resize + pad + normalize in one pass (avoids 2 extra allocations)
-        let tensor = resize_pad_and_normalize(image, &cfg, &levels, transparent_bg)?;
+        append_patches(
+            image,
+            &cfg,
+            params.patch_size,
+            &levels,
+            transparent_bg,
+            &mut all_patches,
+        )?;
 
         let padded_h = cfg.new_height + cfg.pad_height;
         let padded_w = cfg.new_width + cfg.pad_width;
@@ -330,11 +310,6 @@ pub fn preprocess(
         let num_patches = grid_h * grid_w;
         feature_token_counts.push(cfg.num_tokens);
 
-        // Patchify directly into the pooled batch buffer, then recycle the
-        // CHW tensor's storage (standard layout, offset 0) for the next image.
-        extract_patches_into(&tensor, params.patch_size, &mut all_patches);
-        let (storage, _offset) = tensor.into_raw_vec_and_offset();
-        scratch::give_f32(storage);
         patches_per_image.push(num_patches as i64);
     }
 
@@ -611,5 +586,43 @@ mod tests {
             digest_of(&got[..]),
             "47e02f6a5305085afa077da8ab756e1380052bea0a4433ce584c1f1f7e972a50"
         );
+    }
+
+    /// A 20x16 image on a 2x2 grid of 14-pixel patches: the right patch
+    /// column holds 6 image columns then 8 of padding, the bottom patch row 2
+    /// image rows then 12 of padding. The tables tell the channels and the
+    /// levels apart.
+    #[test]
+    fn write_patches_maps_each_channel_through_its_own_table_and_pads_with_its_zero() {
+        let (image_w, image_h, patch) = (20, 16, 14);
+        let rgb = generated_bytes(image_w * image_h * 3, 3);
+        let levels: [[f32; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|level| (c * 1000 + level) as f32));
+        let mut out = Vec::new();
+        write_patches(&rgb, (image_w, image_h), (2, 2), patch, &levels, &mut out);
+        assert_eq!(out.len(), 4 * 3 * patch * patch);
+        let mut index = 0;
+        for gh in 0..2 {
+            for gw in 0..2 {
+                for c in 0..3 {
+                    for py in 0..patch {
+                        for px in 0..patch {
+                            let (x, y) = (gw * patch + px, gh * patch + py);
+                            let level = if x < image_w && y < image_h {
+                                rgb[(y * image_w + x) * 3 + c]
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                out[index].to_bits(),
+                                levels[c][usize::from(level)].to_bits(),
+                                "patch ({gh}, {gw}) channel {c} at ({px}, {py})"
+                            );
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -7,18 +7,27 @@
 //! holder's renewal over an API server in this process behind the real
 //! client (`policy_elector/kubernetes/renew`: the GET, the PUT, JSON both
 //! ways, no network). The renewals and looks run once per renew period in
-//! production; the fence read runs per decision. Not a pull-request gate:
-//! the rows are I/O bound and read for their order of magnitude.
+//! production; the fence read runs per decision. The last group is the
+//! decision beside the election
+//! (`policy_elector/decide_beside/<alone|elected|alone_again>/<n>`): the
+//! decision bench's least-load cell with no election thread, with one
+//! renewing a lease file at the design's settings, and with none again, the
+//! same binary's control. Not a pull-request gate: the rows are I/O bound and
+//! read for their order of magnitude.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a lease that fails to open is a bug the unit tests catch"
 )]
 
-use std::{hint::black_box, time::Instant};
+mod common;
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use smg_policy_controller::elector::{
-    ElectionSettings, Elector, FileLease, LeaseBackend, MemoryLease, Tick,
+use std::{hint::black_box, sync::mpsc, thread, time::Instant};
+
+use common::{build_view, engine_of, fleet};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use smg_policy_controller::{
+    elector::{ElectionSettings, Elector, FileLease, LeaseBackend, MemoryLease, Tick},
+    Constraints, PoolFacts, RequestFacts, Scratch,
 };
 
 fn holder(backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
@@ -68,6 +77,86 @@ fn file(c: &mut Criterion) {
     group.bench_function("follow", |b| {
         b.iter(|| follower.tick(black_box(t0)).expect("following"));
     });
+    group.finish();
+}
+
+/// A holder renewing its lease file every renew period on a thread of its
+/// own, the way the controller's election thread steps its elector; stopped
+/// and joined when dropped.
+struct Renewing {
+    stop: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+    _dir: tempfile::TempDir,
+}
+
+impl Renewing {
+    fn start() -> Self {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut elector = holder(
+            Box::new(FileLease::new(dir.path().join("lease"))),
+            "a@host:1",
+        );
+        let period = ElectionSettings::default().renew_period;
+        let (stop, stopped) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while stopped.recv_timeout(period) == Err(mpsc::RecvTimeoutError::Timeout) {
+                elector.tick(Instant::now()).expect("renewed");
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+            _dir: dir,
+        }
+    }
+}
+
+impl Drop for Renewing {
+    fn drop(&mut self) {
+        // A thread that is gone has nothing to stop.
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The decision beside the election: the election is one thread that wakes
+/// once a renew period, and no read of the decision path is its. The three
+/// arms run in one process, pinned by the caller to one core, so the thread
+/// renews on the core the decisions run on.
+fn decide_beside(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_elector/decide_beside");
+    let engine = engine_of("least_load");
+    for arm in ["alone", "elected", "alone_again"] {
+        let _renewing = (arm == "elected").then(Renewing::start);
+        for n in [8usize, 64, 512] {
+            let fleet = fleet(n);
+            let mut view = Vec::with_capacity(n);
+            build_view(&fleet, &mut view);
+            let mut scratch = Scratch::new();
+            let pool = PoolFacts {
+                pool_size: n as u32,
+                generation: 1,
+                ..PoolFacts::default()
+            };
+            let cx = Constraints::default();
+            group.bench_with_input(BenchmarkId::new(arm, n), &n, |b, _| {
+                let mut seed = 0u64;
+                b.iter(|| {
+                    seed += 1;
+                    let facts = RequestFacts {
+                        model: "m",
+                        prompt_tokens: 512,
+                        seed,
+                        now_micros: 1_000_000,
+                        ..RequestFacts::default()
+                    };
+                    engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+                });
+            });
+        }
+    }
     group.finish();
 }
 
@@ -156,7 +245,14 @@ mod kubernetes {
 }
 
 #[cfg(feature = "kubernetes")]
-criterion_group!(benches, fence, memory, file, kubernetes::renew);
+criterion_group!(
+    benches,
+    fence,
+    memory,
+    file,
+    kubernetes::renew,
+    decide_beside
+);
 #[cfg(not(feature = "kubernetes"))]
-criterion_group!(benches, fence, memory, file);
+criterion_group!(benches, fence, memory, file, decide_beside);
 criterion_main!(benches);

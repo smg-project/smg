@@ -23,7 +23,7 @@ _MORIIO_CONNECTOR = "MoRIIOConnector"
 # The connectors whose sides meet in a store the deployment shares, by exact
 # name or family prefix: the router's store profile (no side tagged, no
 # bootstrap port handed or probed) applies to a worker that names one of them.
-# The router's table (`model_gateway/src/worker/pd_pairing.rs`,
+# The router's table (`model_gateway/src/worker/pd/pairing.rs`,
 # `STORE_CONNECTORS` / `STORE_CONNECTOR_FAMILIES`) is the reference; a name
 # listed there and not here is reported as the wrapper, which the router
 # handles as an unknown connector.

@@ -24,8 +24,8 @@ use smg::{
     routers::RouterFactory,
     tenant::TenantKey,
     worker::{
-        circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
-        WorkerType,
+        health::circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType,
+        Worker, WorkerType,
     },
 };
 use smg_grpc_client::{
@@ -54,7 +54,7 @@ impl TokenSpeedAnswers for RefusingWorker {
     ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let refused = self
             .refusals
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
             .is_ok();

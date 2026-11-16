@@ -6,8 +6,11 @@
 //! without the lock (an operator, a candidate's `read`) sees the old record
 //! or the new one, never a torn or empty file, and a host crash leaves one
 //! of the two as well, so the term survives the host. A deleted or emptied
-//! file restarts the term at one; the gateways' term floors then refuse the
-//! controller until they restart, so the file is not something to clean up.
+//! file is waited out by a replica that saw its record held, for that
+//! record's duration, and taken above the highest term that replica saw; one
+//! removed again before a waiting replica read its taker's record is taken at
+//! once. A replica started after the loss takes it at term one; the gateways'
+//! term floors then refuse the controller until they restart: keep the file.
 //! Local filesystems only: the lock is the standard library's advisory lock,
 //! which a network filesystem need not honour between hosts.
 

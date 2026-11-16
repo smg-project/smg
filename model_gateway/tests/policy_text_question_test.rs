@@ -37,7 +37,7 @@ use smg::{
         PrefixHashPolicy, RandomPolicy, SelectWorkerInfo,
     },
     worker::{
-        load_state::{one_rank_load, TestFeed},
+        load::state::{one_rank_load, TestFeed},
         BasicWorkerBuilder, Worker, WorkerType,
     },
 };
