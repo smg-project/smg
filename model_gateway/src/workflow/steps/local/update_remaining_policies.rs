@@ -5,7 +5,8 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    policies::as_cache_aware, worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData,
+    policies::as_cache_aware, worker::identity::endpoint::Endpoint,
+    workflow::data::WorkerRemovalWorkflowData,
 };
 
 /// Step to update cache-aware policies for remaining workers.

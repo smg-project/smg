@@ -4,6 +4,20 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ## Unreleased
 
+### Changed
+
+- `EmbeddingObject.embedding` is an `Embedding`: the float array, or the base64 string of the
+  vector's little-endian f32 bytes when the request asked for `encoding_format: "base64"`; the
+  type is untagged, so an answer reads either shape. The gateway's gRPC embeddings path answered
+  the float array for every value of `encoding_format`; it now encodes for `base64`. Breaking:
+  `EmbeddingObject.embedding` is `Embedding`, not `Vec<f32>`.
+
+- A Messages request's `tool_use` block whose `input` is not an object is still refused under
+  `tool_use_input_not_an_object` with the public API's sentence, and the sentence now names the
+  block: `messages.1.content.0.tool_use.input: Input should be a valid dictionary (the tool_use
+  block toolu_... for calc carries an array)`, so a caller who replays a streamed answer sees which
+  block and what it carries.
+
 ### Added
 
 - `responses::validate_metadata_pairs` (the public API's bounds on a `metadata` object, for any
@@ -51,6 +65,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   the caller derived already, beside `template_thinking_for`. The readers without the suffix
   derive the profile from the model id as before; a serving path that derives it once per
   request no longer derives it again at each of them.
+- `ModelCard` derives `PartialEq`: a caller that holds a worker's cards tells a refresh that
+  repeats them from one that changes them (the gateway's model refresh publishes nothing for the
+  first).
 
 ### Changed
 
@@ -139,6 +156,26 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A function declared as a member of a Responses namespace is held to the two rules a top-level
+  function is held to. `parameters` that are not a JSON object are refused (`400`, `error.code`
+  `invalid_type`, `Invalid type for 'tools[0].tools[1].parameters': expected an object, but got a
+  string instead.`, `error.param` `tools`). For one of OpenAI's own models a strict member whose
+  schema does not pin `additionalProperties: false` on every object is refused
+  (`invalid_function_parameters`, the message naming the member's function), as a top-level strict
+  function is. Such a member passed validation, and the model was handed a function whose schema
+  was a string, an array, a number or a boolean. A member with an object, with `null` or with no
+  `parameters` is accepted as before, and a self-hosted model's strict member is passed through as
+  before.
+- A tool the model calls by name is refused when that name is the empty string (`400`,
+  `error.code` `empty_string`, in the public API's words: `Invalid 'tools[1].function.name': empty
+  string. Expected a string with minimum length 1, but got an empty string instead.`). On Chat
+  Completions that is a function (`error.param` the field; a function of the deprecated
+  `functions` list at the place its migration gives it), and the rule stands ahead of the
+  `tool_choice` rule, so a choice that rule refuses does not hide the unnamed tool. On Responses it
+  is a function, a custom tool, a namespace and a namespace's member (`tools[1].name`,
+  `tools[1].tools[0].name` in the message, `error.param` `tools`), and on Interactions a function.
+  The place counts every tool. Such a request passed validation, and the model could be made to
+  call a tool no client can dispatch.
 - A Messages request's Anthropic-defined tools keep their configuration when the request is
   written back for an upstream: a web search or web fetch tool's domain filters, use cap and
   location, a computer tool's display size, a text editor's `max_characters`, and any tool's

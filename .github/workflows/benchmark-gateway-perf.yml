@@ -54,7 +54,9 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: grpc-stress
+          # No Rust cache: the one release entry is the nightly stress bed's, whose crates
+          # carry line tables, and this job builds without them (the build step says why).
+          cache: 'false'
 
       # The pull request's side: the gateway ALONE first (building it together with
       # another package changes its binary through feature unification; the base is built
@@ -65,16 +67,17 @@ jobs:
       - name: Build the pull request's gateway, the mock engine, the client and the driver
         timeout-minutes: 60
         env:
-          # The nightly stress bed's release build (nightly-grpc-stress.yml) is the cache the
-          # setup step restores (its cache key); the key hashes the CARGO*/CFLAGS*/RUST*
-          # environment of THAT step, so these live on the build steps alone, as the nightly
-          # has them: a release profile with frame pointers and line tables, the same on both
-          # sides of the comparison.
+          # The release profile with frame pointers, the same on both sides of the comparison,
+          # and no line tables: on every crate they double what the gateway binary's compiler
+          # holds at the end of its link (full LTO, one codegen unit: 15.5 GiB against 7.9 GiB
+          # on four cores), a hosted runner's whole memory. Debug sections are not mapped when
+          # the gateway runs, so no cell reads them.
           RUSTFLAGS: -C force-frame-pointers=yes
-          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
           CFLAGS: -fno-omit-frame-pointer
         run: |
           source "$HOME/.cargo/env"
+          # Hosted runners differ: this one's cores, memory and swap, for the reader of a slow run.
+          nproc; free -m
           mkdir -p "$RUNNER_TEMP/gateway-perf/pr" "$RUNNER_TEMP/gateway-perf/base"
           cargo build --release -p smg --bin smg
           cp target/release/smg "$RUNNER_TEMP/gateway-perf/pr/smg"
@@ -89,13 +92,8 @@ jobs:
         id: base
         timeout-minutes: 60
         env:
-          # The nightly stress bed's release build (nightly-grpc-stress.yml) is the cache the
-          # setup step restores (its cache key); the key hashes the CARGO*/CFLAGS*/RUST*
-          # environment of THAT step, so these live on the build steps alone, as the nightly
-          # has them: a release profile with frame pointers and line tables, the same on both
-          # sides of the comparison.
+          # The flags of the pull request's side: frame pointers, no line tables.
           RUSTFLAGS: -C force-frame-pointers=yes
-          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
           CFLAGS: -fno-omit-frame-pointer
         run: |
           source "$HOME/.cargo/env"

@@ -47,7 +47,7 @@ use http_body::Frame;
 use tonic::{
     codegen::{
         http::{
-            header::{HeaderValue, USER_AGENT},
+            header::{HeaderName, HeaderValue, USER_AGENT},
             uri::{Authority, Uri},
             Request, Response, Version,
         },
@@ -60,6 +60,10 @@ use tracing::{debug, info};
 use self::connection::{Connection, End};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The status header a trailers-only response carries in its head; a static
+/// name, so the per-response check does not parse the key.
+static GRPC_STATUS: HeaderName = HeaderName::from_static("grpc-status");
 
 /// Default ceiling on a single TCP connect attempt.
 ///
@@ -200,7 +204,7 @@ pub async fn connect_channel_with_timeout(
 ///
 /// The gateway's liveness asks a different question of the ends of its
 /// polls and streams, whether the peer is reachable for work, and answers
-/// it from the code alone (`worker::liveness::is_connection_code` in the
+/// it from the code alone (`worker::health::liveness::is_connection_code` in the
 /// gateway crate); the two are not interchangeable.
 pub fn is_transport_failure(status: &tonic::Status) -> bool {
     let mut source = std::error::Error::source(status);
@@ -418,7 +422,7 @@ async fn exchange(
     .await?
     .map_err(|e| end.failure(e))?;
     let (parts, stream) = head.into_parts();
-    if stream.is_end_stream() || parts.headers.contains_key("grpc-status") {
+    if stream.is_end_stream() || parts.headers.contains_key(&GRPC_STATUS) {
         write = None;
     }
     Ok(Response::from_parts(parts, RecvBody { stream, write, end }))

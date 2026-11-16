@@ -149,7 +149,7 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// The process-wide switches: either one captures every request.
-fn configured() -> bool {
+pub(crate) fn configured() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| log_enabled() || header_enabled())
 }

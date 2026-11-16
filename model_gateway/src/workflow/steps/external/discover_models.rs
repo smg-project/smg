@@ -14,7 +14,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     routers::provider_support,
     server::http_client_builder,
-    worker::endpoint::Endpoint,
+    worker::identity::endpoint::Endpoint,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -240,7 +240,7 @@ async fn fetch_models(
     let response = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {shown}: {e}"))?;
+        .map_err(|e| format!("Failed to connect to {shown}: {}", e.without_url()))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -367,5 +367,26 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetch_models;
+    use crate::worker::test_support::RefusedAddress;
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_refused_connection_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = fetch_models(&url, None, None)
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
     }
 }

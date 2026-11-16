@@ -1,44 +1,31 @@
 //! The scratch rule, pinned on the `epd` plan: after the first decision on a
 //! thread (which sizes the thread's scratch and lets the ring learn the pool),
 //! an encode item's decision allocates nothing, over 8, 64 and 512 encoders
-//! and under each encode preset.
-#![expect(
-    unsafe_code,
-    reason = "a counting allocator is the one proof of an allocation count; it forwards to the system allocator"
-)]
+//! and under each encode preset. The count is the test thread's own
+//! (`common::counting_alloc`), so what runs beside it in the process, the
+//! harness included, is not charged to the decisions: a second thread
+//! allocates inside every measured window.
+
+mod common;
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicUsize, Ordering},
+    hint::black_box,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
+use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     Candidate, Constraints, Health, Identity, Phase, PolicySpec, PoolFacts, RequestFacts, Role,
     Scratch, WorkerId,
 };
 
-struct Counting;
-
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
-    }
-}
-
 #[global_allocator]
-static COUNTING: Counting = Counting;
+static GLOBAL: Counting = Counting;
 
 fn encoders(n: u32) -> Vec<Candidate> {
     (0..n)
@@ -60,6 +47,23 @@ fn encoders(n: u32) -> Vec<Candidate> {
 
 #[test]
 fn an_encode_items_decision_allocates_nothing_after_the_first() {
+    // A second thread that allocates until the case ends, and how many
+    // allocations it has made. That number moves after its allocation, so
+    // every window below is opened by the deciding thread's count first
+    // and stays open until the number moved twice: the allocation between
+    // the two moves is made inside the window, and a count that is not the
+    // deciding thread's own reads it.
+    let stop = Arc::new(AtomicBool::new(false));
+    let beside = Arc::new(AtomicUsize::new(0));
+    let allocating = {
+        let (stop, beside) = (Arc::clone(&stop), Arc::clone(&beside));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                drop(black_box(Box::new([0u8; 64])));
+                beside.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
     for preset in ["consistent_hashing", "least_load", "round_robin"] {
         let engine = PolicySpec::epd_presets(preset, "round_robin", "round_robin")
             .expect("an epd spec")
@@ -87,20 +91,32 @@ fn an_encode_items_decision_allocates_nothing_after_the_first() {
                 .decide(&facts_of(1), &pool_facts, &pool, &cx, &mut scratch)
                 .pick()
                 .expect("a pick");
-            let before = ALLOCATIONS.load(Ordering::Relaxed);
+            let before = calls();
+            let beside_before = beside.load(Ordering::Relaxed);
             let mut picked = 0usize;
             for key in 2..=200u64 {
                 let decision = engine.decide(&facts_of(key), &pool_facts, &pool, &cx, &mut scratch);
                 picked += decision.pick().map_or(0, |p| p.targets.len());
             }
-            let after = ALLOCATIONS.load(Ordering::Relaxed);
+            // The window closes only once the second thread allocated in it:
+            // its number's second move follows an allocation made after the
+            // first.
+            let waiting = Instant::now();
+            while beside.load(Ordering::Relaxed) < beside_before + 2 {
+                assert!(
+                    waiting.elapsed() < Duration::from_secs(10),
+                    "the second thread made no allocation in 10 s"
+                );
+                thread::yield_now();
+            }
+            let allocated = calls() - before;
             assert!(picked > 0);
             assert_eq!(
-                after - before,
-                0,
-                "{preset} over {n} encoders: {} allocations in 199 decisions",
-                after - before
+                allocated, 0,
+                "{preset} over {n} encoders: {allocated} allocations in 199 decisions"
             );
         }
     }
+    stop.store(true, Ordering::Relaxed);
+    allocating.join().expect("the allocating thread");
 }

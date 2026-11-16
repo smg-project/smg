@@ -64,7 +64,7 @@ jobs:
 
       # No pip cache: its 0.2 GB entry saved seconds of the installs below.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Install protoc
         run: brew install protobuf

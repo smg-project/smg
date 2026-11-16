@@ -137,7 +137,7 @@ def test_anthropic_message_response():
     }
     msg = Message.model_validate(raw)
     assert msg.id == "msg_abc123"
-    assert msg.content[0].type.value == "text"
+    assert msg.content[0].type == "text"
     assert msg.content[0].text == "Hello!"
     assert msg.usage.input_tokens == 10
 

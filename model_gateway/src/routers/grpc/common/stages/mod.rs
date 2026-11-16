@@ -78,6 +78,8 @@ pub(crate) use encode::EncodeStage;
 pub(crate) use rate_limit::RateLimitOutcome;
 pub(crate) use rate_limit::{iteration_charge, RateLimitCell, RateLimitReserveStage};
 pub(crate) use request_execution::execute_plan;
+#[cfg(any(test, feature = "test-util"))]
+pub use worker_selection::SelectionBench;
 pub(crate) use worker_selection::{
     WorkerSelectionMode, WorkerSelectionStage, SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
 };
