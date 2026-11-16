@@ -140,8 +140,9 @@ pub struct HuggingFaceTokenizer {
     /// for such a checkpoint (see `apply_chat_template_with_encoding`).
     structural_controls: bool,
     /// The special tokens between the marks, for the marked template's
-    /// context (`Some` with `structural_controls`, read while the template
-    /// is marked).
+    /// context (`Some` with `structural_controls` or once a template that
+    /// builds its control spellings was marked, read while the template is
+    /// marked).
     special_tokens_marked: Option<SpecialTokens>,
 }
 
@@ -342,8 +343,9 @@ struct EncoderCore {
     native: Option<NativeEncoder>,
     /// Every added token, special or not, as one leftmost-longest matcher
     /// over the raw text, built on first use (only a renderer with an
-    /// encoder of its own asks; a vocabulary can carry tens of thousands of
-    /// added tokens, which a Jinja-rendered model never pays for); `None`
+    /// encoder of its own asks, and the load of a template that builds its
+    /// control spellings; a vocabulary can carry tens of thousands of added
+    /// tokens, which any other Jinja-rendered model never pays for); `None`
     /// for a vocabulary without added tokens. It tells whether the flat
     /// encode of a prompt rendered by segments would cut out exactly the
     /// renderer's control tokens.
@@ -368,6 +370,15 @@ impl EncoderCore {
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
         }
+    }
+
+    /// Whether `text` is one added token of the vocabulary, special or not:
+    /// a lookup, where [`Self::added`] would build its matcher.
+    fn is_added(&self, text: &str) -> bool {
+        self.tokenizer
+            .get_added_vocabulary()
+            .get_vocab()
+            .contains_key(text)
     }
 
     /// The matcher over the added vocabulary, built on first use.
@@ -944,7 +955,15 @@ impl HuggingFaceTokenizer {
             }
             Some(marks::marked_special_tokens(&special_tokens))
         } else {
-            None
+            // A template that builds its control spellings says so itself
+            // (see `ChatTemplateState::mark_built_controls`).
+            chat_template
+                .mark_built_controls(
+                    &|text| core.is_added(text),
+                    || core.added(),
+                    &special_tokens,
+                )
+                .then(|| marks::marked_special_tokens(&special_tokens))
         };
         Ok(HuggingFaceTokenizer {
             byte_level,
@@ -2632,6 +2651,20 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .then(|| self.core.added())
             .flatten();
         self.chat_template.replace_marked(template, controls)?;
+        // Without the vocabulary file the new template is judged as the
+        // checkpoint's own was at load: one that builds its control spellings
+        // is marked, any other renders plain.
+        let core = &self.core;
+        if !self.structural_controls
+            && self.chat_template.mark_built_controls(
+                &|text| core.is_added(text),
+                || core.added(),
+                &self.special_tokens,
+            )
+            && self.special_tokens_marked.is_none()
+        {
+            self.special_tokens_marked = Some(marks::marked_special_tokens(&self.special_tokens));
+        }
         if self.glm.is_some() {
             self.renderer = glm_renderer.map_or(Renderer::Jinja, Renderer::Glm53);
             self.profile = self.renderer.profile();

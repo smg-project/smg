@@ -1801,6 +1801,167 @@ fn dict_function(
     Ok(Value::from_iter(pairs))
 }
 
+/// The function a template compiled by
+/// [`ChatTemplateState::mark_built_controls`] calls on each control spelling
+/// it binds to a name.
+const CONTROL_CONSTANT: &str = "control_constant";
+
+/// `source`, a chat template, with the expression of every root `set`
+/// statement that binds one of `names` wrapped in [`CONTROL_CONSTANT`]: the
+/// statements at the top level and under a top-level `if`, where a template
+/// binds the names its whole render reads. `None` when the template does not
+/// parse or binds none of the names there.
+fn wrap_control_constants(source: &str, names: &HashSet<&str>) -> Option<String> {
+    let ast = parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default()).ok()?;
+    let mut spans = Vec::new();
+    root_set_expressions(&ast, source, names, &mut spans);
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort_unstable();
+    let mut wrapped =
+        String::with_capacity(source.len() + spans.len() * (CONTROL_CONSTANT.len() + 2));
+    let mut cursor = 0;
+    for (start, end) in spans {
+        wrapped.push_str(&source[cursor..start]);
+        wrapped.push_str(CONTROL_CONSTANT);
+        wrapped.push('(');
+        wrapped.push_str(&source[start..end]);
+        wrapped.push(')');
+        cursor = end;
+    }
+    wrapped.push_str(&source[cursor..]);
+    Some(wrapped)
+}
+
+/// The byte spans in `source` of the expressions of the root `set`
+/// statements under `stmt` (the top level and the branches of a top-level
+/// `if`) that bind a name of `names`.
+fn root_set_expressions(
+    stmt: &Stmt<'_>,
+    source: &str,
+    names: &HashSet<&str>,
+    spans: &mut Vec<(usize, usize)>,
+) {
+    match stmt {
+        Stmt::Template(template) => {
+            for child in &template.children {
+                root_set_expressions(child, source, names, spans);
+            }
+        }
+        Stmt::IfCond(cond) => {
+            for child in cond.true_body.iter().chain(&cond.false_body) {
+                root_set_expressions(child, source, names, spans);
+            }
+        }
+        Stmt::Set(set) => {
+            let Expr::Var(target) = &set.target else {
+                return;
+            };
+            if !names.contains(target.id) {
+                return;
+            }
+            // The statement's span runs from `set` to the end of its
+            // expression, which starts after the `=` that follows the name.
+            let (name_end, end) = (
+                target.span().end_offset as usize,
+                set.span().end_offset as usize,
+            );
+            let Some(rest) = source.get(name_end..end) else {
+                return;
+            };
+            let Some(assign) = rest.find('=') else {
+                return;
+            };
+            let expression = rest[assign + 1..].trim_start();
+            spans.push((end - expression.len(), end));
+        }
+        _ => {}
+    }
+}
+
+/// A conversation a template that builds its control spellings is checked on
+/// before its marks are put in force (see
+/// [`ChatTemplateState::mark_built_controls`]).
+struct Probe {
+    messages: Vec<JsonValue>,
+    tools: Option<Vec<JsonValue>>,
+    documents: Option<Vec<JsonValue>>,
+}
+
+impl Probe {
+    /// The parameters the probe renders under, with the generation prompt,
+    /// at the instant `now` (a template may write the time).
+    fn params<'a>(
+        &'a self,
+        special_tokens: &'a SpecialTokens,
+        now: DateTime<FixedOffset>,
+    ) -> ChatTemplateParams<'a> {
+        ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: self.tools.as_deref(),
+            documents: self.documents.as_deref(),
+            special_tokens: Some(special_tokens),
+            now: Some(now),
+            ..Default::default()
+        }
+    }
+}
+
+/// The probe conversations, the bare turn first: a system message and a
+/// second turn, a history message with reasoning, a tool round with its
+/// tools (the call's arguments as the template takes them), a document.
+fn probes(raw_tool_call_arguments: bool) -> [Probe; 5] {
+    let message = |role: &str| serde_json::json!({"role": role, "content": "probe"});
+    let conversation = |messages: Vec<JsonValue>| Probe {
+        messages,
+        tools: None,
+        documents: None,
+    };
+    let arguments = if raw_tool_call_arguments {
+        serde_json::json!("{\"probe\": 1}")
+    } else {
+        serde_json::json!({"probe": 1})
+    };
+    [
+        conversation(vec![message("user")]),
+        conversation(vec![
+            message("system"),
+            message("user"),
+            message("assistant"),
+            message("user"),
+        ]),
+        conversation(vec![
+            message("user"),
+            serde_json::json!({
+                "role": "assistant", "content": "probe", "reasoning_content": "probe",
+            }),
+            message("user"),
+        ]),
+        Probe {
+            tools: Some(vec![serde_json::json!({"type": "function", "function": {
+                "name": "probe",
+                "description": "probe",
+                "parameters": {"type": "object", "properties": {"probe": {"type": "integer"}}},
+            }})]),
+            ..conversation(vec![
+                message("user"),
+                serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": arguments},
+                }]}),
+                serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "probe"}),
+                message("user"),
+            ])
+        },
+        Probe {
+            documents: Some(vec![serde_json::json!({"title": "probe", "text": "probe"})]),
+            ..conversation(vec![message("user")])
+        },
+    ]
+}
+
 /// Build a pre-configured `Environment<'static>` with the given template string,
 /// Python-compat method callback, and custom `tojson` filter already registered.
 /// The template is stored under the name `"chat"` using owned storage so the
@@ -2640,18 +2801,14 @@ fn render_chat_template(
     render_messages(env, messages.iter(), params, output_len)
 }
 
-/// Render `messages` through the template with the generation prompt the
-/// params ask for; the flag says the prompt does not continue a message.
-fn render_messages<'a>(
-    env: &Environment<'_>,
+/// The root context `messages` render in under `params` (see
+/// [`RenderContext`]): what a render gives its template, and what an
+/// evaluation of the template alone reads its names in
+/// ([`ChatTemplateState::mark_built_controls`]).
+fn render_context<'a>(
     messages: impl Iterator<Item = &'a JsonValue>,
-    params: ChatTemplateParams,
-    output_len: &RenderedLength,
-) -> Result<(String, bool)> {
-    let tmpl = env
-        .get_template("chat")
-        .map_err(|e| anyhow!("Failed to get template: {e}"))?;
-
+    params: &ChatTemplateParams,
+) -> Value {
     // transformers adds `strftime_now` to the template environment; here it is
     // a callable of the render context, bound to the render's instant. The
     // instant is read when the template first writes it: a template that never
@@ -2697,7 +2854,7 @@ fn render_messages<'a>(
     // The render's names as one object (no map built per render): its own
     // names are read first, a caller's kwargs for a name left undefined or
     // not set, as the merge of two maps read them.
-    let ctx = Value::from_object(RenderContext {
+    Value::from_object(RenderContext {
         messages: Value::from_object(minijinja_messages),
         add_generation_prompt: Value::from(params.add_generation_prompt),
         strftime_now,
@@ -2708,7 +2865,21 @@ fn render_messages<'a>(
         unk_token: unk_value,
         pad_token: pad_value,
         kwargs: params.template_kwargs.map(Value::from_serialize),
-    });
+    })
+}
+
+/// Render `messages` through the template with the generation prompt the
+/// params ask for; the flag says the prompt does not continue a message.
+fn render_messages<'a>(
+    env: &Environment<'_>,
+    messages: impl Iterator<Item = &'a JsonValue>,
+    params: ChatTemplateParams,
+    output_len: &RenderedLength,
+) -> Result<(String, bool)> {
+    let tmpl = env
+        .get_template("chat")
+        .map_err(|e| anyhow!("Failed to get template: {e}"))?;
+    let ctx = render_context(messages, &params);
 
     // Render into a buffer sized by the last render through this template:
     // the text grows past no capacity on the way.
@@ -3376,7 +3547,18 @@ impl ChatTemplateState {
                  https://huggingface.co/docs/transformers/main/en/chat_templating",
             )
         })?;
+        self.render_through(env, messages, params)
+    }
 
+    /// [`Self::render_with_continuation`] through `env`, this template
+    /// compiled: the one in force, or the one [`Self::mark_built_controls`]
+    /// checks before it puts it in force.
+    fn render_through(
+        &self,
+        env: &Environment<'static>,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
         // The serving engine hands an "openai"-format template every message's string content
         // as a one-item text part list (`_parse_chat_message_content`: a `str`
         // becomes `[{"type": "text", "text": ...}]`, and in that format the
@@ -3480,6 +3662,196 @@ impl ChatTemplateState {
     /// Whether the templates are compiled marked (see [`Self::mark_controls`]).
     pub(crate) fn marked(&self) -> bool {
         self.marked
+    }
+
+    /// Marks the control spellings the templates build. A template may never
+    /// spell a control token whole: it binds each to a name once, out of a
+    /// constant of its own (`'<open{}>'.format(suffix)`), and writes the
+    /// names. [`Self::mark_controls`] finds no spelling in such a source, so
+    /// the template engine resolves the names instead: the template is
+    /// evaluated once on a bare turn, a root name whose value is one added
+    /// token (`is_control`) is a control constant, and the expression of each
+    /// root `set` statement that binds one is wrapped in a function that puts
+    /// such a value between the marks of `encoders::marks`. Compiled so, the
+    /// template writes control tokens where it writes the names, alone or
+    /// inside a longer value, and the same spellings in request text stay
+    /// text, as under [`Self::mark_controls`].
+    ///
+    /// The templates (this one, the `tool_use` one, the processor's) are
+    /// marked together or not at all, and only when the marks are complete
+    /// on the probe conversations ([`Self::marks_every_control`]): a template
+    /// that spells a control whole, or builds one where it writes it, stays
+    /// as it is, its prompts encoded from their text as before. `controls`,
+    /// the matcher over the added tokens, is asked for only once a template
+    /// has a control constant its source does not spell, so a checkpoint
+    /// without one never builds it.
+    /// Returns whether the templates are now marked.
+    pub(crate) fn mark_built_controls<'a>(
+        &mut self,
+        is_control: &dyn Fn(&str) -> bool,
+        controls: impl FnOnce() -> Option<&'a AddedTokens>,
+        special_tokens: &SpecialTokens,
+    ) -> bool {
+        let constants = self.control_constants(is_control, special_tokens);
+        if constants.is_empty() {
+            return false;
+        }
+        let Some(controls) = controls() else {
+            return false;
+        };
+        let Some(own) = self.built_controls_marked(&constants, controls, special_tokens) else {
+            return false;
+        };
+        let mut nested = Vec::new();
+        for state in [&self.tool_use, &self.processor].into_iter().flatten() {
+            let constants = state.control_constants(is_control, special_tokens);
+            let Some(env) = state.built_controls_marked(&constants, controls, special_tokens)
+            else {
+                return false;
+            };
+            nested.push(env);
+        }
+        self.env = Some(own);
+        self.marked = true;
+        for (state, env) in [&mut self.tool_use, &mut self.processor]
+            .into_iter()
+            .flatten()
+            .zip(nested)
+        {
+            state.env = Some(env);
+            state.marked = true;
+        }
+        true
+    }
+
+    /// The root names of this template whose value, on a bare turn, is one
+    /// control spelling (`is_control`), each with its spelling: what the
+    /// template engine itself exports after an evaluation, however the
+    /// template builds the value. None when the source spells one of them
+    /// whole: that template is of the other kind, and it says so here, before
+    /// the matcher over the added tokens is asked for.
+    fn control_constants(
+        &self,
+        is_control: &dyn Fn(&str) -> bool,
+        special_tokens: &SpecialTokens,
+    ) -> Vec<(String, String)> {
+        let Some(template) = self
+            .env
+            .as_ref()
+            .and_then(|env| env.get_template("chat").ok())
+        else {
+            return Vec::new();
+        };
+        let messages = [serde_json::json!({"role": "user", "content": "probe"})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            special_tokens: Some(special_tokens),
+            now: Some(render_instant()),
+            ..Default::default()
+        };
+        // The render's state is what is read; its output goes nowhere.
+        let context = render_context(messages.iter(), &params);
+        let Ok(captured) = template.render_captured_to(context, io::sink()) else {
+            return Vec::new();
+        };
+        let state = captured.state();
+        let constants: Vec<(String, String)> = state
+            .exports()
+            .into_iter()
+            .filter_map(|name| {
+                let value = state.lookup(name)?;
+                let spelling = value.as_str()?;
+                is_control(spelling).then(|| (name.to_owned(), spelling.to_owned()))
+            })
+            .collect();
+        let source = template.source();
+        if constants
+            .iter()
+            .any(|(_, spelling)| source.contains(spelling.as_str()))
+        {
+            return Vec::new();
+        }
+        constants
+    }
+
+    /// This template compiled with the control spellings `constants` bind
+    /// between marks, when the template is of the kind that builds them and
+    /// the marks are complete (see [`Self::mark_built_controls`]).
+    fn built_controls_marked(
+        &self,
+        constants: &[(String, String)],
+        controls: &AddedTokens,
+        special_tokens: &SpecialTokens,
+    ) -> Option<Environment<'static>> {
+        let plain = self.env.as_ref()?;
+        let template = plain.get_template("chat").ok()?;
+        let source = template.source();
+        // A source that spells a control whole is of the other kind: its
+        // spellings would want the scan of `mark_controls`, which is not
+        // made here. A source that uses the wrapper's name would shadow it.
+        if constants.is_empty()
+            || controls.ranges(source).next().is_some()
+            || source.contains(CONTROL_CONSTANT)
+        {
+            return None;
+        }
+        let names: HashSet<&str> = constants.iter().map(|(name, _)| name.as_str()).collect();
+        let mut marked = build_environment(wrap_control_constants(source, &names)?).ok()?;
+        let spellings: HashSet<String> = constants
+            .iter()
+            .map(|(_, spelling)| spelling.clone())
+            .collect();
+        marked.add_function(CONTROL_CONSTANT, move |value: Value| -> Value {
+            let control = value
+                .as_str()
+                .filter(|text| spellings.contains(*text))
+                .map(marks::mark);
+            control.map_or(value, Value::from)
+        });
+        self.marks_every_control(plain, &marked, controls, special_tokens)
+            .then_some(marked)
+    }
+
+    /// Whether `marked`, this template compiled with the control spellings
+    /// it builds between marks, writes on the probe conversations the text
+    /// the template writes today (`plain`), every added token in it between
+    /// marks: then no control the template writes on them would be encoded
+    /// as text, and a request that types no spelling is encoded as it was. A
+    /// conversation the template refuses today is not judged; the bare turn
+    /// must render, and a control must be written.
+    fn marks_every_control(
+        &self,
+        plain: &Environment<'static>,
+        marked: &Environment<'static>,
+        controls: &AddedTokens,
+        special_tokens: &SpecialTokens,
+    ) -> bool {
+        let marked_tokens = marks::marked_special_tokens(special_tokens);
+        let now = render_instant();
+        let mut writes_a_control = false;
+        for (index, probe) in probes(self.raw_tool_call_arguments).iter().enumerate() {
+            let Ok((expected, _)) =
+                self.render_through(plain, &probe.messages, probe.params(special_tokens, now))
+            else {
+                if index == 0 {
+                    return false;
+                }
+                continue;
+            };
+            let Ok((rendered, _)) =
+                self.render_through(marked, &probe.messages, probe.params(&marked_tokens, now))
+            else {
+                return false;
+            };
+            let Ok((text, written)) = marks::flatten(&rendered) else {
+                return false;
+            };
+            if text != expected || !controls.ranges(&text).eq(written.iter().cloned()) {
+                return false;
+            }
+            writes_a_control |= !written.is_empty();
+        }
+        writes_a_control
     }
 
     /// [`Self::set`] and [`Self::mark_controls`] as one step: the template
