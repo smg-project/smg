@@ -2608,6 +2608,481 @@ fn a_close_that_panics_inside_an_opens_unwinding_stops_at_the_engine() {
     assert_eq!(panicked.read(), (2, 1));
 }
 
+/// A profile of the host's own stages, in their order.
+fn host_profile(filters: Vec<Box<dyn smg_policy_controller::Filter>>) -> Profile {
+    Profile {
+        name: "host-scopes".into(),
+        filters,
+        scorers: vec![Weighted {
+            scorer: Box::new(LeastRequests),
+            weight: 1.0,
+        }],
+        picker: Box::new(Best),
+    }
+}
+
+/// A scope whose close panics, once, with its counts.
+fn close_panics_once() -> (Box<PanicsAtItsClose>, Arc<ScopeCounts>) {
+    let counts = Arc::new(ScopeCounts::default());
+    let stage = Box::new(PanicsAtItsClose {
+        counts: Arc::clone(&counts),
+        panics_once: AtomicBool::new(true),
+    });
+    (stage, counts)
+}
+
+/// A stage of the host's own whose scope's close panics once with its
+/// number as the payload, so a case can tell two such panics apart.
+#[derive(Debug)]
+struct ClosePanicsWith(u32, AtomicBool);
+
+impl smg_policy_controller::Filter for ClosePanicsWith {
+    fn name(&self) -> &'static str {
+        "close-panics-with"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+        Some(self)
+    }
+}
+
+impl smg_policy_controller::DecisionScope for ClosePanicsWith {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+    fn close(&self) {
+        if self.1.swap(false, Ordering::Relaxed) {
+            // A panic with a payload of the case's own type; the hook stays quiet.
+            std::panic::resume_unwind(Box::new(self.0));
+        }
+    }
+}
+
+/// A stage of the host's own, with no scope, whose `keep` panics once.
+#[derive(Debug)]
+struct PanicsAtItsKeep(AtomicBool);
+
+impl smg_policy_controller::Filter for PanicsAtItsKeep {
+    fn name(&self) -> &'static str {
+        "panics-at-its-keep"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        assert!(
+            !self.0.swap(false, Ordering::Relaxed),
+            "this stage's keep panics, once"
+        );
+        true
+    }
+}
+
+/// One decision of three candidates, its panic caught.
+fn decide_caught(engine: &Engine) -> Box<dyn std::any::Any + Send> {
+    let candidates = pool(3);
+    let pool_facts = PoolFacts {
+        pool_size: 3,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.decide(
+            &facts(1),
+            &pool_facts,
+            &candidates,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    }))
+    .expect_err("the decision panicked")
+}
+
+/// A close that panics on a decision's own way out keeps no scope after it
+/// open: the engine runs every close it owes, and the first close's panic is
+/// the one the host sees, once the rest are closed.
+#[test]
+fn a_close_that_panics_alone_keeps_no_scope_after_it_open() {
+    let first = Box::new(ClosePanicsWith(1, AtomicBool::new(true)));
+    let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
+    let second = Box::new(ClosePanicsWith(2, AtomicBool::new(true)));
+    let engine = single_engine(host_profile(vec![first, after_it, second]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<u32>().copied(),
+        Some(1),
+        "the first close's panic is the one the host sees"
+    );
+    assert_eq!(
+        closed_after_it.read(),
+        (1, 1),
+        "the scope after the first panic is closed"
+    );
+    // Both closes that panic did so in that decision: the next one closes
+    // clean, so the third scope's close ran too.
+    let next = decide(&engine, &pool(3), 2);
+    assert!(!pick_ids(&next).is_empty(), "the next decision picks");
+    assert_eq!(closed_after_it.read(), (2, 2));
+}
+
+/// A close that panics while a stage's panic unwinds stops at the engine:
+/// the scopes after it are still closed, and the stage's panic is the one
+/// the host sees. Let out inside that unwinding, it would end the process.
+#[test]
+fn a_close_that_panics_while_a_stages_panic_unwinds_stops_at_the_engine() {
+    let (close_panics, close_counts) = close_panics_once();
+    let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
+    let keep_panics = Box::new(PanicsAtItsKeep(AtomicBool::new(true)));
+    let engine = single_engine(host_profile(vec![close_panics, after_it, keep_panics]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this stage's keep panics, once"),
+        "the stage's panic is the one the host sees"
+    );
+    assert_eq!(
+        close_counts.read(),
+        (1, 1),
+        "closed, and its close panicked"
+    );
+    assert_eq!(
+        closed_after_it.read(),
+        (1, 1),
+        "the scope after it is still closed"
+    );
+    let next = decide(&engine, &pool(3), 2);
+    assert!(!pick_ids(&next).is_empty(), "the next decision picks");
+    assert_eq!(close_counts.read(), (2, 2));
+    assert_eq!(closed_after_it.read(), (2, 2));
+}
+
+/// The payload of a pair decision that panics.
+fn pair_decide_caught(engine: &Engine) -> Box<dyn std::any::Any + Send> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pair_decide(engine)))
+        .expect_err("the pair decision panicked")
+}
+
+/// A pair opens its prefill side whole before its decode side. When a decode
+/// scope panics at its open, the prefill side's closes run inside that
+/// unwinding, by the decision's own guard: one that panics there stops at
+/// the engine, the scopes after it are still closed, and the open's panic is
+/// the one the host sees.
+#[test]
+fn a_pairs_prefill_close_that_panics_while_its_decode_side_opens_stops_at_the_engine() {
+    let (close_panics, close_counts) = close_panics_once();
+    let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
+    let (decode_panics, panicked) = StoresAtItsOpen::stage(true);
+    let engine = pair_engine(
+        vec![
+            host_profile(vec![close_panics, after_it]),
+            host_profile(vec![decode_panics]),
+        ],
+        1,
+    );
+    let payload = pair_decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this scope's open panics before its store, once"),
+        "the open's panic is the one the host sees"
+    );
+    assert_eq!(
+        close_counts.read(),
+        (1, 1),
+        "the prefill scope is closed, and its close panicked"
+    );
+    assert_eq!(
+        closed_after_it.read(),
+        (1, 1),
+        "the prefill scope after it is still closed"
+    );
+    assert_eq!(
+        panicked.read(),
+        (1, 0),
+        "its open did not return: not closed"
+    );
+    // The next pair decision opens and closes all three.
+    let next = pair_decide(&engine);
+    assert!(next.pick().is_some(), "the next decision picks");
+    assert_eq!(close_counts.read(), (2, 2));
+    assert_eq!(closed_after_it.read(), (2, 2));
+    assert_eq!(panicked.read(), (2, 1));
+}
+
+/// The same with a decode scope already open when the panic starts: the
+/// opening guard closes that one, the decision's guard then runs the prefill
+/// side's closes, and the one that panics there stops at the engine.
+#[test]
+fn a_pairs_prefill_close_that_panics_after_a_decode_scope_opened_stops_at_the_engine() {
+    let (close_panics, close_counts) = close_panics_once();
+    let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
+    let (decode_opened, decode_counts) = StoresAtItsOpen::stage(false);
+    let (decode_panics, panicked) = StoresAtItsOpen::stage(true);
+    let engine = pair_engine(
+        vec![
+            host_profile(vec![close_panics, after_it]),
+            host_profile(vec![decode_opened, decode_panics]),
+        ],
+        1,
+    );
+    let payload = pair_decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this scope's open panics before its store, once"),
+        "the open's panic is the one the host sees"
+    );
+    assert_eq!(
+        decode_counts.read(),
+        (1, 1),
+        "the decode scope that opened is closed, once"
+    );
+    assert_eq!(
+        close_counts.read(),
+        (1, 1),
+        "the prefill scope is closed, and its close panicked"
+    );
+    assert_eq!(
+        closed_after_it.read(),
+        (1, 1),
+        "the prefill scope after it is still closed"
+    );
+    assert_eq!(
+        panicked.read(),
+        (1, 0),
+        "its open did not return: not closed"
+    );
+    let next = pair_decide(&engine);
+    assert!(next.pick().is_some(), "the next decision picks");
+    assert_eq!(decode_counts.read(), (2, 2));
+    assert_eq!(close_counts.read(), (2, 2));
+    assert_eq!(closed_after_it.read(), (2, 2));
+    assert_eq!(panicked.read(), (2, 1));
+}
+
+/// The close that panics on the decode side itself, inside the unwinding of
+/// its own profile's open: the opening guard stops it, and the prefill side,
+/// open whole, is closed by the decision's guard.
+#[test]
+fn a_pairs_decode_close_that_panics_inside_its_own_opens_unwinding_stops_at_the_engine() {
+    let (prefill, prefill_counts) = StoresAtItsOpen::stage(false);
+    let (close_panics, close_counts) = close_panics_once();
+    let (decode_panics, panicked) = StoresAtItsOpen::stage(true);
+    let engine = pair_engine(
+        vec![
+            host_profile(vec![prefill]),
+            host_profile(vec![close_panics, decode_panics]),
+        ],
+        1,
+    );
+    let payload = pair_decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this scope's open panics before its store, once"),
+        "the open's panic is the one the host sees"
+    );
+    assert_eq!(
+        close_counts.read(),
+        (1, 1),
+        "the decode scope is closed, and its close panicked"
+    );
+    assert_eq!(prefill_counts.read(), (1, 1), "the prefill side is closed");
+    assert_eq!(
+        panicked.read(),
+        (1, 0),
+        "its open did not return: not closed"
+    );
+    let next = pair_decide(&engine);
+    assert!(next.pick().is_some(), "the next decision picks");
+    assert_eq!(close_counts.read(), (2, 2));
+    assert_eq!(prefill_counts.read(), (2, 2));
+    assert_eq!(panicked.read(), (2, 1));
+}
+
+/// A panic payload whose own destructor panics, with a payload whose
+/// destructor panics in turn for as many drops as it counts.
+struct DropPanics(u8);
+
+impl Drop for DropPanics {
+    fn drop(&mut self) {
+        match self.0 {
+            0 => std::panic::resume_unwind(Box::new("this payload's drop panics")),
+            more => std::panic::resume_unwind(Box::new(DropPanics(more - 1))),
+        }
+    }
+}
+
+/// A stage of the host's own whose scope's close panics, once, with a
+/// payload whose own drop panics, as does the drop of that panic's payload.
+#[derive(Debug)]
+struct ClosePanicsWithADrop(AtomicBool);
+
+impl smg_policy_controller::Filter for ClosePanicsWithADrop {
+    fn name(&self) -> &'static str {
+        "close-panics-with-a-drop"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+        Some(self)
+    }
+}
+
+impl smg_policy_controller::DecisionScope for ClosePanicsWithADrop {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+    fn close(&self) {
+        if self.0.swap(false, Ordering::Relaxed) {
+            std::panic::resume_unwind(Box::new(DropPanics(1)));
+        }
+    }
+}
+
+/// The engine drops a payload it caught and does not resume under a catch
+/// of its own: the payload's destructor can panic, and so can the
+/// destructor of that panic's payload, which is forgotten. Let out inside
+/// an unwinding, either panic would end the process; on a decision's own
+/// way out it would take the first panic's place and leave the scopes
+/// after it open.
+#[test]
+fn a_caught_payload_whose_drop_panics_stops_at_the_engine() {
+    // Inside an open's unwinding: the closes of the scopes that had opened.
+    let with_a_drop = Box::new(ClosePanicsWithADrop(AtomicBool::new(true)));
+    let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
+    let (open_panics, _) = StoresAtItsOpen::stage(true);
+    let engine = single_engine(host_profile(vec![with_a_drop, after_it, open_panics]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this scope's open panics before its store, once")
+    );
+    assert_eq!(closed_after_it.read(), (1, 1), "inside an open's unwinding");
+
+    // Inside a stage's unwinding: the decision's own closes.
+    let with_a_drop = Box::new(ClosePanicsWithADrop(AtomicBool::new(true)));
+    let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
+    let keep_panics = Box::new(PanicsAtItsKeep(AtomicBool::new(true)));
+    let engine = single_engine(host_profile(vec![with_a_drop, after_it, keep_panics]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this stage's keep panics, once")
+    );
+    assert_eq!(closed_after_it.read(), (1, 1), "inside a stage's unwinding");
+
+    // On a decision's own way out: the first close's panic goes on, and the
+    // second close's payload is released.
+    let first = Box::new(ClosePanicsWith(1, AtomicBool::new(true)));
+    let with_a_drop = Box::new(ClosePanicsWithADrop(AtomicBool::new(true)));
+    let (after_it, closed_after_it) = StoresAtItsOpen::stage(false);
+    let engine = single_engine(host_profile(vec![first, with_a_drop, after_it]));
+    let payload = decide_caught(&engine);
+    assert_eq!(payload.downcast_ref::<u32>().copied(), Some(1));
+    assert_eq!(
+        closed_after_it.read(),
+        (1, 1),
+        "on a decision's own way out"
+    );
+}
+
+/// A panic payload that counts its drops, so a case can read whether the
+/// engine freed it.
+struct CountsItsDrop(Arc<AtomicU32>);
+
+impl Drop for CountsItsDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A stage of the host's own whose scope's close panics, once, with a
+/// payload that counts its drops.
+#[derive(Debug)]
+struct ClosePanicsWithACount(AtomicBool, Arc<AtomicU32>);
+
+impl ClosePanicsWithACount {
+    fn stage() -> (Box<Self>, Arc<AtomicU32>) {
+        let drops = Arc::new(AtomicU32::new(0));
+        let stage = Box::new(Self(AtomicBool::new(true), Arc::clone(&drops)));
+        (stage, drops)
+    }
+}
+
+impl smg_policy_controller::Filter for ClosePanicsWithACount {
+    fn name(&self) -> &'static str {
+        "close-panics-with-a-count"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+        Some(self)
+    }
+}
+
+impl smg_policy_controller::DecisionScope for ClosePanicsWithACount {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+    fn close(&self) {
+        if self.0.swap(false, Ordering::Relaxed) {
+            std::panic::resume_unwind(Box::new(CountsItsDrop(Arc::clone(&self.1))));
+        }
+    }
+}
+
+/// The engine frees a payload it caught and does not resume. Forgotten, a
+/// fault that repeats would leave one payload allocated a decision, with
+/// nothing to bound it.
+#[test]
+fn a_caught_payload_the_engine_does_not_resume_is_freed() {
+    // Inside an open's unwinding: the closes of the scopes that had opened.
+    let (with_a_count, drops) = ClosePanicsWithACount::stage();
+    let (open_panics, _) = StoresAtItsOpen::stage(true);
+    let engine = single_engine(host_profile(vec![with_a_count, open_panics]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this scope's open panics before its store, once")
+    );
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        1,
+        "inside an open's unwinding"
+    );
+
+    // Inside a stage's unwinding: the decision's own closes.
+    let (with_a_count, drops) = ClosePanicsWithACount::stage();
+    let keep_panics = Box::new(PanicsAtItsKeep(AtomicBool::new(true)));
+    let engine = single_engine(host_profile(vec![with_a_count, keep_panics]));
+    let payload = decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("this stage's keep panics, once")
+    );
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        1,
+        "inside a stage's unwinding"
+    );
+
+    // On a decision's own way out: the first close's panic goes on, and the
+    // second close's payload is freed.
+    let first = Box::new(ClosePanicsWith(1, AtomicBool::new(true)));
+    let (with_a_count, drops) = ClosePanicsWithACount::stage();
+    let engine = single_engine(host_profile(vec![first, with_a_count]));
+    let payload = decide_caught(&engine);
+    assert_eq!(payload.downcast_ref::<u32>().copied(), Some(1));
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        1,
+        "on a decision's own way out"
+    );
+}
+
 /// The plugin's own open marks its phase open and counts the decision
 /// before its instance's steps, and the engine does not close a scope whose
 /// open did not return. So an open that stops half-way undoes itself: here
