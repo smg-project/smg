@@ -2753,3 +2753,34 @@ fn a_membership_write_and_a_new_generation_judge_again_from_what_is_on_file() {
         "no write of the load table moved one"
     );
 }
+
+#[test]
+fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    store.apply(generation(1)).expect("above the unbound start");
+    store.deciding(|world| {
+        // A generation applied and a member admitted while a decision holds
+        // its world are the next decision's: this one reads the rows and
+        // the engine it was handed, whole.
+        store.apply(generation(2)).expect("above the standing one");
+        member(&store, "http://b:8000");
+        let mut out = ViewBuffers::default();
+        let built = world
+            .build(MODEL, Role::Single, &ask(t0), &mut out)
+            .expect("the pool");
+        assert_eq!(
+            (built.generation, world.spec().generation(), built.pool_size),
+            (1, 1, 1)
+        );
+        assert_eq!(world.spec().engine().generation(), 1);
+    });
+    let next = store.deciding(|world| {
+        (
+            world.spec().generation(),
+            world.members(MODEL, Role::Single),
+        )
+    });
+    assert_eq!(next, (2, Some(2)));
+}

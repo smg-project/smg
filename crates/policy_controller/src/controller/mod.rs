@@ -25,6 +25,14 @@
 
 pub mod admin;
 pub mod config;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Decide call's streams hand their requests to the deciders; that call is the step's next PR"
+    )
+)]
+mod deciders;
 pub mod election;
 mod gateways;
 pub mod metrics;
@@ -33,6 +41,14 @@ pub mod readiness;
 mod service;
 mod session;
 pub mod tls;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Decide call's streams read their frames through it; that call is the step's next PR"
+    )
+)]
+mod wire;
 
 use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc};
 

@@ -163,8 +163,10 @@ impl MemoryStore {
     /// across calls. Taking it and dropping it each write the count every
     /// holder of that world shares, so deciding threads that took it would
     /// write one cache line twice a decision. A decision builds through
-    /// [`build_view`](Self::build_view) and a pair decision through
-    /// [`build_pair`](Self::build_pair): both borrow the world and write
+    /// [`build_view`](Self::build_view), a pair decision through
+    /// [`build_pair`](Self::build_pair), and a decision that runs the
+    /// generation's engine over its rows through
+    /// [`deciding`](Self::deciding): all three borrow the world and write
     /// no shared count.
     ///
     /// A world kept across two publications of a pool keeps the rows it
@@ -220,6 +222,18 @@ impl MemoryStore {
             }
         }
         pair
+    }
+
+    /// One decision's door: `decide` is handed the world of this instant
+    /// under one borrow, for the build of its view ([`World::build`]) and
+    /// for the engine of the generation those rows were published under
+    /// ([`World::spec`]). The rows, the engine and the generation's number
+    /// are then of one load, and the borrow writes no shared count, so no
+    /// two deciding threads write one line through it. A publication that
+    /// replaces the world meanwhile is the next decision's: the world
+    /// handed here stays whole until `decide` returns.
+    pub fn deciding<R>(&self, decide: impl FnOnce(&World) -> R) -> R {
+        decide(&self.world.load())
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
