@@ -1,6 +1,6 @@
 //! Who is present (design 4.3, the stream rule): a gateway is present from
-//! its `Welcome` until its grace period ends with no new `Hello`, and what
-//! the controller holds for it lives exactly that long.
+//! its `Welcome` until its grace period ends with no new `Hello`, and its
+//! lease records live exactly that long.
 //!
 //! Presence is read from the clock at the instant of the question, as the
 //! fence is: a gateway is present while a session of it stands and for the
@@ -8,11 +8,13 @@
 //! present. The sweep only lets go what a gateway that ended held, so a
 //! late sweep changes no answer.
 //!
-//! Two rules come from the fence (design 5.3). A replica whose fence is
-//! closed lets nothing go: a fenced leader releases nothing. And at a take
+//! Three rules come from the fence (design 5.3). A replica whose fence is
+//! closed lets nothing go: a fenced leader releases nothing. At a take
 //! every gone gateway's period starts again: no `Hello` could be welcomed
 //! here while this replica did not lead, so that time is not the gateway's
-//! silence.
+//! silence. And a `Hello` is seated under the term the table's own read of
+//! the fence shows, under its lock, or not at all: one read under a term
+//! the election has left supersedes no session of the term that stands.
 //!
 //! A `Welcome` and the letting-go of one gateway are ordered by the table's
 //! lock, held across the store's release: a gateway is welcomed with what
@@ -52,6 +54,10 @@ pub(crate) enum Refused {
     /// The table holds its ceiling of rows and this `Hello` would make a
     /// new one.
     Full { ceiling: usize },
+    /// The table's read of the fence does not show the term the session
+    /// read for this `Hello`: the fence is closed (`None`), or open under
+    /// a later term.
+    Stepped { read: u64, shown: Option<u64> },
 }
 
 /// The presence table.
@@ -183,21 +189,20 @@ impl Gateways {
         self.grace
     }
 
-    /// A `Welcome` at `now` under `term`, the session's one read of the
-    /// fence: the gateway is present, and the session takes its seat. A
-    /// session of the gateway that still stands is superseded. A gateway
-    /// whose period had ended before this `Hello`, the sweep not yet
-    /// passed, is let go first: the new presence starts with nothing of the
-    /// earlier one. The letting-go is the table's own read of the fence,
-    /// under its lock as the sweep's is: a fence that no longer shows
-    /// `term` lets nothing go.
+    /// A `Welcome` at `now` under `term`, the session's read of the fence,
+    /// which the table's own read under its lock must show too: the
+    /// gateway is present, and the session takes its seat. A session of
+    /// the gateway that still stands is superseded. A gateway whose period
+    /// had ended before this `Hello`, the sweep not yet passed, is let go
+    /// first: the new presence starts with nothing of the earlier one.
     ///
     /// # Errors
     ///
-    /// A gateway of another subject is present under the key, or the row
-    /// would be a new one past the table's ceiling. A row whose period is
-    /// over counts until the sweep's next pass, a tenth of the period at
-    /// most.
+    /// The fence no longer shows `term`: no seat is taken, no session is
+    /// superseded and nothing is let go. Or a gateway of another subject
+    /// is present under the key, or the row would be a new one past the
+    /// table's ceiling. A row whose period is over counts until the
+    /// sweep's next pass, a tenth of the period at most.
     pub(crate) fn welcome(
         self: &Arc<Self>,
         gateway: GatewayId,
@@ -208,11 +213,16 @@ impl Gateways {
         let mut table = self.table.lock();
         let shown = self.fence.leader_term(now);
         Self::observe(&mut table, shown, now);
-        if shown == Some(term)
-            && table
-                .rows
-                .get(&gateway)
-                .is_some_and(|row| self.over(row, now))
+        // The seat is taken under the term this read shows or not at all:
+        // a Hello read under a term the election has left would supersede
+        // a session of the term that stands.
+        if shown != Some(term) {
+            return Err(Refused::Stepped { read: term, shown });
+        }
+        if table
+            .rows
+            .get(&gateway)
+            .is_some_and(|row| self.over(row, now))
         {
             if let Some(row) = table.rows.remove(&gateway) {
                 self.end(gateway, row);
@@ -349,9 +359,9 @@ impl Gateways {
             .is_some_and(|gone| now.saturating_duration_since(gone) >= self.grace)
     }
 
-    /// The end of a presence, under the table's lock: what the store holds
-    /// for the gateway is released, then the row goes and its decide
-    /// streams are told.
+    /// The end of a presence, under the table's lock: the gateway's lease
+    /// records are released, then the row goes and its decide streams are
+    /// told.
     fn end(&self, gateway: GatewayId, row: Row) {
         let leases = self.store.drop_gateway(gateway);
         info!(
@@ -711,11 +721,11 @@ pub(crate) mod tests {
         drop(third);
     }
 
-    /// The letting-go at a `Welcome` is the table's own read of the fence:
-    /// a replica that stopped leading after the session's read releases
+    /// The seat is the table's own read of the fence: a replica that
+    /// stopped leading after the session's read seats nobody and releases
     /// nothing.
     #[test]
-    fn a_welcome_whose_fence_closed_since_the_sessions_read_lets_nothing_go() {
+    fn a_hello_whose_fence_closed_since_the_sessions_read_takes_no_seat_and_lets_nothing_go() {
         let (mut elector, store, gateways, t0) = leading(GRACE);
         store.issue(lease(A, 1, t0)).expect("a lease");
         welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
@@ -723,9 +733,46 @@ pub(crate) mod tests {
         // The period is over with no sweep passed, and the lease is given
         // up between a session's read and the table's lock.
         assert!(elector.release().expect("the release"));
-        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
+        assert_eq!(
+            gateways.welcome(A, "gateway-a", TERM, t0 + GRACE).err(),
+            Some(Refused::Stepped {
+                read: TERM,
+                shown: None
+            })
+        );
         assert_eq!(store.live(A), 1, "a fenced replica releases nothing");
-        drop(seat);
+    }
+
+    /// A `Hello` read under a term the election has left takes no seat:
+    /// the session that stands under the later term keeps its own.
+    #[tokio::test]
+    async fn a_hello_read_under_an_earlier_term_supersedes_no_session_of_the_later_one() {
+        let (mut elector, _store, gateways, t0) = leading(GRACE);
+        // The replica gives its lease up and takes it again: term 2.
+        assert!(elector.release().expect("the release"));
+        let again = t0 + MS;
+        assert_eq!(
+            elector.tick(again).expect("the take"),
+            Tick::Acquired { term: 2 }
+        );
+        let stands = welcomed(&gateways, A, "gateway-a", 2, again);
+
+        // A Hello its session read under term 1 reaches the table now.
+        assert_eq!(
+            gateways.welcome(A, "gateway-a", TERM, again).err(),
+            Some(Refused::Stepped {
+                read: TERM,
+                shown: Some(2)
+            })
+        );
+        assert!(
+            timeout(Duration::from_millis(50), stands.superseded())
+                .await
+                .is_err(),
+            "the standing session keeps its seat"
+        );
+        assert!(gateways.presence(A, again).is_some());
+        drop(stands);
     }
 
     /// The table's bound that is not time: a `Hello` that would make a row

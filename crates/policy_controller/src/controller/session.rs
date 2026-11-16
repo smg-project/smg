@@ -16,6 +16,10 @@
 //! `NotLeader` rides the stream ahead of the status that ends it: on a
 //! stream the frame is the status's detail.
 //!
+//! A frame the stream cannot read ends the session with a status, before
+//! the `Welcome` and after it: only the gateway's own close ends a stream
+//! with none.
+//!
 //! One arm a kind of frame. `Hello` is served here. The other kinds are
 //! refused by name until the step that serves each adds its arm, as the
 //! service refuses an unserved call.
@@ -33,7 +37,7 @@ use std::{
 };
 
 use tokio::sync::mpsc;
-use tonic::{codegen::tokio_stream::Stream, Status, Streaming};
+use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::{debug, info};
 
 use super::{gateways::Refused, principal::Principal, service::Shared, PROTOCOL_VERSION};
@@ -49,6 +53,9 @@ pub(crate) const PRESENT_MAX: usize = 4_096;
 
 /// The longest release string of a peer that the log reads.
 const RELEASE_MAX: usize = 64;
+
+/// The refusal of a `Hello` on a replica that does not lead.
+const NOT_LEADING: &str = "this controller does not lead: find the leader through Leader";
 
 /// How often a gateway polls `Leader` for its term floor (design 5.3).
 const LEADER_POLL: Duration = Duration::from_secs(1);
@@ -152,7 +159,38 @@ fn refusal(refused: Refused) -> Status {
         Refused::Full { ceiling } => Status::resource_exhausted(format!(
             "the controller holds its ceiling of {ceiling} present gateways: say Hello again later"
         )),
+        // The election stepped between the session's read of the fence and
+        // the table's: the answer is a fenced session's.
+        Refused::Stepped { shown: None, .. } => Status::failed_precondition(NOT_LEADING),
+        Refused::Stepped {
+            read,
+            shown: Some(later),
+        } => Status::aborted(format!(
+            "this controller leads under term {later} now and read this Hello under term {read}: say Hello again"
+        )),
     }
+}
+
+/// The status of a frame the stream could not read. The transport's own
+/// stands, but for a message over the transport's limit: the contract
+/// never raises the transport's code for that one, and the code alone
+/// tells the case.
+fn unread(status: Status) -> Status {
+    if status.code() == Code::OutOfRange {
+        Status::resource_exhausted(format!(
+            "a Session frame is over the transport's limit: {}",
+            status.message()
+        ))
+    } else {
+        status
+    }
+}
+
+/// The answer to a `Hello` on a replica that does not lead: the
+/// `NotLeader` goes out, and the status follows it.
+async fn not_leading(shared: &Shared, answers: &mut Answers) -> Status {
+    answers.not_leader(shared).await;
+    Status::failed_precondition(NOT_LEADING)
 }
 
 /// A peer's release string as the log reads it: at most [`RELEASE_MAX`]
@@ -191,8 +229,10 @@ async fn session(
     mut inbound: Streaming<proto::GatewayFrame>,
     answers: &mut Answers,
 ) -> Option<Status> {
-    let Ok(Some(first)) = inbound.message().await else {
-        return None;
+    let first = match inbound.message().await {
+        Ok(Some(first)) => first,
+        Ok(None) => return None,
+        Err(status) => return Some(unread(status)),
     };
     let now = Instant::now();
     let hello = match first.frame {
@@ -221,10 +261,7 @@ async fn session(
     let mut steps = shared.standing.clone();
     // One read: the verdict and the term the Welcome carries.
     let Some(term) = shared.fence.leader_term(now) else {
-        answers.not_leader(shared).await;
-        return Some(Status::failed_precondition(
-            "this controller does not lead: find the leader through Leader",
-        ));
+        return Some(not_leading(shared, answers).await);
     };
     if let Some(status) = floor(first.term_floor, term) {
         return Some(status);
@@ -234,6 +271,10 @@ async fn session(
         .welcome(principal.gateway(), &principal.subject, term, now)
     {
         Ok(seat) => seat,
+        // The fence closed between this session's read and the table's.
+        Err(Refused::Stepped { shown: None, .. }) => {
+            return Some(not_leading(shared, answers).await);
+        }
         Err(refused) => return Some(refusal(refused)),
     };
     let (generation, needs, hashing) = applied();
@@ -274,8 +315,10 @@ async fn session(
     let status = loop {
         tokio::select! {
             frame = inbound.message() => {
-                let Ok(Some(frame)) = frame else {
-                    break None;
+                let frame = match frame {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break None,
+                    Err(status) => break Some(unread(status)),
                 };
                 if let Some(status) = judge(shared, term, &frame, answers).await {
                     break Some(status);
@@ -367,11 +410,13 @@ async fn judge(
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
         net::SocketAddr,
         sync::Arc,
         time::{Duration, Instant},
     };
 
+    use parking_lot::Mutex;
     use tokio::{
         net::TcpListener,
         sync::{mpsc, watch},
@@ -379,10 +424,12 @@ mod tests {
         time::timeout,
     };
     use tonic::{
-        codegen::tokio_stream::wrappers::ReceiverStream,
+        client::Grpc,
+        codegen::{http::uri::PathAndQuery, tokio_stream::wrappers::ReceiverStream},
         transport::{server::TcpIncoming, Channel, Error, Server},
         Code, Request, Status, Streaming,
     };
+    use tonic_prost::ProstCodec;
 
     use super::{refusal, release, GRACE_PERIOD, LEADER_POLL, PRESENT_MAX, RELEASE_MAX};
     use crate::{
@@ -494,9 +541,47 @@ mod tests {
     }
 
     /// One `Session` stream of [`GATEWAY`], from the gateway's side.
-    struct Opened {
-        frames: mpsc::Sender<proto::GatewayFrame>,
+    struct Opened<F = proto::GatewayFrame> {
+        frames: mpsc::Sender<F>,
         answers: Streaming<proto::ControllerFrame>,
+    }
+
+    /// A frame of the case's own bytes. A `Hello` rides it as it rides a
+    /// frame, and `dispatched` is the bytes the frame's `Dispatched` is
+    /// decoded from.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Odd {
+        #[prost(message, optional, tag = "3")]
+        hello: Option<proto::Hello>,
+        #[prost(string, tag = "5")]
+        dispatched: String,
+    }
+
+    /// One `Session` stream of [`GATEWAY`] that sends frames of the case's
+    /// own bytes.
+    async fn open_odd(addr: SocketAddr) -> Opened<Odd> {
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("a uri")
+            .connect()
+            .await
+            .expect("the listener accepts");
+        let (frames, sent) = mpsc::channel(8);
+        let mut request = Request::new(ReceiverStream::new(sent));
+        request
+            .metadata_mut()
+            .insert(ENTRY, GATEWAY.parse().expect("an ASCII value"));
+        let mut call = Grpc::new(channel);
+        call.ready().await.expect("the channel is ready");
+        let answers = call
+            .streaming(
+                request,
+                PathAndQuery::from_static("/smg.policy.v1.PolicyController/Session"),
+                ProstCodec::<Odd, proto::ControllerFrame>::default(),
+            )
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        Opened { frames, answers }
     }
 
     async fn open(addr: SocketAddr) -> Opened {
@@ -523,8 +608,8 @@ mod tests {
         Opened { frames, answers }
     }
 
-    impl Opened {
-        async fn send(&self, frame: proto::GatewayFrame) {
+    impl<F> Opened<F> {
+        async fn send(&self, frame: F) {
             self.frames
                 .send(frame)
                 .await
@@ -553,7 +638,9 @@ mod tests {
                 .expect_err("the stream ends with a status");
             (status.code(), status.message().to_owned())
         }
+    }
 
+    impl Opened {
         /// Says `Hello` and takes the `Welcome`, which carries `term`.
         async fn welcomed(&mut self, term: u64) -> proto::Welcome {
             self.send(hello(GATEWAY)).await;
@@ -798,11 +885,25 @@ mod tests {
             renew_deadline: Duration::from_secs(1),
         };
         let mut bed = bed(settings).await;
-        // The stream first, the take after it: the Hello is judged inside
-        // the deadline on a slow host too.
-        let mut session = open(bed.addr).await;
-        bed.leads(1);
-        session.welcomed(1).await;
+        // The stream first, the take after it, and the Hello inside the
+        // take's renew deadline. A host that holds the case past it has
+        // the Hello answered NotLeader, which is no verdict on a session:
+        // the take and the Hello are made again, on a new stream.
+        let mut tries = 0;
+        let mut session = loop {
+            let mut session = open(bed.addr).await;
+            bed.leads(1);
+            session.send(hello(GATEWAY)).await;
+            let answer = session.frame().await;
+            if matches!(answer.frame, Some(controller_frame::Frame::Welcome(_))) {
+                break session;
+            }
+            tries += 1;
+            assert!(
+                tries < 20,
+                "the host held the case past its deadline twenty times: {answer:?}"
+            );
+        };
 
         tokio::time::sleep(settings.renew_deadline + Duration::from_millis(20)).await;
         session.send(frame(1, None)).await;
@@ -926,6 +1027,141 @@ mod tests {
             full.message(),
             "the controller holds its ceiling of 7 present gateways: say Hello again later"
         );
+        let closed = refusal(Refused::Stepped {
+            read: 1,
+            shown: None,
+        });
+        assert_eq!(closed.code(), Code::FailedPrecondition);
+        assert_eq!(
+            closed.message(),
+            "this controller does not lead: find the leader through Leader"
+        );
+        let later = refusal(Refused::Stepped {
+            read: 1,
+            shown: Some(2),
+        });
+        assert_eq!(later.code(), Code::Aborted);
+        assert_eq!(
+            later.message(),
+            "this controller leads under term 2 now and read this Hello under term 1: say Hello again"
+        );
+    }
+
+    /// A frame the stream cannot read ends it with a status, before the
+    /// `Welcome` and after it: one over the transport's limit, and one no
+    /// frame decodes from.
+    #[tokio::test]
+    async fn a_frame_the_stream_cannot_read_ends_it_with_a_status() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        // Over the transport's 4 MiB a message.
+        let mut over = hello(GATEWAY);
+        if let Some(Frame::Hello(hello)) = over.frame.as_mut() {
+            hello.version = "v".repeat(5 * 1024 * 1024);
+        }
+        let over_the_limit = |(code, message): (Code, String)| {
+            assert_eq!(code, Code::ResourceExhausted, "{message}");
+            assert!(
+                message.starts_with("a Session frame is over the transport's limit: ")
+                    && message.contains("4194304"),
+                "{message}"
+            );
+        };
+        // No `Dispatched` decodes from this byte.
+        let odd = Odd {
+            hello: None,
+            dispatched: "\u{f}".to_owned(),
+        };
+        // The transport's own status, which is INTERNAL for a message its
+        // codec could not decode.
+        let undecoded = |(code, message): (Code, String)| {
+            assert_eq!(code, Code::Internal, "{message}");
+            assert!(!message.is_empty());
+        };
+
+        // As the first frame: no session, and the gateway is not present.
+        let mut session = open(bed.addr).await;
+        session.send(over.clone()).await;
+        over_the_limit(session.status().await);
+        let mut session = open_odd(bed.addr).await;
+        session.send(odd.clone()).await;
+        undecoded(session.status().await);
+        assert!(!bed.present(Instant::now()));
+
+        // After the Welcome.
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        session.send(over).await;
+        over_the_limit(session.status().await);
+        let mut session = open_odd(bed.addr).await;
+        let said = match hello(GATEWAY).frame {
+            Some(Frame::Hello(hello)) => hello,
+            other => panic!("a Hello: {other:?}"),
+        };
+        session
+            .send(Odd {
+                hello: Some(said),
+                dispatched: String::new(),
+            })
+            .await;
+        assert!(matches!(
+            session.frame().await.frame,
+            Some(controller_frame::Frame::Welcome(_))
+        ));
+        session.send(odd).await;
+        undecoded(session.status().await);
+    }
+
+    /// The lines a case's own subscriber wrote.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The Welcome's log line reads a peer's release string through its
+    /// bound: the one place a peer's own text reaches the log.
+    #[tokio::test]
+    async fn the_welcomes_log_line_reads_a_forged_release_string_as_the_fixed_word() {
+        // A subscriber of the case's own keeps the lines of this thread,
+        // the session's among them. A second one stays registered beside
+        // it: with one alone a line is on or off by the thread that
+        // reaches it first, and a case beside this one reaches it under
+        // none.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let mut session = open(bed.addr).await;
+        let mut forged = hello(GATEWAY);
+        if let Some(Frame::Hello(hello)) = forged.frame.as_mut() {
+            hello.version = "1.0\nERROR forged".to_owned();
+        }
+        session.send(forged).await;
+        assert!(matches!(
+            session.frame().await.frame,
+            Some(controller_frame::Frame::Welcome(_))
+        ));
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        assert!(logged.contains("a gateway is welcomed"), "{logged}");
+        assert!(logged.contains("version=(unreadable)"), "{logged}");
+        assert!(!logged.contains("forged"), "{logged}");
     }
 
     /// The log reads a peer's release string only when it is a short run of

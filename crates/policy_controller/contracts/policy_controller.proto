@@ -51,13 +51,17 @@
 // stream); INVALID_ARGUMENT a spec or registration rejected (the field
 // path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
-// resync_required batch precedes it), or a Hello past the controller's
-// ceiling of present gateways; ALREADY_EXISTS a Hello whose id collides
+// resync_required batch precedes it), a Hello past the controller's
+// ceiling of present gateways, or a Session frame over the transport's
+// limit of 4 MiB a message; ALREADY_EXISTS a Hello whose id collides
 // with another present gateway's, refused while that one stands;
 // UNAVAILABLE a standby not yet synced;
-// ABORTED fenced mid-stream, reconnect through Leader, or a session a
-// newer one of its gateway replaced; OUT_OF_RANGE and
-// DATA_LOSS never raised, forwarded as RelayResync. In-band within a stream:
+// ABORTED fenced mid-stream, reconnect through Leader, a Hello read
+// under a term the election left before its seat was taken, or a session
+// a newer one of its gateway replaced; OUT_OF_RANGE and
+// DATA_LOSS never raised, forwarded as RelayResync. Any other read of a
+// Session frame that the transport fails ends the stream under the
+// transport's own status. In-band within a stream:
 // Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
