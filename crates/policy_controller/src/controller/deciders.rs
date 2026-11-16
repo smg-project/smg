@@ -508,7 +508,7 @@ mod tests {
             gateways::tests::PATIENT,
             wire::{self, Checked},
         },
-        elector::{Elector, MemoryLease, Tick},
+        elector::{Elector, Tick},
         framework::Scratch,
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
         spec::{AppliedSpec, PolicySpec},
@@ -660,12 +660,10 @@ mod tests {
         if let Some(spec) = spec {
             store.apply(spec).expect("above the unbound start");
         }
-        let mut elector = Elector::new(
-            Box::new(MemoryLease::new()),
-            "controller-0@10.0.0.7:30100",
-            PATIENT,
-        )
-        .expect("the settings are in order");
+        // The bed's lease is its own, handed to nobody: an elector alone,
+        // which leads at its take.
+        let mut elector = Elector::alone("controller-0@10.0.0.7:30100", PATIENT)
+            .expect("the settings are in order");
         let taken = Instant::now();
         if leads {
             let tick = elector.tick(taken).expect("the take");
