@@ -1103,7 +1103,7 @@ impl LoadSink for MemoryStore {
                     let place = writer.fold_load(id, rank, Some(&sample));
                     let engine = place.and_then(|place| {
                         let engine = writer.engine_at(place)?;
-                        writer.hear(engine, place, polled_at);
+                        writer.hear(place, polled_at);
                         Some(engine)
                     });
                     (engine, true)

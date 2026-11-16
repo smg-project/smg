@@ -2898,6 +2898,19 @@ mod tests {
         // A model the pair binding does not match has the phase's own.
         assert_eq!(plan_of(&pd, "n", Phase::Decode), Some(Plan::Single));
         assert_eq!(plan_of(&pd, "n", Phase::Prefill), None);
+        // A binding of another plan that covers prefill ahead of the pair
+        // binding takes the model's prefill lookup: no pair decision runs
+        // for the model, and its decode pool is the decode phase's own.
+        let ahead = engine(vec![
+            phase_first(Phase::Prefill),
+            phase_first(Phase::Decode),
+            pair(Plan::PdPair),
+        ]);
+        let decode = ahead.pool_binding("m", Phase::Decode);
+        assert_eq!(
+            decode.map(|b| (b.plan, b.phases.clone())),
+            Some((Plan::Single, vec![Phase::Decode]))
+        );
 
         let epd = Plan::Epd { encode: 0 };
         let with_encoders = engine(vec![
