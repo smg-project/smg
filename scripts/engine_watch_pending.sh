@@ -10,8 +10,8 @@
 # GitHub's in:title search normalizes dots and hyphens, so "sglang 0.5.16" can
 # match unrelated issues, or miss; and the search index, which
 # `gh issue list --label` asks as well, can trail an issue filed seconds ago,
-# which is when the watch asks a second time. The version is the whole word
-# after the engine's name ("1.4.0rc3" does not report "1.4.0"); a commit pin
+# which is when the watch asks a second time. The engine's name and the version
+# after it are whole words ("1.4.0rc3" does not report "1.4.0"); a commit pin
 # (TokenSpeed's) is matched by prefix, because the titles carry its SHA shortened.
 #
 # Requires: gh, jq; GH_TOKEN and GITHUB_REPOSITORY.
@@ -19,6 +19,10 @@
 set -euo pipefail
 
 rows=$(cat)
+# The loop reads the rows through a process substitution, whose failure the
+# shell does not see: without this, input that is no array would print [].
+[ "$(jq -r type <<<"$rows")" = array ] ||
+    { echo "engine_watch_pending: stdin is not a JSON array" >&2; exit 1; }
 titles=$(gh api --paginate \
     "repos/$GITHUB_REPOSITORY/issues?state=open&labels=engine-watch&per_page=100" \
     --jq '.[] | select(has("pull_request") | not) | .title')
@@ -29,7 +33,7 @@ while IFS= read -r row; do
     latest=$(jq -r .latest <<<"$row")
     reported=
     while IFS= read -r title; do
-        named=${title#*"$engine "}
+        named=${title#*" $engine "}
         [ "$named" != "$title" ] || continue
         named=${named%% *}
         if [ "$named" = "$latest" ] ||

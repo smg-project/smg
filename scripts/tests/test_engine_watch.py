@@ -101,7 +101,7 @@ def agent_of(filing: list[dict]) -> dict:
 
 
 def run_step(step: dict, env, checkout) -> subprocess.CompletedProcess:
-    """The step's script under the runner's default shell, from the checkout's root."""
+    """The step's script as the runner runs a step that names no shell, from the checkout's root."""
     return subprocess.run(
         ["bash", "-e", "-c", step["run"]], cwd=checkout, capture_output=True, text=True, env=env
     )
@@ -123,14 +123,16 @@ def test_an_engine_whose_latest_an_open_issue_names_is_not_pending(env):
     assert pending(env) == ["vllm", "tensorrt-llm"]
 
 
-def test_an_issue_for_another_version_reports_nothing(env):
-    """A candidate of the latest release, the release the latest one follows up, another commit."""
+def test_an_issue_for_another_version_or_engine_reports_nothing(env):
+    """A candidate of the latest release, the release the latest one follows up, another commit,
+    and the latest version of an engine whose name ends in this one's."""
     open_issues(
         env,
         [
             "[engine-watch] vllm 0.33.0rc1 available (pinned: 0.31.0)",
             "[engine-watch] tokenspeed 90eea27 available (pinned: e87f726)",
             "[engine-watch] tensorrt-llm 1.4.0rc2 available (pinned: 1.3.0rc24)",
+            "[engine-watch] xvllm 0.33.0 available (pinned: 0.31.0)",
         ],
     )
     assert pending(env) == ENGINES
@@ -139,6 +141,16 @@ def test_an_issue_for_another_version_reports_nothing(env):
 def test_a_pull_request_under_the_label_reports_nothing(env):
     open_issues(env, [], pull_requests=REPORTED)
     assert pending(env) == ENGINES
+
+
+@pytest.mark.parametrize("stdin", ["", "not json", "{}"], ids=["nothing", "no JSON", "an object"])
+def test_input_that_is_no_array_of_rows_fails(env, stdin):
+    """A list that cannot be read must not read as nothing pending."""
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], input=stdin, capture_output=True, text=True, env=env
+    )
+    assert result.returncode != 0
+    assert result.stdout == ""
 
 
 def test_the_detect_job_hands_over_the_engines_no_issue_reports(env, tmp_path):
@@ -191,6 +203,9 @@ def test_the_filing_job_fails_when_an_engine_it_was_handed_stays_unreported(env,
 
     open_issues(env, REPORTED)
     assert run_step(check, env, tmp_path).returncode == 0
+
+    env["PENDING"] = ""
+    assert run_step(check, env, tmp_path).returncode != 0
 
 
 def test_the_agents_report_goes_to_the_job_summary():
