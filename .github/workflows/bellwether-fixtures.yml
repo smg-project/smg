@@ -27,6 +27,7 @@ on:
     branches: [ main ]
     paths:
       - crates/protocols/**
+      - crates/worker/**
       - crates/tokenizer/**
       - crates/symphony/**
       - crates/response_template/**
@@ -49,6 +50,7 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - crates/protocols/**
+      - crates/worker/**
       - crates/tokenizer/**
       - crates/symphony/**
       - crates/response_template/**
