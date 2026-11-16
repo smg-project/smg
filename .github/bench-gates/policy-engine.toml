@@ -61,10 +61,54 @@
 # job and the row could fail or pass a change that did not touch it. The identical-build spread of the
 # table above was read in one placement; the placed buffer makes it the only one.
 #
+# Count. The 64-byte boundary keeps a function's start on a cache line and no more: code that grows ahead of
+# a function still moves it inside its page, and the same machine code then reads slower by time alone. A
+# pull request grew a cold function ahead of the engine's decision by 109 bytes, and the decision sat 384
+# bytes further (0x0c0 to 0x240 of its page). The hosted job failed `decide/cache_aware/8` at +10.4 % with
+# every run apart, and six more rows of four presets read +3.9 to +8.7 %, every run apart (2026-11-15). Each
+# of the seven runs the same instruction count on both sides, 3,234 to 16,657 an iteration. So
+# `count = true`: an id that still fails after its re-measurement is counted on both binaries under
+# valgrind's callgrind (scripts/bench_gate.py). It is a placement, reported with the count and the two places
+# and not failed, on three facts: the same count in every batch after the first, a measured function that
+# starts at another address in the pull request's binary, and a change within twice the id's threshold. The
+# same count with the function where it was, or beyond twice the threshold, leaves the failure. Two counts
+# that differ are each taken once more, and the failure stands. That job's own results read PASS under it
+# with one placement: `decide/cache_aware/8`, +10.4 % against 10 %, 4,001 instructions an iteration on both
+# sides, the decision at 0x0c0 of its page in one binary and at 0x240 in the other.
+#
+# Read on this file's 33 ids, both binaries from paths of one length as the gate runs them, 2 to 3 s a count:
+#
+#   pair                                                          same   moved   not steady
+#   one build against its own copy                                31     1       1
+#   cold code of that size ahead of the decision, no other line   31     1       1
+#   the job's pair                                                31     0       2
+#   planted work, 10 multiply-adds plus one a candidate           3      25      5
+#
+# The planted work (dependent steps at the start of the decision, never committed) moves the count on 25 of
+# the 30 decision rows, +1.9 to +14.8 %, the same in two counts of each side; the three view rows count the
+# same. The gate fails it as before: 11 rows failed by time, +10.0 to +44.4 %, and none read as a placement.
+# The cold code alone (384 bytes, never committed) puts the decision where the pull request put it. By time,
+# fifteen interleaved runs a side at a host load of 65 to 137, `decide/cache_aware/8` read +3.3 % under it
+# and the other six of the seven rows within 1.4 %.
+#
+# The ids that are not the same in a pair of the same work do not count steadily. A 512-worker row reads 12
+# instructions an iteration more or fewer from one process to the next (0.01 to 0.03 %): it reads as moved
+# when each side happens to repeat itself, as not steady otherwise. `decide/manual_keyed_miss/8` and
+# `spec/parse_validate` differ between two counts of one binary by 0.03 to 3.3 %. Each keeps the time's
+# verdict. The count does not see a change that runs the same instructions slower (a load that misses, a
+# branch that stops predicting): where its measured function moved too, such a row reads as a placement up
+# to twice its threshold, by name, in the summary. A placement is still a row to read.
+#
+# A build that starts every function on a page of its own was read on the same pairs and not taken. The pull
+# request's head against its parent reads level under it (-2.2 to +4.1 % on the seven rows, fifteen runs a
+# side), but each of the seven runs 21 to 44 % slower than under the 64-byte boundary, and the binary is
+# 26.0 MB against 8.6 MB.
+#
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread is read from those.
 
 repeats = 3
+count = true
 filter = "^policy_engine/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the
