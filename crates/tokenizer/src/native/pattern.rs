@@ -641,6 +641,10 @@ pub(crate) struct Pattern {
     /// at its first position, the join of a letter run aside
     /// ([`Self::reads_space_after`]).
     before_space: Vec<usize>,
+    /// The class every match of the program begins with, when its first op
+    /// takes one character of a class or a run of at least one: the search
+    /// passes over every character outside it (see `Matches::next`).
+    opens_with: Option<usize>,
 }
 
 /// The matcher of a pattern: a hand-written scanner for the two template
@@ -861,6 +865,11 @@ impl Pattern {
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
         program.push(Op::Match);
+        let opens_with = match program.first() {
+            Some(&Op::Char(class)) => Some(class),
+            Some(&Op::Run { class, min, .. }) if min > 0 => Some(class),
+            _ => None,
+        };
         Some(Self {
             classes: parser.classes,
             program,
@@ -872,6 +881,7 @@ impl Pattern {
             anchored,
             bare_interval_repeat: parser.bare_interval_repeat,
             before_space,
+            opens_with,
         })
     }
 
@@ -2054,7 +2064,7 @@ impl Iterator for Matches<'_, '_> {
 
     fn next(&mut self) -> Option<(usize, usize)> {
         while self.pos < self.text.len() {
-            let start = self.pos;
+            let mut start = self.pos;
             let end = match &self.pattern.matcher {
                 Matcher::Template(scanner) => {
                     scanner.match_at::<false, false>(&self.pattern.classes, self.text, start)
@@ -2062,13 +2072,32 @@ impl Iterator for Matches<'_, '_> {
                 Matcher::Cased(scanner) => {
                     scanner.match_at::<false>(&self.pattern.classes, self.text, start)
                 }
-                Matcher::Program => self.pattern.match_at(
-                    self.text,
-                    start,
-                    self.from,
-                    &mut self.choices,
-                    &mut self.memo,
-                ),
+                Matcher::Program => {
+                    if let Some(class) = self.pattern.opens_with {
+                        // Every match begins with a character of this class,
+                        // so the characters outside it are passed over here,
+                        // one class test each: a start at one would run the
+                        // program only to fail at its first op.
+                        let class = &self.pattern.classes[class];
+                        loop {
+                            let Some((c, len)) = next_char(self.text, start) else {
+                                self.pos = start;
+                                return None;
+                            };
+                            if class.contains(c) {
+                                break;
+                            }
+                            start += len;
+                        }
+                    }
+                    self.pattern.match_at(
+                        self.text,
+                        start,
+                        self.from,
+                        &mut self.choices,
+                        &mut self.memo,
+                    )
+                }
             };
             match end {
                 Some(end) if end > start => {
@@ -5172,6 +5201,88 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The search passes over the characters no match begins with. A program
+    /// whose first op takes a character of one class, or a run of at least
+    /// one, names that class at load, and its matches are the engine's where
+    /// the class is rare or absent, at both ends of the text and beside
+    /// characters of two to four bytes. A first op that may take nothing
+    /// names no class, since a match can begin with what follows it.
+    #[test]
+    fn the_search_passes_over_characters_outside_the_opening_class() {
+        const ALPHABET: [char; 16] = [
+            '1',
+            '2',
+            '7',
+            '\u{663}',
+            'a',
+            'b',
+            'c',
+            'x',
+            ' ',
+            '\u{e9}',
+            '\u{6f22}',
+            '\u{304b}',
+            '\u{1F600}',
+            '!',
+            '.',
+            '\n',
+        ];
+        let mut texts: Vec<String> = [
+            "",
+            "x",
+            "7",
+            "12",
+            "123",
+            "123 begins",
+            "ends on 123",
+            "abc123def4567",
+            "no digit at all, only words",
+            "\u{e9}123\u{1F600}456\u{6f22}",
+            "\u{663}\u{664}\u{665} 12 345",
+            "aabx abab cx",
+            "\u{6f22}\u{5b57}\u{304b}\u{306a} kana \u{30ab}",
+            "!!.. a.b",
+        ]
+        .iter()
+        .map(|text| (*text).to_string())
+        .collect();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..400 {
+            let len = (pseudo_random(&mut state) % 24) as usize;
+            texts.push(
+                (0..len)
+                    .map(|_| ALPHABET[(pseudo_random(&mut state) % ALPHABET.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        let agrees = |pattern: &str, opens: bool| {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(matches!(parsed.matcher, Matcher::Program), "{pattern}");
+            assert_eq!(parsed.opens_with.is_some(), opens, "{pattern}");
+            for text in &texts {
+                assert_eq!(
+                    parsed.find_iter(text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, text),
+                    "{pattern} on {text:?}"
+                );
+            }
+        };
+        for pattern in [
+            "[0-9][0-9][0-9]",
+            r"\p{N}+",
+            DIGITS,
+            CJK,
+            "[!-/]+",
+            "[a-c]+x",
+            r"\p{Nd}{2}x?",
+        ] {
+            agrees(pattern, true);
+        }
+        for pattern in [" ?[a-z]+", r"\p{N}?x", "ab|[0-9]+"] {
+            agrees(pattern, false);
         }
     }
 }
